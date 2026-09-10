@@ -40,6 +40,14 @@ impl<'a> Cursor<'a> {
         Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// v0.13: big-endian Int64 (standby status messages).
+    pub fn read_i64(&mut self) -> io::Result<i64> {
+        let b = self.take(8)?;
+        Ok(i64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
     pub fn read_u8(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
     }
@@ -90,7 +98,12 @@ pub fn read_startup(stream: &mut TcpStream) -> io::Result<(i32, Vec<u8>)> {
     if len < 8 {
         return invalid(format!("bad startup packet length {}", len));
     }
-    let buf = read_bounded(stream, (len - 4) as i64, MAX_STARTUP_BYTES, "startup packet")?;
+    let buf = read_bounded(
+        stream,
+        (len - 4) as i64,
+        MAX_STARTUP_BYTES,
+        "startup packet",
+    )?;
     let mut cur = Cursor::new(&buf);
     let proto = cur.read_i32()?;
     Ok((proto, buf))
@@ -124,18 +137,16 @@ pub const MAX_STARTUP_BYTES: usize = 16 << 20;
 /// Read `total` bytes from `stream` in 64 KiB chunks, failing if `total`
 /// exceeds `cap`. Incremental: memory grows only with bytes actually
 /// received, never with the claimed length alone.
-fn read_bounded(
-    stream: &mut TcpStream,
-    total: i64,
-    cap: usize,
-    what: &str,
-) -> io::Result<Vec<u8>> {
+fn read_bounded(stream: &mut TcpStream, total: i64, cap: usize, what: &str) -> io::Result<Vec<u8>> {
     if total < 0 || total as u64 > cap as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             // 08P01 surfaces in the fuzzer tests; the io error kind is what
             // callers see, the message carries the SQLSTATE context.
-            format!("{} length {} exceeds maximum {} bytes (08P01)", what, total, cap),
+            format!(
+                "{} length {} exceeds maximum {} bytes (08P01)",
+                what, total, cap
+            ),
         ));
     }
     let mut out = Vec::new();
@@ -179,6 +190,12 @@ impl MsgBuilder {
         self
     }
 
+    /// v0.13: big-endian Int64 (replication XLogData / keepalive / standby).
+    pub fn i64(&mut self, v: i64) -> &mut Self {
+        self.payload.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+
     pub fn cstr(&mut self, s: &str) -> &mut Self {
         self.payload.extend_from_slice(s.as_bytes());
         self.payload.push(0);
@@ -188,6 +205,19 @@ impl MsgBuilder {
     pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
         self.payload.extend_from_slice(b);
         self
+    }
+
+    /// Message type byte (used when the payload is embedded in another
+    /// message, e.g. XLogData inside CopyData).
+    pub fn kind(&self) -> u8 {
+        self.typ
+    }
+
+    /// v0.13: consume the builder and return just the payload bytes
+    /// (for wrapping one message's payload inside another, e.g. XLogData
+    /// inside CopyData).
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
     }
 
     /// Write type byte + Int32 length (including itself) + payload.
@@ -224,11 +254,7 @@ mod tests {
         client.flush().unwrap();
         let err = read_message(&mut server).unwrap_err();
         let msg = format!("{}", err);
-        assert!(
-            msg.contains("exceeds maximum"),
-            "unexpected error: {}",
-            msg
-        );
+        assert!(msg.contains("exceeds maximum"), "unexpected error: {}", msg);
     }
 
     /// Same for the startup packet: claim 1 GiB, deliver nothing.

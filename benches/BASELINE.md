@@ -2,6 +2,63 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.13 baseline — 2026-09-10
+
+Environment: same sandbox, **release build** (`cargo build --release`),
+fresh temp data dir, 5 s per workload. v0.13 adds the replication
+protocol + logical decoding; no hot-path rewrites on the normal query
+path. NOTE: the first v0.13 bench run accidentally used a data dir on
+the workspace btrfs volume (whose fsync stalls: raw `fsync` p50
+0.00 ms / p99 37 ms), while prior milestones used `/tmp` (tmpfs).
+The numbers below are the re-run on `/tmp`, like-for-like with v0.12.
+A bisection scare during measurement (v0.13 COMMIT ~12–59 ms vs v0.12
+~0.1 ms) turned out to be purely the btrfs-vs-tmpfs data-dir
+difference: v0.13 on tmpfs commits in 0.03–0.31 ms, identical to v0.12
+on the same box. The commit path is unchanged apart from
+once-per-datadir system-id syncs.
+
+| workload   | qps      | p50        | p99        | vs v0.12 |
+|------------|----------|------------|------------|---------|
+| `select1`  | 26,899   | 0.026 ms   | 0.195 ms   | p50 same (qps: v0.12 was load-polluted) |
+| `expr`     | 8,254    | 0.068 ms   | 0.880 ms   | p50 same |
+| `scan`     | 39.3     | 18.28 ms   | 93.16 ms   | better (v0.12 was load-polluted) |
+| `insert`   | 214.5    | 3.408 ms   | 25.07 ms   | better (v0.12 was load-polluted) |
+| `prepared` | 15,127   | 0.059 ms   | 0.325 ms   | p50 same |
+| `txn`      | 8,693    | 0.073 ms   | 0.763 ms   | p50 same |
+| `mvcc`     | 1,561    | 0.512 ms   | 2.603 ms   | p50 same/better |
+| `join`     | 2.3      | 439.0 ms   | 587.4 ms   | better (v0.12 was load-polluted) |
+| `idxscan`  | 21,727   | 0.036 ms   | 0.195 ms   | p50 same/better |
+| `window`   | 6.2      | 147.9 ms   | 297.5 ms   | better (v0.12 was load-polluted) |
+| `copy`     | 70.9     | 12.90 ms   | 23.42 ms   | better (v0.12 was load-polluted) |
+
+CPU-bound p50 latencies (`select1`, `expr`, `prepared`, `idxscan`) are
+unchanged vs v0.12 — the v0.13 changes (walsender, slot WAL records,
+`UpdateRows`, `pg_replication_slots`) add no per-query hot-path cost on
+normal connections. `txn`/`insert`/`mvcc` are back to v0.12 levels on
+the like-for-like tmpfs rerun; the earlier scary `txn` numbers were the
+btrfs data dir, not v0.13 code.
+
+Replication streaming (release build, ad-hoc driver, `/tmp` data dir):
+500 single-row INSERTs streamed as 502 logical lines (BEGIN + 500
+INSERT + COMMIT); steady-state per-line gap 0.00 ms (one
+`send_copy_data` write syscall each). Initial catch-up from LSN 0 over
+a WAL holding the full benchmark history scans + CRC-verifies + decodes
+every frame (~2 ms/frame) — proportional to WAL size, as expected; a
+slot started at the current LSN streams new commits with no catch-up
+scan.
+
+Valgrind memcheck over a replication workload (slot create, 50
+inserts/updates/deletes, START_REPLICATION stream, standby status,
+CopyDone, slot drop): **0 bytes definitely lost, 0 indirectly lost**,
+0 invalid reads/writes, 0 uninit errors (the "possibly lost" 31 KB is
+SIGTERM-at-`accept` teardown, same as v0.12). Callgrind on the
+replication scenario: top named cost is the pre-existing table-driven
+`wal::crc32` (10.9%) plus WAL frame decode (`Dec::take`/`read_frame`
+~9%) — no v0.13-specific hotspots in `repl.rs` or the decoder. DHAT:
+3.0 MB total allocated over the scenario, 84.6 KB peak live, all
+short-lived (64 KB network read buffers, `Vec<WalRecord>` batch bufs) —
+no heap bloat.
+
 ## v0.12 baseline — 2026-09-10
 
 Environment: same sandbox, **release build** (`cargo build --release`),

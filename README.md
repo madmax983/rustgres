@@ -1,18 +1,84 @@
-# rustgres v0.12 — "concurrency stress, soak testing, protocol hardening"
+# rustgres v0.13 — "replication protocol, logical decoding"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 12 of the road to Postgres 19 feature parity. v0.12 is a
-robustness milestone: **concurrency stress testing** (threaded mixed
-read/write/DDL/grant workloads with invariant checks), a **randomized
-soak test** (30k statements, `SIGKILL` mid-run, crash recovery verified),
-**wire-protocol hardening** (allocation-DoS resistance, `08P01` FATAL on
-unknown message types, `CancelRequest`/`SSLRequest` handling,
-poisoned-lock recovery), and an **SQLSTATE audit** (65 new protocol
-checks pinning exact error codes, including newly-corrected `42701`
-duplicate-column/assignment reporting). 1051 cumulative protocol tests
-pass (65 new in v0.12), plus 50 unit tests.
+Milestone 13 of the road to Postgres 19 feature parity. v0.13 brings
+the **streaming replication protocol**: `replication=true` connections,
+`IDENTIFY_SYSTEM`, durable logical replication slots (WAL-logged and
+checkpointed, surviving `SIGKILL`), `START_REPLICATION` with walsender
+`CopyBoth` framing (`XLogData` + keepalives), standby status/flush
+tracking, the `pg_replication_slots` catalog view, and a built-in
+logical decoding plugin (`rustgres_decoding`) that emits
+`BEGIN`/`INSERT`/`UPDATE`/`DELETE`/`DDL`/`COMMIT` text with exact
+old/new row images. 1108 cumulative protocol tests pass (57 new in
+v0.13), plus 56 unit tests.
+
+## What v0.13 adds (replication protocol, logical decoding)
+
+- **Walsender dialect.** A startup packet with `replication=true`
+  (superusers only, `42501` otherwise) routes the connection to the
+  replication command loop after the normal auth/handshake. Supported
+  commands: `IDENTIFY_SYSTEM` (exact `systemid/timeline/xlogpos/dbname`
+  shape; the system id is generated once per data directory and stable
+  across restarts), `CREATE_REPLICATION_SLOT` (logical slots with the
+  `rustgres_decoding` plugin; `PHYSICAL` slots accepted as metadata),
+  `DROP_REPLICATION_SLOT`, and `START_REPLICATION SLOT name LOGICAL
+  lsn`. Unknown commands → `42601`; `TIMELINE_HISTORY` and
+  `BASE_BACKUP` → `0A000` (single timeline; no base backup — documented
+  future work). Every command error is followed by `ReadyForQuery`, so
+  the client can continue.
+- **Durable slots.** Slot create/drop/flush are WAL-logged
+  (`ReplSlotCreate`/`ReplSlotDrop`/`ReplSlotFlush` records) and
+  checkpointed (checkpoint format v6, WAL magic `RGSWAL07` — older data
+  directories are refused loudly). Creating a duplicate slot → `42710`,
+  bad names → `42602`, unknown plugins → `0A000`, dropping a missing
+  slot → `42704`, dropping an active slot → `55006`.
+- **`START_REPLICATION` streaming.** The server replies
+  `CopyBothResponse`, then streams `CopyData` frames: `d` XLogData
+  (data_start, wal_end, send timestamp, logical line) and `w`
+  keepalives every 10 s while idle (no reply requested). The client
+  answers with `r` standby-status messages; the server advances the
+  slot's `confirmed_flush_lsn` (WAL-logged periodically) and
+  `restart_lsn`. `CopyDone` ends the stream and returns the connection
+  to command mode (`ReadyForQuery`); `Terminate` closes it. Streaming
+  marks the slot `active`; every return path deactivates it.
+- **Logical decoding (`rustgres_decoding`).** Each committed WAL frame
+  decodes to `BEGIN <lsn>` … `COMMIT <lsn>` with one line per change:
+  `INSERT t id=1 name='alice'`, `UPDATE t OLD id=2 name='bob' NEW id=2
+  name='bobby'`, `DELETE t id=1 name='alice'`, `DDL CREATE_TABLE t`.
+  UPDATE is first-class end to end (WAL `UpdateRows` carries old+new
+  row images; DELETE carries old rows), so logical streams show exact
+  before/after values. Non-table records (sequences, roles, ACLs, slot
+  metadata) are invisible to the decoder.
+- **`pg_replication_slots`.** A virtual catalog view over the slot map:
+  `slot_name, plugin, slot_type, active, restart_lsn,
+  confirmed_flush_lsn` (LSNs in `X/Y` text form), visible to normal SQL
+  clients.
+- **Performance.** Valgrind memcheck over a replication workload (slot
+  create, DML, logical streaming, standby status, drop): 0 bytes
+  definitely/indirectly lost, 0 invalid accesses. Callgrind: no
+  v0.13-specific hotspots (top costs are the pre-existing table-driven
+  `wal::crc32` and WAL frame decode). DHAT: 3.0 MB total, 84.6 KB peak
+  live, all short-lived. Wire benchmarks (`benches/BASELINE.md`):
+  CPU-bound p50s unchanged vs v0.12 (`select1` 0.026 ms, `prepared`
+  0.059 ms, `idxscan` 0.036 ms); `txn` 8,693 qps / 0.073 ms. Logical
+  streaming: 502 change lines with 0.00 ms steady-state inter-line gap.
+  A mid-milestone `txn` scare (12–59 ms COMMITs) was bisected to the
+  data dir sitting on btrfs vs `/tmp` (tmpfs) — v0.13 matches v0.12 to
+  the microsecond on the same filesystem; the commit path is unchanged.
+- **Compatibility.** Normal clients are unaffected: `replication` unset
+  or `replication=database` behaves exactly as before (all 1051 prior
+  protocol checks still pass unchanged).
+
+Known v0.13 deviations/limitations (all documented, none silent): **no
+base backup** (`BASE_BACKUP` → `0A000`); **no physical streaming**
+(physical slots are metadata only); single timeline; `UPDATE` decoding
+uses the table's current schema (a concurrent `ALTER TABLE` between
+commit and decode can mislabel columns — positional fallback after
+`DROP`); replication slots are cluster-global (Postgres scopes them per
+database); `server_version` still reports `16.0`; still no group
+commit and the engine is still globally mutex-serialized.
 
 ## What v0.12 adds (concurrency, soak, hardening)
 
@@ -605,6 +671,7 @@ src/
   net.rs       listening socket with SO_REUSEADDR (raw syscalls, Linux/x86_64)
   protocol.rs  message framing: startup/Message read, Int16/Int32/CString, builders
   server.rs    startup handshake + simple-protocol message dispatch loop
+  repl.rs      replication protocol: walsender, slots, logical decoding (v0.13)
   sql.rs       tokenizer + recursive-descent parser → AST
   exec.rs      executor: AST → in-memory storage, SQLSTATE errors
   storage.rs   HashMap tables, Value/ColType, text-format encoding
@@ -617,7 +684,12 @@ tests/
   protocol_test5.py  MVCC + isolation level tests (v0.5)
   protocol_test6.py  query engine: JOINs/subqueries/aggregates (v0.6)
   protocol_test7.py  types, casts, operators, built-ins (v0.7)
-  protocol_test8.py  B-tree indexes, planner, ANALYZE, EXPLAIN (v0.8)
+  protocol_test8.py  B-tree indexes, planner, ANALYZE/EXPLAIN (v0.8)
+  protocol_test9.py  views, sequences, GRANT/REVOKE, privileges (v0.9)
+  protocol_test10.py window functions, CTEs, UPSERT, FK cascades (v0.10)
+  protocol_test11.py roles, ACLs, row-level locks, advisory locks (v0.11)
+  protocol_test12.py concurrency stress, soak, wire hardening (v0.12)
+  protocol_test13.py replication protocol, logical decoding (v0.13)
 ```
 
 ## How to run
@@ -649,6 +721,12 @@ python3 tests/protocol_test7.py  # v0.7: types/casts/operators/built-ins,
                                  # 198 checks
 python3 tests/protocol_test8.py  # v0.8: indexes/planner/ANALYZE/EXPLAIN,
                                  # 93 checks
+python3 tests/protocol_test9.py  # v0.9: views/sequences/privileges, 84 checks
+python3 tests/protocol_test10.py # v0.10: window/CTEs/UPSERT/FK, 70 checks
+python3 tests/protocol_test11.py # v0.11: roles/ACLs/locks, 118 checks
+python3 tests/protocol_test12.py # v0.12: concurrency/soak/hardening, 65 checks
+python3 tests/protocol_test13.py # v0.13: replication/logical decoding,
+                                 # 57 checks
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts

@@ -1188,21 +1188,22 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
         let pos = t
             .row_pos(*old_id)
             .expect("row version still present; engine lock held throughout");
+        // v0.13: capture the old values for the UpdateRow op (the
+        // logical decoder needs them); values never change in place.
+        let old_values = t.rows[pos].values.clone();
         t.rows[pos].xmax = ctx.own;
-        ctx.writes.push(WriteOp::DeleteRow {
-            table: table.clone(),
-            row_id: *old_id,
-            prev_xmax: *prev_xmax,
-        });
         t.push_version(RowVersion {
             id: new_id,
             values: new_values.clone(),
             xmin: ctx.own,
             xmax: 0,
         });
-        ctx.writes.push(WriteOp::InsertRow {
+        ctx.writes.push(WriteOp::UpdateRow {
             table: table.clone(),
-            row_id: new_id,
+            old_id: *old_id,
+            new_id,
+            prev_xmax: *prev_xmax,
+            old_values,
         });
         indexed.push((table.clone(), new_id, new_values.clone()));
     }
@@ -2122,21 +2123,21 @@ fn exec_insert(
             let pos = t
                 .row_pos(*old_id)
                 .expect("row version still present; engine lock held throughout");
+            // v0.13: UpdateRow carries the old values for logical decoding.
+            let old_values = t.rows[pos].values.clone();
             t.rows[pos].xmax = ctx.own;
-            ctx.writes.push(WriteOp::DeleteRow {
-                table: table.to_string(),
-                row_id: *old_id,
-                prev_xmax: *prev_xmax,
-            });
             t.push_version(RowVersion {
                 id: new_id,
                 values: new_values.clone(),
                 xmin: ctx.own,
                 xmax: 0,
             });
-            ctx.writes.push(WriteOp::InsertRow {
+            ctx.writes.push(WriteOp::UpdateRow {
                 table: table.to_string(),
-                row_id: new_id,
+                old_id: *old_id,
+                new_id,
+                prev_xmax: *prev_xmax,
+                old_values,
             });
             indexed.push((new_id, new_values.clone()));
         }
@@ -2495,21 +2496,21 @@ fn exec_update(
             let pos = t
                 .row_pos(old_id)
                 .expect("row version still present; engine lock held throughout");
+            // v0.13: UpdateRow carries the old values for logical decoding.
+            let old_values = t.rows[pos].values.clone();
             t.rows[pos].xmax = ctx.own;
-            ctx.writes.push(WriteOp::DeleteRow {
-                table: table.to_string(),
-                row_id: old_id,
-                prev_xmax,
-            });
             t.push_version(RowVersion {
                 id: new_id,
                 values: new_values.clone(),
                 xmin: ctx.own,
                 xmax: 0,
             });
-            ctx.writes.push(WriteOp::InsertRow {
+            ctx.writes.push(WriteOp::UpdateRow {
                 table: table.to_string(),
-                row_id: new_id,
+                old_id,
+                new_id,
+                prev_xmax,
+                old_values,
             });
             indexed.push((new_id, new_values));
         }
@@ -3683,6 +3684,17 @@ fn plan_from_item(
                     rows,
                 });
             }
+            // v0.13: pg_replication_slots is virtual too; the estimate is
+            // the live slot count.
+            if name.as_str() == "pg_replication_slots"
+                && eng.db.find_table(name, snap, own).is_none()
+            {
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    filter: None,
+                    rows: eng.repl_slots.len() as u64,
+                });
+            }
             let t = eng.db.find_table(name, snap, own).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", name))
             })?;
@@ -4355,6 +4367,47 @@ fn virtual_role_catalog_rows(db: &Database, name: &str, snap: &Snapshot, own: u6
         return n;
     }
     db.roles.len() as u64
+}
+
+// ---------------------------------------------------------------------------
+// v0.13: pg_replication_slots (virtual). Mirrors PostgreSQL's view over the
+// live slot map: slot_name, plugin, slot_type, active, restart_lsn,
+// confirmed_flush_lsn. LSNs render in PostgreSQL's `pg_lsn` text form.
+// A real table by the same name takes precedence, like the other virtual
+// catalogs.
+// ---------------------------------------------------------------------------
+
+fn pg_replication_slots_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_replication_slots", "slot_name", ColType::Text),
+        qcol("pg_replication_slots", "plugin", ColType::Text),
+        qcol("pg_replication_slots", "slot_type", ColType::Text),
+        qcol("pg_replication_slots", "active", ColType::Bool),
+        qcol("pg_replication_slots", "restart_lsn", ColType::Text),
+        qcol("pg_replication_slots", "confirmed_flush_lsn", ColType::Text),
+    ]
+}
+
+fn pg_replication_slots_rows(eng: &Engine) -> Vec<QRow> {
+    let mut names: Vec<&String> = eng.repl_slots.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|n| {
+            let s = &eng.repl_slots[n];
+            QRow {
+                cells: vec![
+                    Value::Text(s.name.clone()),
+                    Value::Text(s.plugin.clone()),
+                    Value::Text(s.slot_type.clone()),
+                    Value::Bool(s.active),
+                    Value::Text(crate::repl::format_lsn(s.restart_lsn)),
+                    Value::Text(crate::repl::format_lsn(s.confirmed_flush_lsn)),
+                ],
+                prov: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Deterministic stand-in oid for pg_user.usesysid (FNV-1a of the name).
@@ -7047,6 +7100,21 @@ fn build_source(
                         c
                     })
                     .collect();
+                return Ok((schema, rows));
+            }
+            // v0.13: pg_replication_slots is virtual too (cluster-global
+            // slot map, not a table).
+            if name.as_str() == "pg_replication_slots"
+                && q.eng.db.find_table(name, q.snap, q.own).is_none()
+            {
+                let schema: Vec<QCol> = pg_replication_slots_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let rows = pg_replication_slots_rows(q.eng);
                 return Ok((schema, rows));
             }
             // v0.11: scanning a real table needs SELECT (and UPDATE when
@@ -10215,6 +10283,21 @@ fn from_schema_item(
             if name == "information_schema.tables" {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = info_tables_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(schema);
+                return Ok(());
+            }
+            // v0.13: pg_replication_slots is virtual too.
+            if name.as_str() == "pg_replication_slots"
+                && eng.db.find_table(name, snap, own).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_replication_slots_schema()
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();

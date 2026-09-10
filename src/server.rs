@@ -12,13 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::copy;
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
+use crate::repl;
 use crate::sql::{self, CopyFormat, CopyOptions, IsolationLevel, Stmt};
 use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
 
 /// Buffered sink for server→client traffic. Reads still go through the
 /// raw `TcpStream`; every message-loop iteration ends with a `flush()`.
-type Writer = BufWriter<TcpStream>;
+pub(crate) type Writer = BufWriter<TcpStream>;
 
 const SSL_REQUEST_CODE: i32 = 80877103;
 /// v0.12: CancelRequest's magic protocol number. We don't support query
@@ -56,7 +57,7 @@ struct PendingRows {
     pos: usize,
 }
 
-struct Session {
+pub(crate) struct Session {
     /// Stable per-connection id (v0.9: session-local currval()).
     sid: u64,
     /// v0.11: authenticated role name (lowercased). Every statement's
@@ -96,7 +97,7 @@ struct Txn {
 }
 
 impl Session {
-    fn new(role: String) -> Self {
+    pub(crate) fn new(role: String) -> Self {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
             role,
@@ -146,7 +147,7 @@ fn session_counts() -> &'static Mutex<HashMap<String, usize>> {
 /// leave consistent state in the common cases) and logs loudly so the
 /// underlying bug is not silent. This is the pragmatic middle ground
 /// between "wedge forever" and PostgreSQL's "restart the postmaster".
-fn lock_engine(engine: &Arc<Mutex<Engine>>) -> std::sync::MutexGuard<'_, Engine> {
+pub(crate) fn lock_engine(engine: &Arc<Mutex<Engine>>) -> std::sync::MutexGuard<'_, Engine> {
     match engine.lock() {
         Ok(g) => g,
         Err(poisoned) => {
@@ -159,7 +160,7 @@ fn lock_engine(engine: &Arc<Mutex<Engine>>) -> std::sync::MutexGuard<'_, Engine>
     }
 }
 
-fn lock_wal(wal: &Arc<Mutex<Wal>>) -> std::sync::MutexGuard<'_, Wal> {
+pub(crate) fn lock_wal(wal: &Arc<Mutex<Wal>>) -> std::sync::MutexGuard<'_, Wal> {
     match wal.lock() {
         Ok(g) => g,
         Err(poisoned) => {
@@ -322,7 +323,25 @@ fn run_connection(
         .send(&mut writer)?;
 
     // ReadyForQuery (idle)
-    let mut session = Session::new(role_name);
+    let mut session = Session::new(role_name.clone());
+
+    // v0.13: `replication=true` connections speak the walsender protocol
+    // instead of SQL (ParameterStatus/BackendKeyData above are shared).
+    if repl::is_replication_startup(&startup_params) {
+        if !repl::check_replication_role(&engine, &role_name) {
+            send_error(
+                &mut writer,
+                "42501",
+                "permission denied: replication connections require a superuser role",
+            )?;
+            writer.flush()?;
+            return Ok(());
+        }
+        send_ready(&mut writer, &session)?;
+        writer.flush()?;
+        return repl::run_replication(&mut reader, &mut writer, &engine, &wal, role_name, database);
+    }
+
     send_ready(&mut writer, &session)?;
     writer.flush()?;
 
@@ -635,7 +654,10 @@ fn message_loop(
                 writer.flush()?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("protocol violation: unknown message type '{}'", other as char),
+                    format!(
+                        "protocol violation: unknown message type '{}'",
+                        other as char
+                    ),
                 ));
             }
         }
@@ -658,11 +680,11 @@ fn txn_status(session: &Session) -> u8 {
     }
 }
 
-fn send_ready(stream: &mut Writer, session: &Session) -> io::Result<()> {
+pub(crate) fn send_ready(stream: &mut Writer, session: &Session) -> io::Result<()> {
     MsgBuilder::new(b'Z').u8(txn_status(session)).send(stream)
 }
 
-fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::Result<()> {
+pub(crate) fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'E');
     b.u8(b'S')
         .cstr("ERROR")
@@ -1401,6 +1423,8 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             // Only deletes (UPDATE = delete+insert) and drops create dead
             // versions; inserts and creates never do.
             WriteOp::DeleteRow { table, .. } => table.as_str(),
+            // v0.13: UPDATEs also leave a dead old version behind.
+            WriteOp::UpdateRow { table, .. } => table.as_str(),
             WriteOp::DropTable { name, .. } => name.as_str(),
             // v0.9: ALTER TABLE swaps the table version; its rows may be
             // reaped too. Views/sequences create no dead row versions.
@@ -2156,7 +2180,10 @@ fn handle_close(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> i
     Ok(())
 }
 
-fn send_row_description(stream: &mut Writer, columns: &[(String, ColType)]) -> io::Result<()> {
+pub(crate) fn send_row_description(
+    stream: &mut Writer,
+    columns: &[(String, ColType)],
+) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'T');
     b.i16(columns.len() as i16);
     for (name, typ) in columns {
@@ -2171,7 +2198,7 @@ fn send_row_description(stream: &mut Writer, columns: &[(String, ColType)]) -> i
     b.send(stream)
 }
 
-fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
+pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'D');
     b.i16(row.len() as i16);
     for v in row {
@@ -2343,8 +2370,7 @@ mod tests {
         // Same for the WAL lock, using a real Wal on a scratch dir.
         let dir = std::env::temp_dir().join("rg12-poison-wal-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let (_eng, wal_inner) =
-            crate::wal::Wal::open(&dir).expect("wal open");
+        let (_eng, wal_inner) = crate::wal::Wal::open(&dir).expect("wal open");
         let wal = Arc::new(Mutex::new(wal_inner));
         let victim = Arc::clone(&wal);
         let h = std::thread::spawn(move || {

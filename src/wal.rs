@@ -11,19 +11,24 @@
 //! - `InsertRows { table, rows }` — row versions were appended; each row
 //!   carries its stable `id`, `xmin`, and values
 //! - `DropTable { name, xmax }` — a table was dropped
-//! - `DeleteRows { table, ids, xmax }` — row versions were marked deleted
-//!   (covers DELETE and the delete half of UPDATE)
+//! - `DeleteRows { table, ids, old_rows, xmax }` — row versions were
+//!   marked deleted; `old_rows` carries the deleted values for the
+//!   logical decoder (v0.13)
+//! - `UpdateRows { table, old, new, xmax }` — row versions were updated;
+//!   old/new row vectors make UPDATE a first-class record (v0.13)
+//! - `ReplSlotCreate / ReplSlotDrop / ReplSlotFlush` — replication slot
+//!   metadata, non-transactional (v0.13)
 //!
 //! Records are produced from the committing transaction's write log, in
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 6 (`RGSWAL06` / `RGSCHK06`) is NOT compatible with v0.10
-//! or earlier: v0.11 adds roles, table/view/sequence owners, and ACLs.
-//! files: v0.9 refuses to start on a v0.8 data directory with a clear
-//! error instead of misreading it. v0.9 adds constraint/default metadata
-//! to table records, ALTER TABLE / view / sequence records, and
-//! serializes views, sequences, and constraint metadata in checkpoints.
+//! Format version 7 (`RGSWAL07` / `RGSCHK07`) is NOT compatible with v0.12
+//! or earlier: v0.13 adds old row values to DeleteRows, first-class
+//! UpdateRows, replication slot records (CREATE/DROP/FLUSH), and
+//! replication slots in the checkpoint image. Like every format bump,
+//! old data directories are refused with a clear error instead of
+//! being misread. v0.12 was `RGSWAL06` / `RGSCHK06`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -122,11 +127,14 @@ use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK06";
-const CHKPT_VERSION: u32 = 5;
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK07";
+const CHKPT_VERSION: u32 = 6;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL06";
+/// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
+/// UpdateRows / ReplSlot* records. Old `RGSWAL06` files are refused loudly
+/// (see read_wal_header); remove the data directory to start fresh.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL07";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -247,6 +255,20 @@ pub enum WalRecord {
     DeleteRows {
         table: String,
         ids: Vec<u64>,
+        /// v0.13: old row values, parallel to `ids` — what the logical
+        /// decoder reports for DELETE. (Encoding changed with the
+        /// `RGSWAL07` magic bump; old files are refused loudly.)
+        old_rows: Vec<WalRow>,
+        xmax: u64,
+    },
+    // --- v0.13: UPDATE as a first-class record (paired old/new values).
+    // Replay applies it as delete-old + insert-new, exactly like the
+    // DeleteRows+InsertRows pair it replaces; the logical decoder
+    // reports it as a single UPDATE with old and new tuples.
+    UpdateRows {
+        table: String,
+        old: Vec<WalRow>,
+        new: Vec<WalRow>,
         xmax: u64,
     },
     // --- v0.8: index DDL. Index *contents* need no records: replay
@@ -335,6 +357,22 @@ pub enum WalRecord {
     DbAcl {
         acl: Vec<WalAcl>,
         xmin: u64,
+    },
+    // --- v0.13: replication slot metadata (non-transactional, like
+    // SeqAdvance: replay always applies). Slots are cluster-global.
+    ReplSlotCreate {
+        name: String,
+        plugin: String,
+        slot_type: String,
+        restart_lsn: u64,
+    },
+    ReplSlotDrop {
+        name: String,
+    },
+    ReplSlotFlush {
+        name: String,
+        restart_lsn: u64,
+        confirmed_flush_lsn: u64,
     },
 }
 
@@ -688,12 +726,52 @@ impl Enc {
                 self.str(name);
                 self.u64(*xmax);
             }
-            WalRecord::DeleteRows { table, ids, xmax } => {
+            WalRecord::DeleteRows {
+                table,
+                ids,
+                old_rows,
+                xmax,
+            } => {
                 self.u8(4);
                 self.str(table);
                 self.u32(ids.len() as u32);
-                for id in ids {
+                // v0.13: old values ride alongside the ids (parallel vecs).
+                for (id, old) in ids.iter().zip(old_rows.iter()) {
                     self.u64(*id);
+                    self.u64(old.xmin);
+                    self.u32(old.values.len() as u32);
+                    for v in &old.values {
+                        self.value(v);
+                    }
+                }
+                self.u64(*xmax);
+            }
+            // v0.13: UPDATE as one record — old and new row vectors.
+            WalRecord::UpdateRows {
+                table,
+                old,
+                new,
+                xmax,
+            } => {
+                self.u8(18);
+                self.str(table);
+                self.u32(old.len() as u32);
+                for r in old {
+                    self.u64(r.id);
+                    self.u64(r.xmin);
+                    self.u32(r.values.len() as u32);
+                    for v in &r.values {
+                        self.value(v);
+                    }
+                }
+                self.u32(new.len() as u32);
+                for r in new {
+                    self.u64(r.id);
+                    self.u64(r.xmin);
+                    self.u32(r.values.len() as u32);
+                    for v in &r.values {
+                        self.value(v);
+                    }
                 }
                 self.u64(*xmax);
             }
@@ -816,6 +894,33 @@ impl Enc {
                 self.u8(17);
                 self.acl_list(acl);
                 self.u64(*xmin);
+            }
+            // v0.13: replication slot metadata.
+            WalRecord::ReplSlotCreate {
+                name,
+                plugin,
+                slot_type,
+                restart_lsn,
+            } => {
+                self.u8(19);
+                self.str(name);
+                self.str(plugin);
+                self.str(slot_type);
+                self.u64(*restart_lsn);
+            }
+            WalRecord::ReplSlotDrop { name } => {
+                self.u8(20);
+                self.str(name);
+            }
+            WalRecord::ReplSlotFlush {
+                name,
+                restart_lsn,
+                confirmed_flush_lsn,
+            } => {
+                self.u8(21);
+                self.str(name);
+                self.u64(*restart_lsn);
+                self.u64(*confirmed_flush_lsn);
             }
         }
     }
@@ -1028,6 +1133,18 @@ impl<'a> Dec<'a> {
         Ok(out)
     }
 
+    /// Decode one WAL row: id, xmin, value count, values.
+    fn wal_row(&mut self) -> Result<WalRow, String> {
+        let id = self.u64()?;
+        let xmin = self.u64()?;
+        let nv = self.u32()? as usize;
+        let mut values = Vec::with_capacity(nv);
+        for _ in 0..nv {
+            values.push(self.value()?);
+        }
+        Ok(WalRow { id, xmin, values })
+    }
+
     fn record(&mut self) -> Result<WalRecord, String> {
         match self.u8()? {
             1 => {
@@ -1073,11 +1190,25 @@ impl<'a> Dec<'a> {
                 let table = self.str()?;
                 let n = self.u32()? as usize;
                 let mut ids = Vec::with_capacity(n);
+                let mut old_rows = Vec::with_capacity(n);
                 for _ in 0..n {
-                    ids.push(self.u64()?);
+                    let id = self.u64()?;
+                    let xmin = self.u64()?;
+                    let nv = self.u32()? as usize;
+                    let mut values = Vec::with_capacity(nv);
+                    for _ in 0..nv {
+                        values.push(self.value()?);
+                    }
+                    ids.push(id);
+                    old_rows.push(WalRow { id, xmin, values });
                 }
                 let xmax = self.u64()?;
-                Ok(WalRecord::DeleteRows { table, ids, xmax })
+                Ok(WalRecord::DeleteRows {
+                    table,
+                    ids,
+                    old_rows,
+                    xmax,
+                })
             }
             5 => {
                 let name = self.str()?;
@@ -1195,6 +1326,52 @@ impl<'a> Dec<'a> {
                 let acl = self.acl_list()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::DbAcl { acl, xmin })
+            }
+            18 => {
+                let table = self.str()?;
+                let no = self.u32()? as usize;
+                let mut old = Vec::with_capacity(no);
+                for _ in 0..no {
+                    old.push(self.wal_row()?);
+                }
+                let nn = self.u32()? as usize;
+                let mut new = Vec::with_capacity(nn);
+                for _ in 0..nn {
+                    new.push(self.wal_row()?);
+                }
+                let xmax = self.u64()?;
+                Ok(WalRecord::UpdateRows {
+                    table,
+                    old,
+                    new,
+                    xmax,
+                })
+            }
+            19 => {
+                let name = self.str()?;
+                let plugin = self.str()?;
+                let slot_type = self.str()?;
+                let restart_lsn = self.u64()?;
+                Ok(WalRecord::ReplSlotCreate {
+                    name,
+                    plugin,
+                    slot_type,
+                    restart_lsn,
+                })
+            }
+            20 => {
+                let name = self.str()?;
+                Ok(WalRecord::ReplSlotDrop { name })
+            }
+            21 => {
+                let name = self.str()?;
+                let restart_lsn = self.u64()?;
+                let confirmed_flush_lsn = self.u64()?;
+                Ok(WalRecord::ReplSlotFlush {
+                    name,
+                    restart_lsn,
+                    confirmed_flush_lsn,
+                })
             }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
@@ -1365,6 +1542,27 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 eng.txns.next_xid = *xmax + 1;
             }
         }
+        // v0.13: UPDATE carries old/new row ids — fold them into the
+        // row-id counter so it resumes above every id the log used.
+        WalRecord::UpdateRows {
+            table: _,
+            old,
+            new,
+            xmax,
+        } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            for r in old.iter().chain(new.iter()) {
+                if r.id >= eng.txns.next_row_id {
+                    eng.txns.next_row_id = r.id + 1;
+                }
+            }
+        }
+        // v0.13: replication slots carry no xid (non-transactional).
+        WalRecord::ReplSlotCreate { .. }
+        | WalRecord::ReplSlotDrop { .. }
+        | WalRecord::ReplSlotFlush { .. } => {}
         // v0.9: sequence advances carry no xid (non-transactional).
         WalRecord::SeqAdvance { .. } => {}
         // v0.11: roles.
@@ -1451,6 +1649,38 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::DropRole { .. }
         | WalRecord::AlterRole { .. }
         | WalRecord::DbAcl { .. } => {}
+        // v0.13: replication slot records are applied here.
+        WalRecord::ReplSlotCreate {
+            name,
+            plugin,
+            slot_type,
+            restart_lsn,
+        } => {
+            eng.repl_slots.insert(
+                name.clone(),
+                crate::storage::ReplSlot {
+                    name: name.clone(),
+                    plugin: plugin.clone(),
+                    slot_type: slot_type.clone(),
+                    restart_lsn: *restart_lsn,
+                    confirmed_flush_lsn: *restart_lsn,
+                    active: false,
+                },
+            );
+        }
+        WalRecord::ReplSlotDrop { name } => {
+            eng.repl_slots.remove(name);
+        }
+        WalRecord::ReplSlotFlush {
+            name,
+            restart_lsn,
+            confirmed_flush_lsn,
+        } => {
+            if let Some(s) = eng.repl_slots.get_mut(name) {
+                s.confirmed_flush_lsn = s.confirmed_flush_lsn.max(*confirmed_flush_lsn);
+                s.restart_lsn = s.restart_lsn.max(*restart_lsn);
+            }
+        }
         WalRecord::CreateTable {
             name,
             columns,
@@ -1525,7 +1755,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 name
             ),
         },
-        WalRecord::DeleteRows { table, ids, xmax } => {
+        WalRecord::DeleteRows {
+            table,
+            ids,
+            old_rows: _,
+            xmax,
+        } => {
             let Some(t) = live_table(eng, table) else {
                 eprintln!(
                     "WAL replay: skipping DeleteRows for \"{}\": no live table version",
@@ -1545,6 +1780,50 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // No index maintenance: the entries stay (visibility filters
             // them), exactly as in live execution.
         }
+        // v0.13: UPDATE replays as delete-old + insert-new — the same
+        // version-chain surgery live execution performs.
+        WalRecord::UpdateRows {
+            table,
+            old,
+            new,
+            xmax,
+        } => {
+            let Some(t) = live_table(eng, table) else {
+                eprintln!(
+                    "WAL replay: skipping UpdateRows for \"{}\": no live table version",
+                    table
+                );
+                return Ok(());
+            };
+            for r in old {
+                match t.rows.iter_mut().find(|v| v.id == r.id) {
+                    Some(v) => v.xmax = *xmax,
+                    None => eprintln!(
+                        "WAL replay: skipping UPDATE of missing row id {} in table \"{}\"",
+                        r.id, table
+                    ),
+                }
+            }
+            for r in new {
+                t.push_version(RowVersion {
+                    id: r.id,
+                    values: r.values.clone(),
+                    xmin: *xmax,
+                    xmax: 0,
+                });
+            }
+            // Index the new versions, like live execution's
+            // index_insert_row: recovery rebuilds indexes only for the
+            // checkpoint image; replayed rows need their entries.
+            let indexed: Vec<(u64, Vec<Value>)> =
+                new.iter().map(|r| (r.id, r.values.clone())).collect();
+            // `t`'s borrow ends at its last use above; eng.db is free again.
+            for (id, values) in indexed {
+                eng.db.index_insert_row(table, id, &values);
+            }
+        }
+        // v0.13: replication slot metadata is applied by the match
+        // above (like roles); nothing left to do here.
         WalRecord::CreateIndex {
             name,
             table,
@@ -1791,6 +2070,9 @@ pub fn records_for_commit(
                     // successor (an UPDATE pair), committing would leave
                     // BOTH versions live — a duplicate row. Fail the
                     // commit instead, like a write-write conflict.
+                    // (v0.13: exec now emits UpdateRow for updates, so the
+                    // paired_insert case below is vestigial — kept as a
+                    // safety net in case any path still emits the pair.)
                     let paired_insert =
                         matches!(writes.get(i + 1), Some(WriteOp::InsertRow { .. }));
                     if paired_insert {
@@ -1802,15 +2084,84 @@ pub fn records_for_commit(
                     i += 1;
                     continue; // pure DELETE lost; the row stays deleted
                 }
+                // v0.13: the old values travel with the delete so the
+                // logical decoder can report them without consulting
+                // live (possibly vacuumed) storage.
+                let old = WalRow {
+                    id: *row_id,
+                    xmin: v.xmin,
+                    values: v.values.clone(),
+                };
                 match out.last_mut() {
                     Some(WalRecord::DeleteRows {
                         table: t,
                         ids,
+                        old_rows,
                         xmax,
-                    }) if t == table && *xmax == own => ids.push(*row_id),
+                    }) if t == table && *xmax == own => {
+                        ids.push(*row_id);
+                        old_rows.push(old);
+                    }
                     _ => out.push(WalRecord::DeleteRows {
                         table: table.clone(),
                         ids: vec![*row_id],
+                        old_rows: vec![old],
+                        xmax: own,
+                    }),
+                }
+            }
+            // v0.13: first-class UPDATE op (see WriteOp::UpdateRow). The
+            // write-write check mirrors the old paired-insert logic: if
+            // a concurrent txn deleted the row, the update fails.
+            WriteOp::UpdateRow {
+                table,
+                old_id,
+                new_id,
+                old_values,
+                ..
+            } => {
+                let Some(v) = eng.db.find_row_version(*old_id) else {
+                    i += 1;
+                    continue;
+                };
+                if v.xmax != own {
+                    return Err(format!(
+                        "concurrent update on row id {} in table \"{}\"",
+                        old_id, table
+                    ));
+                }
+                let Some((new_values, table_live)) = own_row(eng, own, *new_id) else {
+                    i += 1;
+                    continue;
+                };
+                if !table_live {
+                    i += 1;
+                    continue; // table dropped by a committed concurrent txn
+                }
+                let old = WalRow {
+                    id: *old_id,
+                    xmin: v.xmin,
+                    values: old_values.clone(),
+                };
+                let new = WalRow {
+                    id: *new_id,
+                    xmin: own,
+                    values: new_values,
+                };
+                match out.last_mut() {
+                    Some(WalRecord::UpdateRows {
+                        table: t,
+                        old: olds,
+                        new: news,
+                        xmax,
+                    }) if t == table && *xmax == own => {
+                        olds.push(old);
+                        news.push(new);
+                    }
+                    _ => out.push(WalRecord::UpdateRows {
+                        table: table.clone(),
+                        old: vec![old],
+                        new: vec![new],
                         xmax: own,
                     }),
                 }
@@ -2162,6 +2513,58 @@ pub struct Wal {
     /// `base_lsn + (physical_offset - WAL_HEADER_LEN)`.
     base_lsn: u64,
     next_txn: u64,
+    /// v0.13: cluster-wide random identifier, stable across restarts
+    /// (like PostgreSQL's system identifier from initdb). Stored in
+    /// `system.id` inside the data directory.
+    system_id: u64,
+}
+
+/// v0.13: the stable cluster identifier. Read from `system.id` in the
+/// data directory, or mint a random one (persisted via a tmp-file
+/// rename + dir fsync, like the checkpoint) on first boot.
+fn load_or_create_system_id(dir: &Path) -> std::io::Result<u64> {
+    const NAME: &str = "system.id";
+    let path = dir.join(NAME);
+    if let Ok(bytes) = fs::read(&path) {
+        if bytes.len() == 8 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            let id = u64::from_be_bytes(b);
+            if id != 0 {
+                return Ok(id);
+            }
+        }
+    }
+    // Mint: /dev/urandom when available, else a time/pid hash. Never 0.
+    let mut id = 0u64;
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        use std::io::Read;
+        let mut b = [0u8; 8];
+        if f.read_exact(&mut b).is_ok() {
+            id = u64::from_be_bytes(b);
+        }
+    }
+    if id == 0 {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        let mut x = t ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        // xorshift64* — good enough for a non-secret identifier.
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        id = x.wrapping_mul(0x2545F4914F6CDD1D);
+        if id == 0 {
+            id = 0x9E3779B97F4A7C15;
+        }
+    }
+    let tmp = dir.join("system.id.tmp");
+    fs::write(&tmp, id.to_be_bytes())?;
+    File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    File::open(dir)?.sync_all()?;
+    Ok(id)
 }
 
 fn io_err(what: String) -> std::io::Error {
@@ -2175,6 +2578,9 @@ impl Wal {
     /// the server keeps its in-memory behavior when there is no state.
     pub fn open(dir: &Path) -> std::io::Result<(Engine, Wal)> {
         fs::create_dir_all(dir)?;
+        // v0.13: the system identifier is stable per data directory
+        // (PostgreSQL's initdb assigns it once). Read it, or mint one.
+        let system_id = load_or_create_system_id(dir)?;
         let (mut eng, wal_end) = load_checkpoint(dir)?;
         let wal_path = dir.join(WAL_NAME);
         let mut file = OpenOptions::new()
@@ -2229,7 +2635,7 @@ impl Wal {
         eng.txns.snapshots.clear();
         let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.11 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v0.13 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
             tables,
             batches,
             records,
@@ -2243,8 +2649,44 @@ impl Wal {
                 len: file_len,
                 base_lsn,
                 next_txn: max_txn + 1,
+                system_id,
             },
         ))
+    }
+
+    /// v0.13: the cluster's stable random identifier (IDENTIFY_SYSTEM).
+    pub fn system_id(&self) -> u64 {
+        self.system_id
+    }
+
+    /// v0.13: the current logical end of the WAL — the LSN a new
+    /// replication slot starts from, and what IDENTIFY_SYSTEM reports.
+    pub fn current_lsn(&self) -> u64 {
+        self.base_lsn + self.len.saturating_sub(WAL_HEADER_LEN)
+    }
+
+    /// v0.13: read every committed frame at/after `from_lsn`, in order.
+    /// Returns (frame_lsn, txn_id, records). The walsender uses this to
+    /// stream changes to a replication slot's confirmed position.
+    pub fn read_frames_since(
+        &mut self,
+        from_lsn: u64,
+    ) -> std::io::Result<Vec<(u64, u64, Vec<WalRecord>)>> {
+        let mut out = Vec::new();
+        self.file.seek(SeekFrom::Start(WAL_HEADER_LEN))?;
+        loop {
+            let phys = self.file.stream_position()?;
+            let frame = match read_frame(&mut self.file)? {
+                None => break, // clean EOF or torn tail
+                Some(f) => f,
+            };
+            let frame_lsn = self.base_lsn + (phys - WAL_HEADER_LEN);
+            if frame_lsn < from_lsn {
+                continue;
+            }
+            out.push((frame_lsn, frame.txn_id, frame.records));
+        }
+        Ok(out)
     }
 
     /// Durably append one commit's records: write the whole frame, fsync,
@@ -2465,6 +2907,21 @@ impl Wal {
         let mut a_body = Enc::new();
         a_body.acl_list(&eng.db.db_acl.iter().map(WalAcl::of).collect::<Vec<_>>());
         img.bytes(&a_body.buf);
+
+        // v0.13: replication slots (cluster-global). `active` is not
+        // persisted — a slot is never active across a restart.
+        let mut s_body = Enc::new();
+        let mut n_slots: u32 = 0;
+        for s in eng.repl_slots.values() {
+            s_body.str(&s.name);
+            s_body.str(&s.plugin);
+            s_body.str(&s.slot_type);
+            s_body.u64(s.restart_lsn);
+            s_body.u64(s.confirmed_flush_lsn);
+            n_slots += 1;
+        }
+        img.u32(n_slots);
+        img.bytes(&s_body.buf);
 
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
@@ -2793,6 +3250,27 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         .into_iter()
         .map(WalAcl::into_entry)
         .collect();
+    // v0.13: replication slots. (v6 images only; v5 and older are
+    // refused loudly by the version check at the top of this function.)
+    let n_slots = d.u32().map_err(|e| bad(&e))?;
+    for _ in 0..n_slots {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let plugin = d.str().map_err(|e| bad(&e))?;
+        let slot_type = d.str().map_err(|e| bad(&e))?;
+        let restart_lsn = d.u64().map_err(|e| bad(&e))?;
+        let confirmed_flush_lsn = d.u64().map_err(|e| bad(&e))?;
+        eng.repl_slots.insert(
+            name.clone(),
+            crate::storage::ReplSlot {
+                name,
+                plugin,
+                slot_type,
+                restart_lsn,
+                confirmed_flush_lsn,
+                active: false,
+            },
+        );
+    }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
 }
@@ -2883,8 +3361,53 @@ mod tests {
             WalRecord::DeleteRows {
                 table: "t".into(),
                 ids: vec![7, 8, 9],
+                old_rows: vec![
+                    WalRow {
+                        id: 7,
+                        xmin: 3,
+                        values: vec![Value::Int(1)],
+                    },
+                    WalRow {
+                        id: 8,
+                        xmin: 4,
+                        values: vec![Value::Int(2)],
+                    },
+                    WalRow {
+                        id: 9,
+                        xmin: 4,
+                        values: vec![Value::Int(3)],
+                    },
+                ],
                 xmax: 6,
             },
+            // v0.13: first-class UPDATE with old+new tuples.
+            WalRecord::UpdateRows {
+                table: "t".into(),
+                old: vec![WalRow {
+                    id: 7,
+                    xmin: 4,
+                    values: vec![Value::Int(1), Value::Text("a".into())],
+                }],
+                new: vec![WalRow {
+                    id: 10,
+                    xmin: 6,
+                    values: vec![Value::Int(1), Value::Text("b".into())],
+                }],
+                xmax: 6,
+            },
+            // v0.13: replication slot metadata.
+            WalRecord::ReplSlotCreate {
+                name: "s1".into(),
+                plugin: "rustgres_decoding".into(),
+                slot_type: "logical".into(),
+                restart_lsn: 0x1_0000_0020,
+            },
+            WalRecord::ReplSlotFlush {
+                name: "s1".into(),
+                restart_lsn: 0x1_0000_0020,
+                confirmed_flush_lsn: 0x1_0000_0100,
+            },
+            WalRecord::ReplSlotDrop { name: "s1".into() },
         ];
         for c in &cases {
             assert_eq!(&roundtrip(c), c);
@@ -3028,6 +3551,11 @@ mod tests {
             &WalRecord::DeleteRows {
                 table: "t".into(),
                 ids: vec![12],
+                old_rows: vec![WalRow {
+                    id: 12,
+                    xmin: 5,
+                    values: vec![Value::Int(1)],
+                }],
                 xmax: 6,
             },
         )
@@ -3050,6 +3578,11 @@ mod tests {
             &WalRecord::DeleteRows {
                 table: "nope".into(),
                 ids: vec![1],
+                old_rows: vec![WalRow {
+                    id: 1,
+                    xmin: 2,
+                    values: vec![Value::Int(1)],
+                }],
                 xmax: 9,
             },
         )
@@ -3063,5 +3596,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eng.txns.next_xid, 10);
+    }
+
+    #[test]
+    fn apply_record_slot_lifecycle() {
+        let mut eng = Engine::new();
+        // Create.
+        apply_record(
+            &mut eng,
+            &WalRecord::ReplSlotCreate {
+                name: "s1".into(),
+                plugin: "rustgres_decoding".into(),
+                slot_type: "logical".into(),
+                restart_lsn: 100,
+            },
+        )
+        .unwrap();
+        let s = eng.repl_slots.get("s1").unwrap();
+        assert_eq!(s.plugin, "rustgres_decoding");
+        assert_eq!(s.slot_type, "logical");
+        assert_eq!(s.restart_lsn, 100);
+        assert_eq!(s.confirmed_flush_lsn, 100);
+        assert!(!s.active); // replay never resurrects active state
+        // Flush forward, then backward (flush never moves backwards).
+        apply_record(
+            &mut eng,
+            &WalRecord::ReplSlotFlush {
+                name: "s1".into(),
+                restart_lsn: 100,
+                confirmed_flush_lsn: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(eng.repl_slots["s1"].confirmed_flush_lsn, 200);
+        assert_eq!(eng.repl_slots["s1"].restart_lsn, 100);
+        apply_record(
+            &mut eng,
+            &WalRecord::ReplSlotFlush {
+                name: "s1".into(),
+                restart_lsn: 150,
+                confirmed_flush_lsn: 150,
+            },
+        )
+        .unwrap();
+        assert_eq!(eng.repl_slots["s1"].confirmed_flush_lsn, 200);
+        // restart_lsn follows the flushed record forward (never back).
+        assert_eq!(eng.repl_slots["s1"].restart_lsn, 150);
+        // Flush of a missing slot is a no-op, not an error.
+        apply_record(
+            &mut eng,
+            &WalRecord::ReplSlotFlush {
+                name: "ghost".into(),
+                restart_lsn: 0,
+                confirmed_flush_lsn: 9,
+            },
+        )
+        .unwrap();
+        // Drop.
+        apply_record(&mut eng, &WalRecord::ReplSlotDrop { name: "s1".into() }).unwrap();
+        assert!(!eng.repl_slots.contains_key("s1"));
+    }
+
+    #[test]
+    fn system_id_is_stable_per_data_directory() {
+        let dir = std::env::temp_dir().join("rg13-system-id-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // First open mints a non-zero id and persists exactly 8 bytes.
+        let id1 = load_or_create_system_id(&dir).unwrap();
+        assert_ne!(id1, 0);
+        let raw = std::fs::read(dir.join("system.id")).unwrap();
+        assert_eq!(raw.len(), 8);
+        assert_eq!(u64::from_be_bytes(raw.try_into().unwrap()), id1);
+        // Reopening the same directory returns the identical id.
+        let id2 = load_or_create_system_id(&dir).unwrap();
+        assert_eq!(id1, id2);
+        // A corrupt (short) file is replaced, not propagated.
+        std::fs::write(dir.join("system.id"), b"junk").unwrap();
+        let id3 = load_or_create_system_id(&dir).unwrap();
+        assert_ne!(id3, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

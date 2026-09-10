@@ -818,6 +818,26 @@ pub struct Database {
     pub db_acl: Vec<AclEntry>,
 }
 
+/// v0.13: a replication slot. Cluster-global (not per-database), and
+/// non-transactional: CREATE/DROP take effect immediately and are
+/// WAL-logged as ReplSlot* records, surviving checkpoint + recovery.
+/// `active` is runtime-only (a connected walsender holds it) and is
+/// never persisted.
+#[derive(Clone, Debug)]
+pub struct ReplSlot {
+    pub name: String,
+    /// Output plugin name, e.g. "rustgres_decoding" (v0.13's single
+    /// built-in logical plugin). Empty for physical slots.
+    pub plugin: String,
+    /// "logical" or "physical".
+    pub slot_type: String,
+    /// Oldest LSN the slot still needs (WAL retention floor).
+    pub restart_lsn: u64,
+    /// Last LSN the downstream confirmed flushed.
+    pub confirmed_flush_lsn: u64,
+    pub active: bool,
+}
+
 /// A view definition (v0.9): the raw SELECT text plus dependency names.
 #[derive(Clone, Debug)]
 pub struct ViewDef {
@@ -1241,6 +1261,9 @@ pub struct Engine {
     /// (nextval/setval). Drained into `WriteOp::SeqAdvance` markers by the
     /// server after a successful statement, for commit-time WAL logging.
     pub seq_advanced: Vec<String>,
+    /// v0.13: replication slots by name. Cluster-global, non-transactional;
+    /// WAL-logged (ReplSlot* records) and checkpointed for durability.
+    pub repl_slots: HashMap<String, ReplSlot>,
 }
 
 impl Engine {
@@ -1257,6 +1280,8 @@ impl Engine {
             },
             seq_currval: HashMap::new(),
             seq_advanced: Vec::new(),
+            // v0.13: replication slots.
+            repl_slots: HashMap::new(),
         }
     }
 
@@ -1804,6 +1829,18 @@ pub enum WriteOp {
         row_id: u64,
         prev_xmax: u64,
     },
+    // --- v0.13: an UPDATE is a first-class op (delete old version +
+    // insert new version), not an adjacent DeleteRow/InsertRow pair.
+    // Exec-time pairing is exact — unlike pairing at commit/decode time,
+    // it cannot mislabel `DELETE; INSERT` in one transaction as UPDATE —
+    // and it carries the old values the logical decoder needs.
+    UpdateRow {
+        table: String,
+        old_id: u64,
+        new_id: u64,
+        prev_xmax: u64,
+        old_values: Vec<Value>,
+    },
     CreateTable {
         name: String,
     },
@@ -1912,6 +1949,40 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
         } => {
             if let Some(v) = eng.db.find_row_version_mut(*row_id) {
+                if v.xmax == own {
+                    v.xmax = *prev_xmax;
+                }
+            }
+        }
+        // v0.13: undo an UPDATE = remove the new version (exactly the
+        // InsertRow undo) and restore the old version's xmax (exactly
+        // the DeleteRow undo).
+        WriteOp::UpdateRow {
+            table,
+            old_id,
+            new_id,
+            prev_xmax,
+            old_values: _,
+        } => {
+            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+                let mut out = None;
+                for t in versions.iter_mut() {
+                    if let Some(pos) = t.row_pos(*new_id) {
+                        if t.rows[pos].xmin == own {
+                            out = Some(t.rows[pos].values.clone());
+                            t.swap_remove_version(pos);
+                        }
+                        break;
+                    }
+                }
+                out
+            } else {
+                None
+            };
+            if let Some(values) = removed {
+                eng.db.index_remove_row(table, *new_id, &values);
+            }
+            if let Some(v) = eng.db.find_row_version_mut(*old_id) {
                 if v.xmax == own {
                     v.xmax = *prev_xmax;
                 }
