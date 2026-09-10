@@ -1,10 +1,19 @@
-# rustgres v0.7 — "richer types, casts, operators, built-ins"
+# rustgres v0.8 — "B-tree indexes, planner, ANALYZE, EXPLAIN"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 7 of the road to Postgres 19 feature parity. v0.7 widens the
-type system and expression language: **9 new types** (`SMALLINT`,
+Milestone 8 of the road to Postgres 19 feature parity. v0.8 adds
+secondary **B-tree indexes** (pure-std `BTreeMap`, composite keys, scalar
+ordering with Postgres NULL-high semantics), `CREATE`/`DROP INDEX`
+(transactional, WAL-durable, MVCC-safe), a **cost-agnostic access-path
+planner** (equality/range/`BETWEEN` on leading index prefixes, index-order
+scans for compatible `ORDER BY ... LIMIT`), **`ANALYZE`** with
+`pg_stats`-compatible statistics (row count, null fraction, distinct
+count, most-common values, histogram bounds), and textual **`EXPLAIN`**
+(`Seq Scan`, `Index Scan`, `Index Order Scan`, `Nested Loop`,
+`Aggregate`, `Unique`, `Sort`, `Limit`, `Subquery Scan`). v0.7 widened the
+type system and expression language (below): **9 new types** (`SMALLINT`,
 `BIGINT`, `REAL`, `NUMERIC`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `BYTEA`,
 `UUID`), **casts** (`::type` and `CAST(x AS type)`), the **`^`
 exponentiation operator**, `LIKE`/`ILIKE`/`BETWEEN`, full **numeric
@@ -19,6 +28,43 @@ SQL three-valued (NULL) logic; scalar, `IN`, and `EXISTS` subqueries
 (including ordering by aggregates not in the select list); and
 `SELECT ... FOR UPDATE` row locking with full transaction lifecycle
 (commit/rollback/savepoint/disconnect release the locks).
+
+## What v0.8 adds (B-tree indexes, planner, ANALYZE, EXPLAIN)
+
+- **Secondary indexes.** `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON
+  table(cols...)`, `DROP INDEX [IF EXISTS] name`. Composite keys with
+  lexicographic ordering; NULLs sort high (Postgres default), so `ASC`
+  reads NULLS LAST and `DESC` reads NULLS FIRST. Scalar ordering for all
+  indexable types (ints, floats, numerics, text, bool, dates,
+  timestamps, bytea, UUIDs).
+- **Planner.** Equality on a leading index prefix becomes an index point
+  lookup; `>`/`>=`/`<`/`<=`/`BETWEEN` on the next column (or the leading
+  column) become range bounds; composite `a = ? AND b > ?` uses both.
+  Compatible `ORDER BY ... LIMIT` skips the sort and streams from the
+  index with early termination. Every index scan rechecks MVCC
+  visibility and applies the full residual predicate afterwards, so a
+  plan only ever costs speed.
+- **UNIQUE.** Statement-atomic: one bad row in a multi-row `INSERT`
+  rolls back the whole statement with `23505`. Unique checks see
+  snapshot-visible rows (own txn's rows always count).
+- **Transactional DDL.** `CREATE`/`DROP INDEX` inside a transaction are
+  visible to your own snapshot and roll back cleanly; other
+  transactions never see uncommitted indexes.
+- **ANALYZE.** Per-column stats: row count, null fraction, exact
+  distinct count, most-common values + frequencies, histogram bounds.
+  Visible through the virtual `pg_stats` table (a real table named
+  `pg_stats` takes precedence, like Postgres). Statistics live in
+  memory and are rebuilt by `ANALYZE` after a restart; the planner is
+  rule-based (longest bound prefix wins), so plans never depend on
+  stats being present.
+- **EXPLAIN.** `EXPLAIN SELECT ...` prints a Postgres-style plan tree
+  (works in simple and extended protocol). `EXPLAIN ANALYZE` is
+  rejected with `0A000` (feature not supported), like a real missing
+  feature.
+- **Durability.** WAL magic `RGSWAL04`, checkpoint magic `RGSCHK04`
+  (version 4). Index definitions and entries survive `kill -9` and
+  checkpoint restarts. **v0.7 data directories are loudly refused at
+  startup** — the on-disk encoding changed.
 
 ## What v0.7 adds (richer types, casts, operators, built-ins)
 
@@ -440,6 +486,10 @@ tests/
   protocol_test2.py  raw-socket extended-protocol tests (v0.2)
   protocol_test3.py  raw-socket transaction tests (v0.3)
   protocol_test4.py  raw-socket durability tests: kill -9 + restart (v0.4)
+  protocol_test5.py  MVCC + isolation level tests (v0.5)
+  protocol_test6.py  query engine: JOINs/subqueries/aggregates (v0.6)
+  protocol_test7.py  types, casts, operators, built-ins (v0.7)
+  protocol_test8.py  B-tree indexes, planner, ANALYZE, EXPLAIN (v0.8)
 ```
 
 ## How to run
@@ -467,6 +517,10 @@ python3 tests/protocol_test4.py  # v0.4: durability, 35 checks
 python3 tests/protocol_test5.py  # v0.5: MVCC + isolation, 85 checks
 python3 tests/protocol_test6.py  # v0.6: query engine, 79 checks (own
                                  # ports per test; needs 55434+ free)
+python3 tests/protocol_test7.py  # v0.7: types/casts/operators/built-ins,
+                                 # 198 checks
+python3 tests/protocol_test8.py  # v0.8: indexes/planner/ANALYZE/EXPLAIN,
+                                 # 93 checks
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts

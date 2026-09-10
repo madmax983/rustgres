@@ -36,15 +36,18 @@
 //! (output names, aliases, positions, and — for plain queries —
 //! non-projected columns), OFFSET, and SELECT ... FOR UPDATE row locks.
 
+use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, ArithOp, CmpOp, Expr, FromItem, InsertValue, IsolationLevel, JoinKind, Literal,
-    SelectItem, SelectStmt, Stmt, WhereCond, WhereRhs,
+    OrderTerm, SelectItem, SelectStmt, Stmt, WhereCond, WhereRhs,
 };
 use crate::storage::{
-    ColType, Engine, Numeric, RowVersion, Snapshot, Value, WriteOp, row_visible,
+    ColStats, ColType, Database, Engine, Numeric, RowVersion, Snapshot, Table, TableStats, Value,
+    WriteOp, row_visible,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::Bound;
 
 #[derive(Debug)]
 pub struct ExecError {
@@ -74,6 +77,12 @@ pub struct StmtCtx<'a> {
 pub enum ExecResult {
     /// Rows to return: (column name, column type) + row values.
     Select {
+        columns: Vec<(String, ColType)>,
+        rows: Vec<Vec<Value>>,
+    },
+    /// EXPLAIN output: same shape as Select but completes with the
+    /// "EXPLAIN" tag, like Postgres.
+    Explain {
         columns: Vec<(String, ColType)>,
         rows: Vec<Vec<Value>>,
     },
@@ -114,6 +123,17 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             })
         }
         Stmt::DropTable { if_exists, name } => exec_drop(eng, ctx, name, *if_exists),
+        // --- v0.8: indexes / EXPLAIN / ANALYZE
+        Stmt::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            if_not_exists,
+        } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists),
+        Stmt::DropIndex { name, if_exists } => exec_drop_index(eng, ctx, name, *if_exists),
+        Stmt::Explain { stmt } => exec_explain(eng, ctx, stmt),
+        Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
         Stmt::Update {
             table,
             sets,
@@ -414,6 +434,10 @@ fn exec_insert(
             }
             built.push(values);
         }
+        // v0.8: statement-atomic UNIQUE enforcement — every row is checked
+        // against the indexes and against earlier rows of this statement
+        // before any version is pushed.
+        check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own)?;
         built
     };
     // Apply: each row becomes a version owned by this transaction,
@@ -423,21 +447,30 @@ fn exec_insert(
     for _ in 0..n {
         ids.push(eng.alloc_row_id());
     }
-    let t = eng
-        .db
-        .find_table_mut(table, ctx.snap, ctx.own)
-        .expect("table still visible; engine lock held throughout");
-    for (values, id) in new_rows.into_iter().zip(ids.iter()) {
-        t.push_version(RowVersion {
-            id: *id,
-            values,
-            xmin: ctx.own,
-            xmax: 0,
-        });
-        ctx.writes.push(WriteOp::InsertRow {
-            table: table.to_string(),
-            row_id: *id,
-        });
+    // Apply: each row becomes a version owned by this transaction,
+    // invisible to everyone else until we commit. The table borrow ends
+    // before index maintenance (both need `eng.db` mutably).
+    {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table still visible; engine lock held throughout");
+        for (values, id) in new_rows.iter().zip(ids.iter()) {
+            t.push_version(RowVersion {
+                id: *id,
+                values: values.clone(),
+                xmin: ctx.own,
+                xmax: 0,
+            });
+            ctx.writes.push(WriteOp::InsertRow {
+                table: table.to_string(),
+                row_id: *id,
+            });
+        }
+    }
+    // v0.8: maintain secondary indexes for the new versions.
+    for (values, id) in new_rows.iter().zip(ids.iter()) {
+        eng.db.index_insert_row(table, *id, values);
     }
     Ok(ExecResult::Command {
         tag: format!("INSERT 0 {}", n),
@@ -611,8 +644,26 @@ fn exec_update(
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
+            // v0.8: UNIQUE enforcement against the indexes. The old
+            // version is excluded (it is being replaced); the check runs
+            // before any mutation, keeping the statement atomic.
+            if let Some(vname) =
+                eng.db
+                    .unique_violation(table, &new_values, Some(*id), ctx.snap, ctx.own)
+            {
+                return Err(exec_err(
+                    "23505",
+                    format!(
+                        "duplicate key value violates unique constraint \"{}\"",
+                        vname
+                    ),
+                ));
+            }
             plan.push((*id, *xmax, new_values));
         }
+        // v0.8: pairwise check — two rows updated to the same unique key
+        // in one statement (the index still holds only old entries).
+        check_update_unique_pairs(&eng.db, table, &plan, ctx.snap, ctx.own)?;
         plan
     };
     // Apply: UPDATE = delete old version + insert new version.
@@ -621,30 +672,41 @@ fn exec_update(
     for _ in 0..n {
         new_ids.push(eng.alloc_row_id());
     }
-    let t = eng
-        .db
-        .find_table_mut(table, ctx.snap, ctx.own)
-        .expect("table still visible; engine lock held throughout");
-    for ((old_id, prev_xmax, new_values), new_id) in plan.into_iter().zip(new_ids) {
-        let pos = t
-            .row_pos(old_id)
-            .expect("row version still present; engine lock held throughout");
-        t.rows[pos].xmax = ctx.own;
-        ctx.writes.push(WriteOp::DeleteRow {
-            table: table.to_string(),
-            row_id: old_id,
-            prev_xmax,
-        });
-        t.push_version(RowVersion {
-            id: new_id,
-            values: new_values,
-            xmin: ctx.own,
-            xmax: 0,
-        });
-        ctx.writes.push(WriteOp::InsertRow {
-            table: table.to_string(),
-            row_id: new_id,
-        });
+    // The table borrow ends before index maintenance (both need `eng.db`
+    // mutably); collect the new versions' keys meanwhile.
+    let mut indexed: Vec<(u64, Vec<Value>)> = Vec::with_capacity(n);
+    {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table still visible; engine lock held throughout");
+        for ((old_id, prev_xmax, new_values), new_id) in plan.into_iter().zip(new_ids) {
+            let pos = t
+                .row_pos(old_id)
+                .expect("row version still present; engine lock held throughout");
+            t.rows[pos].xmax = ctx.own;
+            ctx.writes.push(WriteOp::DeleteRow {
+                table: table.to_string(),
+                row_id: old_id,
+                prev_xmax,
+            });
+            t.push_version(RowVersion {
+                id: new_id,
+                values: new_values.clone(),
+                xmin: ctx.own,
+                xmax: 0,
+            });
+            ctx.writes.push(WriteOp::InsertRow {
+                table: table.to_string(),
+                row_id: new_id,
+            });
+            indexed.push((new_id, new_values));
+        }
+    }
+    // v0.8: index the new versions (old versions' entries stay; the
+    // version chain's xmax makes them invisible).
+    for (new_id, new_values) in &indexed {
+        eng.db.index_insert_row(table, *new_id, new_values);
     }
     Ok(ExecResult::Command {
         tag: format!("UPDATE {}", n),
@@ -743,9 +805,1354 @@ fn exec_drop(
         name: name.to_string(),
         prev_xmax,
     });
+    // v0.8: dropping a table drops its indexes with it. Each index drop
+    // is its own write op (snapshotting the definition) so ROLLBACK
+    // restores them and the WAL replays them.
+    let idx_names: Vec<String> = eng
+        .db
+        .visible_indexes_for(name, ctx.snap, ctx.own)
+        .iter()
+        .map(|ix| ix.def.name.clone())
+        .collect();
+    for iname in idx_names {
+        let snapshot = eng
+            .db
+            .indexes
+            .get(&iname)
+            .cloned()
+            .expect("index still present; engine lock held throughout");
+        eng.db.indexes.get_mut(&iname).expect("index still present").def.dropped_xmax = ctx.own;
+        ctx.writes.push(WriteOp::DropIndex {
+            name: iname,
+            index: snapshot,
+        });
+    }
     Ok(ExecResult::Command {
         tag: "DROP TABLE".to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// v0.8 indexes: DDL, unique enforcement, planner, EXPLAIN, ANALYZE
+// ---------------------------------------------------------------------------
+
+/// 23505 error constructor.
+fn unique_violation_err(index: &str) -> ExecError {
+    exec_err(
+        "23505",
+        format!(
+            "duplicate key value violates unique constraint \"{}\"",
+            index
+        ),
+    )
+}
+
+/// Statement-atomic UNIQUE check for INSERT: every candidate row is checked
+/// against the indexes and against earlier rows of the same statement
+/// before any version is pushed.
+fn check_insert_unique(
+    db: &Database,
+    table: &str,
+    rows: &[Vec<Value>],
+    snap: &Snapshot,
+    own: u64,
+) -> Result<(), ExecError> {
+    let uniques: Vec<&Index> = db
+        .visible_indexes_for(table, snap, own)
+        .into_iter()
+        .filter(|ix| ix.def.unique)
+        .collect();
+    for (i, values) in rows.iter().enumerate() {
+        for ix in &uniques {
+            let key = ix.key_for(values);
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict
+            }
+            if rows[..i].iter().any(|prev| ix.key_for(prev) == key) {
+                return Err(unique_violation_err(&ix.def.name));
+            }
+        }
+        if let Some(name) = db.unique_violation(table, values, None, snap, own) {
+            return Err(unique_violation_err(&name));
+        }
+    }
+    Ok(())
+}
+
+/// Pairwise UNIQUE check for UPDATE's planned rows: the index still holds
+/// only the old entries at plan time, so new-vs-new conflicts need an
+/// explicit pass.
+fn check_update_unique_pairs(
+    db: &Database,
+    table: &str,
+    plan: &[(u64, u64, Vec<Value>)],
+    snap: &Snapshot,
+    own: u64,
+) -> Result<(), ExecError> {
+    let uniques: Vec<&Index> = db
+        .visible_indexes_for(table, snap, own)
+        .into_iter()
+        .filter(|ix| ix.def.unique)
+        .collect();
+    for (i, (_, _, values)) in plan.iter().enumerate() {
+        for ix in &uniques {
+            let key = ix.key_for(values);
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            if plan[..i]
+                .iter()
+                .any(|(_, _, prev)| ix.key_for(prev) == key)
+            {
+                return Err(unique_violation_err(&ix.def.name));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exec_create_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    table: &str,
+    columns: &[String],
+    unique: bool,
+    if_not_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    if eng.db.find_index(name, ctx.snap, ctx.own).is_some() {
+        if if_not_exists {
+            return Ok(ExecResult::Command {
+                tag: "CREATE INDEX".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", name),
+        ));
+    }
+    // Resolve the table and columns (immutable borrows only).
+    {
+        let t = eng.db.find_table(table, ctx.snap, ctx.own).ok_or_else(|| {
+            exec_err("42P01", format!("relation \"{}\" does not exist", table))
+        })?;
+        let mut seen = Vec::with_capacity(columns.len());
+        for c in columns {
+            let pos = t.column_index(c).ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        c, table
+                    ),
+                )
+            })?;
+            if seen.contains(&pos) {
+                return Err(exec_err(
+                    "42701",
+                    format!("column \"{}\" specified more than once", c),
+                ));
+            }
+            seen.push(pos);
+        }
+        if seen.is_empty() {
+            return Err(exec_err(
+                "42601",
+                "syntax error: index requires at least one column".to_string(),
+            ));
+        }
+    }
+    // Build + backfill from every version of the visible table version;
+    // visibility is resolved at scan time, so uncommitted and dead
+    // versions get entries too (like Postgres' heap/index split).
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own)
+        .expect("table still visible; engine lock held throughout");
+    let cols: Vec<usize> = columns
+        .iter()
+        .map(|c| t.column_index(c).expect("columns resolved above"))
+        .collect();
+    let mut ix = Index::new(IndexDef {
+        name: name.to_string(),
+        table: table.to_string(),
+        cols,
+        col_names: columns.to_vec(),
+        unique,
+        created_xmin: ctx.own,
+        dropped_xmax: 0,
+    });
+    for r in &t.rows {
+        let key = ix.key_for(&r.values);
+        ix.insert(key, r.id);
+    }
+    if unique {
+        // A duplicate among versions that could still become visible
+        // fails the CREATE, like Postgres. Conservative: versions deleted
+        // only by still-active transactions (or by us) count as live.
+        for (key, ids) in &ix.tree {
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let mut live = 0u32;
+            for &id in ids {
+                let dead = match t.row_pos(id) {
+                    Some(pos) => {
+                        let r = &t.rows[pos];
+                        r.xmax != 0 && r.xmax != ctx.own && eng.xid_committed(r.xmax)
+                    }
+                    None => true, // vacuumed away: cannot conflict
+                };
+                if !dead {
+                    live += 1;
+                    if live >= 2 {
+                        return Err(unique_violation_err(name));
+                    }
+                }
+            }
+        }
+    }
+    // `t`'s borrow ends at its last use above; the insert below needs
+    // `eng.db` mutably.
+    eng.db.indexes.insert(name.to_string(), ix);
+    ctx.writes.push(WriteOp::CreateIndex {
+        name: name.to_string(),
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE INDEX".to_string(),
+    })
+}
+
+fn exec_drop_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    // Snapshot the definition first: the write log's undo restores it on
+    // ROLLBACK, and the WAL replays the drop on commit.
+    let snapshot = match eng.db.find_index(name, ctx.snap, ctx.own) {
+        Some(ix) => ix.clone(),
+        None => {
+            if if_exists {
+                return Ok(ExecResult::Command {
+                    tag: "DROP INDEX".to_string(),
+                });
+            }
+            return Err(exec_err(
+                "42P01",
+                format!("index \"{}\" does not exist", name),
+            ));
+        }
+    };
+    eng.db
+        .find_index_mut(name, ctx.snap, ctx.own)
+        .expect("index still present; engine lock held throughout")
+        .def
+        .dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropIndex {
+        name: name.to_string(),
+        index: snapshot,
+    });
+    Ok(ExecResult::Command {
+        tag: "DROP INDEX".to_string(),
+    })
+}
+
+// --- v0.8 planner ----------------------------------------------------------
+
+/// One usable index bound extracted from a WHERE conjunct.
+#[derive(Clone)]
+enum IndexBoundKind {
+    Eq,
+    /// Greater-than; bool = inclusive.
+    Gt(bool),
+    /// Less-than; bool = inclusive.
+    Lt(bool),
+}
+
+/// Try to read one WHERE conjunct as bounds on this table's columns.
+/// `None` when the conjunct is not indexable — never an error, the
+/// residual filter handles it.
+fn conjunct_bounds(
+    e: &Expr,
+    qual: &str,
+    table_name: &str,
+    columns: &[(String, ColType)],
+) -> Option<Vec<(usize, IndexBoundKind, Value)>> {
+    // Resolve `Column op Literal` in either order, normalizing the
+    // comparison direction.
+    let from_cmp = |op: &CmpOp,
+                        left: &Expr,
+                        right: &Expr|
+     -> Option<(usize, IndexBoundKind, Value)> {
+        let (col_side, lit_side, flip) = match (left, right) {
+            (Expr::Column { .. }, Expr::Literal(_)) => (left, right, false),
+            (Expr::Literal(_), Expr::Column { .. }) => (right, left, true),
+            _ => return None,
+        };
+        let (cq, cname) = match col_side {
+            Expr::Column { table, name } => (table, name),
+            _ => return None,
+        };
+        if let Some(cq) = cq {
+            if cq != qual && cq != table_name {
+                return None;
+            }
+        }
+        let lit = match lit_side {
+            Expr::Literal(l) => l,
+            _ => return None,
+        };
+        let pos = columns.iter().position(|(n, _)| n == cname)?;
+        let (_, ctype) = &columns[pos];
+        // The literal is coerced to the column type, exactly like an
+        // INSERT value; anything uncoercible stays a sequential scan.
+        let v = coerce_literal(lit, ctype, cname).ok()?;
+        let kind = match (op, flip) {
+            (CmpOp::Eq, _) => IndexBoundKind::Eq,
+            (CmpOp::Gt, false) | (CmpOp::Lt, true) => IndexBoundKind::Gt(false),
+            (CmpOp::Ge, false) | (CmpOp::Le, true) => IndexBoundKind::Gt(true),
+            (CmpOp::Lt, false) | (CmpOp::Gt, true) => IndexBoundKind::Lt(false),
+            (CmpOp::Le, false) | (CmpOp::Ge, true) => IndexBoundKind::Lt(true),
+            _ => return None, // <> is never indexable
+        };
+        Some((pos, kind, v))
+    };
+    match e {
+        Expr::Cmp { op, left, right } => from_cmp(op, left, right).map(|b| vec![b]),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => {
+            if *neg {
+                return None;
+            }
+            let (cq, cname) = match &**expr {
+                Expr::Column { table, name } => (table, name),
+                _ => return None,
+            };
+            if let Some(cq) = cq {
+                if cq != qual && cq != table_name {
+                    return None;
+                }
+            }
+            let lo = match &**low {
+                Expr::Literal(l) => l,
+                _ => return None,
+            };
+            let hi = match &**high {
+                Expr::Literal(l) => l,
+                _ => return None,
+            };
+            let pos = columns.iter().position(|(n, _)| n == cname)?;
+            let (_, ctype) = &columns[pos];
+            let lo_v = coerce_literal(lo, ctype, cname).ok()?;
+            let hi_v = coerce_literal(hi, ctype, cname).ok()?;
+            Some(vec![
+                (pos, IndexBoundKind::Gt(true), lo_v),
+                (pos, IndexBoundKind::Lt(true), hi_v),
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Planned access path for one base-table scan.
+#[derive(Clone, Debug)]
+enum AccessPath {
+    SeqScan,
+    IndexScan {
+        index: String,
+        /// Equality values for the leading index columns.
+        prefix: Vec<Value>,
+        /// Optional range on the next index column: (value, inclusive).
+        lo: Option<(Value, bool)>,
+        hi: Option<(Value, bool)>,
+        /// Human-readable condition for EXPLAIN.
+        cond: String,
+    },
+}
+
+/// Choose an access path for one base-table source. The index scan's row
+/// set is always a *superset* of the true matches (same-type bounds under
+/// the index's own ordering); the executor still applies the full residual
+/// predicate and MVCC visibility, so a wrong choice costs speed, never
+/// correctness.
+fn plan_access_path(
+    db: &Database,
+    t: &Table,
+    table_name: &str,
+    qual: &str,
+    where_: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+) -> AccessPath {
+    let w = match where_ {
+        Some(w) => w,
+        None => return AccessPath::SeqScan,
+    };
+    // Gather per-column bounds from the AND-conjuncts.
+    let mut col_bounds: HashMap<usize, Vec<(IndexBoundKind, Value)>> = HashMap::new();
+    for c in split_conjuncts(w) {
+        if let Some(bs) = conjunct_bounds(c, qual, table_name, &t.columns) {
+            for (pos, kind, v) in bs {
+                col_bounds.entry(pos).or_default().push((kind, v));
+            }
+        }
+    }
+    if col_bounds.is_empty() {
+        return AccessPath::SeqScan;
+    }
+    // Prefer the longest equality prefix; a point lookup beats a range,
+    // and more bound columns beat fewer.
+    let mut best: Option<AccessPath> = None;
+    let mut best_score = (0usize, 0usize, false);
+    for ix in db.visible_indexes_for(table_name, snap, own) {
+        let mut prefix: Vec<Value> = Vec::new();
+        let mut cond_parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < ix.def.cols.len() {
+            let cp = ix.def.cols[i];
+            let eq_val = col_bounds
+                .get(&cp)
+                .and_then(|bs| bs.iter().find(|(k, _)| matches!(k, IndexBoundKind::Eq)));
+            match eq_val {
+                Some((_, v)) => {
+                    cond_parts.push(format!(
+                        "{} = {}",
+                        ix.def.col_names[i],
+                        value_to_text_cast(v)
+                    ));
+                    prefix.push(v.clone());
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        // Optional range on the next column — or on the leading column
+        // when there is no equality prefix at all. When several bounds
+        // exist for one side the first wins — a wider range is still a
+        // correct superset.
+        let (mut lo, mut hi): (Option<(Value, bool)>, Option<(Value, bool)>) = (None, None);
+        if i < ix.def.cols.len() {
+            if let Some(bs) = col_bounds.get(&ix.def.cols[i]) {
+                for (k, v) in bs {
+                    match k {
+                        IndexBoundKind::Gt(incl) if lo.is_none() => {
+                            let op = if *incl { ">=" } else { ">" };
+                            cond_parts.push(format!(
+                                "{} {} {}",
+                                ix.def.col_names[i],
+                                op,
+                                value_to_text_cast(v)
+                            ));
+                            lo = Some((v.clone(), *incl));
+                        }
+                        IndexBoundKind::Lt(incl) if hi.is_none() => {
+                            let op = if *incl { "<=" } else { "<" };
+                            cond_parts.push(format!(
+                                "{} {} {}",
+                                ix.def.col_names[i],
+                                op,
+                                value_to_text_cast(v)
+                            ));
+                            hi = Some((v.clone(), *incl));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if i == 0 && lo.is_none() && hi.is_none() {
+            continue; // leading column unbound: index not usable
+        }
+        let is_point = i == ix.def.cols.len() && lo.is_none() && hi.is_none();
+        let bound_cols = i + usize::from(lo.is_some() || hi.is_some());
+        let score = (i, bound_cols, is_point);
+        if score > best_score {
+            best_score = score;
+            best = Some(AccessPath::IndexScan {
+                index: ix.def.name.clone(),
+                prefix,
+                lo,
+                hi,
+                cond: format!("({})", cond_parts.join(" AND ")),
+            });
+        }
+    }
+    best.unwrap_or(AccessPath::SeqScan)
+}
+
+/// Row-version ids from `ix` matching an equality `prefix` plus an
+/// optional range on the next key component, in ascending key order.
+///
+/// The scan starts at the short prefix key: every key with this prefix
+/// sorts after it and before any key with a greater prefix (lexicographic
+/// order), so the matching keys form the contiguous run up to the first
+/// prefix break. Within the run the range component is monotonic, so the
+/// high bound stops the scan and the low bound only skips the head.
+fn index_scan_ids(
+    ix: &Index,
+    prefix: &[Value],
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Vec<u64> {
+    let start = IndexKey(
+        prefix
+            .iter()
+            .cloned()
+            .chain(lo.map(|(v, _)| (*v).clone()))
+            .collect(),
+    );
+    let mut out = Vec::new();
+    let p = prefix.len();
+    let has_range = lo.is_some() || hi.is_some();
+    for (k, ids) in ix.tree.range((Bound::Included(&start), Bound::Unbounded)) {
+        if k.0.len() < p
+            || k.0
+                .iter()
+                .zip(prefix.iter())
+                // Prefix equality in *index* ordering (Numeric 5 = 5.0).
+                .any(|(a, b)| index_key_cmp(a, b) != Ordering::Equal)
+        {
+            break;
+        }
+        if has_range {
+            // A range always sits on column p < ncols here (a full-prefix
+            // point lookup never takes this path).
+            let c = &k.0[p];
+            if let Some((lv, incl)) = lo {
+                match index_key_cmp(c, lv) {
+                    Ordering::Less => continue,
+                    Ordering::Equal if !incl => continue,
+                    _ => {}
+                }
+            }
+            if let Some((hv, incl)) = hi {
+                match index_key_cmp(c, hv) {
+                    Ordering::Greater => break,
+                    Ordering::Equal if !incl => break,
+                    _ => {}
+                }
+            }
+        }
+        out.extend(ids.iter().copied());
+    }
+    out
+}
+
+/// Hint for an index-ordered scan: `SELECT ... FROM t ORDER BY <index cols>`
+/// with no WHERE — rows stream out of the index in ORDER BY order and the
+/// sort step is skipped.
+#[derive(Clone, Debug)]
+struct OrderHint {
+    index: String,
+    desc: bool,
+}
+
+/// ORDER BY term rendering for EXPLAIN.
+fn order_term_text(t: &OrderTerm) -> String {
+    let e = format!("{:?}", t.expr);
+    if t.desc {
+        format!("{} DESC", e)
+    } else {
+        e
+    }
+}
+
+fn plan_order_scan(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    stmt: &SelectStmt,
+) -> Option<OrderHint> {
+    // Only the simplest shape: single base table, no filter, no
+    // aggregation / DISTINCT / grouping.
+    if stmt.from.len() != 1 || stmt.where_.is_some() || stmt.distinct {
+        return None;
+    }
+    if is_agg_query(stmt) || !stmt.group_by.is_empty() || stmt.having.is_some() {
+        return None;
+    }
+    if stmt.order_by.is_empty() {
+        return None;
+    }
+    let (table_name, qual) = match &stmt.from[0] {
+        FromItem::Table { name, alias } => (
+            name.as_str(),
+            alias.clone().unwrap_or_else(|| name.clone()),
+        ),
+        FromItem::Derived { .. } | FromItem::Join { .. } => return None,
+    };
+    let t = eng.db.find_table(table_name, snap, own)?;
+    // ORDER BY alias safety: an unqualified ORDER BY column that matches a
+    // select-list output name resolves to the *output* value (which may be
+    // an expression), not the raw column — unless the select item is the
+    // identical expression. Qualified terms always read the column.
+    for term in &stmt.order_by {
+        if let Expr::Column { table: None, name } = &term.expr {
+            for item in &stmt.items {
+                match item {
+                    SelectItem::Expr { expr: e, alias } => {
+                        let out_name =
+                            alias.clone().unwrap_or_else(|| expr_col_name(e));
+                        if out_name == *name && e != &term.expr {
+                            return None;
+                        }
+                    }
+                    SelectItem::All | SelectItem::AllOf(_) => {}
+                }
+            }
+        }
+    }
+    // Every term must be a plain column of this table, all in the same
+    // direction, with default NULL placement (NULLs sort high in the
+    // index: NULLS LAST for ASC, NULLS FIRST for DESC — Postgres'
+    // defaults, matching compare_values).
+    let desc = stmt.order_by[0].desc;
+    let mut cols: Vec<String> = Vec::new();
+    for term in &stmt.order_by {
+        if term.desc != desc {
+            return None;
+        }
+        if term.nulls_first.unwrap_or(desc) != desc {
+            return None;
+        }
+        match &term.expr {
+            Expr::Column { table, name } => {
+                if let Some(q) = table {
+                    if q != &qual && q != table_name {
+                        return None;
+                    }
+                }
+                if !t.columns.iter().any(|(n, _)| n == name) {
+                    return None;
+                }
+                cols.push(name.clone());
+            }
+            _ => return None,
+        }
+    }
+    // An index whose columns are exactly this sequence (indexes are
+    // ascending; a DESC query scans it backwards).
+    // An index whose leading columns are exactly this sequence satisfies
+    // the ordering (indexes are ascending; a DESC query scans backwards).
+    // A composite index also satisfies a prefix: (a,b) order implies
+    // a-order.
+    for ix in eng.db.visible_indexes_for(table_name, snap, own) {
+        if ix.def.col_names.len() >= cols.len() && ix.def.col_names[..cols.len()] == cols[..] {
+            return Some(OrderHint {
+                index: ix.def.name.clone(),
+                desc,
+            });
+        }
+    }
+    None
+}
+
+/// Rows of one base table in index key order (for ORDER BY ... LIMIT with
+/// no WHERE). NULL placement matches the ORDER BY defaults: ascending
+/// scans yield NULLS LAST, descending scans NULLS FIRST. Stops after
+/// `limit` *visible* rows when set — the caller guarantees no residual
+/// filter, DISTINCT, or aggregation can remove rows afterwards.
+fn index_order_rows(
+    ix: &Index,
+    t: &Table,
+    table_name: &str,
+    desc: bool,
+    snap: &Snapshot,
+    own: u64,
+    need_prov: bool,
+    limit: Option<usize>,
+) -> Vec<QRow> {
+    let mut rows = Vec::new();
+    // Walk the buckets in index order, resolving each id to its visible
+    // heap version, and stop as soon as `limit` visible rows exist.
+    let mut iter: Box<dyn Iterator<Item = (&IndexKey, &Vec<u64>)>> = if desc {
+        Box::new(ix.tree.iter().rev())
+    } else {
+        Box::new(ix.tree.iter())
+    };
+    'scan: for (_, ids) in iter.by_ref() {
+        for &id in ids {
+            if let Some(n) = limit {
+                if rows.len() >= n {
+                    break 'scan;
+                }
+            }
+            if let Some(pos) = t.row_pos(id) {
+                let r = &t.rows[pos];
+                if row_visible(r, snap, own) {
+                    rows.push(QRow {
+                        cells: r.values.clone(),
+                        prov: if need_prov {
+                            vec![(table_name.to_string(), r.id)]
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+// --- EXPLAIN ---------------------------------------------------------------
+
+/// EXPLAIN plan node: mirrors the executor's access-path decisions
+/// without executing anything.
+#[derive(Clone, Debug)]
+enum PlanNode {
+    Result {
+        rows: u64,
+        filter: Option<String>,
+    },
+    SeqScan {
+        table: String,
+        filter: Option<String>,
+        rows: u64,
+    },
+    IndexScan {
+        table: String,
+        index: String,
+        cond: String,
+        filter: Option<String>,
+        rows: u64,
+    },
+    IndexOrderScan {
+        table: String,
+        index: String,
+        order: String,
+        rows: u64,
+    },
+    NestedLoop {
+        filter: Option<String>,
+        rows: u64,
+        outer: Box<PlanNode>,
+        inner: Box<PlanNode>,
+    },
+    Aggregate {
+        rows: u64,
+        child: Box<PlanNode>,
+    },
+    Unique {
+        rows: u64,
+        child: Box<PlanNode>,
+    },
+    Sort {
+        keys: String,
+        rows: u64,
+        child: Box<PlanNode>,
+    },
+    Limit {
+        n: String,
+        rows: u64,
+        child: Box<PlanNode>,
+    },
+    SubqueryScan {
+        alias: String,
+        rows: u64,
+        child: Box<PlanNode>,
+    },
+}
+
+impl PlanNode {
+    fn rows(&self) -> u64 {
+        match self {
+            PlanNode::Result { rows, .. }
+            | PlanNode::SeqScan { rows, .. }
+            | PlanNode::IndexScan { rows, .. }
+            | PlanNode::IndexOrderScan { rows, .. }
+            | PlanNode::NestedLoop { rows, .. }
+            | PlanNode::Aggregate { rows, .. }
+            | PlanNode::Unique { rows, .. }
+            | PlanNode::Sort { rows, .. }
+            | PlanNode::Limit { rows, .. }
+            | PlanNode::SubqueryScan { rows, .. } => *rows,
+        }
+    }
+
+    /// Attach a residual filter to a scan-like node.
+    fn set_filter(&mut self, f: String) {
+        match self {
+            PlanNode::Result { filter, .. }
+            | PlanNode::SeqScan { filter, .. }
+            | PlanNode::IndexScan { filter, .. }
+            | PlanNode::NestedLoop { filter, .. } => *filter = Some(f),
+            _ => {}
+        }
+    }
+}
+
+/// Estimated live row count: ANALYZE stats when present, else a visible
+/// count under this snapshot.
+fn est_rel_rows(db: &Database, table: &str, snap: &Snapshot, own: u64) -> u64 {
+    if let Some(ts) = db.stats.get(table) {
+        return ts.reltuples.round().max(0.0) as u64;
+    }
+    db.find_table(table, snap, own)
+        .map(|t| {
+            t.rows
+                .iter()
+                .filter(|r| row_visible(r, snap, own))
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// Equality selectivity from ANALYZE stats: MCV frequency when the value
+/// is most-common, else the uniform remainder.
+fn est_eq_sel(ts: Option<&TableStats>, col: &str, v: &Value) -> f64 {
+    let cs = match ts.and_then(|t| t.cols.get(col)) {
+        Some(c) => c,
+        None => return 0.1,
+    };
+    if let Some((_, f)) = cs
+        .mcv
+        .iter()
+        .find(|(mv, _)| index_key_cmp(mv, v) == Ordering::Equal)
+    {
+        return f.clamp(0.0001, 1.0);
+    }
+    let mcv_total: f64 = cs.mcv.iter().map(|(_, f)| f).sum();
+    let rest = (1.0 - cs.null_frac - mcv_total).max(0.0);
+    let nd = (cs.n_distinct - cs.mcv.len() as f64).max(1.0);
+    (rest / nd).clamp(0.0001, 1.0)
+}
+
+/// Range selectivity from the histogram bounds: the fraction of
+/// equal-count intervals overlapping [lo, hi].
+fn est_range_sel(
+    ts: Option<&TableStats>,
+    col: &str,
+    lo: Option<&Value>,
+    hi: Option<&Value>,
+) -> f64 {
+    let cs = match ts.and_then(|t| t.cols.get(col)) {
+        Some(c) => c,
+        None => return 0.1,
+    };
+    if cs.hist_bounds.len() >= 2 {
+        let iv = cs.hist_bounds.len() - 1;
+        let mut overlap = 0u32;
+        for i in 0..iv {
+            let b0 = &cs.hist_bounds[i];
+            let b1 = &cs.hist_bounds[i + 1];
+            let above_lo = lo.map_or(true, |lv| index_key_cmp(b1, lv) != Ordering::Less);
+            let below_hi = hi.map_or(true, |hv| index_key_cmp(b0, hv) != Ordering::Greater);
+            if above_lo && below_hi {
+                overlap += 1;
+            }
+        }
+        return (overlap as f64 / iv as f64).clamp(0.0001, 1.0);
+    }
+    0.1
+}
+
+fn est_index_rows(
+    db: &Database,
+    table: &str,
+    ix: &Index,
+    prefix: &[Value],
+    lo: Option<&Value>,
+    hi: Option<&Value>,
+    snap: &Snapshot,
+    own: u64,
+) -> u64 {
+    let rel = est_rel_rows(db, table, snap, own) as f64;
+    if rel == 0.0 {
+        return 0;
+    }
+    let ts = db.stats.get(table);
+    let mut sel = 1.0f64;
+    for (i, v) in prefix.iter().enumerate() {
+        sel *= est_eq_sel(ts, &ix.def.col_names[i], v);
+    }
+    if lo.is_some() || hi.is_some() {
+        sel *= est_range_sel(ts, &ix.def.col_names[prefix.len()], lo, hi);
+    }
+    (rel * sel).round().max(1.0) as u64
+}
+
+fn plan_from_item(
+    eng: &Engine,
+    item: &FromItem,
+    where_: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+) -> Result<PlanNode, ExecError> {
+    match item {
+        FromItem::Table { name, alias } => {
+            if name == "pg_stats" && eng.db.find_table(name, snap, own).is_none() {
+                let rows: u64 = eng
+                    .db
+                    .stats
+                    .values()
+                    .map(|ts| ts.cols.len() as u64)
+                    .sum();
+                return Ok(PlanNode::SeqScan {
+                    table: "pg_stats".to_string(),
+                    filter: None,
+                    rows,
+                });
+            }
+            let t = eng.db.find_table(name, snap, own).ok_or_else(|| {
+                exec_err("42P01", format!("relation \"{}\" does not exist", name))
+            })?;
+            let qual = alias.clone().unwrap_or_else(|| name.clone());
+            let rel_rows = est_rel_rows(&eng.db, name, snap, own);
+            match plan_access_path(&eng.db, t, name, &qual, where_, snap, own) {
+                AccessPath::SeqScan => Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    filter: None,
+                    rows: rel_rows,
+                }),
+                AccessPath::IndexScan {
+                    index,
+                    prefix,
+                    lo,
+                    hi,
+                    cond,
+                } => {
+                    let ix = eng.db.indexes.get(&index).expect(
+                        "planned index still present; engine lock held throughout",
+                    );
+                    let rows = est_index_rows(
+                        &eng.db,
+                        name,
+                        ix,
+                        &prefix,
+                        lo.as_ref().map(|(v, _)| v),
+                        hi.as_ref().map(|(v, _)| v),
+                        snap,
+                        own,
+                    );
+                    Ok(PlanNode::IndexScan {
+                        table: name.clone(),
+                        index,
+                        cond,
+                        filter: None,
+                        rows,
+                    })
+                }
+            }
+        }
+        FromItem::Derived { sub, alias } => {
+            let child = plan_select(eng, sub, snap, own)?;
+            let rows = child.rows();
+            Ok(PlanNode::SubqueryScan {
+                alias: alias.clone(),
+                rows,
+                child: Box::new(child),
+            })
+        }
+        // The executor runs joins as nested loops; the filter attaches to
+        // the outermost Nested Loop node at the top level.
+        FromItem::Join { left, right, .. } => {
+            let outer = plan_from_item(eng, left, None, snap, own)?;
+            let inner = plan_from_item(eng, right, None, snap, own)?;
+            let rows = outer.rows().saturating_mul(inner.rows());
+            Ok(PlanNode::NestedLoop {
+                filter: None,
+                rows,
+                outer: Box::new(outer),
+                inner: Box::new(inner),
+            })
+        }
+    }
+}
+
+fn plan_select(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+) -> Result<PlanNode, ExecError> {
+    // 1. FROM → access paths. A single base table with a usable
+    // ORDER BY ... LIMIT hint becomes an index-order scan.
+    let mut ordered = false;
+    let mut node = if stmt.from.is_empty() {
+        PlanNode::Result { rows: 1, filter: None }
+    } else if stmt.from.len() == 1 {
+        if matches!(&stmt.from[0], FromItem::Table { .. }) {
+            if let Some(hint) = plan_order_scan(eng, snap, own, stmt) {
+                let name = match &stmt.from[0] {
+                    FromItem::Table { name, .. } => name.clone(),
+                    _ => unreachable!(),
+                };
+                ordered = true;
+                PlanNode::IndexOrderScan {
+                    rows: est_rel_rows(&eng.db, &name, snap, own),
+                    table: name,
+                    index: hint.index,
+                    order: stmt.order_by.iter().map(order_term_text).collect::<Vec<_>>().join(", "),
+                }
+            } else {
+                plan_from_item(eng, &stmt.from[0], stmt.where_.as_ref(), snap, own)?
+            }
+        } else {
+            plan_from_item(eng, &stmt.from[0], stmt.where_.as_ref(), snap, own)?
+        }
+    } else {
+        let mut items = stmt.from.iter();
+        let mut node = plan_from_item(eng, items.next().unwrap(), stmt.where_.as_ref(), snap, own)?;
+        for item in items {
+            let inner = plan_from_item(eng, item, stmt.where_.as_ref(), snap, own)?;
+            let rows = node.rows().saturating_mul(inner.rows());
+            node = PlanNode::NestedLoop {
+                filter: None,
+                rows,
+                outer: Box::new(node),
+                inner: Box::new(inner),
+            };
+        }
+        node
+    };
+    // 2. WHERE → residual filter (the index cond is shown separately).
+    if let Some(w) = &stmt.where_ {
+        node.set_filter(format!("{:?}", w));
+    }
+    // 3. Aggregation / DISTINCT.
+    if is_agg_query(stmt) {
+        let rows = if stmt.group_by.is_empty() {
+            1
+        } else {
+            node.rows()
+        };
+        node = PlanNode::Aggregate {
+            rows,
+            child: Box::new(node),
+        };
+    } else if stmt.distinct {
+        let rows = node.rows();
+        node = PlanNode::Unique {
+            rows,
+            child: Box::new(node),
+        };
+    }
+    // 4. ORDER BY → Sort, unless the index-order scan provides it.
+    if !stmt.order_by.is_empty() && !ordered {
+        let keys = stmt
+            .order_by
+            .iter()
+            .map(order_term_text)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = node.rows();
+        node = PlanNode::Sort {
+            keys,
+            rows,
+            child: Box::new(node),
+        };
+    }
+    // 5. OFFSET / LIMIT.
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        let n = match (stmt.offset, stmt.limit) {
+            (Some(o), Some(l)) => format!("{} OFFSET {}", l, o),
+            (Some(o), None) => format!("ALL OFFSET {}", o),
+            (None, Some(l)) => format!("{}", l),
+            (None, None) => unreachable!(),
+        };
+        let mut rows = node.rows();
+        if let Some(l) = stmt.limit {
+            rows = rows.min(l.max(0) as u64);
+        }
+        node = PlanNode::Limit {
+            n,
+            rows,
+            child: Box::new(node),
+        };
+    }
+    Ok(node)
+}
+
+fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
+    let pad = "  ".repeat(depth);
+    match node {
+        PlanNode::Result { rows, filter } => {
+            out.push(format!("{}Result (rows={})", pad, rows));
+            if let Some(f) = filter {
+                out.push(format!("{}  Filter: {}", pad, f));
+            }
+        }
+        PlanNode::SeqScan {
+            table,
+            filter,
+            rows,
+        } => {
+            out.push(format!("{}Seq Scan on {} (rows={})", pad, table, rows));
+            if let Some(f) = filter {
+                out.push(format!("{}  Filter: {}", pad, f));
+            }
+        }
+        PlanNode::IndexScan {
+            table,
+            index,
+            cond,
+            filter,
+            rows,
+        } => {
+            out.push(format!(
+                "{}Index Scan using {} on {} (rows={})",
+                pad, index, table, rows
+            ));
+            out.push(format!("{}  Index Cond: {}", pad, cond));
+            if let Some(f) = filter {
+                out.push(format!("{}  Filter: {}", pad, f));
+            }
+        }
+        PlanNode::IndexOrderScan {
+            table,
+            index,
+            order,
+            rows,
+        } => {
+            out.push(format!(
+                "{}Index Scan using {} on {} (rows={})",
+                pad, index, table, rows
+            ));
+            out.push(format!("{}  Order: {}", pad, order));
+        }
+        PlanNode::NestedLoop {
+            filter,
+            rows,
+            outer,
+            inner,
+        } => {
+            out.push(format!("{}Nested Loop (rows={})", pad, rows));
+            if let Some(f) = filter {
+                out.push(format!("{}  Filter: {}", pad, f));
+            }
+            render_plan(outer, depth + 1, out);
+            render_plan(inner, depth + 1, out);
+        }
+        PlanNode::Aggregate { rows, child } => {
+            out.push(format!("{}Aggregate (rows={})", pad, rows));
+            render_plan(child, depth + 1, out);
+        }
+        PlanNode::Unique { rows, child } => {
+            out.push(format!("{}Unique (rows={})", pad, rows));
+            render_plan(child, depth + 1, out);
+        }
+        PlanNode::Sort { keys, rows, child } => {
+            out.push(format!("{}Sort (rows={})", pad, rows));
+            out.push(format!("{}  Sort Key: {}", pad, keys));
+            render_plan(child, depth + 1, out);
+        }
+        PlanNode::Limit { n, rows, child } => {
+            out.push(format!("{}Limit {} (rows={})", pad, n, rows));
+            render_plan(child, depth + 1, out);
+        }
+        PlanNode::SubqueryScan { alias, rows, child } => {
+            out.push(format!("{}Subquery Scan on {} (rows={})", pad, alias, rows));
+            render_plan(child, depth + 1, out);
+        }
+    }
+}
+
+fn exec_explain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    stmt: &Stmt,
+) -> Result<ExecResult, ExecError> {
+    let sel = match stmt {
+        Stmt::Select(s) => s,
+        _ => {
+            return Err(exec_err(
+                "0A000",
+                "EXPLAIN only supports SELECT statements".to_string(),
+            ));
+        }
+    };
+    // Planning only inspects definitions and statistics — nothing runs.
+    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own)?;
+    let mut lines = Vec::new();
+    render_plan(&plan, 0, &mut lines);
+    Ok(ExecResult::Explain {
+        columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
+        rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
+    })
+}
+
+// --- ANALYZE -----------------------------------------------------------------
+
+/// Compute ANALYZE statistics for one table over the snapshot's visible
+/// rows. Distinct counts are exact (not estimated); the MCV list and
+/// histogram bounds derive from the same pass.
+fn analyze_table(db: &Database, table: &str, snap: &Snapshot, own: u64) -> TableStats {
+    let t = db
+        .find_table(table, snap, own)
+        .expect("table checked visible by caller");
+    let vis: Vec<&RowVersion> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, snap, own))
+        .collect();
+    let total = vis.len() as f64;
+    let mut cols = HashMap::new();
+    for (ci, (cname, _)) in t.columns.iter().enumerate() {
+        let mut nulls = 0u64;
+        let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
+        for r in &vis {
+            let v = &r.values[ci];
+            if matches!(v, Value::Null) {
+                nulls += 1;
+                continue;
+            }
+            let mut k = Vec::new();
+            value_key(v, &mut k);
+            let e = counts.entry(k).or_insert_with(|| (v.clone(), 0));
+            e.1 += 1;
+        }
+        // Most common values: top 100 by count (ties by index order).
+        let mut by_freq: Vec<(Value, u64)> =
+            counts.values().map(|(v, c)| (v.clone(), *c)).collect();
+        by_freq.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| index_key_cmp(&a.0, &b.0))
+        });
+        let mcv: Vec<(Value, f64)> = by_freq
+            .iter()
+            .take(100)
+            .map(|(v, c)| {
+                (
+                    v.clone(),
+                    if total > 0.0 { *c as f64 / total } else { 0.0 },
+                )
+            })
+            .collect();
+        // Histogram bounds: up to 101 evenly spaced distinct values in
+        // index order (5 and 5.0 merge — index ordering, not byte order).
+        let mut distinct: Vec<Value> =
+            counts.values().map(|(v, _)| v.clone()).collect();
+        distinct.sort_by(index_key_cmp);
+        distinct.dedup_by(|a, b| index_key_cmp(a, b) == Ordering::Equal);
+        let n_distinct = distinct.len() as f64;
+        let hist_bounds: Vec<Value> = if distinct.len() <= 101 {
+            distinct
+        } else {
+            (0..101)
+                .map(|i| distinct[i * (distinct.len() - 1) / 100].clone())
+                .collect()
+        };
+        cols.insert(
+            cname.clone(),
+            ColStats {
+                null_frac: if total > 0.0 {
+                    nulls as f64 / total
+                } else {
+                    0.0
+                },
+                n_distinct,
+                mcv,
+                hist_bounds,
+            },
+        );
+    }
+    TableStats {
+        reltuples: total,
+        cols,
+    }
+}
+
+fn exec_analyze(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    let names: Vec<String> = match table {
+        Some(n) => {
+            if eng.db.find_table(n, ctx.snap, ctx.own).is_none() {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", n),
+                ));
+            }
+            vec![n.clone()]
+        }
+        None => eng
+            .db
+            .tables
+            .keys()
+            .filter(|n| eng.db.find_table(n, ctx.snap, ctx.own).is_some())
+            .cloned()
+            .collect(),
+    };
+    // Statistics are not transactional (like Postgres): they are computed
+    // and stored without write ops.
+    for n in names {
+        let stats = analyze_table(&eng.db, &n, ctx.snap, ctx.own);
+        eng.db.stats.insert(n, stats);
+    }
+    Ok(ExecResult::Command {
+        tag: "ANALYZE".to_string(),
+    })
+}
+
+/// The pg_stats system catalog table (virtual): one row per analyzed table
+/// column. A real table named pg_stats takes precedence (checked by the
+/// caller).
+fn pg_stats_schema() -> Vec<QCol> {
+    [
+        ("schemaname", ColType::Text),
+        ("tablename", ColType::Text),
+        ("attname", ColType::Text),
+        ("null_frac", ColType::Float),
+        ("n_distinct", ColType::Float),
+        ("most_common_vals", ColType::Text),
+        ("most_common_freqs", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_stats".to_string(),
+        name: n.to_string(),
+        ty,
+    })
+    .collect()
+}
+
+fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_stats_schema();
+    let mut table_names: Vec<&String> = db.stats.keys().collect();
+    table_names.sort();
+    let mut rows = Vec::new();
+    for tn in table_names {
+        let ts = &db.stats[tn];
+        let mut col_names: Vec<&String> = ts.cols.keys().collect();
+        col_names.sort();
+        for cn in col_names {
+            let cs = &ts.cols[cn];
+            let vals = cs
+                .mcv
+                .iter()
+                .map(|(v, _)| value_to_text_cast(v))
+                .collect::<Vec<_>>()
+                .join(",");
+            let freqs = cs
+                .mcv
+                .iter()
+                .map(|(_, f)| format!("{:.4}", f))
+                .collect::<Vec<_>>()
+                .join(",");
+            rows.push(QRow {
+                cells: vec![
+                    Value::Text("public".to_string()),
+                    Value::Text((*tn).clone()),
+                    Value::Text((*cn).clone()),
+                    Value::Float(cs.null_frac),
+                    Value::Float(cs.n_distinct),
+                    Value::Text(format!("{{{}}}", vals)),
+                    Value::Text(format!("{{{}}}", freqs)),
+                ],
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +2400,32 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
     // Column metadata first, so names/types are identical between
     // Describe and execution.
     let out_cols = describe_select(&*q.eng, q.snap, q.own, stmt)?;
-    let (schema, rows) = build_from(q, outer, &stmt.from, stmt.where_.as_ref(), stmt.for_update)?;
+    // v0.8: when the whole query is a plain single-table SELECT whose
+    // ORDER BY matches an index, rows stream out of the index in ORDER BY
+    // order and the sort step below is skipped.
+    let order_hint = plan_order_scan(&*q.eng, q.snap, q.own, stmt);
+    // v0.8: OFFSET+LIMIT row budget lets the index-order scan stop as
+    // soon as enough visible rows are collected. Safe only together
+    // with the order hint: there is no residual filter, DISTINCT, or
+    // aggregation between the scan and the final truncation.
+    let early_limit = order_hint.as_ref().and(match (stmt.offset, stmt.limit) {
+        (_, Some(l)) => Some(
+            stmt.offset
+                .unwrap_or(0)
+                .max(0)
+                .saturating_add(l.max(0)) as usize,
+        ),
+        _ => None,
+    });
+    let (schema, rows) = build_from(
+        q,
+        outer,
+        &stmt.from,
+        stmt.where_.as_ref(),
+        stmt.for_update,
+        order_hint.as_ref(),
+        early_limit,
+    )?;
     let rows = apply_where(q, outer, &schema, rows, stmt.where_.as_ref())?;
     let agg = is_agg_query(stmt);
     // Non-aggregated queries with ORDER BY keep the full row around: an
@@ -1032,7 +2464,7 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
             seen.insert(k)
         });
     }
-    if !stmt.order_by.is_empty() {
+    if !stmt.order_by.is_empty() && order_hint.is_none() {
         apply_order(q, outer, stmt, &schema, &out_cols, &mut orows)?;
     }
     if let Some(n) = stmt.offset {
@@ -1249,6 +2681,12 @@ fn build_from(
     from: &[FromItem],
     where_: Option<&Expr>,
     need_prov: bool,
+    // v0.8: index-order scan hint for the single-table fast path; always
+    // None when `from` has more than one item.
+    order_hint: Option<&OrderHint>,
+    // v0.8: OFFSET+LIMIT row budget for early termination of the
+    // index-order scan (only meaningful together with `order_hint`).
+    early_limit: Option<usize>,
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     if from.is_empty() {
         // No FROM: exactly one empty row (SELECT 1, SELECT count(*), ...).
@@ -1259,7 +2697,7 @@ fn build_from(
         // its rows in place and return them untouched, without the
         // per-row cells/prov rebuild the general loop below performs.
         // (Identical to one loop iteration with an empty accumulator.)
-        let (s2, r2) = build_source(q, outer, &from[0], where_, need_prov)?;
+        let (s2, r2) = build_source(q, outer, &from[0], where_, need_prov, order_hint, early_limit)?;
         let quals: HashSet<String> = s2.iter().map(|c| c.qual.clone()).collect();
         let no_quals = HashSet::new();
         let push = pushdown_for(where_, &quals, &no_quals, &s2, &[]);
@@ -1269,7 +2707,7 @@ fn build_from(
     let mut acc_schema: Vec<QCol> = Vec::new();
     let mut acc_rows = vec![QRow::default()];
     for item in from {
-        let (s2, mut r2) = build_source(q, outer, item, where_, need_prov)?;
+        let (s2, mut r2) = build_source(q, outer, item, where_, need_prov, None, None)?;
         // Comma joins are inner joins: a WHERE conjunct that mentions only
         // this item's columns can filter its rows before the cross product.
         // (Qualified refs must name a qualifier from this item and from no
@@ -1580,10 +3018,30 @@ fn build_source(
     // pass can lock them. Otherwise provenance stays empty and costs
     // nothing per row.
     need_prov: bool,
+    // v0.8: when the whole query is a plain single-table SELECT whose
+    // ORDER BY matches an index, the table streams out of the index in
+    // ORDER BY order and run_select skips the sort. Only ever set on the
+    // fast path (single FROM item).
+    order_hint: Option<&OrderHint>,
+    // v0.8: row budget for early termination of the index-order scan.
+    early_limit: Option<usize>,
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     match item {
         FromItem::Table { name, alias } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // v0.8: the pg_stats system catalog is virtual — a real table
+            // by that name takes precedence.
+            if name == "pg_stats" && q.eng.db.find_table(name, q.snap, q.own).is_none() {
+                let schema: Vec<QCol> = pg_stats_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_stats_scan(&q.eng.db);
+                return Ok((schema, rows));
+            }
             // Borrow ends before any recursive call below: everything is
             // cloned out of the table.
             let (schema, rows) = {
@@ -1599,19 +3057,70 @@ fn build_source(
                         ty: ty.clone(),
                     })
                     .collect();
-                let rows: Vec<QRow> = t
-                    .rows
-                    .iter()
-                    .filter(|r| row_visible(r, q.snap, q.own))
-                    .map(|r| QRow {
-                        cells: r.values.clone(),
-                        prov: if need_prov {
-                            vec![(name.clone(), r.id)]
-                        } else {
-                            Vec::new()
-                        },
-                    })
-                    .collect();
+                // v0.8: the planner may replace the sequential scan with
+                // an index scan (WHERE bounds on a leading index prefix)
+                // or an index-order scan (ORDER BY). Either way the full
+                // residual predicate and MVCC visibility are still
+                // applied afterwards, so a plan only ever costs speed.
+                let db = &q.eng.db;
+                let snap = q.snap;
+                let own = q.own;
+                let rows: Vec<QRow> = if let Some(hint) = order_hint {
+                    let ix = db.indexes.get(&hint.index).expect(
+                        "planned index still present; engine lock held throughout",
+                    );
+                    index_order_rows(ix, t, name, hint.desc, snap, own, need_prov, early_limit)
+                } else {
+                    match plan_access_path(db, t, name, &qual, where_, snap, own) {
+                        AccessPath::SeqScan => t
+                            .rows
+                            .iter()
+                            .filter(|r| row_visible(r, snap, own))
+                            .map(|r| QRow {
+                                cells: r.values.clone(),
+                                prov: if need_prov {
+                                    vec![(name.clone(), r.id)]
+                                } else {
+                                    Vec::new()
+                                },
+                            })
+                            .collect(),
+                        AccessPath::IndexScan {
+                            index,
+                            prefix,
+                            lo,
+                            hi,
+                            ..
+                        } => {
+                            let ix = db.indexes.get(&index).expect(
+                                "planned index still present; engine lock held throughout",
+                            );
+                            let ids = index_scan_ids(
+                                ix,
+                                &prefix,
+                                lo.as_ref().map(|(v, b)| (v, *b)),
+                                hi.as_ref().map(|(v, b)| (v, *b)),
+                            );
+                            let mut rows = Vec::with_capacity(ids.len());
+                            for id in ids {
+                                if let Some(pos) = t.row_pos(id) {
+                                    let r = &t.rows[pos];
+                                    if row_visible(r, snap, own) {
+                                        rows.push(QRow {
+                                            cells: r.values.clone(),
+                                            prov: if need_prov {
+                                                vec![(name.clone(), r.id)]
+                                            } else {
+                                                Vec::new()
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                            rows
+                        }
+                    }
+                };
                 (schema, rows)
             };
             Ok((schema, rows))
@@ -1654,8 +3163,8 @@ fn build_source(
             right,
             on,
         } => {
-            let (lschema, lrows) = build_source(q, outer, left, where_, need_prov)?;
-            let (rschema, rrows) = build_source(q, outer, right, where_, need_prov)?;
+            let (lschema, lrows) = build_source(q, outer, left, where_, need_prov, None, None)?;
+            let (rschema, rrows) = build_source(q, outer, right, where_, need_prov, None, None)?;
             let mut schema = Vec::with_capacity(lschema.len() + rschema.len());
             schema.extend(lschema.iter().cloned());
             schema.extend(rschema.iter().cloned());
@@ -4488,6 +5997,20 @@ fn from_schema_item(
 ) -> Result<(), ExecError> {
     match item {
         FromItem::Table { name, alias } => {
+            // v0.8: the pg_stats system catalog is virtual — a real table
+            // by that name takes precedence.
+            if name == "pg_stats" && eng.db.find_table(name, snap, own).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_stats_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(schema);
+                return Ok(());
+            }
             let t = eng.db.find_table(name, snap, own).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", name))
             })?;
@@ -5634,7 +7157,7 @@ mod tests {
 
     fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
         match r {
-            ExecResult::Select { rows, .. } => rows
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
                 .into_iter()
                 .map(|row| {
                     row.into_iter()

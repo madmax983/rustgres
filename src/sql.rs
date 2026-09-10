@@ -714,6 +714,26 @@ pub enum Stmt {
         table: Option<String>,
         verbose: bool,
     },
+    // --- v0.8: secondary indexes
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
+    // --- v0.8: EXPLAIN (planned, never executed)
+    Explain {
+        stmt: Box<Stmt>,
+    },
+    // --- v0.8: ANALYZE (statistics collection)
+    Analyze {
+        table: Option<String>,
+    },
 }
 
 /// Transaction isolation level (v0.5). `READ UNCOMMITTED` is accepted and
@@ -741,6 +761,7 @@ impl Stmt {
                 m
             }
             Stmt::Select(sel) => max_param_select(sel),
+            Stmt::Explain { stmt } => stmt.max_param(),
             Stmt::Update { sets, where_, .. } => {
                 let mut m = 0;
                 for (_, e) in sets {
@@ -1004,6 +1025,12 @@ impl Parser {
             Token::Ident(s) => s,
             other => return Err(err(format!("syntax error: unexpected {:?}", other))),
         };
+        self.parse_top_kw(kw)
+    }
+
+    /// Dispatch on an already-consumed leading keyword. Split out so
+    /// EXPLAIN can recurse into it for the explained statement.
+    fn parse_top_kw(&mut self, kw: String) -> Result<Stmt, SqlError> {
         match kw.as_str() {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
@@ -1047,6 +1074,39 @@ impl Parser {
                 Ok(Stmt::Release {
                     name: self.expect_ident()?,
                 })
+            }
+            // --- v0.8: EXPLAIN / ANALYZE
+            "explain" => {
+                if self.eat_keyword("analyze") {
+                    return Err(SqlError {
+                        message: "EXPLAIN ANALYZE is not supported yet".to_string(),
+                        code: "0A000",
+                    });
+                }
+                let inner_kw = match self.next() {
+                    Token::Ident(s) => s,
+                    other => {
+                        return Err(err(format!("syntax error: unexpected {:?}", other)));
+                    }
+                };
+                let inner = self.parse_top_kw(inner_kw)?;
+                match inner {
+                    Stmt::Select(_) => Ok(Stmt::Explain {
+                        stmt: Box::new(inner),
+                    }),
+                    _ => Err(err("EXPLAIN only supports SELECT statements".to_string())),
+                }
+            }
+            "analyze" => {
+                // ANALYZE [table]
+                let table = match self.peek() {
+                    Token::EOF => None,
+                    Token::Ident(_) => Some(self.expect_ident()?),
+                    other => {
+                        return Err(err(format!("syntax error: unexpected {:?}", other)));
+                    }
+                };
+                Ok(Stmt::Analyze { table })
             }
             _ => Err(err(format!("syntax error at or near \"{}\"", kw))),
         }
@@ -1158,6 +1218,45 @@ impl Parser {
     }
 
     fn parse_create(&mut self) -> Result<Stmt, SqlError> {
+        // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
+        let unique = self.eat_keyword("unique");
+        if self.eat_keyword("index") {
+            let if_not_exists = if self.eat_keyword("if") {
+                self.expect_keyword("not")?;
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.expect_ident()?;
+            self.expect_keyword("on")?;
+            let table = self.expect_ident()?;
+            self.expect(Token::LParen, "'('")?;
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_ident()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            if columns.is_empty() {
+                return Err(err("syntax error: index requires at least one column".to_string()));
+            }
+            return Ok(Stmt::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+            });
+        }
         self.expect_keyword("table")?;
         let name = self.expect_ident()?;
         self.expect(Token::LParen, "'('")?;
@@ -2247,6 +2346,16 @@ impl Parser {
     }
 
     fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        if self.eat_keyword("index") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.expect_ident()?;
+            return Ok(Stmt::DropIndex { name, if_exists });
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;

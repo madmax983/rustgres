@@ -444,6 +444,63 @@ def w_expr(conn, seconds):
     return res
 
 
+def w_idxscan(conn, seconds):
+    """v0.8: indexed vs sequential access paths on a 50k-row table."""
+    conn.simple("DROP TABLE IF EXISTS bench_idx")
+    r = conn.simple("CREATE TABLE bench_idx(id INT, grp INT, name TEXT)")
+    assert tag_of(r) == "CREATE TABLE"
+    rows = []
+    for i in range(50000):
+        rows.append(f"({i},{i % 100},'name{i}')")
+    for j in range(0, len(rows), 1000):
+        chunk = ",".join(rows[j:j + 1000])
+        r = conn.simple(f"INSERT INTO bench_idx VALUES {chunk}")
+        assert tag_of(r) == f"INSERT 0 {min(1000, len(rows) - j)}", tag_of(r)
+    r = conn.simple("CREATE INDEX bench_idx_id ON bench_idx(id)")
+    assert tag_of(r) == "CREATE INDEX"
+
+    import random
+    random.seed(42)
+
+    def op_point_idx():
+        i = random.randrange(50000)
+        msgs = conn.simple(f"SELECT * FROM bench_idx WHERE id = {i}")
+        assert tag_of(msgs) == "SELECT 1", tag_of(msgs)
+
+    def op_range_idx():
+        lo = random.randrange(49000)
+        msgs = conn.simple(f"SELECT * FROM bench_idx WHERE id BETWEEN {lo} AND {lo + 999}")
+        assert tag_of(msgs) == "SELECT 1000", tag_of(msgs)
+
+    def op_order_idx():
+        msgs = conn.simple("SELECT * FROM bench_idx ORDER BY id LIMIT 10")
+        assert tag_of(msgs) == "SELECT 10", tag_of(msgs)
+
+    res_point = measure(op_point_idx, seconds)
+    res_range = measure(op_range_idx, seconds)
+    res_order = measure(op_order_idx, seconds)
+
+    # same lookups without the index
+    conn.simple("DROP INDEX bench_idx_id")
+
+    def op_point_seq():
+        i = random.randrange(50000)
+        msgs = conn.simple(f"SELECT * FROM bench_idx WHERE id = {i}")
+        assert tag_of(msgs) == "SELECT 1", tag_of(msgs)
+
+    res_seq = measure(op_point_seq, seconds)
+    conn.simple("DROP TABLE bench_idx")
+
+    res = res_point
+    res["note"] = (
+        "50k rows; point lookup qps idx=%.0f vs seq=%.0f (%.1fx); "
+        "range-1000 idx=%.0f qps; order-limit-10 idx=%.0f qps" % (
+            res_point["qps"], res_seq["qps"],
+            res_point["qps"] / res_seq["qps"] if res_seq["qps"] else 0,
+            res_range["qps"], res_order["qps"]))
+    return res
+
+
 WORKLOADS = {
     "select1": ("simple-query SELECT 1", w_select1),
     "expr": ("expression-heavy SELECT (v0.7 types/ops/built-ins)", w_expr),
@@ -453,6 +510,7 @@ WORKLOADS = {
     "txn": ("BEGIN + INSERT + COMMIT loop", w_txn),
     "mvcc": ("concurrent MVCC txn loop (4 threads)", w_mvcc),
     "join": ("filtered JOIN + GROUP BY (2k x 20k)", w_join),
+    "idxscan": ("indexed vs sequential point/range/order scans (50k rows)", w_idxscan),
 }
 
 

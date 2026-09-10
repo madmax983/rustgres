@@ -23,6 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::index::{Index, IndexDef, IndexKey};
+
 /// Column data types supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
@@ -741,12 +743,21 @@ impl Table {
 #[derive(Clone, Debug)]
 pub struct Database {
     pub tables: HashMap<String, Vec<Table>>,
+    /// Secondary indexes by index name (v0.8). DDL is transactional: each
+    /// definition carries creator/deleter xids, and entries for
+    /// uncommitted row versions are filtered by visibility at scan time.
+    pub indexes: HashMap<String, Index>,
+    /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
+    /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
+    pub stats: HashMap<String, TableStats>,
 }
 
 impl Database {
     pub fn new() -> Self {
         Database {
             tables: HashMap::new(),
+            indexes: HashMap::new(),
+            stats: HashMap::new(),
         }
     }
 
@@ -789,6 +800,167 @@ impl Database {
         }
         None
     }
+
+    // -- v0.8: secondary index maintenance -------------------------------
+
+    /// Index definition visible to (`snap`, `own`), if any.
+    pub fn find_index(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Index> {
+        self.indexes
+            .get(name)
+            .filter(|ix| index_visible(&ix.def, snap, own))
+    }
+
+    /// Mutable twin of [`Database::find_index`].
+    pub fn find_index_mut(
+        &mut self,
+        name: &str,
+        snap: &Snapshot,
+        own: u64,
+    ) -> Option<&mut Index> {
+        self.indexes
+            .get_mut(name)
+            .filter(|ix| index_visible(&ix.def, snap, own))
+    }
+
+    /// All index definitions on `table` visible to (`snap`, `own`),
+    /// sorted by name for determinism.
+    pub fn visible_indexes_for(&self, table: &str, snap: &Snapshot, own: u64) -> Vec<&Index> {
+        let mut out: Vec<&Index> = self
+            .indexes
+            .values()
+            .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, own))
+            .collect();
+        out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+        out
+    }
+
+    /// Insert entries for one row version into every live (not dropped)
+    /// index on `table`. Called for INSERT and for the new version of an
+    /// UPDATE — including uncommitted versions, whose entries are filtered
+    /// by visibility at scan time (PostgreSQL does the same).
+    pub fn index_insert_row(&mut self, table: &str, row_id: u64, values: &[Value]) {
+        let targets: Vec<(String, Vec<usize>)> = self
+            .indexes
+            .values()
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .collect();
+        for (name, cols) in targets {
+            let key = IndexKey(cols.iter().map(|&c| values[c].clone()).collect());
+            if let Some(ix) = self.indexes.get_mut(&name) {
+                ix.insert(key, row_id);
+            }
+        }
+    }
+
+    /// Remove one row version's entries from every live index on `table`.
+    /// Called when a version disappears entirely: ROLLBACK of an INSERT
+    /// and VACUUM of dead versions. (DELETE/UPDATE keep the entry — the
+    /// version still exists, just invisibly.)
+    pub fn index_remove_row(&mut self, table: &str, row_id: u64, values: &[Value]) {
+        let targets: Vec<(String, Vec<usize>)> = self
+            .indexes
+            .values()
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .collect();
+        for (name, cols) in targets {
+            let key = IndexKey(cols.iter().map(|&c| values[c].clone()).collect());
+            if let Some(ix) = self.indexes.get_mut(&name) {
+                ix.remove(&key, row_id);
+            }
+        }
+    }
+
+    /// Unique-violation check for an INSERT/UPDATE of `values` into
+    /// `table`. Returns the name of the violated unique index, if any.
+    /// A conflicting entry only counts when its row version is *alive*
+    /// for us: our own uncommitted version, or a version visible in our
+    /// snapshot. Deleted or invisible versions are ignored — like a
+    /// Postgres unique check, which consults the heap. NULL key parts
+    /// never conflict (PostgreSQL semantics). `exclude_row_id` skips one
+    /// row id (the UPDATE old version, already marked deleted by us).
+    pub fn unique_violation(
+        &self,
+        table: &str,
+        values: &[Value],
+        exclude_row_id: Option<u64>,
+        snap: &Snapshot,
+        own: u64,
+    ) -> Option<String> {
+        let t = self.find_table(table, snap, own)?;
+        for ix in self.visible_indexes_for(table, snap, own) {
+            if !ix.def.unique {
+                continue;
+            }
+            let key = ix.key_for(values);
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict
+            }
+            let Some(bucket) = ix.tree.get(&key) else {
+                continue;
+            };
+            for &id in bucket {
+                if Some(id) == exclude_row_id {
+                    continue;
+                }
+                let alive = match t.row_pos(id) {
+                    Some(pos) => {
+                        let r = &t.rows[pos];
+                        if r.xmax == own {
+                            false // deleted by us: not a conflict
+                        } else {
+                            r.xmin == own || row_visible(r, snap, own)
+                        }
+                    }
+                    None => false, // vacuumed away: cannot conflict
+                };
+                if alive {
+                    return Some(ix.def.name.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Index DDL visibility: like a table version, but definitions are stored
+/// flat (one live definition per name at a time — enforced at commit).
+fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
+    let created_ok = def.created_xmin == own
+        || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
+    if !created_ok {
+        return false;
+    }
+    if def.dropped_xmax == 0 {
+        return true;
+    }
+    if def.dropped_xmax == own {
+        return false;
+    }
+    !(def.dropped_xmax < snap.next_xid && !snap.active.contains(&def.dropped_xmax))
+}
+
+/// Per-column statistics from ANALYZE (v0.8).
+#[derive(Clone, Debug, Default)]
+pub struct ColStats {
+    /// Fraction of NULL values, 0.0..=1.0.
+    pub null_frac: f64,
+    /// Estimated number of distinct non-null values.
+    pub n_distinct: f64,
+    /// Most common values with their frequencies: (value, frac).
+    pub mcv: Vec<(Value, f64)>,
+    /// Sorted distinct-value bounds for range selectivity (a coarse
+    /// histogram: consecutive pairs bracket ~equal row counts).
+    pub hist_bounds: Vec<Value>,
+}
+
+/// Per-table statistics from ANALYZE (v0.8).
+#[derive(Clone, Debug, Default)]
+pub struct TableStats {
+    /// Estimated live row count.
+    pub reltuples: f64,
+    pub cols: HashMap<String, ColStats>,
 }
 
 /// A transaction's consistent view: the xids active when it was taken plus
@@ -955,8 +1127,14 @@ impl Engine {
         // Borrow the manager immutably for the dead-to-all test while the
         // table versions are borrowed mutably: the two are disjoint.
         let txns = &self.txns;
+        // Collect (id, values) of the dead versions first: index cleanup
+        // needs each version's key, hence its values.
+        let mut dead: Vec<(u64, Vec<Value>)> = Vec::new();
         if let Some(versions) = self.db.tables.get_mut(name) {
             for t in versions {
+                for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
+                    dead.push((v.id, v.values.clone()));
+                }
                 let before = t.rows.len();
                 t.rows.retain(|v| !version_dead_to_all(txns, v));
                 let gone = before - t.rows.len();
@@ -965,6 +1143,9 @@ impl Engine {
                 }
                 removed += gone;
             }
+        }
+        for (id, values) in &dead {
+            self.db.index_remove_row(name, *id, values);
         }
         removed
     }
@@ -1060,6 +1241,15 @@ pub enum WriteOp {
         name: String,
         prev_xmax: u64,
     },
+    // --- v0.8: index DDL. DropIndex carries the whole index so undo can
+    // restore the definition and its entries exactly.
+    CreateIndex {
+        name: String,
+    },
+    DropIndex {
+        name: String,
+        index: Index,
+    },
 }
 
 /// Undo a single write op. Each undo is conditional on the version still
@@ -1069,15 +1259,29 @@ pub enum WriteOp {
 pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
     match op {
         WriteOp::InsertRow { table, row_id } => {
-            if let Some(versions) = eng.db.tables.get_mut(table) {
-                for t in versions {
-                    if let Some(pos) = t.row_pos(*row_id) {
-                        if t.rows[pos].xmin == own {
-                            t.swap_remove_version(pos);
+            // Two phases: removing the version borrows the table mutably,
+            // and the index cleanup needs `eng.db` mutably too — so the
+            // values are cloned and the table borrow is dropped first.
+            // (DELETE/UPDATE never remove entries, so undoing an insert is
+            // the only DML case that touches the index.)
+            let removed: Option<Vec<Value>> =
+                if let Some(versions) = eng.db.tables.get_mut(table) {
+                    let mut out = None;
+                    for t in versions.iter_mut() {
+                        if let Some(pos) = t.row_pos(*row_id) {
+                            if t.rows[pos].xmin == own {
+                                out = Some(t.rows[pos].values.clone());
+                                t.swap_remove_version(pos);
+                            }
+                            break;
                         }
-                        break;
                     }
-                }
+                    out
+                } else {
+                    None
+                };
+            if let Some(values) = removed {
+                eng.db.index_remove_row(table, *row_id, &values);
             }
         }
         WriteOp::DeleteRow {
@@ -1106,6 +1310,33 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 if let Some(t) = versions.iter_mut().find(|t| t.dropped_xmax == own) {
                     t.dropped_xmax = *prev_xmax;
                 }
+            }
+        }
+        WriteOp::CreateIndex { name } => {
+            // Undo a CREATE INDEX: drop the definition (and its entries)
+            // iff it is still ours — a concurrent DROP INDEX of the same
+            // name owns it now.
+            let ours = eng
+                .db
+                .indexes
+                .get(name)
+                .map(|ix| ix.def.created_xmin == own)
+                .unwrap_or(false);
+            if ours {
+                eng.db.indexes.remove(name);
+            }
+        }
+        WriteOp::DropIndex { name, index } => {
+            // Undo a DROP INDEX: restore the definition and entries iff
+            // the drop is still ours.
+            let ours = eng
+                .db
+                .indexes
+                .get(name)
+                .map(|ix| ix.def.dropped_xmax == own)
+                .unwrap_or(false);
+            if ours {
+                eng.db.indexes.insert(name.clone(), index.clone());
             }
         }
     }

@@ -39,6 +39,8 @@ struct Portal {
     pending: Option<PendingRows>,
     done: bool,
     last_tag: Option<String>,
+    /// v0.8: the portal ran EXPLAIN — its completion tag is "EXPLAIN".
+    explain: bool,
 }
 
 struct PendingRows {
@@ -332,6 +334,13 @@ fn handle_query(
                     .cstr(&format!("SELECT {}", rows.len()))
                     .send(stream)?;
             }
+            Ok(ExecResult::Explain { columns, rows }) => {
+                send_row_description(stream, &columns)?;
+                for row in &rows {
+                    send_data_row(stream, row)?;
+                }
+                MsgBuilder::new(b'C').cstr("EXPLAIN").send(stream)?;
+            }
             Ok(ExecResult::Command { tag }) => {
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
@@ -584,7 +593,10 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             // versions; inserts and creates never do.
             WriteOp::DeleteRow { table, .. } => table.as_str(),
             WriteOp::DropTable { name, .. } => name.as_str(),
-            WriteOp::InsertRow { .. } | WriteOp::CreateTable { .. } => continue,
+            WriteOp::InsertRow { .. }
+            | WriteOp::CreateTable { .. }
+            | WriteOp::CreateIndex { .. }
+            | WriteOp::DropIndex { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);
@@ -1012,6 +1024,7 @@ fn handle_bind(
             pending: None,
             done: false,
             last_tag: None,
+            explain: false,
         },
     );
     MsgBuilder::new(b'2').send(stream)?; // BindComplete
@@ -1193,6 +1206,13 @@ fn handle_execute(
                 session.portals.get_mut(&portal_name).unwrap().pending =
                     Some(PendingRows { rows, pos: 0 });
             }
+            // EXPLAIN rows are cached like SELECT rows; only the final
+            // tag differs (set when the portal completes below).
+            Ok(ExecResult::Explain { rows, .. }) => {
+                session.portals.get_mut(&portal_name).unwrap().pending =
+                    Some(PendingRows { rows, pos: 0 });
+                session.portals.get_mut(&portal_name).unwrap().explain = true;
+            }
             Ok(ExecResult::Command { tag }) => {
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
                 let portal = session.portals.get_mut(&portal_name).unwrap();
@@ -1221,7 +1241,12 @@ fn handle_execute(
         MsgBuilder::new(b's').send(stream)?; // PortalSuspended
     } else {
         let total = pending.rows.len();
-        let tag = format!("SELECT {}", total);
+        // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
+        let tag = if portal.explain {
+            "EXPLAIN".to_string()
+        } else {
+            format!("SELECT {}", total)
+        };
         MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
         portal.pending = None;
         portal.done = true;

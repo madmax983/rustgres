@@ -18,11 +18,10 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 3 (`RGSWAL03` / `RGSCHK03`) is NOT compatible with v0.6
-//! files: v0.7 refuses to start on a v0.6 data directory with a clear
-//! error instead of misreading it. v0.7 adds column types and value
-//! tags for smallint, bigint, real, numeric, date, timestamp,
-//! timestamptz, bytea, and uuid.
+//! Format version 4 (`RGSWAL04` / `RGSCHK04`) is NOT compatible with v0.7
+//! files: v0.8 refuses to start on a v0.7 data directory with a clear
+//! error instead of misreading it. v0.8 adds index DDL records and
+//! serializes index definitions + entries in checkpoints.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -115,16 +114,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::index::{Index, IndexDef};
 use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK03";
-const CHKPT_VERSION: u32 = 3;
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK04";
+const CHKPT_VERSION: u32 = 4;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL03";
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL04";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -237,6 +237,20 @@ pub enum WalRecord {
     DeleteRows {
         table: String,
         ids: Vec<u64>,
+        xmax: u64,
+    },
+    // --- v0.8: index DDL. Index *contents* need no records: replay
+    // rebuilds them from the row records (CreateIndex scans the table;
+    // InsertRows maintains live indexes), and checkpoints serialize them.
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+        xmin: u64,
+    },
+    DropIndex {
+        name: String,
         xmax: u64,
     },
 }
@@ -421,6 +435,28 @@ impl Enc {
                 }
                 self.u64(*xmax);
             }
+            WalRecord::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                xmin,
+            } => {
+                self.u8(5);
+                self.str(name);
+                self.str(table);
+                self.u32(columns.len() as u32);
+                for c in columns {
+                    self.str(c);
+                }
+                self.u8(*unique as u8);
+                self.u64(*xmin);
+            }
+            WalRecord::DropIndex { name, xmax } => {
+                self.u8(6);
+                self.str(name);
+                self.u64(*xmax);
+            }
         }
     }
 }
@@ -601,6 +637,29 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DeleteRows { table, ids, xmax })
             }
+            5 => {
+                let name = self.str()?;
+                let table = self.str()?;
+                let n = self.u32()? as usize;
+                let mut columns = Vec::with_capacity(n);
+                for _ in 0..n {
+                    columns.push(self.str()?);
+                }
+                let unique = self.u8()? != 0;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateIndex {
+                    name,
+                    table,
+                    columns,
+                    unique,
+                    xmin,
+                })
+            }
+            6 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropIndex { name, xmax })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -638,7 +697,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
     // resume above every id the log ever used even when the record below
     // is skipped as a no-op.
     match r {
-        WalRecord::CreateTable { xmin, .. } | WalRecord::DropTable { xmax: xmin, .. } => {
+        WalRecord::CreateTable { xmin, .. }
+        | WalRecord::DropTable { xmax: xmin, .. }
+        | WalRecord::CreateIndex { xmin, .. }
+        | WalRecord::DropIndex { xmax: xmin, .. } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
@@ -672,27 +734,38 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .push(Table::new(columns.clone(), *xmin));
         }
         WalRecord::InsertRows { table, rows } => {
-            let Some(t) = live_table(eng, table) else {
-                eprintln!(
-                    "WAL replay: skipping InsertRows for \"{}\": no live table version",
-                    table
-                );
-                return Ok(());
-            };
-            for row in rows {
-                if t.rows.iter().any(|r| r.id == row.id) {
+            // Collect the actually-inserted (id, values) first: the index
+            // maintenance below needs `eng` mutably, which conflicts with
+            // the table borrow.
+            let inserted: Vec<(u64, Vec<Value>)> = {
+                let Some(t) = live_table(eng, table) else {
                     eprintln!(
-                        "WAL replay: skipping duplicate row id {} in table \"{}\"",
-                        row.id, table
+                        "WAL replay: skipping InsertRows for \"{}\": no live table version",
+                        table
                     );
-                    continue;
+                    return Ok(());
+                };
+                let mut out = Vec::new();
+                for row in rows {
+                    if t.rows.iter().any(|r| r.id == row.id) {
+                        eprintln!(
+                            "WAL replay: skipping duplicate row id {} in table \"{}\"",
+                            row.id, table
+                        );
+                        continue;
+                    }
+                    t.push_version(RowVersion {
+                        id: row.id,
+                        values: row.values.clone(),
+                        xmin: row.xmin,
+                        xmax: 0,
+                    });
+                    out.push((row.id, row.values.clone()));
                 }
-                t.push_version(RowVersion {
-                    id: row.id,
-                    values: row.values.clone(),
-                    xmin: row.xmin,
-                    xmax: 0,
-                });
+                out
+            };
+            for (id, values) in &inserted {
+                eng.db.index_insert_row(table, *id, values);
             }
         }
         WalRecord::DropTable { name, xmax } => match live_table(eng, name) {
@@ -719,7 +792,58 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     ),
                 }
             }
+            // No index maintenance: the entries stay (visibility filters
+            // them), exactly as in live execution.
         }
+        WalRecord::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            xmin,
+        } => {
+            // Rebuild the index from the table's current rows: at recovery
+            // every row present comes from a committed batch, so indexing
+            // all versions is correct (visibility filters at scan time).
+            let built: Option<Index> = (|| {
+                let t = live_table(eng, table)?;
+                let mut cols = Vec::with_capacity(columns.len());
+                for c in columns {
+                    cols.push(t.column_index(c)?);
+                }
+                let mut ix = Index::new(IndexDef {
+                    name: name.clone(),
+                    table: table.clone(),
+                    cols,
+                    col_names: columns.clone(),
+                    unique: *unique,
+                    created_xmin: *xmin,
+                    dropped_xmax: 0,
+                });
+                for r in &t.rows {
+                    let key = ix.key_for(&r.values);
+                    ix.insert(key, r.id);
+                }
+                Some(ix)
+            })();
+            match built {
+                Some(ix) => {
+                    eng.db.indexes.insert(name.clone(), ix);
+                }
+                None => eprintln!(
+                    "WAL replay: skipping CreateIndex \"{}\": no live table version \
+                     or unknown column",
+                    name
+                ),
+            }
+        }
+        WalRecord::DropIndex { name, xmax } => match eng.db.indexes.get_mut(name) {
+            Some(ix) => ix.def.dropped_xmax = *xmax,
+            None => eprintln!(
+                "WAL replay: skipping DropIndex \"{}\": no such index",
+                name
+            ),
+        },
     }
     Ok(())
 }
@@ -852,6 +976,50 @@ pub fn records_for_commit(
                     xmax: own,
                 });
             }
+            WriteOp::CreateIndex { name } => {
+                let Some(ix) = eng.db.indexes.get(name) else {
+                    i += 1;
+                    continue;
+                };
+                if ix.def.created_xmin != own {
+                    i += 1;
+                    continue;
+                }
+                // First-committer-wins, mirroring CREATE TABLE: a rival
+                // committed live definition means our CREATE lost the race.
+                let rival = eng.db.indexes.values().any(|o| {
+                    o.def.name == *name
+                        && o.def.created_xmin != own
+                        && eng.xid_committed(o.def.created_xmin)
+                        && (o.def.dropped_xmax == 0
+                            || !eng.xid_committed(o.def.dropped_xmax))
+                });
+                if rival {
+                    return Err(format!("relation \"{}\" already exists", name));
+                }
+                out.push(WalRecord::CreateIndex {
+                    name: name.clone(),
+                    table: ix.def.table.clone(),
+                    columns: ix.def.col_names.clone(),
+                    unique: ix.def.unique,
+                    xmin: own,
+                });
+            }
+            WriteOp::DropIndex { name, .. } => {
+                let won = eng
+                    .db
+                    .indexes
+                    .get(name)
+                    .is_some_and(|ix| ix.def.dropped_xmax == own);
+                if !won {
+                    i += 1;
+                    continue; // overwritten by a concurrent drop; theirs wins
+                }
+                out.push(WalRecord::DropIndex {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
         }
         i += 1;
     }
@@ -961,7 +1129,7 @@ impl Wal {
         eng.txns.snapshots.clear();
         let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.7 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v0.8 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
             tables,
             batches,
             records,
@@ -1074,6 +1242,35 @@ impl Wal {
         img.u32(n_versions);
         img.bytes(&body.buf);
 
+        // v0.8: index *definitions*. Only live, committed indexes; their
+        // entries are rebuilt from the decoded tables on load (every row
+        // in the image is committed, so the rebuild is exact).
+        let mut ix_names: Vec<&String> = eng.db.indexes.keys().collect();
+        ix_names.sort();
+        let mut ix_body = Enc::new();
+        let mut n_indexes = 0u32;
+        for name in ix_names {
+            let ix = &eng.db.indexes[name];
+            if !eng.xid_committed(ix.def.created_xmin) {
+                continue; // uncommitted CREATE INDEX: not durable state
+            }
+            if committed_xmax(eng, ix.def.dropped_xmax) != 0 {
+                continue; // dropped by a committed txn: not durable state
+            }
+            ix_body.str(name);
+            ix_body.str(&ix.def.table);
+            ix_body.u32(ix.def.col_names.len() as u32);
+            for c in &ix.def.col_names {
+                ix_body.str(c);
+            }
+            ix_body.u8(ix.def.unique as u8);
+            ix_body.u64(ix.def.created_xmin);
+            ix_body.u64(0); // live index: no committed drop
+            n_indexes += 1;
+        }
+        img.u32(n_indexes);
+        img.bytes(&ix_body.buf);
+
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
         {
@@ -1096,7 +1293,7 @@ impl Wal {
         self.len = WAL_HEADER_LEN;
         self.base_lsn = wal_end;
         println!(
-            "rustgres v0.5 checkpoint: {} table version(s), WAL reset (base_lsn={})",
+            "rustgres v0.8 checkpoint: {} table version(s), WAL reset (base_lsn={})",
             n_versions, wal_end
         );
         Ok(())
@@ -1178,7 +1375,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     };
     if d.take(8).map_err(|e| bad(&e))? != CHKPT_MAGIC {
         return Err(bad(
-            "bad magic (a v0.6 checkpoint is not readable by v0.7; remove the data directory)",
+            "bad magic (a v0.7 checkpoint is not readable by v0.8; remove the data directory)",
         ));
     }
     if d.u32().map_err(|e| bad(&e))? != CHKPT_VERSION {
@@ -1224,6 +1421,61 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             __t.push_version(__rv);
         }
         eng.db.tables.entry(name).or_default().push(__t);
+    }
+    // v0.8: index definitions, then rebuild entries from the decoded
+    // tables (every row here is committed).
+    let n_indexes = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_indexes {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let table = d.str().map_err(|e| bad(&e))?;
+        let n_cols = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut col_names = Vec::with_capacity(n_cols);
+        for _ in 0..n_cols {
+            col_names.push(d.str().map_err(|e| bad(&e))?);
+        }
+        let unique = d.u8().map_err(|e| bad(&e))? != 0;
+        let created_xmin = d.u64().map_err(|e| bad(&e))?;
+        let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
+        let bad_idx = |why: String| {
+            io_err(format!(
+                "{} is corrupt (index \"{}\": {}); refusing to start",
+                path.display(),
+                name,
+                why
+            ))
+        };
+        let ix: Index = {
+            let versions = eng
+                .db
+                .tables
+                .get(&table)
+                .ok_or_else(|| bad_idx(format!("no such table \"{}\"", table)))?;
+            let t = versions
+                .iter()
+                .find(|t| t.dropped_xmax == 0)
+                .ok_or_else(|| bad_idx(format!("no live version of table \"{}\"", table)))?;
+            let mut cols = Vec::with_capacity(col_names.len());
+            for c in &col_names {
+                cols.push(t.column_index(c).ok_or_else(|| {
+                    bad_idx(format!("unknown column \"{}\" in table \"{}\"", c, table))
+                })?);
+            }
+            let mut ix = Index::new(IndexDef {
+                name: name.clone(),
+                table: table.clone(),
+                cols,
+                col_names,
+                unique,
+                created_xmin,
+                dropped_xmax,
+            });
+            for r in &t.rows {
+                let key = ix.key_for(&r.values);
+                ix.insert(key, r.id);
+            }
+            ix
+        };
+        eng.db.indexes.insert(name, ix);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))

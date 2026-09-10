@@ -422,3 +422,54 @@ nothing retained. Conclusion: expression evaluation itself is cheap;
 a future prepared-statement parse cache would help workloads that
 re-send identical SQL text (the `prepared` workload already avoids
 this by parsing once).
+
+## v0.8 baseline — 2026-09-10
+
+Environment: same sandbox, debug build, fresh temp data dir, 5 s per
+workload. New workload `idxscan`: 50k-row table, measures indexed point
+lookup (p50/p99/qps), range-1000 scan, and ORDER BY … LIMIT 10 against
+the same point lookup with the index dropped (sequential scan).
+
+| workload   | qps      | p50        | p99        | vs v0.7 |
+|------------|----------|------------|------------|---------|
+| `select1`  | ~22,700  | 0.045 ms   | 0.091 ms   | noise |
+| `expr`     | ~4,030   | 0.215 ms   | 0.948 ms   | noise |
+| `scan`     | 32.4     | 28.37 ms   | 68.23 ms   | noise |
+| `insert`   | 93.8     | 9.02 ms    | 31.55 ms   | noise |
+| `prepared` | ~12,500  | 0.065 ms   | 0.304 ms   | noise |
+| `txn`      | ~5,810   | 0.113 ms   | 0.968 ms   | noise |
+| `mvcc`     | ~941     | 0.920 ms   | 2.68 ms    | noise |
+| `join`     | 0.8      | 1170 ms    | 1331 ms    | noise |
+| `idxscan`  | ~10,710  | 0.073 ms   | 0.547 ms   | new |
+
+`idxscan` breakdown (debug build, 50k rows):
+
+| access path | qps | vs sequential |
+|-------------|-----|---------------|
+| point lookup, B-tree index | ~10,710 | **662x** (seq: 16 qps) |
+| range 1000 rows, B-tree index | ~168 | — |
+| `ORDER BY id LIMIT 10`, index order + early termination | ~8,940 | — |
+
+(Release build for reference: point lookup ~24,000 qps, 600x over
+sequential; order-limit ~2,000 qps.) Early termination of the
+index-order scan (stop after OFFSET+LIMIT visible rows instead of
+walking all 50k entries) took `ORDER BY … LIMIT 10` from 150 qps to
+7,310 qps on the debug build.
+
+### Callgrind / DHAT on `idxscan` (valgrind 3.22.0)
+
+`benches/profiles/callgrind.out.idxscan`, `dhat.out.41970`. The first
+profile caught a real hotspot: index key comparison for integer columns
+went through `NUMERIC` normalization (`Numeric::cmp` 10.9% of all
+instructions, plus `i128::checked_mul/pow` underneath). Fixed with an
+`i64` fast path in `index_key_cmp` (`exact_as_i64`: SmallInt/Int/BigInt
+all fit in `i64`; only true `NUMERIC` values pay for normalization)
+and by replacing a `to_text().parse::<f64>()` roundtrip with
+`Numeric::to_f64()` in the mixed exact/float comparison. After the fix
+the top consumers are the usual per-query SQL text parsing
+(`tokenize`, `split_statements`) and libc `malloc`/`memcpy` — the same
+conclusion as v0.7: expression/index code is cheap, per-query parsing
+dominates. DHAT: 220 MB allocated over the workload, 7.2 MB peak live
+(the 50k-row table + index itself); top allocators are short-lived
+tokenizer buffers and per-INSERT `Vec<Value>` row buffers. Nothing
+retained, no leaks.
