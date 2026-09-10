@@ -1,14 +1,103 @@
-# rustgres v0.4 — "carved in stone"
+# rustgres v0.5 — "many eyes"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 4 of the road to Postgres 19 feature parity. v0.4 adds
-**durability**: a write-ahead log for committed DML and DDL, `fsync` on
-every commit, checkpoints with WAL truncation, and crash recovery that
-replays committed batches and drops uncommitted ones. Kill `-9` the
-server mid-transaction and restart it — committed data is there,
-uncommitted data is not.
+Milestone 5 of the road to Postgres 19 feature parity. v0.5 replaces the
+v0.3/v0.4 full-database transaction overlay with **real MVCC**: every row
+is a chain of versions stamped with creator/deleter transaction ids
+(`xmin`/`xmax`), tables themselves are versioned the same way, and each
+transaction reads from a snapshot. On top of that: `READ COMMITTED`,
+`REPEATABLE READ`, and `SERIALIZABLE` isolation levels, `UPDATE`/`DELETE`,
+`VACUUM`, and — as a bonus the test suite demanded — `ORDER BY`.
+
+## What v0.5 adds (MVCC + isolation)
+
+- **Row versions, not row locks.** Each row version carries `xmin`
+  (creating xid) and `xmax` (deleting/updating xid, 0 = live).
+  `UPDATE` = stamp the old version's `xmax` + append a new version;
+  `DELETE` = stamp `xmax`. Tables are versioned identically
+  (`created_xmin`/`dropped_xmax`), so `CREATE`/`DROP TABLE` are
+  transactional too. A version is visible to a snapshot iff its `xmin`
+  committed before the snapshot and its `xmax` did not — the standard
+  MVCC visibility rule, plus "own writes are always visible to self".
+- **Isolation levels.** `BEGIN [ISOLATION LEVEL { READ COMMITTED |
+  REPEATABLE READ | SERIALIZABLE }]` (also `START TRANSACTION ...`;
+  `READ UNCOMMITTED` is accepted and treated as `READ COMMITTED`, like
+  Postgres). `READ COMMITTED` takes a fresh snapshot per statement
+  (sees newly committed rows, including phantoms); `REPEATABLE READ`
+  and `SERIALIZABLE` pin one snapshot at the first snapshot-taking
+  statement and hold it to COMMIT. Aborted transactions behave like
+  Postgres: the first error poisons the transaction (`25P02` on anything
+  but `COMMIT`/`ROLLBACK`), and `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
+  undo MVCC writes in reverse order.
+- **`UPDATE` / `DELETE` with `WHERE`.** Full predicate support shared
+  with `SELECT`; `UPDATE t SET a = a + 1` works; tags are `UPDATE n` /
+  `DELETE n`. Statement atomicity is preserved: the statement plans
+  (validates + conflict-checks) before mutating, so a failed statement
+  leaves no trace.
+- **`VACUUM [VERBOSE] [table]`.** Dead versions (invisible to every
+  active snapshot *and* every possible future snapshot) are physically
+  reclaimed; `VERBOSE` reports per-table counts. An automatic
+  best-effort vacuum runs after every commit/abort, but only on tables
+  where the transaction may have created dead versions
+  (`DELETE`/`UPDATE`/`DROP` — pure `INSERT`s skip the scan). Open
+  snapshots pin the versions they can still see: a `REPEATABLE READ`
+  transaction holding an old snapshot blocks reclamation until it ends.
+  `VACUUM` is rejected inside a transaction (`25001`), like Postgres.
+- **`ORDER BY` (bonus).** `ORDER BY expr [ASC|DESC] [, ...]`, positional
+  `ORDER BY 1`, sorting by non-selected columns, `LIMIT` applied after
+  the sort, and Postgres null placement (`NULLS LAST` for ASC,
+  `NULLS FIRST` for DESC). Text sorts byte-wise — no collations yet.
+- **WAL v2.** Records are now per-version rather than per-diff:
+  `CreateTable`, `InsertRows` (grouped per table, carrying stable row
+  ids + `xmin`), `DeleteRows` (row ids + deleter `xmax`), `DropTable`.
+  The on-disk magic is `RGSWAL02` / `RGSCHK02`: **v0.5 refuses to open
+  v0.4 data directories** (loud error, not silent truncation — start
+  fresh or keep a v0.4 binary for old data).
+- **Row-id index.** Every table keeps an id → position hash map, so
+  commit-time WAL derivation and undo are O(1) per row instead of O(n)
+  scans — a 1000-row `INSERT` went from 6 qps back to competitive after
+  this landed (see `benches/BASELINE.md`).
+
+### v0.5 concurrency model (read this before benchmarking)
+
+- **One global engine mutex, held per statement.** There is no row
+  locking and no waiting: a concurrent writer never blocks. Instead,
+  conflicts are detected and reported as `40001`
+  (`serialization_failure`):
+  - `REPEATABLE READ` / `SERIALIZABLE`: writing a row that changed after
+    your snapshot → `40001`, like Postgres.
+  - Lost-update race (two transactions `UPDATE` the same row while both
+    uncommitted): the first committer gets `40001` rather than silently
+    duplicating the row; the second committer wins.
+  - Concurrent `CREATE TABLE` of the same name: second committer gets
+    `40001`.
+- **`SERIALIZABLE` is snapshot isolation, not full SSI.** It gives you a
+  stable snapshot plus the write-conflict detection above, but it does
+  **not** prevent write skew: two concurrent serializable transactions
+  can each pass a `SELECT`-based check and then both commit overlapping
+  writes. Documented and tested (`protocol_test5.py` asserts both
+  commits succeed) — predicate locking / SSI is a later milestone.
+- **Disconnects roll back.** A client that disconnects — clean
+  `Terminate`, raw socket close, or read error — with an open
+  transaction gets its writes undone and its xid retired, via the same
+  `txn_rollback` path as `ROLLBACK`. Uncommitted versions never leak
+  into the shared tables and abandoned xids never pin snapshots or
+  vacuum.
+
+Known v0.5 deviations/limitations (all documented, none silent):
+**no row locking / blocking** (see above — conflicts become `40001`
+instead of waits, which is stricter than Postgres in a few
+`READ COMMITTED` re-evaluation cases); **SERIALIZABLE ≠ SSI** (write
+skew possible); **no predicate locking, no `SELECT ... FOR UPDATE`**;
+**no secondary indexes** (every `WHERE` is a full version-chain scan);
+**autovacuum is best-effort and lazy** (a snapshot released by a
+read-only transaction can leave dead versions until the next
+delete-carrying commit or an explicit `VACUUM`); **no collations**
+(`ORDER BY` on text is byte-wise); **no aggregates** (`COUNT(*)` etc.
+are still unimplemented); **WAL v2 is incompatible with v0.4 data
+directories**.
 
 ## What v0.4 adds (durability)
 
@@ -264,6 +353,7 @@ python3 tests/protocol_test.py   # v0.1: simple protocol, 40 checks
 python3 tests/protocol_test2.py  # v0.2: extended protocol, 91 checks
 python3 tests/protocol_test3.py  # v0.3: transactions, 93 checks
 python3 tests/protocol_test4.py  # v0.4: durability, 35 checks
+python3 tests/protocol_test5.py  # v0.5: MVCC + isolation, 85 checks
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts
@@ -297,7 +387,22 @@ and uncommitted DDL disappearing; committed CREATE/DROP surviving; all
 to a fresh 16-byte generation header; writes after (two) checkpoints
 replaying via logical LSNs; a 1500-row WAL replaying with no checkpoint;
 `ROLLBACK`ed data absent; `CHECKPOINT` inside a transaction → `25001`;
-and nested data-dir auto-creation.
+and nested data-dir auto-creation. The v0.5 suite covers MVCC and
+isolation over raw sockets with concurrent connections: uncommitted /
+aborted invisibility, own-writes-visible, `READ COMMITTED` fresh
+snapshots (phantoms visible), `REPEATABLE READ` stable snapshots (no
+phantoms), `40001` on `REPEATABLE READ` write conflicts and on
+lost-update races, `SERIALIZABLE` as snapshot isolation (write skew is
+*not* prevented — asserted), savepoint rollback of MVCC writes,
+`UPDATE`/`DELETE` basics, `VACUUM [VERBOSE]` reclamation including
+snapshot pinning (0 versions reclaimed while a `REPEATABLE READ`
+snapshot is open, all reclaimed after), `VACUUM`/`CHECKPOINT` rejected
+inside transactions (`25001`), isolation-level syntax
+(`BEGIN ISOLATION LEVEL ...`), extended-protocol `UPDATE` inside a
+transaction, crash recovery of `UPDATE`/`DELETE` chains (`kill -9` with
+mixed committed/uncommitted writes), `CHECKPOINT` with an open
+transaction, and `ORDER BY` (direction, null placement, positional,
+multi-term, `LIMIT`-after-sort, error codes).
 If you have a real `psql` client handy:
 
 ```bash

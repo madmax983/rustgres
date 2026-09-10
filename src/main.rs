@@ -1,7 +1,7 @@
-//! rustgres v0.4 — a from-scratch PostgreSQL-compatible server in pure Rust.
+//! rustgres v0.5 — a from-scratch PostgreSQL-compatible server in pure Rust.
 //!
-//! Listens on 127.0.0.1:5433, one thread per connection, shared in-memory
-//! database backed by a write-ahead log. Zero external crates: builds
+//! Listens on 127.0.0.1:5433, one thread per connection, shared MVCC
+//! engine backed by a write-ahead log. Zero external crates: builds
 //! offline with plain `cargo build`.
 
 mod exec;
@@ -42,7 +42,7 @@ fn main() {
     // Crash recovery: load the latest checkpoint, replay WAL frames after
     // it. A missing/empty data dir yields an empty database — the server
     // keeps its in-memory behavior when there is no state.
-    let (db, wal) = match wal::Wal::open(&data_dir) {
+    let (engine, wal) = match wal::Wal::open(&data_dir) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!(
@@ -55,8 +55,8 @@ fn main() {
     };
     let listener = net::bind_listen("127.0.0.1:5433".parse().unwrap())
         .expect("failed to bind 127.0.0.1:5433");
-    println!("rustgres v0.4 listening on 127.0.0.1:5433");
-    let db = Arc::new(Mutex::new(db));
+    println!("rustgres v0.5 listening on 127.0.0.1:5433");
+    let engine = Arc::new(Mutex::new(engine));
     let wal = Arc::new(Mutex::new(wal));
     for stream in listener.incoming() {
         match stream {
@@ -68,9 +68,9 @@ fn main() {
                 if let Err(e) = stream.set_nodelay(true) {
                     eprintln!("set_nodelay failed: {}", e);
                 }
-                let db = Arc::clone(&db);
+                let engine = Arc::clone(&engine);
                 let wal = Arc::clone(&wal);
-                std::thread::spawn(move || server::handle_connection(stream, db, wal));
+                std::thread::spawn(move || server::handle_connection(stream, engine, wal));
             }
             Err(e) => eprintln!("accept error: {}", e),
         }

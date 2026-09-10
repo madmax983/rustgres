@@ -1,19 +1,26 @@
-//! Write-ahead log, checkpoints, and crash recovery (v0.4).
+//! Write-ahead log, checkpoints, and crash recovery (v0.4; v0.5 record format).
 //!
-//! # Design: logical row-level WAL
+//! # Design: logical row-version WAL
 //!
-//! The storage engine has no pages — it is a `HashMap<String, Table>` of
-//! column schemas plus `Vec<Vec<Value>>` row stores. A physical
-//! page-image WAL would force us to invent a page abstraction purely for
-//! the log. Instead the WAL records *logical* changes at the granularity
-//! the engine actually mutates:
+//! The storage engine is MVCC: tables hold `RowVersion`s carrying xmin/xmax.
+//! The WAL records *logical* changes at the granularity the engine actually
+//! mutates, with the version metadata needed to rebuild identical version
+//! chains on recovery:
 //!
-//! - `CreateTable { name, columns }` — a table was created
-//! - `InsertRows { table, rows }` — rows were appended to a table
-//! - `DropTable { name }` — a table was dropped
-//! - `FullTable { name, columns, rows }` — a table's content changed in a
-//!   way that is not a pure append (the fallback that keeps the log
-//!   consistent under last-writer-wins concurrency; see below)
+//! - `CreateTable { name, columns, xmin }` — a table was created
+//! - `InsertRows { table, rows }` — row versions were appended; each row
+//!   carries its stable `id`, `xmin`, and values
+//! - `DropTable { name, xmax }` — a table was dropped
+//! - `DeleteRows { table, ids, xmax }` — row versions were marked deleted
+//!   (covers DELETE and the delete half of UPDATE)
+//!
+//! Records are produced from the committing transaction's write log, in
+//! order, so replay rebuilds exactly the published version chains with
+//! identical xmin/xmax — and therefore identical visibility.
+//!
+//! Format version 2 (`RGSWAL02` / `RGSCHK02`) is NOT compatible with v0.4
+//! files: v0.5 refuses to start on a v0.4 data directory with a clear
+//! error instead of misreading it.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -93,7 +100,7 @@
 //! - COMMIT path (`append_batch`): `write_all` the frame, then
 //!   `sync_all` (fsync) on `wal.log`, *then* publish to the in-memory
 //!   database and return. COMMIT never returns before its records are
-//!   durable. One fsync per commit; no group commit in v0.4 (measured
+//!   durable. One fsync per commit; no group commit in v0.5 (measured
 //!   honestly in benches/BASELINE.md).
 //! - Checkpoint: fsync the tmp image file, atomic rename, fsync the
 //!   data-directory fd (so the rename itself is durable), then reset
@@ -106,16 +113,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::storage::{ColType, Database, Table, Value};
+use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK01";
-const CHKPT_VERSION: u32 = 1;
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK02";
+const CHKPT_VERSION: u32 = 2;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL01";
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL02";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -127,8 +134,9 @@ fn encode_wal_header(base_lsn: u64) -> [u8; 16] {
 }
 
 /// Read the WAL header. Returns `Ok(None)` when the file is empty or the
-/// header is torn (short file / bad magic) — both mean "start a fresh
-/// generation"; see the module docs for why that is safe.
+/// header is torn (short file) — both mean "start a fresh generation";
+/// see the module docs for why that is safe. A complete header with the
+/// wrong magic is an error (incompatible format, e.g. v0.4 data).
 fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
     let mut hdr = [0u8; 16];
     file.seek(SeekFrom::Start(0))?;
@@ -140,8 +148,19 @@ fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
             Err(e) => return Err(e),
         }
     }
-    if got < 16 || &hdr[..8] != WAL_MAGIC {
-        return Ok(None);
+    if got == 0 {
+        return Ok(None); // fresh data dir
+    }
+    if got < 16 {
+        return Ok(None); // torn header: crash during the WAL reset
+    }
+    // A full 16-byte header with the wrong magic (e.g. a v0.4 `RGSWAL01`
+    // file, whose record format is incompatible) is a loud error:
+    // silently treating it as empty would lose data.
+    if &hdr[..8] != WAL_MAGIC {
+        return Err(io_err(
+            "wal.log has an unrecognized magic; rustgres v0.5 cannot read v0.4 data - remove the data directory".to_string(),
+        ));
     }
     Ok(Some(u64::from_be_bytes(hdr[8..].try_into().unwrap())))
 }
@@ -188,27 +207,35 @@ fn crc32(data: &[u8]) -> u32 {
 // Logical WAL records
 // ---------------------------------------------------------------------------
 
+/// One row version for the WAL: stable id, creator xid, values.
+/// (xmax is always 0 at insert time; deletes are separate records.)
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalRow {
+    pub id: u64,
+    pub xmin: u64,
+    pub values: Vec<Value>,
+}
+
 /// One logical change to the committed database.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WalRecord {
     CreateTable {
         name: String,
         columns: Vec<(String, ColType)>,
+        xmin: u64,
     },
     InsertRows {
         table: String,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<WalRow>,
     },
     DropTable {
         name: String,
+        xmax: u64,
     },
-    /// Full table image: used when a commit's diff is not a pure row
-    /// append (e.g. a concurrent commit landed between BEGIN and COMMIT).
-    /// Replays as an unconditional overwrite, mirroring the in-memory swap.
-    FullTable {
-        name: String,
-        columns: Vec<(String, ColType)>,
-        rows: Vec<Vec<Value>>,
+    DeleteRows {
+        table: String,
+        ids: Vec<u64>,
+        xmax: u64,
     },
 }
 
@@ -293,41 +320,40 @@ impl Enc {
         }
     }
 
-    fn rows(&mut self, rows: &[Vec<Value>]) {
-        self.u32(rows.len() as u32);
-        for row in rows {
-            self.u32(row.len() as u32);
-            for v in row {
-                self.value(v);
-            }
-        }
-    }
-
     fn record(&mut self, r: &WalRecord) {
         match r {
-            WalRecord::CreateTable { name, columns } => {
+            WalRecord::CreateTable { name, columns, xmin } => {
                 self.u8(1);
                 self.str(name);
                 self.columns(columns);
+                self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
                 self.u8(2);
                 self.str(table);
-                self.rows(rows);
+                self.u32(rows.len() as u32);
+                for r in rows {
+                    self.u64(r.id);
+                    self.u64(r.xmin);
+                    self.u32(r.values.len() as u32);
+                    for v in &r.values {
+                        self.value(v);
+                    }
+                }
             }
-            WalRecord::DropTable { name } => {
+            WalRecord::DropTable { name, xmax } => {
                 self.u8(3);
                 self.str(name);
+                self.u64(*xmax);
             }
-            WalRecord::FullTable {
-                name,
-                columns,
-                rows,
-            } => {
+            WalRecord::DeleteRows { table, ids, xmax } => {
                 self.u8(4);
-                self.str(name);
-                self.columns(columns);
-                self.rows(rows);
+                self.str(table);
+                self.u32(ids.len() as u32);
+                for id in ids {
+                    self.u64(*id);
+                }
+                self.u64(*xmax);
             }
         }
     }
@@ -426,36 +452,43 @@ impl<'a> Dec<'a> {
         Ok(out)
     }
 
-    fn rows(&mut self) -> Result<Vec<Vec<Value>>, String> {
-        let n = self.u32()? as usize;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let m = self.u32()? as usize;
-            let mut row = Vec::with_capacity(m);
-            for _ in 0..m {
-                row.push(self.value()?);
-            }
-            out.push(row);
-        }
-        Ok(out)
-    }
-
     fn record(&mut self) -> Result<WalRecord, String> {
         match self.u8()? {
             1 => Ok(WalRecord::CreateTable {
                 name: self.str()?,
                 columns: self.columns()?,
+                xmin: self.u64()?,
             }),
-            2 => Ok(WalRecord::InsertRows {
-                table: self.str()?,
-                rows: self.rows()?,
-            }),
-            3 => Ok(WalRecord::DropTable { name: self.str()? }),
-            4 => Ok(WalRecord::FullTable {
+            2 => {
+                let table = self.str()?;
+                let n = self.u32()? as usize;
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let id = self.u64()?;
+                    let xmin = self.u64()?;
+                    let m = self.u32()? as usize;
+                    let mut values = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        values.push(self.value()?);
+                    }
+                    rows.push(WalRow { id, xmin, values });
+                }
+                Ok(WalRecord::InsertRows { table, rows })
+            }
+            3 => Ok(WalRecord::DropTable {
                 name: self.str()?,
-                columns: self.columns()?,
-                rows: self.rows()?,
+                xmax: self.u64()?,
             }),
+            4 => {
+                let table = self.str()?;
+                let n = self.u32()? as usize;
+                let mut ids = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ids.push(self.u64()?);
+                }
+                let xmax = self.u64()?;
+                Ok(WalRecord::DeleteRows { table, ids, xmax })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -470,110 +503,269 @@ impl<'a> Dec<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Diff: committed database vs. a transaction's working copy
+// Applying records during recovery
 // ---------------------------------------------------------------------------
 
-/// Logical delta between the pre-commit database `old` and the committed
-/// working copy `new`, as WAL records. Pure row appends become `InsertRows`;
-/// anything else (new/dropped tables, non-append changes from concurrent
-/// commits) becomes a full-image record, so replay always reproduces the
-/// exact published state.
-pub fn diff_dbs(old: &Database, new: &Database) -> Vec<WalRecord> {
-    let mut out = Vec::new();
-    for (name, nt) in &new.tables {
-        match old.tables.get(name) {
-            None => {
-                out.push(WalRecord::CreateTable {
-                    name: name.clone(),
-                    columns: nt.columns.clone(),
-                });
-                if !nt.rows.is_empty() {
-                    out.push(WalRecord::InsertRows {
-                        table: name.clone(),
-                        rows: nt.rows.clone(),
-                    });
-                }
-            }
-            Some(ot) => {
-                if ot.columns != nt.columns {
-                    out.push(WalRecord::FullTable {
-                        name: name.clone(),
-                        columns: nt.columns.clone(),
-                        rows: nt.rows.clone(),
-                    });
-                } else if nt.rows.len() >= ot.rows.len()
-                    && nt.rows[..ot.rows.len()] == ot.rows[..]
-                {
-                    // Pure append: log only the new suffix.
-                    if nt.rows.len() > ot.rows.len() {
-                        out.push(WalRecord::InsertRows {
-                            table: name.clone(),
-                            rows: nt.rows[ot.rows.len()..].to_vec(),
-                        });
-                    }
-                } else {
-                    // Not a pure append (concurrent commit landed first):
-                    // full image overwrites on replay, exactly like the
-                    // in-memory swap overwrote.
-                    out.push(WalRecord::FullTable {
-                        name: name.clone(),
-                        columns: nt.columns.clone(),
-                        rows: nt.rows.clone(),
-                    });
-                }
-            }
-        }
-    }
-    for name in old.tables.keys() {
-        if !new.tables.contains_key(name) {
-            out.push(WalRecord::DropTable { name: name.clone() });
-        }
-    }
-    out
+/// Find the table version that a committed DML record targets: the live
+/// (not dropped) version with `name`. Returns `None` when there is no
+/// live version — possible if a concurrent transaction's DDL won a race
+/// after the record's own commit validation (see `records_for_commit`);
+/// the caller skips the record with a warning rather than failing
+/// recovery over it.
+fn live_table<'e>(eng: &'e mut Engine, name: &str) -> Option<&'e mut Table> {
+    eng.db
+        .tables
+        .get_mut(name)
+        .and_then(|vs| vs.iter_mut().find(|t| t.dropped_xmax == 0))
 }
 
-/// Apply one record during recovery. `CreateTable`/`FullTable` overwrite
-/// unconditionally (a valid log never contradicts itself); `DropTable` of
-/// a missing table is a no-op. `InsertRows` into a missing table is a
-/// corrupt log — fail loudly rather than silently dropping committed data.
-pub fn apply_record(db: &mut Database, r: &WalRecord) -> Result<(), String> {
+/// Apply one record during recovery. Records replay in commit order, so
+/// the version chains — and therefore visibility — are rebuilt exactly.
+pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
+    // Fold the record's xids / row ids into the counters first, so they
+    // resume above every id the log ever used even when the record below
+    // is skipped as a no-op.
     match r {
-        WalRecord::CreateTable { name, columns } => {
-            db.tables.insert(
-                name.clone(),
-                Table {
-                    columns: columns.clone(),
-                    rows: Vec::new(),
-                },
-            );
-            Ok(())
-        }
-        WalRecord::InsertRows { table, rows } => match db.tables.get_mut(table) {
-            Some(t) => {
-                t.rows.extend(rows.iter().cloned());
-                Ok(())
+        WalRecord::CreateTable { xmin, .. } | WalRecord::DropTable { xmax: xmin, .. } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
             }
-            None => Err(format!("WAL replay: INSERT into missing table \"{}\"", table)),
-        },
-        WalRecord::DropTable { name } => {
-            db.tables.remove(name);
-            Ok(())
         }
-        WalRecord::FullTable {
-            name,
-            columns,
-            rows,
-        } => {
-            db.tables.insert(
-                name.clone(),
-                Table {
-                    columns: columns.clone(),
-                    rows: rows.clone(),
-                },
-            );
-            Ok(())
+        WalRecord::InsertRows { rows, .. } => {
+            for row in rows {
+                if row.xmin >= eng.txns.next_xid {
+                    eng.txns.next_xid = row.xmin + 1;
+                }
+                if row.id >= eng.txns.next_row_id {
+                    eng.txns.next_row_id = row.id + 1;
+                }
+            }
+        }
+        WalRecord::DeleteRows { xmax, .. } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
         }
     }
+    match r {
+        WalRecord::CreateTable { name, columns, xmin } => {
+            eng.db.tables.entry(name.clone()).or_default().push(Table::new(
+                columns.clone(),
+                *xmin,
+            ));
+        }
+        WalRecord::InsertRows { table, rows } => {
+            let Some(t) = live_table(eng, table) else {
+                eprintln!(
+                    "WAL replay: skipping InsertRows for \"{}\": no live table version",
+                    table
+                );
+                return Ok(());
+            };
+            for row in rows {
+                if t.rows.iter().any(|r| r.id == row.id) {
+                    eprintln!(
+                        "WAL replay: skipping duplicate row id {} in table \"{}\"",
+                        row.id, table
+                    );
+                    continue;
+                }
+                t.push_version(RowVersion {
+                    id: row.id,
+                    values: row.values.clone(),
+                    xmin: row.xmin,
+                    xmax: 0,
+                });
+            }
+        }
+        WalRecord::DropTable { name, xmax } => {
+            match live_table(eng, name) {
+                Some(t) => t.dropped_xmax = *xmax,
+                None => eprintln!(
+                    "WAL replay: skipping DropTable \"{}\": no live table version",
+                    name
+                ),
+            }
+        }
+        WalRecord::DeleteRows { table, ids, xmax } => {
+            let Some(t) = live_table(eng, table) else {
+                eprintln!(
+                    "WAL replay: skipping DeleteRows for \"{}\": no live table version",
+                    table
+                );
+                return Ok(());
+            };
+            for id in ids {
+                match t.rows.iter_mut().find(|r| r.id == *id) {
+                    Some(r) => r.xmax = *xmax,
+                    None => eprintln!(
+                        "WAL replay: skipping DELETE of missing row id {} in table \"{}\"",
+                        id, table
+                    ),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derive the commit-time WAL records from a transaction's write log.
+///
+/// Every op is re-validated against current engine state: only effects
+/// that are still "ours" (`xmin`/`xmax`/`dropped_xmax`/`created_xmin`
+/// equal to our xid) are logged. A concurrent transaction may have
+/// overwritten our change after we made it (last-writer-wins — there is
+/// no row locking in v0.5); logging the stale op would corrupt replay,
+/// so it is skipped and the concurrent change wins. An op whose target
+/// vanished (table dropped by a committed concurrent transaction) is
+/// skipped for the same reason.
+///
+/// Two commit-ordering rules keep replay total:
+/// - CREATE TABLE is first-committer-wins: if another committed live
+///   version of the name exists, our commit fails with a serialization
+///   error (the statement-time check could not see the concurrent
+///   uncommitted CREATE).
+/// - Records stay in op order (inserts grouped per table), so replay
+///   sees every target its record needs.
+///
+/// Returns `Err` on a commit-time serialization conflict (SQLSTATE 40001
+/// at the call site).
+pub fn records_for_commit(
+    eng: &Engine,
+    own: u64,
+    writes: &[WriteOp],
+) -> Result<Vec<WalRecord>, String> {
+    let mut out: Vec<WalRecord> = Vec::new();
+    let mut i = 0;
+    while i < writes.len() {
+        let op = &writes[i];
+        match op {
+            WriteOp::InsertRow { table, row_id } => {
+                let Some((values, table_live)) = own_row(eng, own, *row_id) else {
+                    i += 1;
+                    continue;
+                };
+                if !table_live {
+                    i += 1;
+                    continue; // table dropped by a committed concurrent txn
+                }
+                let row = WalRow {
+                    id: *row_id,
+                    xmin: own,
+                    values,
+                };
+                match out.last_mut() {
+                    Some(WalRecord::InsertRows { table: t, rows }) if t == table => {
+                        rows.push(row)
+                    }
+                    _ => out.push(WalRecord::InsertRows {
+                        table: table.clone(),
+                        rows: vec![row],
+                    }),
+                }
+            }
+            WriteOp::DeleteRow { table, row_id, .. } => {
+                let Some(v) = eng.db.find_row_version(*row_id) else {
+                    i += 1;
+                    continue;
+                };
+                if v.xmax != own {
+                    // Our delete was overwritten by a concurrent txn
+                    // (last-writer-wins). If the next op is our INSERT
+                    // successor (an UPDATE pair), committing would leave
+                    // BOTH versions live — a duplicate row. Fail the
+                    // commit instead, like a write-write conflict.
+                    let paired_insert = matches!(
+                        writes.get(i + 1),
+                        Some(WriteOp::InsertRow { .. })
+                    );
+                    if paired_insert {
+                        return Err(format!(
+                            "concurrent update on row id {} in table \"{}\"",
+                            row_id, table
+                        ));
+                    }
+                    i += 1;
+                    continue; // pure DELETE lost; the row stays deleted
+                }
+                match out.last_mut() {
+                    Some(WalRecord::DeleteRows { table: t, ids, xmax })
+                        if t == table && *xmax == own =>
+                    {
+                        ids.push(*row_id)
+                    }
+                    _ => out.push(WalRecord::DeleteRows {
+                        table: table.clone(),
+                        ids: vec![*row_id],
+                        xmax: own,
+                    }),
+                }
+            }
+            WriteOp::CreateTable { name } => {
+                let Some(versions) = eng.db.tables.get(name) else {
+                    i += 1;
+                    continue;
+                };
+                let Some(ours) = versions.iter().find(|t| t.created_xmin == own) else {
+                    i += 1;
+                    continue;
+                };
+                // First-committer-wins: a rival committed live version
+                // means our CREATE lost the race.
+                let rival = versions.iter().any(|t| {
+                    t.created_xmin != own
+                        && eng.xid_committed(t.created_xmin)
+                        && (t.dropped_xmax == 0 || !eng.xid_committed(t.dropped_xmax))
+                });
+                if rival {
+                    return Err(format!("relation \"{}\" already exists", name));
+                }
+                out.push(WalRecord::CreateTable {
+                    name: name.clone(),
+                    columns: ours.columns.clone(),
+                    xmin: own,
+                });
+            }
+            WriteOp::DropTable { name, .. } => {
+                let won = eng
+                    .db
+                    .tables
+                    .get(name)
+                    .is_some_and(|vs| vs.iter().any(|t| t.dropped_xmax == own));
+                if !won {
+                    i += 1;
+                    continue; // overwritten by a concurrent drop; theirs wins
+                }
+                out.push(WalRecord::DropTable {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Our uncommitted row version, plus whether its table version is still
+/// live (not dropped by a committed concurrent transaction). `None` when
+/// the row is gone or no longer ours.
+fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Vec<Value>, bool)> {
+    for versions in eng.db.tables.values() {
+        for t in versions {
+            if let Some(pos) = t.row_pos(row_id) {
+                let v = &t.rows[pos];
+                if v.xmin != own {
+                    return None;
+                }
+                let dropped = t.dropped_xmax != 0
+                    && t.dropped_xmax != own
+                    && eng.xid_committed(t.dropped_xmax);
+                return Some((v.values.clone(), !dropped));
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -602,9 +794,9 @@ impl Wal {
     /// and replay WAL frames after it. Returns the recovered database and
     /// the open WAL. A missing/empty data dir yields an empty database —
     /// the server keeps its in-memory behavior when there is no state.
-    pub fn open(dir: &Path) -> std::io::Result<(Database, Wal)> {
+    pub fn open(dir: &Path) -> std::io::Result<(Engine, Wal)> {
         fs::create_dir_all(dir)?;
-        let (mut db, wal_end) = load_checkpoint(dir)?;
+        let (mut eng, wal_end) = load_checkpoint(dir)?;
         let wal_path = dir.join(WAL_NAME);
         let mut file = OpenOptions::new()
             .read(true)
@@ -647,21 +839,25 @@ impl Wal {
             }
             max_txn = max_txn.max(frame.txn_id);
             for r in &frame.records {
-                apply_record(&mut db, r).map_err(io_err)?;
+                apply_record(&mut eng, r).map_err(io_err)?;
                 records += 1;
             }
             batches += 1;
         }
-        let tables = db.tables.len();
+        // No transaction survives a crash: anything still marked active
+        // would be a lie. (Uncommitted work never reached the WAL.)
+        eng.txns.active.clear();
+        eng.txns.snapshots.clear();
+        let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.4 recovery: {} table(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v0.5 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
             tables,
             batches,
             records,
             dir.display()
         );
         Ok((
-            db,
+            eng,
             Wal {
                 dir: dir.to_path_buf(),
                 file,
@@ -698,35 +894,74 @@ impl Wal {
 
         self.file.write_all(&frame.buf)?;
         // COMMIT durability: the frame is on stable storage before we
-        // return. No group commit in v0.4 — one fsync per commit.
+        // return. No group commit in v0.5 — one fsync per commit.
         self.file.sync_all()?;
         self.len += frame.buf.len() as u64;
         Ok(txn_id)
     }
 
     /// Snapshot the committed database and truncate the WAL. Holds the
-    /// caller's database lock for the whole procedure (writers block
+    /// caller's engine lock for the whole procedure (writers block
     /// briefly); crash-safe at every step — see the module docs.
-    pub fn checkpoint(&mut self, db: &Database) -> std::io::Result<()> {
+    /// Only committed versions are written to the image: versions
+    /// created by still-active transactions are skipped, and
+    /// xmax/dropped_xmax set by still-active transactions is masked to
+    /// 0 — so a crash can never resurrect uncommitted work as committed.
+    pub fn checkpoint(&mut self, eng: &Engine) -> std::io::Result<()> {
         // Logical end of this WAL generation: everything before it is
         // about to be snapshotted.
         let wal_end = self.base_lsn + (self.len - WAL_HEADER_LEN);
 
-        // 1. Encode the image in memory: magic, version, WAL offset, db.
+        // 1. Encode the image in memory: magic, version, WAL offset,
+        // counters, then tables. Only *committed* state is snapshotted:
+        // versions created by still-active transactions are skipped, and
+        // xmax/dropped_xmax set by still-active transactions is masked to
+        // 0. (Uncommitted work never reaches the WAL either, so recovery
+        //   = this image + replay of later committed batches, exactly.)
+        // The checkpoint holds the engine lock throughout, so no commit
+        // can interleave: every commit is either fully before wal_end
+        // (in the WAL, skipped on replay) or fully after (replayed).
         let mut img = Enc::new();
         img.bytes(CHKPT_MAGIC);
         img.u32(CHKPT_VERSION);
         img.u64(wal_end);
-        img.u32(db.tables.len() as u32);
+        img.u64(eng.txns.next_xid);
+        img.u64(eng.txns.next_row_id);
         // Sort table names for a deterministic image (HashMap order is not).
-        let mut names: Vec<&String> = db.tables.keys().collect();
+        let mut names: Vec<&String> = eng.db.tables.keys().collect();
         names.sort();
+        let mut n_versions = 0u32;
+        let mut body = Enc::new();
         for name in names {
-            let t = &db.tables[name];
-            img.str(name);
-            img.columns(&t.columns);
-            img.rows(&t.rows);
+            for t in &eng.db.tables[name] {
+                if !eng.xid_committed(t.created_xmin) {
+                    continue; // uncommitted CREATE: not part of durable state
+                }
+                let dropped_xmax = committed_xmax(eng, t.dropped_xmax);
+                body.str(name);
+                body.u64(t.created_xmin);
+                body.u64(dropped_xmax);
+                body.columns(&t.columns);
+                let live_rows: Vec<&RowVersion> = t
+                    .rows
+                    .iter()
+                    .filter(|r| eng.xid_committed(r.xmin))
+                    .collect();
+                body.u32(live_rows.len() as u32);
+                for r in live_rows {
+                    body.u64(r.id);
+                    body.u64(r.xmin);
+                    body.u64(committed_xmax(eng, r.xmax));
+                    body.u32(r.values.len() as u32);
+                    for v in &r.values {
+                        body.value(v);
+                    }
+                }
+                n_versions += 1;
+            }
         }
+        img.u32(n_versions);
+        img.bytes(&body.buf);
 
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
@@ -750,11 +985,21 @@ impl Wal {
         self.len = WAL_HEADER_LEN;
         self.base_lsn = wal_end;
         println!(
-            "rustgres v0.4 checkpoint: {} table(s), WAL reset (base_lsn={})",
-            db.tables.len(),
+            "rustgres v0.5 checkpoint: {} table version(s), WAL reset (base_lsn={})",
+            n_versions,
             wal_end
         );
         Ok(())
+    }
+}
+
+/// The effective xmax for durable state: the deleter's xid if that
+/// delete committed, else 0 (the delete is not durable yet).
+fn committed_xmax(eng: &Engine, xmax: u64) -> u64 {
+    if xmax != 0 && eng.xid_committed(xmax) {
+        xmax
+    } else {
+        0
     }
 }
 
@@ -806,39 +1051,87 @@ fn read_frame(file: &mut File) -> std::io::Result<Option<Frame>> {
 /// checkpoint covers). Missing file = fresh database. A present-but-
 /// undecodable file is a loud error: silently starting empty would lose
 /// data, so the server refuses to start instead.
-fn load_checkpoint(dir: &Path) -> std::io::Result<(Database, u64)> {
+fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     let path = dir.join(CHKPT_NAME);
     let bytes = match fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Database::new(), 0))
+            return Ok((Engine::new(), 0))
         }
         Err(e) => return Err(e),
     };
     let mut d = Dec::new(&bytes);
     let bad = |why: &str| io_err(format!("{} is corrupt ({}); refusing to start", path.display(), why));
     if d.take(8).map_err(|e| bad(&e))? != CHKPT_MAGIC {
-        return Err(bad("bad magic"));
+        return Err(bad("bad magic (a v0.4 checkpoint is not readable by v0.5; remove the data directory)"));
     }
     if d.u32().map_err(|e| bad(&e))? != CHKPT_VERSION {
         return Err(bad("unsupported version"));
     }
     let wal_end = d.u64().map_err(|e| bad(&e))?;
-    let n_tables = d.u32().map_err(|e| bad(&e))? as usize;
-    let mut db = Database::new();
-    for _ in 0..n_tables {
+    let mut eng = Engine::new();
+    eng.txns.next_xid = d.u64().map_err(|e| bad(&e))?.max(1);
+    eng.txns.next_row_id = d.u64().map_err(|e| bad(&e))?.max(1);
+    let n_versions = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_versions {
         let name = d.str().map_err(|e| bad(&e))?;
+        let created_xmin = d.u64().map_err(|e| bad(&e))?;
+        let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let columns = d.columns().map_err(|e| bad(&e))?;
-        let rows = d.rows().map_err(|e| bad(&e))?;
-        db.tables.insert(name, Table { columns, rows });
+        let n_rows = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut rows = Vec::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let id = d.u64().map_err(|e| bad(&e))?;
+            let xmin = d.u64().map_err(|e| bad(&e))?;
+            let xmax = d.u64().map_err(|e| bad(&e))?;
+            let n_vals = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut values = Vec::with_capacity(n_vals);
+            for _ in 0..n_vals {
+                values.push(d.value().map_err(|e| bad(&e))?);
+            }
+            if values.len() != columns.len() {
+                return Err(bad("row/column count mismatch"));
+            }
+            if id >= eng.txns.next_row_id {
+                eng.txns.next_row_id = id + 1;
+            }
+            rows.push(RowVersion { id, values, xmin, xmax });
+        }
+        let mut __t = Table::new(columns, created_xmin);
+        __t.dropped_xmax = dropped_xmax;
+        for __rv in rows {
+            __t.push_version(__rv);
+        }
+        eng.db.tables.entry(name).or_default().push(__t);
     }
     d.end().map_err(|e| bad(&e))?;
-    Ok((db, wal_end))
+    Ok((eng, wal_end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::WriteOp;
+
+    fn engine_with_committed_table() -> Engine {
+        let mut eng = Engine::new();
+        eng.db.tables.insert(
+            "t".into(),
+            vec![{
+                let mut t = Table::new(vec![("a".into(), ColType::Int)], 1);
+                t.push_version(RowVersion {
+                    id: 1,
+                    values: vec![Value::Int(10)],
+                    xmin: 1,
+                    xmax: 0,
+                });
+                t
+            }],
+        );
+        eng.txns.next_xid = 10;
+        eng.txns.next_row_id = 2;
+        eng
+    }
 
     #[test]
     fn crc32_known_answers() {
@@ -854,5 +1147,219 @@ mod tests {
         let mut b = b"hello world".to_vec();
         b[5] ^= 1;
         assert_ne!(a, crc32(&b));
+    }
+
+    fn roundtrip(r: &WalRecord) -> WalRecord {
+        let mut e = Enc::new();
+        e.record(r);
+        let mut d = Dec::new(&e.buf);
+        let out = d.record().unwrap();
+        d.end().unwrap();
+        out
+    }
+
+    #[test]
+    fn record_roundtrip_all_kinds() {
+        let cases = vec![
+            WalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("a".into(), ColType::Int)],
+                xmin: 3,
+            },
+            WalRecord::InsertRows {
+                table: "t".into(),
+                rows: vec![
+                    WalRow {
+                        id: 7,
+                        xmin: 4,
+                        values: vec![Value::Int(1), Value::Null],
+                    },
+                    WalRow {
+                        id: 8,
+                        xmin: 4,
+                        values: vec![Value::Int(2), Value::Text("x".into())],
+                    },
+                ],
+            },
+            WalRecord::DropTable {
+                name: "t".into(),
+                xmax: 5,
+            },
+            WalRecord::DeleteRows {
+                table: "t".into(),
+                ids: vec![7, 8, 9],
+                xmax: 6,
+            },
+        ];
+        for c in &cases {
+            assert_eq!(&roundtrip(c), c);
+        }
+    }
+
+    #[test]
+    fn records_for_commit_groups_inserts() {
+        let mut eng = engine_with_committed_table();
+        let xid = eng.begin_txn();
+        // Stage two inserts into t.
+        for (id, v) in [(2u64, 20i64), (3, 30)] {
+            eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
+                id,
+                values: vec![Value::Int(v)],
+                xmin: xid,
+                xmax: 0,
+            });
+        }
+        let writes = vec![
+            WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 2,
+            },
+            WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 3,
+            },
+        ];
+        let recs = records_for_commit(&eng, xid, &writes).unwrap();
+        assert_eq!(recs.len(), 1);
+        match &recs[0] {
+            WalRecord::InsertRows { table, rows } => {
+                assert_eq!(table, "t");
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].values, vec![Value::Int(20)]);
+            }
+            r => panic!("unexpected record: {:?}", r),
+        }
+    }
+
+    #[test]
+    fn records_for_commit_rejects_lost_create_race() {
+        let mut eng = engine_with_committed_table();
+        // Rival transaction created "t" and committed first.
+        eng.db.tables.get_mut("t").unwrap()[0].created_xmin = 5;
+        let xid = eng.begin_txn(); // 11
+        // Our own uncommitted create of the same name.
+        eng.db.tables
+            .get_mut("t")
+            .unwrap()
+            .push(Table::new(vec![("a".into(), ColType::Int)], xid));
+        let writes = vec![WriteOp::CreateTable { name: "t".into() }];
+        let err = records_for_commit(&eng, xid, &writes).unwrap_err();
+        assert!(err.contains("already exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn records_for_commit_skips_overwritten_delete() {
+        let mut eng = engine_with_committed_table();
+        let xid = eng.begin_txn();
+        // We delete row 1...
+        eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = xid;
+        // ...but a concurrent txn overwrites our delete (last-writer-wins).
+        let other = eng.begin_txn();
+        eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = other;
+        let writes = vec![WriteOp::DeleteRow {
+            table: "t".into(),
+            row_id: 1,
+            prev_xmax: 0,
+        }];
+        let recs = records_for_commit(&eng, xid, &writes).unwrap();
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn records_for_commit_fails_lost_update() {
+        // UPDATE/UPDATE race: our delete-half was overwritten, but our
+        // insert-half survives -> committing would duplicate the row.
+        let mut eng = engine_with_committed_table();
+        let xid = eng.begin_txn();
+        // Our UPDATE of row 1: delete-half + insert-half (adjacent pair).
+        eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = xid;
+        eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
+            id: 2,
+            values: vec![Value::Int(99)],
+            xmin: xid,
+            xmax: 0,
+        });
+        // Concurrent txn overwrites our delete-half.
+        let other = eng.begin_txn();
+        eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = other;
+        let writes = vec![
+            WriteOp::DeleteRow {
+                table: "t".into(),
+                row_id: 1,
+                prev_xmax: 0,
+            },
+            WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 2,
+            },
+        ];
+        let err = records_for_commit(&eng, xid, &writes).unwrap_err();
+        assert!(err.contains("concurrent update"), "got: {}", err);
+    }
+
+    #[test]
+    fn apply_record_rebuilds_versions_and_counters() {
+        let mut eng = Engine::new();
+        apply_record(
+            &mut eng,
+            &WalRecord::CreateTable {
+                name: "t".into(),
+                columns: vec![("a".into(), ColType::Int)],
+                xmin: 4,
+            },
+        )
+        .unwrap();
+        apply_record(
+            &mut eng,
+            &WalRecord::InsertRows {
+                table: "t".into(),
+                rows: vec![WalRow {
+                    id: 12,
+                    xmin: 5,
+                    values: vec![Value::Int(1)],
+                }],
+            },
+        )
+        .unwrap();
+        apply_record(
+            &mut eng,
+            &WalRecord::DeleteRows {
+                table: "t".into(),
+                ids: vec![12],
+                xmax: 6,
+            },
+        )
+        .unwrap();
+        let t = &eng.db.tables["t"][0];
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].xmin, 5);
+        assert_eq!(t.rows[0].xmax, 6);
+        // Counters resume above every id the log used.
+        assert_eq!(eng.txns.next_xid, 7);
+        assert_eq!(eng.txns.next_row_id, 13);
+    }
+
+    #[test]
+    fn apply_record_tolerates_missing_targets() {
+        let mut eng = Engine::new();
+        // No such table / row: warnings, not errors.
+        apply_record(
+            &mut eng,
+            &WalRecord::DeleteRows {
+                table: "nope".into(),
+                ids: vec![1],
+                xmax: 9,
+            },
+        )
+        .unwrap();
+        apply_record(
+            &mut eng,
+            &WalRecord::DropTable {
+                name: "nope".into(),
+                xmax: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(eng.txns.next_xid, 10);
     }
 }

@@ -81,6 +81,87 @@ Deliberately *not* optimized in v0.3: tokenizer byte-level rewrite and
 zero-alloc `to_text` — both are real but the debug profile overstates
 them; they get revisited against release-build profiles in M4.
 
+## v0.5 baseline — 2026-09-10
+
+Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),
+valgrind 3.22.0. Server on `127.0.0.1:5433` with a fresh temp data dir
+(`RUSTGRES_DATA_DIR=$(mktemp -d)`). 5 s measurement + 1 s warmup per
+workload. New workload `mvcc`: 4 threads x connections running
+`BEGIN` + `UPDATE` (disjoint rows) + `SELECT` + `COMMIT` in a loop.
+
+| workload   | what                              | qps      | rows/s  | p50      | p99      | vs v0.4 |
+|------------|-----------------------------------|----------|---------|----------|----------|---------|
+| `select1`  | simple-query `SELECT 1`           | 25,873   | —       | 0.032 ms | 0.105 ms | +2% (noise) |
+| `prepared` | ext. protocol: Parse once, Bind($1)/Execute loop | 15,026 | — | 0.062 ms | 0.147 ms | −15% (noise) |
+| `insert`   | 1000-row multi-VALUES `INSERT`    | 136.4    | 136,400 | 6.707 ms | 13.85 ms | **−31%** (see notes) |
+| `scan`     | `SELECT *` over 10k-row table     | 56.2     | —       | 14.43 ms | 38.43 ms | −13% (noise-ish) |
+| `txn`      | `BEGIN` + 1-row `INSERT` + `COMMIT` loop | 5,687 | —      | 0.133 ms | 0.724 ms | **+737%** |
+| `mvcc`     | 4 threads x (`BEGIN`+`UPDATE`+`SELECT`+`COMMIT`) | 1,030 | — | 0.725 ms | 3.46 ms | new |
+
+### What changed and why
+
+- **`txn` is 8.4x faster: the full-database transaction overlay is
+  gone.** v0.3/v0.4 cloned the entire database on every `BEGIN` and
+  diffed it on every `COMMIT` (O(database) per transaction). MVCC
+  stages per-row write ops and derives WAL records at commit — the
+  1.3 ms p50 of v0.4 is now 0.13 ms. This was the single biggest
+  structural win of the milestone and it fell out of the design, not
+  micro-optimization.
+- **`insert` regressed 198 → 136 qps, honestly.** Two causes, one fixed
+  during profiling and one inherent to the workload:
+  1. *Fixed:* commit-time WAL derivation did a global linear row-id
+     scan per row — O(rows) per row, O(n²) per 1000-row INSERT. The
+     first v0.5 bench run measured **6.1 qps**. Adding a per-table
+     id → position hash map (`Table::row_index`, O(1) lookup) took it
+     to 136 qps.
+  2. *Remaining:* the workload re-sends the identical 30 KB `INSERT`
+     statement every op, so ~50% of the profiled insert path is
+     tokenize + parse of SQL the server has already seen (callgrind:
+     `parse_statement` 33%, `tokenize` 20%, `split_statements` 16%).
+     Real clients use the prepared protocol for this (`prepared` does
+     15k qps with Parse-once). A statement cache would fix the
+     benchmark; it is a real feature, deferred, not a hack for the
+     harness.
+  3. The v0.4 `insert` number itself was documented as ±25% noisy
+     (sandbox fsync variance); 136 vs 198 is at the edge of that band
+     plus the parse artifact above.
+- **Auto-vacuum no longer scans insert-only tables.** The first
+  implementation vacuum-scanned every touched table after every
+  commit — O(table) per op on a table the benchmark grows by 1000
+  rows/op. Now only transactions that may have created dead versions
+  (`DELETE`/`UPDATE`/`DROP`) trigger the scan; pure `INSERT`s skip it.
+- **Read-only workloads are flat**, as expected: MVCC visibility
+  (one `xmin`/`xmax` check per version) costs nothing measurable on
+  `select1`/`scan`/`prepared`.
+
+### Where the time goes now (callgrind/DHAT)
+
+Profiles captured 2026-09-10: `benches/profiles/callgrind.out.9663`
++ `dhat.out.9690` (`insert` workload), `benches/profiles/callgrind.out.9788`
++ `dhat.out.9817` (`mvcc` workload), debug build, fresh data dirs.
+
+1. **`insert`:** parse 50% (workload artifact, see above), CRC32 16%
+   (required checksum; debug-build bounds checks inflate it), and
+   `exec_insert` proper 15%. DHAT's top allocator is
+   `RawVec<Token>::grow_one` — the tokenizer growing its token vec
+   one push at a time for the re-sent 30 KB statement, same artifact.
+2. **`mvcc` (the new-code path): no MVCC hotspot.** `parse_statement`
+   30% (again the re-sent-SQL artifact, 4 statements per op),
+   `txn_commit` 23% (WAL derivation + encode + fsync), `txn_execute`
+   14%, `exec::execute` 12%. Snapshot take/register, visibility
+   checks, and version-chain appends do not appear as hotspots — the
+   new machinery is not the bottleneck.
+3. **No leaks under concurrency.** The `mvcc` DHAT run allocated
+   199 MB total and had 5 KB live at exit; all version chains, write
+   logs, and snapshots are freed.
+4. Heap peaks stay small (tens of MB transient).
+
+Deliberately *not* optimized in v0.5: tokenizer throughput and a
+statement/plan cache (both real, both deferred — the prepared protocol
+is the supported fast path); zero-alloc `Value::to_text` (still in
+DHAT's top 10, still debug-inflated); group commit (still one fsync
+per commit, still intentional).
+
 ## v0.4 baseline — 2026-09-10
 
 Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),

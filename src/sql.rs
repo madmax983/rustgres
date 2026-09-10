@@ -296,6 +296,13 @@ pub enum InsertValue {
     Param(u32),
 }
 
+/// One `ORDER BY` sort key: expression + direction.
+#[derive(Clone, Debug)]
+pub struct OrderTerm {
+    pub expr: Expr,
+    pub desc: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -311,11 +318,25 @@ pub enum Stmt {
         items: Vec<SelectItem>,
         table: Option<String>,
         where_: Vec<WhereCond>,
+        order_by: Vec<OrderTerm>,
         limit: Option<i64>,
     },
     DropTable { if_exists: bool, name: String },
+    // --- v0.5: UPDATE / DELETE with MVCC semantics
+    Update {
+        table: String,
+        /// (column, expression) assignments.
+        sets: Vec<(String, Expr)>,
+        where_: Vec<WhereCond>,
+    },
+    Delete {
+        table: String,
+        where_: Vec<WhereCond>,
+    },
     // --- v0.3: transaction control (handled by the session, not the executor)
-    Begin,
+    Begin {
+        level: Option<IsolationLevel>,
+    },
     Commit,
     Rollback,
     Savepoint { name: String },
@@ -323,6 +344,20 @@ pub enum Stmt {
     Release { name: String },
     // --- v0.4: checkpoint (handled by the session, not the executor)
     Checkpoint,
+    // --- v0.5: vacuum (handled by the session, not the executor)
+    Vacuum {
+        table: Option<String>,
+        verbose: bool,
+    },
+}
+
+/// Transaction isolation level (v0.5). `READ UNCOMMITTED` is accepted and
+/// treated as `READ COMMITTED`, like Postgres.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
 }
 
 impl Stmt {
@@ -340,13 +375,42 @@ impl Stmt {
                 }
                 m
             }
-            Stmt::Select { items, where_, .. } => {
+            Stmt::Select {
+                items,
+                where_,
+                order_by,
+                ..
+            } => {
                 let mut m = 0;
                 for item in items {
                     if let SelectItem::Expr(e) = item {
                         m = m.max(max_param_expr(e));
                     }
                 }
+                for w in where_ {
+                    if let WhereRhs::Param(n) = w.rhs {
+                        m = m.max(n as usize);
+                    }
+                }
+                for o in order_by {
+                    m = m.max(max_param_expr(&o.expr));
+                }
+                m
+            }
+            Stmt::Update { sets, where_, .. } => {
+                let mut m = 0;
+                for (_, e) in sets {
+                    m = m.max(max_param_expr(e));
+                }
+                for w in where_ {
+                    if let WhereRhs::Param(n) = w.rhs {
+                        m = m.max(n as usize);
+                    }
+                }
+                m
+            }
+            Stmt::Delete { where_, .. } => {
+                let mut m = 0;
                 for w in where_ {
                     if let WhereRhs::Param(n) = w.rhs {
                         m = m.max(n as usize);
@@ -454,15 +518,20 @@ impl Parser {
             "insert" => self.parse_insert(),
             "select" => self.parse_select(),
             "drop" => self.parse_drop(),
+            // --- v0.5: UPDATE / DELETE
+            "update" => self.parse_update(),
+            "delete" => self.parse_delete(),
+            // --- v0.5: VACUUM
+            "vacuum" => self.parse_vacuum(),
             // --- v0.3: transaction control
             "begin" => {
-                // BEGIN [TRANSACTION]
+                // BEGIN [TRANSACTION] [ISOLATION LEVEL ...]
                 self.eat_keyword("transaction");
-                Ok(Stmt::Begin)
+                self.parse_begin_rest()
             }
             "start" => {
                 self.expect_keyword("transaction")?;
-                Ok(Stmt::Begin)
+                self.parse_begin_rest()
             }
             "commit" | "end" => Ok(Stmt::Commit),
             // --- v0.4: CHECKPOINT (snapshot + WAL truncation)
@@ -652,6 +721,103 @@ impl Parser {
         }
     }
 
+    /// Remainder of BEGIN / START TRANSACTION after the optional
+    /// TRANSACTION keyword: `[ISOLATION LEVEL ...]`.
+    fn parse_begin_rest(&mut self) -> Result<Stmt, SqlError> {
+        let level = if self.eat_keyword("isolation") {
+            self.expect_keyword("level")?;
+            Some(self.parse_isolation_level()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Begin { level })
+    }
+
+    fn parse_isolation_level(&mut self) -> Result<IsolationLevel, SqlError> {
+        let w = self.expect_ident()?;
+        match w.as_str() {
+            "serializable" => Ok(IsolationLevel::Serializable),
+            "repeatable" => {
+                self.expect_keyword("read")?;
+                Ok(IsolationLevel::RepeatableRead)
+            }
+            "read" => match self.peek() {
+                // READ UNCOMMITTED is treated as READ COMMITTED, like Postgres.
+                Token::Ident(s) if s == "committed" || s == "uncommitted" => {
+                    self.next();
+                    Ok(IsolationLevel::ReadCommitted)
+                }
+                other => Err(err(format!(
+                    "syntax error: expected COMMITTED or UNCOMMITTED, found {:?}",
+                    other
+                ))),
+            },
+            _ => Err(err(format!("syntax error: unknown isolation level \"{}\"", w))),
+        }
+    }
+
+    /// Shared `WHERE col = lit|$N [AND ...]` tail for SELECT/UPDATE/DELETE.
+    fn parse_where_opt(&mut self) -> Result<Vec<WhereCond>, SqlError> {
+        let mut where_ = Vec::new();
+        if self.eat_keyword("where") {
+            loop {
+                let col = self.expect_ident()?;
+                self.expect(Token::Eq, "'='")?;
+                let rhs = match self.peek() {
+                    Token::Param(n) => {
+                        self.next();
+                        WhereRhs::Param(n)
+                    }
+                    _ => WhereRhs::Lit(self.parse_literal()?),
+                };
+                where_.push(WhereCond { col, rhs });
+                if self.eat_keyword("and") {
+                    continue;
+                }
+                break;
+            }
+        }
+        Ok(where_)
+    }
+
+    fn parse_update(&mut self) -> Result<Stmt, SqlError> {
+        let table = self.expect_ident()?;
+        self.expect_keyword("set")?;
+        let mut sets = Vec::new();
+        loop {
+            let col = self.expect_ident()?;
+            self.expect(Token::Eq, "'='")?;
+            let expr = self.parse_expr()?;
+            sets.push((col, expr));
+            if self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        if sets.is_empty() {
+            return Err(err("syntax error: UPDATE requires at least one assignment"));
+        }
+        let where_ = self.parse_where_opt()?;
+        Ok(Stmt::Update { table, sets, where_ })
+    }
+
+    fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("from")?;
+        let table = self.expect_ident()?;
+        let where_ = self.parse_where_opt()?;
+        Ok(Stmt::Delete { table, where_ })
+    }
+
+    fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
+        let verbose = self.eat_keyword("verbose");
+        let table = match self.peek() {
+            Token::Ident(_) => Some(self.expect_ident()?),
+            _ => None,
+        };
+        Ok(Stmt::Vacuum { table, verbose })
+    }
+
     fn parse_select(&mut self) -> Result<Stmt, SqlError> {
         let mut items = Vec::new();
         if self.peek() == Token::Star {
@@ -672,25 +838,30 @@ impl Parser {
         } else {
             None
         };
-        let mut where_ = Vec::new();
-        if self.eat_keyword("where") {
+        let where_ = self.parse_where_opt()?;
+        let order_by = if self.eat_keyword("order") {
+            self.expect_keyword("by")?;
+            let mut terms = Vec::new();
             loop {
-                let col = self.expect_ident()?;
-                self.expect(Token::Eq, "'='")?;
-                let rhs = match self.peek() {
-                    Token::Param(n) => {
-                        self.next();
-                        WhereRhs::Param(n)
-                    }
-                    _ => WhereRhs::Lit(self.parse_literal()?),
+                let expr = self.parse_expr()?;
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    // ASC is the default; an explicit ASC is just consumed.
+                    self.eat_keyword("asc");
+                    false
                 };
-                where_.push(WhereCond { col, rhs });
-                if self.eat_keyword("and") {
+                terms.push(OrderTerm { expr, desc });
+                if self.peek() == Token::Comma {
+                    self.next();
                     continue;
                 }
                 break;
             }
-        }
+            terms
+        } else {
+            Vec::new()
+        };
         let limit = if self.eat_keyword("limit") {
             match self.next() {
                 Token::Number(raw) => match raw.parse::<i64>() {
@@ -730,6 +901,7 @@ impl Parser {
             items,
             table,
             where_,
+            order_by,
             limit,
         })
     }

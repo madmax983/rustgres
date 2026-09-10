@@ -17,6 +17,7 @@ import argparse
 import socket
 import struct
 import sys
+import threading
 import time
 
 DEFAULT_HOST = "127.0.0.1"
@@ -273,10 +274,80 @@ def w_txn(conn, seconds):
         msgs = conn.simple("COMMIT")
         assert tag_of(msgs) == "COMMIT", tag_of(msgs)
     res = measure(op, seconds)
-    res["note"] = ("BEGIN + single-row INSERT + COMMIT per op; "
-                   "measures the full-database transaction-overlay cost")
+    res["note"] = ("BEGIN + single-row INSERT + COMMIT per op; measures the "
+                   "MVCC commit path (WAL fsync + snapshot bookkeeping)")
     conn.simple("DROP TABLE bench_txn")
     return res
+
+
+BENCH_HOST = DEFAULT_HOST
+BENCH_PORT = DEFAULT_PORT
+
+
+def w_mvcc(conn, seconds, nthreads=4):
+    """Concurrent MVCC workload: N threads x connections, each running
+    BEGIN + UPDATE (own row) + SELECT + COMMIT in a loop. Threads touch
+    disjoint rows so no write-write conflicts are expected; this measures
+    snapshot/visibility/version-chain overhead under real concurrency on
+    the shared engine."""
+    conn.simple("DROP TABLE IF EXISTS bench_mvcc")
+    r = conn.simple("CREATE TABLE bench_mvcc(id INT, v INT)")
+    assert tag_of(r) == "CREATE TABLE"
+    r = conn.simple(
+        "INSERT INTO bench_mvcc VALUES " +
+        ",".join(f"({i},0)" for i in range(nthreads)))
+    assert tag_of(r) == f"INSERT 0 {nthreads}", tag_of(r)
+
+    stop = threading.Event()
+    lat_lock = threading.Lock()
+    lat = []
+
+    def worker(tid):
+        c = Conn(BENCH_HOST, BENCH_PORT)
+        try:
+            # warmup
+            end = time.perf_counter() + 1.0
+            while time.perf_counter() < end and not stop.is_set():
+                c.simple("BEGIN")
+                c.simple(f"UPDATE bench_mvcc SET v = v + 1 WHERE id = {tid}")
+                c.simple(f"SELECT v FROM bench_mvcc WHERE id = {tid}")
+                c.simple("COMMIT")
+            # measured
+            local = []
+            end = time.perf_counter() + seconds
+            while time.perf_counter() < end and not stop.is_set():
+                t0 = time.perf_counter()
+                msgs = c.simple("BEGIN")
+                assert tag_of(msgs) == "BEGIN", tag_of(msgs)
+                msgs = c.simple(f"UPDATE bench_mvcc SET v = v + 1 WHERE id = {tid}")
+                assert tag_of(msgs) == "UPDATE 1", tag_of(msgs)
+                msgs = c.simple(f"SELECT v FROM bench_mvcc WHERE id = {tid}")
+                assert tag_of(msgs) == "SELECT 1", tag_of(msgs)
+                msgs = c.simple("COMMIT")
+                assert tag_of(msgs) == "COMMIT", tag_of(msgs)
+                local.append((time.perf_counter() - t0) * 1000.0)
+            with lat_lock:
+                lat.extend(local)
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(nthreads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    conn.simple("DROP TABLE bench_mvcc")
+
+    lat.sort()
+    total_s = sum(lat) / 1000.0
+    return {
+        "ops": len(lat),
+        "qps": len(lat) / total_s if total_s > 0 else 0.0,
+        "p50_ms": percentile(lat, 50),
+        "p99_ms": percentile(lat, 99),
+        "note": (f"{nthreads} threads x (BEGIN + UPDATE + SELECT + COMMIT) "
+                 "on disjoint rows; measures MVCC under concurrency"),
+    }
 
 
 def _parse_ok(conn, query, oids):
@@ -320,6 +391,7 @@ WORKLOADS = {
     "insert": ("1000-row batched INSERTs", w_insert),
     "prepared": ("extended-protocol prepared loop", w_prepared),
     "txn": ("BEGIN + INSERT + COMMIT loop", w_txn),
+    "mvcc": ("concurrent MVCC txn loop (4 threads)", w_mvcc),
 }
 
 
@@ -337,6 +409,8 @@ def main():
                     default="all", help="which workload to run")
     args = ap.parse_args()
 
+    global BENCH_HOST, BENCH_PORT
+    BENCH_HOST, BENCH_PORT = args.host, args.port
     names = list(WORKLOADS) if args.workload == "all" else [args.workload]
     print(f"rustgres bench: {args.host}:{args.port}, "
           f"{args.seconds:g}s per workload\n")

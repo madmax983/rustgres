@@ -1,16 +1,6 @@
-//! Connection handling: startup handshake + simple/extended protocol loops.
-//!
-//! v0.2 adds the extended query protocol: Parse/Bind/Describe/Execute/Close
-//! with named/unnamed prepared statements and portals, `$N` parameters,
-//! and PortalSuspended for row-limited Execute. After any extended-protocol
-//! error the server discards input until Sync, per the protocol spec.
-//!
-//! v0.3 adds transactions: each session may hold an explicit transaction
-//! (a private working copy of the database). Uncommitted writes are visible
-//! only to their own session; COMMIT swaps the working copy into the shared
-//! database, ROLLBACK discards it. SAVEPOINTs snapshot the working copy.
-//! ReadyForQuery carries the real transaction status: 'I' idle, 'T' in
-//! transaction, 'E' in a failed (aborted) transaction.
+//! v0.5 transaction core: MVCC statement execution, commit/abort paths,
+//! savepoints, VACUUM, and the snapshot helper shared with the extended
+//! protocol's parameter resolution.
 
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
@@ -18,11 +8,11 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::exec::{self, ExecError, ExecResult};
+use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{read_message, read_startup, Cursor, MsgBuilder};
-use crate::sql::{self, Stmt};
-use crate::storage::{ColType, Database, Table, Value};
-use crate::wal::{self, Wal, WalRecord};
+use crate::sql::{self, IsolationLevel, Stmt};
+use crate::storage::{undo_write_op, ColType, Engine, Snapshot, Value, WriteOp};
+use crate::wal::{self, Wal};
 
 /// Buffered sink for server→client traffic. Reads still go through the
 /// raw `TcpStream`; every message-loop iteration ends with a `flush()`.
@@ -65,12 +55,21 @@ struct Session {
     txn: Option<Txn>,
 }
 
-/// One explicit transaction: a private working copy of the database.
-/// Uncommitted writes live here and are visible only to this session.
+/// One explicit transaction: an xid registered in the engine, an optional
+/// fixed snapshot (REPEATABLE READ / SERIALIZABLE), and the log of
+/// uncommitted writes. There is no private database copy: uncommitted
+/// versions live in the shared tables stamped with our xid, invisible to
+/// every other snapshot.
 struct Txn {
-    working: Database,
-    /// (name, snapshot of `working`) stack for SAVEPOINT.
-    savepoints: Vec<(String, Database)>,
+    xid: u64,
+    level: IsolationLevel,
+    /// Pinned at the first data statement for RR/SERIALIZABLE.
+    snapshot: Option<Snapshot>,
+    /// Uncommitted writes, in order: the undo log (abort / ROLLBACK TO)
+    /// and the commit-time WAL source.
+    writes: Vec<WriteOp>,
+    /// (name, writes.len()) stack for SAVEPOINT.
+    savepoints: Vec<(String, usize)>,
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
@@ -87,18 +86,14 @@ impl Session {
     }
 }
 
-pub fn handle_connection(
-    stream: TcpStream,
-    db: Arc<Mutex<Database>>,
-    wal: Arc<Mutex<Wal>>,
-) {
+pub fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, wal: Arc<Mutex<Wal>>) {
     // Reads use the raw socket; writes go through a BufWriter so each
     // message's small write_all calls (type byte, length, payload) — and,
     // crucially, thousands of DataRows — coalesce into a few large TCP
     // segments. Without this, TCP_NODELAY turns every row into its own
     // packet (see benches/BASELINE.md).
     let writer = BufWriter::new(stream.try_clone().expect("try_clone failed"));
-    if let Err(e) = run_connection(stream, writer, db, wal) {
+    if let Err(e) = run_connection(stream, writer, engine, wal) {
         eprintln!("connection closed with error: {}", e);
     }
 }
@@ -106,7 +101,7 @@ pub fn handle_connection(
 fn run_connection(
     mut reader: TcpStream,
     mut writer: Writer,
-    db: Arc<Mutex<Database>>,
+    engine: Arc<Mutex<Engine>>,
     wal: Arc<Mutex<Wal>>,
 ) -> io::Result<()> {
     // --- Startup handshake -------------------------------------------------
@@ -127,7 +122,7 @@ fn run_connection(
         break;
     }
 
-    // AuthenticationOk (trust auth in v0.2)
+    // AuthenticationOk (trust auth)
     MsgBuilder::new(b'R').i32(0).send(&mut writer)?;
 
     // ParameterStatus
@@ -160,15 +155,33 @@ fn run_connection(
     send_ready(&mut writer, &session)?;
     writer.flush()?;
 
-    // --- Message loop -------------------------------------------------------
+    let result = message_loop(&mut reader, &mut writer, &engine, &wal, &mut session);
+    // Disconnect cleanup: an open transaction must not leak its uncommitted
+    // versions or its xid (both would pin snapshots and vacuum forever).
+    // Postgres aborts the transaction on disconnect; do the same on every
+    // exit path — clean Terminate, client EOF, and read errors alike.
+    if session.txn.is_some() {
+        let _ = txn_rollback(&engine, &mut session);
+    }
+    result
+}
 
+/// The per-message dispatch loop, extracted so `run_connection` can run
+/// disconnect cleanup exactly once no matter how the loop exits.
+fn message_loop(
+    reader: &mut TcpStream,
+    writer: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+) -> io::Result<()> {
     loop {
-        let msg = read_message(&mut reader)?;
+        let msg = read_message(reader)?;
         // After an extended-protocol error, discard everything until Sync.
         if session.in_error {
             match msg.typ {
                 b'S' => {
-                    send_ready(&mut writer, &session)?;
+                    send_ready(writer, session)?;
                     writer.flush()?;
                     session.in_error = false;
                 }
@@ -181,29 +194,29 @@ fn run_connection(
             b'Q' => {
                 let mut cur = Cursor::new(&msg.payload);
                 let sql_text = cur.read_cstring()?;
-                handle_query(&mut writer, &db, &wal, &mut session, &sql_text)?;
+                handle_query(writer, engine, wal, session, &sql_text)?;
             }
-            b'P' => handle_parse(&mut writer, &mut session, &msg.payload)?,
-            b'B' => handle_bind(&mut writer, &db, &mut session, &msg.payload)?,
-            b'D' => handle_describe(&mut writer, &db, &mut session, &msg.payload)?,
-            b'E' => handle_execute(&mut writer, &db, &wal, &mut session, &msg.payload)?,
-            b'C' => handle_close(&mut writer, &mut session, &msg.payload)?,
+            b'P' => handle_parse(writer, session, &msg.payload)?,
+            b'B' => handle_bind(writer, engine, session, &msg.payload)?,
+            b'D' => handle_describe(writer, engine, session, &msg.payload)?,
+            b'E' => handle_execute(writer, engine, wal, session, &msg.payload)?,
+            b'C' => handle_close(writer, session, &msg.payload)?,
             b'X' => break, // Terminate
             b'H' => {
                 writer.flush()?;
             }
             b'S' => {
                 // Sync: ReadyForQuery with the real transaction status.
-                send_ready(&mut writer, &session)?;
+                send_ready(writer, session)?;
                 writer.flush()?;
             }
             other => {
                 send_error(
-                    &mut writer,
+                    writer,
                     "0A000",
                     &format!("unimplemented message type '{}'", other as char),
                 )?;
-                send_ready(&mut writer, &session)?;
+                send_ready(writer, session)?;
                 writer.flush()?;
             }
         }
@@ -232,11 +245,15 @@ fn send_ready(stream: &mut Writer, session: &Session) -> io::Result<()> {
 
 fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'E');
-    b.u8(b'S').cstr("ERROR");
-    b.u8(b'V').cstr("ERROR");
-    b.u8(b'C').cstr(code);
-    b.u8(b'M').cstr(message);
-    b.u8(0); // terminator
+    b.u8(b'S')
+        .cstr("ERROR")
+        .u8(b'V')
+        .cstr("ERROR")
+        .u8(b'C')
+        .cstr(code)
+        .u8(b'M')
+        .cstr(message)
+        .u8(0);
     b.send(stream)
 }
 
@@ -258,7 +275,7 @@ fn protocol_error(
 }
 
 // ---------------------------------------------------------------------------
-// Simple query protocol (v0.1 behavior + v0.3 transactions)
+// Simple query protocol (v0.1 behavior + v0.5 MVCC transactions)
 // ---------------------------------------------------------------------------
 
 /// Run one simple-protocol Query message. The message may hold several
@@ -268,7 +285,7 @@ fn protocol_error(
 /// like Postgres. Exactly one ReadyForQuery closes the message.
 fn handle_query(
     stream: &mut Writer,
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     sql_text: &str,
@@ -294,7 +311,7 @@ fn handle_query(
             send_error(stream, e.code, &e.message)?;
             break;
         }
-        match run_statement(db, wal, session, &stmt) {
+        match run_statement(engine, wal, session, &stmt) {
             Err(e) => {
                 send_error(stream, e.code, &e.message)?;
                 break;
@@ -320,7 +337,7 @@ fn handle_query(
 }
 
 // ---------------------------------------------------------------------------
-// v0.3: transactions
+// v0.5: MVCC transactions
 // ---------------------------------------------------------------------------
 
 fn cmd(tag: &str) -> ExecResult {
@@ -345,21 +362,23 @@ fn allowed_in_aborted(stmt: &Stmt) -> bool {
     )
 }
 
-/// Execute one statement with transaction semantics:
+/// Execute one statement with MVCC transaction semantics:
 /// - transaction control statements manipulate the session's txn state;
-/// - `CHECKPOINT` (v0.4) snapshots the committed database and truncates
-///   the WAL; refused inside a transaction block, like Postgres;
-/// - inside an explicit transaction, data statements run against the
-///   session-private working copy (a failure aborts the transaction);
-/// - in autocommit they run directly against the committed database, and
-///   every write is WAL-logged + fsynced before it returns (each
-///   autocommit statement is its own durable mini-transaction).
-///   Statement atomicity in autocommit comes from the executor's
-///   validate-then-apply discipline: every statement fully validates
-///   before mutating anything, so a failed statement leaves no trace —
-///   and nothing is logged for it.
+/// - `CHECKPOINT` snapshots the committed engine and truncates the WAL;
+///   refused inside a transaction block, like Postgres;
+/// - `VACUUM` reclaims dead row versions; refused inside a transaction
+///   block, like Postgres (automatic cleanup still runs after every
+///   commit/abort);
+/// - inside an explicit transaction, data statements run under the
+///   transaction's snapshot with its xid as owner (a failure aborts the
+///   transaction);
+/// - in autocommit each statement is its own transaction: it gets an xid,
+///   runs, its write set is WAL-logged + fsynced, and the xid retires.
+///   Statement atomicity comes from the executor's validate-then-apply
+///   discipline: a failed statement stages no writes, so there is nothing
+///   to undo — and nothing is logged for it.
 fn run_statement(
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     stmt: &Stmt,
@@ -375,24 +394,23 @@ fn run_statement(
         }
     }
     match stmt {
-        Stmt::Begin => txn_begin(db, session),
-        Stmt::Commit => txn_commit(db, wal, session),
-        Stmt::Rollback => txn_rollback(session),
+        Stmt::Begin { level } => {
+            txn_begin(engine, session, level.unwrap_or(IsolationLevel::ReadCommitted))
+        }
+        Stmt::Commit => txn_commit(engine, wal, session),
+        Stmt::Rollback => txn_rollback(engine, session),
         Stmt::Savepoint { name } => txn_savepoint(session, name),
-        Stmt::RollbackTo { name } => txn_rollback_to(session, name),
+        Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
-        Stmt::Checkpoint => txn_checkpoint(db, wal, session),
+        Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
+        Stmt::Vacuum { table, verbose } => {
+            txn_vacuum(engine, session, table.as_deref(), *verbose)
+        }
         _ => {
-            if let Some(t) = session.txn.as_mut() {
-                match exec::execute(&mut t.working, stmt) {
-                    Ok(r) => Ok(r),
-                    Err(e) => {
-                        t.failed = true;
-                        Err(e)
-                    }
-                }
+            if session.txn.is_some() {
+                txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(db, wal, stmt)
+                autocommit_execute(engine, wal, stmt)
             }
         }
     }
@@ -406,115 +424,178 @@ fn wal_err(e: io::Error) -> ExecError {
     }
 }
 
-/// Before-image of an autocommit write, used both to derive the WAL
-/// records and to undo the in-memory mutation if the WAL append/fsync
-/// fails. A failed WAL write must leave the committed database exactly
-/// as it was: the client gets a 58000 error and nothing undurable is
-/// ever visible.
-enum Undo {
-    /// INSERT: truncate the table's rows back to this length.
-    Truncate { table: String, len: usize },
-    /// CREATE TABLE: remove the newly created table.
-    Remove { name: String },
-    /// DROP TABLE: restore the removed table.
-    Restore { name: String, table: Table },
-    /// Read-only statement, or a write that cannot have mutated.
-    None,
+/// The snapshot for one statement: the transaction's fixed snapshot for
+/// REPEATABLE READ / SERIALIZABLE (taken at the first data statement and
+/// registered, so VACUUM cannot reap what it can see), a fresh snapshot
+/// for READ COMMITTED, or a fresh snapshot with owner 0 outside a
+/// transaction. Establishing the snapshot here (rather than only at
+/// Execute) means Bind/Describe see the same view the statement will.
+fn stmt_snapshot(
+    engine: &mut Engine,
+    txn: Option<&mut Txn>,
+) -> (Snapshot, u64, IsolationLevel) {
+    match txn {
+        Some(t) => {
+            let xid = t.xid;
+            let level = t.level;
+            let snap = match level {
+                IsolationLevel::ReadCommitted => engine.take_snapshot(),
+                _ => match t.snapshot.clone() {
+                    Some(s) => s,
+                    None => {
+                        let s = engine.take_snapshot();
+                        engine.register_snapshot(xid, s.clone());
+                        t.snapshot = Some(s.clone());
+                        s
+                    }
+                },
+            };
+            (snap, xid, level)
+        }
+        None => (engine.take_snapshot(), 0, IsolationLevel::ReadCommitted),
+    }
 }
 
-impl Undo {
-    fn apply(self, db: &mut Database) {
-        match self {
-            Undo::Truncate { table, len } => {
-                if let Some(t) = db.tables.get_mut(&table) {
-                    t.rows.truncate(len);
-                }
-            }
-            Undo::Remove { name } => {
-                db.tables.remove(&name);
-            }
-            Undo::Restore { name, table } => {
-                db.tables.insert(name, table);
-            }
-            Undo::None => {}
+/// One data statement inside an explicit transaction: run under the
+/// transaction's snapshot with its xid as owner. A failed statement
+/// aborts the transaction (Postgres semantics); its staged writes stay
+/// in the log until ROLLBACK/COMMIT undoes them.
+fn txn_execute(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    stmt: &Stmt,
+) -> Result<ExecResult, ExecError> {
+    let mut guard = engine.lock().unwrap();
+    let t = session
+        .txn
+        .as_mut()
+        .expect("txn_execute called without a transaction");
+    let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+    let result = {
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: xid,
+            level,
+            writes: &mut t.writes,
+        };
+        exec::execute(&mut *guard, &mut ctx, stmt)
+    };
+    match result {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            t.failed = true;
+            Err(e)
         }
     }
 }
 
-/// Autocommit write path (v0.4): the statement executes against the
-/// committed database under the db lock, then its logical change is
-/// appended to the WAL and fsynced *before* we return. Each autocommit
-/// statement is its own durable mini-transaction. The records are derived
-/// from the before-image (rather than diffing the whole database), which
-/// keeps this O(changed rows): INSERT logs the appended row suffix via a
-/// before/after row count, CREATE/DROP log their schema/name.
+/// Autocommit: the statement is its own transaction. It gets an xid,
+/// runs under a fresh snapshot, its write set is WAL-logged and fsynced,
+/// and only then the xid retires. On any failure the staged writes are
+/// undone and the xid retires without a trace.
 fn autocommit_execute(
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
-    let mut db_guard = db.lock().unwrap();
-    // Capture the before-image while holding the db lock (no one else
-    // can mutate concurrently).
-    let undo = match stmt {
-        Stmt::Insert { table, .. } => Undo::Truncate {
-            table: table.clone(),
-            len: db_guard.tables.get(table).map(|t| t.rows.len()).unwrap_or(0),
-        },
-        Stmt::CreateTable { name, .. } => Undo::Remove { name: name.clone() },
-        Stmt::DropTable { name, .. } => match db_guard.tables.get(name) {
-            Some(t) => Undo::Restore {
-                name: name.clone(),
-                table: t.clone(),
-            },
-            None => Undo::None, // execute will fail (or be a no-op); nothing to undo
-        },
-        _ => Undo::None,
+    let mut guard = engine.lock().unwrap();
+    let xid = guard.begin_txn();
+    let snap = guard.take_snapshot();
+    let mut writes: Vec<WriteOp> = Vec::new();
+    let result = {
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: xid,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+        };
+        exec::execute(&mut *guard, &mut ctx, stmt)
     };
-    let result = exec::execute(&mut db_guard, stmt)?;
-    // Derive the WAL records from the same before-image.
-    let records: Vec<WalRecord> = match &undo {
-        Undo::Truncate { table, len } => match db_guard.tables.get(table) {
-            Some(t) if t.rows.len() > *len => vec![WalRecord::InsertRows {
-                table: table.clone(),
-                rows: t.rows[*len..].to_vec(),
-            }],
-            _ => Vec::new(),
-        },
-        Undo::Remove { name } => match stmt {
-            Stmt::CreateTable { columns, .. } => vec![WalRecord::CreateTable {
-                name: name.clone(),
-                columns: columns.clone(),
-            }],
-            _ => Vec::new(),
-        },
-        Undo::Restore { name, .. } => vec![WalRecord::DropTable { name: name.clone() }],
-        Undo::None => Vec::new(),
-    };
-    // Lock order is always db -> wal.
-    if !records.is_empty() {
-        if let Err(e) = wal.lock().unwrap().append_batch(&records) {
-            // WAL is not durable: roll back the in-memory mutation so a
-            // failed commit never becomes visible, then report 58000.
-            undo.apply(&mut db_guard);
-            return Err(wal_err(e));
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            undo_all(&mut guard, xid, &writes);
+            guard.end_txn(xid);
+            return Err(e);
         }
+    };
+    // Derive the WAL records, then fsync BEFORE the commit can become
+    // visible: we still hold the engine lock, so no other session can
+    // observe the in-memory mutation until the frame is durable.
+    // A commit-time serialization conflict (e.g. a concurrent CREATE
+    // TABLE of the same name won the race) aborts the statement: undo
+    // the staged writes and retire the xid.
+    let records = match wal::records_for_commit(&guard, xid, &writes) {
+        Ok(r) => r,
+        Err(msg) => {
+            undo_all(&mut guard, xid, &writes);
+            guard.end_txn(xid);
+            auto_vacuum(&mut guard, &writes);
+            return Err(ExecError {
+                code: "40001",
+                message: format!("could not serialize access due to concurrent update: {}", msg),
+            });
+        }
+    };
+    // Lock order is always engine -> wal.
+    if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+        undo_all(&mut guard, xid, &writes);
+        guard.end_txn(xid);
+        auto_vacuum(&mut guard, &writes);
+        return Err(wal_err(e));
     }
+    guard.end_txn(xid);
+    auto_vacuum(&mut guard, &writes);
     Ok(result)
 }
 
+/// Undo every op, newest first (abort / failed autocommit / WAL failure).
+fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
+    for op in writes.iter().rev() {
+        undo_write_op(engine, own, op);
+    }
+}
+
+/// Best-effort cleanup after a commit or abort: reclaim versions that are
+/// dead to every snapshot. Only tables where the transaction may have
+/// created dead versions (DELETE/UPDATE/DROP — never pure INSERT/CREATE)
+/// are scanned, so insert-only workloads don't pay an O(table) scan per
+/// commit. Never fails the statement it follows.
+fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
+    let mut names: Vec<&str> = Vec::new();
+    for op in writes {
+        let name = match op {
+            // Only deletes (UPDATE = delete+insert) and drops create dead
+            // versions; inserts and creates never do.
+            WriteOp::DeleteRow { table, .. } => table.as_str(),
+            WriteOp::DropTable { name, .. } => name.as_str(),
+            WriteOp::InsertRow { .. } | WriteOp::CreateTable { .. } => continue,
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    for name in names {
+        engine.vacuum_table(name);
+    }
+}
+
 fn txn_begin(
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
+    level: IsolationLevel,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
         // Postgres: WARNING "there is already a transaction in progress",
-        // otherwise a no-op. v0.3 has no NOTICE channel, so plain no-op.
+        // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
         return Ok(cmd("BEGIN"));
     }
-    let working = db.lock().unwrap().clone();
+    let xid = engine.lock().unwrap().begin_txn();
     session.txn = Some(Txn {
-        working,
+        xid,
+        level,
+        snapshot: None,
+        writes: Vec::new(),
         savepoints: Vec::new(),
         failed: false,
     });
@@ -522,59 +603,144 @@ fn txn_begin(
 }
 
 fn txn_commit(
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
 ) -> Result<ExecResult, ExecError> {
-    match session.txn.take() {
-        None => Ok(cmd("COMMIT")), // Postgres: WARNING, no-op
-        Some(t) if t.failed => Ok(cmd("ROLLBACK")), // COMMIT of an aborted txn rolls back
-        Some(t) => {
-            let mut db_guard = db.lock().unwrap();
-            // Diff the pre-commit database against the working copy and
-            // make the delta durable BEFORE publishing it: COMMIT returns
-            // only after the WAL frame is fsynced.
-            let records = wal::diff_dbs(&db_guard, &t.working);
-            if !records.is_empty() {
-                // Lock order is always db -> wal.
-                if let Err(e) = wal.lock().unwrap().append_batch(&records) {
-                    // Nothing was published; hand the transaction back so
-                    // the session can retry the COMMIT or ROLLBACK.
-                    session.txn = Some(t);
-                    return Err(wal_err(e));
-                }
-            }
-            // Publish the working copy. (Concurrent transactions are
-            // last-writer-wins in v0.4; real MVCC is a later milestone.)
-            *db_guard = t.working;
-            Ok(cmd("COMMIT"))
-        }
+    let t = match session.txn.take() {
+        None => return Ok(cmd("COMMIT")), // Postgres: WARNING, no-op
+        Some(t) => t,
+    };
+    let mut guard = engine.lock().unwrap();
+    if t.failed {
+        // COMMIT of an aborted transaction rolls back (v0.3 behavior).
+        undo_all(&mut guard, t.xid, &t.writes);
+        guard.end_txn(t.xid);
+        auto_vacuum(&mut guard, &t.writes);
+        return Ok(cmd("ROLLBACK"));
     }
+    // Derive the records from the write log and make them durable BEFORE
+    // the commit returns. The in-memory versions are already stamped with
+    // our xid; retiring the xid (below) is what publishes them.
+    // A commit-time serialization conflict aborts the transaction, like
+    // Postgres: hand it back marked failed so the client can ROLLBACK.
+    let records = match wal::records_for_commit(&guard, t.xid, &t.writes) {
+        Ok(r) => r,
+        Err(msg) => {
+            let mut t = t;
+            t.failed = true;
+            session.txn = Some(t);
+            return Err(ExecError {
+                code: "40001",
+                message: format!("could not serialize access due to concurrent update: {}", msg),
+            });
+        }
+    };
+    // Lock order is always engine -> wal.
+    if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+        // Not durable: the transaction cannot commit. Hand it back marked
+        // failed so the client can ROLLBACK (which undoes the staged
+        // writes); a COMMIT retry would be meaningless.
+        let mut t = t;
+        t.failed = true;
+        session.txn = Some(t);
+        return Err(wal_err(e));
+    }
+    guard.end_txn(t.xid);
+    auto_vacuum(&mut guard, &t.writes);
+    Ok(cmd("COMMIT"))
 }
 
-/// v0.4: snapshot the committed database and truncate the WAL.
+/// Snapshot the committed engine and truncate the WAL.
 /// Refused inside a transaction block, like Postgres.
 fn txn_checkpoint(
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &Session,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
-        return Err(ExecError {
-            code: "25001",
-            message: "CHECKPOINT cannot be executed inside a transaction block".to_string(),
-        });
+        return Err(err_25001(
+            "CHECKPOINT cannot be executed inside a transaction block",
+        ));
     }
-    let db_guard = db.lock().unwrap();
+    let guard = engine.lock().unwrap();
     wal.lock()
         .unwrap()
-        .checkpoint(&db_guard)
+        .checkpoint(&guard)
         .map_err(wal_err)?;
     Ok(cmd("CHECKPOINT"))
 }
 
-fn txn_rollback(session: &mut Session) -> Result<ExecResult, ExecError> {
-    session.txn.take();
+/// Explicit VACUUM. Refused inside a transaction block, like Postgres.
+/// `VACUUM VERBOSE` returns one informational row per table vacuumed.
+fn txn_vacuum(
+    engine: &Arc<Mutex<Engine>>,
+    session: &Session,
+    table: Option<&str>,
+    verbose: bool,
+) -> Result<ExecResult, ExecError> {
+    if session.txn.is_some() {
+        return Err(err_25001(
+            "VACUUM cannot be executed inside a transaction block",
+        ));
+    }
+    let mut guard = engine.lock().unwrap();
+    if let Some(name) = table {
+        if !guard.db.tables.contains_key(name) {
+            return Err(ExecError {
+                code: "42P01",
+                message: format!("table \"{}\" does not exist", name),
+            });
+        }
+    }
+    if !verbose {
+        match table {
+            Some(name) => {
+                guard.vacuum_table(name);
+            }
+            None => {
+                guard.vacuum_all();
+            }
+        }
+        return Ok(cmd("VACUUM"));
+    }
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    match table {
+        Some(name) => {
+            let n = guard.vacuum_table(name);
+            rows.push(vec![Value::Text(format!(
+                "table \"{}\": removed {} dead row version(s)",
+                name, n
+            ))]);
+        }
+        None => {
+            for (name, n) in guard.vacuum_all() {
+                rows.push(vec![Value::Text(format!(
+                    "table \"{}\": removed {} dead row version(s)",
+                    name, n
+                ))]);
+            }
+            if rows.is_empty() {
+                rows.push(vec![Value::Text("vacuum: nothing to remove".to_string())]);
+            }
+        }
+    }
+    Ok(ExecResult::Select {
+        columns: vec![("vacuum".to_string(), ColType::Text)],
+        rows,
+    })
+}
+
+fn txn_rollback(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+) -> Result<ExecResult, ExecError> {
+    if let Some(t) = session.txn.take() {
+        let mut guard = engine.lock().unwrap();
+        undo_all(&mut guard, t.xid, &t.writes);
+        guard.end_txn(t.xid);
+        auto_vacuum(&mut guard, &t.writes);
+    }
     Ok(cmd("ROLLBACK"))
 }
 
@@ -582,13 +748,19 @@ fn txn_savepoint(session: &mut Session, name: &str) -> Result<ExecResult, ExecEr
     match session.txn.as_mut() {
         None => Err(err_25001("SAVEPOINT can only be used in transaction blocks")),
         Some(t) => {
-            t.savepoints.push((name.to_string(), t.working.clone()));
+            // A savepoint is just a position in the write log — no copy.
+            t.savepoints.push((name.to_string(), t.writes.len()));
             Ok(cmd("SAVEPOINT"))
         }
     }
 }
 
-fn txn_rollback_to(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
+fn txn_rollback_to(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    name: &str,
+) -> Result<ExecResult, ExecError> {
+    let mut guard = engine.lock().unwrap();
     let t = session.txn.as_mut().ok_or_else(|| {
         err_25001("ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
     })?;
@@ -600,7 +772,13 @@ fn txn_rollback_to(session: &mut Session, name: &str) -> Result<ExecResult, Exec
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
-    t.working = t.savepoints[idx].1.clone();
+    let to = t.savepoints[idx].1;
+    let xid = t.xid;
+    // Undo everything staged after the savepoint, newest first. Each undo
+    // is conditional on the version still being ours (see undo_write_op).
+    for op in t.writes.drain(to..).rev() {
+        undo_write_op(&mut guard, xid, &op);
+    }
     // Savepoints established after the named one are destroyed; the named
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
@@ -623,30 +801,6 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
     // Destroys the named savepoint and all established after it.
     t.savepoints.truncate(idx);
     Ok(cmd("RELEASE"))
-}
-
-/// Read-only view of the data visible to a session: its transaction's
-/// working copy when in a transaction, else the committed database.
-enum DbView<'a> {
-    Committed(std::sync::MutexGuard<'a, Database>),
-    Working(&'a Database),
-}
-
-impl<'a> std::ops::Deref for DbView<'a> {
-    type Target = Database;
-    fn deref(&self) -> &Database {
-        match self {
-            DbView::Committed(g) => g,
-            DbView::Working(w) => w,
-        }
-    }
-}
-
-fn db_view<'a>(db: &'a Arc<Mutex<Database>>, session: &'a Session) -> DbView<'a> {
-    match &session.txn {
-        Some(t) => DbView::Working(&t.working),
-        None => DbView::Committed(db.lock().unwrap()),
-    }
 }
 
 const ABORTED_MSG: &str =
@@ -714,7 +868,7 @@ fn handle_parse(
 /// statement stored on the portal.
 fn handle_bind(
     stream: &mut Writer,
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -814,8 +968,9 @@ fn handle_bind(
             }
             let params = {
                 // Type resolution sees the session's own uncommitted data.
-                let view = db_view(db, session);
-                exec::bind_params(&s, &prep.declared_oids, &raw, &view)
+                let mut guard = engine.lock().unwrap();
+                let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
+                exec::bind_params(&s, &prep.declared_oids, &raw, &guard, &snap, own)
             };
             let params = match params {
                 Ok(p) => p,
@@ -847,7 +1002,7 @@ fn handle_bind(
 /// 'P' name → RowDescription/NoData.
 fn handle_describe(
     stream: &mut Writer,
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -913,8 +1068,9 @@ fn handle_describe(
             None => Vec::new(),
             Some(stmt) => {
                 let types = {
-                    let view = db_view(db, session);
-                    exec::resolve_param_types(stmt, &prep.declared_oids, &view)
+                    let mut guard = engine.lock().unwrap();
+                    let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
+                    exec::resolve_param_types(stmt, &prep.declared_oids, &guard, &snap, own)
                 };
                 match types {
                     Ok(types) => types.iter().map(|t| t.oid()).collect(),
@@ -930,7 +1086,7 @@ fn handle_describe(
         b.send(stream)?;
     }
 
-    match describe_prepared(&prep, db, session) {
+    match describe_prepared(&prep, engine, session) {
         Err(e) => protocol_error(stream, session, e.code, &e.message),
         Ok(None) => {
             MsgBuilder::new(b'n').send(stream)?; // NoData
@@ -947,14 +1103,15 @@ fn handle_describe(
 
 fn describe_prepared(
     prep: &Prepared,
-    db: &Arc<Mutex<Database>>,
-    session: &Session,
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
 ) -> Result<Option<Vec<(String, ColType)>>, exec::ExecError> {
     match &prep.stmt {
         None => Ok(None),
         Some(stmt) => {
-            let view = db_view(db, session);
-            exec::describe_columns(stmt, &prep.declared_oids, &view)
+            let mut guard = engine.lock().unwrap();
+            let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
+            exec::describe_columns(stmt, &prep.declared_oids, &guard, &snap, own)
         }
     }
 }
@@ -963,7 +1120,7 @@ fn describe_prepared(
 /// PortalSuspended; the final CommandComplete carries the total row count.
 fn handle_execute(
     stream: &mut Writer,
-    db: &Arc<Mutex<Database>>,
+    engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     payload: &[u8],
@@ -1011,7 +1168,7 @@ fn handle_execute(
     // First Execute: run the statement, caching SELECT rows for suspension.
     if session.portals[&portal_name].pending.is_none() {
         let stmt = session.portals[&portal_name].stmt.clone().unwrap();
-        match run_statement(db, wal, session, &stmt) {
+        match run_statement(engine, wal, session, &stmt) {
             Err(e) => return protocol_error(stream, session, e.code, &e.message),
             Ok(ExecResult::Select { rows, .. }) => {
                 session.portals.get_mut(&portal_name).unwrap().pending =
@@ -1124,58 +1281,126 @@ fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ColType;
+    use crate::storage::Engine;
 
-    fn sample_db() -> Database {
-        let mut db = Database::new();
-        db.tables.insert(
-            "t".to_string(),
-            Table {
-                columns: vec![("a".to_string(), ColType::Int)],
-                rows: vec![vec![Value::Int(1)]],
-            },
-        );
-        db
+    fn session_with_txn(level: IsolationLevel) -> (Engine, Session) {
+        let mut engine = Engine::new();
+        let xid = engine.begin_txn();
+        let session = Session {
+            stmts: HashMap::new(),
+            portals: HashMap::new(),
+            in_error: false,
+            txn: Some(Txn {
+                xid,
+                level,
+                snapshot: None,
+                writes: Vec::new(),
+                savepoints: Vec::new(),
+                failed: false,
+            }),
+        };
+        (engine, session)
     }
 
     #[test]
-    fn undo_truncate_restores_row_count() {
-        let mut db = sample_db();
-        // Simulate a successful INSERT of two rows followed by WAL failure.
-        db.tables.get_mut("t").unwrap().rows.push(vec![Value::Int(2)]);
-        db.tables.get_mut("t").unwrap().rows.push(vec![Value::Int(3)]);
-        Undo::Truncate {
+    fn rr_snapshot_pinned_at_first_use() {
+        let (mut engine, mut session) = session_with_txn(IsolationLevel::RepeatableRead);
+        let (s1, own1, _) = stmt_snapshot(&mut engine, session.txn.as_mut());
+        // A concurrent transaction commits between the two calls...
+        let other = engine.begin_txn();
+        engine.end_txn(other);
+        let (s2, own2, _) = stmt_snapshot(&mut engine, session.txn.as_mut());
+        assert_eq!(s1.active, s2.active);
+        assert_eq!(s1.next_xid, s2.next_xid);
+        assert_eq!(own1, own2);
+        // ...and the snapshot is registered so VACUUM respects it.
+        assert!(engine.txns.snapshots.contains_key(&own1));
+    }
+
+    #[test]
+    fn rc_takes_fresh_snapshot_each_time() {
+        let (mut engine, mut session) = session_with_txn(IsolationLevel::ReadCommitted);
+        let (s1, _, _) = stmt_snapshot(&mut engine, session.txn.as_mut());
+        let other = engine.begin_txn();
+        engine.end_txn(other);
+        let (s2, _, _) = stmt_snapshot(&mut engine, session.txn.as_mut());
+        assert!(s2.next_xid > s1.next_xid);
+        // RC snapshots are ephemeral: never registered.
+        assert!(engine.txns.snapshots.is_empty());
+        // And the transaction itself stores none.
+        assert!(session.txn.as_ref().unwrap().snapshot.is_none());
+    }
+
+    #[test]
+    fn savepoint_records_write_log_position() {
+        let (_engine, mut session) = session_with_txn(IsolationLevel::ReadCommitted);
+        let t = session.txn.as_mut().unwrap();
+        t.writes.push(WriteOp::InsertRow {
             table: "t".into(),
-            len: 1,
-        }
-        .apply(&mut db);
-        assert_eq!(db.tables["t"].rows, vec![vec![Value::Int(1)]]);
-    }
-
-    #[test]
-    fn undo_remove_drops_created_table() {
-        let mut db = sample_db();
-        db.tables.insert(
-            "new".to_string(),
-            Table {
-                columns: vec![],
-                rows: vec![],
-            },
+            row_id: 1,
+        });
+        t.writes.push(WriteOp::InsertRow {
+            table: "t".into(),
+            row_id: 2,
+        });
+        txn_savepoint(&mut session, "sp1").unwrap();
+        assert_eq!(
+            session.txn.as_ref().unwrap().savepoints,
+            vec![("sp1".to_string(), 2)]
         );
-        Undo::Remove { name: "new".into() }.apply(&mut db);
-        assert!(!db.tables.contains_key("new"));
-        assert!(db.tables.contains_key("t")); // untouched
     }
 
     #[test]
-    fn undo_restore_brings_back_dropped_table() {
-        let mut db = sample_db();
-        let t = db.tables.remove("t").unwrap();
-        Undo::Restore {
-            name: "t".into(),
-            table: t,
+    fn undo_all_reverses_in_order() {
+        let mut engine = Engine::new();
+        engine.db.tables.insert(
+            "t".into(),
+            vec![crate::storage::Table::new(
+                vec![("a".into(), ColType::Int)],
+                1,
+            )],
+        );
+        engine.txns.next_xid = 9;
+        let xid = engine.begin_txn(); // xid 9
+        // Simulate two staged inserts, then abort.
+        let writes = vec![
+            WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 1,
+            },
+            WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 2,
+            },
+        ];
+        for (i, op) in writes.iter().enumerate() {
+            if let WriteOp::InsertRow { row_id, .. } = op {
+                engine.db.tables.get_mut("t").unwrap()[0]
+                    .push_version(crate::storage::RowVersion {
+                        id: *row_id,
+                        values: vec![Value::Int(i as i64)],
+                        xmin: xid,
+                        xmax: 0,
+                    });
+            }
         }
-        .apply(&mut db);
-        assert_eq!(db.tables["t"].rows, vec![vec![Value::Int(1)]]);
+        assert_eq!(engine.db.tables["t"][0].rows.len(), 2);
+        undo_all(&mut engine, xid, &writes);
+        assert!(engine.db.tables["t"][0].rows.is_empty());
+    }
+
+    #[test]
+    fn aborted_txn_gate() {
+        // Only ROLLBACK / ROLLBACK TO / COMMIT may run once failed.
+        let rb = Stmt::Rollback;
+        let rbt = Stmt::RollbackTo {
+            name: "sp".into(),
+        };
+        let commit = Stmt::Commit;
+        let sel = Stmt::Checkpoint;
+        assert!(allowed_in_aborted(&rb));
+        assert!(allowed_in_aborted(&rbt));
+        assert!(allowed_in_aborted(&commit));
+        assert!(!allowed_in_aborted(&sel));
     }
 }
