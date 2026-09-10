@@ -24,67 +24,609 @@
 use std::collections::{HashMap, HashSet};
 
 /// Column data types supported.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
-    Int,
-    Float,
-    Text,
-    Bool,
+    Int,      // INT4, OID 23
+    BigInt,   // INT8, OID 20 (v0.7)
+    SmallInt, // INT2, OID 21 (v0.7)
+    Float,    // FLOAT8, OID 701
+    Float4,   // FLOAT4, OID 700 (v0.7)
+    Numeric,  // NUMERIC, OID 1700 (v0.7)
+    Text,     // OID 25
+    Bool,     // OID 16
+    Date,     // OID 1082 (v0.7)
+    Timestamp,   // OID 1114 (v0.7)
+    Timestamptz, // OID 1184 (v0.7)
+    Bytea,    // OID 17 (v0.7)
+    Uuid,     // OID 2950 (v0.7)
 }
 
 impl ColType {
     /// PostgreSQL type OID used in RowDescription.
     pub fn oid(&self) -> i32 {
         match self {
-            ColType::Int => 23,    // INT4
-            ColType::Text => 25,   // TEXT
-            ColType::Bool => 16,   // BOOL
-            ColType::Float => 701, // FLOAT8
+            ColType::Int => 23,         // INT4
+            ColType::BigInt => 20,      // INT8
+            ColType::SmallInt => 21,    // INT2
+            ColType::Text => 25,        // TEXT
+            ColType::Bool => 16,        // BOOL
+            ColType::Float => 701,      // FLOAT8
+            ColType::Float4 => 700,     // FLOAT4
+            ColType::Numeric => 1700,   // NUMERIC
+            ColType::Date => 1082,      // DATE
+            ColType::Timestamp => 1114, // TIMESTAMP
+            ColType::Timestamptz => 1184, // TIMESTAMPTZ
+            ColType::Bytea => 17,       // BYTEA
+            ColType::Uuid => 2950,      // UUID
         }
     }
 
     pub fn sql_name(&self) -> &'static str {
         match self {
             ColType::Int => "integer",
+            ColType::BigInt => "bigint",
+            ColType::SmallInt => "smallint",
             ColType::Float => "double precision",
+            ColType::Float4 => "real",
+            ColType::Numeric => "numeric",
             ColType::Text => "text",
             ColType::Bool => "boolean",
+            ColType::Date => "date",
+            ColType::Timestamp => "timestamp without time zone",
+            ColType::Timestamptz => "timestamp with time zone",
+            ColType::Bytea => "bytea",
+            ColType::Uuid => "uuid",
         }
+    }
+}
+
+/// Fixed-precision decimal (v0.7): value = `unscaled * 10^-scale`.
+///
+/// Always kept normalized (no trailing decimal zeros unless the value is
+/// zero, which is `0/10^0`), so derived `PartialEq`/`Eq` compare
+/// numerically. The `i128` mantissa holds ~38 significant digits;
+/// operations that would exceed it fail with 22003 rather than silently
+/// rounding — a deliberate v0.7 deviation from Postgres' arbitrary
+/// precision (documented in the README).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Numeric {
+    pub unscaled: i128,
+    pub scale: u32,
+}
+
+impl Numeric {
+    /// Build and normalize.
+    pub fn new(unscaled: i128, scale: u32) -> Self {
+        let mut n = Numeric { unscaled, scale };
+        n.normalize();
+        n
+    }
+
+    fn normalize(&mut self) {
+        if self.unscaled == 0 {
+            self.scale = 0;
+            return;
+        }
+        while self.scale > 0 && self.unscaled % 10 == 0 {
+            self.unscaled /= 10;
+            self.scale -= 1;
+        }
+    }
+
+    pub fn zero() -> Self {
+        Numeric {
+            unscaled: 0,
+            scale: 0,
+        }
+    }
+
+    pub fn from_i64(i: i64) -> Self {
+        Numeric::new(i as i128, 0)
+    }
+
+    /// Parse a decimal literal: `[+-]digits[.digits][e[+-]digits]`.
+    /// `Err(())` = not a number (caller maps to 22P02).
+    /// `Err` with overflow is impossible here only if digits fit; too
+    /// many digits yield `None` via the overflow flag (caller: 22003).
+    pub fn parse(s: &str) -> Result<Self, NumericParseError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(NumericParseError::Syntax);
+        }
+        let (neg, rest) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        // Split off an exponent.
+        let (mant, exp): (&str, i32) = match rest.find(['e', 'E']) {
+            Some(i) => {
+                let e: i32 = rest[i + 1..]
+                    .parse()
+                    .map_err(|_| NumericParseError::Syntax)?;
+                (&rest[..i], e)
+            }
+            None => (rest, 0),
+        };
+        let (int_part, frac_part) = match mant.find('.') {
+            Some(i) => (&mant[..i], &mant[i + 1..]),
+            None => (mant, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(NumericParseError::Syntax);
+        }
+        for c in int_part.chars().chain(frac_part.chars()) {
+            if !c.is_ascii_digit() {
+                return Err(NumericParseError::Syntax);
+            }
+        }
+        // Assemble the unscaled integer from all digits.
+        let mut unscaled: i128 = 0;
+        for c in int_part.chars().chain(frac_part.chars()) {
+            let d = (c as i128) - ('0' as i128);
+            unscaled = unscaled
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(d))
+                .ok_or(NumericParseError::Overflow)?;
+        }
+        if neg {
+            unscaled = -unscaled;
+        }
+        // scale = frac digits - exponent.
+        let scale = frac_part.len() as i32 - exp;
+        if scale < 0 {
+            let extra = (-scale) as u32;
+            unscaled = unscaled
+                .checked_mul(10i128.checked_pow(extra).ok_or(NumericParseError::Overflow)?)
+                .ok_or(NumericParseError::Overflow)?;
+            Ok(Numeric::new(unscaled, 0))
+        } else {
+            Ok(Numeric::new(unscaled, scale as u32))
+        }
+    }
+
+    /// Build from an f64's shortest round-trip representation, so
+    /// `Numeric::from_f64(0.1)` is exactly 0.1. Non-finite and extreme
+    /// magnitudes fail.
+    pub fn from_f64(f: f64) -> Result<Self, NumericParseError> {
+        if !f.is_finite() {
+            return Err(NumericParseError::Syntax);
+        }
+        // Shortest round-trip text, then decimal parse. Rust's Display
+        // for f64 already gives the shortest such string.
+        let s = if f.abs() < 1e-6 || f.abs() >= 1e21 {
+            format!("{:e}", f)
+        } else {
+            format!("{}", f)
+        };
+        Numeric::parse(&s)
+    }
+
+    pub fn to_f64(&self) -> f64 {
+        self.unscaled as f64 * 10f64.powi(-(self.scale as i32))
+    }
+
+    /// Round half away from zero to an integer; overflow -> None.
+    pub fn to_i64(&self) -> Option<i64> {
+        let half = 10i128.checked_pow(self.scale)? / 2;
+        let rounded = if self.unscaled >= 0 {
+            self.unscaled.checked_add(half)? / 10i128.checked_pow(self.scale)?
+        } else {
+            self.unscaled.checked_sub(half)? / 10i128.checked_pow(self.scale)?
+        };
+        i64::try_from(rounded).ok()
+    }
+
+    /// Align `other` to our scale; used by add/sub. Overflow -> None.
+    fn aligned(&self, other: &Numeric) -> Option<(i128, i128, u32)> {
+        let scale = self.scale.max(other.scale);
+        let a = self
+            .unscaled
+            .checked_mul(10i128.checked_pow(scale - self.scale)?)?;
+        let b = other
+            .unscaled
+            .checked_mul(10i128.checked_pow(scale - other.scale)?)?;
+        Some((a, b, scale))
+    }
+
+    pub fn checked_add(&self, other: &Numeric) -> Option<Numeric> {
+        let (a, b, scale) = self.aligned(other)?;
+        Some(Numeric::new(a.checked_add(b)?, scale))
+    }
+
+    pub fn checked_sub(&self, other: &Numeric) -> Option<Numeric> {
+        let (a, b, scale) = self.aligned(other)?;
+        Some(Numeric::new(a.checked_sub(b)?, scale))
+    }
+
+    pub fn checked_mul(&self, other: &Numeric) -> Option<Numeric> {
+        Some(Numeric::new(
+            self.unscaled.checked_mul(other.unscaled)?,
+            self.scale.checked_add(other.scale)?,
+        ))
+    }
+
+    /// Division with 10 guard digits after the decimal point
+    /// (documented v0.7 fixed scale). Division by zero -> None with the
+    /// `is_zero` flag distinguishable by the caller via `other.is_zero()`.
+    pub fn checked_div(&self, other: &Numeric) -> Option<Numeric> {
+        if other.unscaled == 0 {
+            return None;
+        }
+        // a/b = (ua * 10^(sb+10)) / (ub * 10^sa), scale 10.
+        let num = self
+            .unscaled
+            .checked_mul(10i128.checked_pow(other.scale + 10)?)?;
+        let den = other
+            .unscaled
+            .checked_mul(10i128.checked_pow(self.scale)?)?;
+        Some(Numeric::new(num.checked_div(den)?, 10))
+    }
+
+    /// Remainder, sign follows the dividend (like Rust's `%` and PG's
+    /// numeric mod). Division by zero -> None.
+    pub fn checked_rem(&self, other: &Numeric) -> Option<Numeric> {
+        if other.unscaled == 0 {
+            return None;
+        }
+        let (a, b, scale) = self.aligned(other)?;
+        Some(Numeric::new(a.checked_rem(b)?, scale))
+    }
+
+    pub fn abs(&self) -> Numeric {
+        Numeric::new(self.unscaled.abs(), self.scale)
+    }
+
+    /// Round to `scale` fractional digits, half away from zero.
+    pub fn round_to(&self, scale: u32) -> Option<Numeric> {
+        if scale >= self.scale {
+            let mul = 10i128.checked_pow(scale - self.scale)?;
+            return Some(Numeric::new(self.unscaled.checked_mul(mul)?, scale));
+        }
+        let drop = self.scale - scale;
+        let div = 10i128.checked_pow(drop)?;
+        let half = div / 2;
+        let adj = if self.unscaled >= 0 { half } else { -half };
+        Some(Numeric::new(
+            self.unscaled.checked_add(adj)?.checked_div(div)?,
+            scale,
+        ))
+    }
+
+    pub fn floor(&self) -> Option<Numeric> {
+        let div = 10i128.checked_pow(self.scale)?;
+        let q = self.unscaled.checked_div(div)?;
+        let r = self.unscaled.checked_rem(div)?;
+        let q = if r != 0 && self.unscaled < 0 { q - 1 } else { q };
+        Some(Numeric::new(q, 0))
+    }
+
+    pub fn ceil(&self) -> Option<Numeric> {
+        let div = 10i128.checked_pow(self.scale)?;
+        let q = self.unscaled.checked_div(div)?;
+        let r = self.unscaled.checked_rem(div)?;
+        let q = if r != 0 && self.unscaled > 0 { q + 1 } else { q };
+        Some(Numeric::new(q, 0))
+    }
+
+    /// Square root via f64 (documented precision limit: ~15-16
+    /// significant digits). Negative -> None.
+    pub fn sqrt(&self) -> Option<Numeric> {
+        let f = self.to_f64();
+        if f < 0.0 {
+            return None;
+        }
+        Numeric::from_f64(f.sqrt()).ok()
+    }
+
+    /// Exact power for integer exponents (repeated squaring). `None`
+    /// on overflow or absurd exponents (callers fall back to f64 or
+    /// raise 22003). Negative exponents divide, with 10 guard digits.
+    pub fn pow(&self, exp: i64) -> Option<Numeric> {
+        if exp == 0 {
+            return Some(Numeric::new(1, 0));
+        }
+        if exp.unsigned_abs() > 10_000 {
+            return None;
+        }
+        let neg = exp < 0;
+        let mut e = exp.unsigned_abs();
+        let mut base = self.clone();
+        let mut acc = Numeric::new(1, 0);
+        while e > 0 {
+            if e & 1 == 1 {
+                acc = acc.checked_mul(&base)?;
+            }
+            e >>= 1;
+            if e > 0 {
+                base = base.checked_mul(&base)?;
+            }
+        }
+        if neg {
+            if acc.is_zero() {
+                return None;
+            }
+            Numeric::new(1, 0).checked_div(&acc)
+        } else {
+            Some(acc)
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.unscaled == 0
+    }
+
+    pub fn cmp(&self, other: &Numeric) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.unscaled == 0 && other.unscaled == 0 {
+            return Ordering::Equal;
+        }
+        let neg_a = self.unscaled < 0;
+        let neg_b = other.unscaled < 0;
+        if neg_a != neg_b {
+            return if neg_a { Ordering::Less } else { Ordering::Greater };
+        }
+        // Compare by magnitude: digits(unscaled) - scale.
+        let mag = |n: &Numeric| -> i64 {
+            let mut v = n.unscaled.unsigned_abs();
+            let mut digits: i64 = 0;
+            while v >= 10 {
+                v /= 10;
+                digits += 1;
+            }
+            digits - n.scale as i64
+        };
+        let (ma, mb) = (mag(self), mag(other));
+        if ma != mb {
+            return if neg_a { mb.cmp(&ma) } else { ma.cmp(&mb) };
+        }
+        // Same magnitude: align scales; on overflow fall back to f64.
+        let ord = match self.aligned(other) {
+            Some((a, b, _)) => a.cmp(&b),
+            None => self
+                .to_f64()
+                .partial_cmp(&other.to_f64())
+                .unwrap_or(Ordering::Equal),
+        };
+        ord
+    }
+
+    /// Canonical decimal text: no trailing fractional zeros.
+    pub fn to_text(&self) -> String {
+        if self.unscaled == 0 {
+            return "0".to_string();
+        }
+        let neg = self.unscaled < 0;
+        let digits = self.unscaled.unsigned_abs().to_string();
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        if self.scale == 0 {
+            out.push_str(&digits);
+        } else if digits.len() > self.scale as usize {
+            let at = digits.len() - self.scale as usize;
+            out.push_str(&digits[..at]);
+            out.push('.');
+            out.push_str(&digits[at..]);
+        } else {
+            out.push_str("0.");
+            for _ in 0..(self.scale as usize - digits.len()) {
+                out.push('0');
+            }
+            out.push_str(&digits);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericParseError {
+    Syntax,
+    Overflow,
+}
+
+impl PartialOrd for Numeric {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(Numeric::cmp(self, other))
+    }
+}
+
+impl Ord for Numeric {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        Numeric::cmp(self, other)
     }
 }
 
 /// A single cell value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
-    Int(i64),
-    Float(f64),
+    SmallInt(i16),   // v0.7: INT2
+    Int(i64),        // INT4 (kept as i64, like v0.1-v0.6)
+    BigInt(i64),     // v0.7: INT8
+    Float4(f32),     // v0.7: REAL
+    Float(f64),      // FLOAT8
+    Numeric(Numeric),// v0.7: NUMERIC
     Text(String),
     Bool(bool),
+    Date(i32),       // v0.7: days since 1970-01-01
+    Timestamp(i64),  // v0.7: micros since 1970-01-01 00:00:00 UTC
+    Timestamptz(i64),// v0.7: micros since epoch, UTC
+    Bytea(Vec<u8>),  // v0.7
+    Uuid([u8; 16]),  // v0.7
     Null,
 }
 
 impl Value {
     /// Text-format encoding for the wire protocol (`None` = NULL).
-    /// Matches what psql prints: ints/floats via Display, bools as t/f.
+    /// Matches what psql prints: ints/floats via Display, bools as t/f,
+    /// bytea as `\x` hex, timestamps as ISO.
     pub fn to_text(&self) -> Option<String> {
         match self {
+            Value::SmallInt(i) => Some(i.to_string()),
             Value::Int(i) => Some(i.to_string()),
+            Value::BigInt(i) => Some(i.to_string()),
+            Value::Float4(f) => Some(float4_text(*f)),
             Value::Float(f) => Some(float_text(*f)),
+            Value::Numeric(n) => Some(n.to_text()),
             Value::Text(s) => Some(s.clone()),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
+            Value::Date(d) => Some(crate::datetime::format_date(*d)),
+            Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
+            Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
+            Value::Bytea(b) => Some(bytea_text(b)),
+            Value::Uuid(u) => Some(uuid_text(u)),
             Value::Null => None,
         }
     }
 
     pub fn type_name(&self) -> &'static str {
         match self {
+            Value::SmallInt(_) => "smallint",
             Value::Int(_) => "integer",
+            Value::BigInt(_) => "bigint",
+            Value::Float4(_) => "real",
             Value::Float(_) => "double precision",
+            Value::Numeric(_) => "numeric",
             Value::Text(_) => "text",
             Value::Bool(_) => "boolean",
+            Value::Date(_) => "date",
+            Value::Timestamp(_) => "timestamp without time zone",
+            Value::Timestamptz(_) => "timestamp with time zone",
+            Value::Bytea(_) => "bytea",
+            Value::Uuid(_) => "uuid",
             Value::Null => "unknown",
         }
     }
+
+    /// The column type this value reports as in RowDescription.
+    pub fn col_type(&self) -> ColType {
+        match self {
+            Value::SmallInt(_) => ColType::SmallInt,
+            Value::Int(_) => ColType::Int,
+            Value::BigInt(_) => ColType::BigInt,
+            Value::Float4(_) => ColType::Float4,
+            Value::Float(_) => ColType::Float,
+            Value::Numeric(_) => ColType::Numeric,
+            Value::Text(_) => ColType::Text,
+            Value::Bool(_) => ColType::Bool,
+            Value::Date(_) => ColType::Date,
+            Value::Timestamp(_) => ColType::Timestamp,
+            Value::Timestamptz(_) => ColType::Timestamptz,
+            Value::Bytea(_) => ColType::Bytea,
+            Value::Uuid(_) => ColType::Uuid,
+            Value::Null => ColType::Text,
+        }
+    }
+}
+
+/// `\x` + lowercase hex, like Postgres' hex-format bytea output.
+fn bytea_text(b: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 + b.len() * 2);
+    out.push_str("\\x");
+    for &byte in b {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Canonical `8-4-4-4-12` lowercase hex.
+fn uuid_text(u: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (i, &byte) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Parse `\xdeadbeef` (or a bare even-length hex string) into bytes.
+/// `Err(())` = malformed (caller maps to 22P02).
+pub fn parse_bytea(s: &str) -> Result<Vec<u8>, ()> {
+    // Hex format: `\x` followed by an even number of hex digits.
+    if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
+        if hex.len() % 2 != 0 {
+            return Err(());
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let bytes = hex.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let hi = (bytes[i] as char).to_digit(16).ok_or(())?;
+            let lo = (bytes[i + 1] as char).to_digit(16).ok_or(())?;
+            out.push((hi * 16 + lo) as u8);
+            i += 2;
+        }
+        return Ok(out);
+    }
+    // Escape format: literal bytes, with `\\` for a backslash and
+    // `\ooo` (three octal digits) for an arbitrary byte — like Postgres.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'\\' {
+                out.push(b'\\');
+                i += 1;
+            } else if i + 2 < bytes.len()
+                && (bytes[i] as char).is_digit(8)
+                && (bytes[i + 1] as char).is_digit(8)
+                && (bytes[i + 2] as char).is_digit(8)
+            {
+                let v = (bytes[i] - b'0') as u16 * 64
+                    + (bytes[i + 1] - b'0') as u16 * 8
+                    + (bytes[i + 2] - b'0') as u16;
+                if v > 255 {
+                    return Err(());
+                }
+                out.push(v as u8);
+                i += 3;
+            } else {
+                return Err(());
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a UUID in canonical `8-4-4-4-12` form (also accepts 32 bare hex
+/// digits). `Err(())` = malformed (caller maps to 22P02).
+pub fn parse_uuid(s: &str) -> Result<[u8; 16], ()> {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    // Dashes, when present, must be in the 8-4-4-4-12 positions.
+    if s.contains('-') {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 5
+            || parts[0].len() != 8
+            || parts[1].len() != 4
+            || parts[2].len() != 4
+            || parts[3].len() != 4
+            || parts[4].len() != 12
+        {
+            return Err(());
+        }
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        let hi = (bytes[2 * i] as char).to_digit(16).ok_or(())?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16).ok_or(())?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Ok(out)
 }
 
 /// Shortest round-trip float rendering, Postgres-style.
@@ -96,6 +638,19 @@ fn float_text(f: f64) -> String {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
     // `{}` on f64 already prints the shortest string that round-trips.
+    format!("{}", f)
+}
+
+/// Same for f32 (real): Rust's Display already prints the shortest
+/// string that round-trips at f32 precision, so `1.1::real` prints
+/// `1.1` rather than `1.100000023841858`.
+fn float4_text(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
     format!("{}", f)
 }
 

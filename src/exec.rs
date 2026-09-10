@@ -37,10 +37,12 @@
 //! non-projected columns), OFFSET, and SELECT ... FOR UPDATE row locks.
 
 use crate::sql::{
-    AggFunc, CmpOp, Expr, FromItem, InsertValue, IsolationLevel, JoinKind, Literal, SelectItem,
-    SelectStmt, Stmt, WhereCond, WhereRhs,
+    AggFunc, ArithOp, CmpOp, Expr, FromItem, InsertValue, IsolationLevel, JoinKind, Literal,
+    SelectItem, SelectStmt, Stmt, WhereCond, WhereRhs,
 };
-use crate::storage::{ColType, Engine, RowVersion, Snapshot, Value, WriteOp, row_visible};
+use crate::storage::{
+    ColType, Engine, Numeric, RowVersion, Snapshot, Value, WriteOp, row_visible,
+};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -187,46 +189,176 @@ fn exec_create(
     })
 }
 
-/// Coerce an INSERT literal to the target column type.
+fn assign_err(col_name: &str, col_type: &ColType, from: &str) -> ExecError {
+    exec_err(
+        "42804",
+        format!(
+            "column \"{}\" is of type {} but expression is of type {}",
+            col_name,
+            col_type.sql_name(),
+            from
+        ),
+    )
+}
+
+/// Coerce an INSERT literal to the target column type. SQL literals
+/// start life as Postgres' "unknown" type, so int/float/text literals
+/// coerce generously (with range checks); typed literals (DATE '...'
+/// etc.) and anything else go through the strict value path.
 fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<Value, ExecError> {
-    match (lit, col_type) {
-        (Literal::Null, _) => Ok(Value::Null),
-        (Literal::Int(i), ColType::Int) => Ok(Value::Int(*i)),
-        (Literal::Int(i), ColType::Float) => Ok(Value::Float(*i as f64)),
-        (Literal::Float(f), ColType::Float) => Ok(Value::Float(*f)),
-        (Literal::Text(s), ColType::Text) => Ok(Value::Text(s.clone())),
-        (Literal::Bool(b), ColType::Bool) => Ok(Value::Bool(*b)),
-        _ => Err(exec_err(
-            "42804",
-            format!(
-                "column \"{}\" is of type {} but expression is of type {}",
-                col_name,
-                col_type.sql_name(),
-                lit.type_name()
-            ),
-        )),
+    match lit {
+        Literal::Null => Ok(Value::Null),
+        Literal::SmallInt(i) => coerce_int_lit(*i as i128, col_type, col_name, lit.type_name()),
+        Literal::Int(i) => coerce_int_lit(*i as i128, col_type, col_name, lit.type_name()),
+        Literal::BigInt(i) => coerce_int_lit(*i as i128, col_type, col_name, lit.type_name()),
+        Literal::Real(f) => coerce_float_lit(*f as f64, col_type, col_name, lit.type_name()),
+        Literal::Float(f) => coerce_float_lit(*f, col_type, col_name, lit.type_name()),
+        Literal::Numeric(n) => coerce_numeric_lit(n, col_type, col_name),
+        // Decimal literal text: parse exactly for numeric targets so
+        // high-precision decimals don't round-trip through f64.
+        Literal::Decimal(s) => match col_type {
+            ColType::Numeric => crate::storage::Numeric::parse(s)
+                .map(Value::Numeric)
+                .map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type numeric: {:?}", s),
+                    )
+                }),
+            ColType::Float4 => s
+                .parse::<f64>()
+                .map(|f| Value::Float4(f as f32))
+                .map_err(|_| assign_err(col_name, col_type, lit.type_name())),
+            ColType::Float => s
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| assign_err(col_name, col_type, lit.type_name())),
+            ColType::Text => Ok(Value::Text(s.clone())),
+            _ => Err(assign_err(col_name, col_type, lit.type_name())),
+        },
+        // Unknown-type text literal: through the type's input function
+        // (so INSERT INTO d VALUES ('2026-01-01') works for dates).
+        Literal::Text(s) => eval_cast(&Value::Text(s.clone()), *col_type).map_err(|e| {
+            if e.code == "42846" {
+                assign_err(col_name, col_type, lit.type_name())
+            } else {
+                e
+            }
+        }),
+        // Unknown-type boolean literal.
+        Literal::Bool(b) => match col_type {
+            ColType::Bool => Ok(Value::Bool(*b)),
+            ColType::Text => Ok(Value::Text(b.to_string())),
+            _ => Err(assign_err(col_name, col_type, lit.type_name())),
+        },
+        // Typed literals (DATE '...', BYTEA '...', ...): strict.
+        other => coerce_value(other.clone().into_value(), col_type, col_name),
     }
 }
 
-/// Coerce an evaluated UPDATE value to the target column type.
-fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, ExecError> {
-    match (&v, col_type) {
-        (Value::Null, _) => Ok(Value::Null),
-        (Value::Int(i), ColType::Int) => Ok(Value::Int(*i)),
-        (Value::Int(i), ColType::Float) => Ok(Value::Float(*i as f64)),
-        (Value::Float(f), ColType::Float) => Ok(Value::Float(*f)),
-        (Value::Text(s), ColType::Text) => Ok(Value::Text(s.clone())),
-        (Value::Bool(b), ColType::Bool) => Ok(Value::Bool(*b)),
-        _ => Err(exec_err(
-            "42804",
-            format!(
-                "column \"{}\" is of type {} but expression is of type {}",
-                col_name,
-                col_type.sql_name(),
-                v.type_name()
-            ),
-        )),
+/// Integer literal (unknown type) to a column: any int kind with a
+/// range check, float/numeric widening, or text rendering.
+fn coerce_int_lit(i: i128, col_type: &ColType, col_name: &str, _from: &str) -> Result<Value, ExecError> {
+    let range = |i: i128| {
+        coerce_value(
+            Value::BigInt(i64::try_from(i).map_err(|_| exec_err("22003", "integer out of range"))?),
+            col_type,
+            col_name,
+        )
+    };
+    match col_type {
+        ColType::SmallInt => i16::try_from(i)
+            .map(Value::SmallInt)
+            .map_err(|_| exec_err("22003", "smallint out of range")),
+        ColType::Int => i32::try_from(i)
+            .map(|w| Value::Int(w as i64))
+            .map_err(|_| exec_err("22003", "integer out of range")),
+        ColType::BigInt => i64::try_from(i)
+            .map(Value::BigInt)
+            .map_err(|_| exec_err("22003", "bigint out of range")),
+        ColType::Text => Ok(Value::Text(i.to_string())),
+        _ => range(i),
     }
+}
+
+/// Float literal (unknown type) to a column.
+fn coerce_float_lit(
+    f: f64,
+    col_type: &ColType,
+    col_name: &str,
+    from: &str,
+) -> Result<Value, ExecError> {
+    match col_type {
+        ColType::Float4 => {
+            if f.abs() > f32::MAX as f64 {
+                return Err(exec_err("22003", "value out of range for type real"));
+            }
+            Ok(Value::Float4(f as f32))
+        }
+        ColType::Float => Ok(Value::Float(f)),
+        ColType::Numeric => Numeric::from_f64(f)
+            .map(Value::Numeric)
+            .map_err(|_| exec_err("22003", "value out of range for type numeric")),
+        ColType::Text => Ok(Value::Text(
+            Value::Float(f).to_text().unwrap_or_default(),
+        )),
+        _ => Err(assign_err(col_name, col_type, from)),
+    }
+}
+
+/// Numeric literal (unknown type, only via params) to a column.
+fn coerce_numeric_lit(n: &Numeric, col_type: &ColType, col_name: &str) -> Result<Value, ExecError> {
+    match col_type {
+        ColType::Numeric => Ok(Value::Numeric(n.clone())),
+        ColType::Float4 => Ok(Value::Float4(n.to_f64() as f32)),
+        ColType::Float => Ok(Value::Float(n.to_f64())),
+        ColType::Text => Ok(Value::Text(n.to_text())),
+        _ => Err(assign_err(col_name, col_type, "numeric")),
+    }
+}
+
+/// Coerce an evaluated UPDATE value to the target column type: same
+/// type, numeric widening, or text through the type's input function.
+/// Narrowing a computed value needs an explicit cast (like Postgres).
+fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, ExecError> {
+    if v == Value::Null || v.col_type() == *col_type {
+        return Ok(v);
+    }
+    let widened = match (&v, col_type) {
+        (Value::SmallInt(i), ColType::Int) => Some(Value::Int(*i as i64)),
+        (Value::SmallInt(i), ColType::BigInt) => Some(Value::BigInt(*i as i64)),
+        (Value::SmallInt(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
+        (Value::SmallInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
+        (Value::SmallInt(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i as i64))),
+        (Value::Int(i), ColType::BigInt) => Some(Value::BigInt(*i)),
+        (Value::Int(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
+        (Value::Int(i), ColType::Float) => Some(Value::Float(*i as f64)),
+        (Value::Int(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i))),
+        (Value::BigInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
+        (Value::BigInt(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i))),
+        (Value::Float4(f), ColType::Float) => Some(Value::Float(*f as f64)),
+        (Value::Float4(f), ColType::Numeric) => {
+            Numeric::from_f64(*f as f64).ok().map(Value::Numeric)
+        }
+        (Value::Float(f), ColType::Numeric) => Numeric::from_f64(*f).ok().map(Value::Numeric),
+        (Value::Numeric(n), ColType::Float4) => Some(Value::Float4(n.to_f64() as f32)),
+        (Value::Numeric(n), ColType::Float) => Some(Value::Float(n.to_f64())),
+        _ => None,
+    };
+    if let Some(w) = widened {
+        return Ok(w);
+    }
+    // Text goes through the type's input function (assignment cast).
+    if matches!(v, Value::Text(_)) {
+        return eval_cast(&v, *col_type).map_err(|e| {
+            if e.code == "42846" {
+                assign_err(col_name, col_type, v.type_name())
+            } else {
+                e
+            }
+        });
+    }
+    Err(assign_err(col_name, col_type, v.type_name()))
 }
 
 fn exec_insert(
@@ -322,6 +454,12 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
         (Value::Float(a), Literal::Float(b)) => Ok(a == b),
         (Value::Int(a), Literal::Float(b)) => Ok((*a as f64) == *b),
         (Value::Float(a), Literal::Int(b)) => Ok(*a == (*b as f64)),
+        (Value::Float(a), Literal::Decimal(b)) => {
+            Ok(*a == b.parse::<f64>().unwrap_or(f64::NAN))
+        }
+        (Value::Int(a), Literal::Decimal(b)) => {
+            Ok((*a as f64) == b.parse::<f64>().unwrap_or(f64::NAN))
+        }
         (Value::Text(a), Literal::Text(b)) => Ok(a == b),
         (Value::Bool(a), Literal::Bool(b)) => Ok(a == b),
         _ => Err(exec_err(
@@ -736,7 +874,51 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => Ok(pred.clone()),
         // Separate query levels: runtime resolution (correlation intact).
         Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => Ok(pred.clone()),
-        Expr::Add(a, b) => Ok(Expr::Add(Box::new(r(a)?), Box::new(r(b)?))),
+        Expr::Arith { op, left, right } => Ok(Expr::Arith {
+            op: *op,
+            left: Box::new(r(left)?),
+            right: Box::new(r(right)?),
+        }),
+        Expr::Concat(a, b) => Ok(Expr::Concat(Box::new(r(a)?), Box::new(r(b)?))),
+        Expr::Cast { expr, to } => Ok(Expr::Cast {
+            expr: Box::new(r(expr)?),
+            to: *to,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+        } => Ok(Expr::Like {
+            expr: Box::new(r(expr)?),
+            pattern: Box::new(r(pattern)?),
+            not: *not,
+            ilike: *ilike,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => Ok(Expr::Between {
+            expr: Box::new(r(expr)?),
+            low: Box::new(r(low)?),
+            high: Box::new(r(high)?),
+            neg: *neg,
+        }),
+        Expr::IsBool { expr, neg, val } => Ok(Expr::IsBool {
+            expr: Box::new(r(expr)?),
+            neg: *neg,
+            val: *val,
+        }),
+        Expr::Func { name, args } => Ok(Expr::Func {
+            name: name.clone(),
+            args: args.iter().map(r).collect::<Result<Vec<_>, _>>()?,
+        }),
+        Expr::Extract { field, from } => Ok(Expr::Extract {
+            field: field.clone(),
+            from: Box::new(r(from)?),
+        }),
         Expr::Cmp { op, left, right } => Ok(Expr::Cmp {
             op: *op,
             left: Box::new(r(left)?),
@@ -751,9 +933,16 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         }),
         // Can't occur in a JOIN ON (rejected by validation), but resolve
         // the argument rather than choke if one ever arrives.
-        Expr::Agg { func, arg } => Ok(Expr::Agg {
+        Expr::Agg {
+            func,
+            arg,
+            distinct,
+            arg2,
+        } => Ok(Expr::Agg {
             func: *func,
             arg: arg.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
+            distinct: *distinct,
+            arg2: arg2.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
         }),
     }
 }
@@ -957,17 +1146,46 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             validate_select(sub)
         }
         Expr::Exists { sub, .. } => validate_select(sub),
-        Expr::Add(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
-            validate_expr(a)?;
-            validate_expr(b)
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Concat(left, right) => {
+            validate_expr(left)?;
+            validate_expr(right)
         }
         Expr::Cmp { left, right, .. } => {
             validate_expr(left)?;
             validate_expr(right)
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } => validate_expr(x),
-        Expr::Agg { arg, .. } => {
+        Expr::Like {
+            expr, pattern, ..
+        } => {
+            validate_expr(expr)?;
+            validate_expr(pattern)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_expr(expr)?;
+            validate_expr(low)?;
+            validate_expr(high)
+        }
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+            validate_expr(x)
+        }
+        Expr::Cast { expr, .. } => validate_expr(expr),
+        Expr::Func { args, .. } => {
+            for a in args {
+                validate_expr(a)?;
+            }
+            Ok(())
+        }
+        Expr::Extract { from, .. } => validate_expr(from),
+        Expr::Agg { arg, arg2, .. } => {
             if let Some(a) = arg {
+                validate_expr(a)?;
+            }
+            if let Some(a) = arg2 {
                 validate_expr(a)?;
             }
             Ok(())
@@ -982,9 +1200,23 @@ fn contains_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } => true,
         Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => false,
-        Expr::Add(a, b) | Expr::And(a, b) | Expr::Or(a, b) => contains_agg(a) || contains_agg(b),
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
         Expr::Cmp { left, right, .. } => contains_agg(left) || contains_agg(right),
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } => contains_agg(x),
+        Expr::Like {
+            expr, pattern, ..
+        } => contains_agg(expr) || contains_agg(pattern),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+            contains_agg(x)
+        }
+        Expr::Cast { expr, .. } => contains_agg(expr),
+        Expr::Func { args, .. } => args.iter().any(contains_agg),
+        Expr::Extract { from, .. } => contains_agg(from),
         Expr::InSub { expr, .. } => contains_agg(expr),
         // ScalarSub / Exists are separate query levels.
         Expr::ScalarSub(_) | Expr::Exists { .. } => false,
@@ -1097,13 +1329,29 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
             true
         }
         Expr::Literal(_) | Expr::Param(_) => true,
-        Expr::Add(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
+        Expr::Arith { left, right, .. } => {
+            pushable_columns(left, cols) && pushable_columns(right, cols)
+        }
+        Expr::Concat(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
+        Expr::Cast { expr, .. } => pushable_columns(expr, cols),
+        Expr::Like {
+            expr, pattern, ..
+        } => pushable_columns(expr, cols) && pushable_columns(pattern, cols),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            pushable_columns(expr, cols)
+                && pushable_columns(low, cols)
+                && pushable_columns(high, cols)
+        }
+        Expr::Func { args, .. } => args.iter().all(|a| pushable_columns(a, cols)),
+        Expr::Extract { from, .. } => pushable_columns(from, cols),
         Expr::Cmp { left, right, .. } => {
             pushable_columns(left, cols) && pushable_columns(right, cols)
         }
         Expr::And(a, b) | Expr::Or(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
         Expr::Not(x) => pushable_columns(x, cols),
-        Expr::IsNull { expr: x, .. } => pushable_columns(x, cols),
+        Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => pushable_columns(x, cols),
         _ => false,
     }
 }
@@ -1186,10 +1434,35 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         // Already resolved (unambiguous by construction): nothing to collect.
         Expr::ResolvedCol { .. } => {}
         Expr::Literal(_) | Expr::Param(_) => {}
-        Expr::Add(a, b) => {
+        Expr::Arith { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
+        Expr::Concat(a, b) => {
             collect_column_refs(a, out);
             collect_column_refs(b, out);
         }
+        Expr::Cast { expr, .. } => collect_column_refs(expr, out),
+        Expr::Like {
+            expr, pattern, ..
+        } => {
+            collect_column_refs(expr, out);
+            collect_column_refs(pattern, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_refs(expr, out);
+            collect_column_refs(low, out);
+            collect_column_refs(high, out);
+        }
+        Expr::IsBool { expr: x, .. } => collect_column_refs(x, out),
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
+        Expr::Extract { from, .. } => collect_column_refs(from, out),
         Expr::Cmp { left, right, .. } => {
             collect_column_refs(left, out);
             collect_column_refs(right, out);
@@ -1200,8 +1473,11 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::Not(x) => collect_column_refs(x, out),
         Expr::IsNull { expr: x, .. } => collect_column_refs(x, out),
-        Expr::Agg { arg, .. } => {
+        Expr::Agg { arg, arg2, .. } => {
             if let Some(x) = arg {
+                collect_column_refs(x, out);
+            }
+            if let Some(x) = arg2 {
                 collect_column_refs(x, out);
             }
         }
@@ -1651,12 +1927,36 @@ fn project_row(
 
 /// Append a canonical byte key for a value (for GROUP BY / DISTINCT).
 /// Floats use their bit pattern so NaN groups with NaN, like Postgres.
+/// Hash key for GROUP BY / DISTINCT. Exact numerics (int2/int4/int8/
+/// numeric) canonicalize to a (tag, unscaled, scale) triple and floats to
+/// f64 bits, so `1::int`, `1::bigint` and `1.0::numeric` group together —
+/// like Postgres' common-type resolution for grouping.
 fn value_key(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Null => out.push(0),
+        Value::SmallInt(i) => {
+            out.push(8);
+            out.extend_from_slice(&(*i as i128).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
         Value::Int(i) => {
-            out.push(1);
-            out.extend_from_slice(&i.to_be_bytes());
+            out.push(8);
+            out.extend_from_slice(&(*i as i128).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        Value::BigInt(i) => {
+            out.push(8);
+            out.extend_from_slice(&(*i as i128).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        Value::Numeric(n) => {
+            out.push(8);
+            out.extend_from_slice(&n.unscaled.to_be_bytes());
+            out.extend_from_slice(&n.scale.to_be_bytes());
+        }
+        Value::Float4(f) => {
+            out.push(2);
+            out.extend_from_slice(&(*f as f64).to_bits().to_be_bytes());
         }
         Value::Float(f) => {
             out.push(2);
@@ -1670,6 +1970,27 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
         Value::Bool(b) => {
             out.push(4);
             out.push(*b as u8);
+        }
+        Value::Date(d) => {
+            out.push(9);
+            out.extend_from_slice(&d.to_be_bytes());
+        }
+        Value::Timestamp(m) => {
+            out.push(10);
+            out.extend_from_slice(&m.to_be_bytes());
+        }
+        Value::Timestamptz(m) => {
+            out.push(11);
+            out.extend_from_slice(&m.to_be_bytes());
+        }
+        Value::Bytea(b) => {
+            out.push(12);
+            out.extend_from_slice(&(b.len() as u64).to_be_bytes());
+            out.extend_from_slice(b);
+        }
+        Value::Uuid(u) => {
+            out.push(13);
+            out.extend_from_slice(u);
         }
     }
 }
@@ -1900,9 +2221,22 @@ fn eval_grouped(
     e: &Expr,
 ) -> Result<Value, ExecError> {
     match e {
-        Expr::Agg { func, arg } => {
-            eval_agg_func(q, outer, schema, rows, idxs, *func, arg.as_deref())
-        }
+        Expr::Agg {
+            func,
+            arg,
+            distinct,
+            arg2,
+        } => eval_agg_func(
+            q,
+            outer,
+            schema,
+            rows,
+            idxs,
+            *func,
+            arg.as_deref(),
+            *distinct,
+            arg2.as_deref(),
+        ),
         Expr::Column { table, name } => grouped_col_value(
             gscope,
             group_by,
@@ -1926,10 +2260,84 @@ fn eval_grouped(
         }
         Expr::Literal(lit) => Ok(lit.clone().into_value()),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
-        Expr::Add(a, b) => {
-            let va = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
-            let vb = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, b)?;
-            eval_add(&va, &vb).map(|(_, v)| v)
+        Expr::Arith { op, left, right } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, left,
+            )?;
+            let vb = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, right,
+            )?;
+            eval_arith(*op, &va, &vb)
+        }
+        Expr::Cast { expr, to } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            eval_cast(&v, *to)
+        }
+        Expr::Concat(a, b) => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
+            )?;
+            let vb = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, b,
+            )?;
+            eval_concat(&va, &vb)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+        } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            let vb = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, pattern,
+            )?;
+            eval_like(&va, &vb, *not, *ilike)
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            let lo = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, low,
+            )?;
+            let hi = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, high,
+            )?;
+            eval_between(&v, &lo, &hi, *neg)
+        }
+        Expr::IsBool { expr, neg, val } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            eval_is_bool(&v, *neg, *val)
+        }
+        Expr::Func { name, args } => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
+                )?);
+            }
+            // Grouped context: no correlated subqueries inside function
+            // args here (subqueries take the eval_expr path); dispatch on
+            // pre-evaluated values.
+            eval_func_vals(name, &vals)
+        }
+        Expr::Extract { field, from } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, from,
+            )?;
+            eval_extract(field, &v)
         }
         Expr::Cmp { op, left, right } => {
             let va = eval_grouped(
@@ -1985,12 +2393,18 @@ fn eval_agg_func(
     idxs: &[usize],
     func: AggFunc,
     arg: Option<&Expr>,
+    distinct: bool,
+    arg2: Option<&Expr>,
 ) -> Result<Value, ExecError> {
     if func == AggFunc::Count && arg.is_none() {
-        return Ok(Value::Int(idxs.len() as i64));
+        return Ok(Value::BigInt(idxs.len() as i64));
     }
     let a = arg.expect("non-COUNT aggregates take an argument");
     let mut vals: Vec<Value> = Vec::new();
+    // string_agg evaluates (value, delimiter) per row; the delimiter
+    // may be NULL per-row (then it defaults to "") while a NULL value
+    // still skips the row, like Postgres.
+    let mut delims: Vec<Value> = Vec::new();
     for &i in idxs {
         let frame = Scope {
             schema,
@@ -2002,64 +2416,110 @@ fn eval_agg_func(
         // Aggregate arguments cannot nest aggregates (the parser allows
         // the syntax; fail like Postgres rather than recursing forever).
         let v = eval_expr(q, &scopes, a)?;
-        if v != Value::Null {
+        if func == AggFunc::StringAgg {
+            let d = eval_expr(q, &scopes, arg2.expect("string_agg takes a delimiter"))?;
+            if v == Value::Null {
+                continue;
+            }
+            vals.push(v);
+            delims.push(d);
+        } else if v != Value::Null {
             vals.push(v);
         }
     }
+    // DISTINCT: dedupe on the canonical grouping key (NULLs already
+    // removed above, so this matches Postgres' "DISTINCT treats NULLs
+    // as equal" trivially). For string_agg, dedupe on the value alone,
+    // like Postgres deduplicates the input rows.
+    if distinct {
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut kept: Vec<usize> = Vec::new();
+        for (i, v) in vals.iter().enumerate() {
+            let mut k = Vec::new();
+            value_key(v, &mut k);
+            if !seen.contains(&k) {
+                seen.push(k);
+                kept.push(i);
+            }
+        }
+        let new_vals: Vec<Value> = kept.iter().map(|&i| vals[i].clone()).collect();
+        vals = new_vals;
+        // delims is only populated for string_agg; other aggregates
+        // have no second argument to deduplicate.
+        if !delims.is_empty() {
+            let new_delims: Vec<Value> = kept.iter().map(|&i| delims[i].clone()).collect();
+            delims = new_delims;
+        }
+    }
     match func {
-        AggFunc::Count => Ok(Value::Int(vals.len() as i64)),
+        AggFunc::Count => Ok(Value::BigInt(vals.len() as i64)),
         AggFunc::Sum => {
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
-            let mut int_sum: i64 = 0;
-            let mut float_sum: f64 = 0.0;
-            let mut is_float = false;
+            // v0.6 rule kept: sum returns the widest input kind among
+            // the rows (documented deviation: Postgres widens int->bigint).
+            let mut cat = NumCat::Small;
             for v in &vals {
-                match v {
-                    Value::Int(i) => {
-                        if is_float {
-                            float_sum += *i as f64;
-                        } else {
-                            int_sum = int_sum
-                                .checked_add(*i)
-                                .ok_or_else(|| exec_err("22003", "integer out of range"))?;
-                        }
-                    }
-                    Value::Float(f) => {
-                        if !is_float {
-                            is_float = true;
-                            float_sum = int_sum as f64;
-                        }
-                        float_sum += *f;
-                    }
-                    other => {
+                match num_cat(v) {
+                    Some(c) => cat = cat.max(c),
+                    None => {
                         return Err(exec_err(
                             "42883",
-                            format!("function sum({}) does not exist", other.type_name()),
+                            format!("function sum({}) does not exist", v.type_name()),
                         ));
                     }
                 }
             }
-            Ok(if is_float {
-                Value::Float(float_sum)
+            if cat == NumCat::Numeric {
+                let mut acc = Numeric::zero();
+                for v in &vals {
+                    let n = to_numeric_opt(v).ok_or_else(|| {
+                        exec_err("22003", "value out of range for numeric")
+                    })?;
+                    acc = acc
+                        .checked_add(&n)
+                        .ok_or_else(|| exec_err("22003", "numeric field overflow"))?;
+                }
+                Ok(Value::Numeric(acc))
+            } else if cat >= NumCat::Real {
+                let mut acc = 0.0;
+                for v in &vals {
+                    acc += to_f64v(v);
+                }
+                Ok(if cat == NumCat::Real {
+                    Value::Float4(acc as f32)
+                } else {
+                    Value::Float(acc)
+                })
             } else {
-                Value::Int(int_sum)
-            })
+                let mut acc: i128 = 0;
+                for v in &vals {
+                    acc = acc.checked_add(to_i128(v)).ok_or_else(|| {
+                        exec_err("22003", "integer out of range")
+                    })?;
+                }
+                let icat = if cat == NumCat::Small {
+                    NumCat::Int
+                } else {
+                    cat
+                };
+                fit_int_result(icat, acc)
+            }
         }
         AggFunc::Avg => {
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
+            // v0.6 rule kept: avg always returns double precision.
             let mut sum = 0.0;
             for v in &vals {
-                match v {
-                    Value::Int(i) => sum += *i as f64,
-                    Value::Float(f) => sum += *f,
-                    other => {
+                match num_cat(v) {
+                    Some(_) => sum += to_f64v(v),
+                    None => {
                         return Err(exec_err(
                             "42883",
-                            format!("function avg({}) does not exist", other.type_name()),
+                            format!("function avg({}) does not exist", v.type_name()),
                         ));
                     }
                 }
@@ -2085,6 +2545,41 @@ fn eval_agg_func(
                 }
             }
             Ok(best.cloned().unwrap_or(Value::Null))
+        }
+        AggFunc::StringAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::new();
+            for (i, v) in vals.iter().enumerate() {
+                let s = match v {
+                    Value::Text(t) => t.clone(),
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!("function string_agg({}) does not exist", other.type_name()),
+                        ));
+                    }
+                };
+                if i > 0 {
+                    // NULL delimiter = no separator (Postgres rule).
+                    match &delims[i] {
+                        Value::Null => {}
+                        Value::Text(d) => out.push_str(d),
+                        other => {
+                            return Err(exec_err(
+                                "42883",
+                                format!(
+                                    "function string_agg(text, {}) does not exist",
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                out.push_str(&s);
+            }
+            Ok(Value::Text(out))
         }
     }
 }
@@ -2197,7 +2692,7 @@ fn apply_order(
             return Ordering::Equal;
         }
         for (i, term) in stmt.order_by.iter().enumerate() {
-            match compare_values(&keys[a][i], &keys[b][i], term.desc) {
+            match compare_values(&keys[a][i], &keys[b][i], term.desc, term.nulls_first) {
                 Ok(Ordering::Equal) => continue,
                 Ok(ord) => return ord,
                 Err(e) => {
@@ -2296,10 +2791,49 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         Expr::ResolvedCol { frame, idx } => Ok(scopes[*frame].row[*idx].clone()),
         Expr::Literal(lit) => Ok(lit.clone().into_value()),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
-        Expr::Add(a, b) => {
+        Expr::Arith { op, left, right } => {
+            let va = eval_expr(q, scopes, left)?;
+            let vb = eval_expr(q, scopes, right)?;
+            eval_arith(*op, &va, &vb)
+        }
+        Expr::Cast { expr, to } => {
+            let v = eval_expr(q, scopes, expr)?;
+            eval_cast(&v, *to)
+        }
+        Expr::Concat(a, b) => {
             let va = eval_expr(q, scopes, a)?;
             let vb = eval_expr(q, scopes, b)?;
-            eval_add(&va, &vb).map(|(_, v)| v)
+            eval_concat(&va, &vb)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+        } => {
+            let va = eval_expr(q, scopes, expr)?;
+            let vb = eval_expr(q, scopes, pattern)?;
+            eval_like(&va, &vb, *not, *ilike)
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => {
+            let v = eval_expr(q, scopes, expr)?;
+            let lo = eval_expr(q, scopes, low)?;
+            let hi = eval_expr(q, scopes, high)?;
+            eval_between(&v, &lo, &hi, *neg)
+        }
+        Expr::IsBool { expr, neg, val } => {
+            let v = eval_expr(q, scopes, expr)?;
+            eval_is_bool(&v, *neg, *val)
+        }
+        Expr::Func { name, args } => eval_func(q, scopes, name, args),
+        Expr::Extract { field, from } => {
+            let v = eval_expr(q, scopes, from)?;
+            eval_extract(field, &v)
         }
         Expr::Cmp { op, left, right } => {
             let va = eval_expr(q, scopes, left)?;
@@ -2427,18 +2961,49 @@ fn not3(v: Option<bool>) -> Option<bool> {
 }
 
 /// Compare two values: None when either side is NULL (SQL semantics).
-/// Numeric types compare numerically (int/float mix), text byte-wise (no
-/// collations yet), bools false < true. Mismatched non-null types are
-/// 42883, like Postgres.
+/// Exact numerics (int2/int4/int8/numeric) compare exactly; float
+/// kinds compare by total_cmp; mixed exact/float goes through f64 (a
+/// documented precision caveat). Text is byte-wise (no collations
+/// yet), bools false < true, dates/times/bytea/uuid compare naturally.
+/// Mismatched non-null types are 42883, like Postgres.
+/// Date as a timestamp (midnight) for mixed date/timestamp comparisons.
+fn date_as_ts(d: i32) -> i64 {
+    d as i64 * 86_400_000_000
+}
+
 fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, ExecError> {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
-        (Value::Int(x), Value::Int(y)) => Ok(Some(x.cmp(y))),
+        (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
+            Ok(Some(exact_numeric(x).cmp(&exact_numeric(y))))
+        }
+        (Value::Float4(x), Value::Float4(y)) => Ok(Some((*x as f64).total_cmp(&(*y as f64)))),
+        (Value::Float4(x), Value::Float(y)) => Ok(Some((*x as f64).total_cmp(y))),
+        (Value::Float(x), Value::Float4(y)) => Ok(Some(x.total_cmp(&(*y as f64)))),
         (Value::Float(x), Value::Float(y)) => Ok(Some(x.total_cmp(y))),
-        (Value::Int(x), Value::Float(y)) => Ok(Some((*x as f64).total_cmp(y))),
-        (Value::Float(x), Value::Int(y)) => Ok(Some(x.total_cmp(&(*y as f64)))),
+        (x, y @ (Value::Float4(_) | Value::Float(_))) if is_exact_numeric(x) => {
+            Ok(Some(exact_to_f64(x).total_cmp(&float_val(y))))
+        }
+        (x @ (Value::Float4(_) | Value::Float(_)), y) if is_exact_numeric(y) => {
+            Ok(Some(float_val(x).total_cmp(&exact_to_f64(y))))
+        }
         (Value::Text(x), Value::Text(y)) => Ok(Some(x.cmp(y))),
         (Value::Bool(x), Value::Bool(y)) => Ok(Some(x.cmp(y))),
+        (Value::Date(x), Value::Date(y)) => Ok(Some(x.cmp(y))),
+        (Value::Timestamp(x), Value::Timestamp(y)) => Ok(Some(x.cmp(y))),
+        (Value::Timestamptz(x), Value::Timestamptz(y)) => Ok(Some(x.cmp(y))),
+        // Postgres casts date up to timestamp/timestamptz for mixed
+        // comparisons (date is midnight).
+        (Value::Date(d), Value::Timestamp(t)) => Ok(Some(date_as_ts(*d).cmp(t))),
+        (Value::Timestamp(t), Value::Date(d)) => Ok(Some(t.cmp(&date_as_ts(*d)))),
+        (Value::Date(d), Value::Timestamptz(t)) => Ok(Some(date_as_ts(*d).cmp(t))),
+        (Value::Timestamptz(t), Value::Date(d)) => Ok(Some(t.cmp(&date_as_ts(*d)))),
+        // Postgres casts timestamp up to timestamptz (session zone; v0.7
+        // is UTC-only so this is exact).
+        (Value::Timestamp(t), Value::Timestamptz(z)) => Ok(Some(t.cmp(z))),
+        (Value::Timestamptz(z), Value::Timestamp(t)) => Ok(Some(z.cmp(t))),
+        (Value::Bytea(x), Value::Bytea(y)) => Ok(Some(x.cmp(y))),
+        (Value::Uuid(x), Value::Uuid(y)) => Ok(Some(x.cmp(y))),
         _ => Err(exec_err(
             "42883",
             format!(
@@ -2544,66 +3109,1250 @@ fn eval_update_expr(
 // ---------------------------------------------------------------------------
 
 /// A value's type for `+` resolution; NULL contributes no constraint.
-fn add_operand_value_type(v: &Value) -> Option<ColType> {
+// ---------------------------------------------------------------------------
+// v0.7 arithmetic, casts, operators, and built-in functions
+// ---------------------------------------------------------------------------
+
+/// Numeric category for promotion. Declaration order IS the promotion
+/// lattice: smallint < integer < bigint < real < double precision <
+/// numeric. (Postgres resolves real+int to double, and
+/// anything+numeric to numeric; int2+int2 resolves to int4.)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NumCat {
+    Small,
+    Int,
+    Big,
+    Real,
+    Double,
+    Numeric,
+}
+
+fn num_cat(v: &Value) -> Option<NumCat> {
     match v {
-        Value::Null => None,
-        Value::Int(_) => Some(ColType::Int),
-        Value::Float(_) => Some(ColType::Float),
-        Value::Text(_) => Some(ColType::Text),
-        Value::Bool(_) => Some(ColType::Bool),
+        Value::SmallInt(_) => Some(NumCat::Small),
+        Value::Int(_) => Some(NumCat::Int),
+        Value::BigInt(_) => Some(NumCat::Big),
+        Value::Float4(_) => Some(NumCat::Real),
+        Value::Float(_) => Some(NumCat::Double),
+        Value::Numeric(_) => Some(NumCat::Numeric),
+        _ => None,
     }
 }
 
-/// Result type of `a + b` given operand types (None = NULL/unknown side).
-fn combine_add_types(a: Option<ColType>, b: Option<ColType>) -> Result<ColType, ExecError> {
+fn op_err(op: ArithOp, a: &Value, b: &Value) -> ExecError {
+    exec_err(
+        "42883",
+        format!(
+            "operator does not exist: {} {} {}",
+            a.type_name(),
+            op.sql(),
+            b.type_name()
+        ),
+    )
+}
+
+/// Exact numeric -> Numeric. Floats that don't fit (NaN/Inf) -> None.
+fn to_numeric_opt(v: &Value) -> Option<Numeric> {
+    match v {
+        Value::SmallInt(i) => Some(Numeric::new(*i as i128, 0)),
+        Value::Int(i) => Some(Numeric::new(*i as i128, 0)),
+        Value::BigInt(i) => Some(Numeric::new(*i as i128, 0)),
+        Value::Numeric(n) => Some(n.clone()),
+        Value::Float4(f) => Numeric::from_f64(*f as f64).ok(),
+        Value::Float(f) => Numeric::from_f64(*f).ok(),
+        _ => None,
+    }
+}
+
+fn to_i128(v: &Value) -> i128 {
+    match v {
+        Value::SmallInt(i) => *i as i128,
+        Value::Int(i) => *i as i128,
+        Value::BigInt(i) => *i as i128,
+        _ => 0,
+    }
+}
+
+fn to_f64v(v: &Value) -> f64 {
+    match v {
+        Value::SmallInt(i) => *i as f64,
+        Value::Int(i) => *i as f64,
+        Value::BigInt(i) => *i as f64,
+        Value::Numeric(n) => n.to_f64(),
+        Value::Float4(f) => *f as f64,
+        Value::Float(f) => *f,
+        _ => f64::NAN,
+    }
+}
+
+/// `+ - * / %` with Postgres-ish numeric promotion. NULL propagates.
+/// Date arithmetic is handled first: date +/- integer-kind -> date,
+/// date - date -> integer days. No intervals in v0.7, so timestamp
+/// arithmetic (other than comparisons) is 42883.
+fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    if a == &Value::Null || b == &Value::Null {
+        return Ok(Value::Null);
+    }
+    if let Some(v) = eval_datetime_arith(op, a, b)? {
+        return Ok(v);
+    }
+    if op == ArithOp::Pow {
+        // Postgres `^`: exact numeric power for integer exponents,
+        // float8 when either side is floating.
+        return eval_power_op(a, b, |w| op_err(op, a, w));
+    }
+    let (ca, cb) = match (num_cat(a), num_cat(b)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return Err(op_err(op, a, b)),
+    };
+    let cat = ca.max(cb);
+    if op == ArithOp::Mod && matches!(cat, NumCat::Real | NumCat::Double) {
+        // Postgres defines % only for the exact numeric types
+        // (smallint/int/bigint/numeric), not for real/double.
+        return Err(op_err(op, a, b));
+    }
+    // Postgres resolves smallint <op> smallint to integer.
+    let icat = if ca == NumCat::Small && cb == NumCat::Small {
+        NumCat::Int
+    } else {
+        cat
+    };
+    match cat {
+        NumCat::Numeric => {
+            let x = to_numeric_opt(a)
+                .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
+            let y = to_numeric_opt(b)
+                .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
+            if matches!(op, ArithOp::Div | ArithOp::Mod) && y.is_zero() {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            let r = match op {
+                ArithOp::Add => x.checked_add(&y),
+                ArithOp::Sub => x.checked_sub(&y),
+                ArithOp::Mul => x.checked_mul(&y),
+                ArithOp::Div => x.checked_div(&y),
+                ArithOp::Mod => x.checked_rem(&y),
+                ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+            };
+            r.map(Value::Numeric)
+                .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+        }
+        NumCat::Double | NumCat::Real => {
+            let x = to_f64v(a);
+            let y = to_f64v(b);
+            if op == ArithOp::Div && y == 0.0 {
+                // Postgres raises 22012 even for float division.
+                return Err(exec_err("22012", "division by zero"));
+            }
+            let r = match op {
+                ArithOp::Add => x + y,
+                ArithOp::Sub => x - y,
+                ArithOp::Mul => x * y,
+                ArithOp::Div => x / y,
+                ArithOp::Mod => unreachable!("rejected above"),
+                ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+            };
+            Ok(if cat == NumCat::Real {
+                Value::Float4(r as f32)
+            } else {
+                Value::Float(r)
+            })
+        }
+        _ => {
+            let x = to_i128(a);
+            let y = to_i128(b);
+            if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0 {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            let r = match op {
+                ArithOp::Add => x.checked_add(y),
+                ArithOp::Sub => x.checked_sub(y),
+                ArithOp::Mul => x.checked_mul(y),
+                // i128::MIN / -1 is the only overflow here.
+                ArithOp::Div => x.checked_div(y),
+                ArithOp::Mod => x.checked_rem(y),
+                ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+            };
+            let r = r.ok_or_else(|| exec_err("22003", "integer out of range"))?;
+            fit_int_result(icat, r)
+        }
+    }
+}
+
+/// Fit an i128 arithmetic result into the resolved integer kind.
+fn fit_int_result(icat: NumCat, r: i128) -> Result<Value, ExecError> {
+    let ovf = || exec_err("22003", "integer out of range");
+    match icat {
+        NumCat::Small => Ok(Value::SmallInt(i16::try_from(r).map_err(|_| {
+            exec_err("22003", "smallint out of range")
+        })?)),
+        NumCat::Int => Ok(Value::Int(i32::try_from(r).map_err(|_| ovf())? as i64)),
+        _ => Ok(Value::BigInt(i64::try_from(r).map_err(|_| ovf())?)),
+    }
+}
+
+/// Date arithmetic. Ok(None) = not date/time operands (caller falls
+/// through to numeric handling).
+fn eval_datetime_arith(
+    op: ArithOp,
+    a: &Value,
+    b: &Value,
+) -> Result<Option<Value>, ExecError> {
+    fn int_days(v: &Value) -> Option<i64> {
+        match v {
+            Value::SmallInt(i) => Some(*i as i64),
+            Value::Int(i) => Some(*i),
+            Value::BigInt(i) => Some(*i),
+            _ => None,
+        }
+    }
+    let is_dt = |v: &Value| {
+        matches!(
+            v,
+            Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_)
+        )
+    };
+    if !is_dt(a) && !is_dt(b) {
+        return Ok(None);
+    }
+    // date +/- integer-kind -> date
+    if let Value::Date(d) = a {
+        if let Some(days) = int_days(b) {
+            match op {
+                ArithOp::Add | ArithOp::Sub => {
+                    let delta = if op == ArithOp::Add { days } else { -days };
+                    let r = (*d as i64)
+                        .checked_add(delta)
+                        .and_then(|r| i32::try_from(r).ok())
+                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
+                    return Ok(Some(Value::Date(r)));
+                }
+                _ => return Err(op_err(op, a, b)),
+            }
+        }
+    }
+    // integer + date -> date (commutative with date + integer; only
+    // addition commutes — `int - date` is undefined, like Postgres).
+    if let Value::Date(d) = b {
+        if let Some(days) = int_days(a) {
+            if op == ArithOp::Add {
+                let r = (*d as i64)
+                    .checked_add(days)
+                    .and_then(|r| i32::try_from(r).ok())
+                    .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
+                return Ok(Some(Value::Date(r)));
+            }
+            return Err(op_err(op, a, b));
+        }
+    }
+    // date - date -> integer days
+    if let (Value::Date(d1), Value::Date(d2)) = (a, b) {
+        return match op {
+            ArithOp::Sub => Ok(Some(Value::Int(*d1 as i64 - *d2 as i64))),
+            _ => Err(op_err(op, a, b)),
+        };
+    }
+    // timestamp - timestamp would be an interval; v0.7 has none.
+    if matches!(
+        (a, b),
+        (Value::Timestamp(_), Value::Timestamp(_))
+            | (Value::Timestamptz(_), Value::Timestamptz(_))
+    ) {
+        return Err(exec_err(
+            "42883",
+            "operator does not exist: timestamp - timestamp (intervals are not supported in v0.7)",
+        ));
+    }
+    Err(op_err(op, a, b))
+}
+
+// ---------------------------------------------------------------------------
+// Casts
+// ---------------------------------------------------------------------------
+
+fn cast_err(from: &Value, to: &str) -> ExecError {
+    exec_err(
+        "42846",
+        format!(
+            "cannot cast type {} to {}",
+            from.type_name(),
+            to
+        ),
+    )
+}
+
+/// Cast a value to an integer kind. Floats and numerics round half away
+/// from zero (like Postgres); text must be plain integer syntax.
+fn cast_to_int(v: &Value) -> Result<i128, ExecError> {
+    match v {
+        Value::SmallInt(i) => Ok(*i as i128),
+        Value::Int(i) => Ok(*i as i128),
+        Value::BigInt(i) => Ok(*i as i128),
+        Value::Numeric(n) => {
+            let r = n.to_i64().ok_or_else(|| exec_err("22003", "numeric out of range"))?;
+            Ok(r as i128)
+        }
+        Value::Float4(f) => float_to_int(*f as f64),
+        Value::Float(f) => float_to_int(*f),
+        Value::Text(s) => parse_int_text(s),
+        Value::Bool(b) => Ok(*b as i128),
+        other => Err(cast_err(other, "integer")),
+    }
+}
+
+fn float_to_int(f: f64) -> Result<i128, ExecError> {
+    if !f.is_finite() {
+        return Err(exec_err("22003", "integer out of range"));
+    }
+    // Half away from zero.
+    let r = (f.abs() + 0.5).floor().copysign(f);
+    if r < i128::MIN as f64 || r > i128::MAX as f64 {
+        return Err(exec_err("22003", "integer out of range"));
+    }
+    Ok(r as i128)
+}
+
+/// Postgres integer input: optional sign, digits, surrounding
+/// whitespace. Anything else (decimal points, exponents) is 22P02.
+fn parse_int_text(s: &str) -> Result<i128, ExecError> {
+    let t = s.trim();
+    let digits = t.strip_prefix('+').unwrap_or(t);
+    let digits = digits.strip_prefix('-').map(|d| d).unwrap_or(digits);
+    let neg = t.starts_with('-');
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(exec_err(
+            "22P02",
+            format!("invalid input syntax for type integer: {:?}", s),
+        ));
+    }
+    let mut r: i128 = 0;
+    for c in digits.bytes() {
+        r = r
+            .checked_mul(10)
+            .and_then(|r| r.checked_add((c - b'0') as i128))
+            .ok_or_else(|| exec_err("22003", "value overflows integer"))?;
+    }
+    if neg {
+        r = -r;
+    }
+    Ok(r)
+}
+
+fn cast_to_f64(v: &Value) -> Result<f64, ExecError> {
+    match v {
+        Value::SmallInt(i) => Ok(*i as f64),
+        Value::Int(i) => Ok(*i as f64),
+        Value::BigInt(i) => Ok(*i as f64),
+        Value::Numeric(n) => Ok(n.to_f64()),
+        Value::Float4(f) => Ok(*f as f64),
+        Value::Float(f) => Ok(*f),
+        Value::Bool(b) => Ok(*b as i32 as f64),
+        Value::Text(s) => {
+            let t = s.trim();
+            match t.parse::<f64>() {
+                Ok(f) => {
+                    // Rust parses "1e999" as inf; Postgres rejects it.
+                    if f.is_infinite()
+                        && !t.eq_ignore_ascii_case("inf")
+                        && !t.eq_ignore_ascii_case("infinity")
+                        && !t.eq_ignore_ascii_case("+inf")
+                        && !t.eq_ignore_ascii_case("+infinity")
+                        && !t.eq_ignore_ascii_case("-inf")
+                        && !t.eq_ignore_ascii_case("-infinity")
+                    {
+                        Err(exec_err(
+                            "22003",
+                            format!("value {:?} is out of range for type double precision", s),
+                        ))
+                    } else {
+                        Ok(f)
+                    }
+                }
+                Err(_) => Err(exec_err(
+                    "22P02",
+                    format!(
+                        "invalid input syntax for type double precision: {:?}",
+                        s
+                    ),
+                )),
+            }
+        }
+        other => Err(cast_err(other, "double precision")),
+    }
+}
+
+fn cast_to_numeric(v: &Value) -> Result<Numeric, ExecError> {
+    match v {
+        Value::SmallInt(i) => Ok(Numeric::new(*i as i128, 0)),
+        Value::Int(i) => Ok(Numeric::new(*i as i128, 0)),
+        Value::BigInt(i) => Ok(Numeric::new(*i as i128, 0)),
+        Value::Numeric(n) => Ok(n.clone()),
+        Value::Float4(f) => Numeric::from_f64(*f as f64)
+            .map_err(|_| exec_err("22003", "value out of range for type numeric")),
+        Value::Float(f) => Numeric::from_f64(*f)
+            .map_err(|_| exec_err("22003", "value out of range for type numeric")),
+        Value::Bool(b) => Ok(Numeric::new(*b as i128, 0)),
+        Value::Text(s) => match Numeric::parse(s) {
+            Ok(n) => Ok(n),
+            Err(crate::storage::NumericParseError::Syntax) => Err(exec_err(
+                "22P02",
+                format!("invalid input syntax for type numeric: {:?}", s),
+            )),
+            Err(crate::storage::NumericParseError::Overflow) => {
+                Err(exec_err("22003", "value overflows numeric"))
+            }
+        },
+        other => Err(cast_err(other, "numeric")),
+    }
+}
+
+fn cast_to_bool(v: &Value) -> Result<bool, ExecError> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+            "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+            _ => Err(exec_err(
+                "22P02",
+                format!("invalid input syntax for type boolean: {:?}", s),
+            )),
+        },
+        other => Err(cast_err(other, "boolean")),
+    }
+}
+
+/// Text rendering for casts and `||`: like the wire format, except
+/// booleans render as `true`/`false` (Postgres cast output).
+fn value_to_text_cast(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        other => other.to_text().unwrap_or_default(),
+    }
+}
+
+fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    if v.col_type() == to {
+        return Ok(v.clone());
+    }
+    match to {
+        ColType::Text => Ok(Value::Text(value_to_text_cast(v))),
+        ColType::Bool => cast_to_bool(v).map(Value::Bool),
+        ColType::SmallInt => {
+            let i = cast_to_int(v)?;
+            i16::try_from(i)
+                .map(Value::SmallInt)
+                .map_err(|_| exec_err("22003", "smallint out of range"))
+        }
+        ColType::Int => {
+            let i = cast_to_int(v)?;
+            i32::try_from(i)
+                .map(|w| Value::Int(w as i64))
+                .map_err(|_| exec_err("22003", "integer out of range"))
+        }
+        ColType::BigInt => {
+            let i = cast_to_int(v)?;
+            i64::try_from(i)
+                .map(Value::BigInt)
+                .map_err(|_| exec_err("22003", "bigint out of range"))
+        }
+        ColType::Float4 => {
+            let f = cast_to_f64(v)?;
+            if f.abs() > f32::MAX as f64 {
+                return Err(exec_err("22003", "value out of range for type real"));
+            }
+            Ok(Value::Float4(f as f32))
+        }
+        ColType::Float => cast_to_f64(v).map(Value::Float),
+        ColType::Numeric => cast_to_numeric(v).map(Value::Numeric),
+        ColType::Date => match v {
+            Value::Text(s) => crate::datetime::parse_date(s)
+                .map(Value::Date)
+                .map_err(|e| exec_err("22P02", e)),
+            // Timestamps truncate to their UTC date (v0.7 is always UTC).
+            Value::Timestamp(m) | Value::Timestamptz(m) => {
+                Ok(Value::Date((m.div_euclid(86_400_000_000)) as i32))
+            }
+            other => Err(cast_err(other, "date")),
+        },
+        ColType::Timestamp => match v {
+            Value::Text(s) => crate::datetime::parse_timestamp(s)
+                .map(Value::Timestamp)
+                .map_err(|e| exec_err("22P02", e)),
+            Value::Date(d) => (*d as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::Timestamp)
+                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
+            // Timestamptz -> timestamp keeps the instant; v0.7 has no
+            // session timezone so this is the UTC wall-clock time.
+            Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
+            other => Err(cast_err(other, "timestamp without time zone")),
+        },
+        ColType::Timestamptz => match v {
+            Value::Text(s) => crate::datetime::parse_timestamptz(s)
+                .map(Value::Timestamptz)
+                .map_err(|e| exec_err("22P02", e)),
+            Value::Date(d) => (*d as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::Timestamptz)
+                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
+            // Timestamp -> timestamptz assumes UTC (documented: v0.7
+            // has no session timezone setting).
+            Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+            other => Err(cast_err(other, "timestamp with time zone")),
+        },
+        ColType::Bytea => match v {
+            Value::Text(s) => crate::storage::parse_bytea(s)
+                .map(Value::Bytea)
+                .map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type bytea: {:?}", s),
+                    )
+                }),
+            other => Err(cast_err(other, "bytea")),
+        },
+        ColType::Uuid => match v {
+            Value::Text(s) => crate::storage::parse_uuid(s)
+                .map(Value::Uuid)
+                .map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type uuid: {:?}", s),
+                    )
+                }),
+            other => Err(cast_err(other, "uuid")),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ||, LIKE, BETWEEN, IS TRUE/FALSE/UNKNOWN
+// ---------------------------------------------------------------------------
+
+/// `||`: bytea||bytea -> bytea; anything else coerces to text
+/// (Postgres' anynonarray || text behavior). NULL propagates.
+fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
+    if a == &Value::Null || b == &Value::Null {
+        return Ok(Value::Null);
+    }
     match (a, b) {
-        (None, None) => Ok(ColType::Int),
-        (None, Some(t)) | (Some(t), None) => Ok(t),
-        (Some(ColType::Int), Some(ColType::Int)) => Ok(ColType::Int),
-        (Some(ColType::Float), _) | (_, Some(ColType::Float)) => Ok(ColType::Float),
-        (Some(x), Some(y)) => Err(exec_err(
+        (Value::Bytea(x), Value::Bytea(y)) => {
+            let mut r = Vec::with_capacity(x.len() + y.len());
+            r.extend_from_slice(x);
+            r.extend_from_slice(y);
+            Ok(Value::Bytea(r))
+        }
+        _ => {
+            let mut s = value_to_text_cast(a);
+            s.push_str(&value_to_text_cast(b));
+            Ok(Value::Text(s))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatTok {
+    Lit(char),
+    Any,  // `_`
+    Star, // `%`
+}
+
+/// Tokenize a LIKE pattern; backslash escapes the next character.
+fn tokenize_like(pat: &[char]) -> Vec<PatTok> {
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < pat.len() {
+        if pat[i] == '\\' && i + 1 < pat.len() {
+            toks.push(PatTok::Lit(pat[i + 1]));
+            i += 2;
+        } else if pat[i] == '%' {
+            toks.push(PatTok::Star);
+            i += 1;
+        } else if pat[i] == '_' {
+            toks.push(PatTok::Any);
+            i += 1;
+        } else {
+            toks.push(PatTok::Lit(pat[i]));
+            i += 1;
+        }
+    }
+    toks
+}
+
+/// Classic backtracking LIKE matcher over tokenized pattern.
+fn match_like(s: &[char], toks: &[PatTok]) -> bool {
+    let (mut si, mut ti) = (0, 0);
+    let mut star_ti: Option<usize> = None;
+    let mut star_si = 0;
+    while si < s.len() {
+        if ti < toks.len()
+            && (toks[ti] == PatTok::Any
+                || matches!(toks[ti], PatTok::Lit(c) if c == s[si]))
+        {
+            si += 1;
+            ti += 1;
+        } else if ti < toks.len() && toks[ti] == PatTok::Star {
+            star_ti = Some(ti);
+            star_si = si;
+            ti += 1;
+        } else if let Some(st) = star_ti {
+            ti = st + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while ti < toks.len() && toks[ti] == PatTok::Star {
+        ti += 1;
+    }
+    ti == toks.len()
+}
+
+fn eval_like(a: &Value, pattern: &Value, not: bool, ilike: bool) -> Result<Value, ExecError> {
+    match (a, pattern) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(s), Value::Text(p)) => {
+            let (s, p) = if ilike {
+                (s.to_lowercase(), p.to_lowercase())
+            } else {
+                (s.clone(), p.clone())
+            };
+            let sc: Vec<char> = s.chars().collect();
+            let pc: Vec<char> = p.chars().collect();
+            let m = match_like(&sc, &tokenize_like(&pc));
+            Ok(Value::Bool(if not { !m } else { m }))
+        }
+        _ => Err(exec_err(
             "42883",
             format!(
-                "operator does not exist: {} + {}",
-                x.sql_name(),
-                y.sql_name()
+                "operator does not exist: {} {} {}",
+                a.type_name(),
+                if ilike { "~~*" } else { "~~" },
+                pattern.type_name()
             ),
         )),
     }
 }
 
-fn eval_add(a: &Value, b: &Value) -> Result<(ColType, Value), ExecError> {
-    let ty = combine_add_types(add_operand_value_type(a), add_operand_value_type(b))?;
-    let v = match (a, b) {
-        (Value::Null, _) | (_, Value::Null) => Value::Null,
-        (Value::Int(x), Value::Int(y)) => Value::Int(
-            x.checked_add(*y)
-                .ok_or_else(|| exec_err("22003", "integer out of range"))?,
-        ),
-        (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
-        (Value::Int(x), Value::Float(y)) => Value::Float(*x as f64 + y),
-        (Value::Float(x), Value::Int(y)) => Value::Float(x + *y as f64),
-        _ => {
+/// `x BETWEEN lo AND hi` = `x >= lo AND x <= hi`; NULL in any operand
+/// -> NULL; type mismatches surface as 42883 from the comparisons.
+fn eval_between(v: &Value, lo: &Value, hi: &Value, neg: bool) -> Result<Value, ExecError> {
+    if v == &Value::Null || lo == &Value::Null || hi == &Value::Null {
+        return Ok(Value::Null);
+    }
+    let ge = eval_cmp_vals(CmpOp::Ge, v, lo)?;
+    let le = eval_cmp_vals(CmpOp::Le, v, hi)?;
+    match (ge, le) {
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(if neg { !(a && b) } else { a && b })),
+        // Unreachable: non-null inputs compare to bools or raise.
+        _ => Ok(Value::Null),
+    }
+}
+
+/// `IS [NOT] TRUE/FALSE/UNKNOWN`. Non-boolean input is 42804.
+fn eval_is_bool(v: &Value, neg: bool, val: Option<bool>) -> Result<Value, ExecError> {
+    let matched = match (v, val) {
+        (Value::Null, None) => true,
+        (Value::Bool(b), Some(w)) => *b == w,
+        (Value::Null, Some(_)) | (Value::Bool(_), None) => false,
+        (other, _) => {
             return Err(exec_err(
-                "42883",
+                "42804",
                 format!(
-                    "operator does not exist: {} + {}",
-                    a.type_name(),
-                    b.type_name()
+                    "argument of IS must be type boolean, not type {}",
+                    other.type_name()
                 ),
             ));
         }
     };
-    Ok((ty, v))
+    Ok(Value::Bool(matched != neg))
 }
 
-/// Compare two values for ORDER BY. Numeric types compare numerically
-/// (int/float mix), text compares byte-wise (no collation support yet),
-/// bools order false < true. Mismatched non-null types are an error, like
-/// PostgreSQL. NULL placement follows PostgreSQL defaults: NULLS LAST for
-/// ASC, NULLS FIRST for DESC.
-fn compare_values(a: &Value, b: &Value, desc: bool) -> Result<Ordering, ExecError> {
-    let nulls_first = desc;
+// ---------------------------------------------------------------------------
+// EXTRACT
+// ---------------------------------------------------------------------------
+
+fn eval_extract(field: &str, v: &Value) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    let field = field.to_ascii_lowercase();
+    let r = match v {
+        Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::extract(&field, *m),
+        Value::Date(d) => crate::datetime::extract_date(&field, *d),
+        other => {
+            return Err(exec_err(
+                "42883",
+                format!(
+                    "function extract({} from {}) does not exist",
+                    field,
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    match r {
+        Ok(f) => Numeric::from_f64(f)
+            .map(Value::Numeric)
+            .map_err(|_| exec_err("22003", "value out of range for type numeric")),
+        Err(e) => Err(exec_err("22023", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in scalar functions
+// ---------------------------------------------------------------------------
+
+fn func_arg_err(fname: &str, v: &Value) -> ExecError {
+    exec_err(
+        "42883",
+        format!("function {}({}) does not exist", fname, v.type_name()),
+    )
+}
+
+/// Strict text argument (no implicit casts, like Postgres' LIKE).
+fn str_arg<'a>(fname: &str, v: &'a Value) -> Result<Option<&'a str>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Text(s) => Ok(Some(s)),
+        other => Err(func_arg_err(fname, other)),
+    }
+}
+
+/// Strict integer-kind argument.
+fn int_arg(fname: &str, v: &Value) -> Result<Option<i64>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::SmallInt(i) => Ok(Some(*i as i64)),
+        Value::Int(i) => Ok(Some(*i)),
+        Value::BigInt(i) => Ok(Some(*i)),
+        other => Err(func_arg_err(fname, other)),
+    }
+}
+
+fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
+    let mut vals = Vec::with_capacity(args.len());
+    for a in args {
+        vals.push(eval_expr(q, scopes, a)?);
+    }
+    eval_func_vals(name, &vals)
+}
+
+/// Validate argument counts for scalar built-ins. A wrong count is
+/// 42883 (undefined_function), like Postgres — never an index panic.
+fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
+    let n = vals.len();
+    let ok = match name {
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "abs"
+        | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "round" => n == 1 || n == 2,
+        "substring" => n == 2 || n == 3,
+        "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
+        "replace" | "split_part" | "trim" => n == 3,
+        "now" | "current_date" | "current_timestamp" => n == 0,
+        "coalesce" | "greatest" | "least" => n >= 1,
+        // EXTRACT and friends validate their own shapes; unknown names
+        // fall through to the dispatch below which raises 42883.
+        _ => true,
+    };
+    if ok {
+        return Ok(());
+    }
+    let sig = vals
+        .iter()
+        .map(|v| v.type_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(exec_err(
+        "42883",
+        format!("function {}({}) does not exist", name, sig),
+    ))
+}
+
+/// Dispatch on pre-evaluated argument values (used by the grouped path).
+fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    check_builtin_arity(name, vals)?;
+    match name {
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "substring"
+        | "trim" | "position" | "replace" | "split_part" => eval_str_func(name, vals),
+        "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" => {
+            eval_math_func(name, vals)
+        }
+        "now" | "current_date" | "current_timestamp" | "date_trunc" => {
+            eval_datetime_func(name, vals)
+        }
+        "coalesce" | "nullif" | "greatest" | "least" => eval_cond_func(name, vals),
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    match name {
+        "upper" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::Text(s.to_uppercase()),
+        }),
+        "lower" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::Text(s.to_lowercase()),
+        }),
+        "length" | "char_length" | "character_length" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::Int(s.chars().count() as i64),
+        }),
+        "substring" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let len = if vals.len() > 2 {
+                match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => {
+                        if n < 0 {
+                            return Err(exec_err("22011", "negative substring length not allowed"));
+                        }
+                        Some(n)
+                    }
+                }
+            } else {
+                None
+            };
+            // 1-based; start < 1 shifts the window (Postgres rule).
+            let chars: Vec<char> = s.chars().collect();
+            let total = chars.len() as i64;
+            let from = start.max(1);
+            let upto = match len {
+                Some(n) => start + n,
+                None => total + 1,
+            };
+            let lo = (from - 1).max(0).min(total) as usize;
+            let hi = (upto - 1).max(0).min(total) as usize;
+            let (lo, hi) = (lo.min(hi), hi);
+            Ok(Value::Text(chars[lo..hi].iter().collect()))
+        }
+        "trim" => {
+            // Parser encodes trim as (spec, chars, str); the 1-arg form
+            // arrives as ("both", " ", str).
+            let (spec, ch, s) = (&vals[0], &vals[1], &vals[2]);
+            let s = match str_arg(name, s)? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let spec = match spec {
+                Value::Text(t) => t.as_str(),
+                _ => return Err(exec_err("22023", "invalid trim specification")),
+            };
+            if !matches!(spec, "leading" | "trailing" | "both") {
+                return Err(exec_err("22023", "invalid trim specification"));
+            }
+            let ch = match str_arg(name, ch)? {
+                None => " ",
+                Some(c) => c,
+            };
+            let set: Vec<char> = ch.chars().collect();
+            let t = |c: char| set.contains(&c);
+            let r = match spec {
+                "leading" => s.trim_start_matches(t).to_string(),
+                "trailing" => s.trim_end_matches(t).to_string(),
+                _ => s.trim_matches(t).to_string(),
+            };
+            Ok(Value::Text(r))
+        }
+        "position" => {
+            let sub = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let s = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            if sub.is_empty() {
+                return Ok(Value::Int(1));
+            }
+            let sc: Vec<char> = s.chars().collect();
+            let nc: Vec<char> = sub.chars().collect();
+            let pos = sc
+                .windows(nc.len())
+                .position(|w| w == nc.as_slice())
+                .map(|i| i as i64 + 1)
+                .unwrap_or(0);
+            Ok(Value::Int(pos))
+        }
+        "replace" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let from = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let to = match str_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            // Postgres: empty search string leaves the input unchanged.
+            if from.is_empty() {
+                return Ok(Value::Text(s.to_string()));
+            }
+            Ok(Value::Text(s.replace(from, to)))
+        }
+        "split_part" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let delim = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let n = match int_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if n == 0 {
+                return Err(exec_err(
+                    "22023",
+                    "field position must be greater than zero",
+                ));
+            }
+            let parts: Vec<&str> = if delim.is_empty() {
+                // Split into characters (Postgres behavior).
+                let mut v: Vec<&str> = Vec::new();
+                let mut i = 0;
+                for c in s.chars() {
+                    let l = c.len_utf8();
+                    v.push(&s[i..i + l]);
+                    i += l;
+                }
+                v
+            } else {
+                s.split(delim).collect()
+            };
+            let idx = if n > 0 {
+                n - 1
+            } else {
+                parts.len() as i64 + n
+            };
+            let r = if idx >= 0 {
+                parts.get(idx as usize).copied().unwrap_or("")
+            } else {
+                ""
+            };
+            Ok(Value::Text(r.to_string()))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+/// Shared `power(a, b)` / `a ^ b` implementation. `bad` builds the
+/// type-mismatch error (42883), which differs between the function and
+/// operator spellings.
+fn eval_power_op(a: &Value, b: &Value, bad: impl Fn(&Value) -> ExecError) -> Result<Value, ExecError> {
+    if matches!(a, Value::Float4(_) | Value::Float(_))
+        || matches!(b, Value::Float4(_) | Value::Float(_))
+    {
+        return Ok(Value::Float(to_f64v(a).powf(to_f64v(b))));
+    }
+    let base = to_numeric_opt(a).ok_or_else(|| bad(a))?;
+    let exp = to_numeric_opt(b).ok_or_else(|| bad(b))?;
+    // Integer exponents are exact (like Postgres' numeric
+    // power); anything else goes through f64.
+    if exp.scale == 0 {
+        if let Ok(e) = i64::try_from(exp.unscaled) {
+            if let Some(n) = base.pow(e) {
+                return Ok(Value::Numeric(n));
+            }
+        }
+    }
+    let f = base.to_f64().powf(exp.to_f64());
+    if f.is_nan() {
+        return Err(exec_err(
+            "2201F",
+            "a negative number raised to a non-integer power yields a non-real result",
+        ));
+    }
+    if f.is_infinite() {
+        return Err(exec_err("22003", "value out of range for type numeric"));
+    }
+    Numeric::from_f64(f)
+        .map(Value::Numeric)
+        .map_err(|_| exec_err("22003", "value out of range for type numeric"))
+}
+
+fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    let v = &vals[0];
+    if v == &Value::Null || (vals.len() > 1 && vals[1] == Value::Null) {
+        return Ok(Value::Null);
+    }
+    match name {
+        "abs" => match v {
+            Value::SmallInt(i) => i
+                .checked_abs()
+                .map(Value::SmallInt)
+                .ok_or_else(|| exec_err("22003", "smallint out of range")),
+            Value::Int(i) => i
+                .checked_abs()
+                .map(Value::Int)
+                .ok_or_else(|| exec_err("22003", "integer out of range")),
+            Value::BigInt(i) => i
+                .checked_abs()
+                .map(Value::BigInt)
+                .ok_or_else(|| exec_err("22003", "bigint out of range")),
+            Value::Numeric(n) => Ok(Value::Numeric(n.abs())),
+            Value::Float4(f) => Ok(Value::Float4(f.abs())),
+            Value::Float(f) => Ok(Value::Float(f.abs())),
+            other => Err(func_arg_err(name, other)),
+        },
+        "round" => {
+            // Postgres: round(numeric) -> numeric, round(float8) ->
+            // numeric, round(numeric, int) -> numeric.
+            let n = to_numeric_opt(v)
+                .ok_or_else(|| func_arg_err(name, v))?;
+            if vals.len() == 1 {
+                n.round_to(0)
+                    .map(Value::Numeric)
+                    .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+            } else {
+                let s = int_arg(name, &vals[1])?.unwrap_or(0);
+                round_scale(&n, s)
+                    .map(Value::Numeric)
+                    .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+            }
+        }
+        "floor" | "ceil" | "ceiling" => {
+            let is_floor = name == "floor";
+            match v {
+                Value::Float4(f) => Ok(Value::Float4(if is_floor {
+                    f.floor()
+                } else {
+                    f.ceil()
+                })),
+                Value::Float(f) => Ok(Value::Float(if is_floor {
+                    f.floor()
+                } else {
+                    f.ceil()
+                })),
+                other => {
+                    let n = to_numeric_opt(other).ok_or_else(|| func_arg_err(name, other))?;
+                    let r = if is_floor { n.floor() } else { n.ceil() };
+                    r.map(Value::Numeric)
+                        .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+                }
+            }
+        }
+        "sqrt" => {
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                // Postgres: sqrt(float8) -> float8, NaN for negatives.
+                return Ok(Value::Float(to_f64v(v).sqrt()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            match n.sqrt() {
+                Some(r) => Ok(Value::Numeric(r)),
+                // Postgres numeric.c: ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION.
+                None => Err(exec_err(
+                    "2201F",
+                    "cannot take square root of a negative number",
+                )),
+            }
+        }
+        "power" => eval_power_op(v, &vals[1], |w| func_arg_err(name, w)),
+        "mod" => {
+            // Postgres resolves mod() to numeric.
+            let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            if b.is_zero() {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            a.checked_rem(&b)
+                .map(Value::Numeric)
+                .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+/// round(n, s) for negative s (round_to only takes u32 scales).
+fn round_scale(n: &Numeric, s: i64) -> Option<Numeric> {
+    if s >= 0 {
+        return n.round_to(s as u32);
+    }
+    let mag = 10i128.checked_pow((-s) as u32)?;
+    let shifted = Numeric::new(n.unscaled.checked_div(mag)?, 0);
+    let rounded = shifted.round_to(0)?;
+    Some(Numeric::new(rounded.unscaled.checked_mul(mag)?, 0))
+}
+
+fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    match name {
+        "now" | "current_timestamp" => Ok(Value::Timestamptz(crate::datetime::now_micros())),
+        "current_date" => Ok(Value::Date(crate::datetime::today_days())),
+        "date_trunc" => {
+            let field = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s.to_ascii_lowercase(),
+            };
+            let v = &vals[1];
+            if v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let (micros, is_tz) = match v {
+                Value::Date(d) => (
+                    (*d as i64)
+                        .checked_mul(86_400_000_000)
+                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?,
+                    false,
+                ),
+                Value::Timestamp(m) => (*m, false),
+                Value::Timestamptz(m) => (*m, true),
+                other => return Err(func_arg_err(name, other)),
+            };
+            match crate::datetime::date_trunc(&field, micros) {
+                Ok(m) => Ok(if is_tz {
+                    Value::Timestamptz(m)
+                } else {
+                    Value::Timestamp(m)
+                }),
+                Err(e) => Err(exec_err("22023", e)),
+            }
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+fn eval_cond_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    match name {
+        "coalesce" => Ok(vals
+            .iter()
+            .find(|v| **v != Value::Null)
+            .cloned()
+            .unwrap_or(Value::Null)),
+        "nullif" => {
+            let (a, b) = (&vals[0], &vals[1]);
+            if a == &Value::Null || b == &Value::Null {
+                return Ok(a.clone());
+            }
+            match cmp_ordering(a, b, CmpOp::Eq)? {
+                Some(Ordering::Equal) => Ok(Value::Null),
+                _ => Ok(a.clone()),
+            }
+        }
+        // Postgres: GREATEST/LEAST ignore NULLs; all-NULL -> NULL.
+        "greatest" | "least" => {
+            let want_greatest = name == "greatest";
+            let mut best: Option<&Value> = None;
+            for v in vals {
+                if v == &Value::Null {
+                    continue;
+                }
+                match best {
+                    None => best = Some(v),
+                    Some(cur) => {
+                        let ord = cmp_ordering(cur, v, CmpOp::Eq)?.ok_or_else(|| {
+                            exec_err("XX000", "internal error: null in greatest/least")
+                        })?;
+                        let take = if want_greatest {
+                            ord == Ordering::Less
+                        } else {
+                            ord == Ordering::Greater
+                        };
+                        if take {
+                            best = Some(v);
+                        }
+                    }
+                }
+            }
+            Ok(best.cloned().unwrap_or(Value::Null))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+/// Result-column type of a built-in function call (Describe path).
+fn func_result_type(
+    name: &str,
+    args: &[Expr],
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    schemas: &[&[QCol]],
+) -> Result<ColType, ExecError> {
+    let arg0 = || expr_type(eng, snap, own, schemas, &args[0]);
+    match name {
+        "upper" | "lower" | "substring" | "trim" | "replace" | "split_part" => Ok(ColType::Text),
+        "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
+        "abs" => arg0(),
+        "round" | "mod" => Ok(ColType::Numeric),
+        "floor" | "ceil" | "ceiling" => match arg0()? {
+            ColType::Float4 => Ok(ColType::Float4),
+            ColType::Float => Ok(ColType::Float),
+            _ => Ok(ColType::Numeric),
+        },
+        // Any float argument -> Float, else Numeric (documented:
+        // Postgres returns numeric for sqrt(real)).
+        "sqrt" | "power" => {
+            for a in args {
+                match expr_type(eng, snap, own, schemas, a)? {
+                    ColType::Float4 | ColType::Float => return Ok(ColType::Float),
+                    _ => {}
+                }
+            }
+            Ok(ColType::Numeric)
+        }
+        "now" | "current_timestamp" => Ok(ColType::Timestamptz),
+        "current_date" => Ok(ColType::Date),
+        "date_trunc" => match expr_type(eng, snap, own, schemas, &args[1])? {
+            ColType::Timestamptz => Ok(ColType::Timestamptz),
+            _ => Ok(ColType::Timestamp),
+        },
+        "coalesce" | "nullif" | "greatest" | "least" => arg0(),
+        _ => Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )),
+    }
+}
+
+/// Compare two values for ORDER BY. Exact numerics (int2/int4/int8/
+/// numeric) compare exactly; float4/float8 compare by `total_cmp`;
+/// mixed exact/float goes through f64 (a documented precision caveat).
+/// Text compares byte-wise (no collation support yet), bools order
+/// false < true, dates/times/bytea/uuid compare naturally. Mismatched
+/// non-null types are an error, like PostgreSQL. NULL placement follows
+/// PostgreSQL defaults unless overridden: NULLS LAST for ASC,
+/// NULLS FIRST for DESC.
+fn compare_values(
+    a: &Value,
+    b: &Value,
+    desc: bool,
+    nulls_first: Option<bool>,
+) -> Result<Ordering, ExecError> {
+    let nulls_first = nulls_first.unwrap_or(desc);
     let ord = match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => {
@@ -2620,12 +4369,26 @@ fn compare_values(a: &Value, b: &Value, desc: bool) -> Result<Ordering, ExecErro
                 Ordering::Less
             });
         }
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
+            exact_numeric(x).cmp(&exact_numeric(y))
+        }
+        (Value::Float4(x), Value::Float4(y)) => (*x as f64).total_cmp(&(*y as f64)),
+        (Value::Float4(x), Value::Float(y)) => (*x as f64).total_cmp(y),
+        (Value::Float(x), Value::Float4(y)) => x.total_cmp(&(*y as f64)),
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y),
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
+        (x, y @ (Value::Float4(_) | Value::Float(_))) if is_exact_numeric(x) => {
+            (exact_to_f64(x)).total_cmp(&float_val(y))
+        }
+        (x @ (Value::Float4(_) | Value::Float(_)), y) if is_exact_numeric(y) => {
+            float_val(x).total_cmp(&exact_to_f64(y))
+        }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
+        (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         _ => {
             return Err(exec_err(
                 "42804",
@@ -2640,12 +4403,58 @@ fn compare_values(a: &Value, b: &Value, desc: bool) -> Result<Ordering, ExecErro
     Ok(if desc { ord.reverse() } else { ord })
 }
 
+/// Exact numeric kinds: int2/int4/int8/numeric.
+fn is_exact_numeric(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) | Value::Numeric(_)
+    )
+}
+
+/// Lift an exact numeric to a canonical Numeric for comparison.
+fn exact_numeric(v: &Value) -> Numeric {
+    match v {
+        Value::SmallInt(i) => Numeric::new(*i as i128, 0),
+        Value::Int(i) => Numeric::new(*i as i128, 0),
+        Value::BigInt(i) => Numeric::new(*i as i128, 0),
+        Value::Numeric(n) => n.clone(),
+        _ => Numeric::zero(),
+    }
+}
+
+fn exact_to_f64(v: &Value) -> f64 {
+    match v {
+        Value::SmallInt(i) => *i as f64,
+        Value::Int(i) => *i as f64,
+        Value::BigInt(i) => *i as f64,
+        Value::Numeric(n) => n.to_f64(),
+        _ => f64::NAN,
+    }
+}
+
+fn float_val(v: &Value) -> f64 {
+    match v {
+        Value::Float4(f) => *f as f64,
+        Value::Float(f) => *f,
+        _ => f64::NAN,
+    }
+}
+
 fn value_type_name(v: &Value) -> &'static str {
     match v {
+        Value::SmallInt(_) => "smallint",
         Value::Int(_) => "integer",
+        Value::BigInt(_) => "bigint",
+        Value::Float4(_) => "real",
         Value::Float(_) => "float",
+        Value::Numeric(_) => "numeric",
         Value::Text(_) => "text",
         Value::Bool(_) => "boolean",
+        Value::Date(_) => "date",
+        Value::Timestamp(_) => "timestamp",
+        Value::Timestamptz(_) => "timestamptz",
+        Value::Bytea(_) => "bytea",
+        Value::Uuid(_) => "uuid",
         Value::Null => "null",
     }
 }
@@ -2800,19 +4609,31 @@ fn expr_type(
             .ok_or_else(|| exec_err("XX000", "internal error: resolved column out of range")),
         Expr::Literal(lit) => Ok(lit.col_type()),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
-        Expr::Add(a, b) => {
-            let ta = add_operand_type(eng, snap, own, schemas, a)?;
-            let tb = add_operand_type(eng, snap, own, schemas, b)?;
-            combine_add_types(ta, tb)
+        Expr::Arith { op, left, right } => {
+            let ta = arith_operand_type(eng, snap, own, schemas, left, *op)?;
+            let tb = arith_operand_type(eng, snap, own, schemas, right, *op)?;
+            combine_arith_types(*op, ta, tb)
         }
+        Expr::Cast { to, .. } => Ok(*to),
+        Expr::Concat(..) => Ok(ColType::Text),
         Expr::Cmp { .. }
         | Expr::And(_, _)
         | Expr::Or(_, _)
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::IsBool { .. }
+        | Expr::Like { .. }
+        | Expr::Between { .. }
         | Expr::InSub { .. }
         | Expr::Exists { .. } => Ok(ColType::Bool),
-        Expr::Agg { func, arg } => agg_result_type(eng, snap, own, schemas, *func, arg.as_deref()),
+        Expr::Func { name, args } => func_result_type(name, args, eng, snap, own, schemas),
+        Expr::Extract { .. } => Ok(ColType::Numeric),
+        Expr::Agg {
+            func,
+            arg,
+            distinct: _,
+            arg2,
+        } => agg_result_type(eng, snap, own, schemas, *func, arg.as_deref(), arg2.as_deref()),
         Expr::ScalarSub(sub) => {
             let cols = describe_select(eng, snap, own, sub)?;
             if cols.len() != 1 {
@@ -2823,13 +4644,15 @@ fn expr_type(
     }
 }
 
-/// Operand type of `+` for the description pass; NULL contributes nothing.
-fn add_operand_type(
+/// Operand type of an arithmetic operator for the description pass;
+/// NULL contributes nothing.
+fn arith_operand_type(
     eng: &Engine,
     snap: &Snapshot,
     own: u64,
     schemas: &[&[QCol]],
     e: &Expr,
+    op: ArithOp,
 ) -> Result<Option<ColType>, ExecError> {
     match e {
         Expr::Literal(Literal::Null) => Ok(None),
@@ -2838,23 +4661,132 @@ fn add_operand_type(
         Expr::Column { .. } | Expr::ResolvedCol { .. } => {
             Ok(Some(expr_type(eng, snap, own, schemas, e)?))
         }
-        Expr::Add(a, b) => {
-            let ta = add_operand_type(eng, snap, own, schemas, a)?;
-            let tb = add_operand_type(eng, snap, own, schemas, b)?;
-            Ok(Some(combine_add_types(ta, tb)?))
+        Expr::Arith {
+            op: inner,
+            left,
+            right,
+        } => {
+            let ta = arith_operand_type(eng, snap, own, schemas, left, *inner)?;
+            let tb = arith_operand_type(eng, snap, own, schemas, right, *inner)?;
+            Ok(Some(combine_arith_types(*inner, ta, tb)?))
         }
         Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(eng, snap, own, schemas, e)?)),
-        // Boolean / predicate expressions can't be added.
+        Expr::Cast { to, .. } => Ok(Some(*to)),
+        Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, schemas, e)?)),
+        // Boolean / predicate expressions can't be arithmetic operands.
         _ => Err(exec_err(
             "42883",
-            "operator does not exist: boolean + integer",
+            format!("operator does not exist: boolean {} integer", op.sql()),
         )),
+    }
+}
+
+/// Rank in the numeric promotion lattice (v0.7):
+/// smallint < integer < bigint < real < double precision < numeric.
+/// (Postgres resolves real+int to double and anything+numeric to
+/// numeric; int2+int2 resolves to int4 — see the special case below.)
+fn numeric_rank(t: &ColType) -> Option<u8> {
+    match t {
+        ColType::SmallInt => Some(0),
+        ColType::Int => Some(1),
+        ColType::BigInt => Some(2),
+        ColType::Float4 => Some(3),
+        ColType::Float => Some(4),
+        ColType::Numeric => Some(5),
+        _ => None,
+    }
+}
+
+fn rank_type(rank: u8) -> ColType {
+    match rank {
+        0 => ColType::SmallInt,
+        1 => ColType::Int,
+        2 => ColType::BigInt,
+        3 => ColType::Float4,
+        4 => ColType::Float,
+        _ => ColType::Numeric,
+    }
+}
+
+/// Result type of `a <op> b` given operand types (None = NULL/unknown
+/// side). Date arithmetic: date +/- integer-kind -> date, date - date
+/// -> integer. Anything else mismatched is 42883.
+fn combine_arith_types(
+    op: ArithOp,
+    a: Option<ColType>,
+    b: Option<ColType>,
+) -> Result<ColType, ExecError> {
+    let op_err = |x: &ColType, y: &ColType| {
+        exec_err(
+            "42883",
+            format!(
+                "operator does not exist: {} {} {}",
+                x.sql_name(),
+                op.sql(),
+                y.sql_name()
+            ),
+        )
+    };
+    match (a, b) {
+        (None, None) => Ok(ColType::Int),
+        (None, Some(t)) | (Some(t), None) => Ok(t),
+        (Some(x), Some(y)) => {
+            // Date arithmetic (v0.7): date +/- int-kind -> date,
+            // date - date -> integer (days). No intervals in v0.7.
+            let is_int_kind = |t: &ColType| {
+                matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt)
+            };
+            match (&x, &y) {
+                (ColType::Date, y) if is_int_kind(y) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Date),
+                    _ => Err(op_err(&x, &y)),
+                },
+                // `int + date` commutes; `int - date` is undefined.
+                (x, ColType::Date) if is_int_kind(x) => match op {
+                    ArithOp::Add => Ok(ColType::Date),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::Date) => match op {
+                    ArithOp::Sub => Ok(ColType::Int),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (x, y) => match (numeric_rank(x), numeric_rank(y)) {
+                    (Some(rx), Some(ry)) => {
+                        if op == ArithOp::Pow {
+                            // Postgres `^`: numeric for exact inputs,
+                            // float8 when either side is floating.
+                            return Ok(if rx.max(ry) >= 3 {
+                                ColType::Float
+                            } else {
+                                ColType::Numeric
+                            });
+                        }
+                        if op == ArithOp::Mod && matches!(rx.max(ry), 3 | 4) {
+                            // Postgres defines % only for the exact numeric
+                            // types (not real/double).
+                            return Err(op_err(x, y));
+                        }
+                        // int2 <op> int2 -> int4, like Postgres.
+                        if rx == 0 && ry == 0 {
+                            return Ok(ColType::Int);
+                        }
+                        Ok(rank_type(rx.max(ry)))
+                    }
+                    _ => Err(op_err(x, y)),
+                },
+            }
+        }
     }
 }
 
 fn numeric_agg_arg(func: &str, t: &ColType) -> Result<(), ExecError> {
     match t {
-        ColType::Int | ColType::Float => Ok(()),
+        ColType::SmallInt
+        | ColType::Int
+        | ColType::BigInt
+        | ColType::Float4
+        | ColType::Float
+        | ColType::Numeric => Ok(()),
         _ => Err(exec_err(
             "42883",
             format!("function {}({}) does not exist", func, t.sql_name()),
@@ -2869,9 +4801,11 @@ fn agg_result_type(
     schemas: &[&[QCol]],
     func: AggFunc,
     arg: Option<&Expr>,
+    arg2: Option<&Expr>,
 ) -> Result<ColType, ExecError> {
     match func {
-        AggFunc::Count => Ok(ColType::Int),
+        // Postgres count() returns bigint.
+        AggFunc::Count => Ok(ColType::BigInt),
         AggFunc::Avg => {
             if let Some(a) = arg {
                 numeric_agg_arg("avg", &expr_type(eng, snap, own, schemas, a)?)?;
@@ -2884,12 +4818,28 @@ fn agg_result_type(
             Some(a) => {
                 let t = expr_type(eng, snap, own, schemas, a)?;
                 numeric_agg_arg("sum", &t)?;
+                // v0.6 rule kept (documented): sum returns the
+                // argument type; Postgres would widen int->bigint.
                 Ok(t)
             }
         },
         AggFunc::Min | AggFunc::Max => {
             let a = arg.expect("min/max always take an argument");
             expr_type(eng, snap, own, schemas, a)
+        }
+        AggFunc::StringAgg => {
+            // Delimiter should be text-ish; be permissive here (the
+            // executor coerces via casts) and just require an argument.
+            let a = arg.expect("string_agg always takes arguments");
+            let t = expr_type(eng, snap, own, schemas, a)?;
+            if !matches!(t, ColType::Text) {
+                return Err(exec_err(
+                    "42883",
+                    format!("function string_agg({}) does not exist", t.sql_name()),
+                ));
+            }
+            let _ = arg2;
+            Ok(ColType::Text)
         }
     }
 }
@@ -2945,14 +4895,33 @@ fn hint_type(
             let c = schemas.get(si)?.get(ci)?;
             Some(c.ty.clone())
         }
-        Expr::Add(a, b) => combine_add_types(
-            hint_type(eng, snap, own, schemas, a),
-            hint_type(eng, snap, own, schemas, b),
+        Expr::Arith { op, left, right } => combine_arith_types(
+            *op,
+            hint_type(eng, snap, own, schemas, left),
+            hint_type(eng, snap, own, schemas, right),
         )
         .ok(),
-        Expr::Agg { func, arg } => {
-            agg_result_type(eng, snap, own, schemas, *func, arg.as_deref()).ok()
+        Expr::Cast { to, .. } => Some(*to),
+        Expr::Concat(..) => Some(ColType::Text),
+        Expr::Extract { .. } => Some(ColType::Numeric),
+        Expr::Func { name, args } => {
+            func_result_type(name, args, eng, snap, own, schemas).ok()
         }
+        Expr::Agg {
+            func,
+            arg,
+            distinct: _,
+            arg2,
+        } => agg_result_type(
+            eng,
+            snap,
+            own,
+            schemas,
+            *func,
+            arg.as_deref(),
+            arg2.as_deref(),
+        )
+        .ok(),
         Expr::ScalarSub(sub) => {
             let cols = describe_select(eng, snap, own, sub).ok()?;
             if cols.len() == 1 {
@@ -2975,11 +4944,11 @@ fn infer_expr(
     out: &mut [Option<ColType>],
 ) -> Result<(), ExecError> {
     match e {
-        Expr::Add(a, b) => {
-            infer_expr(a, eng, snap, own, schemas, out)?;
-            infer_expr(b, eng, snap, own, schemas, out)?;
+        Expr::Arith { left, right, .. } => {
+            infer_expr(left, eng, snap, own, schemas, out)?;
+            infer_expr(right, eng, snap, own, schemas, out)?;
             // One side a param, the other side typed: pin the param.
-            for (p_side, o_side) in [(a, b), (b, a)] {
+            for (p_side, o_side) in [(left, right), (right, left)] {
                 if let Expr::Param(p) = **p_side {
                     if let Some(t) = hint_type(eng, snap, own, schemas, o_side) {
                         pin_param(out, p, t)?;
@@ -2988,8 +4957,8 @@ fn infer_expr(
             }
             // Both sides params with no other info: default to integer
             // (documented v0.2 inference rule for `$1 + $2`).
-            if matches!(**a, Expr::Param(_)) && matches!(**b, Expr::Param(_)) {
-                for p_side in [a, b] {
+            if matches!(**left, Expr::Param(_)) && matches!(**right, Expr::Param(_)) {
+                for p_side in [left, right] {
                     if let Expr::Param(p) = **p_side {
                         let i = (p as usize) - 1;
                         if out[i].is_none() {
@@ -3315,8 +5284,22 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
+                .parse::<i32>()
+                .map(|w| Value::Int(w as i64))
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::SmallInt => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            s.trim()
+                .parse::<i16>()
+                .map(Value::SmallInt)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::BigInt => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            s.trim()
                 .parse::<i64>()
-                .map(Value::Int)
+                .map(Value::BigInt)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
         ColType::Float => {
@@ -3326,6 +5309,19 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::Float)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        ColType::Float4 => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            s.trim()
+                .parse::<f32>()
+                .map(Value::Float4)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Numeric => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::storage::Numeric::parse(s.trim())
+                .map(Value::Numeric)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
         ColType::Bool => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             match s.trim().to_lowercase().as_str() {
@@ -3333,6 +5329,36 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 "f" | "false" | "0" | "no" | "n" | "off" => Ok(Value::Bool(false)),
                 _ => Err(bad(format!("\"{}\"", s))),
             }
+        }
+        ColType::Date => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_date(s.trim())
+                .map(Value::Date)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Timestamp => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_timestamp(s.trim())
+                .map(Value::Timestamp)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Timestamptz => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_timestamptz(s.trim())
+                .map(Value::Timestamptz)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Bytea => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::storage::parse_bytea(s.trim())
+                .map(Value::Bytea)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Uuid => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::storage::parse_uuid(s.trim())
+                .map(Value::Uuid)
+                .map_err(|_| bad(format!("\"{}\"", s)))
         }
     }
     .map_err(|e| {
@@ -3426,10 +5452,19 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         .ok_or_else(|| exec_err("42P02", format!("there is no parameter ${}", p)))?;
     Ok(match v {
         None => Literal::Null,
+        Some(Value::SmallInt(i)) => Literal::SmallInt(*i),
         Some(Value::Int(i)) => Literal::Int(*i),
+        Some(Value::BigInt(i)) => Literal::BigInt(*i),
+        Some(Value::Float4(f)) => Literal::Real(*f),
         Some(Value::Float(f)) => Literal::Float(*f),
+        Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
         Some(Value::Text(s)) => Literal::Text(s.clone()),
         Some(Value::Bool(b)) => Literal::Bool(*b),
+        Some(Value::Date(d)) => Literal::Date(*d),
+        Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
+        Some(Value::Timestamptz(m)) => Literal::Timestamptz(*m),
+        Some(Value::Bytea(b)) => Literal::Bytea(b.clone()),
+        Some(Value::Uuid(u)) => Literal::Uuid(*u),
         Some(Value::Null) => Literal::Null,
     })
 }
@@ -3439,17 +5474,45 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
         Expr::Param(p) => {
             *e = Expr::Literal(param_literal(*p, params)?);
         }
-        Expr::Add(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
-            subst_expr(a, params)?;
-            subst_expr(b, params)?;
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Concat(left, right) => {
+            subst_expr(left, params)?;
+            subst_expr(right, params)?;
         }
         Expr::Cmp { left, right, .. } => {
             subst_expr(left, params)?;
             subst_expr(right, params)?;
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } => subst_expr(x, params)?,
-        Expr::Agg { arg, .. } => {
+        Expr::Like {
+            expr, pattern, ..
+        } => {
+            subst_expr(expr, params)?;
+            subst_expr(pattern, params)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            subst_expr(expr, params)?;
+            subst_expr(low, params)?;
+            subst_expr(high, params)?;
+        }
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+            subst_expr(x, params)?
+        }
+        Expr::Cast { expr, .. } => subst_expr(expr, params)?,
+        Expr::Func { args, .. } => {
+            for a in args {
+                subst_expr(a, params)?;
+            }
+        }
+        Expr::Extract { from, .. } => subst_expr(from, params)?,
+        Expr::Agg { arg, arg2, .. } => {
             if let Some(a) = arg {
+                subst_expr(a, params)?;
+            }
+            if let Some(a) = arg2 {
                 subst_expr(a, params)?;
             }
         }
@@ -3466,10 +5529,19 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
 
 fn dummy_value(t: &ColType) -> Value {
     match t {
+        ColType::SmallInt => Value::SmallInt(0),
         ColType::Int => Value::Int(0),
+        ColType::BigInt => Value::BigInt(0),
+        ColType::Float4 => Value::Float4(0.0),
         ColType::Float => Value::Float(0.0),
+        ColType::Numeric => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::Text(String::new()),
         ColType::Bool => Value::Bool(false),
+        ColType::Date => Value::Date(0),
+        ColType::Timestamp => Value::Timestamp(0),
+        ColType::Timestamptz => Value::Timestamptz(0),
+        ColType::Bytea => Value::Bytea(Vec::new()),
+        ColType::Uuid => Value::Uuid([0; 16]),
     }
 }
 

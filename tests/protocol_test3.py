@@ -289,8 +289,10 @@ def main():
     r = split(c1.query("SELECT id FROM acct WHERE id = 7"))
     check("first statement's row present", r["rows"] == [["7"]], str(r["rows"]))
     r = split(c1.query("INSERT INTO acct VALUES (8, 800), (9, 'xx')"))
-    check("multi-row INSERT with bad row -> 42804",
-          r["error"] is not None and r["error"].get("C") == "42804",
+    # v0.7: text literals go through the type's input function, so a bad
+    # integer literal is 22P02 (like Postgres), not 42804.
+    check("multi-row INSERT with bad row -> 22P02",
+          r["error"] is not None and r["error"].get("C") == "22P02",
           str(r["error"]))
     r = split(c1.query("SELECT id FROM acct WHERE id = 8"))
     check("failed statement left no trace", r["rows"] == [], str(r["rows"]))

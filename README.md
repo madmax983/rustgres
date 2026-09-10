@@ -1,10 +1,16 @@
-# rustgres v0.6 — "query engine"
+# rustgres v0.7 — "richer types, casts, operators, built-ins"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 6 of the road to Postgres 19 feature parity. v0.6 replaces the
-v0.1–v0.5 single-table `SELECT` with a **real query engine**: `FROM`
+Milestone 7 of the road to Postgres 19 feature parity. v0.7 widens the
+type system and expression language: **9 new types** (`SMALLINT`,
+`BIGINT`, `REAL`, `NUMERIC`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `BYTEA`,
+`UUID`), **casts** (`::type` and `CAST(x AS type)`), the **`^`
+exponentiation operator**, `LIKE`/`ILIKE`/`BETWEEN`, full **numeric
+promotion**, **30+ built-in functions** (string, math, datetime,
+conditional), explicit `NULLS FIRST`/`LAST`, aggregate `DISTINCT`, and
+`string_agg`. v0.6 added the query engine (below): `FROM`
 sources are tables, derived tables, and `INNER`/`LEFT`/`CROSS` joins with
 arbitrary `ON` predicates; `WHERE` is a general boolean expression with
 SQL three-valued (NULL) logic; scalar, `IN`, and `EXISTS` subqueries
@@ -13,6 +19,62 @@ SQL three-valued (NULL) logic; scalar, `IN`, and `EXISTS` subqueries
 (including ordering by aggregates not in the select list); and
 `SELECT ... FOR UPDATE` row locking with full transaction lifecycle
 (commit/rollback/savepoint/disconnect release the locks).
+
+## What v0.7 adds (richer types, casts, operators, built-ins)
+
+- **New types.** `SMALLINT` (int2), `BIGINT` (int8), `REAL` (float4),
+  `NUMERIC` (arbitrary-precision decimal), `DATE`, `TIMESTAMP`,
+  `TIMESTAMPTZ` (UTC-only), `BYTEA` (hex output, hex/escape/octal input),
+  `UUID`. All work with MVCC, WAL/checkpoint replay, JOINs, aggregates,
+  and GROUP BY. Integer literals outside the int4 range become `BIGINT`,
+  like Postgres.
+- **Casts.** `expr::type` and `CAST(expr AS type)` between all pairs
+  Postgres allows (text↔numeric, text↔date, date→timestamp, …).
+  Bad input is `22P02`, impossible casts are `42846`.
+- **Operators.** `^` for exponentiation (exact `NUMERIC` power for
+  integer exponents, `float8` otherwise; unary minus binds tighter,
+  like Postgres: `-2^2 = 4`). `%` works for exact numerics including
+  `NUMERIC` (not for `real`/`double`, like Postgres). `LIKE`/`ILIKE`
+  (with `ESCAPE`), `BETWEEN`, `||` concatenation.
+- **Numeric promotion.** `smallint+smallint→int`,
+  `int+bigint→bigint`, `int+real→real`, `int+numeric→numeric`,
+  `real+double→double`, like Postgres. Division: integer division
+  truncates, `NUMERIC` division is exact (10 guard digits, normalized),
+  float division by zero is `22012` (like Postgres).
+- **Built-ins.** String: `upper`, `lower`, `length`, `char_length`,
+  `substring` (both forms), `trim`, `position` (both forms), `replace`,
+  `split_part`. Math: `abs`, `round`, `floor`, `ceil`/`ceiling`, `sqrt`,
+  `power`, `mod`. Datetime: `now`, `current_date`,
+  `current_timestamp`, `date_trunc`, `extract`. Conditional: `coalesce`,
+  `nullif`, `greatest`, `least` (NULL-ignoring, like Postgres).
+  Wrong arity and unknown functions are `42883`, like Postgres.
+- **Date arithmetic.** `date ± integer → date`, `date - date →
+  integer` days. No `INTERVAL` type yet (timestamp arithmetic is
+  `42883`).
+- **NULL handling.** Three-valued logic throughout, `IS [NOT]
+  TRUE/FALSE/UNKNOWN`, explicit `NULLS FIRST`/`LAST` (defaults match
+  Postgres: `ASC` → nulls last, `DESC` → nulls first), aggregate
+  `DISTINCT`, `string_agg` (NULL-ignoring, NULL delimiter = no
+  separator).
+- **Persistence.** WAL magic `RGSWAL03`, checkpoint magic `RGSCHK03`
+  (version 3). **v0.6 data directories are loudly refused at startup**
+  — the on-disk encoding changed.
+
+Known v0.7 deviations/limitations (all documented, none silent):
+**NUMERIC is limited to ~38 significant digits** (Postgres allows far
+more); NUMERIC division computes 10 fractional guard digits then
+normalizes (Postgres emits 20 fractional digits); NUMERIC `sqrt` and
+non-integer `power` use `f64` (~15–16 digits); **TIMESTAMPTZ is
+UTC-only** (no session timezone; zone-less input is UTC); leap seconds
+clamp to `:59`; **no INTERVAL type**; mixed exact/float comparisons use
+`f64`; `numeric(p,s)` modifiers are parsed but not enforced; `SUM`
+keeps the input type instead of Postgres' int→bigint widening; `AVG`
+is double precision (Postgres uses exact numeric for exact inputs);
+`GREATEST`/`LEAST` ignore NULLs (Postgres returns NULL if any arg is
+NULL — deliberate); `string_agg` ignores NULLs; decimal literals are
+`float8` in expressions (Postgres parses them as numeric) but INSERT
+preserves exact text for NUMERIC targets; `VALUES` only accepts
+literals (and `$N` params), not expressions; no `CASE` expressions yet.
 
 ## What v0.6 adds (query engine)
 

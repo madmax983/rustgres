@@ -37,11 +37,23 @@ use crate::storage::ColType;
 #[derive(Debug)]
 pub struct SqlError {
     pub message: String,
+    /// SQLSTATE for this parse error. Syntax errors are 42601; undefined
+    /// functions / wrong arity are 42883 (like Postgres' parser).
+    pub code: &'static str,
 }
 
 fn err(msg: impl Into<String>) -> SqlError {
     SqlError {
         message: msg.into(),
+        code: "42601",
+    }
+}
+
+/// A parse-time 42883 (undefined function), like Postgres.
+fn err_undefined(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "42883",
     }
 }
 
@@ -57,6 +69,9 @@ enum Token {
     Semi,
     Star,
     Plus,
+    Minus,      // v0.7: `-` (unary and binary)
+    Slash,      // v0.7: `/`
+    Percent,    // v0.7: `%`
     Eq,
     Dot,  // v0.6: qualified refs (t.col)
     Lt,   // v0.6: <
@@ -64,6 +79,9 @@ enum Token {
     LtEq, // v0.6: <=
     GtEq, // v0.6: >=
     Neq,  // v0.6: <> and !=
+    ColonColon, // v0.7: `::` cast
+    PipePipe,   // v0.7: `||` concat
+    Caret,      // v0.7: `^` exponentiation
     EOF,
 }
 
@@ -81,6 +99,32 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
         if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
+            }
+            continue;
+        }
+        // `-` (minus) when not starting a `--` comment.
+        if c == '-' {
+            toks.push(Token::Minus);
+            i += 1;
+            continue;
+        }
+        // `::` cast operator (a lone `:` is a syntax error).
+        if c == ':' {
+            if i + 1 < chars.len() && chars[i + 1] == ':' {
+                toks.push(Token::ColonColon);
+                i += 2;
+            } else {
+                return Err(err("unexpected character ':'"));
+            }
+            continue;
+        }
+        // `||` concatenation (a lone `|` is a syntax error).
+        if c == '|' {
+            if i + 1 < chars.len() && chars[i + 1] == '|' {
+                toks.push(Token::PipePipe);
+                i += 2;
+            } else {
+                return Err(err("unexpected character '|'"));
             }
             continue;
         }
@@ -119,6 +163,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             }
             '+' => {
                 toks.push(Token::Plus);
+                i += 1;
+            }
+            '/' => {
+                toks.push(Token::Slash);
+                i += 1;
+            }
+            '%' => {
+                toks.push(Token::Percent);
+                i += 1;
+            }
+            '^' => {
+                toks.push(Token::Caret);
                 i += 1;
             }
             '=' => {
@@ -270,9 +326,22 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
     Int(i64),
+    BigInt(i64),   // v0.7: integer literals outside the int4 range
+    SmallInt(i16), // v0.7: only via typed params/casts, never parsed
     Float(f64),
+    /// Decimal literal text, e.g. `1.5`. Evaluates as float8 in expressions
+    /// (v0.6 behavior) but INSERT coerces the exact text for numeric
+    /// targets, so high-precision decimals don't round-trip through f64.
+    Decimal(String),
+    Real(f32), // v0.7: only via typed params/casts, never parsed
+    Numeric(crate::storage::Numeric), // v0.7: only via typed params/casts
     Text(String),
     Bool(bool),
+    Date(i32),        // v0.7: days since 1970-01-01
+    Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
+    Timestamptz(i64), // v0.7: micros since epoch, UTC
+    Bytea(Vec<u8>),   // v0.7
+    Uuid([u8; 16]),   // v0.7
     Null,
 }
 
@@ -280,9 +349,18 @@ impl Literal {
     pub fn type_name(&self) -> &'static str {
         match self {
             Literal::Int(_) => "integer",
-            Literal::Float(_) => "double precision",
+            Literal::BigInt(_) => "bigint",
+            Literal::SmallInt(_) => "smallint",
+            Literal::Float(_) | Literal::Decimal(_) => "double precision",
+            Literal::Real(_) => "real",
+            Literal::Numeric(_) => "numeric",
             Literal::Text(_) => "text",
             Literal::Bool(_) => "boolean",
+            Literal::Date(_) => "date",
+            Literal::Timestamp(_) => "timestamp without time zone",
+            Literal::Timestamptz(_) => "timestamp with time zone",
+            Literal::Bytea(_) => "bytea",
+            Literal::Uuid(_) => "uuid",
             Literal::Null => "unknown",
         }
     }
@@ -291,9 +369,18 @@ impl Literal {
     pub fn col_type(&self) -> ColType {
         match self {
             Literal::Int(_) => ColType::Int,
-            Literal::Float(_) => ColType::Float,
+            Literal::BigInt(_) => ColType::BigInt,
+            Literal::SmallInt(_) => ColType::SmallInt,
+            Literal::Float(_) | Literal::Decimal(_) => ColType::Float,
+            Literal::Real(_) => ColType::Float4,
+            Literal::Numeric(_) => ColType::Numeric,
             Literal::Text(_) => ColType::Text,
             Literal::Bool(_) => ColType::Bool,
+            Literal::Date(_) => ColType::Date,
+            Literal::Timestamp(_) => ColType::Timestamp,
+            Literal::Timestamptz(_) => ColType::Timestamptz,
+            Literal::Bytea(_) => ColType::Bytea,
+            Literal::Uuid(_) => ColType::Uuid,
             // Postgres would say "unknown"; text is a fine stand-in.
             Literal::Null => ColType::Text,
         }
@@ -303,9 +390,19 @@ impl Literal {
         use crate::storage::Value;
         match self {
             Literal::Int(i) => Value::Int(i),
+            Literal::BigInt(i) => Value::BigInt(i),
+            Literal::SmallInt(i) => Value::SmallInt(i),
             Literal::Float(f) => Value::Float(f),
+            Literal::Decimal(s) => Value::Float(s.parse().unwrap_or(f64::NAN)),
+            Literal::Real(f) => Value::Float4(f),
+            Literal::Numeric(n) => Value::Numeric(n),
             Literal::Text(s) => Value::Text(s),
             Literal::Bool(b) => Value::Bool(b),
+            Literal::Date(d) => Value::Date(d),
+            Literal::Timestamp(m) => Value::Timestamp(m),
+            Literal::Timestamptz(m) => Value::Timestamptz(m),
+            Literal::Bytea(b) => Value::Bytea(b),
+            Literal::Uuid(u) => Value::Uuid(u),
             Literal::Null => Value::Null,
         }
     }
@@ -335,7 +432,7 @@ impl CmpOp {
     }
 }
 
-/// Aggregate functions (v0.6).
+/// Aggregate functions (v0.6; v0.7 adds StringAgg).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggFunc {
     Count,
@@ -343,6 +440,7 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    StringAgg, // v0.7: string_agg(x, delim)
 }
 
 impl AggFunc {
@@ -353,6 +451,31 @@ impl AggFunc {
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::StringAgg => "string_agg",
+        }
+    }
+}
+
+/// Binary arithmetic operators (v0.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow, // v0.7: `^` exponentiation
+}
+
+impl ArithOp {
+    pub fn sql(&self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+            ArithOp::Pow => "^",
         }
     }
 }
@@ -376,7 +499,49 @@ pub enum Expr {
     },
     Literal(Literal),
     Param(u32), // 1-based $N; substituted with a Literal before execution
-    Add(Box<Expr>, Box<Expr>),
+    /// v0.7: `+ - * / %` with Postgres-ish numeric promotion.
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// v0.7: explicit cast, `x::type` or `CAST(x AS type)`.
+    Cast {
+        expr: Box<Expr>,
+        to: ColType,
+    },
+    /// v0.7: `||` string concatenation.
+    Concat(Box<Expr>, Box<Expr>),
+    /// v0.7: `[NOT] LIKE` / `[NOT] ILIKE`.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        not: bool,
+        ilike: bool,
+    },
+    /// v0.7: `[NOT] BETWEEN low AND high`.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        neg: bool,
+    },
+    /// v0.7: `IS [NOT] TRUE/FALSE/UNKNOWN`. `val: None` = UNKNOWN.
+    IsBool {
+        expr: Box<Expr>,
+        neg: bool,
+        val: Option<bool>,
+    },
+    /// v0.7: built-in scalar function call.
+    Func {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// v0.7: `extract(field FROM expr)`.
+    Extract {
+        field: String,
+        from: Box<Expr>,
+    },
     Cmp {
         op: CmpOp,
         left: Box<Expr>,
@@ -393,6 +558,10 @@ pub enum Expr {
         func: AggFunc,
         /// None = COUNT(*).
         arg: Option<Box<Expr>>,
+        /// v0.7: DISTINCT inside the aggregate.
+        distinct: bool,
+        /// v0.7: second argument (string_agg's delimiter).
+        arg2: Option<Box<Expr>>,
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
@@ -486,11 +655,14 @@ pub enum InsertValue {
     Param(u32),
 }
 
-/// One `ORDER BY` sort key: expression + direction.
+/// One `ORDER BY` sort key: expression + direction + explicit NULL
+/// placement (v0.7: `NULLS FIRST` / `NULLS LAST`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderTerm {
     pub expr: Expr,
     pub desc: bool,
+    /// None = default (NULLS LAST for ASC, NULLS FIRST for DESC).
+    pub nulls_first: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -641,12 +813,30 @@ fn max_param_expr(e: &Expr) -> usize {
     match e {
         Expr::Param(n) => *n as usize,
         Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) => 0,
-        Expr::Add(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
-            max_param_expr(a).max(max_param_expr(b))
+        Expr::Arith { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            max_param_expr(left).max(max_param_expr(right))
         }
+        Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } => max_param_expr(x),
-        Expr::Agg { arg, .. } => arg.as_ref().map_or(0, |x| max_param_expr(x)),
+        Expr::Like {
+            expr, pattern, ..
+        } => max_param_expr(expr).max(max_param_expr(pattern)),
+        Expr::Between {
+            expr, low, high, ..
+        } => max_param_expr(expr)
+            .max(max_param_expr(low))
+            .max(max_param_expr(high)),
+        Expr::Cast { expr, .. } | Expr::Not(expr) | Expr::IsNull { expr, .. } => {
+            max_param_expr(expr)
+        }
+        Expr::IsBool { expr, .. } => max_param_expr(expr),
+        Expr::Func { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
+        Expr::Extract { from, .. } => max_param_expr(from),
+        Expr::Agg { arg, arg2, .. } => arg
+            .as_deref()
+            .map(max_param_expr)
+            .unwrap_or(0)
+            .max(arg2.as_deref().map(max_param_expr).unwrap_or(0)),
         Expr::ScalarSub(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
         Expr::Exists { sub, .. } => max_param_select(sub),
@@ -679,7 +869,9 @@ fn is_reserved(word: &str) -> bool {
             | "as"
             | "asc"
             | "begin"
+            | "between" // v0.7
             | "by"
+            | "cast" // v0.7
             | "checkpoint"
             | "commit"
             | "create"
@@ -694,6 +886,7 @@ fn is_reserved(word: &str) -> bool {
             | "from"
             | "group"
             | "having"
+            | "ilike" // v0.7
             | "in"
             | "inner"
             | "insert"
@@ -703,9 +896,11 @@ fn is_reserved(word: &str) -> bool {
             | "join"
             | "left"
             | "level"
+            | "like" // v0.7
             | "limit"
             | "not"
             | "null"
+            | "nulls" // v0.7
             | "offset"
             | "on"
             | "or"
@@ -858,14 +1053,108 @@ impl Parser {
     }
 
     fn parse_col_type(&mut self) -> Result<ColType, SqlError> {
+        self.parse_type_name()
+    }
+
+    /// A type name for CREATE TABLE / CAST / `::` (v0.7: full set).
+    /// Multi-word names like `double precision` and
+    /// `timestamp with time zone` are accepted; `numeric(p[,s])`
+    /// precision/scale are parsed but not enforced (documented).
+    fn parse_type_name(&mut self) -> Result<ColType, SqlError> {
         let name = self.expect_ident()?;
+        self.parse_type_name_rest(name)
+    }
+
+    fn parse_type_name_rest(&mut self, name: String) -> Result<ColType, SqlError> {
         match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
-            "text" => Ok(ColType::Text),
+            "bigint" | "int8" => Ok(ColType::BigInt),
+            "smallint" | "int2" => Ok(ColType::SmallInt),
+            "real" | "float4" => Ok(ColType::Float4),
+            "float8" => Ok(ColType::Float),
+            // v0.1-v0.6 spelled the float8 column type "float"/"double".
+            "float" | "double" => {
+                self.eat_keyword("precision");
+                Ok(ColType::Float)
+            }
+            "numeric" | "decimal" => {
+                // Optional (p[, s]); parsed and ignored.
+                if self.peek() == Token::LParen {
+                    self.next();
+                    match self.next() {
+                        Token::Number(_) => {}
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected numeric precision, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        match self.next() {
+                            Token::Number(_) => {}
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected numeric scale, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    self.expect(Token::RParen, "')'")?;
+                }
+                Ok(ColType::Numeric)
+            }
             "bool" | "boolean" => Ok(ColType::Bool),
-            "real" | "float" | "float8" | "double" => Ok(ColType::Float),
+            "text" => Ok(ColType::Text),
+            "date" => Ok(ColType::Date),
+            "timestamptz" => Ok(ColType::Timestamptz),
+            "timestamp" => {
+                if self.eat_keyword("with") {
+                    self.expect_keyword("time")?;
+                    self.expect_keyword("zone")?;
+                    Ok(ColType::Timestamptz)
+                } else {
+                    if self.eat_keyword("without") {
+                        self.expect_keyword("time")?;
+                        self.expect_keyword("zone")?;
+                    }
+                    Ok(ColType::Timestamp)
+                }
+            }
+            "bytea" => Ok(ColType::Bytea),
+            "uuid" => Ok(ColType::Uuid),
             _ => Err(err(format!("syntax error: unknown type \"{}\"", name))),
         }
+    }
+
+    /// First word of a type name (for typed-literal lookahead like
+    /// `DATE '2026-01-01'`).
+    fn is_type_start(name: &str) -> bool {
+        matches!(
+            name,
+            "int" | "integer"
+                | "bigint"
+                | "int8"
+                | "smallint"
+                | "int2"
+                | "real"
+                | "float4"
+                | "float8"
+                | "float"
+                | "double"
+                | "numeric"
+                | "decimal"
+                | "bool"
+                | "boolean"
+                | "text"
+                | "date"
+                | "timestamp"
+                | "timestamptz"
+                | "bytea"
+                | "uuid"
+        )
     }
 
     fn parse_create(&mut self) -> Result<Stmt, SqlError> {
@@ -894,10 +1183,18 @@ impl Parser {
     fn parse_literal(&mut self) -> Result<Literal, SqlError> {
         match self.next() {
             Token::Number(raw) => {
+                // v0.7: integer literals outside the int4 range become
+                // bigint, like Postgres.
                 if let Ok(i) = raw.parse::<i64>() {
-                    Ok(Literal::Int(i))
-                } else if let Ok(f) = raw.parse::<f64>() {
-                    Ok(Literal::Float(f))
+                    if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                        Ok(Literal::Int(i))
+                    } else {
+                        Ok(Literal::BigInt(i))
+                    }
+                } else if raw.parse::<f64>().is_ok() {
+                    // Keep the exact text; eval treats it as float8, but
+                    // INSERT into numeric uses the text exactly.
+                    Ok(Literal::Decimal(raw))
                 } else {
                     Err(err(format!(
                         "syntax error: bad numeric literal \"{}\"",
@@ -974,12 +1271,34 @@ impl Parser {
         })
     }
 
-    /// One INSERT value: a literal, or a `$N` parameter placeholder.
+    /// One INSERT value: a literal (with optional unary `+`/`-`), or a
+    /// `$N` parameter placeholder.
     fn parse_insert_value(&mut self) -> Result<InsertValue, SqlError> {
         match self.peek() {
             Token::Param(n) => {
                 self.next();
                 Ok(InsertValue::Param(n))
+            }
+            Token::Minus | Token::Plus => {
+                let neg = self.peek() == Token::Minus;
+                self.next();
+                let lit = self.parse_literal()?;
+                Ok(InsertValue::Lit(match (neg, lit) {
+                    (true, Literal::Int(i)) => Literal::Int(-i),
+                    (true, Literal::BigInt(i)) => Literal::BigInt(-i),
+                    // `-9223372036854775808`: the digits alone overflow
+                    // i64; recover the exact i64::MIN.
+                    (true, Literal::Decimal(s))
+                        if s == "9223372036854775808" =>
+                    {
+                        Literal::BigInt(i64::MIN)
+                    }
+                    (true, Literal::Decimal(s)) => {
+                        Literal::Decimal(format!("-{}", s))
+                    }
+                    (true, Literal::Float(f)) => Literal::Float(-f),
+                    (_, l) => l,
+                }))
             }
             _ => Ok(InsertValue::Lit(self.parse_literal()?)),
         }
@@ -1023,28 +1342,62 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, SqlError> {
-        let left = self.parse_add()?;
-        // `[NOT] IN (subquery)`
-        let not_in = if self.eat_keyword("not") {
-            if self.eat_keyword("in") {
-                true
-            } else {
-                return Err(err(format!(
-                    "syntax error: expected IN after NOT, found {:?}",
-                    self.peek()
-                )));
+        let left = self.parse_concat()?;
+        // `[NOT] BETWEEN low AND high`, `[NOT] LIKE pat`,
+        // `[NOT] ILIKE pat`, `[NOT] IN (subquery)`.
+        let neg = self.eat_keyword("not");
+        if self.eat_keyword("between") {
+            let low = self.parse_concat()?;
+            self.expect_keyword("and")?;
+            let high = self.parse_concat()?;
+            return Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                neg,
+            });
+        }
+        if self.eat_keyword("like") {
+            let pattern = self.parse_concat()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                not: neg,
+                ilike: false,
+            });
+        }
+        if self.eat_keyword("ilike") {
+            let pattern = self.parse_concat()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                not: neg,
+                ilike: true,
+            });
+        }
+        if neg || self.eat_keyword("in") {
+            // In the negated case the `NOT` is consumed but `IN` is
+            // still pending; anything else after NOT is a syntax error.
+            if neg {
+                match self.peek() {
+                    Token::Ident(s) if s == "in" => {
+                        self.next();
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected BETWEEN, LIKE, ILIKE or IN after NOT, found {:?}",
+                            other
+                        )));
+                    }
+                }
             }
-        } else {
-            false
-        };
-        if not_in || self.eat_keyword("in") {
             self.expect(Token::LParen, "'('")?;
             let sub = self.parse_subquery()?;
             self.expect(Token::RParen, "')'")?;
             return Ok(Expr::InSub {
                 expr: Box::new(left),
                 sub: Box::new(sub),
-                neg: not_in,
+                neg,
             });
         }
         let op = match self.peek() {
@@ -1059,7 +1412,7 @@ impl Parser {
         let mut expr = match op {
             Some(op) => {
                 self.next();
-                let right = self.parse_add()?;
+                let right = self.parse_concat()?;
                 Expr::Cmp {
                     op,
                     left: Box::new(left),
@@ -1068,14 +1421,37 @@ impl Parser {
             }
             None => left,
         };
-        // `IS [NOT] NULL`
+        // `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`.
         if self.eat_keyword("is") {
             let neg = self.eat_keyword("not");
-            self.expect_keyword("null")?;
-            expr = Expr::IsNull {
-                expr: Box::new(expr),
-                neg,
-            };
+            match self.peek() {
+                Token::Ident(s) if s == "null" => {
+                    self.next();
+                    expr = Expr::IsNull {
+                        expr: Box::new(expr),
+                        neg,
+                    };
+                }
+                Token::Ident(s) if s == "true" || s == "false" || s == "unknown" => {
+                    let val = match s.as_str() {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    };
+                    self.next();
+                    expr = Expr::IsBool {
+                        expr: Box::new(expr),
+                        neg,
+                        val,
+                    };
+                }
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected NULL, TRUE, FALSE or UNKNOWN after IS, found {:?}",
+                        other
+                    )));
+                }
+            }
         }
         Ok(expr)
     }
@@ -1091,15 +1467,121 @@ impl Parser {
         }
     }
 
-    /// expr := primary (`+` primary)*
-    fn parse_add(&mut self) -> Result<Expr, SqlError> {
-        let mut left = self.parse_primary()?;
-        while self.peek() == Token::Plus {
+    /// concat := add (`||` add)*
+    fn parse_concat(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_add()?;
+        while self.peek() == Token::PipePipe {
             self.next();
-            let right = self.parse_primary()?;
-            left = Expr::Add(Box::new(left), Box::new(right));
+            let right = self.parse_add()?;
+            left = Expr::Concat(Box::new(left), Box::new(right));
         }
         Ok(left)
+    }
+
+    /// add := mul ((`+` | `-`) mul)*
+    fn parse_add(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_mul()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => ArithOp::Add,
+                Token::Minus => ArithOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_mul()?;
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// mul := pow ((`*` | `/` | `%`) pow)*
+    fn parse_mul(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_pow()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => ArithOp::Mul,
+                Token::Slash => ArithOp::Div,
+                Token::Percent => ArithOp::Mod,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_pow()?;
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// pow := cast (`^` cast)* — left-associative, like Postgres.
+    /// `^` binds tighter than `*`/`/`/`%` but looser than unary minus,
+    /// so `-2^2` is `(-2)^2`.
+    fn parse_pow(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_cast()?;
+        while self.peek() == Token::Caret {
+            self.next();
+            let right = self.parse_cast()?;
+            left = Expr::Arith {
+                op: ArithOp::Pow,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// cast := unary (`::` type)*
+    fn parse_cast(&mut self) -> Result<Expr, SqlError> {
+        let mut expr = self.parse_unary()?;
+        while self.peek() == Token::ColonColon {
+            self.next();
+            let to = self.parse_type_name()?;
+            // Fold `decimal-literal::numeric` to an exact Numeric literal
+            // so high-precision decimals don't round-trip through f64.
+            // (Postgres parses decimal literals as numeric in the first
+            // place; v0.7 keeps float8 for expressions but not for this.)
+            if let (Expr::Literal(Literal::Decimal(s)), crate::storage::ColType::Numeric) =
+                (&expr, &to)
+            {
+                if let Ok(n) = crate::storage::Numeric::parse(s) {
+                    expr = Expr::Literal(Literal::Numeric(n));
+                    continue;
+                }
+            }
+            expr = Expr::Cast {
+                expr: Box::new(expr),
+                to,
+            };
+        }
+        Ok(expr)
+    }
+
+    /// unary := (`-` | `+`) unary | primary.
+    /// `-x` desugars to `0 - x` (so `-NULL` is NULL and `-'2026-01-01'`
+    /// fails at evaluation, like Postgres).
+    fn parse_unary(&mut self) -> Result<Expr, SqlError> {
+        match self.peek() {
+            Token::Minus => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Arith {
+                    op: ArithOp::Sub,
+                    left: Box::new(Expr::Literal(Literal::Int(0))),
+                    right: Box::new(inner),
+                })
+            }
+            Token::Plus => {
+                self.next();
+                self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, SqlError> {
@@ -1142,9 +1624,44 @@ impl Parser {
                         neg: false,
                     });
                 }
-                // Aggregate call `name(...)`?
+                // `CAST(x AS type)` — special form, not a function call.
+                if name == "cast" && self.peek() == Token::LParen {
+                    self.next();
+                    let expr = self.parse_or()?;
+                    self.expect_keyword("as")?;
+                    let to = self.parse_type_name()?;
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(Expr::Cast {
+                        expr: Box::new(expr),
+                        to,
+                    });
+                }
+                // Typed literal: DATE '2026-01-01', TIMESTAMP '...', etc.
+                // Backtracks when no string literal follows, so columns
+                // named e.g. "date" keep working.
+                if Self::is_type_start(&name) {
+                    let save = self.pos;
+                    if let Ok(to) = self.parse_type_name_rest(name.clone()) {
+                        if let Token::Str(s) = self.peek() {
+                            self.next();
+                            return Ok(Expr::Cast {
+                                expr: Box::new(Expr::Literal(Literal::Text(s))),
+                                to,
+                            });
+                        }
+                    }
+                    self.pos = save;
+                }
+                // Aggregate / built-in function call `name(...)`?
                 if self.peek() == Token::LParen {
-                    return self.parse_agg_call(name);
+                    return self.parse_call(name);
+                }
+                // `current_date` / `current_timestamp` without parens.
+                if name == "current_date" || name == "current_timestamp" {
+                    return Ok(Expr::Func {
+                        name,
+                        args: Vec::new(),
+                    });
                 }
                 // Qualified ref `table.column`?
                 if self.peek() == Token::Dot {
@@ -1167,24 +1684,189 @@ impl Parser {
     /// `count(*)`, `count(e)`, `sum(e)`, `avg(e)`, `min(e)`, `max(e)`.
     /// Anything else followed by `(` is "function does not exist" (42883
     /// at execution type-check; here a plain syntax-level error naming it).
-    fn parse_agg_call(&mut self, name: String) -> Result<Expr, SqlError> {
-        let func = match name.as_str() {
-            "count" => AggFunc::Count,
-            "sum" => AggFunc::Sum,
-            "avg" => AggFunc::Avg,
-            "min" => AggFunc::Min,
-            "max" => AggFunc::Max,
-            _ => return Err(err(format!("function {}() does not exist", name))),
+    /// `name(...)` — aggregates, EXTRACT/TRIM/POSITION/SUBSTRING special
+    /// forms, and the v0.7 built-in function set. Anything else is
+    /// "function does not exist" (SQLSTATE 42883).
+    fn parse_call(&mut self, name: String) -> Result<Expr, SqlError> {
+        match name.as_str() {
+            "extract" => return self.parse_extract(),
+            "trim" => return self.parse_trim(),
+            "position" => return self.parse_position(),
+            "substring" => return self.parse_substring(),
+            _ => {}
+        }
+        let agg = match name.as_str() {
+            "count" => Some(AggFunc::Count),
+            "sum" => Some(AggFunc::Sum),
+            "avg" => Some(AggFunc::Avg),
+            "min" => Some(AggFunc::Min),
+            "max" => Some(AggFunc::Max),
+            "string_agg" => Some(AggFunc::StringAgg),
+            _ => None,
         };
-        self.expect(Token::LParen, "'('")?;
-        let arg = if func == AggFunc::Count && self.peek() == Token::Star {
+        if let Some(func) = agg {
+            self.expect(Token::LParen, "'('")?;
+            let distinct = self.eat_keyword("distinct");
+            if distinct && matches!(func, AggFunc::Count) && self.peek() == Token::Star {
+                return Err(err("syntax error: DISTINCT is not allowed with count(*)"));
+            }
+            let arg = if matches!(func, AggFunc::Count) && self.peek() == Token::Star {
+                self.next();
+                None
+            } else {
+                Some(Box::new(self.parse_or()?))
+            };
+            let arg2 = if matches!(func, AggFunc::StringAgg) {
+                self.expect(Token::Comma, "','")?;
+                Some(Box::new(self.parse_or()?))
+            } else {
+                None
+            };
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::Agg {
+                func,
+                arg,
+                distinct,
+                arg2,
+            });
+        }
+        // Any `name(` is a function call. Unknown names and wrong
+        // arities are 42883 (raised here for builtins, in exec for the
+        // rest) — like Postgres.
+        if self.peek() == Token::LParen {
             self.next();
-            None
+            let mut args = Vec::new();
+            if self.peek() != Token::RParen {
+                loop {
+                    args.push(self.parse_or()?);
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(Token::RParen, "')'")?;
+            if is_builtin_fn(&name) {
+                check_builtin_arity(&name, args.len())?;
+            }
+            return Ok(Expr::Func { name, args });
+        }
+        Err(err(format!("syntax error: expected '(', found {:?}", self.peek())))
+    }
+
+    /// `extract(field FROM expr)`.
+    fn parse_extract(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let field = self.expect_ident()?;
+        self.expect_keyword("from")?;
+        let from = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Extract {
+            field,
+            from: Box::new(from),
+        })
+    }
+
+    /// `trim([ [leading|trailing|both] [chars] from ] str)`.
+    /// Encoded as Func "trim" with args [spec, chars, str] where spec is
+    /// a Text literal "leading"/"trailing"/"both" and chars defaults to " ".
+    fn parse_trim(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut spec = "both".to_string();
+        if matches!(self.peek(), Token::Ident(ref s) if s == "leading" || s == "trailing" || s == "both")
+        {
+            if let Token::Ident(s) = self.next() {
+                spec = s;
+            }
+        }
+        if self.eat_keyword("from") {
+            let s = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::Func {
+                name: "trim".to_string(),
+                args: vec![
+                    Expr::Literal(Literal::Text(spec.to_string())),
+                    Expr::Literal(Literal::Text(" ".to_string())),
+                    s,
+                ],
+            });
+        }
+        let first = self.parse_or()?;
+        if self.eat_keyword("from") {
+            let s = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::Func {
+                name: "trim".to_string(),
+                args: vec![
+                    Expr::Literal(Literal::Text(spec.to_string())),
+                    first,
+                    s,
+                ],
+            });
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "trim".to_string(),
+            args: vec![
+                Expr::Literal(Literal::Text("both".to_string())),
+                Expr::Literal(Literal::Text(" ".to_string())),
+                first,
+            ],
+        })
+    }
+
+    /// `position(sub in str)` or `position(sub, str)`.
+    fn parse_position(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        // Parse below `IN` (parse_cmp) so a trailing `in` is left for the
+        // `position(x in y)` form instead of becoming an IN-subquery.
+        let a = self.parse_concat()?;
+        let b = if self.eat_keyword("in") {
+            self.parse_or()?
         } else {
-            Some(Box::new(self.parse_or()?))
+            self.expect(Token::Comma, "','")?;
+            self.parse_or()?
         };
         self.expect(Token::RParen, "')'")?;
-        Ok(Expr::Agg { func, arg })
+        Ok(Expr::Func {
+            name: "position".to_string(),
+            args: vec![a, b],
+        })
+    }
+
+    /// `substring(str from start [for len])` or `substring(str, start [, len])`.
+    fn parse_substring(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let s = self.parse_or()?;
+        let (start, len) = if self.eat_keyword("from") {
+            let start = self.parse_or()?;
+            let len = if self.eat_keyword("for") {
+                Some(self.parse_or()?)
+            } else {
+                None
+            };
+            (start, len)
+        } else {
+            self.expect(Token::Comma, "','")?;
+            let start = self.parse_or()?;
+            let len = if self.peek() == Token::Comma {
+                self.next();
+                Some(self.parse_or()?)
+            } else {
+                None
+            };
+            (start, len)
+        };
+        self.expect(Token::RParen, "')'")?;
+        let mut args = vec![s, start];
+        if let Some(len) = len {
+            args.push(len);
+        }
+        Ok(Expr::Func {
+            name: "substring".to_string(),
+            args,
+        })
     }
 
     /// Optional `[AS] alias` after a select item or table source. A bare
@@ -1391,7 +2073,26 @@ impl Parser {
                     self.eat_keyword("asc");
                     false
                 };
-                terms.push(OrderTerm { expr, desc });
+                // v0.7: explicit `NULLS FIRST` / `NULLS LAST`.
+                let nulls_first = if self.eat_keyword("nulls") {
+                    if self.eat_keyword("first") {
+                        Some(true)
+                    } else if self.eat_keyword("last") {
+                        Some(false)
+                    } else {
+                        return Err(err(format!(
+                            "syntax error: expected FIRST or LAST after NULLS, found {:?}",
+                            self.peek()
+                        )));
+                    }
+                } else {
+                    None
+                };
+                terms.push(OrderTerm {
+                    expr,
+                    desc,
+                    nulls_first,
+                });
                 if self.peek() == Token::Comma {
                     self.next();
                     continue;
@@ -1632,3 +2333,46 @@ pub fn split_statements(input: &str) -> Vec<String> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// v0.7 built-in scalar functions
+// ---------------------------------------------------------------------------
+
+/// Is `name` one of the v0.7 built-in scalar functions?
+pub fn is_builtin_fn(name: &str) -> bool {
+    matches!(
+        name,
+        // string
+        "upper" | "lower" | "length" | "char_length" | "character_length"
+        | "substring" | "trim" | "position" | "replace" | "split_part"
+        // math
+        | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod"
+        // date/time
+        | "now" | "current_date" | "current_timestamp" | "date_trunc"
+        // conditional
+        | "coalesce" | "nullif" | "greatest" | "least"
+    )
+}
+
+/// Arity check for built-in functions. Wrong argument counts raise
+/// "function does not exist" (SQLSTATE 42883), like Postgres.
+pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
+    let ok = match name {
+        "upper" | "lower" | "length" | "char_length" | "character_length"
+        | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "now" | "current_date" | "current_timestamp" => n == 0,
+        "substring" => n == 2 || n == 3,
+        "trim" => n == 1 || n == 3,
+        "position" | "power" | "mod" | "nullif" | "date_trunc" => n == 2,
+        "replace" | "split_part" => n == 3,
+        "round" => n == 1 || n == 2,
+        "coalesce" | "greatest" | "least" => n >= 1,
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(err_undefined(format!("function {}() does not exist", name)))
+    }
+}
+

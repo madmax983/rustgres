@@ -302,7 +302,12 @@ fn handle_query(
     for one in sql::split_statements(sql_text) {
         let stmt = match sql::parse_statement(&one) {
             Err(e) => {
-                send_error(stream, "42601", &format!("syntax error: {}", e.message))?;
+                let msg = if e.code == "42601" {
+                    format!("syntax error: {}", e.message)
+                } else {
+                    e.message.clone()
+                };
+                send_error(stream, e.code, &msg)?;
                 break;
             }
             Ok(s) => s,

@@ -18,9 +18,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 2 (`RGSWAL02` / `RGSCHK02`) is NOT compatible with v0.4
-//! files: v0.5 refuses to start on a v0.4 data directory with a clear
-//! error instead of misreading it.
+//! Format version 3 (`RGSWAL03` / `RGSCHK03`) is NOT compatible with v0.6
+//! files: v0.7 refuses to start on a v0.6 data directory with a clear
+//! error instead of misreading it. v0.7 adds column types and value
+//! tags for smallint, bigint, real, numeric, date, timestamp,
+//! timestamptz, bytea, and uuid.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -118,11 +120,11 @@ use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK02";
-const CHKPT_VERSION: u32 = 2;
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK03";
+const CHKPT_VERSION: u32 = 3;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL02";
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL03";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -154,12 +156,12 @@ fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
     if got < 16 {
         return Ok(None); // torn header: crash during the WAL reset
     }
-    // A full 16-byte header with the wrong magic (e.g. a v0.4 `RGSWAL01`
+    // A full 16-byte header with the wrong magic (e.g. a v0.6 `RGSWAL02`
     // file, whose record format is incompatible) is a loud error:
     // silently treating it as empty would lose data.
     if &hdr[..8] != WAL_MAGIC {
         return Err(io_err(
-            "wal.log has an unrecognized magic; rustgres v0.5 cannot read v0.4 data - remove the data directory".to_string(),
+            "wal.log has an unrecognized magic; rustgres v0.7 cannot read v0.6 data - remove the data directory".to_string(),
         ));
     }
     Ok(Some(u64::from_be_bytes(hdr[8..].try_into().unwrap())))
@@ -268,6 +270,18 @@ impl Enc {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
 
+    fn i16(&mut self, v: i16) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn f32(&mut self, v: f32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
     fn f64(&mut self, v: f64) {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
@@ -282,15 +296,26 @@ impl Enc {
     }
 
     fn col_type(&mut self, t: &ColType) {
+        // Tags 0-3 are the v0.6 layout; new v0.7 types append after.
         self.u8(match t {
             ColType::Int => 0,
             ColType::Float => 1,
             ColType::Text => 2,
             ColType::Bool => 3,
+            ColType::SmallInt => 4,
+            ColType::BigInt => 5,
+            ColType::Float4 => 6,
+            ColType::Numeric => 7,
+            ColType::Date => 8,
+            ColType::Timestamp => 9,
+            ColType::Timestamptz => 10,
+            ColType::Bytea => 11,
+            ColType::Uuid => 12,
         });
     }
 
     fn value(&mut self, v: &Value) {
+        // Tags 0-4 are the v0.6 layout; new v0.7 values append after.
         match v {
             Value::Null => self.u8(0),
             Value::Int(i) => {
@@ -308,6 +333,43 @@ impl Enc {
             Value::Bool(b) => {
                 self.u8(4);
                 self.u8(*b as u8);
+            }
+            Value::SmallInt(i) => {
+                self.u8(5);
+                self.i16(*i);
+            }
+            Value::BigInt(i) => {
+                self.u8(6);
+                self.i64(*i);
+            }
+            Value::Float4(f) => {
+                self.u8(7);
+                self.f32(*f);
+            }
+            Value::Numeric(n) => {
+                self.u8(8);
+                self.str(&n.to_text());
+            }
+            Value::Date(d) => {
+                self.u8(9);
+                self.i32(*d);
+            }
+            Value::Timestamp(m) => {
+                self.u8(10);
+                self.i64(*m);
+            }
+            Value::Timestamptz(m) => {
+                self.u8(11);
+                self.i64(*m);
+            }
+            Value::Bytea(b) => {
+                self.u8(12);
+                self.u32(b.len() as u32);
+                self.bytes(b);
+            }
+            Value::Uuid(u) => {
+                self.u8(13);
+                self.bytes(u);
             }
         }
     }
@@ -409,6 +471,21 @@ impl<'a> Dec<'a> {
         ]))
     }
 
+    fn i16(&mut self) -> Result<i16, String> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn i32(&mut self) -> Result<i32, String> {
+        let b = self.take(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn f32(&mut self) -> Result<f32, String> {
+        let b = self.take(4)?;
+        Ok(f32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     fn f64(&mut self) -> Result<f64, String> {
         let b = self.take(8)?;
         Ok(f64::from_be_bytes([
@@ -430,6 +507,15 @@ impl<'a> Dec<'a> {
             1 => Ok(ColType::Float),
             2 => Ok(ColType::Text),
             3 => Ok(ColType::Bool),
+            4 => Ok(ColType::SmallInt),
+            5 => Ok(ColType::BigInt),
+            6 => Ok(ColType::Float4),
+            7 => Ok(ColType::Numeric),
+            8 => Ok(ColType::Date),
+            9 => Ok(ColType::Timestamp),
+            10 => Ok(ColType::Timestamptz),
+            11 => Ok(ColType::Bytea),
+            12 => Ok(ColType::Uuid),
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }
@@ -441,6 +527,28 @@ impl<'a> Dec<'a> {
             2 => Ok(Value::Float(self.f64()?)),
             3 => Ok(Value::Text(self.str()?)),
             4 => Ok(Value::Bool(self.u8()? != 0)),
+            5 => Ok(Value::SmallInt(self.i16()?)),
+            6 => Ok(Value::BigInt(self.i64()?)),
+            7 => Ok(Value::Float4(self.f32()?)),
+            8 => {
+                let s = self.str()?;
+                crate::storage::Numeric::parse(&s)
+                    .map(Value::Numeric)
+                    .map_err(|e| self.err(&format!("bad numeric in WAL: {:?}", e)))
+            }
+            9 => Ok(Value::Date(self.i32()?)),
+            10 => Ok(Value::Timestamp(self.i64()?)),
+            11 => Ok(Value::Timestamptz(self.i64()?)),
+            12 => {
+                let n = self.u32()? as usize;
+                Ok(Value::Bytea(self.take(n)?.to_vec()))
+            }
+            13 => {
+                let b = self.take(16)?;
+                let mut u = [0u8; 16];
+                u.copy_from_slice(b);
+                Ok(Value::Uuid(u))
+            }
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
     }
@@ -853,7 +961,7 @@ impl Wal {
         eng.txns.snapshots.clear();
         let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.5 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v0.7 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
             tables,
             batches,
             records,
@@ -1070,7 +1178,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     };
     if d.take(8).map_err(|e| bad(&e))? != CHKPT_MAGIC {
         return Err(bad(
-            "bad magic (a v0.4 checkpoint is not readable by v0.5; remove the data directory)",
+            "bad magic (a v0.6 checkpoint is not readable by v0.7; remove the data directory)",
         ));
     }
     if d.u32().map_err(|e| bad(&e))? != CHKPT_VERSION {

@@ -390,3 +390,35 @@ Profile under valgrind:
 ```
 
 See `benches/profiles/README.md` for the profile → optimize loop.
+
+## v0.7 baseline — 2026-09-10
+
+Environment: same sandbox, debug build, fresh temp data dir, 5 s per
+workload. New workload `expr`: single-row SELECT exercising v0.7
+features — numeric/string/math/date expressions, casts, `^`, LIKE/ILIKE,
+built-ins (`upper`, `substring`, `abs`, `round`, `power`, `sqrt`,
+`coalesce`, `trim`, `position`, `split_part`, `char_length`).
+
+| workload   | qps      | p50        | p99        | vs v0.6 |
+|------------|----------|------------|------------|---------|
+| `select1`  | ~23,100  | 0.034 ms   | 0.119 ms   | noise |
+| `expr`     | ~4,190   | 0.215 ms   | 0.625 ms   | new |
+| `scan`     | 34.4     | 28.19 ms   | 54.74 ms   | noise |
+| `insert`   | 107.9    | 7.82 ms    | 24.42 ms   | noise |
+| `prepared` | ~13,800  | 0.065 ms   | 0.217 ms   | noise |
+| `txn`      | ~4,350   | 0.150 ms   | 1.54 ms    | noise |
+| `mvcc`     | ~993     | 0.865 ms   | 2.85 ms    | noise |
+| `join`     | 0.8      | 1195 ms    | 1469 ms    | noise (faster run than v0.6's 2055 ms; noisy sandbox) |
+
+### Callgrind / DHAT on `expr` (valgrind 3.22.0, 3 s)
+
+Top instruction consumers are the SQL tokenizer/parser (`tokenize`,
+`split_statements`, `Parser::peek`, `Token::clone`/`drop`) plus libc
+`malloc`/`free`/`memcpy` — i.e. per-query SQL text parsing dominates,
+not the new type-system code. No pathological hotspots in NUMERIC,
+datetime, or built-in evaluation. DHAT shows the expected pattern of
+many small short-lived allocations from tokenizing/parsing each query;
+nothing retained. Conclusion: expression evaluation itself is cheap;
+a future prepared-statement parse cache would help workloads that
+re-send identical SQL text (the `prepared` workload already avoids
+this by parsing once).

@@ -417,8 +417,36 @@ def w_join(conn, seconds):
     return res
 
 
+def w_expr(conn, seconds):
+    # v0.7: expression-heavy SELECT exercising the new types, casts,
+    # operators and built-ins: numeric arithmetic + power, string
+    # functions, math built-ins, CASE, casts, LIKE. One row out.
+    sql = (
+        "SELECT "
+        "upper(substring('hello world', 1, 5)) || '-' || lower('ABC'), "
+        "abs(-42) + round(3.14159, 2) * power(2, 10) - sqrt(16.0), "
+        "('12345678901234567890.12345678'::numeric "
+        "  * 2::numeric + 0.5::numeric) / 3::numeric, "
+        "coalesce(NULL, 'fallback') || '-' || trim('  padded  '), "
+        "'2026-09-10'::date + 30, "
+        "position('ll' in 'hello') + char_length('rustgres'), "
+        "split_part('a,b,c,d', ',', 3), "
+        "'abc' LIKE 'a%' AND 'ABC' ILIKE 'a%', "
+        "2 ^ 10 + 10 % 3"
+    )
+
+    def op():
+        msgs = conn.simple(sql)
+        assert tag_of(msgs) == "SELECT 1", tag_of(msgs)
+    res = measure(op, seconds)
+    res["note"] = ("single-row SELECT with numeric/string/math/date "
+                   "expressions, casts, CASE, LIKE; one query per op")
+    return res
+
+
 WORKLOADS = {
     "select1": ("simple-query SELECT 1", w_select1),
+    "expr": ("expression-heavy SELECT (v0.7 types/ops/built-ins)", w_expr),
     "scan": ("SELECT * over 10k rows", w_scan),
     "insert": ("1000-row batched INSERTs", w_insert),
     "prepared": ("extended-protocol prepared loop", w_prepared),
