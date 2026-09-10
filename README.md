@@ -1,33 +1,42 @@
-# rustgres v0.8 — "B-tree indexes, planner, ANALYZE, EXPLAIN"
+# rustgres v0.9 — "constraints, ALTER TABLE, views, sequences"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 8 of the road to Postgres 19 feature parity. v0.8 adds
-secondary **B-tree indexes** (pure-std `BTreeMap`, composite keys, scalar
-ordering with Postgres NULL-high semantics), `CREATE`/`DROP INDEX`
-(transactional, WAL-durable, MVCC-safe), a **cost-agnostic access-path
-planner** (equality/range/`BETWEEN` on leading index prefixes, index-order
-scans for compatible `ORDER BY ... LIMIT`), **`ANALYZE`** with
-`pg_stats`-compatible statistics (row count, null fraction, distinct
-count, most-common values, histogram bounds), and textual **`EXPLAIN`**
-(`Seq Scan`, `Index Scan`, `Index Order Scan`, `Nested Loop`,
-`Aggregate`, `Unique`, `Sort`, `Limit`, `Subquery Scan`). v0.7 widened the
-type system and expression language (below): **9 new types** (`SMALLINT`,
-`BIGINT`, `REAL`, `NUMERIC`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `BYTEA`,
-`UUID`), **casts** (`::type` and `CAST(x AS type)`), the **`^`
-exponentiation operator**, `LIKE`/`ILIKE`/`BETWEEN`, full **numeric
-promotion**, **30+ built-in functions** (string, math, datetime,
-conditional), explicit `NULLS FIRST`/`LAST`, aggregate `DISTINCT`, and
-`string_agg`. v0.6 added the query engine (below): `FROM`
-sources are tables, derived tables, and `INNER`/`LEFT`/`CROSS` joins with
-arbitrary `ON` predicates; `WHERE` is a general boolean expression with
-SQL three-valued (NULL) logic; scalar, `IN`, and `EXISTS` subqueries
-(including correlated ones); hash-based `GROUP BY` with `COUNT`/`SUM`/
-`AVG`/`MIN`/`MAX` plus `HAVING`; `DISTINCT`; expression `ORDER BY`
-(including ordering by aggregates not in the select list); and
-`SELECT ... FOR UPDATE` row locking with full transaction lifecycle
-(commit/rollback/savepoint/disconnect release the locks).
+Milestone 9 of the road to Postgres 19 feature parity. v0.9 adds **table
+constraints** (`PRIMARY KEY`, `FOREIGN KEY` with `CASCADE`/`SET NULL`/`SET
+DEFAULT` actions, `UNIQUE`, `NOT NULL`, `CHECK`), **`ALTER TABLE`**
+(`ADD`/`DROP`/`RENAME COLUMN`, `ADD`/`DROP CONSTRAINT`, `RENAME TO`),
+**views** (`CREATE [OR REPLACE] VIEW`, `DROP VIEW` with dependency
+tracking), **sequences** (`CREATE SEQUENCE` with `INCREMENT`/`MINVALUE`/
+`MAXVALUE`/`CYCLE`, `nextval`/`currval`/`setval`, `DEFAULT nextval()`),
+`information_schema` catalog views, transactional DDL with full rollback,
+and WAL-durable crash recovery for all new objects. 798 cumulative
+protocol tests pass (84 new in v0.9).
+
+## What v0.9 adds (constraints, ALTER TABLE, views, sequences)
+
+- **Constraints.** `PRIMARY KEY`, `FOREIGN KEY ... REFERENCES` (with
+  `ON DELETE/UPDATE CASCADE|SET NULL|SET DEFAULT|RESTRICT`), `UNIQUE`,
+  `NOT NULL`, `CHECK (expr)`. Proper SQLSTATE codes (`23502`, `23503`,
+  `23505`, `23514`). FK actions cascade correctly across tables.
+- **ALTER TABLE.** `ADD COLUMN` (with `DEFAULT` backfill), `DROP COLUMN`
+  (with `CASCADE`/`RESTRICT` dependency checking), `RENAME COLUMN`,
+  `ADD CONSTRAINT`, `DROP CONSTRAINT`, `RENAME TO`. All transactional
+  with WAL durability and MVCC-safe version swapping.
+- **Views.** `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`.
+  Dependency tracking prevents dropping tables/views with dependents
+  (unless `CASCADE`). Views are fully transactional and WAL-durable.
+- **Sequences.** `CREATE SEQUENCE` with `START WITH`, `INCREMENT BY`,
+  `MINVALUE`/`MAXVALUE`, `CYCLE`/`NO CYCLE`. `nextval()`, `currval()`,
+  `setval()` with session-local `currval` state. Sequences advance
+  non-transactionally (like Postgres) and survive crashes via WAL.
+  `DEFAULT nextval('seq')` works for auto-increment columns.
+- **Catalogs.** `information_schema.tables` and
+  `information_schema.columns` for basic schema introspection.
+- **Transactional DDL.** `ALTER TABLE` and `CREATE VIEW` roll back
+  correctly. Sequence advancements are NOT rolled back (Postgres
+  semantics).
 
 ## What v0.8 adds (B-tree indexes, planner, ANALYZE, EXPLAIN)
 

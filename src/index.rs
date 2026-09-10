@@ -169,6 +169,10 @@ pub struct IndexDef {
     pub cols: Vec<usize>,
     pub col_names: Vec<String>,
     pub unique: bool,
+    /// v0.9: backing index for a PRIMARY KEY / UNIQUE constraint. Not
+    /// droppable directly (use ALTER TABLE ... DROP CONSTRAINT); hidden
+    /// from information_schema where appropriate.
+    pub internal: bool,
     pub created_xmin: u64,
     pub dropped_xmax: u64,
 }

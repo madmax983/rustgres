@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::index::{Index, IndexDef, IndexKey};
+use crate::sql::{CheckDef, DefaultExpr, FkDef, TableDef, UniqueDef};
 
 /// Column data types supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,17 +683,48 @@ pub struct Table {
     pub created_xmin: u64,
     /// Xid of the DROP TABLE transaction; 0 = not dropped.
     pub dropped_xmax: u64,
+    // --- v0.9: constraints ---
+    /// Per-column NOT NULL flags (PRIMARY KEY implies NOT NULL).
+    pub not_null: Vec<bool>,
+    /// Per-column DEFAULTs; None = no default.
+    pub defaults: Vec<Option<DefaultExpr>>,
+    pub checks: Vec<CheckDef>,
+    pub uniques: Vec<UniqueDef>,
+    pub pkey: Option<UniqueDef>,
+    pub fks: Vec<FkDef>,
 }
 
 impl Table {
     pub fn new(columns: Vec<(String, ColType)>, created_xmin: u64) -> Self {
+        let n = columns.len();
         Table {
             columns,
             rows: Vec::new(),
             row_index: HashMap::new(),
             created_xmin,
             dropped_xmax: 0,
+            not_null: vec![false; n],
+            defaults: vec![None; n],
+            checks: Vec::new(),
+            uniques: Vec::new(),
+            pkey: None,
+            fks: Vec::new(),
         }
+    }
+
+    /// Build a table from a parsed v0.9 `TableDef` (constraints included).
+    pub fn with_def(def: &TableDef, created_xmin: u64) -> Self {
+        let mut t = Table::new(
+            def.columns.clone(),
+            created_xmin,
+        );
+        t.not_null = def.not_null.clone();
+        t.defaults = def.defaults.clone();
+        t.checks = def.checks.clone();
+        t.uniques = def.uniques.clone();
+        t.pkey = def.pkey.clone();
+        t.fks = def.fks.clone();
+        t
     }
 
     /// Index of a column by (already lowercased) name.
@@ -750,6 +782,65 @@ pub struct Database {
     /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
     /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
     pub stats: HashMap<String, TableStats>,
+    /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
+    /// transactional under MVCC.
+    pub views: HashMap<String, Vec<ViewDef>>,
+    /// Sequences by name (v0.9). DDL is transactional; the sequence
+    /// *value* (`current`) advances non-transactionally, like PostgreSQL.
+    pub sequences: HashMap<String, Vec<Sequence>>,
+}
+
+/// A view definition (v0.9): the raw SELECT text plus dependency names.
+#[derive(Clone, Debug)]
+pub struct ViewDef {
+    /// The raw SELECT text after AS (re-parsed at query time).
+    pub query: String,
+    /// Optional CREATE VIEW (col, ...) aliases.
+    pub col_aliases: Vec<String>,
+    /// Plain table names the query reads (for dependency tracking).
+    pub deps: Vec<String>,
+    /// Xid of the CREATE VIEW transaction.
+    pub created_xmin: u64,
+    /// Xid of the DROP VIEW transaction; 0 = not dropped.
+    pub dropped_xmax: u64,
+}
+
+/// A sequence (v0.9). Bounds and parameters are transactional DDL;
+/// `current` (last nextval result) advances outside transactions.
+#[derive(Clone, Debug)]
+pub struct Sequence {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    /// Last value returned by nextval; None = never called.
+    pub current: Option<i64>,
+    /// Postgres `is_called`: false after setval(v,false) means the next
+    /// nextval returns `current` itself instead of advancing.
+    pub is_called: bool,
+    /// Xid of the CREATE SEQUENCE transaction.
+    pub created_xmin: u64,
+    /// Xid of the DROP SEQUENCE transaction; 0 = not dropped.
+    pub dropped_xmax: u64,
+}
+
+impl Sequence {
+    pub fn new(name: String, start: i64, increment: i64, min_value: i64, max_value: i64, cycle: bool, created_xmin: u64) -> Self {
+        Sequence {
+            name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+            current: None,
+            is_called: false,
+            created_xmin,
+            dropped_xmax: 0,
+        }
+    }
 }
 
 impl Database {
@@ -758,7 +849,42 @@ impl Database {
             tables: HashMap::new(),
             indexes: HashMap::new(),
             stats: HashMap::new(),
+            views: HashMap::new(),
+            sequences: HashMap::new(),
         }
+    }
+
+    /// First view version with `name` visible to (`snap`, `own`).
+    pub fn find_view(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&ViewDef> {
+        self.views
+            .get(name)
+            .and_then(|vs| vs.iter().find(|v| view_visible(v, snap, own)))
+    }
+
+    /// Mutable variant of [`Database::find_view`].
+    pub fn find_view_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut ViewDef> {
+        self.views
+            .get_mut(name)
+            .and_then(|vs| vs.iter_mut().find(|v| view_visible(v, snap, own)))
+    }
+
+    /// First sequence version with `name` visible to (`snap`, `own`).
+    pub fn find_sequence(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Sequence> {
+        self.sequences
+            .get(name)
+            .and_then(|vs| vs.iter().find(|s| seq_visible(s, snap, own)))
+    }
+
+    /// Mutable variant of [`Database::find_sequence`].
+    pub fn find_sequence_mut(
+        &mut self,
+        name: &str,
+        snap: &Snapshot,
+        own: u64,
+    ) -> Option<&mut Sequence> {
+        self.sequences
+            .get_mut(name)
+            .and_then(|vs| vs.iter_mut().find(|s| seq_visible(s, snap, own)))
     }
 
     /// First table version with `name` visible to (`snap`, `own`).
@@ -1002,6 +1128,15 @@ pub struct TxnManager {
 pub struct Engine {
     pub db: Database,
     pub txns: TxnManager,
+    /// v0.9: session-local `currval` state: (session id, sequence name) ->
+    /// last `nextval` result in that session. Cleared when... never
+    /// automatically (Postgres keeps it for the session); keyed by the
+    /// server-assigned session id.
+    pub seq_currval: HashMap<(u64, String), i64>,
+    /// v0.9: names of sequences advanced by the in-flight statement
+    /// (nextval/setval). Drained into `WriteOp::SeqAdvance` markers by the
+    /// server after a successful statement, for commit-time WAL logging.
+    pub seq_advanced: Vec<String>,
 }
 
 impl Engine {
@@ -1016,6 +1151,8 @@ impl Engine {
                 row_locks: HashMap::new(),
                 lock_order: HashMap::new(),
             },
+            seq_currval: HashMap::new(),
+            seq_advanced: Vec::new(),
         }
     }
 
@@ -1217,6 +1354,38 @@ pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
     !(t.dropped_xmax < snap.next_xid && !snap.active.contains(&t.dropped_xmax))
 }
 
+/// Visibility for view versions (v0.9): same rules as tables.
+pub fn view_visible(v: &ViewDef, snap: &Snapshot, own: u64) -> bool {
+    let created_ok = v.created_xmin == own
+        || (v.created_xmin < snap.next_xid && !snap.active.contains(&v.created_xmin));
+    if !created_ok {
+        return false;
+    }
+    if v.dropped_xmax == 0 {
+        return true;
+    }
+    if v.dropped_xmax == own {
+        return false;
+    }
+    !(v.dropped_xmax < snap.next_xid && !snap.active.contains(&v.dropped_xmax))
+}
+
+/// Visibility for sequence versions (v0.9): same rules as tables.
+pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
+    let created_ok = s.created_xmin == own
+        || (s.created_xmin < snap.next_xid && !snap.active.contains(&s.created_xmin));
+    if !created_ok {
+        return false;
+    }
+    if s.dropped_xmax == 0 {
+        return true;
+    }
+    if s.dropped_xmax == own {
+        return false;
+    }
+    !(s.dropped_xmax < snap.next_xid && !snap.active.contains(&s.dropped_xmax))
+}
+
 // ---------------------------------------------------------------------------
 // Write log: per-transaction undo + commit-time WAL records
 // ---------------------------------------------------------------------------
@@ -1249,6 +1418,41 @@ pub enum WriteOp {
     DropIndex {
         name: String,
         index: Index,
+    },
+    // --- v0.9: ALTER TABLE carries the whole previous table (schema and
+    // rows) so undo restores it exactly. `renamed_to` is Some when the
+    // alter renamed the table: the altered version lives under the new
+    // name and the previous one is restored under `name`.
+    AlterTable {
+        name: String,
+        prev: Table,
+        renamed_to: Option<String>,
+        /// True when ADD/DROP COLUMN rewrote the rows (new ids, logged as
+        /// InsertRow ops); false for pure-metadata alters.
+        rewrite_rows: bool,
+    },
+    CreateView {
+        name: String,
+    },
+    DropView {
+        name: String,
+        view: ViewDef,
+    },
+    CreateSequence {
+        name: String,
+    },
+    DropSequence {
+        name: String,
+        seq: Sequence,
+    },
+    AlterSequence {
+        name: String,
+        prev: Sequence,
+    },
+    /// A non-transactional sequence advance (Postgres semantics): abort
+    /// never rolls it back; the op is only a commit-time WAL marker.
+    SeqAdvance {
+        name: String,
     },
 }
 
@@ -1338,6 +1542,108 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             if ours {
                 eng.db.indexes.insert(name.clone(), index.clone());
             }
+        }
+        // --- v0.9 undos ---
+        WriteOp::AlterTable {
+            name,
+            prev,
+            renamed_to,
+            ..
+        } => {
+            // Remove our altered version (under the new name if renamed),
+            // then restore the previous table under its original name.
+            let target = renamed_to.as_deref().unwrap_or(name);
+            if let Some(versions) = eng.db.tables.get_mut(target) {
+                versions.retain(|t| t.created_xmin != own);
+                if versions.is_empty() {
+                    eng.db.tables.remove(target);
+                }
+            }
+            eng.db
+                .tables
+                .entry(name.clone())
+                .or_default()
+                .push(prev.clone());
+        }
+        WriteOp::CreateView { name } => {
+            if let Some(versions) = eng.db.views.get_mut(name) {
+                versions.retain(|v| v.created_xmin != own);
+                if versions.is_empty() {
+                    eng.db.views.remove(name);
+                }
+            }
+        }
+        WriteOp::DropView { name, view } => {
+            let ours = eng
+                .db
+                .views
+                .get(name)
+                .map(|vs| {
+                    vs.iter()
+                        .any(|v| v.created_xmin == view.created_xmin && v.dropped_xmax == own)
+                })
+                .unwrap_or(false);
+            if ours {
+                let mut restored = view.clone();
+                restored.dropped_xmax = 0;
+                if let Some(versions) = eng.db.views.get_mut(name) {
+                    for v in versions.iter_mut() {
+                        if v.created_xmin == view.created_xmin {
+                            *v = restored;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        WriteOp::CreateSequence { name } => {
+            if let Some(versions) = eng.db.sequences.get_mut(name) {
+                versions.retain(|s| s.created_xmin != own);
+                if versions.is_empty() {
+                    eng.db.sequences.remove(name);
+                }
+            }
+        }
+        WriteOp::DropSequence { name, seq } => {
+            let ours = eng
+                .db
+                .sequences
+                .get(name)
+                .map(|vs| {
+                    vs.iter()
+                        .any(|s| s.created_xmin == seq.created_xmin && s.dropped_xmax == own)
+                })
+                .unwrap_or(false);
+            if ours {
+                let mut restored = seq.clone();
+                restored.dropped_xmax = 0;
+                if let Some(versions) = eng.db.sequences.get_mut(name) {
+                    for s in versions.iter_mut() {
+                        if s.created_xmin == seq.created_xmin {
+                            *s = restored;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        WriteOp::AlterSequence { name, prev } => {
+            if let Some(versions) = eng.db.sequences.get_mut(name) {
+                for s in versions.iter_mut() {
+                    if s.created_xmin == prev.created_xmin {
+                        *s = prev.clone();
+                        break;
+                    }
+                }
+            }
+        }
+        WriteOp::SeqAdvance { name, .. } => {
+            // Postgres semantics: nextval/setval advances are NOT rolled
+            // back on abort. The op is only a commit-time WAL marker, so
+            // undo is a deliberate no-op. (If the sequence itself was
+            // created by this transaction, the CreateSequence undo drops
+            // it, taking the advance with it.)
+            let _ = name;
         }
     }
 }

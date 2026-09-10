@@ -653,6 +653,8 @@ pub struct WhereCond {
 pub enum InsertValue {
     Lit(Literal),
     Param(u32),
+    /// v0.9: the DEFAULT keyword in INSERT VALUES.
+    Default,
 }
 
 /// One `ORDER BY` sort key: expression + direction + explicit NULL
@@ -665,11 +667,481 @@ pub struct OrderTerm {
     pub nulls_first: Option<bool>,
 }
 
+/// v0.9: column DEFAULT. Stored parsed in memory; serialized to WAL /
+/// checkpoints through the s-expression encoding (`encode_expr`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DefaultExpr {
+    /// `DEFAULT <literal>`.
+    Lit(Literal),
+    /// `DEFAULT nextval('seq')` — recognized specially so the sequence
+    /// dependency is visible and survives rewrites.
+    Nextval(String),
+    /// Any other default expression.
+    Expr(Expr),
+}
+
+/// v0.9: a CHECK constraint (name + parsed expression).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckDef {
+    pub name: String,
+    pub expr: Expr,
+}
+
+/// v0.9: a PRIMARY KEY or UNIQUE constraint over column names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UniqueDef {
+    pub name: String,
+    pub cols: Vec<String>,
+}
+
+/// v0.9: referential actions for foreign keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkAction {
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+/// v0.9: a FOREIGN KEY constraint (column names; resolved at execution).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkDef {
+    pub name: String,
+    /// Child column names.
+    pub cols: Vec<String>,
+    pub ref_table: String,
+    /// Parent column names (empty = parent's primary key, resolved later).
+    pub ref_cols: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+/// v0.9: the full schema of a CREATE TABLE: columns plus constraints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableDef {
+    pub columns: Vec<(String, ColType)>,
+    pub not_null: Vec<bool>,
+    pub defaults: Vec<Option<DefaultExpr>>,
+    pub checks: Vec<CheckDef>,
+    pub uniques: Vec<UniqueDef>,
+    pub pkey: Option<UniqueDef>,
+    pub fks: Vec<FkDef>,
+}
+
+/// v0.9: ALTER TABLE actions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterAction {
+    AddColumn {
+        name: String,
+        col_type: ColType,
+        not_null: bool,
+        default: Option<DefaultExpr>,
+        checks: Vec<CheckDef>,
+        uniques: Vec<UniqueDef>,
+        pkey: Option<UniqueDef>,
+        fks: Vec<FkDef>,
+    },
+    DropColumn {
+        name: String,
+        cascade: bool,
+    },
+    AddConstraint {
+        check: Option<CheckDef>,
+        unique: Option<UniqueDef>,
+        pkey: Option<UniqueDef>,
+        fk: Option<FkDef>,
+    },
+    DropConstraint {
+        name: String,
+        cascade: bool,
+    },
+    AlterColumnSetDefault {
+        name: String,
+        default: DefaultExpr,
+    },
+    AlterColumnDropDefault {
+        name: String,
+    },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+    RenameTo {
+        new_name: String,
+    },
+}
+
+/// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
+/// (ALTER) or the Postgres default (CREATE).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SequenceOpts {
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: Option<bool>,
+    pub restart: Option<i64>,
+}
+
+impl SequenceOpts {
+    /// `NO MINVALUE` / `NO MAXVALUE` sentinel: Postgres uses 1 /
+    /// 2^63-1 for ascending sequences.
+    pub fn no_minvalue() -> i64 {
+        1
+    }
+    pub fn no_maxvalue() -> i64 {
+        i64::MAX
+    }
+    /// Bare `RESTART` (no WITH value) resets to the sequence's start.
+    pub const RESTART_SENTINEL: i64 = i64::MIN;
+}
+
+// ---------------------------------------------------------------------------
+// v0.9: parser-internal intermediate forms for CREATE TABLE.
+// ---------------------------------------------------------------------------
+
+/// One item inside `CREATE TABLE (...)`.
+enum TableItem {
+    Col(ParsedColDef),
+    TableCon(ParsedTableCon),
+}
+
+struct ParsedColDef {
+    name: String,
+    col_type: ColType,
+    cons: Vec<ColCon>,
+}
+
+enum ColCon {
+    NotNull,
+    Null,
+    Unique(Option<String>),
+    PKey(Option<String>),
+    Default(DefaultExpr),
+    Check(Option<String>, Expr),
+    References { name: Option<String>, tail: ParsedFkTail },
+}
+
+enum ParsedTableCon {
+    PKey(Option<String>, Vec<String>),
+    Unique(Option<String>, Vec<String>),
+    Check(Option<String>, Expr),
+    Fk {
+        name: Option<String>,
+        cols: Vec<String>,
+        tail: ParsedFkTail,
+    },
+}
+
+struct ParsedFkTail {
+    ref_table: String,
+    ref_cols: Vec<String>,
+    on_delete: FkAction,
+    on_update: FkAction,
+}
+
+/// Classify a DEFAULT expression into its stored form.
+fn classify_default(e: Expr) -> Result<DefaultExpr, SqlError> {
+    match e {
+        Expr::Literal(l) => Ok(DefaultExpr::Lit(l)),
+        Expr::Func { name, args } if name == "nextval" && args.len() == 1 => {
+            match args.into_iter().next() {
+                Some(Expr::Literal(Literal::Text(s))) => Ok(DefaultExpr::Nextval(s)),
+                _ => Err(err(
+                    "nextval() in DEFAULT requires a sequence name string literal".to_string(),
+                )),
+            }
+        }
+        other => Ok(DefaultExpr::Expr(other)),
+    }
+}
+
+impl TableDef {
+    fn empty() -> Self {
+        TableDef {
+            columns: Vec::new(),
+            not_null: Vec::new(),
+            defaults: Vec::new(),
+            checks: Vec::new(),
+            uniques: Vec::new(),
+            pkey: None,
+            fks: Vec::new(),
+        }
+    }
+}
+
+/// Resolve a parsed CREATE TABLE item list into a `TableDef`, assigning
+/// Postgres-style automatic constraint names.
+
+fn def_col_exists(def: &TableDef, n: &str) -> bool {
+    def.columns.iter().any(|(c, _)| c == n)
+}
+
+fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
+    def.uniques.iter().any(|u| u.name == cname)
+        || def.checks.iter().any(|c| c.name == cname)
+        || def.fks.iter().any(|f| f.name == cname)
+        || def.pkey.as_ref().map(|p| p.name == cname).unwrap_or(false)
+}
+
+fn def_add_pkey(
+    table: &str,
+    def: &mut TableDef,
+    name: Option<String>,
+    cols: &[String],
+) -> Result<(), SqlError> {
+    for c in cols {
+        if !def_col_exists(def, c) {
+            return Err(err(format!("column \"{}\" does not exist", c)));
+        }
+    }
+    if def.pkey.is_some() {
+        return Err(err("multiple primary keys for table".to_string()));
+    }
+    let cname = name.unwrap_or_else(|| format!("{}_pkey", table));
+    if def_constraint_name_exists(def, &cname) {
+        return Err(err(format!("constraint \"{}\" already exists", cname)));
+    }
+    for c in cols {
+        let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
+        def.not_null[i] = true;
+    }
+    def.pkey = Some(UniqueDef {
+        name: cname,
+        cols: cols.to_vec(),
+    });
+    Ok(())
+}
+
+fn def_add_unique(
+    table: &str,
+    def: &mut TableDef,
+    name: Option<String>,
+    cols: &[String],
+    col: &str,
+) -> Result<(), SqlError> {
+    for c in cols {
+        if !def_col_exists(def, c) {
+            return Err(err(format!("column \"{}\" does not exist", c)));
+        }
+    }
+    let cname = name.unwrap_or_else(|| format!("{}_{}_key", table, col));
+    if def_constraint_name_exists(def, &cname) {
+        return Err(err(format!("constraint \"{}\" already exists", cname)));
+    }
+    def.uniques.push(UniqueDef {
+        name: cname,
+        cols: cols.to_vec(),
+    });
+    Ok(())
+}
+
+fn def_add_check(
+    table: &str,
+    def: &mut TableDef,
+    name: Option<String>,
+    e: Expr,
+    col: &str,
+) -> Result<(), SqlError> {
+    let cname = name.unwrap_or_else(|| format!("{}_{}_check", table, col));
+    if def_constraint_name_exists(def, &cname) {
+        return Err(err(format!("constraint \"{}\" already exists", cname)));
+    }
+    // CHECK expressions may only reference this table's columns.
+    let mut refs = Vec::new();
+    collect_col_refs(&e, &mut refs);
+    for (qual, r) in refs {
+        if let Some(q) = qual {
+            return Err(err(format!(
+                "qualified column reference \"{}.{}\" not allowed in CHECK",
+                q, r
+            )));
+        }
+        if !def_col_exists(def, &r) {
+            return Err(err(format!("column \"{}\" does not exist", r)));
+        }
+    }
+    def.checks.push(CheckDef { name: cname, expr: e });
+    Ok(())
+}
+
+fn def_add_fk(
+    table: &str,
+    def: &mut TableDef,
+    name: Option<String>,
+    cols: &[String],
+    tail: ParsedFkTail,
+) -> Result<(), SqlError> {
+    for c in cols {
+        if !def_col_exists(def, c) {
+            return Err(err(format!("column \"{}\" does not exist", c)));
+        }
+    }
+    let cname = name.unwrap_or_else(|| format!("{}_{}_fkey", table, cols[0]));
+    if def_constraint_name_exists(def, &cname) {
+        return Err(err(format!("constraint \"{}\" already exists", cname)));
+    }
+    def.fks.push(FkDef {
+        name: cname,
+        cols: cols.to_vec(),
+        ref_table: tail.ref_table,
+        ref_cols: tail.ref_cols,
+        on_delete: tail.on_delete,
+        on_update: tail.on_update,
+    });
+    Ok(())
+}
+
+fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlError> {
+    let mut def = TableDef::empty();
+    // Pass 1: columns.
+    for item in &items {
+        if let TableItem::Col(c) = item {
+            if def.columns.iter().any(|(n, _)| n == &c.name) {
+                return Err(err(format!(
+                    "column \"{}\" specified more than once",
+                    c.name
+                )));
+            }
+            def.columns.push((c.name.clone(), c.col_type.clone()));
+            def.not_null.push(false);
+            def.defaults.push(None);
+        }
+    }
+    if def.columns.is_empty() {
+        return Err(err("syntax error: table must have at least one column".to_string()));
+    }
+    // Pass 2: constraints.
+    for item in &items {
+        match item {
+            TableItem::Col(c) => {
+                let i = def.columns.iter().position(|(n, _)| n == &c.name).unwrap();
+                for con in &c.cons {
+                    match con {
+                        ColCon::NotNull => def.not_null[i] = true,
+                        ColCon::Null => def.not_null[i] = false,
+                        ColCon::Unique(n) => {
+                            def_add_unique(table, &mut def, n.clone(), std::slice::from_ref(&c.name), &c.name)?
+                        }
+                        ColCon::PKey(n) => def_add_pkey(table, &mut def, n.clone(), std::slice::from_ref(&c.name))?,
+                        ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
+                        ColCon::Check(n, e) => def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?,
+                        ColCon::References { name: n, tail } => def_add_fk(table, &mut def,
+                            n.clone(),
+                            std::slice::from_ref(&c.name),
+                            ParsedFkTail {
+                                ref_table: tail.ref_table.clone(),
+                                ref_cols: tail.ref_cols.clone(),
+                                on_delete: tail.on_delete,
+                                on_update: tail.on_update,
+                            },
+                        )?,
+                    }
+                }
+            }
+            TableItem::TableCon(tc) => match tc {
+                ParsedTableCon::PKey(n, cols) => def_add_pkey(table, &mut def, n.clone(), cols)?,
+                ParsedTableCon::Unique(n, cols) => {
+                    let first = cols[0].clone();
+                    def_add_unique(table, &mut def, n.clone(), cols, &first)?
+                }
+                ParsedTableCon::Check(n, e) => def_add_check(table, &mut def, n.clone(), e.clone(), table)?,
+                ParsedTableCon::Fk { name: n, cols, tail } => def_add_fk(table, &mut def,
+                    n.clone(),
+                    cols,
+                    ParsedFkTail {
+                        ref_table: tail.ref_table.clone(),
+                        ref_cols: tail.ref_cols.clone(),
+                        on_delete: tail.on_delete,
+                        on_update: tail.on_update,
+                    },
+                )?,
+            },
+        }
+    }
+    Ok(def)
+}
+
+/// Collect `(qualifier, name)` of every column reference in an expression.
+pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match e {
+        Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        Expr::Arith { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
+        Expr::Cast { expr, .. } => collect_col_refs(expr, out),
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            collect_col_refs(a, out);
+            collect_col_refs(b, out);
+        }
+        Expr::Not(a) => collect_col_refs(a, out),
+        Expr::Like { expr, pattern, .. } => {
+            collect_col_refs(expr, out);
+            collect_col_refs(pattern, out);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            collect_col_refs(expr, out);
+            collect_col_refs(low, out);
+            collect_col_refs(high, out);
+        }
+        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => collect_col_refs(expr, out),
+        Expr::Extract { from, .. } => collect_col_refs(from, out),
+        Expr::Cmp { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_col_refs(a, out);
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::Agg { .. }
+        | Expr::ScalarSub(_)
+        | Expr::InSub { .. }
+        | Expr::Exists { .. }
+        | Expr::ResolvedCol { .. } => {}
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
         name: String,
-        columns: Vec<(String, ColType)>,
+        def: TableDef,
+    },
+    // --- v0.9: ALTER TABLE ---
+    AlterTable {
+        name: String,
+        action: AlterAction,
+    },
+    // --- v0.9: views ---
+    CreateView {
+        name: String,
+        query: String,
+        col_aliases: Vec<String>,
+        or_replace: bool,
+    },
+    DropView {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    // --- v0.9: sequences ---
+    CreateSequence {
+        name: String,
+        if_not_exists: bool,
+        opts: SequenceOpts,
+    },
+    AlterSequence {
+        name: String,
+        opts: SequenceOpts,
+    },
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
     },
     Insert {
         table: String,
@@ -679,7 +1151,8 @@ pub enum Stmt {
     Select(SelectStmt),
     DropTable {
         if_exists: bool,
-        name: String,
+        names: Vec<String>,
+        cascade: bool,
     },
     // --- v0.5: UPDATE / DELETE with MVCC semantics
     Update {
@@ -870,13 +1343,12 @@ pub fn parse_statement(input: &str) -> Result<Stmt, SqlError> {
     if let Some(stripped) = text.strip_suffix(';') {
         text = stripped.trim_end();
     }
-    let tokens = tokenize(text)?;
-    let mut p = Parser { tokens, pos: 0 };
-    let stmt = p.parse_top()?;
-    match p.next() {
-        Token::EOF => Ok(stmt),
-        other => Err(err(format!("syntax error: unexpected {:?}", other))),
+    // v0.9: CREATE VIEW needs the raw query text for the catalog, so it is
+    // split off before tokenizing (tokens carry no spans).
+    if let Some(view_stmt) = try_split_create_view(text) {
+        return view_stmt;
     }
+    parse_statement_inner(text)
 }
 
 /// Keywords that can never be a bare (AS-less) alias or table alias.
@@ -1108,6 +1580,14 @@ impl Parser {
                 };
                 Ok(Stmt::Analyze { table })
             }
+            // --- v0.9: ALTER TABLE / ALTER SEQUENCE
+            "alter" => match self.peek() {
+                Token::Ident(ref s) if s == "table" => self.parse_alter(),
+                Token::Ident(ref s) if s == "sequence" => self.parse_alter_sequence(),
+                _ => Err(err(
+                    "syntax error: expected TABLE or SEQUENCE after ALTER".to_string(),
+                )),
+            },
             _ => Err(err(format!("syntax error at or near \"{}\"", kw))),
         }
     }
@@ -1220,8 +1700,7 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Stmt, SqlError> {
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
-        if self.eat_keyword("index") {
-            let if_not_exists = if self.eat_keyword("if") {
+        if self.eat_keyword("index") {            let if_not_exists = if self.eat_keyword("if") {
                 self.expect_keyword("not")?;
                 self.expect_keyword("exists")?;
                 true
@@ -1257,14 +1736,21 @@ impl Parser {
                 if_not_exists,
             });
         }
+        // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
+        // tokenizing so the raw query text survives).
+        if matches!(self.peek(), Token::Ident(ref s) if s == "sequence") {
+            return self.parse_create_sequence();
+        }
         self.expect_keyword("table")?;
         let name = self.expect_ident()?;
         self.expect(Token::LParen, "'('")?;
-        let mut columns = Vec::new();
+        let mut items: Vec<TableItem> = Vec::new();
         loop {
-            let col = self.expect_ident()?;
-            let typ = self.parse_col_type()?;
-            columns.push((col, typ));
+            if self.is_table_constraint_start() {
+                items.push(TableItem::TableCon(self.parse_table_constraint()?));
+            } else {
+                items.push(TableItem::Col(self.parse_column_def()?));
+            }
             match self.next() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -1276,7 +1762,441 @@ impl Parser {
                 }
             }
         }
-        Ok(Stmt::CreateTable { name, columns })
+        let def = build_table_def(&name, items)?;
+        Ok(Stmt::CreateTable { name, def })
+    }
+
+    /// True when the next tokens start a table-level constraint rather
+    /// than a column definition.
+    fn is_table_constraint_start(&mut self) -> bool {
+        matches!(self.peek(), Token::Ident(ref s)
+            if s == "constraint" || s == "primary" || s == "unique"
+                || s == "check" || s == "foreign")
+    }
+
+    /// `name type [column constraints...]`.
+    fn parse_column_def(&mut self) -> Result<ParsedColDef, SqlError> {
+        let name = self.expect_ident()?;
+        let col_type = self.parse_col_type()?;
+        let mut cons = Vec::new();
+        loop {
+            let cname = if self.eat_keyword("constraint") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                cons.push(ColCon::NotNull);
+            } else if self.eat_keyword("null") {
+                cons.push(ColCon::Null);
+            } else if self.eat_keyword("unique") {
+                cons.push(ColCon::Unique(cname));
+            } else if self.eat_keyword("primary") {
+                self.expect_keyword("key")?;
+                cons.push(ColCon::PKey(cname));
+            } else if self.eat_keyword("default") {
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                cons.push(ColCon::Default(classify_default(e)?));
+            } else if self.eat_keyword("check") {
+                self.expect(Token::LParen, "'('")?;
+                let e = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                validate_constraint_expr(&e, "CHECK")?;
+                cons.push(ColCon::Check(cname, e));
+            } else if self.eat_keyword("references") {
+                let tail = self.parse_fk_tail()?;
+                cons.push(ColCon::References { name: cname, tail });
+            } else {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: expected constraint type after CONSTRAINT name"
+                            .to_string(),
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(ParsedColDef {
+            name,
+            col_type,
+            cons,
+        })
+    }
+
+    /// Parse a table-level constraint: `[CONSTRAINT name] PRIMARY KEY (cols)
+    /// | UNIQUE (cols) | CHECK (expr) | FOREIGN KEY (cols) REFERENCES ...`.
+    fn parse_table_constraint(&mut self) -> Result<ParsedTableCon, SqlError> {
+        let cname = if self.eat_keyword("constraint") {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        if self.eat_keyword("primary") {
+            self.expect_keyword("key")?;
+            let cols = self.parse_col_name_list()?;
+            Ok(ParsedTableCon::PKey(cname, cols))
+        } else if self.eat_keyword("unique") {
+            let cols = self.parse_col_name_list()?;
+            Ok(ParsedTableCon::Unique(cname, cols))
+        } else if self.eat_keyword("check") {
+            self.expect(Token::LParen, "'('")?;
+            let e = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            validate_constraint_expr(&e, "CHECK")?;
+            Ok(ParsedTableCon::Check(cname, e))
+        } else if self.eat_keyword("foreign") {
+            self.expect_keyword("key")?;
+            let cols = self.parse_col_name_list()?;
+            self.expect_keyword("references")?;
+            let tail = self.parse_fk_tail()?;
+            Ok(ParsedTableCon::Fk { name: cname, cols, tail })
+        } else {
+            Err(err("syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string()))
+        }
+    }
+
+    fn parse_col_name_list(&mut self) -> Result<Vec<String>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.expect_ident()?);
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        if cols.is_empty() {
+            return Err(err("syntax error: empty column list".to_string()));
+        }
+        Ok(cols)
+    }
+
+    /// `reftable [(refcol [, ...])] [ON DELETE action] [ON UPDATE action]`,
+    /// after the REFERENCES keyword.
+    fn parse_fk_tail(&mut self) -> Result<ParsedFkTail, SqlError> {
+        let ref_table = self.expect_ident()?;
+        let mut ref_cols = Vec::new();
+        if self.peek() == Token::LParen {
+            ref_cols = self.parse_col_name_list()?;
+        }
+        let mut on_delete = FkAction::Restrict;
+        let mut on_update = FkAction::Restrict;
+        loop {
+            if self.eat_keyword("on") {
+                if self.eat_keyword("delete") {
+                    on_delete = self.parse_fk_action()?;
+                } else if self.eat_keyword("update") {
+                    on_update = self.parse_fk_action()?;
+                } else {
+                    return Err(err(
+                        "syntax error: expected DELETE or UPDATE after ON".to_string(),
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(ParsedFkTail {
+            ref_table,
+            ref_cols,
+            on_delete,
+            on_update,
+        })
+    }
+
+    fn parse_fk_action(&mut self) -> Result<FkAction, SqlError> {
+        if self.eat_keyword("cascade") {
+            Ok(FkAction::Cascade)
+        } else if self.eat_keyword("restrict") {
+            Ok(FkAction::Restrict)
+        } else if self.eat_keyword("set") {
+            if self.eat_keyword("null") {
+                Ok(FkAction::SetNull)
+            } else if self.eat_keyword("default") {
+                Ok(FkAction::SetDefault)
+            } else {
+                Err(err("syntax error: expected NULL or DEFAULT after SET".to_string()))
+            }
+        } else if self.eat_keyword("no") {
+            self.expect_keyword("action")?;
+            Ok(FkAction::Restrict)
+        } else {
+            Err(err(
+                "syntax error: expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// ALTER TABLE name <action>.
+    fn parse_alter(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("table")?;
+        let name = self.expect_ident()?;
+        let action = self.parse_alter_action()?;
+        Ok(Stmt::AlterTable { name, action })
+    }
+
+    fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        if self.eat_keyword("add") {
+            if self.is_table_constraint_start() {
+                return self.parse_alter_add_constraint();
+            }
+            self.eat_keyword("column");
+            let col = self.parse_column_def()?;
+            let mut not_null = false;
+            let mut default = None;
+            let mut checks = Vec::new();
+            let mut uniques = Vec::new();
+            let mut pkey = None;
+            let mut fks = Vec::new();
+            for con in col.cons {
+                match con {
+                    ColCon::NotNull => not_null = true,
+                    ColCon::Null => not_null = false,
+                    ColCon::Unique(n) => uniques.push(UniqueDef {
+                        name: n.unwrap_or_else(|| format!("{}_key", col.name)),
+                        cols: vec![col.name.clone()],
+                    }),
+                    ColCon::PKey(n) => {
+                        pkey = Some(UniqueDef {
+                            name: n.unwrap_or_else(|| format!("{}_pkey", col.name)),
+                            cols: vec![col.name.clone()],
+                        });
+                        not_null = true;
+                    }
+                    ColCon::Default(d) => default = Some(d),
+                    ColCon::Check(n, e) => checks.push(CheckDef {
+                        name: n.unwrap_or_else(|| format!("{}_check", col.name)),
+                        expr: e,
+                    }),
+                    ColCon::References { name: n, tail } => fks.push(FkDef {
+                        name: n.unwrap_or_else(|| format!("{}_fkey", col.name)),
+                        cols: vec![col.name.clone()],
+                        ref_table: tail.ref_table,
+                        ref_cols: tail.ref_cols,
+                        on_delete: tail.on_delete,
+                        on_update: tail.on_update,
+                    }),
+                }
+            }
+            return Ok(AlterAction::AddColumn {
+                name: col.name,
+                col_type: col.col_type,
+                not_null,
+                default,
+                checks,
+                uniques,
+                pkey,
+                fks,
+            });
+        }
+        if self.eat_keyword("drop") {
+            if self.eat_keyword("constraint") {
+                let cname = self.expect_ident()?;
+                let cascade = self.parse_cascade_opt()?;
+                return Ok(AlterAction::DropConstraint {
+                    name: cname,
+                    cascade,
+                });
+            }
+            self.eat_keyword("column");
+            let cname = self.expect_ident()?;
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(AlterAction::DropColumn {
+                name: cname,
+                cascade,
+            });
+        }
+        if self.eat_keyword("alter") {
+            self.eat_keyword("column");
+            let cname = self.expect_ident()?;
+            if self.eat_keyword("set") {
+                self.expect_keyword("default")?;
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                return Ok(AlterAction::AlterColumnSetDefault {
+                    name: cname,
+                    default: classify_default(e)?,
+                });
+            }
+            if self.eat_keyword("drop") {
+                self.expect_keyword("default")?;
+                return Ok(AlterAction::AlterColumnDropDefault { name: cname });
+            }
+            return Err(err("syntax error: expected SET DEFAULT or DROP DEFAULT".to_string()));
+        }
+        if self.eat_keyword("rename") {
+            if self.eat_keyword("column") {
+                let old = self.expect_ident()?;
+                self.expect_keyword("to")?;
+                let new = self.expect_ident()?;
+                return Ok(AlterAction::RenameColumn { old, new });
+            }
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(AlterAction::RenameTo { new_name });
+        }
+        Err(err("syntax error: expected ADD, DROP, ALTER or RENAME".to_string()))
+    }
+
+    /// `ADD [CONSTRAINT name] PRIMARY KEY ... | UNIQUE ... | CHECK ... |
+    /// FOREIGN KEY ...` (table-constraint form).
+    fn parse_alter_add_constraint(&mut self) -> Result<AlterAction, SqlError> {
+        match self.parse_table_constraint()? {
+            ParsedTableCon::PKey(name, cols) => Ok(AlterAction::AddConstraint {
+                pkey: Some(UniqueDef {
+                    name: name.unwrap_or_default(),
+                    cols,
+                }),
+                check: None,
+                unique: None,
+                fk: None,
+            }),
+            ParsedTableCon::Unique(name, cols) => Ok(AlterAction::AddConstraint {
+                unique: Some(UniqueDef {
+                    name: name.unwrap_or_default(),
+                    cols,
+                }),
+                check: None,
+                pkey: None,
+                fk: None,
+            }),
+            ParsedTableCon::Check(name, e) => Ok(AlterAction::AddConstraint {
+                check: Some(CheckDef {
+                    name: name.unwrap_or_default(),
+                    expr: e,
+                }),
+                unique: None,
+                pkey: None,
+                fk: None,
+            }),
+            ParsedTableCon::Fk { name, cols, tail } => Ok(AlterAction::AddConstraint {
+                fk: Some(FkDef {
+                    name: name.unwrap_or_default(),
+                    cols,
+                    ref_table: tail.ref_table,
+                    ref_cols: tail.ref_cols,
+                    on_delete: tail.on_delete,
+                    on_update: tail.on_update,
+                }),
+                check: None,
+                unique: None,
+                pkey: None,
+            }),
+        }
+    }
+
+    fn parse_cascade_opt(&mut self) -> Result<bool, SqlError> {
+        if self.eat_keyword("cascade") {
+            Ok(true)
+        } else {
+            // RESTRICT is the default; consume it if present.
+            self.eat_keyword("restrict");
+            Ok(false)
+        }
+    }
+
+    /// CREATE SEQUENCE name [options...].
+    fn parse_create_sequence(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("sequence")?;
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        let opts = self.parse_sequence_opts()?;
+        Ok(Stmt::CreateSequence {
+            name,
+            if_not_exists,
+            opts,
+        })
+    }
+
+    /// ALTER SEQUENCE name [options...] — all options optional.
+    fn parse_alter_sequence(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("sequence")?;
+        if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+        }
+        let name = self.expect_ident()?;
+        let opts = self.parse_sequence_opts()?;
+        Ok(Stmt::AlterSequence { name, opts })
+    }
+
+    fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {
+        let mut opts = SequenceOpts::default();
+        loop {
+            if self.eat_keyword("start") {
+                if self.eat_keyword("with") {
+                    opts.start = Some(self.parse_seq_int("START")?);
+                } else {
+                    return Err(err("syntax error: expected WITH after START".to_string()));
+                }
+            } else if self.eat_keyword("increment") {
+                if self.eat_keyword("by") {
+                    opts.increment = Some(self.parse_seq_int("INCREMENT")?);
+                } else {
+                    return Err(err("syntax error: expected BY after INCREMENT".to_string()));
+                }
+            } else if self.eat_keyword("minvalue") {
+                opts.min_value = Some(self.parse_seq_int("MINVALUE")?);
+            } else if self.eat_keyword("no") {
+                if self.eat_keyword("minvalue") {
+                    opts.min_value = Some(SequenceOpts::no_minvalue());
+                } else if self.eat_keyword("maxvalue") {
+                    opts.max_value = Some(SequenceOpts::no_maxvalue());
+                } else if self.eat_keyword("cycle") {
+                    opts.cycle = Some(false);
+                } else {
+                    return Err(err(
+                        "syntax error: expected MINVALUE, MAXVALUE or CYCLE after NO".to_string(),
+                    ));
+                }
+            } else if self.eat_keyword("maxvalue") {
+                opts.max_value = Some(self.parse_seq_int("MAXVALUE")?);
+            } else if self.eat_keyword("cycle") {
+                opts.cycle = Some(true);
+            } else if self.eat_keyword("restart") {
+                if self.eat_keyword("with") {
+                    opts.restart = Some(self.parse_seq_int("RESTART")?);
+                } else {
+                    opts.restart = Some(SequenceOpts::RESTART_SENTINEL);
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(opts)
+    }
+
+    fn parse_seq_int(&mut self, what: &str) -> Result<i64, SqlError> {
+        let neg = matches!(self.peek(), Token::Minus);
+        if neg {
+            self.next();
+        }
+        match self.next() {
+            Token::Number(raw) => {
+                let v: i64 = raw.parse().map_err(|_| {
+                    err(format!("invalid {} value: {}", what, raw))
+                })?;
+                Ok(if neg { -v } else { v })
+            }
+            other => Err(err(format!(
+                "syntax error: expected integer for {}, found {:?}",
+                what, other
+            ))),
+        }
     }
 
     fn parse_literal(&mut self) -> Result<Literal, SqlError> {
@@ -1370,9 +2290,12 @@ impl Parser {
         })
     }
 
-    /// One INSERT value: a literal (with optional unary `+`/`-`), or a
-    /// `$N` parameter placeholder.
+    /// One INSERT value: a literal (with optional unary `+`/`-`), a
+    /// `$N` parameter placeholder, or the DEFAULT keyword (v0.9).
     fn parse_insert_value(&mut self) -> Result<InsertValue, SqlError> {
+        if self.eat_keyword("default") {
+            return Ok(InsertValue::Default);
+        }
         match self.peek() {
             Token::Param(n) => {
                 self.next();
@@ -2340,6 +3263,14 @@ impl Parser {
             })
         } else {
             let name = self.expect_ident()?;
+            // v0.9: schema-qualified names, so the information_schema
+            // catalog views are reachable (`FROM information_schema.tables`).
+            let name = if self.peek() == Token::Dot {
+                self.next();
+                format!("{}.{}", name, self.expect_ident()?)
+            } else {
+                name
+            };
             let alias = self.parse_alias_opt()?;
             Ok(FromItem::Table { name, alias })
         }
@@ -2356,6 +3287,50 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Stmt::DropIndex { name, if_exists });
         }
+        // v0.9: DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+        if self.eat_keyword("view") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropView {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
+        // v0.9: DROP SEQUENCE [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+        if self.eat_keyword("sequence") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            // RESTRICT/CASCADE accepted but sequences have no dependents
+            // tracked in v0.9 (documented).
+            self.parse_cascade_opt()?;
+            return Ok(Stmt::DropSequence { names, if_exists });
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
@@ -2363,8 +3338,21 @@ impl Parser {
         } else {
             false
         };
-        let name = self.expect_ident()?;
-        Ok(Stmt::DropTable { if_exists, name })
+        // v0.9: DROP TABLE [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+        let mut names = Vec::new();
+        loop {
+            names.push(self.expect_ident()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        let cascade = self.parse_cascade_opt()?;
+        Ok(Stmt::DropTable {
+            if_exists,
+            names,
+            cascade,
+        })
     }
 }
 
@@ -2460,6 +3448,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "now" | "current_date" | "current_timestamp" | "date_trunc"
         // conditional
         | "coalesce" | "nullif" | "greatest" | "least"
+        // v0.9: sequence functions
+        | "nextval" | "currval" | "setval"
     )
 }
 
@@ -2476,6 +3466,9 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "replace" | "split_part" => n == 3,
         "round" => n == 1 || n == 2,
         "coalesce" | "greatest" | "least" => n >= 1,
+        // v0.9: setval(name, value [, is_called])
+        "nextval" | "currval" => n == 1,
+        "setval" => n == 2 || n == 3,
         _ => false,
     };
     if ok {
@@ -2485,3 +3478,1096 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
     }
 }
 
+
+// ============================================================================
+// v0.9: CREATE VIEW raw-text split, s-expression codec for CHECK / DEFAULT
+// expressions, and constraint-expression validation.
+// ============================================================================
+
+/// Match a keyword case-insensitively at the start of `s`, requiring a
+/// word boundary after it. Returns the remainder on success.
+fn match_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    if s.len() < kw.len() {
+        return None;
+    }
+    if !s[..kw.len()].eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let rest = &s[kw.len()..];
+    match rest.chars().next() {
+        None => Some(rest),
+        Some(c) if c.is_alphanumeric() || c == '_' => None,
+        Some(_) => Some(rest),
+    }
+}
+
+/// Skip whitespace and `--` / `/* */` comments.
+fn skip_ws_comments(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_start();
+        if let Some(r) = t.strip_prefix("--") {
+            match r.find('\n') {
+                Some(i) => s = &r[i..],
+                None => return "",
+            }
+        } else if let Some(r) = t.strip_prefix("/*") {
+            match r.find("*/") {
+                Some(i) => s = &r[i + 2..],
+                None => return "",
+            }
+        } else {
+            return t;
+        }
+    }
+}
+
+/// Parse one identifier (bare or double-quoted) at the start of `s`.
+fn split_ident(s: &str) -> Option<(String, &str)> {
+    let s = skip_ws_comments(s);
+    if let Some(r) = s.strip_prefix('"') {
+        let mut name = String::new();
+        let mut chars = r.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '"' {
+                if r[i + 1..].starts_with('"') {
+                    name.push('"');
+                    chars.next();
+                } else {
+                    return Some((name, &r[i + 1..]));
+                }
+            } else {
+                name.push(c);
+            }
+        }
+        return None;
+    }
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let word = &s[..end];
+    if word.chars().next().unwrap().is_ascii_digit() {
+        return None;
+    }
+    Some((word.to_lowercase(), &s[end..]))
+}
+
+/// Skip a balanced parenthesized group; `s` must start with `(`.
+/// Returns the text after the closing paren.
+fn skip_balanced_parens(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '(' {
+        return None;
+    }
+    let mut depth = 1;
+    let mut in_str = false;
+    let mut in_ident = false;
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_str = false;
+                }
+            }
+        } else if in_ident {
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 1;
+                } else {
+                    in_ident = false;
+                }
+            }
+        } else if c == b'\'' {
+            in_str = true;
+        } else if c == b'"' {
+            in_ident = true;
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[i + 1..]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// v0.9: split `CREATE [OR REPLACE] VIEW name [(cols)] AS <query>` off the
+/// raw statement text. Tokens carry no spans, so the view definition is
+/// captured from the source before tokenizing. Returns `None` when the
+/// statement is not a CREATE VIEW.
+fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
+    let mut rest = match_kw(text.trim_start(), "create")?;
+    rest = skip_ws_comments(rest);
+    let mut or_replace = false;
+    if let Some(r) = match_kw(rest, "or") {
+        let r2 = skip_ws_comments(r);
+        if let Some(r3) = match_kw(r2, "replace") {
+            or_replace = true;
+            rest = skip_ws_comments(r3);
+        }
+    }
+    // v0.9: TEMP views are accepted as regular views (documented: no
+    // session-local temp namespace yet).
+    if let Some(r) = match_kw(rest, "temporary") {
+        rest = skip_ws_comments(r);
+    } else if let Some(r) = match_kw(rest, "temp") {
+        rest = skip_ws_comments(r);
+    }
+    rest = match_kw(rest, "view")?;
+    rest = skip_ws_comments(rest);
+    // Postgres does not allow IF NOT EXISTS on CREATE VIEW.
+    let (name, r) = split_ident(rest)?;
+    rest = skip_ws_comments(r);
+    // Optional column alias list.
+    let mut col_aliases = Vec::new();
+    if rest.starts_with('(') {
+        let inner_end = rest.find(')')?; // aliases are plain idents; no nesting
+        let inner = &rest[1..inner_end];
+        for part in inner.split(',') {
+            let (a, r) = split_ident(part)?;
+            if !skip_ws_comments(r).is_empty() {
+                return Some(Err(err("syntax error in view column alias list".to_string())));
+            }
+            col_aliases.push(a);
+        }
+        rest = skip_balanced_parens(rest)?;
+        rest = skip_ws_comments(rest);
+    }
+    rest = match_kw(rest, "as")?;
+    let query = skip_ws_comments(rest).trim().to_string();
+    if query.is_empty() {
+        return Some(Err(err("syntax error: expected query after AS".to_string())));
+    }
+    // The view query must parse as a SELECT (this also validates it now).
+    let parsed = match parse_statement_inner(&query) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    let sel = match parsed {
+        Stmt::Select(s) => s,
+        _ => {
+            return Some(Err(err(
+                "syntax error: view query must be a SELECT".to_string(),
+            )))
+        }
+    };
+    if sel.for_update {
+        return Some(Err(err(
+            "SELECT FOR UPDATE is not allowed in a view".to_string(),
+        )));
+    }
+    let mut deps = Vec::new();
+    collect_table_refs(&sel, &mut deps);
+    deps.sort();
+    deps.dedup();
+    if deps.iter().any(|d| d == &name) {
+        return Some(Err(err(format!(
+            "view \"{}\" cannot depend on itself",
+            name
+        ))));
+    }
+    Some(Ok(Stmt::CreateView {
+        name,
+        query,
+        col_aliases,
+        or_replace,
+    }))
+}
+
+/// Collect every plain table name referenced by a SELECT (through joins
+/// and derived tables), for view dependency tracking.
+pub fn collect_table_refs(sel: &SelectStmt, out: &mut Vec<String>) {
+    fn from_item(fi: &FromItem, out: &mut Vec<String>) {
+        match fi {
+            FromItem::Table { name, .. } => out.push(name.clone()),
+            FromItem::Derived { sub, .. } => collect_table_refs(sub, out),
+            FromItem::Join { left, right, .. } => {
+                from_item(left, out);
+                from_item(right, out);
+            }
+        }
+    }
+    for fi in &sel.from {
+        from_item(fi, out);
+    }
+}
+
+/// Parse one statement from already-trimmed text (no view interception).
+fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
+    let tokens = tokenize(text)?;
+    let mut p = Parser { tokens, pos: 0 };
+    let stmt = p.parse_top()?;
+    match p.next() {
+        Token::EOF => Ok(stmt),
+        other => Err(err(format!("syntax error: unexpected {:?}", other))),
+    }
+}
+
+/// Walk an expression, rejecting anything a CHECK / DEFAULT expression
+/// may not contain: aggregates, subqueries, window-less set functions
+/// are fine, but no sub-selects, no aggregates, no `Param` placeholders,
+/// and no volatile sequence calls other than the recognized nextval form.
+pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
+    match e {
+        Expr::Agg { .. } => Err(err(format!(
+            "cannot use aggregate in {} constraint",
+            what
+        ))),
+        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => Err(err(format!(
+            "cannot use subquery in {} constraint",
+            what
+        ))),
+        Expr::Param(_) => Err(err(format!(
+            "cannot use parameter in {} constraint",
+            what
+        ))),
+        Expr::ResolvedCol { .. } => Err(err(format!("invalid expression in {}", what))),
+        Expr::Column { .. } | Expr::Literal(_) => Ok(()),
+        Expr::Arith { left, right, .. } => {
+            validate_constraint_expr(left, what)?;
+            validate_constraint_expr(right, what)
+        }
+        Expr::Cast { expr, .. } => validate_constraint_expr(expr, what),
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            validate_constraint_expr(a, what)?;
+            validate_constraint_expr(b, what)
+        }
+        Expr::Not(a) => validate_constraint_expr(a, what),
+        Expr::Like { expr, pattern, .. } => {
+            validate_constraint_expr(expr, what)?;
+            validate_constraint_expr(pattern, what)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            validate_constraint_expr(expr, what)?;
+            validate_constraint_expr(low, what)?;
+            validate_constraint_expr(high, what)
+        }
+        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => {
+            validate_constraint_expr(expr, what)
+        }
+        Expr::Extract { from, .. } => validate_constraint_expr(from, what),
+        Expr::Cmp { left, right, .. } => {
+            validate_constraint_expr(left, what)?;
+            validate_constraint_expr(right, what)
+        }
+        Expr::Func { name, args } => {
+            // v0.9: nextval is allowed in DEFAULT (Postgres auto-increment),
+            // but no sequence functions in CHECK (must be immutable).
+            if name == "nextval" || name == "currval" || name == "setval" {
+                if what != "DEFAULT" || name != "nextval" {
+                    return Err(err(format!(
+                        "cannot use sequence function in {} constraint",
+                        what
+                    )));
+                }
+            }
+            for a in args {
+                validate_constraint_expr(a, what)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S-expression codec for CHECK / DEFAULT expressions (WAL + checkpoints).
+// ---------------------------------------------------------------------------
+
+fn sexpr_escape(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn encode_literal(lit: &Literal, out: &mut String) {
+    out.push_str("(lit ");
+    match lit {
+        Literal::Int(i) => out.push_str(&format!("int {}", i)),
+        Literal::BigInt(i) => out.push_str(&format!("bigint {}", i)),
+        Literal::SmallInt(i) => out.push_str(&format!("smallint {}", i)),
+        Literal::Float(f) => out.push_str(&format!("float {}", f)),
+        Literal::Decimal(s) => {
+            out.push_str("decimal ");
+            sexpr_escape(s, out);
+        }
+        Literal::Real(f) => out.push_str(&format!("real {}", f)),
+        Literal::Numeric(n) => {
+            out.push_str(&format!("numeric {} {}", n.unscaled, n.scale));
+        }
+        Literal::Text(s) => {
+            out.push_str("text ");
+            sexpr_escape(s, out);
+        }
+        Literal::Bool(b) => out.push_str(&format!("bool {}", b)),
+        Literal::Date(d) => out.push_str(&format!("date {}", d)),
+        Literal::Timestamp(t) => out.push_str(&format!("ts {}", t)),
+        Literal::Timestamptz(t) => out.push_str(&format!("tstz {}", t)),
+        Literal::Bytea(b) => {
+            out.push_str("bytea ");
+            for byte in b {
+                out.push_str(&format!("{:02x}", byte));
+            }
+        }
+        Literal::Uuid(u) => {
+            out.push_str("uuid ");
+            for byte in u {
+                out.push_str(&format!("{:02x}", byte));
+            }
+        }
+        Literal::Null => out.push_str("null"),
+    }
+    out.push(')');
+}
+
+fn encode_expr_inner(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Column { table, name } => {
+            out.push_str("(col ");
+            sexpr_escape(table.as_deref().unwrap_or(""), out);
+            out.push(' ');
+            sexpr_escape(name, out);
+            out.push(')');
+        }
+        Expr::Literal(l) => encode_literal(l, out),
+        Expr::Param(n) => out.push_str(&format!("(param {})", n)),
+        Expr::Arith { op, left, right } => {
+            let o = match op {
+                ArithOp::Add => "add",
+                ArithOp::Sub => "sub",
+                ArithOp::Mul => "mul",
+                ArithOp::Div => "div",
+                ArithOp::Mod => "mod",
+                ArithOp::Pow => "pow",
+            };
+            out.push_str(&format!("(arith {} ", o));
+            encode_expr_inner(left, out);
+            out.push(' ');
+            encode_expr_inner(right, out);
+            out.push(')');
+        }
+        Expr::Cast { expr, to } => {
+            out.push_str(&format!("(cast {} ", to.sql_name()));
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        Expr::Concat(a, b) => {
+            out.push_str("(concat ");
+            encode_expr_inner(a, out);
+            out.push(' ');
+            encode_expr_inner(b, out);
+            out.push(')');
+        }
+        Expr::Like { expr, pattern, not, ilike } => {
+            out.push_str(&format!(
+                "(like {} {} ",
+                if *not { 1 } else { 0 },
+                if *ilike { 1 } else { 0 }
+            ));
+            encode_expr_inner(expr, out);
+            out.push(' ');
+            encode_expr_inner(pattern, out);
+            out.push(')');
+        }
+        Expr::Between { expr, low, high, neg } => {
+            out.push_str(&format!("(between {} ", if *neg { 1 } else { 0 }));
+            encode_expr_inner(expr, out);
+            out.push(' ');
+            encode_expr_inner(low, out);
+            out.push(' ');
+            encode_expr_inner(high, out);
+            out.push(')');
+        }
+        Expr::IsBool { expr, neg, val } => {
+            let v = match val {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => 2,
+            };
+            out.push_str(&format!("(isbool {} {} ", if *neg { 1 } else { 0 }, v));
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        Expr::Func { name, args } => {
+            out.push_str("(func ");
+            sexpr_escape(name, out);
+            for a in args {
+                out.push(' ');
+                encode_expr_inner(a, out);
+            }
+            out.push(')');
+        }
+        Expr::Extract { field, from } => {
+            out.push_str("(extract ");
+            sexpr_escape(field, out);
+            out.push(' ');
+            encode_expr_inner(from, out);
+            out.push(')');
+        }
+        Expr::Cmp { op, left, right } => {
+            let o = match op {
+                CmpOp::Eq => "eq",
+                CmpOp::Ne => "ne",
+                CmpOp::Lt => "lt",
+                CmpOp::Le => "le",
+                CmpOp::Gt => "gt",
+                CmpOp::Ge => "ge",
+            };
+            out.push_str(&format!("(cmp {} ", o));
+            encode_expr_inner(left, out);
+            out.push(' ');
+            encode_expr_inner(right, out);
+            out.push(')');
+        }
+        Expr::And(a, b) => {
+            out.push_str("(and ");
+            encode_expr_inner(a, out);
+            out.push(' ');
+            encode_expr_inner(b, out);
+            out.push(')');
+        }
+        Expr::Or(a, b) => {
+            out.push_str("(or ");
+            encode_expr_inner(a, out);
+            out.push(' ');
+            encode_expr_inner(b, out);
+            out.push(')');
+        }
+        Expr::Not(a) => {
+            out.push_str("(not ");
+            encode_expr_inner(a, out);
+            out.push(')');
+        }
+        Expr::IsNull { expr, neg } => {
+            out.push_str(&format!("(isnull {} ", if *neg { 1 } else { 0 }));
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        // Aggregates, subqueries and pre-resolved columns can never appear
+        // in a persisted CHECK / DEFAULT (validated at parse time).
+        Expr::Agg { .. }
+        | Expr::ScalarSub(_)
+        | Expr::InSub { .. }
+        | Expr::Exists { .. }
+        | Expr::ResolvedCol { .. } => {
+            out.push_str("(invalid)");
+        }
+    }
+}
+
+fn encode_default(d: &DefaultExpr, out: &mut String) {
+    match d {
+        DefaultExpr::Lit(l) => {
+            out.push_str("(default-lit ");
+            encode_literal(l, out);
+            out.push(')');
+        }
+        DefaultExpr::Nextval(s) => {
+            out.push_str("(default-nextval ");
+            sexpr_escape(s, out);
+            out.push(')');
+        }
+        DefaultExpr::Expr(e) => {
+            out.push_str("(default-expr ");
+            encode_expr_inner(e, out);
+            out.push(')');
+        }
+    }
+}
+
+struct SexprParser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl<'a> SexprParser<'a> {
+    fn new(s: &'a str) -> Self {
+        SexprParser {
+            chars: s.chars().peekable(),
+        }
+    }
+    fn ws(&mut self) {
+        while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
+            self.chars.next();
+        }
+    }
+    fn atom(&mut self) -> Result<String, String> {
+        self.ws();
+        let mut s = String::new();
+        if self.chars.peek() == Some(&'"') {
+            self.chars.next();
+            loop {
+                match self.chars.next() {
+                    None => return Err("unterminated string in expression encoding".into()),
+                    Some('"') => break,
+                    Some('\\') => match self.chars.next() {
+                        Some('n') => s.push('\n'),
+                        Some('\"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        Some(c) => {
+                            s.push('\\');
+                            s.push(c);
+                        }
+                        None => return Err("unterminated escape".into()),
+                    },
+                    Some(c) => s.push(c),
+                }
+            }
+            return Ok(s);
+        }
+        while let Some(&c) = self.chars.peek() {
+            if c.is_whitespace() || c == '(' || c == ')' {
+                break;
+            }
+            s.push(c);
+            self.chars.next();
+        }
+        if s.is_empty() {
+            return Err("expected atom in expression encoding".into());
+        }
+        Ok(s)
+    }
+    fn open(&mut self) -> Result<(), String> {
+        self.ws();
+        match self.chars.next() {
+            Some('(') => Ok(()),
+            _ => Err("expected '(' in expression encoding".into()),
+        }
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.ws();
+        match self.chars.next() {
+            Some(')') => Ok(()),
+            _ => Err("expected ')' in expression encoding".into()),
+        }
+    }
+    fn expr(&mut self) -> Result<Expr, String> {
+        self.open()?;
+        let head = self.atom()?;
+        let e = match head.as_str() {
+            "col" => {
+                let qual = self.atom()?;
+                let name = self.atom()?;
+                Expr::Column {
+                    table: if qual.is_empty() { None } else { Some(qual) },
+                    name,
+                }
+            }
+            "lit" => Expr::Literal(self.literal()?),
+            "param" => Expr::Param(self.atom()?.parse::<u32>().map_err(|_| "bad param")?),
+            "arith" => {
+                let op = match self.atom()?.as_str() {
+                    "add" => ArithOp::Add,
+                    "sub" => ArithOp::Sub,
+                    "mul" => ArithOp::Mul,
+                    "div" => ArithOp::Div,
+                    "mod" => ArithOp::Mod,
+                    "pow" => ArithOp::Pow,
+                    o => return Err(format!("bad arith op {}", o)),
+                };
+                let l = self.expr()?;
+                let r = self.expr()?;
+                Expr::Arith {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }
+            }
+            "cast" => {
+                let to = coltype_by_name(&self.atom()?)?;
+                let x = self.expr()?;
+                Expr::Cast {
+                    expr: Box::new(x),
+                    to,
+                }
+            }
+            "concat" => {
+                let a = self.expr()?;
+                let b = self.expr()?;
+                Expr::Concat(Box::new(a), Box::new(b))
+            }
+            "like" => {
+                let not = self.atom()? == "1";
+                let ilike = self.atom()? == "1";
+                let x = self.expr()?;
+                let p = self.expr()?;
+                Expr::Like {
+                    expr: Box::new(x),
+                    pattern: Box::new(p),
+                    not,
+                    ilike,
+                }
+            }
+            "between" => {
+                let neg = self.atom()? == "1";
+                let x = self.expr()?;
+                let low = self.expr()?;
+                let high = self.expr()?;
+                Expr::Between {
+                    expr: Box::new(x),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    neg,
+                }
+            }
+            "isbool" => {
+                let neg = self.atom()? == "1";
+                let val = match self.atom()?.as_str() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                };
+                let x = self.expr()?;
+                Expr::IsBool {
+                    expr: Box::new(x),
+                    neg,
+                    val,
+                }
+            }
+            "func" => {
+                let name = self.atom()?;
+                let mut args = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    args.push(self.expr()?);
+                }
+                Expr::Func { name, args }
+            }
+            "extract" => {
+                let field = self.atom()?;
+                let x = self.expr()?;
+                Expr::Extract {
+                    field,
+                    from: Box::new(x),
+                }
+            }
+            "cmp" => {
+                let op = match self.atom()?.as_str() {
+                    "eq" => CmpOp::Eq,
+                    "ne" => CmpOp::Ne,
+                    "lt" => CmpOp::Lt,
+                    "le" => CmpOp::Le,
+                    "gt" => CmpOp::Gt,
+                    "ge" => CmpOp::Ge,
+                    o => return Err(format!("bad cmp op {}", o)),
+                };
+                let l = self.expr()?;
+                let r = self.expr()?;
+                Expr::Cmp {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }
+            }
+            "and" => {
+                let a = self.expr()?;
+                let b = self.expr()?;
+                Expr::And(Box::new(a), Box::new(b))
+            }
+            "or" => {
+                let a = self.expr()?;
+                let b = self.expr()?;
+                Expr::Or(Box::new(a), Box::new(b))
+            }
+            "not" => {
+                let a = self.expr()?;
+                Expr::Not(Box::new(a))
+            }
+            "isnull" => {
+                let neg = self.atom()? == "1";
+                let x = self.expr()?;
+                Expr::IsNull {
+                    expr: Box::new(x),
+                    neg,
+                }
+            }
+            o => return Err(format!("bad expr head {}", o)),
+        };
+        self.close()?;
+        Ok(e)
+    }
+    fn literal(&mut self) -> Result<Literal, String> {
+        let kind = self.atom()?;
+        let lit = match kind.as_str() {
+            "int" => Literal::Int(self.atom()?.parse().map_err(|_| "bad int")?),
+            "bigint" => Literal::BigInt(self.atom()?.parse().map_err(|_| "bad bigint")?),
+            "smallint" => Literal::SmallInt(self.atom()?.parse().map_err(|_| "bad smallint")?),
+            "float" => Literal::Float(self.atom()?.parse().map_err(|_| "bad float")?),
+            "decimal" => Literal::Decimal(self.atom()?),
+            "real" => Literal::Real(self.atom()?.parse().map_err(|_| "bad real")?),
+            "numeric" => {
+                let unscaled: i128 = self.atom()?.parse().map_err(|_| "bad numeric")?;
+                let scale: u32 = self.atom()?.parse().map_err(|_| "bad numeric")?;
+                Literal::Numeric(crate::storage::Numeric { unscaled, scale })
+            }
+            "text" => Literal::Text(self.atom()?),
+            "bool" => Literal::Bool(self.atom()?.parse().map_err(|_| "bad bool")?),
+            "date" => Literal::Date(self.atom()?.parse().map_err(|_| "bad date")?),
+            "ts" => Literal::Timestamp(self.atom()?.parse().map_err(|_| "bad ts")?),
+            "tstz" => Literal::Timestamptz(self.atom()?.parse().map_err(|_| "bad tstz")?),
+            "bytea" => {
+                let hex = self.atom()?;
+                Literal::Bytea(hex_decode(&hex)?)
+            }
+            "uuid" => {
+                let hex = self.atom()?;
+                let b = hex_decode(&hex)?;
+                if b.len() != 16 {
+                    return Err("bad uuid".into());
+                }
+                let mut u = [0u8; 16];
+                u.copy_from_slice(&b);
+                Literal::Uuid(u)
+            }
+            "null" => Literal::Null,
+            o => return Err(format!("bad literal kind {}", o)),
+        };
+        Ok(lit)
+    }
+}
+
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("bad hex".into());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16).ok_or("bad hex")?;
+        let lo = (bytes[i + 1] as char).to_digit(16).ok_or("bad hex")?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn coltype_by_name(name: &str) -> Result<ColType, String> {
+    Ok(match name {
+        "integer" | "int" | "int4" => ColType::Int,
+        "bigint" | "int8" => ColType::BigInt,
+        "smallint" | "int2" => ColType::SmallInt,
+        "double precision" | "float8" | "float" => ColType::Float,
+        "real" | "float4" => ColType::Float4,
+        "numeric" | "decimal" => ColType::Numeric,
+        "text" | "varchar" | "character varying" => ColType::Text,
+        "boolean" | "bool" => ColType::Bool,
+        "date" => ColType::Date,
+        "timestamp" | "timestamp without time zone" => ColType::Timestamp,
+        "timestamptz" | "timestamp with time zone" => ColType::Timestamptz,
+        "bytea" => ColType::Bytea,
+        "uuid" => ColType::Uuid,
+        o => return Err(format!("bad column type {}", o)),
+    })
+}
+
+
+
+fn fk_action_name(a: FkAction) -> &'static str {
+    match a {
+        FkAction::Restrict => "restrict",
+        FkAction::Cascade => "cascade",
+        FkAction::SetNull => "setnull",
+        FkAction::SetDefault => "setdefault",
+    }
+}
+
+fn parse_fk_action(s: &str) -> Result<FkAction, String> {
+    match s {
+        "restrict" => Ok(FkAction::Restrict),
+        "cascade" => Ok(FkAction::Cascade),
+        "setnull" => Ok(FkAction::SetNull),
+        "setdefault" => Ok(FkAction::SetDefault),
+        o => Err(format!("bad fk action {}", o)),
+    }
+}
+
+/// v0.9: encode a table's full constraint/default metadata for WAL and
+/// checkpoints. All variable-length lists align with the table's columns
+/// by position (defaults/notnull) or carry their own names.
+pub fn encode_constraints(t: &crate::storage::Table) -> String {
+    let mut out = String::from("(constraints ");
+    out.push_str("(notnull");
+    for b in &t.not_null {
+        out.push_str(if *b { " 1" } else { " 0" });
+    }
+    out.push_str(") (defaults");
+    for d in &t.defaults {
+        out.push(' ');
+        match d {
+            Some(dd) => encode_default(dd, &mut out),
+            None => out.push('-'),
+        }
+    }
+    out.push_str(") (checks");
+    for c in &t.checks {
+        out.push('(');
+        sexpr_escape(&c.name, &mut out);
+        out.push(' ');
+        encode_expr_inner(&c.expr, &mut out);
+        out.push(')');
+    }
+    out.push_str(") (uniques");
+    for u in &t.uniques {
+        out.push('(');
+        sexpr_escape(&u.name, &mut out);
+        for c in &u.cols {
+            out.push(' ');
+            sexpr_escape(c, &mut out);
+        }
+        out.push(')');
+    }
+    out.push(')');
+    match &t.pkey {
+        Some(pk) => {
+            out.push_str(" (pkey ");
+            sexpr_escape(&pk.name, &mut out);
+            for c in &pk.cols {
+                out.push(' ');
+                sexpr_escape(c, &mut out);
+            }
+            out.push(')');
+        }
+        None => out.push_str(" (pkey -)"),
+    }
+    out.push_str(" (fks");
+    for f in &t.fks {
+        out.push('(');
+        sexpr_escape(&f.name, &mut out);
+        out.push_str(" (cols");
+        for c in &f.cols {
+            out.push(' ');
+            sexpr_escape(c, &mut out);
+        }
+        out.push_str(") (ref ");
+        sexpr_escape(&f.ref_table, &mut out);
+        out.push_str(") (refcols");
+        for c in &f.ref_cols {
+            out.push(' ');
+            sexpr_escape(c, &mut out);
+        }
+        out.push_str(") (ondel ");
+        out.push_str(fk_action_name(f.on_delete));
+        out.push_str(") (onupd ");
+        out.push_str(fk_action_name(f.on_update));
+        out.push_str("))");
+    }
+    out.push_str("))");
+    out
+}
+
+/// Decoded v0.9 table constraint metadata (WAL replay / checkpoints).
+pub struct DecodedConstraints {
+    pub not_null: Vec<bool>,
+    pub defaults: Vec<Option<DefaultExpr>>,
+    pub checks: Vec<CheckDef>,
+    pub uniques: Vec<UniqueDef>,
+    pub pkey: Option<UniqueDef>,
+    pub fks: Vec<FkDef>,
+}
+
+fn sexpr_is_close(p: &mut SexprParser) -> bool {
+    p.ws();
+    p.chars.peek() == Some(&')')
+}
+
+pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    if p.atom()? != "constraints" {
+        return Err("bad constraints head".into());
+    }
+    // (notnull 0 1 ...)
+    p.open()?;
+    if p.atom()? != "notnull" {
+        return Err("bad notnull head".into());
+    }
+    let mut not_null = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        not_null.push(match p.atom()?.as_str() {
+            "1" => true,
+            "0" => false,
+            o => return Err(format!("bad notnull bit {}", o)),
+        });
+    }
+    p.close()?;
+    // (defaults ...)
+    p.open()?;
+    if p.atom()? != "defaults" {
+        return Err("bad defaults head".into());
+    }
+    let mut defaults = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        p.ws();
+        if p.chars.peek() == Some(&'-') {
+            p.chars.next();
+            defaults.push(None);
+            continue;
+        }
+        p.open()?;
+        let head = p.atom()?;
+        let d = match head.as_str() {
+            "default-lit" => {
+                p.open()?;
+                let lit_head = p.atom()?;
+                if lit_head != "lit" {
+                    return Err(format!("bad default-lit head {}", lit_head));
+                }
+                let lit = p.literal()?;
+                p.close()?;
+                DefaultExpr::Lit(lit)
+            }
+            "default-nextval" => DefaultExpr::Nextval(p.atom()?),
+            "default-expr" => DefaultExpr::Expr(p.expr()?),
+            o => return Err(format!("bad default head {}", o)),
+        };
+        p.close()?;
+        defaults.push(Some(d));
+    }
+    p.close()?;
+    // (checks ...)
+    p.open()?;
+    if p.atom()? != "checks" {
+        return Err("bad checks head".into());
+    }
+    let mut checks = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        p.open()?;
+        let name = p.atom()?;
+        let expr = p.expr()?;
+        p.close()?;
+        checks.push(CheckDef { name, expr });
+    }
+    p.close()?;
+    // (uniques ...)
+    p.open()?;
+    if p.atom()? != "uniques" {
+        return Err("bad uniques head".into());
+    }
+    let mut uniques = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        p.open()?;
+        let name = p.atom()?;
+        let mut cols = Vec::new();
+        while !sexpr_is_close(&mut p) {
+            cols.push(p.atom()?);
+        }
+        p.close()?;
+        uniques.push(UniqueDef { name, cols });
+    }
+    p.close()?;
+    // (pkey -) | (pkey name cols...)
+    p.open()?;
+    if p.atom()? != "pkey" {
+        return Err("bad pkey head".into());
+    }
+    let pkey = if sexpr_is_close(&mut p) {
+        None
+    } else {
+        let name = p.atom()?;
+        let mut cols = Vec::new();
+        while !sexpr_is_close(&mut p) {
+            cols.push(p.atom()?);
+        }
+        Some(UniqueDef { name, cols })
+    };
+    // Careful: `(pkey -)` encodes absence as the atom "-".
+    let pkey = match &pkey {
+        Some(pk) if pk.name == "-" && pk.cols.is_empty() => None,
+        other => other.clone(),
+    };
+    p.close()?;
+    // (fks ...)
+    p.open()?;
+    if p.atom()? != "fks" {
+        return Err("bad fks head".into());
+    }
+    let mut fks = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        p.open()?;
+        let name = p.atom()?;
+        p.open()?;
+        if p.atom()? != "cols" {
+            return Err("bad fk cols head".into());
+        }
+        let mut cols = Vec::new();
+        while !sexpr_is_close(&mut p) {
+            cols.push(p.atom()?);
+        }
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "ref" {
+            return Err("bad fk ref head".into());
+        }
+        let ref_table = p.atom()?;
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "refcols" {
+            return Err("bad fk refcols head".into());
+        }
+        let mut ref_cols = Vec::new();
+        while !sexpr_is_close(&mut p) {
+            ref_cols.push(p.atom()?);
+        }
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "ondel" {
+            return Err("bad fk ondel head".into());
+        }
+        let on_delete = parse_fk_action(&p.atom()?)?;
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "onupd" {
+            return Err("bad fk onupd head".into());
+        }
+        let on_update = parse_fk_action(&p.atom()?)?;
+        p.close()?;
+        p.close()?;
+        fks.push(FkDef {
+            name,
+            cols,
+            ref_table,
+            ref_cols,
+            on_delete,
+            on_update,
+        });
+    }
+    p.close()?;
+    p.close()?;
+    p.ws();
+    if p.chars.peek().is_some() {
+        return Err("trailing data in constraints encoding".into());
+    }
+    Ok(DecodedConstraints {
+        not_null,
+        defaults,
+        checks,
+        uniques,
+        pkey,
+        fks,
+    })
+}

@@ -2,6 +2,32 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.9 baseline — 2026-09-10
+
+Environment: same sandbox, **release build** (`cargo build --release`),
+fresh temp data dir, 5 s per workload. v0.9 adds constraints, ALTER
+TABLE, views, sequences — no planner/executor hot-path changes, so
+performance is consistent with v0.8 (release vs debug accounts for the
+uplift vs the v0.8 debug numbers).
+
+| workload   | qps      | p50        | p99        | vs v0.8 (debug) |
+|------------|----------|------------|------------|-----------------|
+| `select1`  | 26,015   | 0.024 ms   | 0.242 ms   | release uplift |
+| `expr`     | 6,653    | 0.064 ms   | 1.502 ms   | release uplift |
+| `scan`     | 32.6     | 23.47 ms   | 95.10 ms   | noise |
+| `insert`   | 229.4    | 2.926 ms   | 21.14 ms   | release uplift |
+| `prepared` | 16,809   | 0.040 ms   | 0.268 ms   | release uplift |
+| `txn`      | 7,293    | 0.076 ms   | 0.988 ms   | release uplift |
+| `mvcc`     | 1,351    | 0.571 ms   | 2.764 ms   | release uplift |
+| `join`     | 1.9      | 522 ms     | 625 ms     | release uplift |
+| `idxscan`  | 18,476   | 0.031 ms   | 0.359 ms   | release uplift |
+
+`idxscan` breakdown (release, 50k rows): point lookup idx=18,476 qps vs
+seq=24 qps (**774x**); range-1000 idx=193 qps; order-limit-10 idx=12,876
+qps. Valgrind memcheck on v0.9 DDL paths (constraints, ALTER, views,
+sequences): 0 bytes definitely lost; 89 contexts are Rust-runtime false
+positives.
+
 ## v0.6 baseline — 2026-09-10
 
 Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),

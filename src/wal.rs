@@ -18,10 +18,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 4 (`RGSWAL04` / `RGSCHK04`) is NOT compatible with v0.7
-//! files: v0.8 refuses to start on a v0.7 data directory with a clear
-//! error instead of misreading it. v0.8 adds index DDL records and
-//! serializes index definitions + entries in checkpoints.
+//! Format version 5 (`RGSWAL05` / `RGSCHK05`) is NOT compatible with v0.8
+//! files: v0.9 refuses to start on a v0.8 data directory with a clear
+//! error instead of misreading it. v0.9 adds constraint/default metadata
+//! to table records, ALTER TABLE / view / sequence records, and
+//! serializes views, sequences, and constraint metadata in checkpoints.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -120,11 +121,11 @@ use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK04";
-const CHKPT_VERSION: u32 = 4;
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK05";
+const CHKPT_VERSION: u32 = 5;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL04";
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL05";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -224,6 +225,8 @@ pub enum WalRecord {
     CreateTable {
         name: String,
         columns: Vec<(String, ColType)>,
+        /// v0.9: s-expr encoded constraints/defaults (sql::encode_constraints).
+        constraints: String,
         xmin: u64,
     },
     InsertRows {
@@ -247,12 +250,108 @@ pub enum WalRecord {
         table: String,
         columns: Vec<String>,
         unique: bool,
+        /// v0.9: constraint-owned backing index.
+        internal: bool,
         xmin: u64,
     },
     DropIndex {
         name: String,
         xmax: u64,
     },
+    // --- v0.9: ALTER TABLE swaps the table version (new columns and/or
+    // constraint metadata); the row data is unchanged.
+    AlterTable {
+        name: String,
+        columns: Vec<(String, ColType)>,
+        constraints: String,
+        /// True for pure-metadata alters: replay copies the old version's
+        /// rows. False for ADD/DROP COLUMN: rows are rewritten and flow
+        /// through InsertRows records instead.
+        copy_rows: bool,
+        xmin: u64,
+    },
+    CreateView {
+        name: String,
+        query: String,
+        col_aliases: Vec<String>,
+        deps: Vec<String>,
+        xmin: u64,
+    },
+    DropView {
+        name: String,
+        xmax: u64,
+    },
+    CreateSequence {
+        name: String,
+        seq: WalSequence,
+        xmin: u64,
+    },
+    DropSequence {
+        name: String,
+        xmax: u64,
+    },
+    AlterSequence {
+        name: String,
+        seq: WalSequence,
+        xmin: u64,
+    },
+    /// A committed nextval advance. Not transactional by design (like
+    /// Postgres): replay always applies it.
+    SeqAdvance {
+        name: String,
+        last_value: i64,
+        is_called: bool,
+    },
+}
+
+/// Plain-data form of a Sequence for WAL records and checkpoints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalSequence {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    /// Last value returned by nextval; i64::MIN sentinel = never called.
+    pub current: i64,
+    pub current_is_set: bool,
+    pub is_called: bool,
+}
+
+impl WalSequence {
+    pub fn of(s: &crate::storage::Sequence) -> Self {
+        WalSequence {
+            name: s.name.clone(),
+            start: s.start,
+            increment: s.increment,
+            min_value: s.min_value,
+            max_value: s.max_value,
+            cycle: s.cycle,
+            current: s.current.unwrap_or(i64::MIN),
+            current_is_set: s.current.is_some(),
+            is_called: s.is_called,
+        }
+    }
+
+    pub fn into_sequence(self, created_xmin: u64) -> crate::storage::Sequence {
+        crate::storage::Sequence {
+            name: self.name,
+            start: self.start,
+            increment: self.increment,
+            min_value: self.min_value,
+            max_value: self.max_value,
+            cycle: self.cycle,
+            current: if self.current_is_set {
+                Some(self.current)
+            } else {
+                None
+            },
+            is_called: self.is_called,
+            created_xmin,
+            dropped_xmax: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +500,13 @@ impl Enc {
             WalRecord::CreateTable {
                 name,
                 columns,
+                constraints,
                 xmin,
             } => {
                 self.u8(1);
                 self.str(name);
                 self.columns(columns);
+                self.str(constraints);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -440,6 +541,7 @@ impl Enc {
                 table,
                 columns,
                 unique,
+                internal,
                 xmin,
             } => {
                 self.u8(5);
@@ -450,6 +552,7 @@ impl Enc {
                     self.str(c);
                 }
                 self.u8(*unique as u8);
+                self.u8(*internal as u8);
                 self.u64(*xmin);
             }
             WalRecord::DropIndex { name, xmax } => {
@@ -457,7 +560,85 @@ impl Enc {
                 self.str(name);
                 self.u64(*xmax);
             }
+            WalRecord::AlterTable {
+                name,
+                columns,
+                constraints,
+                copy_rows,
+                xmin,
+            } => {
+                self.u8(7);
+                self.str(name);
+                self.columns(columns);
+                self.str(constraints);
+                self.u8(*copy_rows as u8);
+                self.u64(*xmin);
+            }
+            WalRecord::CreateView {
+                name,
+                query,
+                col_aliases,
+                deps,
+                xmin,
+            } => {
+                self.u8(8);
+                self.str(name);
+                self.str(query);
+                self.u32(col_aliases.len() as u32);
+                for a in col_aliases {
+                    self.str(a);
+                }
+                self.u32(deps.len() as u32);
+                for d in deps {
+                    self.str(d);
+                }
+                self.u64(*xmin);
+            }
+            WalRecord::DropView { name, xmax } => {
+                self.u8(9);
+                self.str(name);
+                self.u64(*xmax);
+            }
+            WalRecord::CreateSequence { name, seq, xmin } => {
+                self.u8(10);
+                self.str(name);
+                self.sequence(seq);
+                self.u64(*xmin);
+            }
+            WalRecord::DropSequence { name, xmax } => {
+                self.u8(11);
+                self.str(name);
+                self.u64(*xmax);
+            }
+            WalRecord::AlterSequence { name, seq, xmin } => {
+                self.u8(12);
+                self.str(name);
+                self.sequence(seq);
+                self.u64(*xmin);
+            }
+            WalRecord::SeqAdvance {
+                name,
+                last_value,
+                is_called,
+            } => {
+                self.u8(13);
+                self.str(name);
+                self.i64(*last_value);
+                self.u8(*is_called as u8);
+            }
         }
+    }
+
+    fn sequence(&mut self, s: &WalSequence) {
+        self.str(&s.name);
+        self.i64(s.start);
+        self.i64(s.increment);
+        self.i64(s.min_value);
+        self.i64(s.max_value);
+        self.u8(s.cycle as u8);
+        self.i64(s.current);
+        self.u8(s.current_is_set as u8);
+        self.u8(s.is_called as u8);
     }
 }
 
@@ -605,6 +786,7 @@ impl<'a> Dec<'a> {
             1 => Ok(WalRecord::CreateTable {
                 name: self.str()?,
                 columns: self.columns()?,
+                constraints: self.str()?,
                 xmin: self.u64()?,
             }),
             2 => {
@@ -646,12 +828,14 @@ impl<'a> Dec<'a> {
                     columns.push(self.str()?);
                 }
                 let unique = self.u8()? != 0;
+                let internal = self.u8()? != 0;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
                     columns,
                     unique,
+                    internal,
                     xmin,
                 })
             }
@@ -660,8 +844,76 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropIndex { name, xmax })
             }
+            7 => Ok(WalRecord::AlterTable {
+                name: self.str()?,
+                columns: self.columns()?,
+                constraints: self.str()?,
+                copy_rows: self.u8()? != 0,
+                xmin: self.u64()?,
+            }),
+            8 => {
+                let name = self.str()?;
+                let query = self.str()?;
+                let n = self.u32()? as usize;
+                let mut col_aliases = Vec::with_capacity(n);
+                for _ in 0..n {
+                    col_aliases.push(self.str()?);
+                }
+                let m = self.u32()? as usize;
+                let mut deps = Vec::with_capacity(m);
+                for _ in 0..m {
+                    deps.push(self.str()?);
+                }
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateView {
+                    name,
+                    query,
+                    col_aliases,
+                    deps,
+                    xmin,
+                })
+            }
+            9 => Ok(WalRecord::DropView {
+                name: self.str()?,
+                xmax: self.u64()?,
+            }),
+            10 => {
+                let name = self.str()?;
+                let seq = self.sequence()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateSequence { name, seq, xmin })
+            }
+            11 => Ok(WalRecord::DropSequence {
+                name: self.str()?,
+                xmax: self.u64()?,
+            }),
+            12 => {
+                let name = self.str()?;
+                let seq = self.sequence()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::AlterSequence { name, seq, xmin })
+            }
+            13 => Ok(WalRecord::SeqAdvance {
+                name: self.str()?,
+                last_value: self.i64()?,
+                is_called: self.u8()? != 0,
+            }),
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
+    }
+
+    fn sequence(&mut self) -> Result<WalSequence, String> {
+        Ok(WalSequence {
+            name: self.str()?,
+            start: self.i64()?,
+            increment: self.i64()?,
+            min_value: self.i64()?,
+            max_value: self.i64()?,
+            cycle: self.u8()? != 0,
+            current: self.i64()?,
+            current_is_set: self.u8()? != 0,
+            is_called: self.u8()? != 0,
+        })
     }
 
     fn end(&self) -> Result<(), String> {
@@ -700,7 +952,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         WalRecord::CreateTable { xmin, .. }
         | WalRecord::DropTable { xmax: xmin, .. }
         | WalRecord::CreateIndex { xmin, .. }
-        | WalRecord::DropIndex { xmax: xmin, .. } => {
+        | WalRecord::DropIndex { xmax: xmin, .. }
+        | WalRecord::AlterTable { xmin, .. }
+        | WalRecord::CreateView { xmin, .. }
+        | WalRecord::DropView { xmax: xmin, .. }
+        | WalRecord::CreateSequence { xmin, .. }
+        | WalRecord::DropSequence { xmax: xmin, .. }
+        | WalRecord::AlterSequence { xmin, .. } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
@@ -720,18 +978,34 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 eng.txns.next_xid = *xmax + 1;
             }
         }
+        // v0.9: sequence advances carry no xid (non-transactional).
+        WalRecord::SeqAdvance { .. } => {}
     }
     match r {
         WalRecord::CreateTable {
             name,
             columns,
+            constraints,
             xmin,
         } => {
-            eng.db
-                .tables
-                .entry(name.clone())
-                .or_default()
-                .push(Table::new(columns.clone(), *xmin));
+            let mut t = Table::new(columns.clone(), *xmin);
+            match crate::sql::decode_constraints(constraints) {
+                Ok(dc) => {
+                    t.not_null = dc.not_null;
+                    t.defaults = dc.defaults;
+                    t.checks = dc.checks;
+                    t.uniques = dc.uniques;
+                    t.pkey = dc.pkey;
+                    t.fks = dc.fks;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "WAL replay: bad constraints for table \"{}\": {}",
+                        name, e
+                    ))
+                }
+            }
+            eng.db.tables.entry(name.clone()).or_default().push(t);
         }
         WalRecord::InsertRows { table, rows } => {
             // Collect the actually-inserted (id, values) first: the index
@@ -800,6 +1074,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             table,
             columns,
             unique,
+            internal,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -817,6 +1092,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     cols,
                     col_names: columns.clone(),
                     unique: *unique,
+                    internal: *internal,
                     created_xmin: *xmin,
                     dropped_xmax: 0,
                 });
@@ -844,6 +1120,127 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 name
             ),
         },
+        WalRecord::AlterTable {
+            name,
+            columns,
+            constraints,
+            copy_rows,
+            xmin,
+        } => {
+            let versions = eng.db.tables.entry(name.clone()).or_default();
+            // The previous live version is superseded.
+            if let Some(prev) = versions.iter_mut().find(|v| v.dropped_xmax == 0) {
+                prev.dropped_xmax = *xmin;
+            }
+            let mut t = Table::new(columns.clone(), *xmin);
+            match crate::sql::decode_constraints(constraints) {
+                Ok(dc) => {
+                    t.not_null = dc.not_null;
+                    t.defaults = dc.defaults;
+                    t.checks = dc.checks;
+                    t.uniques = dc.uniques;
+                    t.pkey = dc.pkey;
+                    t.fks = dc.fks;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "WAL replay: bad constraints for table \"{}\": {}",
+                        name, e
+                    ))
+                }
+            }
+            // Pure-metadata alters carry the rows forward; ADD/DROP COLUMN
+            // rewrites them via InsertRows records.
+            if *copy_rows {
+                if let Some(prev) = versions.iter().find(|v| v.dropped_xmax == *xmin) {
+                    t.rows = prev.rows.clone();
+                }
+            }
+            versions.push(t);
+        }
+        WalRecord::CreateView {
+            name,
+            query,
+            col_aliases,
+            deps,
+            xmin,
+        } => {
+            eng.db.views.entry(name.clone()).or_default().push(
+                crate::storage::ViewDef {
+                    query: query.clone(),
+                    col_aliases: col_aliases.clone(),
+                    deps: deps.clone(),
+                    created_xmin: *xmin,
+                    dropped_xmax: 0,
+                },
+            );
+        }
+        WalRecord::DropView { name, xmax } => {
+            match eng
+                .db
+                .views
+                .get_mut(name)
+                .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
+            {
+                Some(v) => v.dropped_xmax = *xmax,
+                None => eprintln!(
+                    "WAL replay: skipping DropView \"{}\": no live view",
+                    name
+                ),
+            }
+        }
+        WalRecord::CreateSequence { name, seq, xmin } => {
+            eng.db
+                .sequences
+                .entry(name.clone())
+                .or_default()
+                .push(seq.clone().into_sequence(*xmin));
+        }
+        WalRecord::DropSequence { name, xmax } => {
+            match eng
+                .db
+                .sequences
+                .get_mut(name)
+                .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
+            {
+                Some(s) => s.dropped_xmax = *xmax,
+                None => eprintln!(
+                    "WAL replay: skipping DropSequence \"{}\": no live sequence",
+                    name
+                ),
+            }
+        }
+        WalRecord::AlterSequence { name, seq, xmin } => {
+            let versions = eng.db.sequences.entry(name.clone()).or_default();
+            let mut s = seq.clone().into_sequence(*xmin);
+            // Carry the current value forward: ALTER SEQUENCE changes the
+            // parameters, not the position.
+            if let Some(prev) = versions.iter().find(|v| v.dropped_xmax == 0) {
+                s.current = prev.current;
+            }
+            versions.push(s);
+        }
+        WalRecord::SeqAdvance {
+            name,
+            last_value,
+            is_called,
+        } => {
+            match eng
+                .db
+                .sequences
+                .get_mut(name)
+                .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
+            {
+                Some(s) => {
+                    s.current = Some(*last_value);
+                    s.is_called = *is_called;
+                }
+                None => eprintln!(
+                    "WAL replay: skipping SeqAdvance \"{}\": no live sequence",
+                    name
+                ),
+            }
+        }
     }
     Ok(())
 }
@@ -958,7 +1355,153 @@ pub fn records_for_commit(
                 out.push(WalRecord::CreateTable {
                     name: name.clone(),
                     columns: ours.columns.clone(),
+                    constraints: crate::sql::encode_constraints(ours),
                     xmin: own,
+                });
+            }
+            // v0.9: ALTER TABLE swaps the table version; log the latest
+            // version this transaction created.
+            WriteOp::AlterTable {
+                name, rewrite_rows, ..
+            } => {
+                let Some(ours) = eng
+                    .db
+                    .tables
+                    .get(name)
+                    .and_then(|vs| vs.iter().filter(|t| t.created_xmin == own).last())
+                else {
+                    i += 1;
+                    continue;
+                };
+                out.push(WalRecord::AlterTable {
+                    name: name.clone(),
+                    columns: ours.columns.clone(),
+                    constraints: crate::sql::encode_constraints(ours),
+                    copy_rows: !rewrite_rows,
+                    xmin: own,
+                });
+            }
+            WriteOp::CreateView { name } => {
+                let Some(ours) = eng
+                    .db
+                    .views
+                    .get(name)
+                    .and_then(|vs| vs.iter().find(|v| v.created_xmin == own))
+                else {
+                    i += 1;
+                    continue;
+                };
+                // First-committer-wins, like CREATE TABLE. v0.9: exclude
+                // views we dropped ourselves in this transaction (OR REPLACE).
+                let rival = eng.db.views.get(name).is_some_and(|vs| {
+                    vs.iter().any(|v| {
+                        v.created_xmin != own
+                            && eng.xid_committed(v.created_xmin)
+                            && (v.dropped_xmax == 0 || !eng.xid_committed(v.dropped_xmax))
+                            && v.dropped_xmax != own
+                    })
+                });
+                if rival {
+                    return Err(format!("relation \"{}\" already exists", name));
+                }
+                out.push(WalRecord::CreateView {
+                    name: name.clone(),
+                    query: ours.query.clone(),
+                    col_aliases: ours.col_aliases.clone(),
+                    deps: ours.deps.clone(),
+                    xmin: own,
+                });
+            }
+            WriteOp::DropView { name, .. } => {
+                let won = eng
+                    .db
+                    .views
+                    .get(name)
+                    .is_some_and(|vs| vs.iter().any(|v| v.dropped_xmax == own));
+                if !won {
+                    i += 1;
+                    continue;
+                }
+                out.push(WalRecord::DropView {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
+            WriteOp::CreateSequence { name } => {
+                let Some(ours) = eng
+                    .db
+                    .sequences
+                    .get(name)
+                    .and_then(|vs| vs.iter().find(|s| s.created_xmin == own))
+                else {
+                    i += 1;
+                    continue;
+                };
+                let rival = eng.db.sequences.get(name).is_some_and(|vs| {
+                    vs.iter().any(|s| {
+                        s.created_xmin != own
+                            && eng.xid_committed(s.created_xmin)
+                            && (s.dropped_xmax == 0 || !eng.xid_committed(s.dropped_xmax))
+                    })
+                });
+                if rival {
+                    return Err(format!("relation \"{}\" already exists", name));
+                }
+                out.push(WalRecord::CreateSequence {
+                    name: name.clone(),
+                    seq: WalSequence::of(ours),
+                    xmin: own,
+                });
+            }
+            WriteOp::DropSequence { name, .. } => {
+                let won = eng
+                    .db
+                    .sequences
+                    .get(name)
+                    .is_some_and(|vs| vs.iter().any(|s| s.dropped_xmax == own));
+                if !won {
+                    i += 1;
+                    continue;
+                }
+                out.push(WalRecord::DropSequence {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
+            WriteOp::AlterSequence { name, .. } => {
+                let Some(ours) = eng
+                    .db
+                    .sequences
+                    .get(name)
+                    .and_then(|vs| vs.iter().filter(|s| s.created_xmin == own).last())
+                else {
+                    i += 1;
+                    continue;
+                };
+                out.push(WalRecord::AlterSequence {
+                    name: name.clone(),
+                    seq: WalSequence::of(ours),
+                    xmin: own,
+                });
+            }
+            // v0.9: sequence advances are non-transactional (Postgres
+            // semantics): the value at commit time is logged, and abort
+            // never rolls it back.
+            WriteOp::SeqAdvance { name, .. } => {
+                let Some((cur, called)) = eng
+                    .db
+                    .sequences
+                    .get(name)
+                    .and_then(|vs| vs.iter().find(|s| s.dropped_xmax == 0))
+                    .and_then(|s| s.current.map(|c| (c, s.is_called)))
+                else {
+                    i += 1;
+                    continue;
+                };
+                out.push(WalRecord::SeqAdvance {
+                    name: name.clone(),
+                    last_value: cur,
+                    is_called: called,
                 });
             }
             WriteOp::DropTable { name, .. } => {
@@ -1002,6 +1545,7 @@ pub fn records_for_commit(
                     table: ix.def.table.clone(),
                     columns: ix.def.col_names.clone(),
                     unique: ix.def.unique,
+                    internal: ix.def.internal,
                     xmin: own,
                 });
             }
@@ -1035,7 +1579,9 @@ fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Vec<Value>, bool)> {
             if let Some(pos) = t.row_pos(row_id) {
                 let v = &t.rows[pos];
                 if v.xmin != own {
-                    return None;
+                    // Not our row version (e.g. an old table version with
+                    // reused row ids after ALTER); keep searching.
+                    continue;
                 }
                 let dropped = t.dropped_xmax != 0
                     && t.dropped_xmax != own
@@ -1221,6 +1767,8 @@ impl Wal {
                 body.u64(t.created_xmin);
                 body.u64(dropped_xmax);
                 body.columns(&t.columns);
+                // v0.9: constraint/default metadata.
+                body.str(&crate::sql::encode_constraints(t));
                 let live_rows: Vec<&RowVersion> = t
                     .rows
                     .iter()
@@ -1264,12 +1812,69 @@ impl Wal {
                 ix_body.str(c);
             }
             ix_body.u8(ix.def.unique as u8);
+            // v0.9: persist the constraint-owned flag.
+            ix_body.u8(ix.def.internal as u8);
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
         }
         img.u32(n_indexes);
         img.bytes(&ix_body.buf);
+
+        // v0.9: views. Only live, committed versions.
+        let mut v_names: Vec<&String> = eng.db.views.keys().collect();
+        v_names.sort();
+        let mut v_body = Enc::new();
+        let mut n_views = 0u32;
+        for name in v_names {
+            for v in &eng.db.views[name] {
+                if !eng.xid_committed(v.created_xmin) {
+                    continue;
+                }
+                if committed_xmax(eng, v.dropped_xmax) != 0 {
+                    continue;
+                }
+                v_body.str(name);
+                v_body.u64(v.created_xmin);
+                v_body.u64(0); // live view: no committed drop
+                v_body.str(&v.query);
+                v_body.u32(v.col_aliases.len() as u32);
+                for a in &v.col_aliases {
+                    v_body.str(a);
+                }
+                v_body.u32(v.deps.len() as u32);
+                for d in &v.deps {
+                    v_body.str(d);
+                }
+                n_views += 1;
+            }
+        }
+        img.u32(n_views);
+        img.bytes(&v_body.buf);
+
+        // v0.9: sequences, including their current values (crash-safe).
+        // Only live, committed versions.
+        let mut s_names: Vec<&String> = eng.db.sequences.keys().collect();
+        s_names.sort();
+        let mut s_body = Enc::new();
+        let mut n_seqs = 0u32;
+        for name in s_names {
+            for s in &eng.db.sequences[name] {
+                if !eng.xid_committed(s.created_xmin) {
+                    continue;
+                }
+                if committed_xmax(eng, s.dropped_xmax) != 0 {
+                    continue;
+                }
+                s_body.str(name);
+                s_body.u64(s.created_xmin);
+                s_body.u64(0); // live sequence: no committed drop
+                s_body.sequence(&WalSequence::of(s));
+                n_seqs += 1;
+            }
+        }
+        img.u32(n_seqs);
+        img.bytes(&s_body.buf);
 
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
@@ -1391,6 +1996,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let columns = d.columns().map_err(|e| bad(&e))?;
+        // v0.9: constraint/default metadata.
+        let constraints = d.str().map_err(|e| bad(&e))?;
         let n_rows = d.u32().map_err(|e| bad(&e))? as usize;
         let mut rows = Vec::with_capacity(n_rows);
         for _ in 0..n_rows {
@@ -1417,6 +2024,22 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
+        match crate::sql::decode_constraints(&constraints) {
+            Ok(dc) => {
+                __t.not_null = dc.not_null;
+                __t.defaults = dc.defaults;
+                __t.checks = dc.checks;
+                __t.uniques = dc.uniques;
+                __t.pkey = dc.pkey;
+                __t.fks = dc.fks;
+            }
+            Err(e) => {
+                return Err(bad(&format!(
+                    "bad constraints for table \"{}\": {}",
+                    name, e
+                )))
+            }
+        }
         for __rv in rows {
             __t.push_version(__rv);
         }
@@ -1434,6 +2057,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             col_names.push(d.str().map_err(|e| bad(&e))?);
         }
         let unique = d.u8().map_err(|e| bad(&e))? != 0;
+        // v0.9: constraint-owned flag.
+        let internal = d.u8().map_err(|e| bad(&e))? != 0;
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -1466,6 +2091,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 cols,
                 col_names,
                 unique,
+                internal,
                 created_xmin,
                 dropped_xmax,
             });
@@ -1476,6 +2102,44 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             ix
         };
         eng.db.indexes.insert(name, ix);
+    }
+    // v0.9: views.
+    let n_views = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_views {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let created_xmin = d.u64().map_err(|e| bad(&e))?;
+        let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
+        let query = d.str().map_err(|e| bad(&e))?;
+        let n_a = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut col_aliases = Vec::with_capacity(n_a);
+        for _ in 0..n_a {
+            col_aliases.push(d.str().map_err(|e| bad(&e))?);
+        }
+        let n_d = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut deps = Vec::with_capacity(n_d);
+        for _ in 0..n_d {
+            deps.push(d.str().map_err(|e| bad(&e))?);
+        }
+        eng.db.views.entry(name.clone()).or_default().push(
+            crate::storage::ViewDef {
+                query,
+                col_aliases,
+                deps,
+                created_xmin,
+                dropped_xmax,
+            },
+        );
+    }
+    // v0.9: sequences, with their current values.
+    let n_seqs = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_seqs {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let created_xmin = d.u64().map_err(|e| bad(&e))?;
+        let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
+        let ws = d.sequence().map_err(|e| bad(&e))?;
+        let mut s = ws.into_sequence(created_xmin);
+        s.dropped_xmax = dropped_xmax;
+        eng.db.sequences.entry(name).or_default().push(s);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
@@ -1533,10 +2197,12 @@ mod tests {
 
     #[test]
     fn record_roundtrip_all_kinds() {
+        let empty_constraints = "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
         let cases = vec![
             WalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("a".into(), ColType::Int)],
+                constraints: empty_constraints.clone(),
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -1674,11 +2340,13 @@ mod tests {
     #[test]
     fn apply_record_rebuilds_versions_and_counters() {
         let mut eng = Engine::new();
+        let empty_constraints = "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
         apply_record(
             &mut eng,
             &WalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("a".into(), ColType::Int)],
+                constraints: empty_constraints,
                 xmin: 4,
             },
         )

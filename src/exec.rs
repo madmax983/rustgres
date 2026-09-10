@@ -38,12 +38,14 @@
 
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
-    AggFunc, ArithOp, CmpOp, Expr, FromItem, InsertValue, IsolationLevel, JoinKind, Literal,
-    OrderTerm, SelectItem, SelectStmt, Stmt, WhereCond, WhereRhs,
+    AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, DefaultExpr, Expr, FkAction, FkDef, FromItem,
+    InsertValue, IsolationLevel, JoinKind, Literal, OrderTerm, SelectItem, SelectStmt, SequenceOpts,
+    SqlError, Stmt, TableDef, UniqueDef, WhereCond, WhereRhs, collect_col_refs, collect_table_refs,
+    parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ColStats, ColType, Database, Engine, Numeric, RowVersion, Snapshot, Table, TableStats, Value,
-    WriteOp, row_visible,
+    ColStats, ColType, Database, Engine, Numeric, RowVersion, Sequence, Snapshot, Table, TableStats,
+    Value, ViewDef, WriteOp, row_visible,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +64,14 @@ fn exec_err(code: &'static str, message: impl Into<String>) -> ExecError {
     }
 }
 
+/// Convert a SQL-layer validation error into an execution error.
+fn sql_err(e: SqlError) -> ExecError {
+    // SqlError.code is &'static str; ExecError.code is too, but the borrow
+    // checker can't see that — map to a static fallback.
+    let _ = e.code;
+    exec_err("42601", e.message)
+}
+
 /// Per-statement execution context: the snapshot to read from, the
 /// acting transaction's xid, its isolation level, and the write log that
 /// receives every mutation (for undo and commit-time WAL records).
@@ -70,6 +80,8 @@ pub struct StmtCtx<'a> {
     pub own: u64,
     pub level: IsolationLevel,
     pub writes: &'a mut Vec<WriteOp>,
+    /// v0.9: server-assigned session id, for session-local `currval`.
+    pub session: u64,
 }
 
 /// Outcome of executing one statement.
@@ -92,7 +104,7 @@ pub enum ExecResult {
 
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     match stmt {
-        Stmt::CreateTable { name, columns } => exec_create(eng, ctx, name, columns),
+        Stmt::CreateTable { name, def } => exec_create(eng, ctx, name, def),
         Stmt::Insert {
             table,
             columns,
@@ -109,6 +121,7 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     eng,
                     snap: ctx.snap,
                     own: ctx.own,
+                    session: ctx.session,
                     depth: 0,
                     lock_ids: &mut lock_ids,
                 };
@@ -122,7 +135,31 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                 rows: out.rows,
             })
         }
-        Stmt::DropTable { if_exists, name } => exec_drop(eng, ctx, name, *if_exists),
+        Stmt::DropTable {
+            if_exists,
+            names,
+            cascade,
+        } => exec_drop(eng, ctx, names, *if_exists, *cascade),
+        // --- v0.9: constraints / ALTER / views / sequences
+        Stmt::AlterTable { name, action } => exec_alter(eng, ctx, name, action),
+        Stmt::CreateView {
+            name,
+            query,
+            col_aliases,
+            or_replace,
+        } => exec_create_view(eng, ctx, name, query, col_aliases, *or_replace),
+        Stmt::DropView {
+            names,
+            if_exists,
+            cascade,
+        } => exec_drop_view(eng, ctx, names, *if_exists, *cascade),
+        Stmt::CreateSequence {
+            name,
+            if_not_exists,
+            opts,
+        } => exec_create_sequence(eng, ctx, name, *if_not_exists, opts),
+        Stmt::AlterSequence { name, opts } => exec_alter_sequence(eng, ctx, name, opts),
+        Stmt::DropSequence { names, if_exists } => exec_drop_sequence(eng, ctx, names, *if_exists),
         // --- v0.8: indexes / EXPLAIN / ANALYZE
         Stmt::CreateIndex {
             name,
@@ -177,21 +214,15 @@ fn exec_create(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
-    columns: &[(String, ColType)],
+    def: &TableDef,
 ) -> Result<ExecResult, ExecError> {
-    if eng.db.find_table(name, ctx.snap, ctx.own).is_some() {
+    if eng.db.find_table(name, ctx.snap, ctx.own).is_some()
+        || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
+    {
         return Err(exec_err(
             "42P07",
             format!("relation \"{}\" already exists", name),
         ));
-    }
-    for (i, (col, _)) in columns.iter().enumerate() {
-        if columns[..i].iter().any(|(c, _)| c == col) {
-            return Err(exec_err(
-                "42701",
-                format!("column \"{}\" specified more than once", col),
-            ));
-        }
     }
     // NOTE: a concurrent uncommitted CREATE of the same name is allowed
     // here (it is invisible to us); the commit-time check in server.rs
@@ -200,13 +231,684 @@ fn exec_create(
         .tables
         .entry(name.to_string())
         .or_default()
-        .push(crate::storage::Table::new(columns.to_vec(), ctx.own));
+        .push(Table::with_def(def, ctx.own));
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
     });
+    // Validate foreign keys after the table exists so self-references
+    // resolve. On failure the statement aborts and undo removes the
+    // table (statement atomicity).
+    for fk in &def.fks {
+        validate_fk_def(eng, ctx, name, fk)?;
+    }
+    // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
+    // table is empty, so no duplicate check is needed.
+    if let Some(pk) = &def.pkey {
+        create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+    }
+    for u in &def.uniques {
+        create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+    }
     Ok(ExecResult::Command {
         tag: "CREATE TABLE".to_string(),
     })
+}
+
+/// Validate a foreign-key definition: the referenced table exists, the
+/// referenced columns resolve, and they form the parent's primary key or
+/// a unique constraint (SQLSTATE 42830, like Postgres).
+fn validate_fk_def(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    child_table: &str,
+    fk: &FkDef,
+) -> Result<(), ExecError> {
+    let child = eng
+        .db
+        .find_table(child_table, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", child_table)))?;
+    for c in &fk.cols {
+        if child.column_index(c).is_none() {
+            return Err(exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", c, child_table),
+            ));
+        }
+    }
+    let parent = eng.db.find_table(&fk.ref_table, ctx.snap, ctx.own).ok_or_else(|| {
+        exec_err(
+            "42P01",
+            format!("relation \"{}\" does not exist", fk.ref_table),
+        )
+    })?;
+    let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+        match &parent.pkey {
+            Some(pk) => pk.cols.clone(),
+            None => {
+                return Err(exec_err(
+                    "42830",
+                    format!(
+                        "there is no primary key for referenced table \"{}\"",
+                        fk.ref_table
+                    ),
+                ))
+            }
+        }
+    } else {
+        fk.ref_cols.clone()
+    };
+    if fk.cols.len() != ref_cols.len() {
+        return Err(exec_err(
+            "42830",
+            format!(
+                "number of referencing and referenced columns for foreign key \"{}\" must be the same",
+                fk.name
+            ),
+        ));
+    }
+    for c in &ref_cols {
+        if parent.column_index(c).is_none() {
+            return Err(exec_err(
+                "42703",
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    c, fk.ref_table
+                ),
+            ));
+        }
+    }
+    let is_key = parent
+        .pkey
+        .as_ref()
+        .map(|pk| pk.cols == ref_cols)
+        .unwrap_or(false)
+        || parent.uniques.iter().any(|u| u.cols == ref_cols);
+    if !is_key {
+        return Err(exec_err(
+            "42830",
+            format!(
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                fk.ref_table
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the backing unique index for a PRIMARY KEY / UNIQUE constraint
+/// (`internal` marks it as constraint-owned). Checks for duplicate keys
+/// among live row versions, like CREATE UNIQUE INDEX.
+fn create_constraint_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    cname: &str,
+    cols: &[String],
+    internal: bool,
+) -> Result<(), ExecError> {
+    if eng.db.find_index(cname, ctx.snap, ctx.own).is_some() {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", cname),
+        ));
+    }
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own)
+        .expect("table still visible; engine lock held throughout");
+    let mut seen = Vec::with_capacity(cols.len());
+    for c in cols {
+        let pos = t.column_index(c).ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", c, table),
+            )
+        })?;
+        if seen.contains(&pos) {
+            return Err(exec_err(
+                "42701",
+                format!("column \"{}\" specified more than once", c),
+            ));
+        }
+        seen.push(pos);
+    }
+    let mut ix = Index::new(IndexDef {
+        name: cname.to_string(),
+        table: table.to_string(),
+        cols: seen,
+        col_names: cols.to_vec(),
+        unique: true,
+        internal,
+        created_xmin: ctx.own,
+        dropped_xmax: 0,
+    });
+    for r in &t.rows {
+        let key = ix.key_for(&r.values);
+        ix.insert(key, r.id);
+    }
+    // Duplicate check among versions that could still become visible
+    // (mirrors CREATE UNIQUE INDEX).
+    for (key, ids) in &ix.tree {
+        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if ids.len() > 1 {
+            return Err(exec_err(
+                "23505",
+                format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    cname
+                ),
+            ));
+        }
+    }
+    eng.db.indexes.insert(cname.to_string(), ix);
+    ctx.writes.push(WriteOp::CreateIndex {
+        name: cname.to_string(),
+    });
+    Ok(())
+}
+
+// ============================================================================
+// v0.9: constraint enforcement (NOT NULL / CHECK / FOREIGN KEY / DEFAULT).
+// ============================================================================
+
+/// Owned copy of a table's constraint metadata, so checks can run while
+/// `eng` is mutably borrowed for expression evaluation.
+#[derive(Clone)]
+struct TableMeta {
+    columns: Vec<(String, ColType)>,
+    not_null: Vec<bool>,
+    defaults: Vec<Option<DefaultExpr>>,
+    checks: Vec<CheckDef>,
+    pkey: Option<UniqueDef>,
+    fks: Vec<FkDef>,
+}
+
+impl TableMeta {
+    fn of(t: &Table) -> Self {
+        TableMeta {
+            columns: t.columns.clone(),
+            not_null: t.not_null.clone(),
+            defaults: t.defaults.clone(),
+            checks: t.checks.clone(),
+            pkey: t.pkey.clone(),
+            fks: t.fks.clone(),
+        }
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|(n, _)| n == name)
+    }
+}
+
+/// Evaluate a column DEFAULT to a value of the column's type.
+fn eval_default(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    d: &DefaultExpr,
+    ctype: &ColType,
+    cname: &str,
+) -> Result<Value, ExecError> {
+    match d {
+        DefaultExpr::Lit(lit) => coerce_literal(lit, ctype, cname),
+        DefaultExpr::Nextval(seq) => {
+            let v = seq_nextval(eng, snap, own, session, seq)?;
+            coerce_value(Value::BigInt(v), ctype, cname)
+        }
+        DefaultExpr::Expr(e) => {
+            let mut lock_ids = Vec::new();
+            let mut q = Q {
+                eng,
+                snap,
+                own,
+                session,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+            };
+            let v = eval_expr(&mut q, &[], e)?;
+            coerce_value(v, ctype, cname)
+        }
+    }
+}
+
+/// NOT NULL + CHECK validation for a fully-built row (INSERT / UPDATE /
+/// cascaded writes). SQLSTATEs 23502 / 23514, like Postgres.
+fn check_row_constraints(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    meta: &TableMeta,
+    table: &str,
+    values: &[Value],
+) -> Result<(), ExecError> {
+    for (i, (name, _)) in meta.columns.iter().enumerate() {
+        if meta.not_null[i] && matches!(values[i], Value::Null) {
+            return Err(exec_err(
+                "23502",
+                format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                    name, table
+                ),
+            ));
+        }
+    }
+    if meta.checks.is_empty() {
+        return Ok(());
+    }
+    let schema: Vec<QCol> = meta
+        .columns
+        .iter()
+        .map(|(n, ty)| QCol {
+            qual: String::new(),
+            name: n.clone(),
+            ty: ty.clone(),
+        })
+        .collect();
+    for check in &meta.checks {
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng,
+            snap,
+            own,
+            session,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+        };
+        let frame = Scope {
+            schema: &schema,
+            row: values,
+        };
+        let v = eval_expr(&mut q, &[frame], &check.expr)?;
+        // Postgres CHECK passes on TRUE or NULL; only FALSE fails it.
+        if matches!(v, Value::Bool(false)) {
+            return Err(exec_err(
+                "23514",
+                format!(
+                    "new row for relation \"{}\" violates check constraint \"{}\"",
+                    table, check.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an FK's referenced column names (empty = parent's primary key).
+fn fk_ref_cols(parent_meta: &TableMeta, fk: &FkDef) -> Result<Vec<String>, ExecError> {
+    if fk.ref_cols.is_empty() {
+        match &parent_meta.pkey {
+            Some(pk) => Ok(pk.cols.clone()),
+            None => Err(exec_err(
+                "42830",
+                format!(
+                    "there is no primary key for referenced table \"{}\"",
+                    fk.ref_table
+                ),
+            )),
+        }
+    } else {
+        Ok(fk.ref_cols.clone())
+    }
+}
+
+/// Child-side foreign-key check for one new row (INSERT / UPDATE /
+/// cascaded SET NULL / SET DEFAULT). `self_new` holds the statement's own
+/// new rows on the child table (self-references); `ignore_id` excludes the
+/// row version being replaced (self-referencing UPDATE).
+///
+/// MATCH SIMPLE semantics: a NULL in any referencing column skips the
+/// check. Violation is SQLSTATE 23503.
+fn check_fk_child_row(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    child_meta: &TableMeta,
+    child_table: &str,
+    values: &[Value],
+    self_new: &[Vec<Value>],
+    ignore_id: Option<u64>,
+) -> Result<(), ExecError> {
+    for fk in &child_meta.fks {
+        let child_pos: Vec<usize> = fk
+            .cols
+            .iter()
+            .map(|c| child_meta.column_index(c).expect("fk columns validated at DDL"))
+            .collect();
+        let key: Vec<Value> = child_pos.iter().map(|&i| values[i].clone()).collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        let parent = eng
+            .db
+            .find_table(&fk.ref_table, snap, own)
+            .expect("fk parent validated at DDL time");
+        let parent_meta = TableMeta::of(parent);
+        let ref_cols = fk_ref_cols(&parent_meta, fk)?;
+        let parent_pos: Vec<usize> = ref_cols
+            .iter()
+            .map(|c| parent.column_index(c).expect("fk ref cols validated at DDL"))
+            .collect();
+        let matches_key = |vals: &[Value]| {
+            parent_pos
+                .iter()
+                .zip(key.iter())
+                .all(|(&pi, kv)| vals[pi] == *kv)
+        };
+        let self_ref = fk.ref_table == child_table;
+        let found = parent
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, snap, own))
+            .filter(|r| !(self_ref && Some(r.id) == ignore_id))
+            .any(|r| matches_key(&r.values))
+            || (self_ref && self_new.iter().any(|v| matches_key(v)));
+        if !found {
+            return Err(exec_err(
+                "23503",
+                format!(
+                    "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                    child_table, fk.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every (child table, FK) pair in the database whose referenced table is
+/// `parent`, using the versions visible to (`snap`, `own`).
+fn fks_referencing(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    parent: &str,
+) -> Vec<(String, FkDef)> {
+    let mut out = Vec::new();
+    for (name, versions) in &eng.db.tables {
+        if let Some(t) = versions.iter().find(|t| crate::storage::table_visible(t, snap, own)) {
+            for fk in &t.fks {
+                if fk.ref_table == parent {
+                    out.push((name.clone(), fk.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cascaded writes collected while planning parent-side FK actions.
+#[derive(Default)]
+struct FkCascade {
+    /// (table, row id, prev xmax) to delete.
+    deletes: Vec<(String, u64, u64)>,
+    /// (table, row id, prev xmax, new values) to update.
+    updates: Vec<(String, u64, u64, Vec<Value>)>,
+}
+
+impl FkCascade {
+    fn contains(&self, table: &str, id: u64) -> bool {
+        self.deletes.iter().any(|(t, i, _)| t == table && *i == id)
+            || self.updates.iter().any(|(t, i, _, _)| t == table && *i == id)
+    }
+}
+
+/// Plan the child-side effects of deleting/updating parent rows.
+///
+/// `changed` holds (row id, old values, new values or None for delete) for
+/// the parent table. RESTRICT violations fail with 23503; CASCADE / SET
+/// NULL / SET DEFAULT collect into `out` (recursively, depth-limited).
+fn plan_fk_cascade(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    level: IsolationLevel,
+    parent_table: &str,
+    parent_meta: &TableMeta,
+    changed: &[(u64, Vec<Value>, Option<Vec<Value>>)],
+    depth: u8,
+    out: &mut FkCascade,
+) -> Result<(), ExecError> {
+    if depth > 16 {
+        return Err(exec_err(
+            "54000",
+            "foreign key cascade depth exceeded".to_string(),
+        ));
+    }
+    for (child_table, fk) in fks_referencing(eng, snap, own, parent_table) {
+        let ref_cols = fk_ref_cols(parent_meta, &fk)?;
+        let parent_pos: Vec<usize> = ref_cols
+            .iter()
+            .map(|c| {
+                parent_meta.column_index(c).expect("fk ref cols validated at DDL")
+            })
+            .collect();
+        // Child metadata (owned; the borrow ends before recursion).
+        let child_meta = {
+            let t = eng
+                .db
+                .find_table(&child_table, snap, own)
+                .expect("child table visible; engine lock held");
+            TableMeta::of(t)
+        };
+        let child_pos: Vec<usize> = fk
+            .cols
+            .iter()
+            .map(|c| child_meta.column_index(c).expect("fk cols validated at DDL"))
+            .collect();
+        for (pid, old_values, new_values) in changed {
+            let _ = pid;
+            let old_key: Vec<Value> =
+                parent_pos.iter().map(|&i| old_values[i].clone()).collect();
+            let new_key: Option<Vec<Value>> = new_values
+                .as_ref()
+                .map(|nv| parent_pos.iter().map(|&i| nv[i].clone()).collect());
+            if let Some(nk) = &new_key {
+                if nk == &old_key {
+                    continue; // key unchanged: nothing to do
+                }
+            }
+            let act = if new_values.is_some() {
+                fk.on_update
+            } else {
+                fk.on_delete
+            };
+            // Visible child rows referencing the old key.
+            let refs: Vec<(u64, u64, Vec<Value>)> = {
+                let t = eng
+                    .db
+                    .find_table(&child_table, snap, own)
+                    .expect("child table visible; engine lock held");
+                t.rows
+                    .iter()
+                    .filter(|r| row_visible(r, snap, own))
+                    .filter(|r| {
+                        child_pos
+                            .iter()
+                            .zip(old_key.iter())
+                            .all(|(&ci, kv)| r.values[ci] == *kv)
+                    })
+                    .map(|r| (r.id, r.xmax, r.values.clone()))
+                    .collect()
+            };
+            for (cid, cxmax, cvalues) in refs {
+                if out.contains(&child_table, cid) {
+                    continue; // already handled by this cascade
+                }
+                match act {
+                    FkAction::Restrict => {
+                        return Err(exec_err(
+                            "23503",
+                            format!(
+                                "{} on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                                if new_values.is_some() { "update" } else { "delete" },
+                                parent_table,
+                                fk.name,
+                                child_table,
+                            ),
+                        ));
+                    }
+                    FkAction::Cascade => {
+                        check_write_conflict(eng, cxmax, level)?;
+                        check_row_lock(eng, &child_table, cid, own)?;
+                        if let Some(nk) = &new_key {
+                            // ON UPDATE CASCADE: move the child key.
+                            let mut nv = cvalues.clone();
+                            for (&ci, kv) in child_pos.iter().zip(nk.iter()) {
+                                nv[ci] = kv.clone();
+                            }
+                            check_row_constraints(
+                                eng, snap, own, session, &child_meta, &child_table, &nv,
+                            )?;
+                            if let Some(vname) =
+                                eng.db.unique_violation(&child_table, &nv, Some(cid), snap, own)
+                            {
+                                return Err(exec_err(
+                                    "23505",
+                                    format!(
+                                        "duplicate key value violates unique constraint \"{}\"",
+                                        vname
+                                    ),
+                                ));
+                            }
+                            // The child's own FKs must still hold.
+                            check_fk_child_row(
+                                eng, snap, own, &child_meta, &child_table, &nv, &[], Some(cid),
+                            )?;
+                            out.updates.push((child_table.clone(), cid, cxmax, nv.clone()));
+                            let child_meta2 = child_meta.clone();
+                            plan_fk_cascade(
+                                eng, snap, own, session, level,
+                                &child_table, &child_meta2,
+                                &[(cid, cvalues.clone(), Some(nv))],
+                                depth + 1, out,
+                            )?;
+                        } else {
+                            // ON DELETE CASCADE.
+                            out.deletes.push((child_table.clone(), cid, cxmax));
+                            let child_meta2 = child_meta.clone();
+                            plan_fk_cascade(
+                                eng, snap, own, session, level,
+                                &child_table, &child_meta2,
+                                &[(cid, cvalues.clone(), None)],
+                                depth + 1, out,
+                            )?;
+                        }
+                    }
+                    FkAction::SetNull | FkAction::SetDefault => {
+                        check_write_conflict(eng, cxmax, level)?;
+                        check_row_lock(eng, &child_table, cid, own)?;
+                        let mut nv = cvalues.clone();
+                        for &ci in &child_pos {
+                            nv[ci] = match act {
+                                FkAction::SetNull => Value::Null,
+                                _ => {
+                                    let (cname, ctype) = &child_meta.columns[ci];
+                                    match &child_meta.defaults[ci] {
+                                        Some(d) => eval_default(
+                                            eng, snap, own, session, d, ctype, cname,
+                                        )?,
+                                        None => Value::Null,
+                                    }
+                                }
+                            };
+                        }
+                        check_row_constraints(
+                            eng, snap, own, session, &child_meta, &child_table, &nv,
+                        )?;
+                        if let Some(vname) =
+                            eng.db.unique_violation(&child_table, &nv, Some(cid), snap, own)
+                        {
+                            return Err(exec_err(
+                                "23505",
+                                format!(
+                                    "duplicate key value violates unique constraint \"{}\"",
+                                    vname
+                                ),
+                            ));
+                        }
+                        check_fk_child_row(
+                            eng, snap, own, &child_meta, &child_table, &nv, &[], Some(cid),
+                        )?;
+                        out.updates.push((child_table.clone(), cid, cxmax, nv.clone()));
+                        let child_meta2 = child_meta.clone();
+                        plan_fk_cascade(
+                            eng, snap, own, session, level,
+                            &child_table, &child_meta2,
+                            &[(cid, cvalues.clone(), Some(nv))],
+                            depth + 1, out,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a planned FK cascade: deletes then updates, with index
+/// maintenance and write logging, like exec_update/exec_delete do.
+fn apply_fk_cascade(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    out: FkCascade,
+) -> Result<(), ExecError> {
+    // Deletes.
+    for (table, id, prev_xmax) in &out.deletes {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table still visible; engine lock held throughout");
+        let pos = t
+            .row_pos(*id)
+            .expect("row version still present; engine lock held throughout");
+        t.rows[pos].xmax = ctx.own;
+        ctx.writes.push(WriteOp::DeleteRow {
+            table: table.clone(),
+            row_id: *id,
+            prev_xmax: *prev_xmax,
+        });
+    }
+    // Updates = delete old version + insert new version.
+    let mut new_ids = Vec::with_capacity(out.updates.len());
+    for _ in 0..out.updates.len() {
+        new_ids.push(eng.alloc_row_id());
+    }
+    let mut indexed: Vec<(String, u64, Vec<Value>)> = Vec::with_capacity(out.updates.len());
+    for ((table, old_id, prev_xmax, new_values), new_id) in out.updates.iter().zip(new_ids) {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table still visible; engine lock held throughout");
+        let pos = t
+            .row_pos(*old_id)
+            .expect("row version still present; engine lock held throughout");
+        t.rows[pos].xmax = ctx.own;
+        ctx.writes.push(WriteOp::DeleteRow {
+            table: table.clone(),
+            row_id: *old_id,
+            prev_xmax: *prev_xmax,
+        });
+        t.push_version(RowVersion {
+            id: new_id,
+            values: new_values.clone(),
+            xmin: ctx.own,
+            xmax: 0,
+        });
+        ctx.writes.push(WriteOp::InsertRow {
+            table: table.clone(),
+            row_id: new_id,
+        });
+        indexed.push((table.clone(), new_id, new_values.clone()));
+    }
+    for (table, new_id, new_values) in &indexed {
+        eng.db.index_insert_row(table, *new_id, new_values);
+    }
+    Ok(())
 }
 
 fn assign_err(col_name: &str, col_type: &ColType, from: &str) -> ExecError {
@@ -390,15 +1092,18 @@ fn exec_insert(
 ) -> Result<ExecResult, ExecError> {
     // Validate everything before mutating (statement atomicity).
     let new_rows: Vec<Vec<Value>> = {
-        let t = eng
-            .db
-            .find_table(table, ctx.snap, ctx.own)
-            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let meta = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own)
+                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+            TableMeta::of(t)
+        };
         let targets: Vec<usize> = match columns {
             Some(names) => names
                 .iter()
                 .map(|n| {
-                    t.column_index(n).ok_or_else(|| {
+                    meta.columns.iter().position(|(c, _)| c == n).ok_or_else(|| {
                         exec_err(
                             "42703",
                             format!("column \"{}\" of relation \"{}\" does not exist", n, table),
@@ -406,9 +1111,9 @@ fn exec_insert(
                     })
                 })
                 .collect::<Result<_, _>>()?,
-            None => (0..t.columns.len()).collect(),
+            None => (0..meta.columns.len()).collect(),
         };
-        let ncols = t.columns.len();
+        let ncols = meta.columns.len();
         let mut built = Vec::with_capacity(rows.len());
         for row in rows {
             if row.len() != targets.len() {
@@ -422,22 +1127,53 @@ fn exec_insert(
                 ));
             }
             let mut values = vec![Value::Null; ncols];
+            let mut explicit = vec![false; ncols];
             for (v, &ci) in row.iter().zip(targets.iter()) {
-                let lit = match v {
-                    InsertValue::Lit(l) => l,
+                let (cname, ctype) = &meta.columns[ci];
+                values[ci] = match v {
+                    InsertValue::Lit(l) => coerce_literal(l, ctype, cname)?,
                     InsertValue::Param(n) => {
                         return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
                     }
+                    // v0.9: DEFAULT in VALUES applies the column default.
+                    InsertValue::Default => match &meta.defaults[ci] {
+                        Some(d) => eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?,
+                        None => Value::Null,
+                    },
                 };
-                let (cname, ctype) = &t.columns[ci];
-                values[ci] = coerce_literal(lit, ctype, cname)?;
+                explicit[ci] = true;
             }
+            // v0.9: fill defaults for columns not mentioned.
+            for (i, d) in meta.defaults.iter().enumerate() {
+                if !explicit[i] {
+                    if let Some(d) = d {
+                        let (cname, ctype) = &meta.columns[i];
+                        values[i] = eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?;
+                    }
+                }
+            }
+            // v0.9: NOT NULL + CHECK.
+            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &values)?;
             built.push(values);
         }
         // v0.8: statement-atomic UNIQUE enforcement — every row is checked
         // against the indexes and against earlier rows of this statement
         // before any version is pushed.
         check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own)?;
+        // v0.9: child-side foreign keys. Rows inserted earlier in the same
+        // statement are visible to later rows (self-references).
+        for (i, values) in built.iter().enumerate() {
+            check_fk_child_row(
+                eng,
+                ctx.snap,
+                ctx.own,
+                &meta,
+                table,
+                values,
+                &built[..i],
+                None,
+            )?;
+        }
         built
     };
     // Apply: each row becomes a version owned by this transaction,
@@ -507,13 +1243,6 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
 }
 
 /// Does this row version satisfy all WHERE conditions? (UPDATE/DELETE.)
-fn row_matches_where(
-    t: &crate::storage::Table,
-    values: &[Value],
-    where_: &[WhereCond],
-) -> Result<bool, ExecError> {
-    row_matches_where_cols(&t.columns, values, where_)
-}
 
 fn row_matches_where_cols(
     columns: &[(String, ColType)],
@@ -596,10 +1325,11 @@ fn exec_update(
             .db
             .find_table(table, ctx.snap, ctx.own)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let meta = TableMeta::of(t);
         let set_cols: Vec<usize> = sets
             .iter()
             .map(|(name, _)| {
-                t.column_index(name).ok_or_else(|| {
+                meta.column_index(name).ok_or_else(|| {
                     exec_err(
                         "42703",
                         format!(
@@ -610,7 +1340,7 @@ fn exec_update(
                 })
             })
             .collect::<Result<_, _>>()?;
-        let columns = t.columns.clone();
+        let columns = meta.columns.clone();
         let schema: Vec<QCol> = columns
             .iter()
             .map(|(n, ty)| QCol {
@@ -621,13 +1351,19 @@ fn exec_update(
             .collect();
         // Copy the visible rows' data out; the borrow of `t` ends here so
         // SET expressions can run against `eng` below.
-        let vis: Vec<(u64, u64, Vec<Value>)> = t
-            .rows
-            .iter()
-            .filter(|r| row_visible(r, ctx.snap, ctx.own))
-            .map(|r| (r.id, r.xmax, r.values.clone()))
-            .collect();
+        let vis: Vec<(u64, u64, Vec<Value>)> = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own)
+                .expect("table still visible; engine lock held throughout");
+            t.rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, ctx.own))
+                .map(|r| (r.id, r.xmax, r.values.clone()))
+                .collect()
+        };
         let mut plan = Vec::new();
+        let mut old_vals = Vec::new();
         // SET expressions are evaluated with a scratch query context;
         // subqueries in SET correlate to the row being updated.
         for (id, xmax, values) in &vis {
@@ -640,7 +1376,7 @@ fn exec_update(
             check_row_lock(eng, table, *id, ctx.own)?;
             let mut new_values = values.clone();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
-                let v = eval_update_expr(eng, ctx.snap, ctx.own, &schema, values, expr)?;
+                let v = eval_update_expr(eng, ctx.snap, ctx.own, ctx.session, &schema, values, expr)?;
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
@@ -659,11 +1395,73 @@ fn exec_update(
                     ),
                 ));
             }
+            // v0.9: NOT NULL + CHECK on the new row.
+            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &new_values)?;
+            old_vals.push(values.clone());
             plan.push((*id, *xmax, new_values));
         }
-        // v0.8: pairwise check — two rows updated to the same unique key
-        // in one statement (the index still holds only old entries).
-        check_update_unique_pairs(&eng.db, table, &plan, ctx.snap, ctx.own)?;
+        // v0.9: child-side FK checks for the new rows. Self-references see
+        // the statement's own new versions; each row's old version is
+        // excluded from the parent scan.
+        {
+            let self_new: Vec<Vec<Value>> =
+                plan.iter().map(|(_, _, nv)| nv.clone()).collect();
+            for (i, (_, _, nv)) in plan.iter().enumerate() {
+                check_fk_child_row(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    &meta,
+                    table,
+                    nv,
+                    &self_new,
+                    Some(plan[i].0),
+                )?;
+            }
+        }
+        // v0.9: parent-side FK actions (RESTRICT / CASCADE / SET NULL /
+        // SET DEFAULT), planned before any mutation.
+        let mut cascade = FkCascade::default();
+        {
+            let changed: Vec<(u64, Vec<Value>, Option<Vec<Value>>)> = plan
+                .iter()
+                .zip(old_vals.iter())
+                .map(|((id, _, nv), ov)| (*id, ov.clone(), Some(nv.clone())))
+                .collect();
+            plan_fk_cascade(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.level,
+                table,
+                &meta,
+                &changed,
+                0,
+                &mut cascade,
+            )?;
+        }
+        // v0.8: pairwise unique check — two rows updated to the same unique
+        // key in one statement (the index still holds only old entries).
+        // v0.9: extended over cascaded updates, grouped by table.
+        {
+            let mut by_table: HashMap<&str, Vec<(u64, u64, Vec<Value>)>> = HashMap::new();
+            by_table
+                .entry(table)
+                .or_default()
+                .extend(plan.iter().cloned());
+            for (t, id, xmax, nv) in &cascade.updates {
+                by_table
+                    .entry(t.as_str())
+                    .or_default()
+                    .push((*id, *xmax, nv.clone()));
+            }
+            for (t, p) in &by_table {
+                check_update_unique_pairs(&eng.db, t, p, ctx.snap, ctx.own)?;
+            }
+        }
+        // Apply the cascade after the unique checks pass.
+        apply_fk_cascade(eng, ctx, cascade)?;
         plan
     };
     // Apply: UPDATE = delete old version + insert new version.
@@ -721,21 +1519,47 @@ fn exec_delete(
 ) -> Result<ExecResult, ExecError> {
     // Plan first for statement atomicity (WHERE type errors must not
     // leave half the rows deleted).
-    let plan: Vec<(u64, u64)> = {
+    let plan: Vec<(u64, u64, Vec<Value>)> = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let meta = TableMeta::of(t);
         let mut plan = Vec::new();
-        for rv in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+        for rv in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, ctx.snap, ctx.own))
+        {
             check_write_conflict(eng, rv.xmax, ctx.level)?;
-            if row_matches_where(t, &rv.values, where_)? {
+            if row_matches_where_cols(&meta.columns, &rv.values, where_)? {
                 // Only rows we actually delete conflict with FOR UPDATE
                 // locks — merely scanning a locked row is fine.
                 check_row_lock(eng, table, rv.id, ctx.own)?;
-                plan.push((rv.id, rv.xmax));
+                plan.push((rv.id, rv.xmax, rv.values.clone()));
             }
         }
+        // v0.9: parent-side FK actions for the deleted rows.
+        let mut cascade = FkCascade::default();
+        {
+            let changed: Vec<(u64, Vec<Value>, Option<Vec<Value>>)> = plan
+                .iter()
+                .map(|(id, _, values)| (*id, values.clone(), None))
+                .collect();
+            plan_fk_cascade(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.level,
+                table,
+                &meta,
+                &changed,
+                0,
+                &mut cascade,
+            )?;
+        }
+        apply_fk_cascade(eng, ctx, cascade)?;
         plan
     };
     let n = plan.len();
@@ -743,7 +1567,7 @@ fn exec_delete(
         .db
         .find_table_mut(table, ctx.snap, ctx.own)
         .expect("table still visible; engine lock held throughout");
-    for (id, prev_xmax) in plan {
+    for (id, prev_xmax, _) in plan {
         let pos = t
             .row_pos(id)
             .expect("row version still present; engine lock held throughout");
@@ -762,20 +1586,33 @@ fn exec_delete(
 fn exec_drop(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
+    names: &[String],
+    if_exists: bool,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    for name in names {
+        drop_one_table(eng, ctx, name, if_exists, cascade)?;
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP TABLE".to_string(),
+    })
+}
+
+/// Drop a single table with dependency handling.
+fn drop_one_table(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
     name: &str,
     if_exists: bool,
-) -> Result<ExecResult, ExecError> {
+    cascade: bool,
+) -> Result<(), ExecError> {
     // Find the visible version first (immutable) for the conflict check,
     // then mutate. A DROP of a table dropped by a not-yet-visible
     // transaction behaves like the row case (40001 under RR/SERIALIZABLE).
     let prev_xmax = {
         let t = eng.db.find_table(name, ctx.snap, ctx.own);
         match t {
-            None if if_exists => {
-                return Ok(ExecResult::Command {
-                    tag: "DROP TABLE".to_string(),
-                });
-            }
+            None if if_exists => return Ok(()),
             None => {
                 return Err(exec_err(
                     "42P01",
@@ -796,6 +1633,57 @@ fn exec_drop(
             }
         }
     };
+    // Dependency scan: FKs from other tables, and views.
+    let mut dep_fks: Vec<(String, String)> = Vec::new();
+    for (tname, vs) in &eng.db.tables {
+        if tname == name {
+            continue;
+        }
+        let Some(ot) = vs
+            .iter()
+            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+        else {
+            continue;
+        };
+        for fk in &ot.fks {
+            if fk.ref_table == name {
+                dep_fks.push((tname.clone(), fk.name.clone()));
+            }
+        }
+    }
+    let mut dep_views: Vec<String> = Vec::new();
+    for (vname, vs) in &eng.db.views {
+        if vs.iter().any(|v| {
+            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
+        }) {
+            dep_views.push(vname.clone());
+        }
+    }
+    if !cascade && (!dep_fks.is_empty() || !dep_views.is_empty()) {
+        let first = dep_fks
+            .first()
+            .map(|(_, f)| f.as_str())
+            .or(dep_views.first().map(|s| s.as_str()))
+            .unwrap_or("?");
+        return Err(exec_err(
+            "2BP01",
+            format!(
+                "cannot drop table {} because {} depends on it",
+                name, first
+            ),
+        ));
+    }
+    // CASCADE: drop dependent views and FKs first.
+    for v in &dep_views {
+        drop_view_internal(eng, ctx, v)?;
+    }
+    for (tname, fk_name) in &dep_fks {
+        // The referencing table may itself have been dropped by an
+        // earlier CASCADE in this same statement.
+        if eng.db.find_table(tname, ctx.snap, ctx.own).is_some() {
+            alter_drop_constraint_internal(eng, ctx, tname, fk_name)?;
+        }
+    }
     let t = eng
         .db
         .find_table_mut(name, ctx.snap, ctx.own)
@@ -815,21 +1703,9 @@ fn exec_drop(
         .map(|ix| ix.def.name.clone())
         .collect();
     for iname in idx_names {
-        let snapshot = eng
-            .db
-            .indexes
-            .get(&iname)
-            .cloned()
-            .expect("index still present; engine lock held throughout");
-        eng.db.indexes.get_mut(&iname).expect("index still present").def.dropped_xmax = ctx.own;
-        ctx.writes.push(WriteOp::DropIndex {
-            name: iname,
-            index: snapshot,
-        });
+        drop_index_internal(eng, ctx, &iname)?;
     }
-    Ok(ExecResult::Command {
-        tag: "DROP TABLE".to_string(),
-    })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1855,7 @@ fn exec_create_index(
         cols,
         col_names: columns.to_vec(),
         unique,
+        internal: false,
         created_xmin: ctx.own,
         dropped_xmax: 0,
     });
@@ -1687,6 +2564,23 @@ fn plan_from_item(
 ) -> Result<PlanNode, ExecError> {
     match item {
         FromItem::Table { name, alias } => {
+            // v0.9: information_schema virtual tables plan as scans.
+            if name == "information_schema.tables" || name == "information_schema.columns" {
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    filter: None,
+                    rows: 100,
+                });
+            }
+            // v0.9: views plan as a plain scan; build_source expands the
+            // stored SELECT (no index access into views).
+            if eng.db.find_view(name, snap, own).is_some() {
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    filter: None,
+                    rows: 1000,
+                });
+            }
             if name == "pg_stats" && eng.db.find_table(name, snap, own).is_none() {
                 let rows: u64 = eng
                     .db
@@ -2141,7 +3035,7 @@ fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
             rows.push(QRow {
                 cells: vec![
                     Value::Text("public".to_string()),
-                    Value::Text((*tn).clone()),
+                    Value::Text(tn.clone()),
                     Value::Text((*cn).clone()),
                     Value::Float(cs.null_frac),
                     Value::Float(cs.n_distinct),
@@ -2359,6 +3253,8 @@ struct Q<'a, 'b> {
     eng: &'a mut Engine,
     snap: &'b Snapshot,
     own: u64,
+    /// v0.9: server-assigned session id, for session-local `currval`.
+    session: u64,
     /// Subquery nesting depth (0 = top level).
     depth: usize,
     /// Sink for (table, row-version id) pairs named by FOR UPDATE, at any
@@ -3029,6 +3925,78 @@ fn build_source(
     match item {
         FromItem::Table { name, alias } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // v0.9: information_schema virtual tables.
+            if name == "information_schema.tables" {
+                let (schema, rows) = info_tables_scan(&q.eng.db, q.snap, q.own);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((schema, rows));
+            }
+            if name == "information_schema.columns" {
+                let (schema, rows) = info_columns_scan(&q.eng.db, q.snap, q.own);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((schema, rows));
+            }
+            // v0.9: a view name expands to its stored SELECT. Views are
+            // checked before tables (a table would have blocked CREATE VIEW).
+            if let Some(view) = q.eng.db.find_view(name, q.snap, q.own).cloned() {
+                let stmt = parse_statement(&view.query).map_err(sql_err)?;
+                let select = match stmt {
+                    Stmt::Select(s) => s,
+                    _ => {
+                        return Err(exec_err(
+                            "0A000",
+                            format!("view \"{}\" query is not a SELECT", name),
+                        ))
+                    }
+                };
+                // Guard against runaway recursion (e.g. a view recreated
+                // over itself via OR REPLACE races).
+                if q.depth > 16 {
+                    return Err(exec_err(
+                        "54001",
+                        "view recursion limit exceeded".to_string(),
+                    ));
+                }
+                q.depth += 1;
+                let out = run_select(q, &select, outer);
+                q.depth -= 1;
+                let out = out?;
+                let schema: Vec<QCol> = out
+                    .columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (cn, ty))| QCol {
+                        qual: qual.clone(),
+                        name: view
+                            .col_aliases
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(cn),
+                        ty,
+                    })
+                    .collect();
+                let rows: Vec<QRow> = out
+                    .rows
+                    .into_iter()
+                    .map(|cells| QRow {
+                        cells,
+                        prov: Vec::new(),
+                    })
+                    .collect();
+                return Ok((schema, rows));
+            }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
             if name == "pg_stats" && q.eng.db.find_table(name, q.snap, q.own).is_none() {
@@ -3133,6 +4101,7 @@ fn build_source(
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                 };
@@ -3837,6 +4806,13 @@ fn eval_grouped(
                     q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
                 )?);
             }
+            // v0.9: sequence functions need engine access; they cannot
+            // go through the pure eval_func_vals path.
+            if matches!(name.as_str(), "nextval" | "currval" | "setval") {
+                check_builtin_arity(name, &vals)?;
+                let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
+                return eval_sequence_func(eng, snap, own, session, name, &vals);
+            }
             // Grouped context: no correlated subqueries inside function
             // args here (subqueries take the eval_expr path); dispatch on
             // pre-evaluated values.
@@ -4378,6 +5354,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                 };
@@ -4405,6 +5382,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                 };
@@ -4431,6 +5409,7 @@ fn eval_in(
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
+            session: q.session,
             depth: q.depth + 1,
             lock_ids: &mut *q.lock_ids,
         };
@@ -4590,6 +5569,7 @@ fn eval_update_expr(
     eng: &mut Engine,
     snap: &Snapshot,
     own: u64,
+    session: u64,
     schema: &[QCol],
     values: &[Value],
     e: &Expr,
@@ -4599,6 +5579,7 @@ fn eval_update_expr(
         eng,
         snap,
         own,
+        session,
         depth: 0,
         lock_ids: &mut lock_ids,
     };
@@ -5344,6 +6325,17 @@ fn int_arg(fname: &str, v: &Value) -> Result<Option<i64>, ExecError> {
 }
 
 fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
+    // v0.9: sequence functions need engine + snapshot + session access;
+    // they cannot go through the pure eval_func_vals path.
+    if matches!(name, "nextval" | "currval" | "setval") {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        check_builtin_arity(name, &vals)?;
+        let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
+        return eval_sequence_func(eng, snap, own, session, name, &vals);
+    }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
         vals.push(eval_expr(q, scopes, a)?);
@@ -5364,6 +6356,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "replace" | "split_part" | "trim" => n == 3,
         "now" | "current_date" | "current_timestamp" => n == 0,
         "coalesce" | "greatest" | "least" => n >= 1,
+        // v0.9: sequence functions.
+        "nextval" | "currval" => n == 1,
+        "setval" => n == 2 || n == 3,
         // EXTRACT and friends validate their own shapes; unknown names
         // fall through to the dispatch below which raises 42883.
         _ => true,
@@ -5840,6 +6835,8 @@ fn func_result_type(
             _ => Ok(ColType::Timestamp),
         },
         "coalesce" | "nullif" | "greatest" | "least" => arg0(),
+        // v0.9: sequence functions return bigint (INT here).
+        "nextval" | "currval" | "setval" => Ok(ColType::Int),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -5997,6 +6994,57 @@ fn from_schema_item(
 ) -> Result<(), ExecError> {
     match item {
         FromItem::Table { name, alias } => {
+            // v0.9: information_schema virtual tables.
+            if name == "information_schema.tables" {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = info_tables_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(schema);
+                return Ok(());
+            }
+            if name == "information_schema.columns" {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = info_columns_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(schema);
+                return Ok(());
+            }
+            // v0.9: views describe as their stored SELECT's schema.
+            if let Some(view) = eng.db.find_view(name, snap, own) {
+                let stmt = parse_statement(&view.query).map_err(sql_err)?;
+                let select = match stmt {
+                    Stmt::Select(s) => s,
+                    _ => {
+                        return Err(exec_err(
+                            "0A000",
+                            format!("view \"{}\" query is not a SELECT", name),
+                        ))
+                    }
+                };
+                let cols = describe_select(eng, snap, own, &select)?;
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = cols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (cn, ty))| QCol {
+                        qual: qual.clone(),
+                        name: view.col_aliases.get(i).cloned().unwrap_or(cn),
+                        ty,
+                    })
+                    .collect();
+                out.push(schema);
+                return Ok(());
+            }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
             if name == "pg_stats" && eng.db.find_table(name, snap, own).is_none() {
@@ -7151,6 +8199,7 @@ mod tests {
             own: 9,
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
+            session: 0,
         };
         execute(eng, &mut ctx, &stmt)
     }
@@ -7339,6 +8388,7 @@ mod tests {
             own: x1,
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
+            session: 0,
         };
         let sel = parse_statement("SELECT * FROM users WHERE id = 1 FOR UPDATE").unwrap();
         execute(&mut eng, &mut ctx, &sel).unwrap();
@@ -7351,6 +8401,7 @@ mod tests {
             own: x2,
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes2,
+            session: 0,
         };
         let upd = parse_statement("UPDATE users SET name = 'x' WHERE id = 1").unwrap();
         let e = execute(&mut eng, &mut ctx2, &upd).unwrap_err();
@@ -7393,4 +8444,1667 @@ mod tests {
         let rows = rows_of(run(&mut eng, "SELECT name FROM users WHERE id = 1").unwrap());
         assert_eq!(rows, vec![vec!["ann2".to_string()]]);
     }
+}
+
+// ============================================================================
+// v0.9: sequences.
+// ============================================================================
+
+/// Resolve CREATE/ALTER SEQUENCE options to concrete parameters.
+/// Postgres defaults: start 1, increment 1, minvalue 1, maxvalue 2^63-1,
+/// no cycle — except descending sequences (increment < 0), which default
+/// to start -1, minvalue -(2^63), maxvalue -1.
+fn sequence_params(
+    opts: &SequenceOpts,
+    for_alter: bool,
+) -> Result<(i64, i64, i64, i64, bool, Option<i64>), ExecError> {
+    let bad = |m: &str| exec_err("22023", m.to_string());
+    let increment = opts.increment.unwrap_or(1);
+    if increment == 0 {
+        return Err(bad("INCREMENT must not be zero"));
+    }
+    let descending = increment < 0;
+    let (dfl_min, dfl_max, dfl_start) = if descending {
+        (i64::MIN, -1, -1)
+    } else {
+        (1, i64::MAX, 1)
+    };
+    let min_value = opts.min_value.unwrap_or(dfl_min);
+    let max_value = opts.max_value.unwrap_or(dfl_max);
+    let start = opts.start.unwrap_or(dfl_start);
+    let cycle = opts.cycle.unwrap_or(false);
+    if min_value >= max_value {
+        return Err(bad("MINVALUE must be less than MAXVALUE"));
+    }
+    if start < min_value || start > max_value {
+        return Err(bad("START value out of bounds"));
+    }
+    if !for_alter {
+        if let Some(r) = opts.restart {
+            // CREATE SEQUENCE ... RESTART is a Postgres syntax error.
+            let _ = r;
+            return Err(exec_err(
+                "42601",
+                "syntax error: RESTART is not allowed in CREATE SEQUENCE".to_string(),
+            ));
+        }
+    }
+    let restart = match opts.restart {
+        None => None,
+        Some(v) if v == SequenceOpts::RESTART_SENTINEL => Some(start),
+        Some(v) => {
+            if v < min_value || v > max_value {
+                return Err(bad("RESTART value out of bounds"));
+            }
+            Some(v)
+        }
+    };
+    Ok((start, increment, min_value, max_value, cycle, restart))
+}
+
+fn exec_create_sequence(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    if_not_exists: bool,
+    opts: &SequenceOpts,
+) -> Result<ExecResult, ExecError> {
+    if eng.db.find_sequence(name, ctx.snap, ctx.own).is_some() {
+        if if_not_exists {
+            return Ok(ExecResult::Command {
+                tag: "CREATE SEQUENCE".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", name),
+        ));
+    }
+    let (start, increment, min_value, max_value, cycle, _) = sequence_params(opts, false)?;
+    eng.db
+        .sequences
+        .entry(name.to_string())
+        .or_default()
+        .push(Sequence::new(
+            name.to_string(),
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+            ctx.own,
+        ));
+    ctx.writes.push(WriteOp::CreateSequence {
+        name: name.to_string(),
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE SEQUENCE".to_string(),
+    })
+}
+
+fn exec_alter_sequence(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    opts: &SequenceOpts,
+) -> Result<ExecResult, ExecError> {
+    let live = eng
+        .db
+        .find_sequence(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // Merge: ALTER supplies only the options it changes.
+    let merged = SequenceOpts {
+        start: opts.start.or(Some(live.start)),
+        increment: opts.increment.or(Some(live.increment)),
+        min_value: opts.min_value.or(Some(live.min_value)),
+        max_value: opts.max_value.or(Some(live.max_value)),
+        cycle: opts.cycle.or(Some(live.cycle)),
+        restart: opts.restart,
+    };
+    let (start, increment, min_value, max_value, cycle, restart) =
+        sequence_params(&merged, true)?;
+    let prev = live.clone();
+    let versions = eng.db.sequences.get_mut(name).expect("visible above");
+    let cur = versions
+        .iter_mut()
+        .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+        .expect("visible above");
+    cur.dropped_xmax = ctx.own;
+    let mut next = Sequence::new(
+        name.to_string(),
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        ctx.own,
+    );
+    // ALTER SEQUENCE changes parameters, not the position: carry the
+    // current value and is_called forward (Postgres behavior).
+    next.current = prev.current;
+    next.is_called = prev.is_called;
+    if let Some(r) = restart {
+        // RESTART is setval(r, true): the next nextval advances past r.
+        next.current = Some(r);
+        next.is_called = true;
+        // A RESTART counts as an advance for WAL purposes.
+        if !eng.seq_advanced.contains(&name.to_string()) {
+            eng.seq_advanced.push(name.to_string());
+        }
+    }
+    eng.db
+        .sequences
+        .get_mut(name)
+        .expect("visible above")
+        .push(next);
+    ctx.writes.push(WriteOp::AlterSequence {
+        name: name.to_string(),
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "ALTER SEQUENCE".to_string(),
+    })
+}
+
+fn exec_drop_sequence(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    names: &[String],
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    for name in names {
+        let live = eng.db.find_sequence(name, ctx.snap, ctx.own);
+        match live {
+            None if if_exists => continue,
+            None => {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", name),
+                ))
+            }
+            Some(_) => {}
+        }
+        // Postgres refuses to drop a sequence owned by a column default
+        // (dependent). v0.9 tracks the dependency: DEFAULT nextval('s').
+        let mut dependent: Option<(String, String)> = None;
+        for (tname, vs) in &eng.db.tables {
+            let Some(t) = vs
+                .iter()
+                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+            else {
+                continue;
+            };
+            for (i, d) in t.defaults.iter().enumerate() {
+                if matches!(d, Some(DefaultExpr::Nextval(s)) if s == name) {
+                    dependent = Some((tname.clone(), t.columns[i].0.clone()));
+                    break;
+                }
+            }
+            if dependent.is_some() {
+                break;
+            }
+        }
+        if let Some((t, c)) = dependent {
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "cannot drop sequence {} because column {}.{} has a default depending on it",
+                    name, t, c
+                ),
+            ));
+        }
+        let versions = eng.db.sequences.get_mut(name).expect("visible above");
+        let cur = versions
+            .iter_mut()
+            .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+            .expect("visible above");
+        let prev = cur.clone();
+        cur.dropped_xmax = ctx.own;
+        ctx.writes.push(WriteOp::DropSequence {
+            name: name.clone(),
+            seq: prev,
+        });
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP SEQUENCE".to_string(),
+    })
+}
+
+/// Advance a sequence, returning the new value. Non-transactional, like
+/// Postgres: the advance survives abort (undo is a no-op) and is staged
+/// for commit-time WAL logging via `eng.seq_advanced`.
+pub fn seq_nextval(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+) -> Result<i64, ExecError> {
+    let cur = eng
+        .db
+        .find_sequence_mut(name, snap, own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // Postgres semantics via is_called: a fresh sequence (or one reset by
+    // setval(v,false)) returns its current value without advancing; once
+    // called, each nextval advances by the increment.
+    let next = match cur.current {
+        None => cur.start,
+        Some(v) if !cur.is_called => v,
+        Some(v) => {
+            let n = v.checked_add(cur.increment).ok_or_else(|| {
+                exec_err(
+                    "55000",
+                    format!(
+                        "nextval: reached {} value of sequence \"{}\"",
+                        if cur.increment > 0 { "maximum" } else { "minimum" },
+                        name
+                    ),
+                )
+            })?;
+            let over = if cur.increment > 0 {
+                n > cur.max_value
+            } else {
+                n < cur.min_value
+            };
+            if over {
+                if cur.cycle {
+                    if cur.increment > 0 {
+                        cur.min_value
+                    } else {
+                        cur.max_value
+                    }
+                } else {
+                    return Err(exec_err(
+                        "55000",
+                        format!(
+                            "nextval: reached {} value of sequence \"{}\" ({})",
+                            if cur.increment > 0 { "maximum" } else { "minimum" },
+                            name,
+                            if cur.increment > 0 {
+                                cur.max_value
+                            } else {
+                                cur.min_value
+                            },
+                        ),
+                    ));
+                }
+            } else {
+                n
+            }
+        }
+    };
+    cur.current = Some(next);
+    cur.is_called = true;
+    eng.seq_currval.insert((session, name.to_string()), next);
+    if !eng.seq_advanced.contains(&name.to_string()) {
+        eng.seq_advanced.push(name.to_string());
+    }
+    Ok(next)
+}
+
+pub fn seq_currval(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+) -> Result<i64, ExecError> {
+    if eng.db.find_sequence(name, snap, own).is_none() {
+        return Err(exec_err("42P01", format!("relation \"{}\" does not exist", name)));
+    }
+    eng.seq_currval
+        .get(&(session, name.to_string()))
+        .copied()
+        .ok_or_else(|| {
+            exec_err(
+                "55000",
+                format!(
+                    "currval of sequence \"{}\" is not yet defined in this session",
+                    name
+                ),
+            )
+        })
+}
+
+pub fn seq_setval(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+    value: i64,
+    is_called: bool,
+) -> Result<i64, ExecError> {
+    let cur = eng
+        .db
+        .find_sequence_mut(name, snap, own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    cur.current = Some(value);
+    // setval(v, true): is_called=true, next nextval returns v + increment.
+    // setval(v, false): is_called=false, next nextval returns v itself.
+    cur.is_called = is_called;
+    if is_called {
+        eng.seq_currval.insert((session, name.to_string()), value);
+    } else {
+        eng.seq_currval.remove(&(session, name.to_string()));
+    }
+    if !eng.seq_advanced.contains(&name.to_string()) {
+        eng.seq_advanced.push(name.to_string());
+    }
+    Ok(value)
+}
+
+/// Dispatch for the nextval/currval/setval SQL functions (called from
+/// eval_func with pre-evaluated args).
+fn eval_sequence_func(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+    vals: &[Value],
+) -> Result<Value, ExecError> {
+    let seq_name = |v: &Value| -> Result<String, ExecError> {
+        match v {
+            Value::Text(s) => Ok(s.clone()),
+            // regclass input: Postgres accepts nextval('seq').
+            _ => Err(exec_err(
+                "42883",
+                format!("function {}: sequence name must be text", name),
+            )),
+        }
+    };
+    match name {
+        "nextval" => {
+            let s = seq_name(&vals[0])?;
+            Ok(Value::BigInt(seq_nextval(eng, snap, own, session, &s)?))
+        }
+        "currval" => {
+            let s = seq_name(&vals[0])?;
+            Ok(Value::BigInt(seq_currval(eng, snap, own, session, &s)?))
+        }
+        "setval" => {
+            let s = seq_name(&vals[0])?;
+            let v = match vals[1] {
+                Value::Int(i) => i as i64,
+                Value::BigInt(i) => i,
+                Value::SmallInt(i) => i as i64,
+                _ => {
+                    return Err(exec_err(
+                        "42883",
+                        "setval: value must be an integer".to_string(),
+                    ))
+                }
+            };
+            let is_called = match vals.get(2) {
+                None => true,
+                Some(Value::Bool(b)) => *b,
+                _ => {
+                    return Err(exec_err(
+                        "42883",
+                        "setval: is_called must be boolean".to_string(),
+                    ))
+                }
+            };
+            Ok(Value::BigInt(seq_setval(eng, snap, own, session, &s, v, is_called)?))
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ============================================================================
+// v0.9: ALTER TABLE.
+// ============================================================================
+
+/// Swap in an altered table version: mark the live version dropped by us,
+/// push the new one, and log WriteOp::AlterTable for undo/WAL.
+/// `new_rows`: Some for ADD/DROP COLUMN (rows rewritten with new ids, WAL-
+/// logged as InsertRow); None for pure-metadata alters (rows move over).
+fn alter_swap(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    renamed_to: Option<String>,
+    mut next: Table,
+    new_rows: Option<Vec<RowVersion>>,
+) -> Result<(), ExecError> {
+    let prev = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    next.created_xmin = ctx.own;
+    next.dropped_xmax = 0;
+    let rewrite = new_rows.is_some();
+    let mut log_ids = Vec::new();
+    if let Some(rows) = new_rows {
+        log_ids.extend(rows.iter().map(|r| r.id));
+        next.rows = rows;
+        // v0.9: the row ids changed — rebuild the id->position index.
+        next.rebuild_row_index();
+    }
+    let target = renamed_to.clone().unwrap_or_else(|| name.to_string());
+    if renamed_to.is_some() {
+        let mut versions = eng.db.tables.remove(name).unwrap_or_default();
+        {
+            let old_live = versions
+                .iter_mut()
+                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+                .expect("visible above");
+            old_live.dropped_xmax = ctx.own;
+            if !rewrite {
+                next.rows = std::mem::take(&mut old_live.rows);
+                // v0.9: the old version's rows were moved; its index is stale.
+                old_live.rebuild_row_index();
+                // v0.9: next got the old rows (same ids/order); its cloned
+                // index is still valid, but rebuild to be safe.
+                next.rebuild_row_index();
+            }
+        }
+        versions.push(next);
+        eng.db.tables.insert(target.clone(), versions);
+    } else {
+        let versions = eng.db.tables.get_mut(name).expect("visible above");
+        let old_live = versions
+            .iter_mut()
+            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+            .expect("visible above");
+        old_live.dropped_xmax = ctx.own;
+        if !rewrite {
+            next.rows = std::mem::take(&mut old_live.rows);
+            // v0.9: the old version's rows were moved; its index is stale.
+            old_live.rebuild_row_index();
+            // v0.9: next got the old rows (same ids/order); its cloned
+            // index is still valid, but rebuild to be safe.
+            next.rebuild_row_index();
+        }
+        versions.push(next);
+    }
+    ctx.writes.push(WriteOp::AlterTable {
+        name: name.to_string(),
+        prev,
+        renamed_to,
+        rewrite_rows: rewrite,
+    });
+    for id in log_ids {
+        ctx.writes.push(WriteOp::InsertRow {
+            table: target.clone(),
+            row_id: id,
+        });
+    }
+    Ok(())
+}
+
+/// Rename column references inside a CHECK/DEFAULT expression (for
+/// ALTER TABLE ... RENAME COLUMN). Constraint expressions are simple
+/// (no subqueries/aggregates), so a shallow walk suffices.
+fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
+    match e {
+        Expr::Column { table, name } => {
+            if table.is_none() && name == old {
+                *name = new.to_string();
+            }
+        }
+        Expr::Arith { left, right, .. } => {
+            rename_col_in_expr(left, old, new);
+            rename_col_in_expr(right, old, new);
+        }
+        Expr::Cast { expr, .. } => rename_col_in_expr(expr, old, new),
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            rename_col_in_expr(a, old, new);
+            rename_col_in_expr(b, old, new);
+        }
+        Expr::Not(a) => rename_col_in_expr(a, old, new),
+        Expr::Like { expr, pattern, .. } => {
+            rename_col_in_expr(expr, old, new);
+            rename_col_in_expr(pattern, old, new);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            rename_col_in_expr(expr, old, new);
+            rename_col_in_expr(low, old, new);
+            rename_col_in_expr(high, old, new);
+        }
+        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => {
+            rename_col_in_expr(expr, old, new)
+        }
+        Expr::Extract { from, .. } => rename_col_in_expr(from, old, new),
+        Expr::Cmp { left, right, .. } => {
+            rename_col_in_expr(left, old, new);
+            rename_col_in_expr(right, old, new);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rename_col_in_expr(a, old, new);
+            }
+        }
+        Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } | Expr::Agg { .. } => {}
+        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {}
+    }
+}
+
+fn exec_alter(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    action: &AlterAction,
+) -> Result<ExecResult, ExecError> {
+    match action {
+        AlterAction::AddColumn {
+            name: col,
+            col_type,
+            not_null,
+            default,
+            checks,
+            uniques,
+            pkey,
+            fks,
+        } => alter_add_column(
+            eng, ctx, name, col, col_type, *not_null, default, checks, uniques, pkey, fks,
+        ),
+        AlterAction::DropColumn { name: col, cascade } => {
+            alter_drop_column(eng, ctx, name, col, *cascade)
+        }
+        AlterAction::AddConstraint {
+            check,
+            unique,
+            pkey,
+            fk,
+        } => alter_add_constraint(eng, ctx, name, check, unique, pkey, fk),
+        AlterAction::DropConstraint { name: con, cascade } => {
+            alter_drop_constraint(eng, ctx, name, con, *cascade)
+        }
+        AlterAction::AlterColumnSetDefault { name: col, default } => {
+            alter_set_default(eng, ctx, name, col, Some(default.clone()))
+        }
+        AlterAction::AlterColumnDropDefault { name: col } => {
+            alter_set_default(eng, ctx, name, col, None)
+        }
+        AlterAction::RenameColumn { old, new } => alter_rename_column(eng, ctx, name, old, new),
+        AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alter_add_column(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    col_type: &ColType,
+    not_null: bool,
+    default: &Option<DefaultExpr>,
+    checks: &[CheckDef],
+    uniques: &[UniqueDef],
+    pkey: &Option<UniqueDef>,
+    fks: &[FkDef],
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    if t.column_index(col).is_some() {
+        return Err(exec_err(
+            "42701",
+            format!("column \"{}\" of relation \"{}\" already exists", col, name),
+        ));
+    }
+    // Validate the default and check expressions up front.
+    if let Some(d) = default {
+        if let DefaultExpr::Expr(e) = d {
+            validate_constraint_expr(e, "DEFAULT").map_err(sql_err)?;
+        }
+    }
+    for c in checks {
+        validate_constraint_expr(&c.expr, "CHECK").map_err(sql_err)?;
+    }
+    let has_rows = t.rows.iter().any(|r| row_visible(r, ctx.snap, ctx.own));
+    if not_null && default.is_none() && has_rows {
+        return Err(exec_err(
+            "23502",
+            format!("column \"{}\" contains null values", col),
+        ));
+    }
+    let mut next = t.clone();
+    next.columns.push((col.to_string(), col_type.clone()));
+    next.not_null.push(not_null);
+    next.defaults.push(default.clone());
+    next.checks.extend(checks.iter().cloned());
+    next.uniques.extend(uniques.iter().cloned());
+    if let Some(pk) = pkey {
+        if next.pkey.is_some() {
+            return Err(exec_err(
+                "42P16",
+                "multiple primary keys for table".to_string(),
+            ));
+        }
+        next.pkey = Some(pk.clone());
+    }
+    // Validate FKs against the new table shape.
+    let next_meta = TableMeta::of(&next);
+    for fk in fks {
+        validate_fk_def(eng, ctx, name, fk)?;
+    }
+    next.fks.extend(fks.iter().cloned());
+    // Rewrite every row with the new column value (default or NULL).
+    // Reuse the old row ids so existing indexes stay valid; the WAL
+    // replays them as InsertRows. Copy the visible rows out first; the
+    // borrow of `t` must end before eval_default.
+    let old_cols = t.columns.len();
+    let old_rows: Vec<(u64, Vec<Value>)> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, ctx.own))
+        .map(|r| (r.id, r.values.clone()))
+        .collect();
+    let mut new_rows = Vec::with_capacity(old_rows.len());
+    for (old_id, values) in old_rows {
+        let dv = match default {
+            Some(d) => eval_default(eng, ctx.snap, ctx.own, ctx.session, d, col_type, col)?,
+            None => Value::Null,
+        };
+        let mut nv = Vec::with_capacity(old_cols + 1);
+        nv.extend_from_slice(&values);
+        // Defensive: tolerate rows narrower than the old schema (shouldn't happen).
+        while nv.len() < old_cols {
+            nv.push(Value::Null);
+        }
+        nv.push(dv);
+        // New CHECK constraints must hold for existing rows.
+        check_row_constraints(
+            eng, ctx.snap, ctx.own, ctx.session, &next_meta, name, &nv,
+        )?;
+        new_rows.push(RowVersion {
+            id: old_id,
+            values: nv,
+            xmin: ctx.own,
+            xmax: 0,
+        });
+    }
+    // Backing indexes for new unique/pkey constraints.
+    let mut new_indexes: Vec<(String, Vec<String>)> = Vec::new();
+    for u in uniques {
+        new_indexes.push((u.name.clone(), u.cols.clone()));
+    }
+    if let Some(pk) = pkey {
+        new_indexes.push((pk.name.clone(), pk.cols.clone()));
+    }
+    alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    for (ix_name, cols) in new_indexes {
+        create_constraint_index(eng, ctx, name, &ix_name, &cols, true)?;
+    }
+    Ok(ExecResult::Command {
+        tag: format!("ALTER TABLE"),
+    })
+}
+
+fn alter_drop_column(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let ci = t.column_index(col).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+        )
+    })?;
+    // Dependency scan.
+    let mut dep_constraints: Vec<String> = Vec::new();
+    for c in &t.checks {
+        let mut refs = Vec::new();
+        collect_col_refs(&c.expr, &mut refs);
+        if refs.iter().any(|(_, r)| r == col) {
+            dep_constraints.push(format!("constraint \"{}\"", c.name));
+        }
+    }
+    for u in &t.uniques {
+        if u.cols.iter().any(|c| c == col) {
+            dep_constraints.push(format!("constraint \"{}\"", u.name));
+        }
+    }
+    if let Some(pk) = &t.pkey {
+        if pk.cols.iter().any(|c| c == col) {
+            dep_constraints.push(format!("constraint \"{}\"", pk.name));
+        }
+    }
+    for fk in &t.fks {
+        if fk.cols.iter().any(|c| c == col) {
+            dep_constraints.push(format!("constraint \"{}\"", fk.name));
+        }
+    }
+    // Other tables' FKs referencing this column.
+    let mut dep_fks: Vec<(String, String)> = Vec::new();
+    for (tname, vs) in &eng.db.tables {
+        if tname == name {
+            continue;
+        }
+        let Some(ot) = vs
+            .iter()
+            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+        else {
+            continue;
+        };
+        for fk in &ot.fks {
+            if fk.ref_table != name {
+                continue;
+            }
+            // Empty ref_cols = references our pkey.
+            let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+                t.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
+            } else {
+                fk.ref_cols.clone()
+            };
+            if ref_cols.iter().any(|c| c == col) {
+                dep_fks.push((tname.clone(), fk.name.clone()));
+            }
+        }
+    }
+    // Indexes on the column.
+    let mut dep_indexes: Vec<String> = Vec::new();
+    for (ix_name, ix) in &eng.db.indexes {
+        if ix.def.table != name {
+            continue;
+        }
+        if ix.def.col_names.iter().any(|c| c == col) {
+            dep_indexes.push(ix_name.clone());
+        }
+    }
+    // Views reading the table.
+    let mut dep_views: Vec<String> = Vec::new();
+    for (vname, vs) in &eng.db.views {
+        if vs
+            .iter()
+            .any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name))
+        {
+            dep_views.push(vname.clone());
+        }
+    }
+    if !cascade
+        && (!dep_constraints.is_empty()
+            || !dep_fks.is_empty()
+            || !dep_indexes.is_empty()
+            || !dep_views.is_empty())
+    {
+        let first = dep_constraints
+            .first()
+            .map(|s| s.as_str())
+            .or(dep_fks.first().map(|(_, f)| f.as_str()))
+            .or(dep_indexes.first().map(|s| s.as_str()))
+            .or(dep_views.first().map(|s| s.as_str()))
+            .unwrap_or("?");
+        return Err(exec_err(
+            "2BP01",
+            format!(
+                "cannot drop column {} of table {} because {} depends on it",
+                col, name, first
+            ),
+        ));
+    }
+    // Snapshot the table state and end `t`'s borrow before CASCADE
+    // mutations (they need `eng` mutably).
+    let mut next = t.clone();
+    let old_rows: Vec<(u64, Vec<Value>)> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, ctx.own))
+        .map(|r| (r.id, r.values.clone()))
+        .collect();
+    let _ = t;
+    // CASCADE: drop dependent objects.
+    // Views first (they only read).
+    for v in &dep_views {
+        drop_view_internal(eng, ctx, v)?;
+    }
+    // This table's dependent constraints and their backing indexes.
+    let drop_idx_for: Vec<String> = next
+        .uniques
+        .iter()
+        .filter(|u| u.cols.iter().any(|c| c == col))
+        .map(|u| u.name.clone())
+        .chain(
+            next.pkey
+                .iter()
+                .filter(|p| p.cols.iter().any(|c| c == col))
+                .map(|p| p.name.clone()),
+        )
+        .collect();
+    next.checks.retain(|c| {
+        let mut refs = Vec::new();
+        collect_col_refs(&c.expr, &mut refs);
+        !refs.iter().any(|(_, r)| r == col)
+    });
+    next.uniques.retain(|u| !u.cols.iter().any(|c| c == col));
+    if next.pkey.as_ref().is_some_and(|p| p.cols.iter().any(|c| c == col)) {
+        next.pkey = None;
+    }
+    next.fks.retain(|fk| !fk.cols.iter().any(|c| c == col));
+    for ix in drop_idx_for {
+        // v0.9: DROP the backing index for the dropped UNIQUE/PK constraint.
+        // Use direct map removal (bypasses MVCC visibility which may miss
+        // the index due to snapshot timing).
+        if let Some(index) = eng.db.indexes.remove(&ix) {
+            ctx.writes.push(WriteOp::DropIndex {
+                name: ix.clone(),
+                index,
+            });
+        }
+    }
+    // Other tables' FKs referencing the column.
+    for (tname, fk_name) in &dep_fks {
+        alter_drop_constraint_internal(eng, ctx, tname, fk_name)?;
+    }
+    // Indexes on the column (non-constraint ones; constraint ones already dropped).
+    for ix in &dep_indexes {
+        if eng.db.indexes.contains_key(ix) {
+            drop_index_internal(eng, ctx, ix)?;
+        }
+    }
+    // Remaining indexes: shift positions after the dropped column.
+    let mut index_defs: Vec<(String, Vec<usize>, Vec<String>)> = Vec::new();
+    for (ix_name, ix) in &eng.db.indexes {
+        if ix.def.table != name {
+            continue;
+        }
+        index_defs.push((ix_name.clone(), ix.def.cols.clone(), ix.def.col_names.clone()));
+    }
+    // Now mutate the table shape.
+    next.columns.remove(ci);
+    next.not_null.remove(ci);
+    next.defaults.remove(ci);
+    // CHECK expressions reference columns by name; nothing to shift.
+    // Rewrite rows without the column. Reuse old row ids so surviving
+    // indexes stay valid.
+    let mut new_rows = Vec::with_capacity(old_rows.len());
+    for (old_id, mut values) in old_rows {
+        if values.len() > ci {
+            values.remove(ci);
+        }
+        new_rows.push(RowVersion {
+            id: old_id,
+            values,
+            xmin: ctx.own,
+            xmax: 0,
+        });
+    }
+    alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    // Shift index positions: drop and re-create each surviving index with
+    // positions adjusted, so undo (DropIndex+CreateIndex pair) and WAL
+    // (new def logged) stay correct.
+    for (ix_name, cols, col_names) in index_defs {
+        let snapshot = eng.db.indexes.get(&ix_name).cloned().expect("found above");
+        let unique = snapshot.def.unique;
+        let internal = snapshot.def.internal;
+        drop_index_internal(eng, ctx, &ix_name)?;
+        let new_cols: Vec<usize> = cols
+            .into_iter()
+            .map(|p| if p > ci { p - 1 } else { p })
+            .collect();
+        let mut ix = Index::new(IndexDef {
+            name: ix_name.clone(),
+            table: name.to_string(),
+            cols: new_cols,
+            col_names,
+            unique,
+            internal,
+            created_xmin: ctx.own,
+            dropped_xmax: 0,
+        });
+        let t2 = eng
+            .db
+            .find_table(name, ctx.snap, ctx.own)
+            .expect("just altered");
+        for r in &t2.rows {
+            let key = ix.key_for(&r.values);
+            ix.insert(key, r.id);
+        }
+        eng.db.indexes.insert(ix_name.clone(), ix);
+        ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// Drop an index by name, logging WriteOp::DropIndex. Used by ALTER TABLE
+/// CASCADE paths.
+fn drop_index_internal(eng: &mut Engine, ctx: &mut StmtCtx, name: &str) -> Result<(), ExecError> {
+    let snapshot = eng
+        .db
+        .find_index(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("index \"{}\" does not exist", name)))?
+        .clone();
+    eng.db
+        .find_index_mut(name, ctx.snap, ctx.own)
+        .expect("index still present")
+        .def
+        .dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropIndex {
+        name: name.to_string(),
+        index: snapshot,
+    });
+    Ok(())
+}
+/// True if a table already has a constraint with this name.
+fn table_has_constraint(t: &Table, con: &str) -> bool {
+    t.checks.iter().any(|c| c.name == con)
+        || t.uniques.iter().any(|u| u.name == con)
+        || t.pkey.as_ref().is_some_and(|p| p.name == con)
+        || t.fks.iter().any(|f| f.name == con)
+}
+
+
+fn alter_add_constraint(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    check: &Option<CheckDef>,
+    unique: &Option<UniqueDef>,
+    pkey: &Option<UniqueDef>,
+    fk: &Option<FkDef>,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let mut next = t.clone();
+    let meta = TableMeta::of(&next);
+    if let Some(c) = check {
+        validate_constraint_expr(&c.expr, "CHECK").map_err(sql_err)?;
+        if table_has_constraint(&next, &c.name) {
+            return Err(exec_err(
+                "42710",
+                format!("constraint \"{}\" already exists", c.name),
+            ));
+        }
+        let mut refs = Vec::new();
+        collect_col_refs(&c.expr, &mut refs);
+        for (_, r) in &refs {
+            if meta.column_index(r).is_none() {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" does not exist", r),
+                ));
+            }
+        }
+        // Existing rows must satisfy the new CHECK.
+        let mut probe = next.clone();
+        probe.checks.push(c.clone());
+        let probe_meta = TableMeta::of(&probe);
+        let old_rows: Vec<Vec<Value>> = t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, ctx.snap, ctx.own))
+            .map(|r| r.values.clone())
+            .collect();
+        for values in &old_rows {
+            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &probe_meta, name, values)?;
+        }
+        next.checks.push(c.clone());
+    }
+    if let Some(u) = unique {
+        if table_has_constraint(&next, &u.name) {
+            return Err(exec_err(
+                "42710",
+                format!("constraint \"{}\" already exists", u.name),
+            ));
+        }
+        for c in &u.cols {
+            if next.column_index(c).is_none() {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", c, name),
+                ));
+            }
+        }
+        next.uniques.push(u.clone());
+        alter_swap(eng, ctx, name, None, next, None)?;
+        create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    if let Some(pk) = pkey {
+        if table_has_constraint(&next, &pk.name) {
+            return Err(exec_err(
+                "42710",
+                format!("constraint \"{}\" already exists", pk.name),
+            ));
+        }
+        if next.pkey.is_some() {
+            return Err(exec_err(
+                "42P16",
+                "multiple primary keys for table".to_string(),
+            ));
+        }
+        for c in &pk.cols {
+            if next.column_index(c).is_none() {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", c, name),
+                ));
+            }
+        }
+        next.pkey = Some(pk.clone());
+        alter_swap(eng, ctx, name, None, next, None)?;
+        create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    if let Some(f) = fk {
+        if table_has_constraint(&next, &f.name) {
+            return Err(exec_err(
+                "42710",
+                format!("constraint \"{}\" already exists", f.name),
+            ));
+        }
+        validate_fk_def(eng, ctx, name, f)?;
+        next.fks.push(f.clone());
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// Drop a single constraint by name on a table (used by DROP CONSTRAINT and
+/// by CASCADE paths). Returns the dropped constraint's backing index name,
+/// if any.
+fn alter_drop_constraint_internal(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    con: &str,
+) -> Result<(), ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let mut next = t.clone();
+    let mut backing_index: Option<String> = None;
+    let mut found = false;
+    if let Some(pos) = next.checks.iter().position(|c| c.name == con) {
+        next.checks.remove(pos);
+        found = true;
+    }
+    if !found {
+        if let Some(pos) = next.uniques.iter().position(|u| u.name == con) {
+            backing_index = Some(next.uniques[pos].name.clone());
+            next.uniques.remove(pos);
+            found = true;
+        }
+    }
+    if !found {
+        if next.pkey.as_ref().is_some_and(|p| p.name == con) {
+            backing_index = next.pkey.as_ref().map(|p| p.name.clone());
+            next.pkey = None;
+            found = true;
+        }
+    }
+    if !found {
+        if let Some(pos) = next.fks.iter().position(|f| f.name == con) {
+            next.fks.remove(pos);
+            found = true;
+        }
+    }
+    if !found {
+        return Err(exec_err(
+            "42704",
+            format!("constraint \"{}\" of relation \"{}\" does not exist", con, name),
+        ));
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    if let Some(ix) = backing_index {
+        if eng.db.find_index(&ix, ctx.snap, ctx.own).is_some() {
+            drop_index_internal(eng, ctx, &ix)?;
+        }
+    }
+    Ok(())
+}
+
+fn alter_drop_constraint(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    con: &str,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    // RESTRICT: refuse if other tables' FKs depend on this constraint
+    // (unique/pkey backing an FK). CASCADE: drop those FKs too.
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let is_uniqueish = t
+        .uniques
+        .iter()
+        .any(|u| u.name == con)
+        || t.pkey.as_ref().is_some_and(|p| p.name == con);
+    if is_uniqueish {
+        let mut dep_fks: Vec<(String, String)> = Vec::new();
+        for (tname, vs) in &eng.db.tables {
+            if tname == name {
+                continue;
+            }
+            let Some(ot) = vs
+                .iter()
+                .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
+            else {
+                continue;
+            };
+            for fk in &ot.fks {
+                if fk.ref_table == name {
+                    dep_fks.push((tname.clone(), fk.name.clone()));
+                }
+            }
+        }
+        if !dep_fks.is_empty() && !cascade {
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "cannot drop constraint {} because other objects depend on it",
+                    con
+                ),
+            ));
+        }
+        for (tname, fk_name) in &dep_fks {
+            alter_drop_constraint_internal(eng, ctx, tname, fk_name)?;
+        }
+    }
+    alter_drop_constraint_internal(eng, ctx, name, con)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+fn alter_set_default(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    default: Option<DefaultExpr>,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let ci = t.column_index(col).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+        )
+    })?;
+    if let Some(DefaultExpr::Expr(e)) = &default {
+        validate_constraint_expr(e, "DEFAULT").map_err(sql_err)?;
+    }
+    let mut next = t.clone();
+    next.defaults[ci] = default;
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+fn alter_rename_column(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    old: &str,
+    new: &str,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    if t.column_index(old).is_none() {
+        return Err(exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", old, name),
+        ));
+    }
+    if t.column_index(new).is_some() {
+        return Err(exec_err(
+            "42701",
+            format!("column \"{}\" of relation \"{}\" already exists", new, name),
+        ));
+    }
+    // Views reference columns by name in stored SQL; refuse rather than
+    // silently breaking them.
+    for (vname, vs) in &eng.db.views {
+        if vs.iter().any(|v| {
+            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
+        }) {
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "cannot rename column {} because view {} depends on table {}",
+                    old, vname, name
+                ),
+            ));
+        }
+    }
+    let mut next = t.clone();
+    let ci = next.column_index(old).expect("checked");
+    next.columns[ci].0 = new.to_string();
+    // Rename inside CHECK/DEFAULT expressions.
+    for c in &mut next.checks {
+        rename_col_in_expr(&mut c.expr, old, new);
+    }
+    for d in &mut next.defaults {
+        if let Some(DefaultExpr::Expr(e)) = d {
+            rename_col_in_expr(e, old, new);
+        }
+    }
+    // Rename inside unique/pkey/fk column lists.
+    for u in &mut next.uniques {
+        for c in &mut u.cols {
+            if c == old {
+                *c = new.to_string();
+            }
+        }
+    }
+    if let Some(pk) = &mut next.pkey {
+        for c in &mut pk.cols {
+            if c == old {
+                *c = new.to_string();
+            }
+        }
+    }
+    for fk in &mut next.fks {
+        for c in &mut fk.cols {
+            if c == old {
+                *c = new.to_string();
+            }
+        }
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    // Update index col_names.
+    let ix_names: Vec<String> = eng
+        .db
+        .indexes
+        .iter()
+        .filter(|(_, ix)| ix.def.table == name)
+        .map(|(n, _)| n.clone())
+        .collect();
+    for ix_name in ix_names {
+        if let Some(ix) = eng.db.indexes.get_mut(&ix_name) {
+            for c in &mut ix.def.col_names {
+                if c == old {
+                    *c = new.to_string();
+                }
+            }
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+fn alter_rename_to(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    new_name: &str,
+) -> Result<ExecResult, ExecError> {
+    if eng
+        .db
+        .find_table(new_name, ctx.snap, ctx.own)
+        .is_some()
+        || eng
+            .db
+            .views
+            .get(new_name)
+            .is_some_and(|vs| vs.iter().any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own)))
+    {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", new_name),
+        ));
+    }
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    // Update FK ref_table in other tables that point at the old name.
+    let mut ref_tables: Vec<String> = Vec::new();
+    for (tname, vs) in &eng.db.tables {
+        if tname == name {
+            continue;
+        }
+        if let Some(ot) = vs
+            .iter()
+            .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
+        {
+            if ot.fks.iter().any(|fk| fk.ref_table == name) {
+                ref_tables.push(tname.clone());
+            }
+        }
+    }
+    for tname in ref_tables {
+        let ot = eng
+            .db
+            .find_table(&tname, ctx.snap, ctx.own)
+            .expect("found above")
+            .clone();
+        let mut onext = ot.clone();
+        for fk in &mut onext.fks {
+            if fk.ref_table == name {
+                fk.ref_table = new_name.to_string();
+            }
+        }
+        alter_swap(eng, ctx, &tname, None, onext, None)?;
+    }
+    // Update view dependencies.
+    let mut view_names: Vec<String> = Vec::new();
+    for (vname, vs) in &eng.db.views {
+        if vs.iter().any(|v| {
+            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
+        }) {
+            view_names.push(vname.clone());
+        }
+    }
+    for vname in view_names {
+        if let Some(vs) = eng.db.views.get_mut(&vname) {
+            if let Some(v) = vs
+                .iter_mut()
+                .find(|v| crate::storage::view_visible(v, ctx.snap, ctx.own))
+            {
+                for d in &mut v.deps {
+                    if d == name {
+                        *d = new_name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    alter_swap(eng, ctx, name, Some(new_name.to_string()), t, None)?;
+    // Indexes were updated inside alter_swap; fix their table field via def.
+    for ix in eng.db.indexes.values_mut() {
+        if ix.def.table == name {
+            ix.def.table = new_name.to_string();
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+// ============================================================================
+// v0.9: views.
+// ============================================================================
+
+fn exec_create_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    query: &str,
+    col_aliases: &[String],
+    or_replace: bool,
+) -> Result<ExecResult, ExecError> {
+    // A table by this name blocks the view (Postgres shares the namespace).
+    if eng.db.find_table(name, ctx.snap, ctx.own).is_some() {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", name),
+        ));
+    }
+    let existing = eng.db.find_view(name, ctx.snap, ctx.own).is_some();
+    if existing && !or_replace {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", name),
+        ));
+    }
+    // The query must parse, and must not reference the view itself
+    // (checked by the parser) or unknown relations.
+    let stmt = parse_statement(query).map_err(sql_err)?;
+    let select = match stmt {
+        Stmt::Select(s) => s,
+        _ => {
+            return Err(exec_err(
+                "42601",
+                "CREATE VIEW query must be a SELECT".to_string(),
+            ))
+        }
+    };
+    let mut deps = Vec::new();
+    collect_table_refs(&select, &mut deps);
+    // Every referenced relation must exist (as a table or view).
+    for d in &deps {
+        let is_table = eng.db.find_table(d, ctx.snap, ctx.own).is_some();
+        let is_view = eng.db.find_view(d, ctx.snap, ctx.own).is_some();
+        if !is_table && !is_view {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", d),
+            ));
+        }
+    }
+    if existing {
+        // OR REPLACE: drop the old definition first (same statement).
+        drop_view_internal(eng, ctx, name)?;
+    }
+    let def = ViewDef {
+        query: query.to_string(),
+        col_aliases: col_aliases.to_vec(),
+        deps,
+        created_xmin: ctx.own,
+        dropped_xmax: 0,
+    };
+    eng.db.views.entry(name.to_string()).or_default().push(def);
+    ctx.writes.push(WriteOp::CreateView {
+        name: name.to_string(),
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE VIEW".to_string(),
+    })
+}
+
+fn exec_drop_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    names: &[String],
+    if_exists: bool,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    for name in names {
+        let exists = eng.db.find_view(name, ctx.snap, ctx.own).is_some();
+        if !exists {
+            if if_exists {
+                continue;
+            }
+            return Err(exec_err(
+                "42P01",
+                format!("view \"{}\" does not exist", name),
+            ));
+        }
+        // Other views depending on this one.
+        let mut dependents: Vec<String> = Vec::new();
+        for (vname, vs) in &eng.db.views {
+            if vname == name {
+                continue;
+            }
+            if vs.iter().any(|v| {
+                crate::storage::view_visible(v, ctx.snap, ctx.own)
+                    && v.deps.iter().any(|d| d == name)
+            }) {
+                dependents.push(vname.clone());
+            }
+        }
+        if !dependents.is_empty() && !cascade {
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "cannot drop view {} because view {} depends on it",
+                    name, dependents[0]
+                ),
+            ));
+        }
+        for dep in &dependents {
+            drop_view_internal(eng, ctx, dep)?;
+        }
+        drop_view_internal(eng, ctx, name)?;
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP VIEW".to_string(),
+    })
+}
+
+/// Drop a view by name, logging WriteOp::DropView. Used by DROP VIEW and
+/// by CASCADE paths from DROP TABLE / DROP COLUMN.
+fn drop_view_internal(eng: &mut Engine, ctx: &mut StmtCtx, name: &str) -> Result<(), ExecError> {
+    let snapshot = eng
+        .db
+        .find_view(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("view \"{}\" does not exist", name)))?
+        .clone();
+    eng.db
+        .find_view_mut(name, ctx.snap, ctx.own)
+        .expect("view still present")
+        .dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropView {
+        name: name.to_string(),
+        view: snapshot,
+    });
+    Ok(())
+}
+
+// ============================================================================
+// v0.9: information_schema / pg_catalog virtual tables (`\d`-style
+// introspection over the real catalog).
+// ============================================================================
+
+fn info_tables_schema() -> Vec<QCol> {
+    [
+        ("table_catalog", ColType::Text),
+        ("table_schema", ColType::Text),
+        ("table_name", ColType::Text),
+        ("table_type", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "information_schema.tables".to_string(),
+        name: n.to_string(),
+        ty,
+    })
+    .collect()
+}
+
+fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_tables_schema();
+    let mut rows = Vec::new();
+    let mut names: Vec<String> = db
+        .tables
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|t| crate::storage::table_visible(t, snap, own))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
+    for tn in names {
+        rows.push(QRow {
+            cells: vec![
+                Value::Text("rustgres".to_string()),
+                Value::Text("public".to_string()),
+                Value::Text(tn),
+                Value::Text("BASE TABLE".to_string()),
+            ],
+            prov: Vec::new(),
+        });
+    }
+    let mut vnames: Vec<String> = db
+        .views
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|v| crate::storage::view_visible(v, snap, own))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    vnames.sort();
+    for vn in vnames {
+        rows.push(QRow {
+            cells: vec![
+                Value::Text("rustgres".to_string()),
+                Value::Text("public".to_string()),
+                Value::Text(vn),
+                Value::Text("VIEW".to_string()),
+            ],
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+fn info_columns_schema() -> Vec<QCol> {
+    [
+        ("table_catalog", ColType::Text),
+        ("table_schema", ColType::Text),
+        ("table_name", ColType::Text),
+        ("column_name", ColType::Text),
+        ("ordinal_position", ColType::Int),
+        ("column_default", ColType::Text),
+        ("is_nullable", ColType::Text),
+        ("data_type", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "information_schema.columns".to_string(),
+        name: n.to_string(),
+        ty,
+    })
+    .collect()
+}
+
+fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_columns_schema();
+    let mut rows = Vec::new();
+    let mut tables: Vec<(String, Table)> = db
+        .tables
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|t| crate::storage::table_visible(t, snap, own))
+        })
+        .map(|(n, vs)| {
+            let t = vs
+                .iter()
+                .find(|t| crate::storage::table_visible(t, snap, own))
+                .expect("filtered")
+                .clone();
+            (n.clone(), t)
+        })
+        .collect();
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+    for (tn, t) in tables {
+        for (i, (cn, ty)) in t.columns.iter().enumerate() {
+            let default = match &t.defaults[i] {
+                Some(d) => Value::Text(format!("{:?}", d)),
+                None => Value::Null,
+            };
+            rows.push(QRow {
+                cells: vec![
+                    Value::Text("rustgres".to_string()),
+                    Value::Text("public".to_string()),
+                    Value::Text(tn.clone()),
+                    Value::Text(cn.clone()),
+                    Value::Int((i + 1) as i64),
+                    default,
+                    Value::Text(if t.not_null[i] { "NO" } else { "YES" }.to_string()),
+                    Value::Text(format!("{:?}", ty)),
+                ],
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
 }

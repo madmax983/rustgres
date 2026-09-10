@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,8 @@ struct PendingRows {
 }
 
 struct Session {
+    /// Stable per-connection id (v0.9: session-local currval()).
+    sid: u64,
     stmts: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
     /// After an extended-protocol error: discard input until Sync.
@@ -56,6 +59,9 @@ struct Session {
     /// Explicit transaction state; None = autocommit.
     txn: Option<Txn>,
 }
+
+/// Connection ids; process-local is fine (currval is in-memory only).
+static NEXT_SID: AtomicU64 = AtomicU64::new(1);
 
 /// One explicit transaction: an xid registered in the engine, an optional
 /// fixed snapshot (REPEATABLE READ / SERIALIZABLE), and the log of
@@ -82,6 +88,7 @@ struct Txn {
 impl Session {
     fn new() -> Self {
         Session {
+            sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             in_error: false,
@@ -426,7 +433,7 @@ fn run_statement(
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(engine, wal, stmt)
+                autocommit_execute(engine, wal, session.sid, stmt)
             }
         }
     }
@@ -489,10 +496,25 @@ fn txn_execute(
             snap: &snap,
             own: xid,
             level,
+            session: session.sid,
             writes: &mut t.writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
     };
+    // v0.9: sequence advances are non-transactional: on success, stage
+    // their commit-time WAL markers. (On failure the in-memory advance
+    // still stands, like Postgres; there is just nothing to log yet.)
+    if result.is_ok() {
+        let advanced = std::mem::take(&mut guard.seq_advanced);
+        let mut seen = std::collections::HashSet::new();
+        for name in advanced {
+            if seen.insert(name.clone()) {
+                t.writes.push(WriteOp::SeqAdvance { name });
+            }
+        }
+    } else {
+        guard.seq_advanced.clear();
+    }
     match result {
         Ok(r) => Ok(r),
         Err(e) => {
@@ -509,6 +531,7 @@ fn txn_execute(
 fn autocommit_execute(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
+    sid: u64,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
     let mut guard = engine.lock().unwrap();
@@ -520,10 +543,24 @@ fn autocommit_execute(
             snap: &snap,
             own: xid,
             level: IsolationLevel::ReadCommitted,
+            session: sid,
             writes: &mut writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
     };
+    // v0.9: stage sequence-advance WAL markers on success (see
+    // txn_execute for the semantics).
+    if result.is_ok() {
+        let advanced = std::mem::take(&mut guard.seq_advanced);
+        let mut seen = std::collections::HashSet::new();
+        for name in advanced {
+            if seen.insert(name.clone()) {
+                writes.push(WriteOp::SeqAdvance { name });
+            }
+        }
+    } else {
+        guard.seq_advanced.clear();
+    }
     let result = match result {
         Ok(r) => r,
         Err(e) => {
@@ -593,10 +630,19 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             // versions; inserts and creates never do.
             WriteOp::DeleteRow { table, .. } => table.as_str(),
             WriteOp::DropTable { name, .. } => name.as_str(),
+            // v0.9: ALTER TABLE swaps the table version; its rows may be
+            // reaped too. Views/sequences create no dead row versions.
+            WriteOp::AlterTable { name, .. } => name.as_str(),
             WriteOp::InsertRow { .. }
             | WriteOp::CreateTable { .. }
             | WriteOp::CreateIndex { .. }
-            | WriteOp::DropIndex { .. } => continue,
+            | WriteOp::DropIndex { .. }
+            | WriteOp::CreateView { .. }
+            | WriteOp::DropView { .. }
+            | WriteOp::CreateSequence { .. }
+            | WriteOp::DropSequence { .. }
+            | WriteOp::AlterSequence { .. }
+            | WriteOp::SeqAdvance { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);
@@ -814,9 +860,17 @@ fn txn_rollback_to(
     let xid = t.xid;
     // Undo everything staged after the savepoint, newest first. Each undo
     // is conditional on the version still being ours (see undo_write_op).
+    // v0.9: sequence advances are non-transactional — they survive
+    // ROLLBACK TO SAVEPOINT (like Postgres) and keep their WAL markers.
+    let mut kept_seq: Vec<WriteOp> = Vec::new();
     for op in t.writes.drain(to..).rev() {
-        undo_write_op(&mut guard, xid, &op);
+        if matches!(op, WriteOp::SeqAdvance { .. }) {
+            kept_seq.push(op);
+        } else {
+            undo_write_op(&mut guard, xid, &op);
+        }
     }
+    t.writes.extend(kept_seq.into_iter().rev());
     // Row locks taken after the savepoint are released, like Postgres;
     // locks from before it stay held.
     guard.release_locks_after(xid, keep_locks);
@@ -1324,6 +1378,7 @@ mod tests {
         let mut engine = Engine::new();
         let xid = engine.begin_txn();
         let session = Session {
+            sid: 4242,
             stmts: HashMap::new(),
             portals: HashMap::new(),
             in_error: false,
