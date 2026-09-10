@@ -30,12 +30,7 @@ impl CopyParseError {
 }
 
 /// Format one row (fields + null flags) into `out`.
-pub fn format_row(
-    fields: &[String],
-    is_null: &[bool],
-    out: &mut Vec<u8>,
-    options: &CopyOptions,
-) {
+pub fn format_row(fields: &[String], is_null: &[bool], out: &mut Vec<u8>, options: &CopyOptions) {
     match options.format {
         CopyFormat::Text => format_text_row(fields, is_null, out, options),
         CopyFormat::Csv => format_csv_row(fields, is_null, out, options),
@@ -62,12 +57,7 @@ fn escape_text(s: &str, out: &mut Vec<u8>, options: &CopyOptions) {
     }
 }
 
-fn format_text_row(
-    fields: &[String],
-    is_null: &[bool],
-    out: &mut Vec<u8>,
-    options: &CopyOptions,
-) {
+fn format_text_row(fields: &[String], is_null: &[bool], out: &mut Vec<u8>, options: &CopyOptions) {
     for (i, (f, &null)) in fields.iter().zip(is_null.iter()).enumerate() {
         if i > 0 {
             out.push(options.delimiter);
@@ -81,12 +71,7 @@ fn format_text_row(
     out.push(b'\n');
 }
 
-fn format_csv_row(
-    fields: &[String],
-    is_null: &[bool],
-    out: &mut Vec<u8>,
-    options: &CopyOptions,
-) {
+fn format_csv_row(fields: &[String], is_null: &[bool], out: &mut Vec<u8>, options: &CopyOptions) {
     for (i, (f, &null)) in fields.iter().zip(is_null.iter()).enumerate() {
         if i > 0 {
             out.push(options.delimiter);
@@ -96,12 +81,10 @@ fn format_csv_row(
         } else {
             // Quote when the field contains delimiter, quote, newline,
             // or matches the null string (like Postgres).
-            let needs_quote = f.bytes().any(|b| {
-                b == options.delimiter
-                    || b == options.quote
-                    || b == b'\n'
-                    || b == b'\r'
-            }) || *f == options.null;
+            let needs_quote = f
+                .bytes()
+                .any(|b| b == options.delimiter || b == options.quote || b == b'\n' || b == b'\r')
+                || *f == options.null;
             if needs_quote {
                 out.push(options.quote);
                 for b in f.bytes() {
@@ -176,11 +159,7 @@ fn parse_text_rows(
         if fields.len() != ncols {
             return Err(CopyParseError::at(
                 lineno,
-                format!(
-                    "expected {} column(s) but found {}",
-                    ncols,
-                    fields.len()
-                ),
+                format!("expected {} column(s) but found {}", ncols, fields.len()),
             ));
         }
         let mut row = Vec::with_capacity(ncols);
@@ -248,8 +227,7 @@ fn unescape_text(field: &[u8], lineno: usize) -> Result<String, CopyParseError> 
             i += 1;
         }
     }
-    String::from_utf8(out)
-        .map_err(|_| CopyParseError::at(lineno, "invalid UTF-8 in COPY data"))
+    String::from_utf8(out).map_err(|_| CopyParseError::at(lineno, "invalid UTF-8 in COPY data"))
 }
 
 fn parse_csv_rows(
@@ -276,9 +254,8 @@ fn parse_csv_rows(
             let f = if !was_quoted && field == options.null.as_bytes() {
                 CopyField::Null
             } else {
-                let s = String::from_utf8(std::mem::take(&mut field)).map_err(|_| {
-                    CopyParseError::at(lineno, "invalid UTF-8 in COPY data")
-                })?;
+                let s = String::from_utf8(std::mem::take(&mut field))
+                    .map_err(|_| CopyParseError::at(lineno, "invalid UTF-8 in COPY data"))?;
                 CopyField::Text(s)
             };
             row.push(f);
@@ -346,10 +323,7 @@ fn parse_csv_rows(
         }
     }
     if in_quotes {
-        return Err(CopyParseError::at(
-            lineno,
-            "unterminated quoted field",
-        ));
+        return Err(CopyParseError::at(lineno, "unterminated quoted field"));
     }
     // Trailing field/row without a newline.
     if !field.is_empty() || !row.is_empty() || field_quoted {

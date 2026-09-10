@@ -1,2 +1,4 @@
 /target
 /rustgres-data
+__pycache__/
+*.pyc

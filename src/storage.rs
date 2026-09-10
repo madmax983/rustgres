@@ -29,38 +29,38 @@ use crate::sql::{CheckDef, DefaultExpr, FkDef, TableDef, UniqueDef};
 /// Column data types supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
-    Int,      // INT4, OID 23
-    BigInt,   // INT8, OID 20 (v0.7)
-    SmallInt, // INT2, OID 21 (v0.7)
-    Float,    // FLOAT8, OID 701
-    Float4,   // FLOAT4, OID 700 (v0.7)
-    Numeric,  // NUMERIC, OID 1700 (v0.7)
-    Text,     // OID 25
-    Bool,     // OID 16
-    Date,     // OID 1082 (v0.7)
+    Int,         // INT4, OID 23
+    BigInt,      // INT8, OID 20 (v0.7)
+    SmallInt,    // INT2, OID 21 (v0.7)
+    Float,       // FLOAT8, OID 701
+    Float4,      // FLOAT4, OID 700 (v0.7)
+    Numeric,     // NUMERIC, OID 1700 (v0.7)
+    Text,        // OID 25
+    Bool,        // OID 16
+    Date,        // OID 1082 (v0.7)
     Timestamp,   // OID 1114 (v0.7)
     Timestamptz, // OID 1184 (v0.7)
-    Bytea,    // OID 17 (v0.7)
-    Uuid,     // OID 2950 (v0.7)
+    Bytea,       // OID 17 (v0.7)
+    Uuid,        // OID 2950 (v0.7)
 }
 
 impl ColType {
     /// PostgreSQL type OID used in RowDescription.
     pub fn oid(&self) -> i32 {
         match self {
-            ColType::Int => 23,         // INT4
-            ColType::BigInt => 20,      // INT8
-            ColType::SmallInt => 21,    // INT2
-            ColType::Text => 25,        // TEXT
-            ColType::Bool => 16,        // BOOL
-            ColType::Float => 701,      // FLOAT8
-            ColType::Float4 => 700,     // FLOAT4
-            ColType::Numeric => 1700,   // NUMERIC
-            ColType::Date => 1082,      // DATE
-            ColType::Timestamp => 1114, // TIMESTAMP
+            ColType::Int => 23,           // INT4
+            ColType::BigInt => 20,        // INT8
+            ColType::SmallInt => 21,      // INT2
+            ColType::Text => 25,          // TEXT
+            ColType::Bool => 16,          // BOOL
+            ColType::Float => 701,        // FLOAT8
+            ColType::Float4 => 700,       // FLOAT4
+            ColType::Numeric => 1700,     // NUMERIC
+            ColType::Date => 1082,        // DATE
+            ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
-            ColType::Bytea => 17,       // BYTEA
-            ColType::Uuid => 2950,      // UUID
+            ColType::Bytea => 17,         // BYTEA
+            ColType::Uuid => 2950,        // UUID
         }
     }
 
@@ -179,7 +179,11 @@ impl Numeric {
         if scale < 0 {
             let extra = (-scale) as u32;
             unscaled = unscaled
-                .checked_mul(10i128.checked_pow(extra).ok_or(NumericParseError::Overflow)?)
+                .checked_mul(
+                    10i128
+                        .checked_pow(extra)
+                        .ok_or(NumericParseError::Overflow)?,
+                )
                 .ok_or(NumericParseError::Overflow)?;
             Ok(Numeric::new(unscaled, 0))
         } else {
@@ -299,7 +303,11 @@ impl Numeric {
         let div = 10i128.checked_pow(self.scale)?;
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
-        let q = if r != 0 && self.unscaled < 0 { q - 1 } else { q };
+        let q = if r != 0 && self.unscaled < 0 {
+            q - 1
+        } else {
+            q
+        };
         Some(Numeric::new(q, 0))
     }
 
@@ -307,7 +315,11 @@ impl Numeric {
         let div = 10i128.checked_pow(self.scale)?;
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
-        let q = if r != 0 && self.unscaled > 0 { q + 1 } else { q };
+        let q = if r != 0 && self.unscaled > 0 {
+            q + 1
+        } else {
+            q
+        };
         Some(Numeric::new(q, 0))
     }
 
@@ -366,7 +378,11 @@ impl Numeric {
         let neg_a = self.unscaled < 0;
         let neg_b = other.unscaled < 0;
         if neg_a != neg_b {
-            return if neg_a { Ordering::Less } else { Ordering::Greater };
+            return if neg_a {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         }
         // Compare by magnitude: digits(unscaled) - scale.
         let mag = |n: &Numeric| -> i64 {
@@ -443,19 +459,19 @@ impl Ord for Numeric {
 /// A single cell value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
-    SmallInt(i16),   // v0.7: INT2
-    Int(i64),        // INT4 (kept as i64, like v0.1-v0.6)
-    BigInt(i64),     // v0.7: INT8
-    Float4(f32),     // v0.7: REAL
-    Float(f64),      // FLOAT8
-    Numeric(Numeric),// v0.7: NUMERIC
+    SmallInt(i16),    // v0.7: INT2
+    Int(i64),         // INT4 (kept as i64, like v0.1-v0.6)
+    BigInt(i64),      // v0.7: INT8
+    Float4(f32),      // v0.7: REAL
+    Float(f64),       // FLOAT8
+    Numeric(Numeric), // v0.7: NUMERIC
     Text(String),
     Bool(bool),
-    Date(i32),       // v0.7: days since 1970-01-01
-    Timestamp(i64),  // v0.7: micros since 1970-01-01 00:00:00 UTC
-    Timestamptz(i64),// v0.7: micros since epoch, UTC
-    Bytea(Vec<u8>),  // v0.7
-    Uuid([u8; 16]),  // v0.7
+    Date(i32),        // v0.7: days since 1970-01-01
+    Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
+    Timestamptz(i64), // v0.7: micros since epoch, UTC
+    Bytea(Vec<u8>),   // v0.7
+    Uuid([u8; 16]),   // v0.7
     Null,
 }
 
@@ -692,6 +708,12 @@ pub struct Table {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v0.11: role that owns the table (the creating role).
+    pub owner: String,
+    /// v0.11: explicit GRANT entries (owner and superusers bypass).
+    pub acl: Vec<AclEntry>,
+    /// v0.11: column-level GRANT entries (empty = none granted).
+    pub col_acl: Vec<ColAclEntry>,
 }
 
 impl Table {
@@ -709,15 +731,15 @@ impl Table {
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
+            owner: "postgres".to_string(),
+            acl: Vec::new(),
+            col_acl: Vec::new(),
         }
     }
 
     /// Build a table from a parsed v0.9 `TableDef` (constraints included).
     pub fn with_def(def: &TableDef, created_xmin: u64) -> Self {
-        let mut t = Table::new(
-            def.columns.clone(),
-            created_xmin,
-        );
+        let mut t = Table::new(def.columns.clone(), created_xmin);
         t.not_null = def.not_null.clone();
         t.defaults = def.defaults.clone();
         t.checks = def.checks.clone();
@@ -788,6 +810,12 @@ pub struct Database {
     /// Sequences by name (v0.9). DDL is transactional; the sequence
     /// *value* (`current`) advances non-transactionally, like PostgreSQL.
     pub sequences: HashMap<String, Vec<Sequence>>,
+    /// Roles by name (v0.11). Versioned like tables so CREATE / DROP /
+    /// ALTER ROLE are transactional under MVCC.
+    pub roles: HashMap<String, Vec<Role>>,
+    /// v0.11: database-level GRANT entries (CONNECT). Empty = default
+    /// allow, matching a fresh PostgreSQL install's PUBLIC grant.
+    pub db_acl: Vec<AclEntry>,
 }
 
 /// A view definition (v0.9): the raw SELECT text plus dependency names.
@@ -803,6 +831,8 @@ pub struct ViewDef {
     pub created_xmin: u64,
     /// Xid of the DROP VIEW transaction; 0 = not dropped.
     pub dropped_xmax: u64,
+    /// v0.11: role that owns the view.
+    pub owner: String,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -824,10 +854,22 @@ pub struct Sequence {
     pub created_xmin: u64,
     /// Xid of the DROP SEQUENCE transaction; 0 = not dropped.
     pub dropped_xmax: u64,
+    /// v0.11: role that owns the sequence.
+    pub owner: String,
+    /// v0.11: explicit GRANT entries for USAGE (owner/superuser bypass).
+    pub acl: Vec<AclEntry>,
 }
 
 impl Sequence {
-    pub fn new(name: String, start: i64, increment: i64, min_value: i64, max_value: i64, cycle: bool, created_xmin: u64) -> Self {
+    pub fn new(
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+        created_xmin: u64,
+    ) -> Self {
         Sequence {
             name,
             start,
@@ -839,19 +881,41 @@ impl Sequence {
             is_called: false,
             created_xmin,
             dropped_xmax: 0,
+            owner: "postgres".to_string(),
+            acl: Vec::new(),
         }
     }
 }
 
 impl Database {
     pub fn new() -> Self {
-        Database {
+        let mut db = Database {
             tables: HashMap::new(),
             indexes: HashMap::new(),
             stats: HashMap::new(),
             views: HashMap::new(),
             sequences: HashMap::new(),
-        }
+            roles: HashMap::new(),
+            db_acl: Vec::new(),
+        };
+        // v0.11: the bootstrap superuser always exists.
+        db.roles
+            .insert("postgres".to_string(), vec![Role::bootstrap_postgres()]);
+        db
+    }
+
+    /// First role version with `name` visible to (`snap`, `own`).
+    pub fn find_role(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Role> {
+        self.roles
+            .get(name)
+            .and_then(|vs| vs.iter().find(|r| role_visible(r, snap, own)))
+    }
+
+    /// Mutable variant of [`Database::find_role`].
+    pub fn find_role_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Role> {
+        self.roles
+            .get_mut(name)
+            .and_then(|vs| vs.iter_mut().find(|r| role_visible(r, snap, own)))
     }
 
     /// First view version with `name` visible to (`snap`, `own`).
@@ -937,12 +1001,7 @@ impl Database {
     }
 
     /// Mutable twin of [`Database::find_index`].
-    pub fn find_index_mut(
-        &mut self,
-        name: &str,
-        snap: &Snapshot,
-        own: u64,
-    ) -> Option<&mut Index> {
+    pub fn find_index_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Index> {
         self.indexes
             .get_mut(name)
             .filter(|ix| index_visible(&ix.def, snap, own))
@@ -1431,6 +1490,303 @@ pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
     !(s.dropped_xmax < snap.next_xid && !snap.active.contains(&s.dropped_xmax))
 }
 
+/// Visibility for role versions (v0.11): same rules as tables.
+pub fn role_visible(r: &Role, snap: &Snapshot, own: u64) -> bool {
+    let created_ok = r.created_xmin == own
+        || (r.created_xmin < snap.next_xid && !snap.active.contains(&r.created_xmin));
+    if !created_ok {
+        return false;
+    }
+    if r.dropped_xmax == 0 {
+        return true;
+    }
+    if r.dropped_xmax == own {
+        return false;
+    }
+    !(r.dropped_xmax < snap.next_xid && !snap.active.contains(&r.dropped_xmax))
+}
+
+// ---------------------------------------------------------------------------
+// Roles, privileges, and access control (v0.11)
+// ---------------------------------------------------------------------------
+
+/// Table/sequence/database privilege bits (v0.11).
+pub const PRIV_SELECT: u32 = 1;
+pub const PRIV_INSERT: u32 = 2;
+pub const PRIV_UPDATE: u32 = 4;
+pub const PRIV_DELETE: u32 = 8;
+pub const PRIV_TRUNCATE: u32 = 16;
+pub const PRIV_REFERENCES: u32 = 32;
+pub const PRIV_TRIGGER: u32 = 64;
+pub const PRIV_USAGE: u32 = 128; // sequences
+pub const PRIV_CONNECT: u32 = 256; // database
+pub const PRIV_ALL_TABLE: u32 = PRIV_SELECT
+    | PRIV_INSERT
+    | PRIV_UPDATE
+    | PRIV_DELETE
+    | PRIV_TRUNCATE
+    | PRIV_REFERENCES
+    | PRIV_TRIGGER;
+
+/// One GRANT entry: `role` holds `privs` on the object the entry is
+/// attached to (a table's `acl`, a sequence's `acl`, or the database's
+/// `db_acl`).
+#[derive(Clone, Debug)]
+pub struct AclEntry {
+    pub role: String,
+    pub privs: u32,
+}
+
+/// v0.11: a column-level GRANT entry (`GRANT SELECT (a, b) ON t TO r`).
+/// `privs` applies only to the named `columns`. Owner and superusers
+/// bypass ACLs entirely, so they never need entries here.
+#[derive(Clone, Debug)]
+pub struct ColAclEntry {
+    pub role: String,
+    pub privs: u32,
+    pub columns: Vec<String>,
+}
+
+/// A database role (v0.11). Versioned like tables so CREATE / DROP /
+/// ALTER ROLE are transactional under MVCC.
+///
+/// Passwords are never stored: `password` holds the SCRAM-SHA-256
+/// verifier (salt, iteration count, StoredKey, ServerKey). `None` means
+/// the role has no password and can only connect via trust auth.
+#[derive(Clone, Debug)]
+pub struct Role {
+    pub name: String,
+    pub password: Option<crate::crypto::ScramVerifier>,
+    pub can_login: bool,
+    pub superuser: bool,
+    /// -1 = unlimited, like PostgreSQL.
+    pub connlimit: i32,
+    /// Group roles this role is a member of (`GRANT group TO member`).
+    /// Membership confers the group's GRANTed privileges (transitively).
+    pub memberships: Vec<RoleMembership>,
+    /// Password expiry from VALID UNTIL, as the raw timestamp literal.
+    /// None = never expires. Enforced at SCRAM authentication.
+    pub valid_until: Option<String>,
+    /// Xid of the CREATE ROLE transaction (0 = bootstrap role, always
+    /// visible: `xid_committed(0)` is true).
+    pub created_xmin: u64,
+    /// Xid of the DROP ROLE transaction; 0 = not dropped.
+    pub dropped_xmax: u64,
+}
+
+/// One `GRANT group_role TO member` edge: `member` inherits the
+/// privileges granted to `group_role`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleMembership {
+    /// The group role.
+    pub role: String,
+    /// The role that ran the GRANT (for pg_auth_members.grantor).
+    pub grantor: String,
+}
+
+impl Role {
+    /// The bootstrap superuser. Always present (created by
+    /// `Database::new`, re-serialized by checkpoints).
+    pub fn bootstrap_postgres() -> Self {
+        Role {
+            name: "postgres".to_string(),
+            password: None,
+            can_login: true,
+            superuser: true,
+            connlimit: -1,
+            memberships: Vec::new(),
+            valid_until: None,
+            created_xmin: 0,
+            dropped_xmax: 0,
+        }
+    }
+}
+
+/// Validate a VALID UNTIL literal at DDL time. Accepts any timestamp the
+/// datetime parser handles, plus 'infinity' (never expires, like
+/// PostgreSQL).
+pub fn check_valid_until(vu: &str) -> Result<(), String> {
+    if vu.eq_ignore_ascii_case("infinity") {
+        return Ok(());
+    }
+    crate::datetime::parse_timestamp(vu).map(|_| ())
+}
+
+pub fn normalize_valid_until(vu: &str) -> Option<String> {
+    if vu.eq_ignore_ascii_case("infinity") {
+        None
+    } else {
+        Some(vu.to_string())
+    }
+}
+
+/// Whether the role's password has expired (VALID UNTIL passed).
+/// Unparseable literals (impossible after DDL validation) are treated
+/// as not expired.
+pub fn password_expired(valid_until: &Option<String>) -> bool {
+    match valid_until {
+        None => false,
+        Some(vu) => match crate::datetime::parse_timestamp(vu) {
+            Ok(t) => crate::datetime::now_micros() >= t,
+            Err(_) => false,
+        },
+    }
+}
+
+/// Transitive closure of `role` plus every group role it is (transitively)
+/// a member of. Used for privilege inheritance: a GRANT to any role in
+/// the closure counts. Owner and superuser status are NOT inherited
+/// (PostgreSQL requires SET ROLE for those, which rustgres does not
+/// implement yet).
+pub fn role_closure(db: &Database, role: &str, snap: &Snapshot, own: u64) -> Vec<String> {
+    let mut out = vec![role.to_string()];
+    let mut i = 0;
+    while i < out.len() {
+        let name = out[i].clone();
+        i += 1;
+        if let Some(r) = db.find_role(&name, snap, own) {
+            for m in &r.memberships {
+                if !out.iter().any(|n| n == &m.role) {
+                    out.push(m.role.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Effective privilege bits `role` holds on table `t`: superusers and
+/// the table owner implicitly hold everything; everyone else gets the
+/// union of their GRANT entries, including entries granted to group
+/// roles they are a member of.
+pub fn table_privs(db: &Database, role: &str, t: &Table, snap: &Snapshot, own: u64) -> u32 {
+    table_privs_in(db, role, t, &role_closure(db, role, snap, own), snap, own)
+}
+
+/// [`table_privs`] with a precomputed [`role_closure`]: the hot privilege
+/// loops call this so the closure is built once per statement, not once
+/// per column (callgrind showed the closure dominating SELECT checks).
+pub fn table_privs_in(
+    db: &Database,
+    role: &str,
+    t: &Table,
+    closure: &[String],
+    snap: &Snapshot,
+    own: u64,
+) -> u32 {
+    if is_superuser_snap(db, role, snap, own) || t.owner == role {
+        return PRIV_ALL_TABLE;
+    }
+    let mut privs = 0u32;
+    for e in &t.acl {
+        if closure.iter().any(|n| n == &e.role) {
+            privs |= e.privs;
+        }
+    }
+    privs
+}
+
+/// Effective privilege bits `role` holds on `column` of table `t`:
+/// the table-level bits plus any column-level grant covering that
+/// column (inherited through role memberships). Owners and superusers
+/// get everything via [`table_privs`].
+/// Effective privilege bits `role` holds on `column` of table `t`:
+/// the table-level bits plus any column-level grant covering that
+/// column (inherited through role memberships). Owners and superusers
+/// get everything via [`table_privs_in`]. Takes a precomputed
+/// [`role_closure`] so hot loops build it once per statement.
+pub fn column_privs_in(
+    db: &Database,
+    role: &str,
+    t: &Table,
+    column: &str,
+    closure: &[String],
+    snap: &Snapshot,
+    own: u64,
+) -> u32 {
+    let mut privs = table_privs_in(db, role, t, closure, snap, own);
+    if privs == PRIV_ALL_TABLE {
+        return privs;
+    }
+    for e in &t.col_acl {
+        if closure.iter().any(|n| n == &e.role) && e.columns.iter().any(|c| c == column) {
+            privs |= e.privs;
+        }
+    }
+    privs
+}
+
+/// Whether `role` holds any column-level grant containing `bit` on
+/// table `t` (used as a coarse gate before the precise per-column
+/// check).
+pub fn has_col_priv(
+    db: &Database,
+    role: &str,
+    t: &Table,
+    bit: u32,
+    snap: &Snapshot,
+    own: u64,
+) -> bool {
+    if table_privs(db, role, t, snap, own) & bit == bit {
+        return true;
+    }
+    let closure = role_closure(db, role, snap, own);
+    t.col_acl
+        .iter()
+        .any(|e| closure.iter().any(|n| n == &e.role) && e.privs & bit == bit)
+}
+
+/// Effective USAGE bits `role` holds on sequence `s`.
+pub fn sequence_privs(db: &Database, role: &str, s: &Sequence, snap: &Snapshot, own: u64) -> u32 {
+    if is_superuser_snap(db, role, snap, own) || s.owner == role {
+        return PRIV_USAGE;
+    }
+    let closure = role_closure(db, role, snap, own);
+    let mut privs = 0u32;
+    for e in &s.acl {
+        if closure.iter().any(|n| n == &e.role) {
+            privs |= e.privs;
+        }
+    }
+    privs
+}
+
+/// Whether `role` may open a session at all (database CONNECT).
+/// Default: everyone may connect (matches a fresh PostgreSQL
+/// install where PUBLIC has CONNECT); REVOKE CONNECT takes it away.
+pub fn db_connect_allowed(db: &Database, role: &str, snap: &Snapshot, own: u64) -> bool {
+    if is_superuser_snap(db, role, snap, own) {
+        return true;
+    }
+    // No explicit ACL = default allow (PostgreSQL's PUBLIC grant).
+    let closure = role_closure(db, role, snap, own);
+    let mut denied = false;
+    let mut allowed = false;
+    for e in &db.db_acl {
+        if closure.iter().any(|n| n == &e.role) {
+            if e.privs & PRIV_CONNECT != 0 {
+                allowed = true;
+            } else {
+                // An entry without CONNECT for this role counts as an
+                // explicit revoke.
+                denied = true;
+            }
+        }
+    }
+    if denied && !allowed {
+        return false;
+    }
+    true
+}
+
+/// Whether `role` is a superuser under (`snap`, `own`). Unknown roles
+/// are not superusers.
+pub fn is_superuser_snap(db: &Database, role: &str, snap: &Snapshot, own: u64) -> bool {
+    db.find_role(role, snap, own)
+        .map(|r| r.superuser)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Write log: per-transaction undo + commit-time WAL records
 // ---------------------------------------------------------------------------
@@ -1499,6 +1855,24 @@ pub enum WriteOp {
     SeqAdvance {
         name: String,
     },
+    // --- v0.11: role DDL. DropRole / AlterRole carry the previous role
+    // version so undo restores it exactly.
+    CreateRole {
+        name: String,
+    },
+    DropRole {
+        name: String,
+        prev: Role,
+    },
+    AlterRole {
+        name: String,
+        prev: Role,
+    },
+    /// v0.11: database-level GRANT/REVOKE CONNECT. Carries the previous
+    /// ACL for undo; the record logs the new full ACL.
+    DbAcl {
+        prev: Vec<AclEntry>,
+    },
 }
 
 /// Undo a single write op. Each undo is conditional on the version still
@@ -1513,22 +1887,21 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // values are cloned and the table borrow is dropped first.
             // (DELETE/UPDATE never remove entries, so undoing an insert is
             // the only DML case that touches the index.)
-            let removed: Option<Vec<Value>> =
-                if let Some(versions) = eng.db.tables.get_mut(table) {
-                    let mut out = None;
-                    for t in versions.iter_mut() {
-                        if let Some(pos) = t.row_pos(*row_id) {
-                            if t.rows[pos].xmin == own {
-                                out = Some(t.rows[pos].values.clone());
-                                t.swap_remove_version(pos);
-                            }
-                            break;
+            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+                let mut out = None;
+                for t in versions.iter_mut() {
+                    if let Some(pos) = t.row_pos(*row_id) {
+                        if t.rows[pos].xmin == own {
+                            out = Some(t.rows[pos].values.clone());
+                            t.swap_remove_version(pos);
                         }
+                        break;
                     }
-                    out
-                } else {
-                    None
-                };
+                }
+                out
+            } else {
+                None
+            };
             if let Some(values) = removed {
                 eng.db.index_remove_row(table, *row_id, &values);
             }
@@ -1689,6 +2062,52 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // created by this transaction, the CreateSequence undo drops
             // it, taking the advance with it.)
             let _ = name;
+        }
+        // --- v0.11: role DDL undo. Conditional on the version still
+        // being ours, like the table/version cases above.
+        WriteOp::CreateRole { name } => {
+            if let Some(versions) = eng.db.roles.get_mut(name) {
+                versions.retain(|r| r.created_xmin != own);
+                if versions.is_empty() {
+                    eng.db.roles.remove(name);
+                }
+            }
+        }
+        WriteOp::DropRole { name, prev } => {
+            let ours = eng
+                .db
+                .roles
+                .get(name)
+                .map(|vs| {
+                    vs.iter()
+                        .any(|r| r.created_xmin == prev.created_xmin && r.dropped_xmax == own)
+                })
+                .unwrap_or(false);
+            if ours {
+                let mut restored = prev.clone();
+                restored.dropped_xmax = 0;
+                if let Some(versions) = eng.db.roles.get_mut(name) {
+                    for r in versions.iter_mut() {
+                        if r.created_xmin == prev.created_xmin {
+                            *r = restored;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        WriteOp::AlterRole { name, prev } => {
+            if let Some(versions) = eng.db.roles.get_mut(name) {
+                for r in versions.iter_mut() {
+                    if r.created_xmin == prev.created_xmin {
+                        *r = prev.clone();
+                        break;
+                    }
+                }
+            }
+        }
+        WriteOp::DbAcl { prev } => {
+            eng.db.db_acl = prev.clone();
         }
     }
 }

@@ -35,11 +35,7 @@ pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (
-        if m <= 2 { y + 1 } else { y } as i32,
-        m as u32,
-        d as u32,
-    )
+    (if m <= 2 { y + 1 } else { y } as i32, m as u32, d as u32)
 }
 
 pub fn is_leap_year(y: i32) -> bool {
@@ -316,7 +312,8 @@ pub fn date_trunc(field: &str, micros: i64) -> Result<i64, String> {
     let ss = (tod / 1_000_000) % 60;
     let us = tod % 1_000_000;
     let day_micros = |y: i32, m: u32, d: u32| -> i64 { days_from_civil(y, m, d) * 86_400_000_000 };
-    let at_hms = |base: i64, h: i64, mi: i64, s: i64| -> i64 { base + (h * 3600 + mi * 60 + s) * 1_000_000 };
+    let at_hms =
+        |base: i64, h: i64, mi: i64, s: i64| -> i64 { base + (h * 3600 + mi * 60 + s) * 1_000_000 };
     Ok(match field {
         "millennium" => day_micros((y / 1000) * 1000, 1, 1),
         "century" => day_micros((y / 100) * 100, 1, 1),
@@ -393,7 +390,13 @@ mod tests {
 
     #[test]
     fn civil_round_trip() {
-        for (y, m, d) in [(1970, 1, 1), (2026, 9, 10), (2000, 2, 29), (1900, 2, 28), (1, 1, 1)] {
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (2026, 9, 10),
+            (2000, 2, 29),
+            (1900, 2, 28),
+            (1, 1, 1),
+        ] {
             let days = days_from_civil(y, m, d);
             assert_eq!(civil_from_days(days), (y, m, d));
         }

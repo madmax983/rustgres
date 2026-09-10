@@ -2,6 +2,37 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.11 baseline — 2026-09-10
+
+Environment: same sandbox, **release build** (`cargo build --release`),
+fresh temp data dir, 5 s per workload. v0.11 adds SCRAM auth, roles,
+and the privilege system; every query now passes a permission check.
+Callgrind showed the per-query role-membership closure dominating
+(`check_select_col_privs` 27.6% + `role_closure` 21.7% of
+instructions); the closure is now built once per statement instead of
+once per column (~2x fewer instructions in the permission path).
+
+| workload   | qps      | p50        | p99        | vs v0.9 |
+|------------|----------|------------|------------|---------|
+| `select1`  | 21,094   | 0.024 ms   | 0.325 ms   | p50 same |
+| `expr`     | 6,672    | 0.066 ms   | 1.319 ms   | p50 same |
+| `scan`     | 36.6     | 17.78 ms   | 136.14 ms  | noise |
+| `insert`   | 116.3    | 3.913 ms   | 55.33 ms   | qps lower, p50 same |
+| `prepared` | 12,534   | 0.041 ms   | 0.675 ms   | p50 same |
+| `txn`      | 4,138    | 0.106 ms   | 2.343 ms   | qps lower, p50 same |
+| `mvcc`     | 1,004    | 0.682 ms   | 4.398 ms   | noise |
+| `join`     | 0.9      | 836 ms     | 1909 ms    | noise |
+| `idxscan`  | 11,133   | 0.033 ms   | 0.808 ms   | p50 same |
+| `window`   | 3.6      | 208.8 ms   | 662.9 ms   | new in v0.10 |
+| `copy`     | 28.9     | 25.02 ms   | 167.0 ms   | new in v0.10 |
+
+p50 latencies are unchanged vs v0.9 across the board; qps deltas on
+`insert`/`txn` are sandbox noise (p50 identical). Valgrind memcheck on
+the v0.11 auth/grant paths (SCRAM, role/membership/column grants,
+CHECKPOINT): 0 bytes definitely lost; 51 contexts are Rust-runtime
+false positives. DHAT on 300 permission-checked SELECTs: 2.3 MB total
+allocated, max live 256 B — no heap bloat.
+
 ## v0.9 baseline — 2026-09-10
 
 Environment: same sandbox, **release build** (`cargo build --release`),

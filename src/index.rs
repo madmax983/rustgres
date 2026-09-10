@@ -227,10 +227,7 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(index_key_cmp(&Value::Int(1), &Value::Null), Ordering::Less);
-        assert_eq!(
-            index_key_cmp(&Value::Null, &Value::Null),
-            Ordering::Equal
-        );
+        assert_eq!(index_key_cmp(&Value::Null, &Value::Null), Ordering::Equal);
     }
 
     #[test]

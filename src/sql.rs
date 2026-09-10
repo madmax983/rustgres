@@ -69,16 +69,16 @@ enum Token {
     Semi,
     Star,
     Plus,
-    Minus,      // v0.7: `-` (unary and binary)
-    Slash,      // v0.7: `/`
-    Percent,    // v0.7: `%`
+    Minus,   // v0.7: `-` (unary and binary)
+    Slash,   // v0.7: `/`
+    Percent, // v0.7: `%`
     Eq,
-    Dot,  // v0.6: qualified refs (t.col)
-    Lt,   // v0.6: <
-    Gt,   // v0.6: >
-    LtEq, // v0.6: <=
-    GtEq, // v0.6: >=
-    Neq,  // v0.6: <> and !=
+    Dot,        // v0.6: qualified refs (t.col)
+    Lt,         // v0.6: <
+    Gt,         // v0.6: >
+    LtEq,       // v0.6: <=
+    GtEq,       // v0.6: >=
+    Neq,        // v0.6: <> and !=
     ColonColon, // v0.7: `::` cast
     PipePipe,   // v0.7: `||` concat
     Caret,      // v0.7: `^` exponentiation
@@ -333,7 +333,7 @@ pub enum Literal {
     /// (v0.6 behavior) but INSERT coerces the exact text for numeric
     /// targets, so high-precision decimals don't round-trip through f64.
     Decimal(String),
-    Real(f32), // v0.7: only via typed params/casts, never parsed
+    Real(f32),                        // v0.7: only via typed params/casts, never parsed
     Numeric(crate::storage::Numeric), // v0.7: only via typed params/casts
     Text(String),
     Bool(bool),
@@ -613,14 +613,8 @@ pub enum WindowFunc {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowFrame {
     Default,
-    Rows {
-        start: FrameBound,
-        end: FrameBound,
-    },
-    Range {
-        start: FrameBound,
-        end: FrameBound,
-    },
+    Rows { start: FrameBound, end: FrameBound },
+    Range { start: FrameBound, end: FrameBound },
 }
 
 /// v0.10: one end of a window frame.
@@ -848,6 +842,10 @@ pub enum AlterAction {
     RenameTo {
         new_name: String,
     },
+    /// v0.11: ALTER TABLE name OWNER TO role.
+    OwnerTo {
+        new_owner: String,
+    },
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -898,7 +896,10 @@ enum ColCon {
     PKey(Option<String>),
     Default(DefaultExpr),
     Check(Option<String>, Expr),
-    References { name: Option<String>, tail: ParsedFkTail },
+    References {
+        name: Option<String>,
+        tail: ParsedFkTail,
+    },
 }
 
 enum ParsedTableCon {
@@ -1040,7 +1041,10 @@ fn def_add_check(
             return Err(err(format!("column \"{}\" does not exist", r)));
         }
     }
-    def.checks.push(CheckDef { name: cname, expr: e });
+    def.checks.push(CheckDef {
+        name: cname,
+        expr: e,
+    });
     Ok(())
 }
 
@@ -1088,7 +1092,9 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
         }
     }
     if def.columns.is_empty() {
-        return Err(err("syntax error: table must have at least one column".to_string()));
+        return Err(err(
+            "syntax error: table must have at least one column".to_string()
+        ));
     }
     // Pass 2: constraints.
     for item in &items {
@@ -1099,13 +1105,23 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                     match con {
                         ColCon::NotNull => def.not_null[i] = true,
                         ColCon::Null => def.not_null[i] = false,
-                        ColCon::Unique(n) => {
-                            def_add_unique(table, &mut def, n.clone(), std::slice::from_ref(&c.name), &c.name)?
+                        ColCon::Unique(n) => def_add_unique(
+                            table,
+                            &mut def,
+                            n.clone(),
+                            std::slice::from_ref(&c.name),
+                            &c.name,
+                        )?,
+                        ColCon::PKey(n) => {
+                            def_add_pkey(table, &mut def, n.clone(), std::slice::from_ref(&c.name))?
                         }
-                        ColCon::PKey(n) => def_add_pkey(table, &mut def, n.clone(), std::slice::from_ref(&c.name))?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
-                        ColCon::Check(n, e) => def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?,
-                        ColCon::References { name: n, tail } => def_add_fk(table, &mut def,
+                        ColCon::Check(n, e) => {
+                            def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?
+                        }
+                        ColCon::References { name: n, tail } => def_add_fk(
+                            table,
+                            &mut def,
                             n.clone(),
                             std::slice::from_ref(&c.name),
                             ParsedFkTail {
@@ -1124,8 +1140,16 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                     let first = cols[0].clone();
                     def_add_unique(table, &mut def, n.clone(), cols, &first)?
                 }
-                ParsedTableCon::Check(n, e) => def_add_check(table, &mut def, n.clone(), e.clone(), table)?,
-                ParsedTableCon::Fk { name: n, cols, tail } => def_add_fk(table, &mut def,
+                ParsedTableCon::Check(n, e) => {
+                    def_add_check(table, &mut def, n.clone(), e.clone(), table)?
+                }
+                ParsedTableCon::Fk {
+                    name: n,
+                    cols,
+                    tail,
+                } => def_add_fk(
+                    table,
+                    &mut def,
                     n.clone(),
                     cols,
                     ParsedFkTail {
@@ -1159,7 +1183,9 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
             collect_col_refs(expr, out);
             collect_col_refs(pattern, out);
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             collect_col_refs(expr, out);
             collect_col_refs(low, out);
             collect_col_refs(high, out);
@@ -1203,6 +1229,62 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.11: privileges and grant targets
+// ---------------------------------------------------------------------------
+
+/// v0.11: a GRANT/REVOKE privilege, optionally restricted to a column
+/// list (`GRANT SELECT (a, b) ON t TO r`). An empty `columns` means the
+/// privilege applies to the whole object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrivSpec {
+    pub priv_: Privilege,
+    pub columns: Vec<String>,
+}
+
+/// A single privilege name from GRANT / REVOKE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    All,
+    /// USAGE (sequences).
+    Usage,
+    /// CONNECT (database).
+    Connect,
+}
+
+impl Privilege {
+    /// Bitmask for table/sequence ACLs. CONNECT has no per-object bit.
+    pub fn bits(self) -> u32 {
+        match self {
+            Privilege::Select => crate::storage::PRIV_SELECT,
+            Privilege::Insert => crate::storage::PRIV_INSERT,
+            Privilege::Update => crate::storage::PRIV_UPDATE,
+            Privilege::Delete => crate::storage::PRIV_DELETE,
+            Privilege::Truncate => crate::storage::PRIV_TRUNCATE,
+            Privilege::References => crate::storage::PRIV_REFERENCES,
+            Privilege::Trigger => crate::storage::PRIV_TRIGGER,
+            Privilege::All => crate::storage::PRIV_ALL_TABLE,
+            Privilege::Usage => crate::storage::PRIV_USAGE,
+            Privilege::Connect => crate::storage::PRIV_CONNECT,
+        }
+    }
+}
+
+/// What a GRANT / REVOKE applies to.
+#[derive(Clone, Debug)]
+pub enum GrantObject {
+    Table(String),
+    Sequence(String),
+    Database,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -1239,6 +1321,55 @@ pub enum Stmt {
     DropSequence {
         names: Vec<String>,
         if_exists: bool,
+    },
+    // --- v0.11: roles and privileges ---
+    CreateRole {
+        name: String,
+        login: bool,
+        superuser: bool,
+        /// Cleartext password from PASSWORD '...'; hashed into a SCRAM
+        /// verifier at execution. None = no password (trust-only).
+        password: Option<String>,
+        /// CONNECTION LIMIT n; None = unlimited (-1).
+        connlimit: Option<i32>,
+        /// VALID UNTIL 'timestamp'; None = never expires.
+        valid_until: Option<String>,
+    },
+    AlterRole {
+        name: String,
+        login: Option<bool>,
+        superuser: Option<bool>,
+        /// Some(Some(pw)) = set password, Some(None) = PASSWORD NULL
+        /// (remove), None = leave unchanged.
+        password: Option<Option<String>>,
+        connlimit: Option<i32>,
+        /// Some(ts) = set expiry, None = leave unchanged. There is no
+        /// way to clear an expiry except VALID UNTIL 'infinity'.
+        valid_until: Option<String>,
+    },
+    DropRole {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    Grant {
+        privs: Vec<PrivSpec>,
+        object: GrantObject,
+        grantees: Vec<String>,
+    },
+    Revoke {
+        privs: Vec<PrivSpec>,
+        object: GrantObject,
+        grantees: Vec<String>,
+    },
+    /// GRANT role [, ...] TO role [, ...] — role membership.
+    GrantRole {
+        roles: Vec<String>,
+        grantees: Vec<String>,
+    },
+    /// REVOKE role [, ...] FROM role [, ...] — remove membership.
+    RevokeRole {
+        roles: Vec<String>,
+        grantees: Vec<String>,
     },
     Insert {
         table: String,
@@ -1563,9 +1694,7 @@ fn max_param_expr(e: &Expr) -> usize {
         }
         Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
-        Expr::Like {
-            expr, pattern, ..
-        } => max_param_expr(expr).max(max_param_expr(pattern)),
+        Expr::Like { expr, pattern, .. } => max_param_expr(expr).max(max_param_expr(pattern)),
         Expr::Between {
             expr, low, high, ..
         } => max_param_expr(expr)
@@ -1596,13 +1725,7 @@ fn max_param_expr(e: &Expr) -> usize {
             .map(max_param_expr)
             .max()
             .unwrap_or(0)
-            .max(
-                partition_by
-                    .iter()
-                    .map(max_param_expr)
-                    .max()
-                    .unwrap_or(0),
-            )
+            .max(partition_by.iter().map(max_param_expr).max().unwrap_or(0))
             .max(
                 order_by
                     .iter()
@@ -1807,6 +1930,9 @@ impl Parser {
             "insert" => self.parse_insert(),
             "select" => Ok(Stmt::Select(self.parse_select_rest()?)),
             "drop" => self.parse_drop(),
+            // --- v0.11: GRANT / REVOKE
+            "grant" => self.parse_grant(),
+            "revoke" => self.parse_revoke(),
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
             "delete" => self.parse_delete(),
@@ -1883,8 +2009,11 @@ impl Parser {
             "alter" => match self.peek() {
                 Token::Ident(ref s) if s == "table" => self.parse_alter(),
                 Token::Ident(ref s) if s == "sequence" => self.parse_alter_sequence(),
+                Token::Ident(ref s) if s == "role" || s == "user" || s == "group" => {
+                    self.parse_alter_role()
+                }
                 _ => Err(err(
-                    "syntax error: expected TABLE or SEQUENCE after ALTER".to_string(),
+                    "syntax error: expected TABLE, SEQUENCE or ROLE after ALTER".to_string(),
                 )),
             },
             // --- v0.10: WITH [RECURSIVE] ... / COPY
@@ -1976,7 +2105,8 @@ impl Parser {
     fn is_type_start(name: &str) -> bool {
         matches!(
             name,
-            "int" | "integer"
+            "int"
+                | "integer"
                 | "bigint"
                 | "int8"
                 | "smallint"
@@ -2000,9 +2130,15 @@ impl Parser {
     }
 
     fn parse_create(&mut self) -> Result<Stmt, SqlError> {
+        // v0.11: CREATE ROLE / USER / GROUP
+        if matches!(self.peek(), Token::Ident(ref s) if s == "role" || s == "user" || s == "group")
+        {
+            return self.parse_create_role();
+        }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
-        if self.eat_keyword("index") {            let if_not_exists = if self.eat_keyword("if") {
+        if self.eat_keyword("index") {
+            let if_not_exists = if self.eat_keyword("if") {
                 self.expect_keyword("not")?;
                 self.expect_keyword("exists")?;
                 true
@@ -2028,7 +2164,9 @@ impl Parser {
                 }
             }
             if columns.is_empty() {
-                return Err(err("syntax error: index requires at least one column".to_string()));
+                return Err(err(
+                    "syntax error: index requires at least one column".to_string()
+                ));
             }
             return Ok(Stmt::CreateIndex {
                 name,
@@ -2113,8 +2251,7 @@ impl Parser {
             } else {
                 if cname.is_some() {
                     return Err(err(
-                        "syntax error: expected constraint type after CONSTRAINT name"
-                            .to_string(),
+                        "syntax error: expected constraint type after CONSTRAINT name".to_string(),
                     ));
                 }
                 break;
@@ -2153,9 +2290,15 @@ impl Parser {
             let cols = self.parse_col_name_list()?;
             self.expect_keyword("references")?;
             let tail = self.parse_fk_tail()?;
-            Ok(ParsedTableCon::Fk { name: cname, cols, tail })
+            Ok(ParsedTableCon::Fk {
+                name: cname,
+                cols,
+                tail,
+            })
         } else {
-            Err(err("syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string()))
+            Err(err(
+                "syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string(),
+            ))
         }
     }
 
@@ -2199,7 +2342,7 @@ impl Parser {
                     on_update = self.parse_fk_action()?;
                 } else {
                     return Err(err(
-                        "syntax error: expected DELETE or UPDATE after ON".to_string(),
+                        "syntax error: expected DELETE or UPDATE after ON".to_string()
                     ));
                 }
             } else {
@@ -2225,7 +2368,9 @@ impl Parser {
             } else if self.eat_keyword("default") {
                 Ok(FkAction::SetDefault)
             } else {
-                Err(err("syntax error: expected NULL or DEFAULT after SET".to_string()))
+                Err(err(
+                    "syntax error: expected NULL or DEFAULT after SET".to_string()
+                ))
             }
         } else if self.eat_keyword("no") {
             self.expect_keyword("action")?;
@@ -2247,6 +2392,13 @@ impl Parser {
     }
 
     fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        // v0.11: ALTER TABLE name OWNER TO role
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            return Ok(AlterAction::OwnerTo {
+                new_owner: self.expect_ident()?,
+            });
+        }
         if self.eat_keyword("add") {
             if self.is_table_constraint_start() {
                 return self.parse_alter_add_constraint();
@@ -2333,7 +2485,9 @@ impl Parser {
                 self.expect_keyword("default")?;
                 return Ok(AlterAction::AlterColumnDropDefault { name: cname });
             }
-            return Err(err("syntax error: expected SET DEFAULT or DROP DEFAULT".to_string()));
+            return Err(err(
+                "syntax error: expected SET DEFAULT or DROP DEFAULT".to_string()
+            ));
         }
         if self.eat_keyword("rename") {
             if self.eat_keyword("column") {
@@ -2346,7 +2500,9 @@ impl Parser {
             let new_name = self.expect_ident()?;
             return Ok(AlterAction::RenameTo { new_name });
         }
-        Err(err("syntax error: expected ADD, DROP, ALTER or RENAME".to_string()))
+        Err(err(
+            "syntax error: expected ADD, DROP, ALTER or RENAME".to_string()
+        ))
     }
 
     /// `ADD [CONSTRAINT name] PRIMARY KEY ... | UNIQUE ... | CHECK ... |
@@ -2489,9 +2645,9 @@ impl Parser {
         }
         match self.next() {
             Token::Number(raw) => {
-                let v: i64 = raw.parse().map_err(|_| {
-                    err(format!("invalid {} value: {}", what, raw))
-                })?;
+                let v: i64 = raw
+                    .parse()
+                    .map_err(|_| err(format!("invalid {} value: {}", what, raw)))?;
                 Ok(if neg { -v } else { v })
             }
             other => Err(err(format!(
@@ -2773,7 +2929,9 @@ impl Parser {
             break;
         }
         if ctes.is_empty() {
-            return Err(err("syntax error: WITH requires at least one CTE".to_string()));
+            return Err(err(
+                "syntax error: WITH requires at least one CTE".to_string()
+            ));
         }
         let kw = match self.next() {
             Token::Ident(kw) => kw,
@@ -2781,7 +2939,7 @@ impl Parser {
                 return Err(err(format!(
                     "syntax error: expected SELECT, INSERT, UPDATE or DELETE after WITH, found {:?}",
                     other
-                )))
+                )));
             }
         };
         match kw.as_str() {
@@ -2831,7 +2989,7 @@ impl Parser {
                 return Err(err(format!(
                     "syntax error: expected SELECT in CTE body, found {:?}",
                     other
-                )))
+                )));
             }
         }
         let first = self.parse_select_rest()?;
@@ -2854,7 +3012,7 @@ impl Parser {
                     return Err(err(format!(
                         "syntax error: expected SELECT after UNION in recursive CTE, found {:?}",
                         other
-                    )))
+                    )));
                 }
             }
             let second = self.parse_select_rest()?;
@@ -2940,13 +3098,13 @@ impl Parser {
                                 return Err(SqlError {
                                     message: "COPY FORMAT BINARY is not supported".to_string(),
                                     code: "0A000",
-                                })
+                                });
                             }
                             _ => {
                                 return Err(err(format!(
                                     "syntax error: unknown COPY format \"{}\"",
                                     fmt
-                                )))
+                                )));
                             }
                         };
                     }
@@ -2979,7 +3137,10 @@ impl Parser {
                         options.escape = self.parse_copy_char("ESCAPE")?;
                     }
                     _ => {
-                        return Err(err(format!("syntax error: unknown COPY option \"{}\"", opt)));
+                        return Err(err(format!(
+                            "syntax error: unknown COPY option \"{}\"",
+                            opt
+                        )));
                     }
                 }
                 if self.peek() == Token::Comma {
@@ -3063,14 +3224,10 @@ impl Parser {
                     (true, Literal::BigInt(i)) => Literal::BigInt(-i),
                     // `-9223372036854775808`: the digits alone overflow
                     // i64; recover the exact i64::MIN.
-                    (true, Literal::Decimal(s))
-                        if s == "9223372036854775808" =>
-                    {
+                    (true, Literal::Decimal(s)) if s == "9223372036854775808" => {
                         Literal::BigInt(i64::MIN)
                     }
-                    (true, Literal::Decimal(s)) => {
-                        Literal::Decimal(format!("-{}", s))
-                    }
+                    (true, Literal::Decimal(s)) => Literal::Decimal(format!("-{}", s)),
                     (true, Literal::Float(f)) => Literal::Float(-f),
                     (_, l) => l,
                 }))
@@ -3565,7 +3722,7 @@ impl Parser {
                                 name
                             ),
                             code: "42883",
-                        })
+                        });
                     }
                 };
                 let spec = self.parse_window_spec()?;
@@ -3581,7 +3738,10 @@ impl Parser {
             }
             return Ok(Expr::Func { name, args });
         }
-        Err(err(format!("syntax error: expected '(', found {:?}", self.peek())))
+        Err(err(format!(
+            "syntax error: expected '(', found {:?}",
+            self.peek()
+        )))
     }
 
     /// v0.10: the parenthesized part of `OVER (...)`: optional PARTITION BY,
@@ -3711,9 +3871,9 @@ impl Parser {
         }
         match self.next() {
             Token::Number(n) => {
-                let n: u64 = n.parse().map_err(|_| {
-                    err(format!("syntax error: bad frame offset \"{}\"", n))
-                })?;
+                let n: u64 = n
+                    .parse()
+                    .map_err(|_| err(format!("syntax error: bad frame offset \"{}\"", n)))?;
                 if self.eat_keyword("preceding") {
                     Ok(FrameBound::Preceding(n))
                 } else if self.eat_keyword("following") {
@@ -3775,11 +3935,7 @@ impl Parser {
             self.expect(Token::RParen, "')'")?;
             return Ok(Expr::Func {
                 name: "trim".to_string(),
-                args: vec![
-                    Expr::Literal(Literal::Text(spec.to_string())),
-                    first,
-                    s,
-                ],
+                args: vec![Expr::Literal(Literal::Text(spec.to_string())), first, s],
             });
         }
         self.expect(Token::RParen, "')'")?;
@@ -4242,6 +4398,11 @@ impl Parser {
     }
 
     fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        // v0.11: DROP ROLE / USER / GROUP
+        if matches!(self.peek(), Token::Ident(ref s) if s == "role" || s == "user" || s == "group")
+        {
+            return self.parse_drop_role();
+        }
         if self.eat_keyword("index") {
             let if_exists = if self.eat_keyword("if") {
                 self.expect_keyword("exists")?;
@@ -4318,6 +4479,410 @@ impl Parser {
             names,
             cascade,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // v0.11: roles and privileges
+    // ------------------------------------------------------------------
+
+    /// Consume ROLE | USER | GROUP and return the canonical kind string.
+    fn parse_role_kind(&mut self) -> Result<&'static str, SqlError> {
+        match self.next() {
+            Token::Ident(s) if s == "role" => Ok("role"),
+            Token::Ident(s) if s == "user" => Ok("user"),
+            Token::Ident(s) if s == "group" => Ok("group"),
+            other => Err(err(format!(
+                "syntax error: expected ROLE, USER or GROUP, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// CREATE ROLE name [LOGIN|NOLOGIN] [SUPERUSER|NOSUPERUSER]
+    ///   [PASSWORD 'pw' | PASSWORD NULL] [CONNECTION LIMIT n]
+    /// CREATE USER = LOGIN; CREATE GROUP = NOLOGIN.
+    fn parse_create_role(&mut self) -> Result<Stmt, SqlError> {
+        let kind = self.parse_role_kind()?;
+        let name = self.expect_ident()?;
+        let mut login = kind == "user";
+        let mut superuser = false;
+        let mut password: Option<String> = None;
+        let mut connlimit: Option<i32> = None;
+        let mut valid_until: Option<String> = None;
+        loop {
+            if self.eat_keyword("login") {
+                login = true;
+            } else if self.eat_keyword("nologin") {
+                login = false;
+            } else if self.eat_keyword("superuser") {
+                superuser = true;
+            } else if self.eat_keyword("nosuperuser") {
+                superuser = false;
+            } else if self.eat_keyword("password") {
+                match self.next() {
+                    Token::Str(s) => password = Some(s),
+                    Token::Ident(s) if s == "null" => password = None,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected password string or NULL, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("connection") {
+                self.expect_keyword("limit")?;
+                let neg = matches!(self.peek(), Token::Minus);
+                if neg {
+                    self.next();
+                }
+                let n = match self.next() {
+                    Token::Number(s) => s
+                        .parse::<i32>()
+                        .map_err(|_| err("syntax error: bad CONNECTION LIMIT value".to_string()))?,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected number for CONNECTION LIMIT, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                connlimit = Some(if neg { -n } else { n });
+            } else if self.eat_keyword("valid") {
+                self.expect_keyword("until")?;
+                match self.next() {
+                    Token::Str(s) => valid_until = Some(s),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected timestamp string for VALID UNTIL, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::CreateRole {
+            name,
+            login,
+            superuser,
+            password,
+            connlimit,
+            valid_until,
+        })
+    }
+
+    /// ALTER ROLE name [LOGIN|NOLOGIN] [SUPERUSER|NOSUPERUSER]
+    ///   [PASSWORD 'pw' | PASSWORD NULL] [CONNECTION LIMIT n]
+    fn parse_alter_role(&mut self) -> Result<Stmt, SqlError> {
+        let _kind = self.parse_role_kind()?;
+        let name = self.expect_ident()?;
+        let mut login: Option<bool> = None;
+        let mut superuser: Option<bool> = None;
+        let mut password: Option<Option<String>> = None;
+        let mut connlimit: Option<i32> = None;
+        let mut valid_until: Option<String> = None;
+        loop {
+            if self.eat_keyword("login") {
+                login = Some(true);
+            } else if self.eat_keyword("nologin") {
+                login = Some(false);
+            } else if self.eat_keyword("superuser") {
+                superuser = Some(true);
+            } else if self.eat_keyword("nosuperuser") {
+                superuser = Some(false);
+            } else if self.eat_keyword("password") {
+                match self.next() {
+                    Token::Str(s) => password = Some(Some(s)),
+                    Token::Ident(s) if s == "null" => password = Some(None),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected password string or NULL, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("connection") {
+                self.expect_keyword("limit")?;
+                let neg = matches!(self.peek(), Token::Minus);
+                if neg {
+                    self.next();
+                }
+                let n = match self.next() {
+                    Token::Number(s) => s
+                        .parse::<i32>()
+                        .map_err(|_| err("syntax error: bad CONNECTION LIMIT value".to_string()))?,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected number for CONNECTION LIMIT, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                connlimit = Some(if neg { -n } else { n });
+            } else if self.eat_keyword("valid") {
+                self.expect_keyword("until")?;
+                match self.next() {
+                    Token::Str(s) => valid_until = Some(s),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected timestamp string for VALID UNTIL, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        if login.is_none()
+            && superuser.is_none()
+            && password.is_none()
+            && connlimit.is_none()
+            && valid_until.is_none()
+        {
+            return Err(err(
+                "syntax error: ALTER ROLE requires at least one option".to_string()
+            ));
+        }
+        Ok(Stmt::AlterRole {
+            name,
+            login,
+            superuser,
+            password,
+            connlimit,
+            valid_until,
+        })
+    }
+
+    /// DROP ROLE [IF EXISTS] name [, ...]
+    fn parse_drop_role(&mut self) -> Result<Stmt, SqlError> {
+        let _kind = self.parse_role_kind()?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut names = Vec::new();
+        loop {
+            names.push(self.expect_ident()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok(Stmt::DropRole { names, if_exists })
+    }
+
+    /// Parse a comma-separated privilege list: SELECT, INSERT, UPDATE,
+    /// DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE, CONNECT, ALL
+    /// [PRIVILEGES].
+    fn parse_privilege_list(&mut self) -> Result<Vec<PrivSpec>, SqlError> {
+        let mut privs = Vec::new();
+        loop {
+            let p = if self.eat_keyword("select") {
+                Privilege::Select
+            } else if self.eat_keyword("insert") {
+                Privilege::Insert
+            } else if self.eat_keyword("update") {
+                Privilege::Update
+            } else if self.eat_keyword("delete") {
+                Privilege::Delete
+            } else if self.eat_keyword("truncate") {
+                Privilege::Truncate
+            } else if self.eat_keyword("references") {
+                Privilege::References
+            } else if self.eat_keyword("trigger") {
+                Privilege::Trigger
+            } else if self.eat_keyword("usage") {
+                Privilege::Usage
+            } else if self.eat_keyword("connect") {
+                Privilege::Connect
+            } else if self.eat_keyword("all") {
+                self.eat_keyword("privileges");
+                Privilege::All
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected privilege name, found {:?}",
+                    self.peek()
+                )));
+            };
+            // v0.11: optional column list, e.g. SELECT (a, b).
+            let mut columns = Vec::new();
+            if matches!(self.peek(), Token::LParen) {
+                match p {
+                    Privilege::Select
+                    | Privilege::Insert
+                    | Privilege::Update
+                    | Privilege::References => {}
+                    _ => {
+                        return Err(err(format!(
+                            "syntax error: privilege {:?} does not accept a column list",
+                            p
+                        )));
+                    }
+                }
+                self.next(); // (
+                loop {
+                    match self.next() {
+                        Token::Ident(n) => columns.push(n),
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected column name, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                match self.next() {
+                    Token::RParen => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+                if columns.is_empty() {
+                    return Err(err("syntax error: empty column list".to_string()));
+                }
+            }
+            privs.push(PrivSpec { priv_: p, columns });
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok(privs)
+    }
+
+    /// GRANT privs ON [TABLE] name [, ...] | SEQUENCE ... | DATABASE TO
+    /// role [, ...].
+    /// True when the upcoming GRANT/REVOKE names an object (`privs ON
+    /// ... TO/FROM ...`) rather than granting role membership
+    /// (`role [, ...] TO/FROM ...`). Scans ahead for a top-level ON
+    /// before a top-level TO/FROM.
+    fn grant_has_object(&self) -> bool {
+        let mut depth = 0i32;
+        for tok in self.tokens[self.pos..].iter() {
+            match tok {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Ident(w) if depth == 0 => {
+                    if w.eq_ignore_ascii_case("on") {
+                        return true;
+                    }
+                    if w.eq_ignore_ascii_case("to") || w.eq_ignore_ascii_case("from") {
+                        return false;
+                    }
+                }
+                Token::EOF => break,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn parse_grant(&mut self) -> Result<Stmt, SqlError> {
+        if !self.grant_has_object() {
+            // GRANT role [, ...] TO role [, ...]: role membership.
+            let roles = self.parse_grantee_list()?;
+            self.expect_keyword("to")?;
+            let grantees = self.parse_grantee_list()?;
+            // WITH ADMIN OPTION is parsed and ignored (documented).
+            if self.eat_keyword("with") {
+                self.expect_keyword("admin")?;
+                self.expect_keyword("option")?;
+            }
+            return Ok(Stmt::GrantRole { roles, grantees });
+        }
+        let privs = self.parse_privilege_list()?;
+        self.expect_keyword("on")?;
+        let object = self.parse_grant_object()?;
+        self.expect_keyword("to")?;
+        let grantees = self.parse_grantee_list()?;
+        // GRANT OPTION is parsed and ignored (documented).
+        if self.eat_keyword("with") {
+            self.expect_keyword("grant")?;
+            self.expect_keyword("option")?;
+        }
+        Ok(Stmt::Grant {
+            privs,
+            object,
+            grantees,
+        })
+    }
+
+    /// REVOKE privs ON ... FROM role [, ...], or REVOKE role [, ...]
+    /// FROM role [, ...] for membership.
+    fn parse_revoke(&mut self) -> Result<Stmt, SqlError> {
+        if !self.grant_has_object() {
+            let roles = self.parse_grantee_list()?;
+            self.expect_keyword("from")?;
+            let grantees = self.parse_grantee_list()?;
+            return Ok(Stmt::RevokeRole { roles, grantees });
+        }
+        let privs = self.parse_privilege_list()?;
+        self.expect_keyword("on")?;
+        let object = self.parse_grant_object()?;
+        self.expect_keyword("from")?;
+        let grantees = self.parse_grantee_list()?;
+        Ok(Stmt::Revoke {
+            privs,
+            object,
+            grantees,
+        })
+    }
+
+    fn parse_grant_object(&mut self) -> Result<GrantObject, SqlError> {
+        // Optional TABLE keyword (Postgres allows omitting it).
+        let is_table_kw = self.eat_keyword("table");
+        if self.eat_keyword("sequence") {
+            return Ok(GrantObject::Sequence(self.expect_ident()?));
+        }
+        if self.eat_keyword("database") {
+            // `GRANT ... ON DATABASE` without a name targets this database.
+            return Ok(GrantObject::Database);
+        }
+        // TABLE name [, ...]: only the first name is used (v0.11 has a
+        // single-database, single-schema catalog; multi-name lists are
+        // accepted and applied to each).
+        let mut names = Vec::new();
+        loop {
+            names.push(self.expect_ident()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        let _ = is_table_kw;
+        // Encode multi-name lists by chaining: keep the first as the
+        // object and stash the rest via repeated execution is complex;
+        // instead we only support one name per statement in v0.11.
+        if names.len() > 1 {
+            return Err(err(
+                "only one object name per GRANT/REVOKE is supported".to_string()
+            ));
+        }
+        Ok(GrantObject::Table(names.into_iter().next().unwrap()))
+    }
+
+    fn parse_grantee_list(&mut self) -> Result<Vec<String>, SqlError> {
+        let mut out = Vec::new();
+        loop {
+            out.push(self.expect_ident()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok(out)
     }
 }
 
@@ -4422,8 +4987,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
 /// "function does not exist" (SQLSTATE 42883), like Postgres.
 pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
     let ok = match name {
-        "upper" | "lower" | "length" | "char_length" | "character_length"
-        | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
+        | "ceil" | "ceiling" | "sqrt" => n == 1,
         "now" | "current_date" | "current_timestamp" => n == 0,
         "substring" => n == 2 || n == 3,
         "trim" => n == 1 || n == 3,
@@ -4442,7 +5007,6 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         Err(err_undefined(format!("function {}() does not exist", name)))
     }
 }
-
 
 // ============================================================================
 // v0.9: CREATE VIEW raw-text split, s-expression codec for CHECK / DEFAULT
@@ -4607,7 +5171,9 @@ fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
         for part in inner.split(',') {
             let (a, r) = split_ident(part)?;
             if !skip_ws_comments(r).is_empty() {
-                return Some(Err(err("syntax error in view column alias list".to_string())));
+                return Some(Err(err(
+                    "syntax error in view column alias list".to_string()
+                )));
             }
             col_aliases.push(a);
         }
@@ -4617,7 +5183,9 @@ fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
     rest = match_kw(rest, "as")?;
     let query = skip_ws_comments(rest).trim().to_string();
     if query.is_empty() {
-        return Some(Err(err("syntax error: expected query after AS".to_string())));
+        return Some(Err(
+            err("syntax error: expected query after AS".to_string()),
+        ));
     }
     // The view query must parse as a SELECT (this also validates it now).
     let parsed = match parse_statement_inner(&query) {
@@ -4628,13 +5196,13 @@ fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
         Stmt::Select(s) => s,
         _ => {
             return Some(Err(err(
-                "syntax error: view query must be a SELECT".to_string(),
-            )))
+                "syntax error: view query must be a SELECT".to_string()
+            )));
         }
     };
     if sel.for_update {
         return Some(Err(err(
-            "SELECT FOR UPDATE is not allowed in a view".to_string(),
+            "SELECT FOR UPDATE is not allowed in a view".to_string()
         )));
     }
     let mut deps = Vec::new();
@@ -4690,18 +5258,11 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 /// and no volatile sequence calls other than the recognized nextval form.
 pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
     match e {
-        Expr::Agg { .. } => Err(err(format!(
-            "cannot use aggregate in {} constraint",
-            what
-        ))),
-        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => Err(err(format!(
-            "cannot use subquery in {} constraint",
-            what
-        ))),
-        Expr::Param(_) => Err(err(format!(
-            "cannot use parameter in {} constraint",
-            what
-        ))),
+        Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
+        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
+            Err(err(format!("cannot use subquery in {} constraint", what)))
+        }
+        Expr::Param(_) => Err(err(format!("cannot use parameter in {} constraint", what))),
         Expr::ResolvedCol { .. } => Err(err(format!("invalid expression in {}", what))),
         Expr::Column { .. } | Expr::Literal(_) => Ok(()),
         Expr::Arith { left, right, .. } => {
@@ -4718,7 +5279,9 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(pattern, what)
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(low, what)?;
             validate_constraint_expr(high, what)
@@ -4850,7 +5413,12 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(b, out);
             out.push(')');
         }
-        Expr::Like { expr, pattern, not, ilike } => {
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+        } => {
             out.push_str(&format!(
                 "(like {} {} ",
                 if *not { 1 } else { 0 },
@@ -4861,7 +5429,12 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(pattern, out);
             out.push(')');
         }
-        Expr::Between { expr, low, high, neg } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => {
             out.push_str(&format!("(between {} ", if *neg { 1 } else { 0 }));
             encode_expr_inner(expr, out);
             out.push(' ');
@@ -5255,8 +5828,6 @@ fn coltype_by_name(name: &str) -> Result<ColType, String> {
         o => return Err(format!("bad column type {}", o)),
     })
 }
-
-
 
 fn fk_action_name(a: FkAction) -> &'static str {
     match a {

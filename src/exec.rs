@@ -38,15 +38,15 @@
 
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
-    AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody, CteDef,
-    DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem,
-    InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt,
-    SequenceOpts, SqlError, Stmt, TableDef, UniqueDef, WhereCond, WhereRhs, WindowFrame, WindowFunc,
-    collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
+    AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
+    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertValue, IsolationLevel,
+    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SqlError, Stmt,
+    TableDef, UniqueDef, WhereCond, WhereRhs, WindowFrame, WindowFunc, collect_col_refs,
+    collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ColStats, ColType, Database, Engine, Numeric, RowVersion, Sequence, Snapshot, Table, TableStats,
-    Value, ViewDef, WriteOp, row_visible,
+    ColStats, ColType, Database, Engine, Numeric, RowVersion, Sequence, Snapshot, Table,
+    TableStats, Value, ViewDef, WriteOp, row_visible,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -84,6 +84,9 @@ pub struct StmtCtx<'a> {
     pub writes: &'a mut Vec<WriteOp>,
     /// v0.9: server-assigned session id, for session-local `currval`.
     pub session: u64,
+    /// v0.11: authenticated role executing this statement (lowercased).
+    /// Owners, grants, and privilege checks all key off this.
+    pub role: &'a str,
 }
 
 /// Outcome of executing one statement.
@@ -112,6 +115,127 @@ pub enum ExecResult {
     },
 }
 
+// ---------------------------------------------------------------------------
+// v0.11: privilege checks. Denials are SQLSTATE 42501
+// (insufficient_privilege), like PostgreSQL.
+// ---------------------------------------------------------------------------
+
+/// Require superuser (for role management).
+fn require_superuser(eng: &Engine, ctx: &StmtCtx) -> Result<(), ExecError> {
+    if crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
+        Ok(())
+    } else {
+        Err(exec_err(
+            "42501",
+            "permission denied: must be superuser to manage roles".to_string(),
+        ))
+    }
+}
+
+/// Require `privs` on a table. Missing tables are left alone so the
+/// caller still reports 42P01 (like PostgreSQL, existence is checked
+/// before privileges).
+fn require_table_priv(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    privs: u32,
+    priv_name: &str,
+) -> Result<(), ExecError> {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own) {
+        let have = crate::storage::table_privs(&eng.db, ctx.role, t, ctx.snap, ctx.own);
+        if have & privs != privs {
+            return Err(exec_err(
+                "42501",
+                format!(
+                    "permission denied for table \"{}\" (needs {})",
+                    table, priv_name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v0.11: require `privs` on each of `columns`, satisfied by a
+/// table-level grant or a column-level grant. Unknown columns are
+/// skipped — the statement's own validation reports them as 42703.
+fn require_column_privs(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    columns: &[String],
+    privs: u32,
+    priv_name: &str,
+) -> Result<(), ExecError> {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own) {
+        let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+        for c in columns {
+            if !t.columns.iter().any(|(n, _)| n == c) {
+                continue;
+            }
+            let have = crate::storage::column_privs_in(
+                &eng.db, ctx.role, t, c, &closure, ctx.snap, ctx.own,
+            );
+            if have & privs != privs {
+                return Err(exec_err(
+                    "42501",
+                    format!(
+                        "permission denied for column \"{}\" of table \"{}\" (needs {})",
+                        c, table, priv_name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Require owner-or-superuser on a table (DDL).
+fn require_table_owner(eng: &Engine, ctx: &StmtCtx, table: &str) -> Result<(), ExecError> {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own) {
+        if t.owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied: must be owner of table \"{}\"", table),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Require owner-or-superuser on a sequence (DDL).
+fn require_seq_owner(eng: &Engine, ctx: &StmtCtx, seq: &str) -> Result<(), ExecError> {
+    if let Some(s) = eng.db.find_sequence(seq, ctx.snap, ctx.own) {
+        if s.owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied: must be owner of sequence \"{}\"", seq),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Require owner-or-superuser on a view (DDL).
+fn require_view_owner(eng: &Engine, ctx: &StmtCtx, view: &str) -> Result<(), ExecError> {
+    if let Some(v) = eng.db.find_view(view, ctx.snap, ctx.own) {
+        if v.owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied: must be owner of view \"{}\"", view),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     match stmt {
         Stmt::CreateTable { name, def } => exec_create(eng, ctx, name, def),
@@ -123,7 +247,17 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             with,
             on_conflict,
             returning,
-        } => exec_insert(eng, ctx, table, columns, rows, select, with, on_conflict, returning),
+        } => exec_insert(
+            eng,
+            ctx,
+            table,
+            columns,
+            rows,
+            select,
+            with,
+            on_conflict,
+            returning,
+        ),
         Stmt::Select(sel) => {
             // FOR UPDATE locks (from every query level that asked for
             // them) are collected during the scan and acquired here, while
@@ -136,10 +270,12 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     snap: ctx.snap,
                     own: ctx.own,
                     session: ctx.session,
+                    role: ctx.role,
                     depth: 0,
                     lock_ids: &mut lock_ids,
                     ctes: Vec::new(),
                     wctx: None,
+                    priv_scopes: Vec::new(),
                 };
                 run_select(&mut q, sel, &[])?
             };
@@ -176,6 +312,54 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         } => exec_create_sequence(eng, ctx, name, *if_not_exists, opts),
         Stmt::AlterSequence { name, opts } => exec_alter_sequence(eng, ctx, name, opts),
         Stmt::DropSequence { names, if_exists } => exec_drop_sequence(eng, ctx, names, *if_exists),
+        // --- v0.11: roles and privileges ---
+        Stmt::CreateRole {
+            name,
+            login,
+            superuser,
+            password,
+            connlimit,
+            valid_until,
+        } => exec_create_role(
+            eng,
+            ctx,
+            name,
+            *login,
+            *superuser,
+            password,
+            *connlimit,
+            valid_until,
+        ),
+        Stmt::AlterRole {
+            name,
+            login,
+            superuser,
+            password,
+            connlimit,
+            valid_until,
+        } => exec_alter_role(
+            eng,
+            ctx,
+            name,
+            *login,
+            *superuser,
+            password,
+            *connlimit,
+            valid_until,
+        ),
+        Stmt::DropRole { names, if_exists } => exec_drop_role(eng, ctx, names, *if_exists),
+        Stmt::Grant {
+            privs,
+            object,
+            grantees,
+        } => exec_grant_revoke(eng, ctx, privs, object, grantees, false),
+        Stmt::Revoke {
+            privs,
+            object,
+            grantees,
+        } => exec_grant_revoke(eng, ctx, privs, object, grantees, true),
+        Stmt::GrantRole { roles, grantees } => exec_grant_role(eng, ctx, roles, grantees),
+        Stmt::RevokeRole { roles, grantees } => exec_revoke_role(eng, ctx, roles, grantees),
         // --- v0.8: indexes / EXPLAIN / ANALYZE
         Stmt::CreateIndex {
             name,
@@ -256,11 +440,10 @@ fn exec_create(
     // NOTE: a concurrent uncommitted CREATE of the same name is allowed
     // here (it is invisible to us); the commit-time check in server.rs
     // rejects the second committer with 40001.
-    eng.db
-        .tables
-        .entry(name.to_string())
-        .or_default()
-        .push(Table::with_def(def, ctx.own));
+    let mut t = Table::with_def(def, ctx.own);
+    // v0.11: the creating role owns the table.
+    t.owner = ctx.role.to_string();
+    eng.db.tables.entry(name.to_string()).or_default().push(t);
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
     });
@@ -295,21 +478,32 @@ fn validate_fk_def(
     let child = eng
         .db
         .find_table(child_table, ctx.snap, ctx.own)
-        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", child_table)))?;
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", child_table),
+            )
+        })?;
     for c in &fk.cols {
         if child.column_index(c).is_none() {
             return Err(exec_err(
                 "42703",
-                format!("column \"{}\" of relation \"{}\" does not exist", c, child_table),
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    c, child_table
+                ),
             ));
         }
     }
-    let parent = eng.db.find_table(&fk.ref_table, ctx.snap, ctx.own).ok_or_else(|| {
-        exec_err(
-            "42P01",
-            format!("relation \"{}\" does not exist", fk.ref_table),
-        )
-    })?;
+    let parent = eng
+        .db
+        .find_table(&fk.ref_table, ctx.snap, ctx.own)
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", fk.ref_table),
+            )
+        })?;
     let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
         match &parent.pkey {
             Some(pk) => pk.cols.clone(),
@@ -320,7 +514,7 @@ fn validate_fk_def(
                         "there is no primary key for referenced table \"{}\"",
                         fk.ref_table
                     ),
-                ))
+                ));
             }
         }
     } else {
@@ -477,6 +671,7 @@ fn eval_default(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     d: &DefaultExpr,
     ctype: &ColType,
     cname: &str,
@@ -484,7 +679,7 @@ fn eval_default(
     match d {
         DefaultExpr::Lit(lit) => coerce_literal(lit, ctype, cname),
         DefaultExpr::Nextval(seq) => {
-            let v = seq_nextval(eng, snap, own, session, seq)?;
+            let v = seq_nextval(eng, snap, own, session, role, seq)?;
             coerce_value(Value::BigInt(v), ctype, cname)
         }
         DefaultExpr::Expr(e) => {
@@ -494,10 +689,12 @@ fn eval_default(
                 snap,
                 own,
                 session,
+                role,
                 depth: 0,
                 lock_ids: &mut lock_ids,
                 ctes: Vec::new(),
                 wctx: None,
+                priv_scopes: Vec::new(),
             };
             let v = eval_expr(&mut q, &[], e)?;
             coerce_value(v, ctype, cname)
@@ -512,6 +709,7 @@ fn check_row_constraints(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     meta: &TableMeta,
     table: &str,
     values: &[Value],
@@ -546,10 +744,12 @@ fn check_row_constraints(
             snap,
             own,
             session,
+            role,
             depth: 0,
             lock_ids: &mut lock_ids,
             ctes: Vec::new(),
             wctx: None,
+            priv_scopes: Vec::new(),
         };
         let frame = Scope {
             schema: &schema,
@@ -609,7 +809,11 @@ fn check_fk_child_row(
         let child_pos: Vec<usize> = fk
             .cols
             .iter()
-            .map(|c| child_meta.column_index(c).expect("fk columns validated at DDL"))
+            .map(|c| {
+                child_meta
+                    .column_index(c)
+                    .expect("fk columns validated at DDL")
+            })
             .collect();
         let key: Vec<Value> = child_pos.iter().map(|&i| values[i].clone()).collect();
         if key.iter().any(|v| matches!(v, Value::Null)) {
@@ -623,7 +827,11 @@ fn check_fk_child_row(
         let ref_cols = fk_ref_cols(&parent_meta, fk)?;
         let parent_pos: Vec<usize> = ref_cols
             .iter()
-            .map(|c| parent.column_index(c).expect("fk ref cols validated at DDL"))
+            .map(|c| {
+                parent
+                    .column_index(c)
+                    .expect("fk ref cols validated at DDL")
+            })
             .collect();
         let matches_key = |vals: &[Value]| {
             parent_pos
@@ -654,15 +862,13 @@ fn check_fk_child_row(
 
 /// Every (child table, FK) pair in the database whose referenced table is
 /// `parent`, using the versions visible to (`snap`, `own`).
-fn fks_referencing(
-    eng: &Engine,
-    snap: &Snapshot,
-    own: u64,
-    parent: &str,
-) -> Vec<(String, FkDef)> {
+fn fks_referencing(eng: &Engine, snap: &Snapshot, own: u64, parent: &str) -> Vec<(String, FkDef)> {
     let mut out = Vec::new();
     for (name, versions) in &eng.db.tables {
-        if let Some(t) = versions.iter().find(|t| crate::storage::table_visible(t, snap, own)) {
+        if let Some(t) = versions
+            .iter()
+            .find(|t| crate::storage::table_visible(t, snap, own))
+        {
             for fk in &t.fks {
                 if fk.ref_table == parent {
                     out.push((name.clone(), fk.clone()));
@@ -685,7 +891,10 @@ struct FkCascade {
 impl FkCascade {
     fn contains(&self, table: &str, id: u64) -> bool {
         self.deletes.iter().any(|(t, i, _)| t == table && *i == id)
-            || self.updates.iter().any(|(t, i, _, _)| t == table && *i == id)
+            || self
+                .updates
+                .iter()
+                .any(|(t, i, _, _)| t == table && *i == id)
     }
 }
 
@@ -699,6 +908,7 @@ fn plan_fk_cascade(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     level: IsolationLevel,
     parent_table: &str,
     parent_meta: &TableMeta,
@@ -717,7 +927,9 @@ fn plan_fk_cascade(
         let parent_pos: Vec<usize> = ref_cols
             .iter()
             .map(|c| {
-                parent_meta.column_index(c).expect("fk ref cols validated at DDL")
+                parent_meta
+                    .column_index(c)
+                    .expect("fk ref cols validated at DDL")
             })
             .collect();
         // Child metadata (owned; the borrow ends before recursion).
@@ -731,12 +943,15 @@ fn plan_fk_cascade(
         let child_pos: Vec<usize> = fk
             .cols
             .iter()
-            .map(|c| child_meta.column_index(c).expect("fk cols validated at DDL"))
+            .map(|c| {
+                child_meta
+                    .column_index(c)
+                    .expect("fk cols validated at DDL")
+            })
             .collect();
         for (pid, old_values, new_values) in changed {
             let _ = pid;
-            let old_key: Vec<Value> =
-                parent_pos.iter().map(|&i| old_values[i].clone()).collect();
+            let old_key: Vec<Value> = parent_pos.iter().map(|&i| old_values[i].clone()).collect();
             let new_key: Option<Vec<Value>> = new_values
                 .as_ref()
                 .map(|nv| parent_pos.iter().map(|&i| nv[i].clone()).collect());
@@ -778,7 +993,11 @@ fn plan_fk_cascade(
                             "23503",
                             format!(
                                 "{} on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
-                                if new_values.is_some() { "update" } else { "delete" },
+                                if new_values.is_some() {
+                                    "update"
+                                } else {
+                                    "delete"
+                                },
                                 parent_table,
                                 fk.name,
                                 child_table,
@@ -795,10 +1014,18 @@ fn plan_fk_cascade(
                                 nv[ci] = kv.clone();
                             }
                             check_row_constraints(
-                                eng, snap, own, session, &child_meta, &child_table, &nv,
+                                eng,
+                                snap,
+                                own,
+                                session,
+                                role,
+                                &child_meta,
+                                &child_table,
+                                &nv,
                             )?;
                             if let Some(vname) =
-                                eng.db.unique_violation(&child_table, &nv, Some(cid), snap, own)
+                                eng.db
+                                    .unique_violation(&child_table, &nv, Some(cid), snap, own)
                             {
                                 return Err(exec_err(
                                     "23505",
@@ -810,25 +1037,47 @@ fn plan_fk_cascade(
                             }
                             // The child's own FKs must still hold.
                             check_fk_child_row(
-                                eng, snap, own, &child_meta, &child_table, &nv, &[], Some(cid),
+                                eng,
+                                snap,
+                                own,
+                                &child_meta,
+                                &child_table,
+                                &nv,
+                                &[],
+                                Some(cid),
                             )?;
-                            out.updates.push((child_table.clone(), cid, cxmax, nv.clone()));
+                            out.updates
+                                .push((child_table.clone(), cid, cxmax, nv.clone()));
                             let child_meta2 = child_meta.clone();
                             plan_fk_cascade(
-                                eng, snap, own, session, level,
-                                &child_table, &child_meta2,
+                                eng,
+                                snap,
+                                own,
+                                session,
+                                role,
+                                level,
+                                &child_table,
+                                &child_meta2,
                                 &[(cid, cvalues.clone(), Some(nv))],
-                                depth + 1, out,
+                                depth + 1,
+                                out,
                             )?;
                         } else {
                             // ON DELETE CASCADE.
                             out.deletes.push((child_table.clone(), cid, cxmax));
                             let child_meta2 = child_meta.clone();
                             plan_fk_cascade(
-                                eng, snap, own, session, level,
-                                &child_table, &child_meta2,
+                                eng,
+                                snap,
+                                own,
+                                session,
+                                role,
+                                level,
+                                &child_table,
+                                &child_meta2,
                                 &[(cid, cvalues.clone(), None)],
-                                depth + 1, out,
+                                depth + 1,
+                                out,
                             )?;
                         }
                     }
@@ -843,7 +1092,7 @@ fn plan_fk_cascade(
                                     let (cname, ctype) = &child_meta.columns[ci];
                                     match &child_meta.defaults[ci] {
                                         Some(d) => eval_default(
-                                            eng, snap, own, session, d, ctype, cname,
+                                            eng, snap, own, session, role, d, ctype, cname,
                                         )?,
                                         None => Value::Null,
                                     }
@@ -851,10 +1100,18 @@ fn plan_fk_cascade(
                             };
                         }
                         check_row_constraints(
-                            eng, snap, own, session, &child_meta, &child_table, &nv,
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            role,
+                            &child_meta,
+                            &child_table,
+                            &nv,
                         )?;
                         if let Some(vname) =
-                            eng.db.unique_violation(&child_table, &nv, Some(cid), snap, own)
+                            eng.db
+                                .unique_violation(&child_table, &nv, Some(cid), snap, own)
                         {
                             return Err(exec_err(
                                 "23505",
@@ -865,15 +1122,30 @@ fn plan_fk_cascade(
                             ));
                         }
                         check_fk_child_row(
-                            eng, snap, own, &child_meta, &child_table, &nv, &[], Some(cid),
+                            eng,
+                            snap,
+                            own,
+                            &child_meta,
+                            &child_table,
+                            &nv,
+                            &[],
+                            Some(cid),
                         )?;
-                        out.updates.push((child_table.clone(), cid, cxmax, nv.clone()));
+                        out.updates
+                            .push((child_table.clone(), cid, cxmax, nv.clone()));
                         let child_meta2 = child_meta.clone();
                         plan_fk_cascade(
-                            eng, snap, own, session, level,
-                            &child_table, &child_meta2,
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            role,
+                            level,
+                            &child_table,
+                            &child_meta2,
                             &[(cid, cvalues.clone(), Some(nv))],
-                            depth + 1, out,
+                            depth + 1,
+                            out,
                         )?;
                     }
                 }
@@ -885,11 +1157,7 @@ fn plan_fk_cascade(
 
 /// Apply a planned FK cascade: deletes then updates, with index
 /// maintenance and write logging, like exec_update/exec_delete do.
-fn apply_fk_cascade(
-    eng: &mut Engine,
-    ctx: &mut StmtCtx,
-    out: FkCascade,
-) -> Result<(), ExecError> {
+fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Result<(), ExecError> {
     // Deletes.
     for (table, id, prev_xmax) in &out.deletes {
         let t = eng
@@ -1013,7 +1281,12 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
 
 /// Integer literal (unknown type) to a column: any int kind with a
 /// range check, float/numeric widening, or text rendering.
-fn coerce_int_lit(i: i128, col_type: &ColType, col_name: &str, _from: &str) -> Result<Value, ExecError> {
+fn coerce_int_lit(
+    i: i128,
+    col_type: &ColType,
+    col_name: &str,
+    _from: &str,
+) -> Result<Value, ExecError> {
     let range = |i: i128| {
         coerce_value(
             Value::BigInt(i64::try_from(i).map_err(|_| exec_err("22003", "integer out of range"))?),
@@ -1054,9 +1327,7 @@ fn coerce_float_lit(
         ColType::Numeric => Numeric::from_f64(f)
             .map(Value::Numeric)
             .map_err(|_| exec_err("22003", "value out of range for type numeric")),
-        ColType::Text => Ok(Value::Text(
-            Value::Float(f).to_text().unwrap_or_default(),
-        )),
+        ColType::Text => Ok(Value::Text(Value::Float(f).to_text().unwrap_or_default())),
         _ => Err(assign_err(col_name, col_type, from)),
     }
 }
@@ -1084,7 +1355,9 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
         (Value::SmallInt(i), ColType::BigInt) => Some(Value::BigInt(*i as i64)),
         (Value::SmallInt(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
         (Value::SmallInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
-        (Value::SmallInt(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i as i64))),
+        (Value::SmallInt(i), ColType::Numeric) => {
+            Some(Value::Numeric(Numeric::from_i64(*i as i64)))
+        }
         (Value::Int(i), ColType::BigInt) => Some(Value::BigInt(*i)),
         (Value::Int(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
         (Value::Int(i), ColType::Float) => Some(Value::Float(*i as f64)),
@@ -1131,10 +1404,12 @@ fn materialize_dml_ctes(
         snap: ctx.snap,
         own: ctx.own,
         session: ctx.session,
+        role: ctx.role,
         depth: 0,
         lock_ids: &mut lock_ids,
         ctes: Vec::new(),
         wctx: None,
+        priv_scopes: Vec::new(),
     };
     materialize_ctes(&mut q, with)?;
     Ok(q.ctes)
@@ -1176,7 +1451,7 @@ fn describe_returning(
                 return Err(exec_err(
                     "42601",
                     "RETURNING * is not supported; list the columns explicitly",
-                ))
+                ));
             }
         }
     }
@@ -1189,6 +1464,7 @@ fn project_returning(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     schema: &[QCol],
     values: &[Value],
     returning: &[SelectItem],
@@ -1202,6 +1478,7 @@ fn project_returning(
                 snap,
                 own,
                 session,
+                role,
                 &[(schema, values)],
                 expr,
                 ctes,
@@ -1305,7 +1582,10 @@ fn plan_upsert(
             set_cols.push(meta.column_index(name).ok_or_else(|| {
                 exec_err(
                     "42703",
-                    format!("column \"{}\" of relation \"{}\" does not exist", name, table),
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name, table
+                    ),
                 )
             })?);
         }
@@ -1366,6 +1646,13 @@ fn exec_insert(
     on_conflict: &Option<OnConflict>,
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: INSERT needs INSERT privilege on the table — or, with an
+    // explicit column list, on each listed column (like PostgreSQL).
+    if let Some(cols) = columns {
+        require_column_privs(eng, ctx, table, cols, crate::storage::PRIV_INSERT, "INSERT")?;
+    } else {
+        require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
+    }
     // v0.10: WITH materialization (validated; plain INSERT cannot reference
     // the CTEs, but subqueries in RETURNING/ON CONFLICT can).
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
@@ -1378,10 +1665,12 @@ fn exec_insert(
             snap: ctx.snap,
             own: ctx.own,
             session: ctx.session,
+            role: ctx.role,
             depth: 0,
             lock_ids: &mut lock_ids,
             ctes: ctes.clone(),
             wctx: None,
+            priv_scopes: Vec::new(),
         };
         let out = run_select(&mut q, sel, &[])?;
         Some(out.rows)
@@ -1404,22 +1693,27 @@ fn exec_insert(
     // Validate everything before mutating (statement atomicity).
     let new_rows: Vec<Vec<Value>> = {
         let meta = {
-            let t = eng
-                .db
-                .find_table(table, ctx.snap, ctx.own)
-                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+            let t = eng.db.find_table(table, ctx.snap, ctx.own).ok_or_else(|| {
+                exec_err("42P01", format!("relation \"{}\" does not exist", table))
+            })?;
             TableMeta::of(t)
         };
         let targets: Vec<usize> = match columns {
             Some(names) => names
                 .iter()
                 .map(|n| {
-                    meta.columns.iter().position(|(c, _)| c == n).ok_or_else(|| {
-                        exec_err(
-                            "42703",
-                            format!("column \"{}\" of relation \"{}\" does not exist", n, table),
-                        )
-                    })
+                    meta.columns
+                        .iter()
+                        .position(|(c, _)| c == n)
+                        .ok_or_else(|| {
+                            exec_err(
+                                "42703",
+                                format!(
+                                    "column \"{}\" of relation \"{}\" does not exist",
+                                    n, table
+                                ),
+                            )
+                        })
                 })
                 .collect::<Result<_, _>>()?,
             None => (0..meta.columns.len()).collect(),
@@ -1452,56 +1746,101 @@ fn exec_insert(
                     if !explicit[i] {
                         if let Some(d) = d {
                             let (cname, ctype) = &meta.columns[i];
-                            values[i] = eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?;
+                            values[i] = eval_default(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                d,
+                                ctype,
+                                cname,
+                            )?;
                         }
                     }
                 }
-                check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &values)?;
+                check_row_constraints(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    table,
+                    &values,
+                )?;
                 built.push(values);
             }
         } else {
             built = Vec::with_capacity(rows.len());
             for row in rows {
-            if row.len() != targets.len() {
-                return Err(exec_err(
-                    "42601",
-                    format!(
-                        "INSERT has {} expressions but {} target columns",
-                        row.len(),
-                        targets.len()
-                    ),
-                ));
-            }
-            let mut values = vec![Value::Null; ncols];
-            let mut explicit = vec![false; ncols];
-            for (v, &ci) in row.iter().zip(targets.iter()) {
-                let (cname, ctype) = &meta.columns[ci];
-                values[ci] = match v {
-                    InsertValue::Lit(l) => coerce_literal(l, ctype, cname)?,
-                    InsertValue::Param(n) => {
-                        return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
-                    }
-                    // v0.9: DEFAULT in VALUES applies the column default.
-                    InsertValue::Default => match &meta.defaults[ci] {
-                        Some(d) => eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?,
-                        None => Value::Null,
-                    },
-                };
-                explicit[ci] = true;
-            }
-            // v0.9: fill defaults for columns not mentioned.
-            for (i, d) in meta.defaults.iter().enumerate() {
-                if !explicit[i] {
-                    if let Some(d) = d {
-                        let (cname, ctype) = &meta.columns[i];
-                        values[i] = eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?;
+                if row.len() != targets.len() {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "INSERT has {} expressions but {} target columns",
+                            row.len(),
+                            targets.len()
+                        ),
+                    ));
+                }
+                let mut values = vec![Value::Null; ncols];
+                let mut explicit = vec![false; ncols];
+                for (v, &ci) in row.iter().zip(targets.iter()) {
+                    let (cname, ctype) = &meta.columns[ci];
+                    values[ci] = match v {
+                        InsertValue::Lit(l) => coerce_literal(l, ctype, cname)?,
+                        InsertValue::Param(n) => {
+                            return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
+                        }
+                        // v0.9: DEFAULT in VALUES applies the column default.
+                        InsertValue::Default => match &meta.defaults[ci] {
+                            Some(d) => eval_default(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                d,
+                                ctype,
+                                cname,
+                            )?,
+                            None => Value::Null,
+                        },
+                    };
+                    explicit[ci] = true;
+                }
+                // v0.9: fill defaults for columns not mentioned.
+                for (i, d) in meta.defaults.iter().enumerate() {
+                    if !explicit[i] {
+                        if let Some(d) = d {
+                            let (cname, ctype) = &meta.columns[i];
+                            values[i] = eval_default(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                d,
+                                ctype,
+                                cname,
+                            )?;
+                        }
                     }
                 }
+                // v0.9: NOT NULL + CHECK.
+                check_row_constraints(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    table,
+                    &values,
+                )?;
+                built.push(values);
             }
-            // v0.9: NOT NULL + CHECK.
-            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &values)?;
-            built.push(values);
-        }
         } // end else (VALUES path)
         // v0.8: statement-atomic UNIQUE enforcement — every row is checked
         // against the indexes and against earlier rows of this statement
@@ -1567,8 +1906,7 @@ fn exec_insert(
         };
         for values in &new_rows {
             // 1. Conflict with a table row?
-            let mut conflict: Option<u64> =
-                find_upsert_conflict(eng, ctx, table, plan, values);
+            let mut conflict: Option<u64> = find_upsert_conflict(eng, ctx, table, plan, values);
             // 2. Conflict with a row planned earlier in this statement?
             if conflict.is_none() {
                 for (iname, kcols) in &plan.indexes {
@@ -1604,17 +1942,17 @@ fn exec_insert(
                     // Target values: latest planned, else the table row.
                     let target_values: Vec<Value> = match latest.get(&tid) {
                         Some(v) => v.clone(),
-                        None => row_values_by_id(eng, ctx, table, tid).ok_or_else(|| {
-                            exec_err("XX000", "upsert conflict target vanished")
-                        })?,
+                        None => row_values_by_id(eng, ctx, table, tid)
+                            .ok_or_else(|| exec_err("XX000", "upsert conflict target vanished"))?,
                     };
                     // Only real table rows need the concurrency checks;
                     // planned rows are ours.
                     let is_planned = latest.contains_key(&tid);
                     if !is_planned {
-                        let t = eng.db.find_table(table, ctx.snap, ctx.own).expect(
-                            "table still visible; engine lock held throughout",
-                        );
+                        let t = eng
+                            .db
+                            .find_table(table, ctx.snap, ctx.own)
+                            .expect("table still visible; engine lock held throughout");
                         let pos = t.row_pos(tid).expect("conflict target still present");
                         let r = &t.rows[pos];
                         check_write_conflict(eng, r.xmax, ctx.level)?;
@@ -1632,6 +1970,7 @@ fn exec_insert(
                             ctx.snap,
                             ctx.own,
                             ctx.session,
+                            ctx.role,
                             &frames,
                             w,
                             &ctes,
@@ -1647,6 +1986,7 @@ fn exec_insert(
                             ctx.snap,
                             ctx.own,
                             ctx.session,
+                            ctx.role,
                             &frames,
                             expr,
                             &ctes,
@@ -1655,13 +1995,10 @@ fn exec_insert(
                         new_values[ci] = coerce_value(v, ctype, cname)?;
                     }
                     // Same validations as a plain UPDATE row.
-                    if let Some(vname) = eng.db.unique_violation(
-                        table,
-                        &new_values,
-                        Some(tid),
-                        ctx.snap,
-                        ctx.own,
-                    ) {
+                    if let Some(vname) =
+                        eng.db
+                            .unique_violation(table, &new_values, Some(tid), ctx.snap, ctx.own)
+                    {
                         return Err(exec_err(
                             "23505",
                             format!(
@@ -1675,6 +2012,7 @@ fn exec_insert(
                         ctx.snap,
                         ctx.own,
                         ctx.session,
+                        ctx.role,
                         &meta_for_upsert,
                         table,
                         &new_values,
@@ -1693,9 +2031,10 @@ fn exec_insert(
                     let prev_xmax: u64 = if is_planned {
                         0
                     } else {
-                        let t = eng.db.find_table(table, ctx.snap, ctx.own).expect(
-                            "table still visible; engine lock held throughout",
-                        );
+                        let t = eng
+                            .db
+                            .find_table(table, ctx.snap, ctx.own)
+                            .expect("table still visible; engine lock held throughout");
                         t.rows[t.row_pos(tid).expect("conflict target still present")].xmax
                     };
                     // Refresh the same-statement key map when the key changed.
@@ -1805,6 +2144,7 @@ fn exec_insert(
                 ctx.snap,
                 ctx.own,
                 ctx.session,
+                ctx.role,
                 &schema,
                 values,
                 returning,
@@ -1830,9 +2170,7 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
         (Value::Float(a), Literal::Float(b)) => Ok(a == b),
         (Value::Int(a), Literal::Float(b)) => Ok((*a as f64) == *b),
         (Value::Float(a), Literal::Int(b)) => Ok(*a == (*b as f64)),
-        (Value::Float(a), Literal::Decimal(b)) => {
-            Ok(*a == b.parse::<f64>().unwrap_or(f64::NAN))
-        }
+        (Value::Float(a), Literal::Decimal(b)) => Ok(*a == b.parse::<f64>().unwrap_or(f64::NAN)),
         (Value::Int(a), Literal::Decimal(b)) => {
             Ok((*a as f64) == b.parse::<f64>().unwrap_or(f64::NAN))
         }
@@ -1927,6 +2265,16 @@ fn exec_update(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: UPDATE needs UPDATE on each SET column — a table-level
+    // grant or a column-level grant (like PostgreSQL).
+    require_column_privs(
+        eng,
+        ctx,
+        table,
+        &sets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        crate::storage::PRIV_UPDATE,
+        "UPDATE",
+    )?;
     // v0.10: WITH materialization; the CTEs are visible to subqueries in
     // SET/WHERE and in the RETURNING list.
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
@@ -1988,7 +2336,17 @@ fn exec_update(
             check_row_lock(eng, table, *id, ctx.own)?;
             let mut new_values = values.clone();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
-                let v = eval_update_expr(eng, ctx.snap, ctx.own, ctx.session, &schema, values, expr, &ctes)?;
+                let v = eval_update_expr(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &schema,
+                    values,
+                    expr,
+                    &ctes,
+                )?;
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
@@ -2008,7 +2366,16 @@ fn exec_update(
                 ));
             }
             // v0.9: NOT NULL + CHECK on the new row.
-            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &new_values)?;
+            check_row_constraints(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &meta,
+                table,
+                &new_values,
+            )?;
             old_vals.push(values.clone());
             plan.push((*id, *xmax, new_values));
         }
@@ -2016,8 +2383,7 @@ fn exec_update(
         // the statement's own new versions; each row's old version is
         // excluded from the parent scan.
         {
-            let self_new: Vec<Vec<Value>> =
-                plan.iter().map(|(_, _, nv)| nv.clone()).collect();
+            let self_new: Vec<Vec<Value>> = plan.iter().map(|(_, _, nv)| nv.clone()).collect();
             for (i, (_, _, nv)) in plan.iter().enumerate() {
                 check_fk_child_row(
                     eng,
@@ -2045,6 +2411,7 @@ fn exec_update(
                 ctx.snap,
                 ctx.own,
                 ctx.session,
+                ctx.role,
                 ctx.level,
                 table,
                 &meta,
@@ -2144,6 +2511,7 @@ fn exec_update(
                 ctx.snap,
                 ctx.own,
                 ctx.session,
+                ctx.role,
                 &schema,
                 new_values,
                 returning,
@@ -2167,6 +2535,8 @@ fn exec_delete(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: DELETE needs DELETE privilege on the table.
+    require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
     // v0.10: WITH materialization (validated; plain DELETE cannot reference
     // the CTEs, but the RETURNING list can via subqueries).
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
@@ -2179,11 +2549,7 @@ fn exec_delete(
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
         let mut plan = Vec::new();
-        for rv in t
-            .rows
-            .iter()
-            .filter(|r| row_visible(r, ctx.snap, ctx.own))
-        {
+        for rv in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
             check_write_conflict(eng, rv.xmax, ctx.level)?;
             if row_matches_where_cols(&meta.columns, &rv.values, where_)? {
                 // Only rows we actually delete conflict with FOR UPDATE
@@ -2204,6 +2570,7 @@ fn exec_delete(
                 ctx.snap,
                 ctx.own,
                 ctx.session,
+                ctx.role,
                 ctx.level,
                 table,
                 &meta,
@@ -2260,6 +2627,7 @@ fn exec_delete(
                 ctx.snap,
                 ctx.own,
                 ctx.session,
+                ctx.role,
                 &schema,
                 values,
                 returning,
@@ -2298,6 +2666,8 @@ fn drop_one_table(
     if_exists: bool,
     cascade: bool,
 ) -> Result<(), ExecError> {
+    // v0.11: only the owner (or a superuser) may drop a table.
+    require_table_owner(eng, ctx, name)?;
     // Find the visible version first (immutable) for the conflict check,
     // then mutate. A DROP of a table dropped by a not-yet-visible
     // transaction behaves like the row case (40001 under RR/SERIALIZABLE).
@@ -2359,10 +2729,7 @@ fn drop_one_table(
             .unwrap_or("?");
         return Err(exec_err(
             "2BP01",
-            format!(
-                "cannot drop table {} because {} depends on it",
-                name, first
-            ),
+            format!("cannot drop table {} because {} depends on it", name, first),
         ));
     }
     // CASCADE: drop dependent views and FKs first.
@@ -2468,10 +2835,7 @@ fn check_update_unique_pairs(
             if key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-            if plan[..i]
-                .iter()
-                .any(|(_, _, prev)| ix.key_for(prev) == key)
-            {
+            if plan[..i].iter().any(|(_, _, prev)| ix.key_for(prev) == key) {
                 return Err(unique_violation_err(&ix.def.name));
             }
         }
@@ -2488,6 +2852,8 @@ fn exec_create_index(
     unique: bool,
     if_not_exists: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: indexing a table needs its owner (or a superuser).
+    require_table_owner(eng, ctx, table)?;
     if eng.db.find_index(name, ctx.snap, ctx.own).is_some() {
         if if_not_exists {
             return Ok(ExecResult::Command {
@@ -2501,18 +2867,16 @@ fn exec_create_index(
     }
     // Resolve the table and columns (immutable borrows only).
     {
-        let t = eng.db.find_table(table, ctx.snap, ctx.own).ok_or_else(|| {
-            exec_err("42P01", format!("relation \"{}\" does not exist", table))
-        })?;
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let mut seen = Vec::with_capacity(columns.len());
         for c in columns {
             let pos = t.column_index(c).ok_or_else(|| {
                 exec_err(
                     "42703",
-                    format!(
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        c, table
-                    ),
+                    format!("column \"{}\" of relation \"{}\" does not exist", c, table),
                 )
             })?;
             if seen.contains(&pos) {
@@ -2600,6 +2964,10 @@ fn exec_drop_index(
 ) -> Result<ExecResult, ExecError> {
     // Snapshot the definition first: the write log's undo restores it on
     // ROLLBACK, and the WAL replays the drop on commit.
+    // v0.11: dropping an index needs its table's owner (or a superuser).
+    if let Some(ix) = eng.db.find_index(name, ctx.snap, ctx.own) {
+        require_table_owner(eng, ctx, &ix.def.table.clone())?;
+    }
     let snapshot = match eng.db.find_index(name, ctx.snap, ctx.own) {
         Some(ix) => ix.clone(),
         None => {
@@ -2651,43 +3019,41 @@ fn conjunct_bounds(
 ) -> Option<Vec<(usize, IndexBoundKind, Value)>> {
     // Resolve `Column op Literal` in either order, normalizing the
     // comparison direction.
-    let from_cmp = |op: &CmpOp,
-                        left: &Expr,
-                        right: &Expr|
-     -> Option<(usize, IndexBoundKind, Value)> {
-        let (col_side, lit_side, flip) = match (left, right) {
-            (Expr::Column { .. }, Expr::Literal(_)) => (left, right, false),
-            (Expr::Literal(_), Expr::Column { .. }) => (right, left, true),
-            _ => return None,
-        };
-        let (cq, cname) = match col_side {
-            Expr::Column { table, name } => (table, name),
-            _ => return None,
-        };
-        if let Some(cq) = cq {
-            if cq != qual && cq != table_name {
-                return None;
+    let from_cmp =
+        |op: &CmpOp, left: &Expr, right: &Expr| -> Option<(usize, IndexBoundKind, Value)> {
+            let (col_side, lit_side, flip) = match (left, right) {
+                (Expr::Column { .. }, Expr::Literal(_)) => (left, right, false),
+                (Expr::Literal(_), Expr::Column { .. }) => (right, left, true),
+                _ => return None,
+            };
+            let (cq, cname) = match col_side {
+                Expr::Column { table, name } => (table, name),
+                _ => return None,
+            };
+            if let Some(cq) = cq {
+                if cq != qual && cq != table_name {
+                    return None;
+                }
             }
-        }
-        let lit = match lit_side {
-            Expr::Literal(l) => l,
-            _ => return None,
+            let lit = match lit_side {
+                Expr::Literal(l) => l,
+                _ => return None,
+            };
+            let pos = columns.iter().position(|(n, _)| n == cname)?;
+            let (_, ctype) = &columns[pos];
+            // The literal is coerced to the column type, exactly like an
+            // INSERT value; anything uncoercible stays a sequential scan.
+            let v = coerce_literal(lit, ctype, cname).ok()?;
+            let kind = match (op, flip) {
+                (CmpOp::Eq, _) => IndexBoundKind::Eq,
+                (CmpOp::Gt, false) | (CmpOp::Lt, true) => IndexBoundKind::Gt(false),
+                (CmpOp::Ge, false) | (CmpOp::Le, true) => IndexBoundKind::Gt(true),
+                (CmpOp::Lt, false) | (CmpOp::Gt, true) => IndexBoundKind::Lt(false),
+                (CmpOp::Le, false) | (CmpOp::Ge, true) => IndexBoundKind::Lt(true),
+                _ => return None, // <> is never indexable
+            };
+            Some((pos, kind, v))
         };
-        let pos = columns.iter().position(|(n, _)| n == cname)?;
-        let (_, ctype) = &columns[pos];
-        // The literal is coerced to the column type, exactly like an
-        // INSERT value; anything uncoercible stays a sequential scan.
-        let v = coerce_literal(lit, ctype, cname).ok()?;
-        let kind = match (op, flip) {
-            (CmpOp::Eq, _) => IndexBoundKind::Eq,
-            (CmpOp::Gt, false) | (CmpOp::Lt, true) => IndexBoundKind::Gt(false),
-            (CmpOp::Ge, false) | (CmpOp::Le, true) => IndexBoundKind::Gt(true),
-            (CmpOp::Lt, false) | (CmpOp::Gt, true) => IndexBoundKind::Lt(false),
-            (CmpOp::Le, false) | (CmpOp::Ge, true) => IndexBoundKind::Lt(true),
-            _ => return None, // <> is never indexable
-        };
-        Some((pos, kind, v))
-    };
     match e {
         Expr::Cmp { op, left, right } => from_cmp(op, left, right).map(|b| vec![b]),
         Expr::Between {
@@ -2925,11 +3291,7 @@ struct OrderHint {
 /// ORDER BY term rendering for EXPLAIN.
 fn order_term_text(t: &OrderTerm) -> String {
     let e = format!("{:?}", t.expr);
-    if t.desc {
-        format!("{} DESC", e)
-    } else {
-        e
-    }
+    if t.desc { format!("{} DESC", e) } else { e }
 }
 
 fn plan_order_scan(
@@ -2950,10 +3312,9 @@ fn plan_order_scan(
         return None;
     }
     let (table_name, qual) = match &stmt.from[0] {
-        FromItem::Table { name, alias } => (
-            name.as_str(),
-            alias.clone().unwrap_or_else(|| name.clone()),
-        ),
+        FromItem::Table { name, alias } => {
+            (name.as_str(), alias.clone().unwrap_or_else(|| name.clone()))
+        }
         FromItem::Derived { .. } | FromItem::Join { .. } => return None,
     };
     let t = eng.db.find_table(table_name, snap, own)?;
@@ -2966,8 +3327,7 @@ fn plan_order_scan(
             for item in &stmt.items {
                 match item {
                     SelectItem::Expr { expr: e, alias } => {
-                        let out_name =
-                            alias.clone().unwrap_or_else(|| expr_col_name(e));
+                        let out_name = alias.clone().unwrap_or_else(|| expr_col_name(e));
                         if out_name == *name && e != &term.expr {
                             return None;
                         }
@@ -3164,12 +3524,7 @@ fn est_rel_rows(db: &Database, table: &str, snap: &Snapshot, own: u64) -> u64 {
         return ts.reltuples.round().max(0.0) as u64;
     }
     db.find_table(table, snap, own)
-        .map(|t| {
-            t.rows
-                .iter()
-                .filter(|r| row_visible(r, snap, own))
-                .count() as u64
-        })
+        .map(|t| t.rows.iter().filter(|r| row_visible(r, snap, own)).count() as u64)
         .unwrap_or(0)
 }
 
@@ -3274,14 +3629,22 @@ fn plan_from_item(
                 });
             }
             if name == "pg_stats" && eng.db.find_table(name, snap, own).is_none() {
-                let rows: u64 = eng
-                    .db
-                    .stats
-                    .values()
-                    .map(|ts| ts.cols.len() as u64)
-                    .sum();
+                let rows: u64 = eng.db.stats.values().map(|ts| ts.cols.len() as u64).sum();
                 return Ok(PlanNode::SeqScan {
                     table: "pg_stats".to_string(),
+                    filter: None,
+                    rows,
+                });
+            }
+            // v0.11: role catalogs are virtual.
+            if matches!(
+                name.as_str(),
+                "pg_authid" | "pg_roles" | "pg_user" | "pg_auth_members"
+            ) && eng.db.find_table(name, snap, own).is_none()
+            {
+                let rows = virtual_role_catalog_rows(&eng.db, name, snap, own);
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
                     filter: None,
                     rows,
                 });
@@ -3304,9 +3667,11 @@ fn plan_from_item(
                     hi,
                     cond,
                 } => {
-                    let ix = eng.db.indexes.get(&index).expect(
-                        "planned index still present; engine lock held throughout",
-                    );
+                    let ix = eng
+                        .db
+                        .indexes
+                        .get(&index)
+                        .expect("planned index still present; engine lock held throughout");
                     let rows = est_index_rows(
                         &eng.db,
                         name,
@@ -3362,7 +3727,10 @@ fn plan_select(
     // ORDER BY ... LIMIT hint becomes an index-order scan.
     let mut ordered = false;
     let mut node = if stmt.from.is_empty() {
-        PlanNode::Result { rows: 1, filter: None }
+        PlanNode::Result {
+            rows: 1,
+            filter: None,
+        }
     } else if stmt.from.len() == 1 {
         if matches!(&stmt.from[0], FromItem::Table { .. }) {
             if let Some(hint) = plan_order_scan(eng, snap, own, stmt) {
@@ -3375,7 +3743,12 @@ fn plan_select(
                     rows: est_rel_rows(&eng.db, &name, snap, own),
                     table: name,
                     index: hint.index,
-                    order: stmt.order_by.iter().map(order_term_text).collect::<Vec<_>>().join(", "),
+                    order: stmt
+                        .order_by
+                        .iter()
+                        .map(order_term_text)
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 }
             } else {
                 plan_from_item(eng, &stmt.from[0], stmt.where_.as_ref(), snap, own)?
@@ -3540,11 +3913,7 @@ fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-fn exec_explain(
-    eng: &mut Engine,
-    ctx: &mut StmtCtx,
-    stmt: &Stmt,
-) -> Result<ExecResult, ExecError> {
+fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     let sel = match stmt {
         Stmt::Select(s) => s,
         _ => {
@@ -3597,24 +3966,15 @@ fn analyze_table(db: &Database, table: &str, snap: &Snapshot, own: u64) -> Table
         // Most common values: top 100 by count (ties by index order).
         let mut by_freq: Vec<(Value, u64)> =
             counts.values().map(|(v, c)| (v.clone(), *c)).collect();
-        by_freq.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| index_key_cmp(&a.0, &b.0))
-        });
+        by_freq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| index_key_cmp(&a.0, &b.0)));
         let mcv: Vec<(Value, f64)> = by_freq
             .iter()
             .take(100)
-            .map(|(v, c)| {
-                (
-                    v.clone(),
-                    if total > 0.0 { *c as f64 / total } else { 0.0 },
-                )
-            })
+            .map(|(v, c)| (v.clone(), if total > 0.0 { *c as f64 / total } else { 0.0 }))
             .collect();
         // Histogram bounds: up to 101 evenly spaced distinct values in
         // index order (5 and 5.0 merge — index ordering, not byte order).
-        let mut distinct: Vec<Value> =
-            counts.values().map(|(v, _)| v.clone()).collect();
+        let mut distinct: Vec<Value> = counts.values().map(|(v, _)| v.clone()).collect();
         distinct.sort_by(index_key_cmp);
         distinct.dedup_by(|a, b| index_key_cmp(a, b) == Ordering::Equal);
         let n_distinct = distinct.len() as f64;
@@ -3650,6 +4010,16 @@ fn exec_analyze(
     ctx: &mut StmtCtx,
     table: &Option<String>,
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: ANALYZE requires ownership (or superuser), like PostgreSQL.
+    let is_owner = |eng: &Engine, n: &str| {
+        eng.db
+            .find_table(n, ctx.snap, ctx.own)
+            .map(|t| {
+                t.owner == ctx.role
+                    || crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+            })
+            .unwrap_or(false)
+    };
     let names: Vec<String> = match table {
         Some(n) => {
             if eng.db.find_table(n, ctx.snap, ctx.own).is_none() {
@@ -3658,13 +4028,21 @@ fn exec_analyze(
                     format!("relation \"{}\" does not exist", n),
                 ));
             }
+            if !is_owner(eng, n) {
+                return Err(exec_err(
+                    "42501",
+                    format!("permission denied: must be owner of table \"{}\"", n),
+                ));
+            }
             vec![n.clone()]
         }
+        // No table named: analyze the tables this role owns (like PG,
+        // which only touches tables the user may maintain).
         None => eng
             .db
             .tables
             .keys()
-            .filter(|n| eng.db.find_table(n, ctx.snap, ctx.own).is_some())
+            .filter(|n| is_owner(eng, n))
             .cloned()
             .collect(),
     };
@@ -3739,6 +4117,220 @@ fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
         }
     }
     (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
+// v0.11: role catalogs (virtual). A real table by the same name takes
+// precedence, like pg_stats. `pg_authid` masks password verifiers from
+// non-superusers, like PostgreSQL.
+// ---------------------------------------------------------------------------
+
+fn qcol(qual: &str, name: &str, ty: ColType) -> QCol {
+    QCol {
+        qual: qual.to_string(),
+        name: name.to_string(),
+        ty,
+    }
+}
+
+fn pg_authid_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_authid", "rolname", ColType::Text),
+        qcol("pg_authid", "rolsuper", ColType::Bool),
+        qcol("pg_authid", "rolinherit", ColType::Bool),
+        qcol("pg_authid", "rolcreaterole", ColType::Bool),
+        qcol("pg_authid", "rolcreatedb", ColType::Bool),
+        qcol("pg_authid", "rolcanlogin", ColType::Bool),
+        qcol("pg_authid", "rolconnlimit", ColType::Int),
+        qcol("pg_authid", "rolpassword", ColType::Text),
+        qcol("pg_authid", "rolvaliduntil", ColType::Timestamp),
+    ]
+}
+
+fn pg_roles_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_roles", "rolname", ColType::Text),
+        qcol("pg_roles", "rolsuper", ColType::Bool),
+        qcol("pg_roles", "rolinherit", ColType::Bool),
+        qcol("pg_roles", "rolcreaterole", ColType::Bool),
+        qcol("pg_roles", "rolcreatedb", ColType::Bool),
+        qcol("pg_roles", "rolcanlogin", ColType::Bool),
+        qcol("pg_roles", "rolconnlimit", ColType::Int),
+        qcol("pg_roles", "rolvaliduntil", ColType::Timestamp),
+    ]
+}
+
+fn pg_user_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_user", "usename", ColType::Text),
+        qcol("pg_user", "usesysid", ColType::Int),
+        qcol("pg_user", "usecreatedb", ColType::Bool),
+        qcol("pg_user", "usesuper", ColType::Bool),
+        qcol("pg_user", "usecatupd", ColType::Bool),
+        qcol("pg_user", "passwd", ColType::Text),
+        qcol("pg_user", "valuntil", ColType::Timestamp),
+        qcol("pg_user", "useconfig", ColType::Text), // text[] has no ColType; always NULL
+    ]
+}
+
+/// Rows for pg_auth_members: one row per live membership edge whose
+/// group role still exists. Oids are deterministic FNV-1a stand-ins
+/// (see name_oid); admin_option is always false (WITH ADMIN OPTION is
+/// parsed but not tracked).
+fn pg_auth_members_rows(db: &Database, snap: &Snapshot, own: u64) -> Vec<QRow> {
+    let mut names: Vec<&String> = db.roles.keys().collect();
+    names.sort();
+    let mut rows = Vec::new();
+    for member_name in names {
+        let Some(r) = db.roles[member_name]
+            .iter()
+            .find(|r| crate::storage::role_visible(r, snap, own))
+        else {
+            continue;
+        };
+        for m in &r.memberships {
+            // Skip edges whose group role is gone (DROP ROLE cleans these
+            // up; this is belt-and-braces for concurrent snapshots).
+            if db.find_role(&m.role, snap, own).is_none() {
+                continue;
+            }
+            rows.push(QRow {
+                cells: vec![
+                    Value::Int(name_oid(&m.role) as i64),
+                    Value::Int(name_oid(member_name) as i64),
+                    Value::Int(name_oid(&m.grantor) as i64),
+                    Value::Bool(false),
+                ],
+                prov: Vec::new(),
+            });
+        }
+    }
+    rows
+}
+
+/// Rows for pg_authid / pg_roles / pg_user. `kind` selects the column
+/// layout. Roles are snapshot-filtered like every other catalog.
+fn pg_auth_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    role: &str,
+    kind: &str,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = match kind {
+        "pg_roles" => pg_roles_schema(),
+        "pg_user" => pg_user_schema(),
+        "pg_auth_members" => pg_auth_members_schema(),
+        _ => pg_authid_schema(),
+    };
+    if kind == "pg_auth_members" {
+        return (schema, pg_auth_members_rows(db, snap, own));
+    }
+    let viewer_super = crate::storage::is_superuser_snap(db, role, snap, own);
+    let mut names: Vec<&String> = db.roles.keys().collect();
+    names.sort();
+    let mut rows = Vec::new();
+    for rn in names {
+        let Some(r) = db.roles[rn]
+            .iter()
+            .find(|r| crate::storage::role_visible(r, snap, own))
+        else {
+            continue;
+        };
+        let valid_until = match &r.valid_until {
+            None => Value::Null,
+            Some(vu) => match crate::datetime::parse_timestamp(vu) {
+                Ok(t) => Value::Timestamp(t),
+                Err(_) => Value::Null,
+            },
+        };
+        let passwd = match &r.password {
+            None => Value::Null,
+            Some(v) => {
+                if viewer_super {
+                    Value::Text(v.encode())
+                } else {
+                    Value::Text("********".to_string())
+                }
+            }
+        };
+        let cells = match kind {
+            "pg_roles" => vec![
+                Value::Text(r.name.clone()),
+                Value::Bool(r.superuser),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(r.can_login),
+                Value::Int(r.connlimit as i64),
+                valid_until.clone(),
+            ],
+            "pg_user" => vec![
+                Value::Text(r.name.clone()),
+                // No stable oids in rustgres; hash the name for a
+                // deterministic stand-in.
+                Value::Int(name_oid(&r.name) as i64),
+                Value::Bool(false),
+                Value::Bool(r.superuser),
+                Value::Bool(false),
+                passwd,
+                valid_until.clone(),
+                Value::Null,
+            ],
+            _ => vec![
+                Value::Text(r.name.clone()),
+                Value::Bool(r.superuser),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(r.can_login),
+                Value::Int(r.connlimit as i64),
+                passwd,
+                valid_until,
+            ],
+        };
+        rows.push(QRow {
+            cells,
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+fn pg_auth_members_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_auth_members", "roleid", ColType::Int),
+        qcol("pg_auth_members", "member", ColType::Int),
+        qcol("pg_auth_members", "grantor", ColType::Int),
+        qcol("pg_auth_members", "admin_option", ColType::Bool),
+    ]
+}
+
+/// Estimated row count for the planner over virtual role catalogs.
+fn virtual_role_catalog_rows(db: &Database, name: &str, snap: &Snapshot, own: u64) -> u64 {
+    if name == "pg_auth_members" {
+        let mut n = 0u64;
+        for vs in db.roles.values() {
+            if let Some(r) = vs
+                .iter()
+                .find(|r| crate::storage::role_visible(r, snap, own))
+            {
+                n += r.memberships.len() as u64;
+            }
+        }
+        return n;
+    }
+    db.roles.len() as u64
+}
+
+/// Deterministic stand-in oid for pg_user.usesysid (FNV-1a of the name).
+fn name_oid(name: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -3948,10 +4540,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             wid,
         } => Ok(Expr::Window {
             func: func.clone(),
-            args: args
-                .iter()
-                .map(|a| r(a))
-                .collect::<Result<Vec<_>, _>>()?,
+            args: args.iter().map(|a| r(a)).collect::<Result<Vec<_>, _>>()?,
             distinct: *distinct,
             partition_by: partition_by
                 .iter()
@@ -3993,6 +4582,13 @@ struct Q<'a, 'b> {
     /// window pre-pass before projection; `Expr::Window` evaluates by
     /// looking up `values[wid][row]`.
     wctx: Option<WindowCtx>,
+    /// v0.11: acting role, for privilege checks during scans and
+    /// sequence-function evaluation.
+    role: &'a str,
+    /// v0.11: qualifier -> real table name per query level (innermost
+    /// last), for the column-privilege pre-pass. `None` = not a base
+    /// table (view/CTE/derived); those are checked at their own level.
+    priv_scopes: Vec<Vec<(String, Option<String>)>>,
 }
 
 /// v0.10: a materialized Common Table Expression: name, output schema and
@@ -4046,11 +4642,188 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
     if !stmt.with.is_empty() {
         materialize_ctes(q, &stmt.with)?;
     }
+    // v0.11: column privileges. Push this level's qualifier map, check
+    // every column this level reads, then pop (balanced across view
+    // expansion, which reuses `q`).
+    q.priv_scopes.push(priv_scope_for(q, stmt));
+    let chk = check_select_col_privs(q, stmt);
+    q.priv_scopes.pop();
+    chk?;
     let out = run_select_inner(q, stmt, outer);
     q.ctes.truncate(base);
     // v0.10: the window context is per query level; never leak it.
     q.wctx = None;
     out
+}
+
+/// v0.11: qualifier -> real-table map for one query level (see
+/// `Q::priv_scopes`). CTEs shadow real tables; views and derived
+/// tables map to `None` (checked at their own query level).
+fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
+    fn walk(q: &Q, item: &FromItem, out: &mut Vec<(String, Option<String>)>) {
+        match item {
+            FromItem::Table { name, alias } => {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let is_cte = q.ctes.iter().rev().any(|b| b.name == *name);
+                let real = if is_cte {
+                    None
+                } else {
+                    q.eng
+                        .db
+                        .find_table(name, q.snap, q.own)
+                        .map(|_| name.clone())
+                };
+                out.push((qual, real));
+            }
+            FromItem::Derived { alias, .. } => out.push((alias.clone(), None)),
+            FromItem::Join { left, right, .. } => {
+                walk(q, left, out);
+                walk(q, right, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for item in &stmt.from {
+        walk(q, item, &mut out);
+    }
+    out
+}
+
+/// v0.11: column-level SELECT enforcement. Every column read at this
+/// query level must be covered by table-level SELECT or a column-level
+/// SELECT grant. Unresolvable references (unknown tables, view/CTE
+/// columns) are skipped here: unknown relations fail later as 42P01,
+/// and views/CTEs/derived tables are checked at their own level when
+/// expanded. Correlated references resolve against outer levels via
+/// `q.priv_scopes` (innermost last, current level included).
+fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
+    use crate::sql::SelectItem;
+    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+    let mut star = false;
+    let mut star_quals: Vec<String> = Vec::new();
+    for item in &stmt.items {
+        match item {
+            SelectItem::All => star = true,
+            SelectItem::AllOf(qual) => star_quals.push(qual.clone()),
+            SelectItem::Expr { expr, .. } => crate::sql::collect_col_refs(expr, &mut refs),
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        crate::sql::collect_col_refs(w, &mut refs);
+    }
+    for g in &stmt.group_by {
+        crate::sql::collect_col_refs(g, &mut refs);
+    }
+    if let Some(h) = &stmt.having {
+        crate::sql::collect_col_refs(h, &mut refs);
+    }
+    for o in &stmt.order_by {
+        crate::sql::collect_col_refs(&o.expr, &mut refs);
+    }
+
+    // All (table, column) pairs this level needs SELECT on.
+    let mut needed: Vec<(String, String)> = Vec::new();
+    let levels: Vec<&Vec<(String, Option<String>)>> = q.priv_scopes.iter().collect();
+    // Does `table` currently have `col`?
+    let has_col = |table: &str, col: &str| {
+        q.eng
+            .db
+            .find_table(table, q.snap, q.own)
+            .map(|t| t.columns.iter().any(|(n, _)| n == col))
+            .unwrap_or(false)
+    };
+    if star {
+        if let Some(level) = levels.last() {
+            for (_, real) in level.iter() {
+                if let Some(t) = real {
+                    if let Some(tab) = q.eng.db.find_table(t, q.snap, q.own) {
+                        for (cn, _) in &tab.columns {
+                            needed.push((t.clone(), cn.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for sq in &star_quals {
+        if let Some((t, _)) = resolve_priv_qual(&levels, Some(sq)) {
+            if let Some(tab) = q.eng.db.find_table(&t, q.snap, q.own) {
+                for (cn, _) in &tab.columns {
+                    needed.push((t.clone(), cn.clone()));
+                }
+            }
+        }
+    }
+    for (qual, col) in &refs {
+        for (t, _) in resolve_priv_ref(&levels, qual.as_deref(), col, &has_col) {
+            needed.push((t, col.clone()));
+        }
+    }
+    let closure = crate::storage::role_closure(&q.eng.db, q.role, q.snap, q.own);
+    for (t, c) in &needed {
+        let tab = q
+            .eng
+            .db
+            .find_table(t, q.snap, q.own)
+            .expect("resolved from a live table above");
+        let have =
+            crate::storage::column_privs_in(&q.eng.db, q.role, tab, c, &closure, q.snap, q.own);
+        if have & crate::storage::PRIV_SELECT != crate::storage::PRIV_SELECT {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied for column \"{}\" of table \"{}\"", c, t),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a qualified name to its table: the innermost level
+/// containing the qualifier wins. Returns `None` when the qualifier
+/// names a view/CTE/derived table (checked at its own level) or is
+/// unknown (fails later as 42P01).
+fn resolve_priv_qual(
+    levels: &[&Vec<(String, Option<String>)>],
+    qual: Option<&str>,
+) -> Option<(String, ())> {
+    let qual = qual?;
+    for level in levels.iter().rev() {
+        if let Some((_, real)) = level.iter().find(|(qn, _)| qn == qual) {
+            return real.clone().map(|t| (t, ()));
+        }
+    }
+    None
+}
+
+/// Resolve a column reference to the (table, column) pairs it may read,
+/// mirroring the executor's innermost-first scope resolution:
+/// a qualified ref binds to the innermost level holding the qualifier;
+/// an unqualified ref binds to the innermost level with a table
+/// carrying that column (all such tables, if several — the query is
+/// ambiguous and fails anyway).
+fn resolve_priv_ref(
+    levels: &[&Vec<(String, Option<String>)>],
+    qual: Option<&str>,
+    col: &str,
+    has_col: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, ())> {
+    if qual.is_some() {
+        return resolve_priv_qual(levels, qual).into_iter().collect();
+    }
+    for level in levels.iter().rev() {
+        let mut found = Vec::new();
+        for (_, real) in level.iter() {
+            if let Some(t) = real {
+                if has_col(t, col) {
+                    found.push((t.clone(), ()));
+                }
+            }
+        }
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -4151,14 +4924,20 @@ fn eval_recursive_cte(
                 coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             if all {
-                binding.rows.push(QRow { cells: coerced, prov: Vec::new() });
+                binding.rows.push(QRow {
+                    cells: coerced,
+                    prov: Vec::new(),
+                });
             } else {
                 let mut k = Vec::new();
                 for v in &coerced {
                     value_key(v, &mut k);
                 }
                 if seen.insert(k) {
-                    binding.rows.push(QRow { cells: coerced, prov: Vec::new() });
+                    binding.rows.push(QRow {
+                        cells: coerced,
+                        prov: Vec::new(),
+                    });
                 }
             }
         }
@@ -4317,12 +5096,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         None
     } else {
         order_hint.as_ref().and(match (stmt.offset, stmt.limit) {
-            (_, Some(l)) => Some(
-                stmt.offset
-                    .unwrap_or(0)
-                    .max(0)
-                    .saturating_add(l.max(0)) as usize,
-            ),
+            (_, Some(l)) => Some(stmt.offset.unwrap_or(0).max(0).saturating_add(l.max(0)) as usize),
             _ => None,
         })
     };
@@ -4546,9 +5320,7 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             validate_expr(left)?;
             validate_expr(right)
         }
-        Expr::Like {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } => {
             validate_expr(expr)?;
             validate_expr(pattern)
         }
@@ -4594,9 +5366,7 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::Or(left, right)
         | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
         Expr::Cmp { left, right, .. } => contains_agg(left) || contains_agg(right),
-        Expr::Like {
-            expr, pattern, ..
-        } => contains_agg(expr) || contains_agg(pattern),
+        Expr::Like { expr, pattern, .. } => contains_agg(expr) || contains_agg(pattern),
         Expr::Between {
             expr, low, high, ..
         } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
@@ -4635,9 +5405,7 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::Or(left, right)
         | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
         Expr::Cmp { left, right, .. } => contains_window(left) || contains_window(right),
-        Expr::Like {
-            expr, pattern, ..
-        } => contains_window(expr) || contains_window(pattern),
+        Expr::Like { expr, pattern, .. } => contains_window(expr) || contains_window(pattern),
         Expr::Between {
             expr, low, high, ..
         } => contains_window(expr) || contains_window(low) || contains_window(high),
@@ -4754,7 +5522,17 @@ pub fn copy_from_rows(
     let n = insert_rows.len() as u64;
     // Reuse the full INSERT path: coercion, defaults, constraints,
     // unique indexes, foreign keys, WAL — atomically.
-    let _ = exec_insert(eng, ctx, table, columns, &insert_rows, &None, &[], &None, &[])?;
+    let _ = exec_insert(
+        eng,
+        ctx,
+        table,
+        columns,
+        &insert_rows,
+        &None,
+        &[],
+        &None,
+        &[],
+    )?;
     Ok(n)
 }
 
@@ -4819,28 +5597,19 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             }
             for a in args {
                 if contains_window(a) {
-                    return Err(exec_err(
-                        "42803",
-                        "window functions cannot be nested",
-                    ));
+                    return Err(exec_err("42803", "window functions cannot be nested"));
                 }
                 validate_window_expr(a, false)?;
             }
             for p in partition_by {
                 if contains_window(p) {
-                    return Err(exec_err(
-                        "42803",
-                        "window functions cannot be nested",
-                    ));
+                    return Err(exec_err("42803", "window functions cannot be nested"));
                 }
                 validate_window_expr(p, false)?;
             }
             for o in order_by {
                 if contains_window(&o.expr) {
-                    return Err(exec_err(
-                        "42803",
-                        "window functions cannot be nested",
-                    ));
+                    return Err(exec_err("42803", "window functions cannot be nested"));
                 }
                 validate_window_expr(&o.expr, false)?;
             }
@@ -4868,9 +5637,7 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)
         }
-        Expr::Like {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } => {
             validate_window_expr(expr, in_agg)?;
             validate_window_expr(pattern, in_agg)
         }
@@ -4951,15 +5718,13 @@ fn check_window_frame(frame: &WindowFrame, order_len: usize) -> Result<(), ExecE
 
 /// v0.10: true for `N PRECEDING` / `N FOLLOWING` bounds.
 fn has_offset_bound(b: &FrameBound) -> bool {
-    matches!(
-        b,
-        FrameBound::Preceding(_) | FrameBound::Following(_)
-    )
+    matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_))
 }
 
 /// v0.10: collect the deduplicated window specifications used at this
 /// query level (SELECT list and ORDER BY).
-fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {    let mut out: Vec<ExecWindow> = Vec::new();
+fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
+    let mut out: Vec<ExecWindow> = Vec::new();
     let mut visit = |e: &Expr| {
         if let Expr::Window {
             func,
@@ -5000,9 +5765,7 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {    let mut out: Vec<E
                 walk(left, visit);
                 walk(right, visit);
             }
-            Expr::Like {
-                expr, pattern, ..
-            } => {
+            Expr::Like { expr, pattern, .. } => {
                 walk(expr, visit);
                 walk(pattern, visit);
             }
@@ -5080,9 +5843,7 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 stamp(left, windows);
                 stamp(right, windows);
             }
-            Expr::Like {
-                expr, pattern, ..
-            } => {
+            Expr::Like { expr, pattern, .. } => {
                 stamp(expr, windows);
                 stamp(pattern, windows);
             }
@@ -5182,10 +5943,9 @@ fn rows_bound(b: &FrameBound, pos: usize, n: usize) -> usize {
         FrameBound::UnboundedPreceding => 0,
         FrameBound::Preceding(k) => pos.saturating_sub((*k).min(usize::MAX as u64) as usize),
         FrameBound::CurrentRow => pos,
-        FrameBound::Following(k) => {
-            pos.saturating_add((*k).min(usize::MAX as u64) as usize)
-                .min(n.saturating_sub(1))
-        }
+        FrameBound::Following(k) => pos
+            .saturating_add((*k).min(usize::MAX as u64) as usize)
+            .min(n.saturating_sub(1)),
         FrameBound::UnboundedFollowing => n.saturating_sub(1),
     }
 }
@@ -5207,11 +5967,7 @@ fn resolve_frame(
     let (is_range, start, end): (bool, FrameBound, FrameBound) = match &spec.frame {
         WindowFrame::Default => {
             if order_len > 0 {
-                (
-                    true,
-                    FrameBound::UnboundedPreceding,
-                    FrameBound::CurrentRow,
-                )
+                (true, FrameBound::UnboundedPreceding, FrameBound::CurrentRow)
             } else {
                 (
                     false,
@@ -5292,14 +6048,17 @@ fn resolve_frame(
                     if is_start {
                         // First peer at or before pos.
                         let mut s = pos;
-                        while s > 0 && is_peer(key_at(s - 1).first().unwrap_or(&Value::Null), &cur) {
+                        while s > 0 && is_peer(key_at(s - 1).first().unwrap_or(&Value::Null), &cur)
+                        {
                             s -= 1;
                         }
                         s
                     } else {
                         // Last peer at or after pos.
                         let mut e = pos;
-                        while e + 1 < n && is_peer(key_at(e + 1).first().unwrap_or(&Value::Null), &cur) {
+                        while e + 1 < n
+                            && is_peer(key_at(e + 1).first().unwrap_or(&Value::Null), &cur)
+                        {
                             e += 1;
                         }
                         e
@@ -5461,8 +6220,7 @@ fn gather_window_inputs_grouped(
             let mut ok = Vec::with_capacity(spec.order_by.len());
             for o in &spec.order_by {
                 ok.push(eval_grouped(
-                    q, outer, gscope, schema, rows, idxs, key_vals, group_by,
-                    &o.expr,
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, &o.expr,
                 )?);
             }
             let mut av = Vec::with_capacity(spec.args.len());
@@ -5500,10 +6258,7 @@ fn install_windows(
 }
 
 /// v0.10: compute one window's value for every input row.
-fn compute_window_values(
-    spec: &ExecWindow,
-    input: &WindowInput,
-) -> Result<Vec<Value>, ExecError> {
+fn compute_window_values(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<Value>, ExecError> {
     let nrows = input.arg_vals.len();
     let mut result = vec![Value::Null; nrows];
     if nrows == 0 {
@@ -5571,10 +6326,7 @@ fn compute_partition(
     if !spec.order_by.is_empty() && n > 0 {
         let mut p = 0;
         for i in 1..n {
-            if !window_keys_equal(
-                &input.order_keys[idxs[i]],
-                &input.order_keys[idxs[i - 1]],
-            ) {
+            if !window_keys_equal(&input.order_keys[idxs[i]], &input.order_keys[idxs[i - 1]]) {
                 p += 1;
             }
             peer_id[i] = p;
@@ -5614,15 +6366,8 @@ fn compute_partition(
             let k = match k_val {
                 Value::Int(i) => i as usize,
                 Value::BigInt(i) => i.max(0) as usize,
-                Value::Null => {
-                    return Err(exec_err("22004", "ntile argument must not be null"))
-                }
-                _ => {
-                    return Err(exec_err(
-                        "22003",
-                        "ntile argument must be an integer",
-                    ))
-                }
+                Value::Null => return Err(exec_err("22004", "ntile argument must not be null")),
+                _ => return Err(exec_err("22003", "ntile argument must be an integer")),
             };
             if k == 0 {
                 return Err(exec_err("22003", "ntile argument must be positive"));
@@ -5644,13 +6389,7 @@ fn compute_partition(
         WindowFunc::Lag | WindowFunc::Lead => {
             let is_lag = matches!(spec.func, WindowFunc::Lag);
             for j in 0..n {
-                let off_val = if input
-                    .arg_vals
-                    .get(idxs[j])
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-                    > 1
-                {
+                let off_val = if input.arg_vals.get(idxs[j]).map(|v| v.len()).unwrap_or(0) > 1 {
                     arg(j, 1)
                 } else {
                     Value::Int(1)
@@ -5659,23 +6398,12 @@ fn compute_partition(
                     Value::Int(i) => i as i64,
                     Value::BigInt(i) => i,
                     Value::Null => {
-                        return Err(exec_err(
-                            "22004",
-                            "lag/lead offset must not be null",
-                        ))
+                        return Err(exec_err("22004", "lag/lead offset must not be null"));
                     }
-                    _ => {
-                        return Err(exec_err(
-                            "22003",
-                            "lag/lead offset must be an integer",
-                        ))
-                    }
+                    _ => return Err(exec_err("22003", "lag/lead offset must be an integer")),
                 };
                 if off < 0 {
-                    return Err(exec_err(
-                        "22003",
-                        "lag/lead offset must not be negative",
-                    ));
+                    return Err(exec_err("22003", "lag/lead offset must not be negative"));
                 }
                 let target = if is_lag {
                     (j as i64) - off
@@ -5684,13 +6412,7 @@ fn compute_partition(
                 };
                 out[j] = if target >= 0 && (target as usize) < n {
                     arg(target as usize, 0)
-                } else if input
-                    .arg_vals
-                    .get(idxs[j])
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-                    > 2
-                {
+                } else if input.arg_vals.get(idxs[j]).map(|v| v.len()).unwrap_or(0) > 2 {
                     arg(j, 2)
                 } else {
                     Value::Null
@@ -5716,14 +6438,9 @@ fn compute_partition(
                     Value::Int(i) => i as i64,
                     Value::BigInt(i) => i,
                     Value::Null => {
-                        return Err(exec_err("22004", "nth_value argument must not be null"))
+                        return Err(exec_err("22004", "nth_value argument must not be null"));
                     }
-                    _ => {
-                        return Err(exec_err(
-                            "22003",
-                            "nth_value argument must be an integer",
-                        ))
-                    }
+                    _ => return Err(exec_err("22003", "nth_value argument must be an integer")),
                 };
                 out[j] = if nth >= 1 && s <= e && (s as i64) + nth - 1 <= e as i64 {
                     arg((s as i64 + nth - 1) as usize, 0)
@@ -5770,8 +6487,7 @@ fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
                 match best {
                     None => best = Some(v),
                     Some(b) => {
-                        let ord =
-                            cmp_ordering(v, b, CmpOp::Lt)?.expect("non-null values compare");
+                        let ord = cmp_ordering(v, b, CmpOp::Lt)?.expect("non-null values compare");
                         let better = if f == AggFunc::Min {
                             ord == Ordering::Less
                         } else {
@@ -5834,7 +6550,15 @@ fn build_from(
         // its rows in place and return them untouched, without the
         // per-row cells/prov rebuild the general loop below performs.
         // (Identical to one loop iteration with an empty accumulator.)
-        let (s2, r2) = build_source(q, outer, &from[0], where_, need_prov, order_hint, early_limit)?;
+        let (s2, r2) = build_source(
+            q,
+            outer,
+            &from[0],
+            where_,
+            need_prov,
+            order_hint,
+            early_limit,
+        )?;
         let quals: HashSet<String> = s2.iter().map(|c| c.qual.clone()).collect();
         let no_quals = HashSet::new();
         let push = pushdown_for(where_, &quals, &no_quals, &s2, &[]);
@@ -5909,9 +6633,9 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
         }
         Expr::Concat(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
         Expr::Cast { expr, .. } => pushable_columns(expr, cols),
-        Expr::Like {
-            expr, pattern, ..
-        } => pushable_columns(expr, cols) && pushable_columns(pattern, cols),
+        Expr::Like { expr, pattern, .. } => {
+            pushable_columns(expr, cols) && pushable_columns(pattern, cols)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -6018,9 +6742,7 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_column_refs(b, out);
         }
         Expr::Cast { expr, .. } => collect_column_refs(expr, out),
-        Expr::Like {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } => {
             collect_column_refs(expr, out);
             collect_column_refs(pattern, out);
         }
@@ -6229,7 +6951,7 @@ fn build_source(
                         return Err(exec_err(
                             "0A000",
                             format!("view \"{}\" query is not a SELECT", name),
-                        ))
+                        ));
                     }
                 };
                 // Guard against runaway recursion (e.g. a view recreated
@@ -6250,11 +6972,7 @@ fn build_source(
                     .enumerate()
                     .map(|(i, (cn, ty))| QCol {
                         qual: qual.clone(),
-                        name: view
-                            .col_aliases
-                            .get(i)
-                            .cloned()
-                            .unwrap_or(cn),
+                        name: view.col_aliases.get(i).cloned().unwrap_or(cn),
                         ty,
                     })
                     .collect();
@@ -6281,6 +6999,60 @@ fn build_source(
                 let (_, rows) = pg_stats_scan(&q.eng.db);
                 return Ok((schema, rows));
             }
+            // v0.11: the role catalogs are virtual too.
+            if matches!(
+                name.as_str(),
+                "pg_authid" | "pg_roles" | "pg_user" | "pg_auth_members"
+            ) && q.eng.db.find_table(name, q.snap, q.own).is_none()
+            {
+                let (schema, rows) = pg_auth_scan(&q.eng.db, q.snap, q.own, q.role, name);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((schema, rows));
+            }
+            // v0.11: scanning a real table needs SELECT (and UPDATE when
+            // the statement is FOR UPDATE, like PostgreSQL). Existence is
+            // still reported as 42P01 when the table is missing.
+            {
+                let (eng, snap, own, role) = (&q.eng, q.snap, q.own, q.role);
+                if let Some(t) = eng.db.find_table(name, snap, own) {
+                    let have = crate::storage::table_privs(&eng.db, role, t, snap, own);
+                    // v0.11: table-level SELECT, or any column-level
+                    // SELECT grant — the run_select pre-pass enforces
+                    // the precise per-column rule.
+                    let select_ok = have & crate::storage::PRIV_SELECT
+                        == crate::storage::PRIV_SELECT
+                        || crate::storage::has_col_priv(
+                            &eng.db,
+                            role,
+                            t,
+                            crate::storage::PRIV_SELECT,
+                            snap,
+                            own,
+                        );
+                    let update_ok = !need_prov
+                        || have & crate::storage::PRIV_UPDATE == crate::storage::PRIV_UPDATE;
+                    if !select_ok || !update_ok {
+                        return Err(exec_err(
+                            "42501",
+                            format!(
+                                "permission denied for table \"{}\" (needs {})",
+                                name,
+                                if need_prov {
+                                    "SELECT, UPDATE"
+                                } else {
+                                    "SELECT"
+                                },
+                            ),
+                        ));
+                    }
+                }
+            }
             // Borrow ends before any recursive call below: everything is
             // cloned out of the table.
             let (schema, rows) = {
@@ -6305,9 +7077,10 @@ fn build_source(
                 let snap = q.snap;
                 let own = q.own;
                 let rows: Vec<QRow> = if let Some(hint) = order_hint {
-                    let ix = db.indexes.get(&hint.index).expect(
-                        "planned index still present; engine lock held throughout",
-                    );
+                    let ix = db
+                        .indexes
+                        .get(&hint.index)
+                        .expect("planned index still present; engine lock held throughout");
                     index_order_rows(ix, t, name, hint.desc, snap, own, need_prov, early_limit)
                 } else {
                     match plan_access_path(db, t, name, &qual, where_, snap, own) {
@@ -6331,9 +7104,10 @@ fn build_source(
                             hi,
                             ..
                         } => {
-                            let ix = db.indexes.get(&index).expect(
-                                "planned index still present; engine lock held throughout",
-                            );
+                            let ix = db
+                                .indexes
+                                .get(&index)
+                                .expect("planned index still present; engine lock held throughout");
                             let ids = index_scan_ids(
                                 ix,
                                 &prefix,
@@ -6373,10 +7147,12 @@ fn build_source(
                     snap: q.snap,
                     own: q.own,
                     session: q.session,
+                    role: q.role,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
                 };
                 run_select(&mut sub_q, sub, &[])?
             };
@@ -7066,12 +7842,8 @@ fn eval_grouped(
             eval_cast(&v, *to)
         }
         Expr::Concat(a, b) => {
-            let va = eval_grouped(
-                q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
-            )?;
-            let vb = eval_grouped(
-                q, outer, gscope, schema, rows, idxs, key_vals, group_by, b,
-            )?;
+            let va = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
+            let vb = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, b)?;
             eval_concat(&va, &vb)
         }
         Expr::Like {
@@ -7123,7 +7895,7 @@ fn eval_grouped(
             if matches!(name.as_str(), "nextval" | "currval" | "setval") {
                 check_builtin_arity(name, &vals)?;
                 let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
-                return eval_sequence_func(eng, snap, own, session, name, &vals);
+                return eval_sequence_func(eng, snap, own, session, q.role, name, &vals);
             }
             // Grouped context: no correlated subqueries inside function
             // args here (subqueries take the eval_expr path); dispatch on
@@ -7168,16 +7940,15 @@ fn eval_grouped(
         // window context. Nested windows never reach here: validation
         // rejects them, and window inputs are gathered separately.
         Expr::Window { wid, .. } => {
-            let wctx = q.wctx.as_ref().ok_or_else(|| {
-                exec_err("XX000", "internal error: window without context")
-            })?;
+            let wctx = q
+                .wctx
+                .as_ref()
+                .ok_or_else(|| exec_err("XX000", "internal error: window without context"))?;
             wctx.values
                 .get(*wid)
                 .and_then(|v| v.get(wctx.row))
                 .cloned()
-                .ok_or_else(|| {
-                    exec_err("XX000", "internal error: window value missing")
-                })
+                .ok_or_else(|| exec_err("XX000", "internal error: window value missing"))
         }
     }
 }
@@ -7701,10 +8472,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     snap: q.snap,
                     own: q.own,
                     session: q.session,
+                    role: q.role,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -7731,10 +8504,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     snap: q.snap,
                     own: q.own,
                     session: q.session,
+                    role: q.role,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -7744,16 +8519,15 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         // v0.10: window functions are precomputed per query level
         // (Q.wctx) before projection; here we just look the value up.
         Expr::Window { wid, .. } => {
-            let wctx = q.wctx.as_ref().ok_or_else(|| {
-                exec_err("XX000", "internal error: window without context")
-            })?;
+            let wctx = q
+                .wctx
+                .as_ref()
+                .ok_or_else(|| exec_err("XX000", "internal error: window without context"))?;
             wctx.values
                 .get(*wid)
                 .and_then(|v| v.get(wctx.row))
                 .cloned()
-                .ok_or_else(|| {
-                    exec_err("XX000", "internal error: window value missing")
-                })
+                .ok_or_else(|| exec_err("XX000", "internal error: window value missing"))
         }
     }
 }
@@ -7774,10 +8548,12 @@ fn eval_in(
             snap: q.snap,
             own: q.own,
             session: q.session,
+            role: q.role,
             depth: q.depth + 1,
             lock_ids: &mut *q.lock_ids,
             ctes: q.ctes.clone(),
             wctx: None,
+            priv_scopes: q.priv_scopes.clone(),
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -7936,12 +8712,13 @@ fn eval_update_expr(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     schema: &[QCol],
     values: &[Value],
     e: &Expr,
     ctes: &[Rc<CteBinding>],
 ) -> Result<Value, ExecError> {
-    eval_dml_expr(eng, snap, own, session, &[(schema, values)], e, ctes)
+    eval_dml_expr(eng, snap, own, session, role, &[(schema, values)], e, ctes)
 }
 
 /// v0.10: evaluate a DML expression (UPDATE SET, RETURNING, ON CONFLICT
@@ -7953,6 +8730,7 @@ fn eval_dml_expr(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     frames: &[(&[QCol], &[Value])],
     e: &Expr,
     ctes: &[Rc<CteBinding>],
@@ -7963,10 +8741,12 @@ fn eval_dml_expr(
         snap,
         own,
         session,
+        role,
         depth: 0,
         lock_ids: &mut lock_ids,
         ctes: ctes.to_vec(),
         wctx: None,
+        priv_scopes: Vec::new(),
     };
     let scopes: Vec<Scope> = frames
         .iter()
@@ -8158,9 +8938,9 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
 fn fit_int_result(icat: NumCat, r: i128) -> Result<Value, ExecError> {
     let ovf = || exec_err("22003", "integer out of range");
     match icat {
-        NumCat::Small => Ok(Value::SmallInt(i16::try_from(r).map_err(|_| {
-            exec_err("22003", "smallint out of range")
-        })?)),
+        NumCat::Small => Ok(Value::SmallInt(
+            i16::try_from(r).map_err(|_| exec_err("22003", "smallint out of range"))?,
+        )),
         NumCat::Int => Ok(Value::Int(i32::try_from(r).map_err(|_| ovf())? as i64)),
         _ => Ok(Value::BigInt(i64::try_from(r).map_err(|_| ovf())?)),
     }
@@ -8168,11 +8948,7 @@ fn fit_int_result(icat: NumCat, r: i128) -> Result<Value, ExecError> {
 
 /// Date arithmetic. Ok(None) = not date/time operands (caller falls
 /// through to numeric handling).
-fn eval_datetime_arith(
-    op: ArithOp,
-    a: &Value,
-    b: &Value,
-) -> Result<Option<Value>, ExecError> {
+fn eval_datetime_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Value>, ExecError> {
     fn int_days(v: &Value) -> Option<i64> {
         match v {
             Value::SmallInt(i) => Some(*i as i64),
@@ -8230,8 +9006,7 @@ fn eval_datetime_arith(
     // timestamp - timestamp would be an interval; v0.7 has none.
     if matches!(
         (a, b),
-        (Value::Timestamp(_), Value::Timestamp(_))
-            | (Value::Timestamptz(_), Value::Timestamptz(_))
+        (Value::Timestamp(_), Value::Timestamp(_)) | (Value::Timestamptz(_), Value::Timestamptz(_))
     ) {
         return Err(exec_err(
             "42883",
@@ -8248,11 +9023,7 @@ fn eval_datetime_arith(
 fn cast_err(from: &Value, to: &str) -> ExecError {
     exec_err(
         "42846",
-        format!(
-            "cannot cast type {} to {}",
-            from.type_name(),
-            to
-        ),
+        format!("cannot cast type {} to {}", from.type_name(), to),
     )
 }
 
@@ -8264,7 +9035,9 @@ fn cast_to_int(v: &Value) -> Result<i128, ExecError> {
         Value::Int(i) => Ok(*i as i128),
         Value::BigInt(i) => Ok(*i as i128),
         Value::Numeric(n) => {
-            let r = n.to_i64().ok_or_else(|| exec_err("22003", "numeric out of range"))?;
+            let r = n
+                .to_i64()
+                .ok_or_else(|| exec_err("22003", "numeric out of range"))?;
             Ok(r as i128)
         }
         Value::Float4(f) => float_to_int(*f as f64),
@@ -8345,10 +9118,7 @@ fn cast_to_f64(v: &Value) -> Result<f64, ExecError> {
                 }
                 Err(_) => Err(exec_err(
                     "22P02",
-                    format!(
-                        "invalid input syntax for type double precision: {:?}",
-                        s
-                    ),
+                    format!("invalid input syntax for type double precision: {:?}", s),
                 )),
             }
         }
@@ -8490,14 +9260,12 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             other => Err(cast_err(other, "bytea")),
         },
         ColType::Uuid => match v {
-            Value::Text(s) => crate::storage::parse_uuid(s)
-                .map(Value::Uuid)
-                .map_err(|_| {
-                    exec_err(
-                        "22P02",
-                        format!("invalid input syntax for type uuid: {:?}", s),
-                    )
-                }),
+            Value::Text(s) => crate::storage::parse_uuid(s).map(Value::Uuid).map_err(|_| {
+                exec_err(
+                    "22P02",
+                    format!("invalid input syntax for type uuid: {:?}", s),
+                )
+            }),
             other => Err(cast_err(other, "uuid")),
         },
     }
@@ -8564,8 +9332,7 @@ fn match_like(s: &[char], toks: &[PatTok]) -> bool {
     let mut star_si = 0;
     while si < s.len() {
         if ti < toks.len()
-            && (toks[ti] == PatTok::Any
-                || matches!(toks[ti], PatTok::Lit(c) if c == s[si]))
+            && (toks[ti] == PatTok::Any || matches!(toks[ti], PatTok::Lit(c) if c == s[si]))
         {
             si += 1;
             ti += 1;
@@ -8719,7 +9486,7 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         }
         check_builtin_arity(name, &vals)?;
         let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
-        return eval_sequence_func(eng, snap, own, session, name, &vals);
+        return eval_sequence_func(eng, snap, own, session, q.role, name, &vals);
     }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
@@ -8733,8 +9500,8 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
 fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
     let n = vals.len();
     let ok = match name {
-        "upper" | "lower" | "length" | "char_length" | "character_length" | "abs"
-        | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
+        | "ceil" | "ceiling" | "sqrt" => n == 1,
         "round" => n == 1 || n == 2,
         "substring" => n == 2 || n == 3,
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
@@ -8931,11 +9698,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 s.split(delim).collect()
             };
-            let idx = if n > 0 {
-                n - 1
-            } else {
-                parts.len() as i64 + n
-            };
+            let idx = if n > 0 { n - 1 } else { parts.len() as i64 + n };
             let r = if idx >= 0 {
                 parts.get(idx as usize).copied().unwrap_or("")
             } else {
@@ -8953,7 +9716,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
 /// Shared `power(a, b)` / `a ^ b` implementation. `bad` builds the
 /// type-mismatch error (42883), which differs between the function and
 /// operator spellings.
-fn eval_power_op(a: &Value, b: &Value, bad: impl Fn(&Value) -> ExecError) -> Result<Value, ExecError> {
+fn eval_power_op(
+    a: &Value,
+    b: &Value,
+    bad: impl Fn(&Value) -> ExecError,
+) -> Result<Value, ExecError> {
     if matches!(a, Value::Float4(_) | Value::Float(_))
         || matches!(b, Value::Float4(_) | Value::Float(_))
     {
@@ -9012,8 +9779,7 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "round" => {
             // Postgres: round(numeric) -> numeric, round(float8) ->
             // numeric, round(numeric, int) -> numeric.
-            let n = to_numeric_opt(v)
-                .ok_or_else(|| func_arg_err(name, v))?;
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             if vals.len() == 1 {
                 n.round_to(0)
                     .map(Value::Numeric)
@@ -9028,16 +9794,8 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "floor" | "ceil" | "ceiling" => {
             let is_floor = name == "floor";
             match v {
-                Value::Float4(f) => Ok(Value::Float4(if is_floor {
-                    f.floor()
-                } else {
-                    f.ceil()
-                })),
-                Value::Float(f) => Ok(Value::Float(if is_floor {
-                    f.floor()
-                } else {
-                    f.ceil()
-                })),
+                Value::Float4(f) => Ok(Value::Float4(if is_floor { f.floor() } else { f.ceil() })),
+                Value::Float(f) => Ok(Value::Float(if is_floor { f.floor() } else { f.ceil() })),
                 other => {
                     let n = to_numeric_opt(other).ok_or_else(|| func_arg_err(name, other))?;
                     let r = if is_floor { n.floor() } else { n.ceil() };
@@ -9453,7 +10211,7 @@ fn from_schema_item(
                         return Err(exec_err(
                             "0A000",
                             format!("view \"{}\" query is not a SELECT", name),
-                        ))
+                        ));
                     }
                 };
                 let cols = describe_select(eng, snap, own, &select, &[])?;
@@ -9481,6 +10239,28 @@ fn from_schema_item(
                         c
                     })
                     .collect();
+                out.push(schema);
+                return Ok(());
+            }
+            // v0.11: the role catalogs are virtual too.
+            if matches!(
+                name.as_str(),
+                "pg_authid" | "pg_roles" | "pg_user" | "pg_auth_members"
+            ) && eng.db.find_table(name, snap, own).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = match name.as_str() {
+                    "pg_roles" => pg_roles_schema(),
+                    "pg_user" => pg_user_schema(),
+                    "pg_auth_members" => pg_auth_members_schema(),
+                    _ => pg_authid_schema(),
+                }
+                .into_iter()
+                .map(|mut c| {
+                    c.qual = qual.clone();
+                    c
+                })
+                .collect();
                 out.push(schema);
                 return Ok(());
             }
@@ -9673,7 +10453,16 @@ fn expr_type(
             arg,
             distinct: _,
             arg2,
-        } => agg_result_type(eng, snap, own, schemas, ctes, *func, arg.as_deref(), arg2.as_deref()),
+        } => agg_result_type(
+            eng,
+            snap,
+            own,
+            schemas,
+            ctes,
+            *func,
+            arg.as_deref(),
+            arg2.as_deref(),
+        ),
         Expr::ScalarSub(sub) => {
             let cols = describe_select_outer(eng, snap, own, sub, ctes, &[])?;
             if cols.len() != 1 {
@@ -9682,15 +10471,9 @@ fn expr_type(
             Ok(cols[1 - 1].clone().1)
         }
         // v0.10: window function result types.
-        Expr::Window { func, args, .. } => window_result_type(
-            eng,
-            snap,
-            own,
-            schemas,
-            ctes,
-            func,
-            args,
-        ),
+        Expr::Window { func, args, .. } => {
+            window_result_type(eng, snap, own, schemas, ctes, func, args)
+        }
     }
 }
 
@@ -9707,9 +10490,7 @@ fn window_result_type(
     match func {
         // Postgres returns bigint for the ranking functions, integer
         // for ntile.
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
-            Ok(ColType::BigInt)
-        }
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Ok(ColType::BigInt),
         WindowFunc::Ntile => Ok(ColType::Int),
         // lag/lead/first_value/last_value/nth_value: type of the value
         // argument.
@@ -9718,9 +10499,9 @@ fn window_result_type(
         | WindowFunc::FirstValue
         | WindowFunc::LastValue
         | WindowFunc::NthValue => {
-            let a = args.first().ok_or_else(|| {
-                exec_err("42883", "window function requires an argument")
-            })?;
+            let a = args
+                .first()
+                .ok_or_else(|| exec_err("42883", "window function requires an argument"))?;
             expr_type(eng, snap, own, schemas, ctes, a)
         }
         WindowFunc::Agg(f) => {
@@ -9758,7 +10539,9 @@ fn arith_operand_type(
             let tb = arith_operand_type(eng, snap, own, schemas, ctes, right, *inner)?;
             Ok(Some(combine_arith_types(*inner, ta, tb)?))
         }
-        Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?)),
+        Expr::Agg { .. } | Expr::ScalarSub(_) => {
+            Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?))
+        }
         Expr::Cast { to, .. } => Ok(Some(*to)),
         Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?)),
         // Boolean / predicate expressions can't be arithmetic operands.
@@ -9821,9 +10604,8 @@ fn combine_arith_types(
         (Some(x), Some(y)) => {
             // Date arithmetic (v0.7): date +/- int-kind -> date,
             // date - date -> integer (days). No intervals in v0.7.
-            let is_int_kind = |t: &ColType| {
-                matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt)
-            };
+            let is_int_kind =
+                |t: &ColType| matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt);
             match (&x, &y) {
                 (ColType::Date, y) if is_int_kind(y) => match op {
                     ArithOp::Add | ArithOp::Sub => Ok(ColType::Date),
@@ -10642,7 +11424,10 @@ fn subst_ctes(ctes: &mut [CteDef], params: &[Option<Value>]) -> Result<(), ExecE
 }
 
 /// v0.10: substitute parameters inside a RETURNING list.
-fn subst_returning(returning: &mut [SelectItem], params: &[Option<Value>]) -> Result<(), ExecError> {
+fn subst_returning(
+    returning: &mut [SelectItem],
+    params: &[Option<Value>],
+) -> Result<(), ExecError> {
     for item in returning {
         if let SelectItem::Expr { expr, .. } = item {
             subst_expr(expr, params)?;
@@ -10762,9 +11547,7 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             subst_expr(left, params)?;
             subst_expr(right, params)?;
         }
-        Expr::Like {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } => {
             subst_expr(expr, params)?;
             subst_expr(pattern, params)?;
         }
@@ -10923,6 +11706,7 @@ mod tests {
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
+            role: "postgres",
         };
         execute(eng, &mut ctx, &stmt)
     }
@@ -11113,6 +11897,7 @@ mod tests {
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
+            role: "postgres",
         };
         let sel = parse_statement("SELECT * FROM users WHERE id = 1 FOR UPDATE").unwrap();
         execute(&mut eng, &mut ctx, &sel).unwrap();
@@ -11126,6 +11911,7 @@ mod tests {
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes2,
             session: 0,
+            role: "postgres",
         };
         let upd = parse_statement("UPDATE users SET name = 'x' WHERE id = 1").unwrap();
         let e = execute(&mut eng, &mut ctx2, &upd).unwrap_err();
@@ -11246,19 +12032,22 @@ fn exec_create_sequence(
         ));
     }
     let (start, increment, min_value, max_value, cycle, _) = sequence_params(opts, false)?;
+    let mut seq = Sequence::new(
+        name.to_string(),
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        ctx.own,
+    );
+    // v0.11: the creating role owns the sequence.
+    seq.owner = ctx.role.to_string();
     eng.db
         .sequences
         .entry(name.to_string())
         .or_default()
-        .push(Sequence::new(
-            name.to_string(),
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
-            ctx.own,
-        ));
+        .push(seq);
     ctx.writes.push(WriteOp::CreateSequence {
         name: name.to_string(),
     });
@@ -11273,6 +12062,8 @@ fn exec_alter_sequence(
     name: &str,
     opts: &SequenceOpts,
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: only the owner (or a superuser) may alter a sequence.
+    require_seq_owner(eng, ctx, name)?;
     let live = eng
         .db
         .find_sequence(name, ctx.snap, ctx.own)
@@ -11286,8 +12077,7 @@ fn exec_alter_sequence(
         cycle: opts.cycle.or(Some(live.cycle)),
         restart: opts.restart,
     };
-    let (start, increment, min_value, max_value, cycle, restart) =
-        sequence_params(&merged, true)?;
+    let (start, increment, min_value, max_value, cycle, restart) = sequence_params(&merged, true)?;
     let prev = live.clone();
     let versions = eng.db.sequences.get_mut(name).expect("visible above");
     let cur = versions
@@ -11308,6 +12098,9 @@ fn exec_alter_sequence(
     // current value and is_called forward (Postgres behavior).
     next.current = prev.current;
     next.is_called = prev.is_called;
+    // v0.11: ALTER SEQUENCE preserves owner and grants.
+    next.owner = prev.owner.clone();
+    next.acl = prev.acl.clone();
     if let Some(r) = restart {
         // RESTART is setval(r, true): the next nextval advances past r.
         next.current = Some(r);
@@ -11338,6 +12131,8 @@ fn exec_drop_sequence(
     if_exists: bool,
 ) -> Result<ExecResult, ExecError> {
     for name in names {
+        // v0.11: only the owner (or a superuser) may drop a sequence.
+        require_seq_owner(eng, ctx, name)?;
         let live = eng.db.find_sequence(name, ctx.snap, ctx.own);
         match live {
             None if if_exists => continue,
@@ -11345,7 +12140,7 @@ fn exec_drop_sequence(
                 return Err(exec_err(
                     "42P01",
                     format!("relation \"{}\" does not exist", name),
-                ))
+                ));
             }
             Some(_) => {}
         }
@@ -11403,8 +12198,19 @@ pub fn seq_nextval(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     name: &str,
 ) -> Result<i64, ExecError> {
+    // v0.11: nextval needs USAGE on the sequence.
+    if let Some(s) = eng.db.find_sequence(name, snap, own) {
+        let have = crate::storage::sequence_privs(&eng.db, role, s, snap, own);
+        if have & crate::storage::PRIV_USAGE == 0 {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied for sequence \"{}\"", name),
+            ));
+        }
+    }
     let cur = eng
         .db
         .find_sequence_mut(name, snap, own)
@@ -11421,7 +12227,11 @@ pub fn seq_nextval(
                     "55000",
                     format!(
                         "nextval: reached {} value of sequence \"{}\"",
-                        if cur.increment > 0 { "maximum" } else { "minimum" },
+                        if cur.increment > 0 {
+                            "maximum"
+                        } else {
+                            "minimum"
+                        },
                         name
                     ),
                 )
@@ -11443,7 +12253,11 @@ pub fn seq_nextval(
                         "55000",
                         format!(
                             "nextval: reached {} value of sequence \"{}\" ({})",
-                            if cur.increment > 0 { "maximum" } else { "minimum" },
+                            if cur.increment > 0 {
+                                "maximum"
+                            } else {
+                                "minimum"
+                            },
                             name,
                             if cur.increment > 0 {
                                 cur.max_value
@@ -11472,10 +12286,26 @@ pub fn seq_currval(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     name: &str,
 ) -> Result<i64, ExecError> {
-    if eng.db.find_sequence(name, snap, own).is_none() {
-        return Err(exec_err("42P01", format!("relation \"{}\" does not exist", name)));
+    // v0.11: currval needs USAGE on the sequence.
+    match eng.db.find_sequence(name, snap, own) {
+        None => {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", name),
+            ));
+        }
+        Some(s) => {
+            let have = crate::storage::sequence_privs(&eng.db, role, s, snap, own);
+            if have & crate::storage::PRIV_USAGE == 0 {
+                return Err(exec_err(
+                    "42501",
+                    format!("permission denied for sequence \"{}\"", name),
+                ));
+            }
+        }
     }
     eng.seq_currval
         .get(&(session, name.to_string()))
@@ -11496,10 +12326,21 @@ pub fn seq_setval(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     name: &str,
     value: i64,
     is_called: bool,
 ) -> Result<i64, ExecError> {
+    // v0.11: setval needs USAGE on the sequence.
+    if let Some(s) = eng.db.find_sequence(name, snap, own) {
+        let have = crate::storage::sequence_privs(&eng.db, role, s, snap, own);
+        if have & crate::storage::PRIV_USAGE == 0 {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied for sequence \"{}\"", name),
+            ));
+        }
+    }
     let cur = eng
         .db
         .find_sequence_mut(name, snap, own)
@@ -11521,11 +12362,660 @@ pub fn seq_setval(
 
 /// Dispatch for the nextval/currval/setval SQL functions (called from
 /// eval_func with pre-evaluated args).
+
+// ============================================================================
+// v0.11: roles and privileges
+// ============================================================================
+
+fn exec_create_role(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    login: bool,
+    superuser: bool,
+    password: &Option<String>,
+    connlimit: Option<i32>,
+    valid_until: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    require_superuser(eng, ctx)?;
+    if eng.db.find_role(name, ctx.snap, ctx.own).is_some() {
+        return Err(exec_err(
+            "42710",
+            format!("role \"{}\" already exists", name),
+        ));
+    }
+    if let Some(vu) = valid_until {
+        crate::storage::check_valid_until(vu).map_err(|e| exec_err("22008", e))?;
+    }
+    let role = crate::storage::Role {
+        name: name.to_string(),
+        password: password
+            .as_ref()
+            .map(|pw| crate::crypto::verifier_for_password(pw)),
+        can_login: login,
+        superuser,
+        connlimit: connlimit.unwrap_or(-1),
+        memberships: Vec::new(),
+        valid_until: valid_until.clone(),
+        created_xmin: ctx.own,
+        dropped_xmax: 0,
+    };
+    eng.db.roles.entry(name.to_string()).or_default().push(role);
+    ctx.writes.push(WriteOp::CreateRole {
+        name: name.to_string(),
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE ROLE".to_string(),
+    })
+}
+
+fn exec_alter_role(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    login: Option<bool>,
+    superuser: Option<bool>,
+    password: &Option<Option<String>>,
+    connlimit: Option<i32>,
+    valid_until: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    require_superuser(eng, ctx)?;
+    let live = eng
+        .db
+        .find_role(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42704", format!("role \"{}\" does not exist", name)))?
+        .clone();
+    // The bootstrap superuser cannot be de-superusered or renamed away
+    // into uselessness: refuse to remove SUPERUSER from `postgres`.
+    // (Documented deviation: real PostgreSQL lets you do this.)
+    if live.name == "postgres" && superuser == Some(false) {
+        return Err(exec_err(
+            "42501",
+            "permission denied: cannot remove superuser from role \"postgres\"".to_string(),
+        ));
+    }
+    let prev = live.clone();
+    let cur = eng
+        .db
+        .find_role_mut(name, ctx.snap, ctx.own)
+        .expect("visible above");
+    cur.dropped_xmax = ctx.own;
+    let versions = eng.db.roles.get_mut(name).expect("visible above");
+    let mut next = live;
+    if let Some(l) = login {
+        next.can_login = l;
+    }
+    if let Some(s) = superuser {
+        next.superuser = s;
+    }
+    if let Some(pw) = password {
+        next.password = pw.as_ref().map(|p| crate::crypto::verifier_for_password(p));
+    }
+    if let Some(c) = connlimit {
+        next.connlimit = c;
+    }
+    if let Some(vu) = valid_until {
+        crate::storage::check_valid_until(vu).map_err(|e| exec_err("22008", e))?;
+        next.valid_until = crate::storage::normalize_valid_until(vu);
+    }
+    next.created_xmin = ctx.own;
+    next.dropped_xmax = 0;
+    versions.push(next);
+    ctx.writes.push(WriteOp::AlterRole {
+        name: name.to_string(),
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "ALTER ROLE".to_string(),
+    })
+}
+
+/// Swap the live version of role `name` for a mutated copy, WAL-logged
+/// as AlterRole. The caller must have verified the role exists and is
+/// visible under (snap, own). Returns the previous live version.
+fn alter_role_swap(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    mutate: impl FnOnce(&mut crate::storage::Role),
+) {
+    let prev = eng
+        .db
+        .find_role(name, ctx.snap, ctx.own)
+        .expect("role visible")
+        .clone();
+    let cur = eng
+        .db
+        .find_role_mut(name, ctx.snap, ctx.own)
+        .expect("role visible");
+    cur.dropped_xmax = ctx.own;
+    let versions = eng.db.roles.get_mut(name).expect("role visible");
+    let mut next = prev.clone();
+    mutate(&mut next);
+    next.created_xmin = ctx.own;
+    next.dropped_xmax = 0;
+    versions.push(next);
+    ctx.writes.push(WriteOp::AlterRole {
+        name: name.to_string(),
+        prev,
+    });
+}
+
+/// Would `GRANT role TO grantee` create a membership cycle? True when
+/// `grantee` is already (transitively) a member of `role`.
+fn membership_would_cycle(
+    db: &crate::storage::Database,
+    role: &str,
+    grantee: &str,
+    snap: &crate::storage::Snapshot,
+    own: u64,
+) -> bool {
+    let mut seen = vec![role.to_string()];
+    let mut i = 0;
+    while i < seen.len() {
+        let n = seen[i].clone();
+        i += 1;
+        if n == grantee {
+            return true;
+        }
+        if let Some(r) = db.find_role(&n, snap, own) {
+            for m in &r.memberships {
+                if !seen.iter().any(|x| x == &m.role) {
+                    seen.push(m.role.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+/// GRANT role [, ...] TO role [, ...]: role membership. Members inherit
+/// the group's GRANTed privileges. Superuser-only (PostgreSQL also
+/// allows ADMIN OPTION holders; rustgres has no CREATEROLE yet).
+fn exec_grant_role(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    roles: &[String],
+    grantees: &[String],
+) -> Result<ExecResult, ExecError> {
+    require_superuser(eng, ctx)?;
+    for grantee in grantees {
+        if eng.db.find_role(grantee, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err(
+                "42704",
+                format!("role \"{}\" does not exist", grantee),
+            ));
+        }
+        for role in roles {
+            if eng.db.find_role(role, ctx.snap, ctx.own).is_none() {
+                return Err(exec_err(
+                    "42704",
+                    format!("role \"{}\" does not exist", role),
+                ));
+            }
+            if role == grantee {
+                return Err(exec_err(
+                    "42501",
+                    "a role cannot be a member of itself".to_string(),
+                ));
+            }
+            if membership_would_cycle(&eng.db, role, grantee, ctx.snap, ctx.own) {
+                return Err(exec_err(
+                    "42501",
+                    format!(
+                        "granting \"{}\" to \"{}\" would create a membership cycle",
+                        role, grantee
+                    ),
+                ));
+            }
+            let already = eng
+                .db
+                .find_role(grantee, ctx.snap, ctx.own)
+                .map(|r| r.memberships.iter().any(|m| &m.role == role))
+                .unwrap_or(false);
+            if already {
+                continue;
+            }
+            let grantor = ctx.role.to_string();
+            let role_name = role.clone();
+            alter_role_swap(eng, ctx, grantee, move |r| {
+                r.memberships.push(crate::storage::RoleMembership {
+                    role: role_name.clone(),
+                    grantor: grantor.clone(),
+                });
+            });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "GRANT".to_string(),
+    })
+}
+
+/// REVOKE role [, ...] FROM role [, ...]: remove membership.
+fn exec_revoke_role(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    roles: &[String],
+    grantees: &[String],
+) -> Result<ExecResult, ExecError> {
+    require_superuser(eng, ctx)?;
+    for grantee in grantees {
+        if eng.db.find_role(grantee, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err(
+                "42704",
+                format!("role \"{}\" does not exist", grantee),
+            ));
+        }
+        for role in roles {
+            if eng.db.find_role(role, ctx.snap, ctx.own).is_none() {
+                return Err(exec_err(
+                    "42704",
+                    format!("role \"{}\" does not exist", role),
+                ));
+            }
+            let has = eng
+                .db
+                .find_role(grantee, ctx.snap, ctx.own)
+                .map(|r| r.memberships.iter().any(|m| &m.role == role))
+                .unwrap_or(false);
+            if !has {
+                continue;
+            }
+            let role_name = role.clone();
+            alter_role_swap(eng, ctx, grantee, move |r| {
+                r.memberships.retain(|m| m.role != role_name);
+            });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "REVOKE".to_string(),
+    })
+}
+
+fn exec_drop_role(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    names: &[String],
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    require_superuser(eng, ctx)?;
+    for name in names {
+        let live = eng.db.find_role(name, ctx.snap, ctx.own).cloned();
+        let Some(role) = live else {
+            if if_exists {
+                continue;
+            }
+            return Err(exec_err(
+                "42704",
+                format!("role \"{}\" does not exist", name),
+            ));
+        };
+        // The bootstrap superuser is the safety net: it cannot be dropped.
+        if role.name == "postgres" {
+            return Err(exec_err(
+                "42501",
+                "permission denied: cannot drop role \"postgres\"".to_string(),
+            ));
+        }
+        // Like PostgreSQL (2BP01): refuse while the role still owns objects.
+        let mut owned = Vec::new();
+        for (tn, vs) in &eng.db.tables {
+            if vs.iter().any(|t| {
+                crate::storage::table_visible(t, ctx.snap, ctx.own) && t.owner == role.name
+            }) {
+                owned.push(format!("table {}", tn));
+            }
+        }
+        for (vn, vs) in &eng.db.views {
+            if vs
+                .iter()
+                .any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own) && v.owner == role.name)
+            {
+                owned.push(format!("view {}", vn));
+            }
+        }
+        for (sn, vs) in &eng.db.sequences {
+            if vs
+                .iter()
+                .any(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own) && s.owner == role.name)
+            {
+                owned.push(format!("sequence {}", sn));
+            }
+        }
+        if !owned.is_empty() {
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "role \"{}\" cannot be dropped because it owns {}",
+                    role.name,
+                    owned.join(", ")
+                ),
+            ));
+        }
+        // Grants *to* the dropped role linger but are inert (documented
+        // deviation from PostgreSQL, which drops them).
+        let cur = eng
+            .db
+            .find_role_mut(name, ctx.snap, ctx.own)
+            .expect("visible above");
+        cur.dropped_xmax = ctx.own;
+        ctx.writes.push(WriteOp::DropRole {
+            name: name.to_string(),
+            prev: role,
+        });
+        // Membership edges referencing the dropped role are removed from
+        // every remaining role (PostgreSQL drops them from pg_auth_members).
+        let affected: Vec<String> = eng
+            .db
+            .roles
+            .iter()
+            .filter(|(rn, vs)| {
+                *rn != name
+                    && vs.iter().any(|r| {
+                        crate::storage::role_visible(r, ctx.snap, ctx.own)
+                            && r.memberships.iter().any(|m| &m.role == name)
+                    })
+            })
+            .map(|(rn, _)| rn.clone())
+            .collect();
+        for rn in affected {
+            let dropped = name.clone();
+            alter_role_swap(eng, ctx, &rn, move |r| {
+                r.memberships.retain(|m| m.role != dropped);
+            });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP ROLE".to_string(),
+    })
+}
+
+/// Apply a GRANT or REVOKE (revoke = true). Only superusers and object
+/// owners may grant; the grantee roles must exist.
+#[allow(clippy::too_many_arguments)]
+fn exec_grant_revoke(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    privs: &[crate::sql::PrivSpec],
+    object: &crate::sql::GrantObject,
+    grantees: &[String],
+    revoke: bool,
+) -> Result<ExecResult, ExecError> {
+    use crate::sql::{GrantObject, PrivSpec, Privilege};
+    // All grantees must be existing roles.
+    for g in grantees {
+        if eng.db.find_role(g, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err("42704", format!("role \"{}\" does not exist", g)));
+        }
+    }
+    // Column lists are only meaningful on tables.
+    if !matches!(object, GrantObject::Table(_)) && privs.iter().any(|s| !s.columns.is_empty()) {
+        return Err(exec_err(
+            "0A000",
+            "column lists are only allowed on tables".to_string(),
+        ));
+    }
+    // Collapse the whole-object privileges to a bitmask, validating
+    // applicability; column-restricted specs are handled separately.
+    let mut bits = 0u32;
+    let mut col_specs: Vec<&PrivSpec> = Vec::new();
+    for s in privs {
+        let p = s.priv_;
+        if !s.columns.is_empty() {
+            col_specs.push(s);
+            continue;
+        }
+        match (p, object) {
+            (Privilege::All, GrantObject::Table(_)) => bits |= crate::storage::PRIV_ALL_TABLE,
+            (Privilege::All, GrantObject::Sequence(_)) => bits |= crate::storage::PRIV_USAGE,
+            (Privilege::All, GrantObject::Database) => bits |= crate::storage::PRIV_CONNECT,
+            (Privilege::Usage, GrantObject::Sequence(_)) => bits |= crate::storage::PRIV_USAGE,
+            (Privilege::Connect, GrantObject::Database) => bits |= crate::storage::PRIV_CONNECT,
+            (
+                Privilege::Select
+                | Privilege::Insert
+                | Privilege::Update
+                | Privilege::Delete
+                | Privilege::Truncate
+                | Privilege::References
+                | Privilege::Trigger,
+                GrantObject::Table(_),
+            ) => bits |= p.bits(),
+            _ => {
+                return Err(exec_err(
+                    "0A000",
+                    format!("invalid privilege {:?} for {:?}", p, object),
+                ));
+            }
+        }
+    }
+    let verb = if revoke { "REVOKE" } else { "GRANT" };
+    match object {
+        GrantObject::Table(name) => {
+            let t = eng.db.find_table(name, ctx.snap, ctx.own).ok_or_else(|| {
+                exec_err("42P01", format!("relation \"{}\" does not exist", name))
+            })?;
+            if t.owner != ctx.role
+                && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+            {
+                return Err(exec_err(
+                    "42501",
+                    format!(
+                        "permission denied: must be owner of table \"{}\" to {}",
+                        name,
+                        verb.to_lowercase()
+                    ),
+                ));
+            }
+            let mut next = t.clone();
+            apply_acl_delta(&mut next.acl, grantees, bits, revoke, false);
+            // v0.11: column-level grants.
+            if !col_specs.is_empty() {
+                let cols: Vec<String> = next.columns.iter().map(|(n, _)| n.clone()).collect();
+                for s in &col_specs {
+                    match (s.priv_, object) {
+                        (
+                            Privilege::Select
+                            | Privilege::Insert
+                            | Privilege::Update
+                            | Privilege::References,
+                            GrantObject::Table(_),
+                        ) => {}
+                        _ => {
+                            return Err(exec_err(
+                                "0A000",
+                                format!("invalid privilege {:?} for {:?}", s.priv_, object),
+                            ));
+                        }
+                    }
+                    for c in &s.columns {
+                        if !cols.iter().any(|n| n == c) {
+                            return Err(exec_err(
+                                "42703",
+                                format!("column \"{}\" of relation \"{}\" does not exist", c, name),
+                            ));
+                        }
+                    }
+                    apply_col_acl_delta(
+                        &mut next.col_acl,
+                        grantees,
+                        s.priv_.bits(),
+                        &s.columns,
+                        revoke,
+                    );
+                }
+            }
+            alter_swap(eng, ctx, name, None, next, None)?;
+        }
+        GrantObject::Sequence(name) => {
+            let s = eng
+                .db
+                .find_sequence(name, ctx.snap, ctx.own)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
+            if s.owner != ctx.role
+                && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+            {
+                return Err(exec_err(
+                    "42501",
+                    format!(
+                        "permission denied: must be owner of sequence \"{}\" to {}",
+                        name,
+                        verb.to_lowercase()
+                    ),
+                ));
+            }
+            // Version-swap like ALTER SEQUENCE so the grant is transactional.
+            let prev = s.clone();
+            let versions = eng.db.sequences.get_mut(name).expect("visible above");
+            let cur = versions
+                .iter_mut()
+                .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+                .expect("visible above");
+            cur.dropped_xmax = ctx.own;
+            let mut next = prev.clone();
+            apply_acl_delta(&mut next.acl, grantees, bits, revoke, false);
+            next.created_xmin = ctx.own;
+            next.dropped_xmax = 0;
+            versions.push(next);
+            ctx.writes.push(WriteOp::AlterSequence {
+                name: name.to_string(),
+                prev,
+            });
+        }
+        GrantObject::Database => {
+            require_superuser(eng, ctx)?;
+            let prev = eng.db.db_acl.clone();
+            apply_acl_delta(&mut eng.db.db_acl, grantees, bits, revoke, true);
+            ctx.writes.push(WriteOp::DbAcl { prev });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: verb.to_string(),
+    })
+}
+
+/// Merge grant/revoke bits into an ACL vector.
+///
+/// When `keep_zero` is false, entries left with no privileges are pruned
+/// (fine for tables/sequences, whose default is deny). When true, zero-priv
+/// entries are kept as explicit deny markers (needed for the database ACL,
+/// whose default is allow: `db_connect_allowed` treats an entry without the
+/// CONNECT bit as a revoked role).
+fn apply_acl_delta(
+    acl: &mut Vec<crate::storage::AclEntry>,
+    grantees: &[String],
+    bits: u32,
+    revoke: bool,
+    keep_zero: bool,
+) {
+    for g in grantees {
+        if let Some(e) = acl.iter_mut().find(|e| e.role == *g) {
+            if revoke {
+                e.privs &= !bits;
+            } else {
+                e.privs |= bits;
+            }
+        } else {
+            // No entry yet. A grant creates one; a revoke creates an
+            // explicit deny marker only when keep_zero (database ACL).
+            // Otherwise revoking a never-granted privilege is a no-op,
+            // like PostgreSQL's warning (we stay silent).
+            if !revoke || keep_zero {
+                acl.push(crate::storage::AclEntry {
+                    role: g.clone(),
+                    privs: if revoke { 0 } else { bits },
+                });
+            }
+        }
+    }
+    if !keep_zero {
+        acl.retain(|e| e.privs != 0);
+    }
+}
+
+/// Merge column grant/revoke bits into a table's `col_acl` vector.
+/// Entries are keyed by (role, column-set): a grant unions the column
+/// list, a revoke removes the columns (dropping the entry when its
+/// column list empties out).
+fn apply_col_acl_delta(
+    col_acl: &mut Vec<crate::storage::ColAclEntry>,
+    grantees: &[String],
+    bits: u32,
+    columns: &[String],
+    revoke: bool,
+) {
+    for g in grantees {
+        if revoke {
+            // Remove the columns from every entry for this role whose
+            // privs overlap; drop emptied entries.
+            for e in col_acl.iter_mut().filter(|e| e.role == *g) {
+                if e.privs & bits != 0 {
+                    e.columns.retain(|c| !columns.contains(c));
+                    if e.columns.is_empty() {
+                        e.privs = 0;
+                    } else {
+                        // Partial column revoke: keep the entry but drop
+                        // the revoked bits only when no columns remain
+                        // for them. Simpler and safe: clear the bits —
+                        // remaining columns keep other granted bits.
+                        // (We track one privs mask per entry; revoking
+                        // one privilege's columns while another's remain
+                        // is approximated by keeping the entry.)
+                    }
+                }
+            }
+            col_acl.retain(|e| e.privs != 0 && !e.columns.is_empty());
+        } else if let Some(e) = col_acl.iter_mut().find(|e| e.role == *g && e.privs == bits) {
+            for c in columns {
+                if !e.columns.contains(c) {
+                    e.columns.push(c.clone());
+                }
+            }
+        } else {
+            col_acl.push(crate::storage::ColAclEntry {
+                role: g.clone(),
+                privs: bits,
+                columns: columns.to_vec(),
+            });
+        }
+    }
+}
+
+/// ALTER TABLE name OWNER TO new_owner.
+fn alter_owner_to(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    new_owner: &str,
+) -> Result<ExecResult, ExecError> {
+    require_table_owner(eng, ctx, name)?;
+    if eng.db.find_role(new_owner, ctx.snap, ctx.own).is_none() {
+        return Err(exec_err(
+            "42704",
+            format!("role \"{}\" does not exist", new_owner),
+        ));
+    }
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let mut next = t;
+    next.owner = new_owner.to_string();
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
 fn eval_sequence_func(
     eng: &mut Engine,
     snap: &Snapshot,
     own: u64,
     session: u64,
+    role: &str,
     name: &str,
     vals: &[Value],
 ) -> Result<Value, ExecError> {
@@ -11542,11 +13032,15 @@ fn eval_sequence_func(
     match name {
         "nextval" => {
             let s = seq_name(&vals[0])?;
-            Ok(Value::BigInt(seq_nextval(eng, snap, own, session, &s)?))
+            Ok(Value::BigInt(seq_nextval(
+                eng, snap, own, session, role, &s,
+            )?))
         }
         "currval" => {
             let s = seq_name(&vals[0])?;
-            Ok(Value::BigInt(seq_currval(eng, snap, own, session, &s)?))
+            Ok(Value::BigInt(seq_currval(
+                eng, snap, own, session, role, &s,
+            )?))
         }
         "setval" => {
             let s = seq_name(&vals[0])?;
@@ -11558,7 +13052,7 @@ fn eval_sequence_func(
                     return Err(exec_err(
                         "42883",
                         "setval: value must be an integer".to_string(),
-                    ))
+                    ));
                 }
             };
             let is_called = match vals.get(2) {
@@ -11568,10 +13062,12 @@ fn eval_sequence_func(
                     return Err(exec_err(
                         "42883",
                         "setval: is_called must be boolean".to_string(),
-                    ))
+                    ));
                 }
             };
-            Ok(Value::BigInt(seq_setval(eng, snap, own, session, &s, v, is_called)?))
+            Ok(Value::BigInt(seq_setval(
+                eng, snap, own, session, role, &s, v, is_called,
+            )?))
         }
         _ => unreachable!(),
     }
@@ -11684,14 +13180,14 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(pattern, old, new);
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(low, old, new);
             rename_col_in_expr(high, old, new);
         }
-        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => {
-            rename_col_in_expr(expr, old, new)
-        }
+        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => rename_col_in_expr(expr, old, new),
         Expr::Extract { from, .. } => rename_col_in_expr(from, old, new),
         Expr::Cmp { left, right, .. } => {
             rename_col_in_expr(left, old, new);
@@ -11715,6 +13211,8 @@ fn exec_alter(
     name: &str,
     action: &AlterAction,
 ) -> Result<ExecResult, ExecError> {
+    // v0.11: every ALTER TABLE needs owner-or-superuser.
+    require_table_owner(eng, ctx, name)?;
     match action {
         AlterAction::AddColumn {
             name: col,
@@ -11748,6 +13246,8 @@ fn exec_alter(
         }
         AlterAction::RenameColumn { old, new } => alter_rename_column(eng, ctx, name, old, new),
         AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
+        // v0.11
+        AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
     }
 }
 
@@ -11826,7 +13326,16 @@ fn alter_add_column(
     let mut new_rows = Vec::with_capacity(old_rows.len());
     for (old_id, values) in old_rows {
         let dv = match default {
-            Some(d) => eval_default(eng, ctx.snap, ctx.own, ctx.session, d, col_type, col)?,
+            Some(d) => eval_default(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                d,
+                col_type,
+                col,
+            )?,
             None => Value::Null,
         };
         let mut nv = Vec::with_capacity(old_cols + 1);
@@ -11838,7 +13347,14 @@ fn alter_add_column(
         nv.push(dv);
         // New CHECK constraints must hold for existing rows.
         check_row_constraints(
-            eng, ctx.snap, ctx.own, ctx.session, &next_meta, name, &nv,
+            eng,
+            ctx.snap,
+            ctx.own,
+            ctx.session,
+            ctx.role,
+            &next_meta,
+            name,
+            &nv,
         )?;
         new_rows.push(RowVersion {
             id: old_id,
@@ -11945,10 +13461,9 @@ fn alter_drop_column(
     // Views reading the table.
     let mut dep_views: Vec<String> = Vec::new();
     for (vname, vs) in &eng.db.views {
-        if vs
-            .iter()
-            .any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name))
-        {
+        if vs.iter().any(|v| {
+            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
+        }) {
             dep_views.push(vname.clone());
         }
     }
@@ -12007,7 +13522,11 @@ fn alter_drop_column(
         !refs.iter().any(|(_, r)| r == col)
     });
     next.uniques.retain(|u| !u.cols.iter().any(|c| c == col));
-    if next.pkey.as_ref().is_some_and(|p| p.cols.iter().any(|c| c == col)) {
+    if next
+        .pkey
+        .as_ref()
+        .is_some_and(|p| p.cols.iter().any(|c| c == col))
+    {
         next.pkey = None;
     }
     next.fks.retain(|fk| !fk.cols.iter().any(|c| c == col));
@@ -12038,7 +13557,11 @@ fn alter_drop_column(
         if ix.def.table != name {
             continue;
         }
-        index_defs.push((ix_name.clone(), ix.def.cols.clone(), ix.def.col_names.clone()));
+        index_defs.push((
+            ix_name.clone(),
+            ix.def.cols.clone(),
+            ix.def.col_names.clone(),
+        ));
     }
     // Now mutate the table shape.
     next.columns.remove(ci);
@@ -12125,7 +13648,6 @@ fn table_has_constraint(t: &Table, con: &str) -> bool {
         || t.fks.iter().any(|f| f.name == con)
 }
 
-
 fn alter_add_constraint(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -12170,7 +13692,16 @@ fn alter_add_constraint(
             .map(|r| r.values.clone())
             .collect();
         for values in &old_rows {
-            check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &probe_meta, name, values)?;
+            check_row_constraints(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &probe_meta,
+                name,
+                values,
+            )?;
         }
         next.checks.push(c.clone());
     }
@@ -12283,7 +13814,10 @@ fn alter_drop_constraint_internal(
     if !found {
         return Err(exec_err(
             "42704",
-            format!("constraint \"{}\" of relation \"{}\" does not exist", con, name),
+            format!(
+                "constraint \"{}\" of relation \"{}\" does not exist",
+                con, name
+            ),
         ));
     }
     alter_swap(eng, ctx, name, None, next, None)?;
@@ -12308,11 +13842,8 @@ fn alter_drop_constraint(
         .db
         .find_table(name, ctx.snap, ctx.own)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
-    let is_uniqueish = t
-        .uniques
-        .iter()
-        .any(|u| u.name == con)
-        || t.pkey.as_ref().is_some_and(|p| p.name == con);
+    let is_uniqueish =
+        t.uniques.iter().any(|u| u.name == con) || t.pkey.as_ref().is_some_and(|p| p.name == con);
     if is_uniqueish {
         let mut dep_fks: Vec<(String, String)> = Vec::new();
         for (tname, vs) in &eng.db.tables {
@@ -12479,15 +14010,11 @@ fn alter_rename_to(
     name: &str,
     new_name: &str,
 ) -> Result<ExecResult, ExecError> {
-    if eng
-        .db
-        .find_table(new_name, ctx.snap, ctx.own)
-        .is_some()
-        || eng
-            .db
-            .views
-            .get(new_name)
-            .is_some_and(|vs| vs.iter().any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own)))
+    if eng.db.find_table(new_name, ctx.snap, ctx.own).is_some()
+        || eng.db.views.get(new_name).is_some_and(|vs| {
+            vs.iter()
+                .any(|v| crate::storage::view_visible(v, ctx.snap, ctx.own))
+        })
     {
         return Err(exec_err(
             "42P07",
@@ -12589,6 +14116,10 @@ fn exec_create_view(
             format!("relation \"{}\" already exists", name),
         ));
     }
+    if existing {
+        // v0.11: OR REPLACE requires ownership of the existing view.
+        require_view_owner(eng, ctx, name)?;
+    }
     // The query must parse, and must not reference the view itself
     // (checked by the parser) or unknown relations.
     let stmt = parse_statement(query).map_err(sql_err)?;
@@ -12598,7 +14129,7 @@ fn exec_create_view(
             return Err(exec_err(
                 "42601",
                 "CREATE VIEW query must be a SELECT".to_string(),
-            ))
+            ));
         }
     };
     let mut deps = Vec::new();
@@ -12624,6 +14155,8 @@ fn exec_create_view(
         deps,
         created_xmin: ctx.own,
         dropped_xmax: 0,
+        // v0.11: the creating role owns the view.
+        owner: ctx.role.to_string(),
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
     ctx.writes.push(WriteOp::CreateView {
@@ -12642,6 +14175,8 @@ fn exec_drop_view(
     cascade: bool,
 ) -> Result<ExecResult, ExecError> {
     for name in names {
+        // v0.11: only the owner (or a superuser) may drop a view.
+        require_view_owner(eng, ctx, name)?;
         let exists = eng.db.find_view(name, ctx.snap, ctx.own).is_some();
         if !exists {
             if if_exists {

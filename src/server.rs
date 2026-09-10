@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::copy;
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
 use crate::sql::{self, CopyFormat, CopyOptions, IsolationLevel, Stmt};
 use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
-use crate::copy;
 
 /// Buffered sink for server→client traffic. Reads still go through the
 /// raw `TcpStream`; every message-loop iteration ends with a `flush()`.
@@ -55,6 +55,9 @@ struct PendingRows {
 struct Session {
     /// Stable per-connection id (v0.9: session-local currval()).
     sid: u64,
+    /// v0.11: authenticated role name (lowercased). Every statement's
+    /// privilege checks key off this.
+    role: String,
     stmts: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
     /// After an extended-protocol error: discard input until Sync.
@@ -89,15 +92,87 @@ struct Txn {
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(role: String) -> Self {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
+            role,
             stmts: HashMap::new(),
             portals: HashMap::new(),
             in_error: false,
             txn: None,
         }
     }
+}
+
+/// v0.11: live connection counts per role, enforcing CONNECTION LIMIT.
+/// Incremented after successful authentication, decremented when the
+/// connection closes.
+static SESSION_COUNTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+
+/// v0.11: live connection counts per role (see SESSION_COUNTS).
+/// v0.11: RAII guard for a CONNECTION LIMIT slot. Releasing the slot in
+/// `Drop` frees it on *every* exit path — clean Terminate, client EOF,
+/// read errors, and I/O failures between authentication and the session
+/// loop alike — so a slot can never leak.
+struct ConnSlot {
+    role: String,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut counts = session_counts().lock().unwrap();
+        if let Some(n) = counts.get_mut(&self.role) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+fn session_counts() -> &'static Mutex<HashMap<String, usize>> {
+    SESSION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// v0.11: authentication mode. `RUSTGRES_AUTH=scram-sha-256` (or `scram`)
+/// requires SCRAM-SHA-256 password auth; anything else (including unset)
+/// is trust auth, like PostgreSQL's `trust` pg_hba line.
+#[derive(PartialEq)]
+enum AuthMode {
+    Trust,
+    Scram,
+}
+
+fn auth_mode() -> AuthMode {
+    match std::env::var("RUSTGRES_AUTH").as_deref() {
+        Ok("scram-sha-256") | Ok("scram") => AuthMode::Scram,
+        _ => AuthMode::Trust,
+    }
+}
+
+/// v0.11: parse the startup packet's key/value parameters. `buf` is the
+/// raw packet body including the leading protocol int32.
+fn parse_startup_params(buf: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if buf.len() < 4 {
+        return out;
+    }
+    let mut parts = buf[4..].split(|b| *b == 0);
+    loop {
+        let k = parts.next();
+        let v = parts.next();
+        match (k, v) {
+            (Some(k), Some(v)) => {
+                if k.is_empty() {
+                    break;
+                }
+                out.push((
+                    String::from_utf8_lossy(k).into_owned(),
+                    String::from_utf8_lossy(v).into_owned(),
+                ));
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 pub fn handle_connection(stream: TcpStream, engine: Arc<Mutex<Engine>>, wal: Arc<Mutex<Wal>>) {
@@ -119,8 +194,9 @@ fn run_connection(
     wal: Arc<Mutex<Wal>>,
 ) -> io::Result<()> {
     // --- Startup handshake -------------------------------------------------
+    let startup_params: Vec<(String, String)>;
     loop {
-        let (proto, _params) = read_startup(&mut reader)?;
+        let (proto, buf) = read_startup(&mut reader)?;
         if proto == SSL_REQUEST_CODE {
             // We don't do SSL; say so ('N') and wait for the real startup packet.
             writer.write_all(b"N")?;
@@ -133,11 +209,38 @@ fn run_connection(
                 format!("unsupported startup protocol {}", proto),
             ));
         }
+        startup_params = parse_startup_params(&buf);
         break;
     }
 
-    // AuthenticationOk (trust auth)
-    MsgBuilder::new(b'R').i32(0).send(&mut writer)?;
+    // v0.11: the startup packet's `user` selects the role (default
+    // `postgres`, like PostgreSQL). Role names are case-folded.
+    let user = startup_params
+        .iter()
+        .find(|(k, _)| k == "user")
+        .map(|(_, v)| v.to_lowercase())
+        .unwrap_or_else(|| "postgres".to_string());
+
+    // v0.11: the startup packet's `database` selects the database. The
+    // server hosts a single database ("postgres"); the name is honored in
+    // authorization messages.
+    let database = startup_params
+        .iter()
+        .find(|(k, _)| k == "database")
+        .map(|(_, v)| v.to_lowercase())
+        .unwrap_or_else(|| "postgres".to_string());
+
+    // v0.11: authenticate (trust or SCRAM-SHA-256), then authorize
+    // (CONNECT privilege + CONNECTION LIMIT). A `None` return means an
+    // auth error was already sent; close the connection cleanly.
+    let (role_name, _slot) =
+        match authenticate(&mut reader, &mut writer, &engine, &user, &database)? {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+    // `_slot` lives until the end of this function: its Drop releases the
+    // CONNECTION LIMIT slot on every exit path, so no manual release is
+    // needed (and none can be skipped by an early `?`).
 
     // ParameterStatus
     let params: &[(&str, &str)] = &[
@@ -165,7 +268,7 @@ fn run_connection(
         .send(&mut writer)?;
 
     // ReadyForQuery (idle)
-    let mut session = Session::new();
+    let mut session = Session::new(role_name);
     send_ready(&mut writer, &session)?;
     writer.flush()?;
 
@@ -178,6 +281,248 @@ fn run_connection(
         let _ = txn_rollback(&engine, &mut session);
     }
     result
+}
+
+/// v0.11: authenticate the startup-packet user. Returns the role name and
+/// its connection-limit slot guard on success, or `None` after sending
+/// an ErrorResponse (the connection is then closed cleanly, like
+/// PostgreSQL). The guard must be held for the whole session so the
+/// slot is released exactly once, on disconnect.
+fn authenticate(
+    reader: &mut TcpStream,
+    writer: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    user: &str,
+    database: &str,
+) -> io::Result<Option<(String, ConnSlot)>> {
+    // Snapshot the auth catalogs once for the whole exchange.
+    let (snap, role) = {
+        let guard = engine.lock().unwrap();
+        let snap = guard.take_snapshot();
+        let role = guard.db.find_role(user, &snap, 0).cloned();
+        (snap, role)
+    };
+    match auth_mode() {
+        AuthMode::Trust => {
+            let r = match role {
+                Some(r) => r,
+                None => {
+                    send_error(
+                        writer,
+                        "28P01",
+                        &format!("role \"{}\" does not exist", user),
+                    )?;
+                    writer.flush()?;
+                    return Ok(None);
+                }
+            };
+            if !r.can_login {
+                send_error(
+                    writer,
+                    "28000",
+                    &format!("role \"{}\" is not permitted to log in", user),
+                )?;
+                writer.flush()?;
+                return Ok(None);
+            }
+            // v0.11: authorize (CONNECT + CONNECTION LIMIT) before
+            // AuthenticationOk, like PostgreSQL.
+            let slot = finish_login(writer, engine, &r, &snap, database)?;
+            if let Some(slot) = slot {
+                MsgBuilder::new(b'R').i32(0).send(writer)?;
+                Ok(Some((r.name.clone(), slot)))
+            } else {
+                Ok(None)
+            }
+        }
+        AuthMode::Scram => scram_auth(reader, writer, engine, user, role, &snap, database),
+    }
+}
+
+/// v0.11: post-authentication authorization shared by both auth modes:
+/// the CONNECT privilege on the database, then the role's CONNECTION
+/// LIMIT. On success the connection-limit slot is returned as a guard
+/// that releases it when dropped.
+fn finish_login(
+    writer: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    role: &crate::storage::Role,
+    snap: &crate::storage::Snapshot,
+    database: &str,
+) -> io::Result<Option<ConnSlot>> {
+    {
+        let guard = engine.lock().unwrap();
+        if !crate::storage::db_connect_allowed(&guard.db, &role.name, snap, 0) {
+            send_error(
+                writer,
+                "42501",
+                &format!("permission denied for database \"{}\"", database),
+            )?;
+            writer.flush()?;
+            return Ok(None);
+        }
+    }
+    if role.connlimit >= 0 {
+        let counts = session_counts().lock().unwrap();
+        let n = counts.get(&role.name).copied().unwrap_or(0);
+        if n as i64 >= role.connlimit as i64 {
+            send_error(
+                writer,
+                "53300",
+                &format!("too many connections for role \"{}\"", role.name),
+            )?;
+            writer.flush()?;
+            return Ok(None);
+        }
+    }
+    // The guard's Drop releases the slot on every exit path.
+    let mut counts = session_counts().lock().unwrap();
+    *counts.entry(role.name.clone()).or_insert(0) += 1;
+    drop(counts);
+    Ok(Some(ConnSlot {
+        role: role.name.clone(),
+    }))
+}
+
+/// v0.11: full SCRAM-SHA-256 exchange (RFC 7677, like PostgreSQL).
+/// Unknown users get a dummy verifier so they are not enumerable by
+/// timing; the "role does not exist" error is only sent after the
+/// crypto verifies, exactly like PostgreSQL.
+fn scram_auth(
+    reader: &mut TcpStream,
+    writer: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    user: &str,
+    role: Option<crate::storage::Role>,
+    snap: &crate::storage::Snapshot,
+    database: &str,
+) -> io::Result<Option<(String, ConnSlot)>> {
+    // AuthenticationSASL, mechanisms = [SCRAM-SHA-256]. The list is a
+    // sequence of C strings terminated by a single zero byte (like PG).
+    MsgBuilder::new(b'R')
+        .i32(10)
+        .cstr("SCRAM-SHA-256")
+        .u8(0)
+        .send(writer)?;
+    writer.flush()?;
+
+    // SASLInitialResponse ('p'): mechanism name + initial client data.
+    let msg = read_message(reader)?;
+    if msg.typ != b'p' {
+        send_error(writer, "08P01", "expected SASLInitialResponse")?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    let mut cur = Cursor::new(&msg.payload);
+    let mech = cur.read_cstring()?;
+    if mech != "SCRAM-SHA-256" {
+        send_error(
+            writer,
+            "08P01",
+            &format!("unsupported SASL mechanism \"{}\"", mech),
+        )?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    let len = cur.read_i32()?;
+    if len < 0 {
+        send_error(writer, "08P01", "bad SASLInitialResponse length")?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    let data = cur.read_bytes(len as usize)?;
+    let client_first = String::from_utf8_lossy(&data).into_owned();
+
+    let verifier = role
+        .as_ref()
+        .and_then(|r| r.password.clone())
+        .unwrap_or_else(crate::crypto::dummy_verifier);
+    let (exchange, server_first) =
+        match crate::crypto::ScramExchange::begin(verifier, &client_first) {
+            Ok(x) => x,
+            Err(e) => {
+                send_error(writer, "28P01", &e)?;
+                writer.flush()?;
+                return Ok(None);
+            }
+        };
+    // AuthenticationSASLContinue.
+    MsgBuilder::new(b'R')
+        .i32(11)
+        .bytes(server_first.as_bytes())
+        .send(writer)?;
+    writer.flush()?;
+
+    // SASLResponse ('p'): client-final message.
+    let msg = read_message(reader)?;
+    if msg.typ != b'p' {
+        send_error(writer, "08P01", "expected SASLResponse")?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    let client_final = String::from_utf8_lossy(&msg.payload).into_owned();
+    let server_final = match exchange.verify(&client_final) {
+        Ok(s) => s,
+        Err(_) => {
+            // Wrong password or tampered messages: 28P01, like PG.
+            send_error(writer, "28P01", "password authentication failed")?;
+            writer.flush()?;
+            return Ok(None);
+        }
+    };
+    // Now that the crypto is done, resolve the role for real.
+    let r = match role {
+        Some(r) => r,
+        None => {
+            send_error(
+                writer,
+                "28P01",
+                &format!("role \"{}\" does not exist", user),
+            )?;
+            writer.flush()?;
+            return Ok(None);
+        }
+    };
+    if r.password.is_none() {
+        // SCRAM mode with no stored password can never succeed.
+        send_error(writer, "28P01", "password authentication failed")?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    if !r.can_login {
+        send_error(
+            writer,
+            "28000",
+            &format!("role \"{}\" is not permitted to log in", user),
+        )?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    // v0.11: VALID UNTIL enforcement (password expiry). Only checked for
+    // password (SCRAM) authentication, like PostgreSQL; trust mode has no
+    // password to expire.
+    if crate::storage::password_expired(&r.valid_until) {
+        send_error(
+            writer,
+            "28P01",
+            &format!("password expired for role \"{}\"", user),
+        )?;
+        writer.flush()?;
+        return Ok(None);
+    }
+    // AuthenticationSASLFinal, then (on successful authorization)
+    // AuthenticationOk.
+    MsgBuilder::new(b'R')
+        .i32(12)
+        .bytes(server_final.as_bytes())
+        .send(writer)?;
+    let slot = finish_login(writer, engine, &r, &snap, database)?;
+    if let Some(slot) = slot {
+        MsgBuilder::new(b'R').i32(0).send(writer)?;
+        Ok(Some((r.name.clone(), slot)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The per-message dispatch loop, extracted so `run_connection` can run
@@ -342,7 +687,9 @@ fn handle_query(
             let copy_ok = if *to_stdout {
                 handle_copy_to(stream, engine, wal, session, table, columns, options)
             } else {
-                handle_copy_from(reader, stream, engine, wal, session, table, columns, options)
+                handle_copy_from(
+                    reader, stream, engine, wal, session, table, columns, options,
+                )
             };
             if let Err(e) = copy_ok {
                 // I/O errors abort the connection; SQL errors were already
@@ -436,6 +783,7 @@ fn handle_copy_to(
                 own: xid,
                 level,
                 session: session.sid,
+                role: &session.role,
                 writes: &mut t.writes,
             };
             match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
@@ -457,6 +805,7 @@ fn handle_copy_to(
                     own: xid,
                     level: IsolationLevel::ReadCommitted,
                     session: session.sid,
+                    role: &session.role,
                     writes: &mut writes,
                 };
                 exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
@@ -586,11 +935,7 @@ fn handle_copy_from(
             b'f' => {
                 // CopyFail: abort the copy.
                 let reason = String::from_utf8_lossy(&msg.payload);
-                send_error(
-                    stream,
-                    "57000",
-                    &format!("COPY failed: {}", reason),
-                )?;
+                send_error(stream, "57000", &format!("COPY failed: {}", reason))?;
                 stream.flush()?;
                 return Ok(());
             }
@@ -642,6 +987,7 @@ fn handle_copy_from(
                 own: xid,
                 level,
                 session: session.sid,
+                role: &session.role,
                 writes: &mut t.writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -661,6 +1007,7 @@ fn handle_copy_from(
                 own: xid,
                 level: IsolationLevel::ReadCommitted,
                 session: session.sid,
+                role: &session.role,
                 writes: &mut writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -795,7 +1142,7 @@ fn run_statement(
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(engine, wal, session.sid, stmt)
+                autocommit_execute(engine, wal, session.sid, &session.role, stmt)
             }
         }
     }
@@ -859,6 +1206,7 @@ fn txn_execute(
             own: xid,
             level,
             session: session.sid,
+            role: &session.role,
             writes: &mut t.writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -894,6 +1242,7 @@ fn autocommit_execute(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     sid: u64,
+    role: &str,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
     let mut guard = engine.lock().unwrap();
@@ -906,6 +1255,7 @@ fn autocommit_execute(
             own: xid,
             level: IsolationLevel::ReadCommitted,
             session: sid,
+            role,
             writes: &mut writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -1004,7 +1354,11 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::CreateSequence { .. }
             | WriteOp::DropSequence { .. }
             | WriteOp::AlterSequence { .. }
-            | WriteOp::SeqAdvance { .. } => continue,
+            | WriteOp::SeqAdvance { .. }
+            | WriteOp::CreateRole { .. }
+            | WriteOp::DropRole { .. }
+            | WriteOp::AlterRole { .. }
+            | WriteOp::DbAcl { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);
@@ -1120,11 +1474,32 @@ fn txn_vacuum(
         ));
     }
     let mut guard = engine.lock().unwrap();
+    // v0.11: VACUUM requires ownership (or superuser), like PostgreSQL.
+    // The session role is the authenticated role. VACUUM runs outside
+    // any transaction, so build a fresh snapshot from the live state.
+    let snap = crate::storage::Snapshot {
+        active: guard.txns.active.iter().cloned().collect(),
+        next_xid: guard.txns.next_xid,
+    };
+    let is_owner = |db: &crate::storage::Database, snap: &crate::storage::Snapshot, name: &str| {
+        db.find_table(name, snap, u64::MAX)
+            .map(|t| {
+                t.owner == session.role
+                    || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
+            })
+            .unwrap_or(false)
+    };
     if let Some(name) = table {
         if !guard.db.tables.contains_key(name) {
             return Err(ExecError {
                 code: "42P01",
                 message: format!("table \"{}\" does not exist", name),
+            });
+        }
+        if !is_owner(&guard.db, &snap, name) {
+            return Err(ExecError {
+                code: "42501",
+                message: format!("permission denied: must be owner of table \"{}\"", name),
             });
         }
     }
@@ -1134,7 +1509,18 @@ fn txn_vacuum(
                 guard.vacuum_table(name);
             }
             None => {
-                guard.vacuum_all();
+                // Plain VACUUM only touches tables this role owns
+                // (superusers vacuum everything).
+                let owned: Vec<String> = guard
+                    .db
+                    .tables
+                    .keys()
+                    .filter(|n| is_owner(&guard.db, &snap, n))
+                    .cloned()
+                    .collect();
+                for n in owned {
+                    guard.vacuum_table(&n);
+                }
             }
         }
         return Ok(cmd("VACUUM"));
@@ -1752,6 +2138,7 @@ mod tests {
         let xid = engine.begin_txn();
         let session = Session {
             sid: 4242,
+            role: "postgres".to_string(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             in_error: false,

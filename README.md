@@ -1,9 +1,68 @@
-# rustgres v0.10 — "CTEs, window functions, upsert, RETURNING, COPY"
+# rustgres v0.11 — "SCRAM auth, roles, grants"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 10 of the road to Postgres 19 feature parity. v0.10 adds **CTEs**
+Milestone 11 of the road to Postgres 19 feature parity. v0.11 adds
+**SCRAM-SHA-256 authentication** (pure-std crypto: SHA-256, HMAC,
+PBKDF2, constant-time verifier comparison), **roles** (`CREATE/ALTER/
+DROP ROLE`, `LOGIN`/`NOLOGIN`, `SUPERUSER`, passwords, `CONNECTION
+LIMIT`, `VALID UNTIL`, transactional DDL), **role memberships**
+(`GRANT`/`REVOKE` role-to-role with transitive inheritance, cycle
+rejection, `pg_auth_members`), **privileges** (`GRANT`/`REVOKE` on
+tables, columns, sequences, and the database, incl. column-level
+`SELECT`/`INSERT`/`UPDATE`/`REFERENCES` with per-column enforcement
+through `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`*`), **ownership**
+checks on DDL (`ANALYZE`/`VACUUM`/`CREATE OR REPLACE VIEW` now require
+owner or superuser), and the `pg_authid`/`pg_roles`/`pg_user`/
+`pg_auth_members` catalogs (passwords masked, `rolvaliduntil`
+exposed). 986 cumulative protocol tests pass (118 new in v0.11).
+
+## What v0.11 adds (SCRAM auth, roles, grants)
+
+- **SCRAM-SHA-256.** `RUSTGRES_AUTH=scram-sha-256` enables full RFC 7677
+  authentication (raw-wire SASL, no SASLprep); trust mode otherwise.
+  Unknown users get a dummy verifier so they are not enumerable by
+  timing; expired passwords fail with `28P01`. Authorization (database
+  `CONNECT` + `CONNECTION LIMIT`) now runs *before* `AuthenticationOk`,
+  like PostgreSQL, and the connection-limit slot is an RAII guard so it
+  cannot leak on I/O failures.
+- **Roles.** `CREATE ROLE ... [NO]LOGIN [SUPERUSER] PASSWORD '...'`
+  `CONNECTION LIMIT n VALID UNTIL '...'`, `ALTER ROLE`, `DROP ROLE`
+  (cleans up membership edges), transactional with WAL/checkpoint
+  durability. Bootstrap `postgres` superuser.
+- **Memberships.** `GRANT group TO member` / `REVOKE group FROM member`
+  (superuser-only), transitive privilege inheritance (ownership and
+  superuser never inherit), duplicate grants are no-ops, self-grants
+  and cycles rejected (`42501`), missing roles are `42704`.
+- **Privileges.** `GRANT SELECT/INSERT/UPDATE/DELETE/TRUNCATE/
+  REFERENCES/TRIGGER ON table`, column lists (`GRANT SELECT (a, b) ON
+  t`), `GRANT USAGE/SELECT ON SEQUENCE`, `GRANT/REVOKE CONNECT ON
+  DATABASE`. Enforcement covers `SELECT` (incl. `*` and every clause
+  that reads a column), `INSERT`/`UPDATE` per-column, `SELECT FOR
+  UPDATE`, and `nextval`.
+- **Ownership.** `ANALYZE`/`VACUUM` on a table and `CREATE OR REPLACE
+  VIEW` require owner or superuser (`42501`); bare `ANALYZE`/`VACUUM`
+  only touch owned tables.
+- **Catalogs.** `pg_authid`, `pg_roles`, `pg_user` (passwords masked,
+  `rolvaliduntil`/`valuntil` exposed), `pg_auth_members`
+  (`roleid`/`member`/`grantor`/`admin_option`).
+- **Performance.** Callgrind-driven: the per-query role-membership
+  closure is now built once per statement instead of once per column
+  (~2x fewer instructions in permission checks). Valgrind memcheck: 0
+  bytes definitely lost on the auth/grant paths; DHAT: no heap bloat.
+
+Known v0.11 deviations/limitations (all documented, none silent): **no
+SASLprep** (raw UTF-8); salt/nonce entropy is time+pid+xorshift, not an
+OS CSPRNG; SCRAM iterations default to 4096; **no channel binding**;
+`WITH GRANT OPTION` / `WITH ADMIN OPTION` parsed but without
+semantics; **no `CREATEROLE`** — role administration is superuser-only;
+multiple objects in one `GRANT`/`REVOKE` rejected; views execute as the
+invoking role (not view-owner); `TRUNCATE` privilege exists but the
+statement is unimplemented; `REVOKE` of a non-edge is a silent no-op
+(Postgres warns); `server_version` still reports `16.0`.
+
+## What v0.10 adds (CTEs, window functions, upsert, RETURNING, COPY) v0.10 adds **CTEs**
 (`WITH`, `WITH RECURSIVE`, multiple CTEs, DML CTEs), **window functions**
 (`row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
 `last_value`, `nth_value`, `ntile`, aggregate windows with `PARTITION BY` /

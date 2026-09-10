@@ -656,8 +656,8 @@ def t_old_data_dir_refused():
             check("v0.6 wal.log refused",
                   not wait_for_port(port, timeout=3.0))
             _, err = proc.communicate(timeout=5)
-            check("refusal mentions v0.7/v0.6",
-                  b"v0.7 cannot read v0.6 data" in err, err.decode()[:200])
+            check("refusal mentions unreadable older data",
+                  b"cannot read older data" in err, err.decode()[:200])
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -673,8 +673,8 @@ def t_old_data_dir_refused():
             check("v0.6 checkpoint refused",
                   not wait_for_port(port, timeout=3.0))
             _, err = proc.communicate(timeout=5)
-            check("checkpoint refusal mentions v0.7",
-                  b"v0.7" in err, err.decode()[:200])
+            check("checkpoint refusal mentions older checkpoint",
+                  b"older rustgres" in err, err.decode()[:200])
         finally:
             if proc.poll() is None:
                 proc.kill()

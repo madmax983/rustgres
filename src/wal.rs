@@ -18,7 +18,8 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 5 (`RGSWAL05` / `RGSCHK05`) is NOT compatible with v0.8
+//! Format version 6 (`RGSWAL06` / `RGSCHK06`) is NOT compatible with v0.10
+//! or earlier: v0.11 adds roles, table/view/sequence owners, and ACLs.
 //! files: v0.9 refuses to start on a v0.8 data directory with a clear
 //! error instead of misreading it. v0.9 adds constraint/default metadata
 //! to table records, ALTER TABLE / view / sequence records, and
@@ -121,11 +122,11 @@ use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK05";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK06";
 const CHKPT_VERSION: u32 = 5;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL05";
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL06";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -157,12 +158,12 @@ fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
     if got < 16 {
         return Ok(None); // torn header: crash during the WAL reset
     }
-    // A full 16-byte header with the wrong magic (e.g. a v0.6 `RGSWAL02`
-    // file, whose record format is incompatible) is a loud error:
-    // silently treating it as empty would lose data.
+    // A full 16-byte header with the wrong magic (e.g. an older
+    // `RGSWAL05` file, whose record format is incompatible) is a loud
+    // error: silently treating it as empty would lose data.
     if &hdr[..8] != WAL_MAGIC {
         return Err(io_err(
-            "wal.log has an unrecognized magic; rustgres v0.7 cannot read v0.6 data - remove the data directory".to_string(),
+            "wal.log has an unrecognized magic; this rustgres cannot read older data - remove the data directory".to_string(),
         ));
     }
     Ok(Some(u64::from_be_bytes(hdr[8..].try_into().unwrap())))
@@ -227,6 +228,12 @@ pub enum WalRecord {
         columns: Vec<(String, ColType)>,
         /// v0.9: s-expr encoded constraints/defaults (sql::encode_constraints).
         constraints: String,
+        /// v0.11: creating role.
+        owner: String,
+        /// v0.11: explicit GRANT entries.
+        acl: Vec<WalAcl>,
+        /// v0.11: column-level GRANT entries.
+        col_acl: Vec<WalColAcl>,
         xmin: u64,
     },
     InsertRows {
@@ -268,6 +275,12 @@ pub enum WalRecord {
         /// rows. False for ADD/DROP COLUMN: rows are rewritten and flow
         /// through InsertRows records instead.
         copy_rows: bool,
+        /// v0.11: owner and ACL travel with every alter (grants and
+        /// OWNER TO reuse the alter machinery).
+        owner: String,
+        acl: Vec<WalAcl>,
+        /// v0.11: column-level GRANT entries.
+        col_acl: Vec<WalColAcl>,
         xmin: u64,
     },
     CreateView {
@@ -275,6 +288,8 @@ pub enum WalRecord {
         query: String,
         col_aliases: Vec<String>,
         deps: Vec<String>,
+        /// v0.11: creating role.
+        owner: String,
         xmin: u64,
     },
     DropView {
@@ -302,6 +317,139 @@ pub enum WalRecord {
         last_value: i64,
         is_called: bool,
     },
+    // --- v0.11: roles and database ACL ---
+    CreateRole {
+        name: String,
+        role: WalRole,
+        xmin: u64,
+    },
+    DropRole {
+        name: String,
+        xmax: u64,
+    },
+    AlterRole {
+        name: String,
+        role: WalRole,
+        xmin: u64,
+    },
+    DbAcl {
+        acl: Vec<WalAcl>,
+        xmin: u64,
+    },
+}
+
+/// One GRANT entry in WAL/checkpoint form (v0.11).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalAcl {
+    pub role: String,
+    pub privs: u32,
+}
+
+impl WalAcl {
+    pub fn of(e: &crate::storage::AclEntry) -> Self {
+        WalAcl {
+            role: e.role.clone(),
+            privs: e.privs,
+        }
+    }
+    pub fn into_entry(self) -> crate::storage::AclEntry {
+        crate::storage::AclEntry {
+            role: self.role,
+            privs: self.privs,
+        }
+    }
+}
+
+/// One column-level GRANT entry in WAL/checkpoint form (v0.11).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalColAcl {
+    pub role: String,
+    pub privs: u32,
+    pub columns: Vec<String>,
+}
+
+impl WalColAcl {
+    pub fn of(e: &crate::storage::ColAclEntry) -> Self {
+        WalColAcl {
+            role: e.role.clone(),
+            privs: e.privs,
+            columns: e.columns.clone(),
+        }
+    }
+    pub fn into_entry(self) -> crate::storage::ColAclEntry {
+        crate::storage::ColAclEntry {
+            role: self.role,
+            privs: self.privs,
+            columns: self.columns,
+        }
+    }
+}
+
+/// A SCRAM verifier in WAL/checkpoint form (v0.11).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalVerifier {
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+}
+
+impl WalVerifier {
+    pub fn of(v: &crate::crypto::ScramVerifier) -> Self {
+        WalVerifier {
+            iterations: v.iterations,
+            salt: v.salt.clone(),
+            stored_key: v.stored_key,
+            server_key: v.server_key,
+        }
+    }
+    pub fn into_verifier(self) -> crate::crypto::ScramVerifier {
+        crate::crypto::ScramVerifier {
+            iterations: self.iterations,
+            salt: self.salt,
+            stored_key: self.stored_key,
+            server_key: self.server_key,
+        }
+    }
+}
+
+/// A role's durable attributes in WAL/checkpoint form (v0.11). The name
+/// itself rides in the enclosing record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalRole {
+    pub password: Option<WalVerifier>,
+    pub can_login: bool,
+    pub superuser: bool,
+    pub connlimit: i32,
+    pub memberships: Vec<WalMembership>,
+    pub valid_until: Option<String>,
+}
+
+/// WAL form of one `GRANT group TO member` edge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalMembership {
+    pub role: String,
+    pub grantor: String,
+}
+
+impl WalRole {
+    pub fn of(r: &crate::storage::Role) -> Self {
+        WalRole {
+            password: r.password.as_ref().map(WalVerifier::of),
+            can_login: r.can_login,
+            superuser: r.superuser,
+            connlimit: r.connlimit,
+            memberships: r
+                .memberships
+                .iter()
+                .map(|m| WalMembership {
+                    role: m.role.clone(),
+                    grantor: m.grantor.clone(),
+                })
+                .collect(),
+            valid_until: r.valid_until.clone(),
+        }
+    }
 }
 
 /// Plain-data form of a Sequence for WAL records and checkpoints.
@@ -317,6 +465,9 @@ pub struct WalSequence {
     pub current: i64,
     pub current_is_set: bool,
     pub is_called: bool,
+    /// v0.11: owning role and explicit USAGE grants.
+    pub owner: String,
+    pub acl: Vec<WalAcl>,
 }
 
 impl WalSequence {
@@ -331,6 +482,8 @@ impl WalSequence {
             current: s.current.unwrap_or(i64::MIN),
             current_is_set: s.current.is_some(),
             is_called: s.is_called,
+            owner: s.owner.clone(),
+            acl: s.acl.iter().map(WalAcl::of).collect(),
         }
     }
 
@@ -350,6 +503,8 @@ impl WalSequence {
             is_called: self.is_called,
             created_xmin,
             dropped_xmax: 0,
+            owner: self.owner,
+            acl: self.acl.into_iter().map(WalAcl::into_entry).collect(),
         }
     }
 }
@@ -501,12 +656,18 @@ impl Enc {
                 name,
                 columns,
                 constraints,
+                owner,
+                acl,
+                col_acl,
                 xmin,
             } => {
                 self.u8(1);
                 self.str(name);
                 self.columns(columns);
                 self.str(constraints);
+                self.str(owner);
+                self.acl_list(acl);
+                self.col_acl_list(col_acl);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -565,6 +726,9 @@ impl Enc {
                 columns,
                 constraints,
                 copy_rows,
+                owner,
+                acl,
+                col_acl,
                 xmin,
             } => {
                 self.u8(7);
@@ -572,6 +736,9 @@ impl Enc {
                 self.columns(columns);
                 self.str(constraints);
                 self.u8(*copy_rows as u8);
+                self.str(owner);
+                self.acl_list(acl);
+                self.col_acl_list(col_acl);
                 self.u64(*xmin);
             }
             WalRecord::CreateView {
@@ -579,6 +746,7 @@ impl Enc {
                 query,
                 col_aliases,
                 deps,
+                owner,
                 xmin,
             } => {
                 self.u8(8);
@@ -592,6 +760,7 @@ impl Enc {
                 for d in deps {
                     self.str(d);
                 }
+                self.str(owner);
                 self.u64(*xmin);
             }
             WalRecord::DropView { name, xmax } => {
@@ -626,6 +795,81 @@ impl Enc {
                 self.i64(*last_value);
                 self.u8(*is_called as u8);
             }
+            WalRecord::CreateRole { name, role, xmin } => {
+                self.u8(14);
+                self.str(name);
+                self.wal_role(role);
+                self.u64(*xmin);
+            }
+            WalRecord::DropRole { name, xmax } => {
+                self.u8(15);
+                self.str(name);
+                self.u64(*xmax);
+            }
+            WalRecord::AlterRole { name, role, xmin } => {
+                self.u8(16);
+                self.str(name);
+                self.wal_role(role);
+                self.u64(*xmin);
+            }
+            WalRecord::DbAcl { acl, xmin } => {
+                self.u8(17);
+                self.acl_list(acl);
+                self.u64(*xmin);
+            }
+        }
+    }
+
+    fn acl_list(&mut self, acl: &[WalAcl]) {
+        self.u32(acl.len() as u32);
+        for e in acl {
+            self.str(&e.role);
+            self.u32(e.privs);
+        }
+    }
+
+    fn col_acl_list(&mut self, acl: &[WalColAcl]) {
+        self.u32(acl.len() as u32);
+        for e in acl {
+            self.str(&e.role);
+            self.u32(e.privs);
+            self.u32(e.columns.len() as u32);
+            for c in &e.columns {
+                self.str(c);
+            }
+        }
+    }
+
+    fn verifier(&mut self, v: &Option<WalVerifier>) {
+        match v {
+            None => self.u8(0),
+            Some(v) => {
+                self.u8(1);
+                self.u32(v.iterations);
+                self.u32(v.salt.len() as u32);
+                self.bytes(&v.salt);
+                self.bytes(&v.stored_key);
+                self.bytes(&v.server_key);
+            }
+        }
+    }
+
+    fn wal_role(&mut self, r: &WalRole) {
+        self.verifier(&r.password);
+        self.u8(r.can_login as u8);
+        self.u8(r.superuser as u8);
+        self.i32(r.connlimit);
+        self.u32(r.memberships.len() as u32);
+        for m in &r.memberships {
+            self.str(&m.role);
+            self.str(&m.grantor);
+        }
+        match &r.valid_until {
+            Some(v) => {
+                self.u8(1);
+                self.str(v);
+            }
+            None => self.u8(0),
         }
     }
 
@@ -639,6 +883,9 @@ impl Enc {
         self.i64(s.current);
         self.u8(s.current_is_set as u8);
         self.u8(s.is_called as u8);
+        // v0.11
+        self.str(&s.owner);
+        self.acl_list(&s.acl);
     }
 }
 
@@ -783,12 +1030,25 @@ impl<'a> Dec<'a> {
 
     fn record(&mut self) -> Result<WalRecord, String> {
         match self.u8()? {
-            1 => Ok(WalRecord::CreateTable {
-                name: self.str()?,
-                columns: self.columns()?,
-                constraints: self.str()?,
-                xmin: self.u64()?,
-            }),
+            1 => {
+                let name = self.str()?;
+                let columns = self.columns()?;
+                let constraints = self.str()?;
+                // v0.11
+                let owner = self.str()?;
+                let acl = self.acl_list()?;
+                let col_acl = self.col_acl_list()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                    owner,
+                    acl,
+                    col_acl,
+                    xmin,
+                })
+            }
             2 => {
                 let table = self.str()?;
                 let n = self.u32()? as usize;
@@ -844,13 +1104,27 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropIndex { name, xmax })
             }
-            7 => Ok(WalRecord::AlterTable {
-                name: self.str()?,
-                columns: self.columns()?,
-                constraints: self.str()?,
-                copy_rows: self.u8()? != 0,
-                xmin: self.u64()?,
-            }),
+            7 => {
+                let name = self.str()?;
+                let columns = self.columns()?;
+                let constraints = self.str()?;
+                let copy_rows = self.u8()? != 0;
+                // v0.11
+                let owner = self.str()?;
+                let acl = self.acl_list()?;
+                let col_acl = self.col_acl_list()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    copy_rows,
+                    owner,
+                    acl,
+                    col_acl,
+                    xmin,
+                })
+            }
             8 => {
                 let name = self.str()?;
                 let query = self.str()?;
@@ -864,12 +1138,15 @@ impl<'a> Dec<'a> {
                 for _ in 0..m {
                     deps.push(self.str()?);
                 }
+                // v0.11
+                let owner = self.str()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateView {
                     name,
                     query,
                     col_aliases,
                     deps,
+                    owner,
                     xmin,
                 })
             }
@@ -898,6 +1175,27 @@ impl<'a> Dec<'a> {
                 last_value: self.i64()?,
                 is_called: self.u8()? != 0,
             }),
+            14 => {
+                let name = self.str()?;
+                let role = self.wal_role()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateRole { name, role, xmin })
+            }
+            15 => Ok(WalRecord::DropRole {
+                name: self.str()?,
+                xmax: self.u64()?,
+            }),
+            16 => {
+                let name = self.str()?;
+                let role = self.wal_role()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::AlterRole { name, role, xmin })
+            }
+            17 => {
+                let acl = self.acl_list()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::DbAcl { acl, xmin })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -913,6 +1211,95 @@ impl<'a> Dec<'a> {
             current: self.i64()?,
             current_is_set: self.u8()? != 0,
             is_called: self.u8()? != 0,
+            // v0.11
+            owner: self.str()?,
+            acl: self.acl_list()?,
+        })
+    }
+
+    fn acl_list(&mut self) -> Result<Vec<WalAcl>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(WalAcl {
+                role: self.str()?,
+                privs: self.u32()?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn col_acl_list(&mut self) -> Result<Vec<WalColAcl>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let role = self.str()?;
+            let privs = self.u32()?;
+            let m = self.u32()? as usize;
+            let mut columns = Vec::with_capacity(m);
+            for _ in 0..m {
+                columns.push(self.str()?);
+            }
+            out.push(WalColAcl {
+                role,
+                privs,
+                columns,
+            });
+        }
+        Ok(out)
+    }
+
+    fn verifier(&mut self) -> Result<Option<WalVerifier>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let iterations = self.u32()?;
+                let salt_len = self.u32()? as usize;
+                let salt = self.take(salt_len)?.to_vec();
+                let stored_key: [u8; 32] = self
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| self.err("bad stored key"))?;
+                let server_key: [u8; 32] = self
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| self.err("bad server key"))?;
+                Ok(Some(WalVerifier {
+                    iterations,
+                    salt,
+                    stored_key,
+                    server_key,
+                }))
+            }
+            b => Err(self.err(&format!("bad verifier tag {}", b))),
+        }
+    }
+
+    fn wal_role(&mut self) -> Result<WalRole, String> {
+        let password = self.verifier()?;
+        let can_login = self.u8()? != 0;
+        let superuser = self.u8()? != 0;
+        let connlimit = self.i32()?;
+        let n_members = self.u32()? as usize;
+        let mut memberships = Vec::with_capacity(n_members);
+        for _ in 0..n_members {
+            memberships.push(WalMembership {
+                role: self.str()?,
+                grantor: self.str()?,
+            });
+        }
+        let valid_until = if self.u8()? != 0 {
+            Some(self.str()?)
+        } else {
+            None
+        };
+        Ok(WalRole {
+            password,
+            can_login,
+            superuser,
+            connlimit,
+            memberships,
+            valid_until,
         })
     }
 
@@ -980,15 +1367,104 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         }
         // v0.9: sequence advances carry no xid (non-transactional).
         WalRecord::SeqAdvance { .. } => {}
+        // v0.11: roles.
+        WalRecord::CreateRole { name, role, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            let r = crate::storage::Role {
+                name: name.clone(),
+                password: role.password.clone().map(WalVerifier::into_verifier),
+                can_login: role.can_login,
+                superuser: role.superuser,
+                connlimit: role.connlimit,
+                memberships: role
+                    .memberships
+                    .iter()
+                    .map(|m| crate::storage::RoleMembership {
+                        role: m.role.clone(),
+                        grantor: m.grantor.clone(),
+                    })
+                    .collect(),
+                valid_until: role.valid_until.clone(),
+                created_xmin: *xmin,
+                dropped_xmax: 0,
+            };
+            eng.db.roles.entry(name.clone()).or_default().push(r);
+        }
+        WalRecord::DropRole { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            match eng
+                .db
+                .roles
+                .get_mut(name)
+                .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
+            {
+                Some(r) => r.dropped_xmax = *xmax,
+                None => eprintln!(
+                    "WAL replay: skipping DropRole \"{}\": no live role version",
+                    name
+                ),
+            }
+        }
+        WalRecord::AlterRole { name, role, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            let versions = eng.db.roles.entry(name.clone()).or_default();
+            if let Some(prev) = versions.iter_mut().find(|v| v.dropped_xmax == 0) {
+                prev.dropped_xmax = *xmin;
+            }
+            let r = crate::storage::Role {
+                name: name.clone(),
+                password: role.password.clone().map(WalVerifier::into_verifier),
+                can_login: role.can_login,
+                superuser: role.superuser,
+                connlimit: role.connlimit,
+                memberships: role
+                    .memberships
+                    .iter()
+                    .map(|m| crate::storage::RoleMembership {
+                        role: m.role.clone(),
+                        grantor: m.grantor.clone(),
+                    })
+                    .collect(),
+                valid_until: role.valid_until.clone(),
+                created_xmin: *xmin,
+                dropped_xmax: 0,
+            };
+            versions.push(r);
+        }
+        WalRecord::DbAcl { acl, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            eng.db.db_acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
+        }
     }
     match r {
+        // v0.11: role records are applied by the match above; nothing left
+        // to do here.
+        WalRecord::CreateRole { .. }
+        | WalRecord::DropRole { .. }
+        | WalRecord::AlterRole { .. }
+        | WalRecord::DbAcl { .. } => {}
         WalRecord::CreateTable {
             name,
             columns,
             constraints,
+            owner,
+            acl,
+            col_acl,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
+            // v0.11
+            t.owner = owner.clone();
+            t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
+            t.col_acl = col_acl.iter().cloned().map(WalColAcl::into_entry).collect();
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
@@ -1002,7 +1478,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     return Err(format!(
                         "WAL replay: bad constraints for table \"{}\": {}",
                         name, e
-                    ))
+                    ));
                 }
             }
             eng.db.tables.entry(name.clone()).or_default().push(t);
@@ -1115,16 +1591,16 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         }
         WalRecord::DropIndex { name, xmax } => match eng.db.indexes.get_mut(name) {
             Some(ix) => ix.def.dropped_xmax = *xmax,
-            None => eprintln!(
-                "WAL replay: skipping DropIndex \"{}\": no such index",
-                name
-            ),
+            None => eprintln!("WAL replay: skipping DropIndex \"{}\": no such index", name),
         },
         WalRecord::AlterTable {
             name,
             columns,
             constraints,
             copy_rows,
+            owner,
+            acl,
+            col_acl,
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
@@ -1146,7 +1622,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     return Err(format!(
                         "WAL replay: bad constraints for table \"{}\": {}",
                         name, e
-                    ))
+                    ));
                 }
             }
             // Pure-metadata alters carry the rows forward; ADD/DROP COLUMN
@@ -1156,6 +1632,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.rows = prev.rows.clone();
                 }
             }
+            // v0.11
+            t.owner = owner.clone();
+            t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
+            t.col_acl = col_acl.iter().cloned().map(WalColAcl::into_entry).collect();
             versions.push(t);
         }
         WalRecord::CreateView {
@@ -1163,17 +1643,22 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             query,
             col_aliases,
             deps,
+            owner,
             xmin,
         } => {
-            eng.db.views.entry(name.clone()).or_default().push(
-                crate::storage::ViewDef {
+            eng.db
+                .views
+                .entry(name.clone())
+                .or_default()
+                .push(crate::storage::ViewDef {
                     query: query.clone(),
                     col_aliases: col_aliases.clone(),
                     deps: deps.clone(),
                     created_xmin: *xmin,
                     dropped_xmax: 0,
-                },
-            );
+                    // v0.11: owner comes from the record.
+                    owner: owner.clone(),
+                });
         }
         WalRecord::DropView { name, xmax } => {
             match eng
@@ -1183,10 +1668,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
             {
                 Some(v) => v.dropped_xmax = *xmax,
-                None => eprintln!(
-                    "WAL replay: skipping DropView \"{}\": no live view",
-                    name
-                ),
+                None => eprintln!("WAL replay: skipping DropView \"{}\": no live view", name),
             }
         }
         WalRecord::CreateSequence { name, seq, xmin } => {
@@ -1356,6 +1838,9 @@ pub fn records_for_commit(
                     name: name.clone(),
                     columns: ours.columns.clone(),
                     constraints: crate::sql::encode_constraints(ours),
+                    owner: ours.owner.clone(),
+                    acl: ours.acl.iter().map(WalAcl::of).collect(),
+                    col_acl: ours.col_acl.iter().map(WalColAcl::of).collect(),
                     xmin: own,
                 });
             }
@@ -1378,6 +1863,9 @@ pub fn records_for_commit(
                     columns: ours.columns.clone(),
                     constraints: crate::sql::encode_constraints(ours),
                     copy_rows: !rewrite_rows,
+                    owner: ours.owner.clone(),
+                    acl: ours.acl.iter().map(WalAcl::of).collect(),
+                    col_acl: ours.col_acl.iter().map(WalColAcl::of).collect(),
                     xmin: own,
                 });
             }
@@ -1409,6 +1897,7 @@ pub fn records_for_commit(
                     query: ours.query.clone(),
                     col_aliases: ours.col_aliases.clone(),
                     deps: ours.deps.clone(),
+                    owner: ours.owner.clone(),
                     xmin: own,
                 });
             }
@@ -1504,6 +1993,72 @@ pub fn records_for_commit(
                     is_called: called,
                 });
             }
+            // v0.11: role DDL.
+            WriteOp::CreateRole { name } => {
+                let Some(ours) = eng
+                    .db
+                    .roles
+                    .get(name)
+                    .and_then(|vs| vs.iter().find(|r| r.created_xmin == own))
+                else {
+                    i += 1;
+                    continue;
+                };
+                // First-committer-wins, like CREATE TABLE.
+                let rival = eng.db.roles.get(name).is_some_and(|vs| {
+                    vs.iter().any(|r| {
+                        r.created_xmin != own
+                            && eng.xid_committed(r.created_xmin)
+                            && (r.dropped_xmax == 0 || !eng.xid_committed(r.dropped_xmax))
+                    })
+                });
+                if rival {
+                    return Err(format!("role \"{}\" already exists", name));
+                }
+                out.push(WalRecord::CreateRole {
+                    name: name.clone(),
+                    role: WalRole::of(ours),
+                    xmin: own,
+                });
+            }
+            WriteOp::DropRole { name, .. } => {
+                let won = eng
+                    .db
+                    .roles
+                    .get(name)
+                    .is_some_and(|vs| vs.iter().any(|r| r.dropped_xmax == own));
+                if !won {
+                    i += 1;
+                    continue;
+                }
+                out.push(WalRecord::DropRole {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
+            WriteOp::AlterRole { name, .. } => {
+                let Some(ours) = eng
+                    .db
+                    .roles
+                    .get(name)
+                    .and_then(|vs| vs.iter().filter(|r| r.created_xmin == own).last())
+                else {
+                    i += 1;
+                    continue;
+                };
+                out.push(WalRecord::AlterRole {
+                    name: name.clone(),
+                    role: WalRole::of(ours),
+                    xmin: own,
+                });
+            }
+            // v0.11: database ACL replaces wholesale.
+            WriteOp::DbAcl { .. } => {
+                out.push(WalRecord::DbAcl {
+                    acl: eng.db.db_acl.iter().map(WalAcl::of).collect(),
+                    xmin: own,
+                });
+            }
             WriteOp::DropTable { name, .. } => {
                 let won = eng
                     .db
@@ -1534,8 +2089,7 @@ pub fn records_for_commit(
                     o.def.name == *name
                         && o.def.created_xmin != own
                         && eng.xid_committed(o.def.created_xmin)
-                        && (o.def.dropped_xmax == 0
-                            || !eng.xid_committed(o.def.dropped_xmax))
+                        && (o.def.dropped_xmax == 0 || !eng.xid_committed(o.def.dropped_xmax))
                 });
                 if rival {
                     return Err(format!("relation \"{}\" already exists", name));
@@ -1675,7 +2229,7 @@ impl Wal {
         eng.txns.snapshots.clear();
         let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.8 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v0.11 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
             tables,
             batches,
             records,
@@ -1769,6 +2323,10 @@ impl Wal {
                 body.columns(&t.columns);
                 // v0.9: constraint/default metadata.
                 body.str(&crate::sql::encode_constraints(t));
+                // v0.11: owner and ACL.
+                body.str(&t.owner);
+                body.acl_list(&t.acl.iter().map(WalAcl::of).collect::<Vec<_>>());
+                body.col_acl_list(&t.col_acl.iter().map(WalColAcl::of).collect::<Vec<_>>());
                 let live_rows: Vec<&RowVersion> = t
                     .rows
                     .iter()
@@ -1846,6 +2404,8 @@ impl Wal {
                 for d in &v.deps {
                     v_body.str(d);
                 }
+                // v0.11: owner.
+                v_body.str(&v.owner);
                 n_views += 1;
             }
         }
@@ -1876,6 +2436,36 @@ impl Wal {
         img.u32(n_seqs);
         img.bytes(&s_body.buf);
 
+        // v0.11: roles. Only live, committed versions. The bootstrap
+        // `postgres` role (created_xmin = 0) is always committed, so it
+        // is always serialized.
+        let mut r_names: Vec<&String> = eng.db.roles.keys().collect();
+        r_names.sort();
+        let mut r_body = Enc::new();
+        let mut n_roles = 0u32;
+        for name in r_names {
+            for r in &eng.db.roles[name] {
+                if !eng.xid_committed(r.created_xmin) {
+                    continue;
+                }
+                if committed_xmax(eng, r.dropped_xmax) != 0 {
+                    continue;
+                }
+                r_body.str(name);
+                r_body.u64(r.created_xmin);
+                r_body.u64(0); // live role: no committed drop
+                r_body.wal_role(&WalRole::of(r));
+                n_roles += 1;
+            }
+        }
+        img.u32(n_roles);
+        img.bytes(&r_body.buf);
+
+        // v0.11: database ACL (CONNECT grants).
+        let mut a_body = Enc::new();
+        a_body.acl_list(&eng.db.db_acl.iter().map(WalAcl::of).collect::<Vec<_>>());
+        img.bytes(&a_body.buf);
+
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
         {
@@ -1898,7 +2488,7 @@ impl Wal {
         self.len = WAL_HEADER_LEN;
         self.base_lsn = wal_end;
         println!(
-            "rustgres v0.8 checkpoint: {} table version(s), WAL reset (base_lsn={})",
+            "rustgres v0.11 checkpoint: {} table version(s), WAL reset (base_lsn={})",
             n_versions, wal_end
         );
         Ok(())
@@ -1980,7 +2570,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     };
     if d.take(8).map_err(|e| bad(&e))? != CHKPT_MAGIC {
         return Err(bad(
-            "bad magic (a v0.7 checkpoint is not readable by v0.8; remove the data directory)",
+            "bad magic (this checkpoint is from an older rustgres; remove the data directory)",
         ));
     }
     if d.u32().map_err(|e| bad(&e))? != CHKPT_VERSION {
@@ -1998,6 +2588,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let columns = d.columns().map_err(|e| bad(&e))?;
         // v0.9: constraint/default metadata.
         let constraints = d.str().map_err(|e| bad(&e))?;
+        // v0.11: owner and ACL.
+        let owner = d.str().map_err(|e| bad(&e))?;
+        let acl: Vec<crate::storage::AclEntry> = d
+            .acl_list()
+            .map_err(|e| bad(&e))?
+            .into_iter()
+            .map(WalAcl::into_entry)
+            .collect();
+        let col_acl: Vec<crate::storage::ColAclEntry> = d
+            .col_acl_list()
+            .map_err(|e| bad(&e))?
+            .into_iter()
+            .map(WalColAcl::into_entry)
+            .collect();
         let n_rows = d.u32().map_err(|e| bad(&e))? as usize;
         let mut rows = Vec::with_capacity(n_rows);
         for _ in 0..n_rows {
@@ -2024,6 +2628,10 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
+        // v0.11
+        __t.owner = owner;
+        __t.acl = acl;
+        __t.col_acl = col_acl;
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;
@@ -2037,7 +2645,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 return Err(bad(&format!(
                     "bad constraints for table \"{}\": {}",
                     name, e
-                )))
+                )));
             }
         }
         for __rv in rows {
@@ -2120,15 +2728,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         for _ in 0..n_d {
             deps.push(d.str().map_err(|e| bad(&e))?);
         }
-        eng.db.views.entry(name.clone()).or_default().push(
-            crate::storage::ViewDef {
+        // v0.11: owner.
+        let owner = d.str().map_err(|e| bad(&e))?;
+        eng.db
+            .views
+            .entry(name.clone())
+            .or_default()
+            .push(crate::storage::ViewDef {
                 query,
                 col_aliases,
                 deps,
                 created_xmin,
                 dropped_xmax,
-            },
-        );
+                owner,
+            });
     }
     // v0.9: sequences, with their current values.
     let n_seqs = d.u32().map_err(|e| bad(&e))? as usize;
@@ -2141,6 +2754,45 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         s.dropped_xmax = dropped_xmax;
         eng.db.sequences.entry(name).or_default().push(s);
     }
+    // v0.11: roles. Replaces the bootstrap map from Engine::new so the
+    // checkpoint is the single source of truth.
+    let n_roles = d.u32().map_err(|e| bad(&e))? as usize;
+    eng.db.roles.clear();
+    for _ in 0..n_roles {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let created_xmin = d.u64().map_err(|e| bad(&e))?;
+        let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
+        let wr = d.wal_role().map_err(|e| bad(&e))?;
+        eng.db
+            .roles
+            .entry(name.clone())
+            .or_default()
+            .push(crate::storage::Role {
+                name,
+                password: wr.password.map(WalVerifier::into_verifier),
+                can_login: wr.can_login,
+                superuser: wr.superuser,
+                connlimit: wr.connlimit,
+                memberships: wr
+                    .memberships
+                    .into_iter()
+                    .map(|m| crate::storage::RoleMembership {
+                        role: m.role,
+                        grantor: m.grantor,
+                    })
+                    .collect(),
+                valid_until: wr.valid_until,
+                created_xmin,
+                dropped_xmax,
+            });
+    }
+    // v0.11: database ACL.
+    eng.db.db_acl = d
+        .acl_list()
+        .map_err(|e| bad(&e))?
+        .into_iter()
+        .map(WalAcl::into_entry)
+        .collect();
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
 }
@@ -2197,12 +2849,16 @@ mod tests {
 
     #[test]
     fn record_roundtrip_all_kinds() {
-        let empty_constraints = "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+        let empty_constraints =
+            "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
         let cases = vec![
             WalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("a".into(), ColType::Int)],
                 constraints: empty_constraints.clone(),
+                owner: "postgres".into(),
+                acl: vec![],
+                col_acl: vec![],
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -2340,13 +2996,17 @@ mod tests {
     #[test]
     fn apply_record_rebuilds_versions_and_counters() {
         let mut eng = Engine::new();
-        let empty_constraints = "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+        let empty_constraints =
+            "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
         apply_record(
             &mut eng,
             &WalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("a".into(), ColType::Int)],
                 constraints: empty_constraints,
+                owner: "postgres".into(),
+                acl: vec![],
+                col_acl: vec![],
                 xmin: 4,
             },
         )
