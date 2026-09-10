@@ -81,6 +81,83 @@ Deliberately *not* optimized in v0.3: tokenizer byte-level rewrite and
 zero-alloc `to_text` — both are real but the debug profile overstates
 them; they get revisited against release-build profiles in M4.
 
+## v0.4 baseline — 2026-09-10
+
+Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),
+valgrind 3.22.0. Server on `127.0.0.1:5433` with a **fresh temp data
+dir** (`RUSTGRES_DATA_DIR=$(mktemp -d)`; `benches/profile.sh` now does
+this per run so profiling never reuses stale benchmark state). 5 s
+measurement + 1 s warmup per workload, same as v0.3.
+
+| workload   | what                              | qps      | rows/s  | p50      | p99      | vs v0.3 |
+|------------|-----------------------------------|----------|---------|----------|----------|---------|
+| `select1`  | simple-query `SELECT 1`           | 25,314   | —       | 0.041 ms | 0.076 ms | −1% (noise) |
+| `prepared` | ext. protocol: Parse once, Bind($1)/Execute loop | 17,625 | — | 0.058 ms | 0.096 ms | +12% (noise) |
+| `insert`   | 1000-row multi-VALUES `INSERT`    | ~198     | ~198,000 | 4.88 ms | 7.5 ms  | **−14%** |
+| `scan`     | `SELECT *` over 10k-row table     | 64.8     | —       | 12.98 ms | 31.82 ms | +4% (noise) |
+| `txn`      | `BEGIN` + 1-row `INSERT` + `COMMIT` loop | 679 | —       | 1.377 ms | 3.422 ms | **−15%** |
+
+### What changed and why
+
+- **Every commit now costs one `fsync`.** That is the entire v0.4
+  performance story, and it is *intentional*: COMMIT does `write_all` +
+  `sync_all` before publishing and before replying, so an acked commit
+  is durable across `kill -9`. `insert` drops 229 → ~198 qps
+  (p50 3.88 → 4.88 ms) and `txn` drops 790 → 679 qps (p50 1.245 →
+  1.377 ms) — the delta is the fsync, ~0.1–1 ms depending on frame
+  size (the 1000-row insert frame is ~30 KB; the 1-row txn frame is
+  ~50 bytes). This is the price of durability, not a regression to
+  claw back by weakening it. No group commit in v0.4 (deliberate;
+  revisit in M5+).
+- **Read-only workloads are untouched**, as expected: `select1`,
+  `scan`, `prepared` do no WAL I/O and sit within run-to-run noise of
+  v0.3. (The `prepared` +12% is noise — re-running moves it ±10%.)
+- **`insert` is noisy on this box.** One full-workload run measured
+  144 qps; three isolated re-runs measured 197–200 qps. The variance is
+  sandbox-disk fsync latency (shared/virtualized I/O), not the server:
+  p50 sat at 4.87–4.92 ms across the stable runs. Take fsync-bound
+  numbers here as ±25%, not gospel.
+- **CRC32 went table-driven.** The v0.4 callgrind (below) showed the
+  bitwise CRC32 loop at ~1.2% of commit-path instructions; it is now a
+  compile-time `const fn` 256-entry table (~8x faster for the same
+  checksum), verified against the standard check value
+  `crc32("123456789") = 0xCBF43926` plus a bit-flip test in
+  `cargo test`. Same checksum, same on-disk format.
+
+### Where the time goes now (callgrind/DHAT on the commit path)
+
+Profiles captured 2026-09-10: `benches/profiles/callgrind.out.3694`,
+`benches/profiles/dhat.out.3719` (`txn` workload: BEGIN + 1-row INSERT
++ COMMIT loop, 5 s under valgrind, debug build, fresh data dir).
+
+1. **The allocator is the commit path.** `_int_malloc` 10.8% +
+   `_int_free` 6.6% + `malloc` 4.1% + `malloc_consolidate` 3.1% ≈ **25%
+   of all instructions** are in libc malloc/free. The structural cause:
+   full-database clone on every `BEGIN`, working-copy clone/swap on
+   every `COMMIT`, and per-row `Vec<Value>` clones into the diff and
+   the WAL frame. DHAT: 38 MB allocated over the 5 s run, almost all
+   short-lived Vec growth (`RawVecInner`). This is the documented v0.3
+   transaction-overlay design (O(database) per txn); fixing it
+   properly means MVCC, which is still deferred — no band-aids here.
+2. **`Value::eq` is 4.4%** — the diff-at-commit comparing every row of
+   the working copy against the pre-commit database. Inherent to the
+   diff design; also goes away with MVCC-era per-row change tracking.
+3. **`Value::clone` 2.2% + slice `to_vec` ~4.4%** — row data copied
+   into WAL records. Could encode straight from the source rows in a
+   future pass (the WAL encoder takes `&[Value]` today only at the
+   record level).
+4. **fsync is invisible to callgrind** (it is a syscall, not
+   instructions) — its cost is the wall-clock delta in the table above,
+   not a hotspot to optimize in userspace.
+5. Heap peak for the profiled run stayed small (tens of MB transient);
+   no leaks: all 38 MB was freed.
+
+Deliberately *not* optimized in v0.4: anything structural in (1)–(3).
+The commit path is now fsync-bound on wall time and clone-bound on
+CPU; both are consequences of documented design choices (fsync-per-
+commit, full-DB transaction overlay), and the next real step for either
+is a design change (group commit, MVCC), not micro-optimization.
+
 ## v0.2 baseline — 2026-09-10 (pre-TCP_NODELAY, kept for history)
 
 Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),

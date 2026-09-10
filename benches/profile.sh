@@ -57,22 +57,31 @@ fi
 run_under() { # $1 = tool, $2.. = extra valgrind args
   local tool="$1"; shift
   echo "== valgrind --tool=$tool =="
-  valgrind --tool="$tool" "$@" ./target/debug/rustgres &
+  # Fresh data dir per profiling run: v0.4 persists to ./rustgres-data by
+  # default, and profiling must not reuse stale benchmark state (a huge
+  # old WAL would dominate replay/startup and skew the profile).
+  local datadir
+  datadir="$(mktemp -d /tmp/rgprof_XXXXXX)"
+  RUSTGRES_DATA_DIR="$datadir" \
+    valgrind --tool="$tool" "$@" ./target/debug/rustgres &
   local pid=$!
   if ! wait_for_port; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    rm -rf "$datadir"
     return 1
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "ERROR: our server (pid $pid) died; port 5433 must belong to " >&2
     echo "another instance. Aborting rather than benchmarking a stranger." >&2
+    rm -rf "$datadir"
     return 1
   fi
   python3 benches/bench.py --seconds "$SECONDS_PER_WORKLOAD" \
       --workload "$WORKLOAD" || true
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  rm -rf "$datadir"
   echo "== $tool done =="
 }
 

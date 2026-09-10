@@ -1,0 +1,1523 @@
+{"dhatFileVersion":2
+,"mode":"heap","verb":"Allocated"
+,"bklt":true,"bkacc":true
+,"tu":"instrs","Mtu":"Minstr"
+,"tuth":500
+,"cmd":"./target/debug/rustgres"
+,"pid":3719
+,"te":561741442
+,"tg":560423368
+,"pps":
+ [{"tb":472,"tbk":1
+  ,"tl":156748
+  ,"mb":472,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2871,"wb":1342
+  ,"acc":[194,-3,143,-4,0,-8,188,-8,86,-8,12,-8,17,-16,12,-8,22,-8,13,-8,10,-16,1,-8,8,-8,3,-4,14,13,-3,5,-8,0,-2,1,-6,0,-8,4,-8,7,-8,0,-16,1,-16,0,-4,9,-20,0,-8,15,-4,4,-4,3,-8,5,-88,1,-136,0,-8,1]
+  ,"fs":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":360,"tbk":2
+  ,"tl":155837
+  ,"mb":240,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6128,"wb":4859
+  ,"fs":[1,19,20,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":155888
+  ,"mb":1024,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9385,"wb":5022
+  ,"acc":[20,-593,15,-332,13,-98,12]
+  ,"fs":[1,21,22,23,24,20,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":349
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":32,"wb":56
+  ,"acc":[-8,2,-24,3]
+  ,"fs":[25,26,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":152,"tbk":1
+  ,"tl":297
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24,"wb":16
+  ,"acc":[-8,3,-8,2,-136,0]
+  ,"fs":[27,28,29,30,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":213
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":32
+  ,"acc":[-32,1]
+  ,"fs":[25,31,30,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+  }
+ ,{"tb":4,"tbk":1
+  ,"tl":561304372
+  ,"mb":0,"mbk":0
+  ,"gb":4,"gbk":1
+  ,"eb":4,"ebk":1
+  ,"rb":0,"wb":4
+  ,"acc":[-4,1]
+  ,"fs":[1,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,17,18]
+  }
+ ,{"tb":544,"tbk":1
+  ,"tl":561304284
+  ,"mb":0,"mbk":0
+  ,"gb":544,"gbk":1
+  ,"eb":544,"ebk":1
+  ,"rb":188,"wb":162
+  ,"acc":[-16,5,-8,6,-72,0,-40,1,-40,4,-362,0,-2,11,-4,0]
+  ,"fs":[1,55,56,57,58,59,60,61,62,63,64,65,66,47,48,49,50,51,52,53,54,17,18]
+  }
+ ,{"tb":24,"tbk":1
+  ,"tl":2302
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24,"wb":24
+  ,"acc":[-24,2]
+  ,"fs":[1,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":23,"tbk":1
+  ,"tl":495
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24,"wb":23
+  ,"acc":[3,-22,2]
+  ,"fs":[1,92,93,94,95,96,97,98,99,100,101,102,103,104,78,79,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":18,"tbk":1
+  ,"tl":561302149
+  ,"mb":0,"mbk":0
+  ,"gb":18,"gbk":1
+  ,"eb":18,"ebk":1
+  ,"rb":217,"wb":18
+  ,"acc":[14,-17,13]
+  ,"fs":[1,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,79,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":54,"tbk":2
+  ,"tl":1555
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":52,"wb":51
+  ,"fs":[1,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":54,"tbk":2
+  ,"tl":6853
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":45,"wb":44
+  ,"fs":[1,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,142,141,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":561294246
+  ,"mb":0,"mbk":0
+  ,"gb":1024,"gbk":1
+  ,"eb":1024,"ebk":1
+  ,"rb":106,"wb":99
+  ,"acc":[-23,2,-2,3,-19,2,-2,3,-16,2,-2,3,-15,2,3,-19,2,-925,0]
+  ,"fs":[1,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,141,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":18,"tbk":1
+  ,"tl":561291046
+  ,"mb":0,"mbk":0
+  ,"gb":18,"gbk":1
+  ,"eb":18,"ebk":1
+  ,"rb":0,"wb":18
+  ,"acc":[-18,1]
+  ,"fs":[1,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,141,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":72,"tbk":1
+  ,"tl":561289505
+  ,"mb":0,"mbk":0
+  ,"gb":72,"gbk":1
+  ,"eb":72,"ebk":1
+  ,"rb":215991,"wb":49088
+  ,"acc":[-8,13,-8,1,-4,7656,1532,-3,1,-8,9955,-8,7654,-8,1536,-8,5362,-16,2297]
+  ,"fs":[1,183,184,185,186,187,188,189,190,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":80,"tbk":1
+  ,"tl":561288997
+  ,"mb":80,"mbk":1
+  ,"gb":80,"gbk":1
+  ,"eb":80,"ebk":1
+  ,"rb":34534,"wb":18496
+  ,"acc":[-8,13,-8,1,-4,3831,767,-27,1,-8,1533,-8,1,-8,2299,-4,1533,-4,1]
+  ,"fs":[1,183,184,185,186,187,191,192,193,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":96,"tbk":2
+  ,"tl":561291075
+  ,"mb":96,"mbk":2
+  ,"gb":48,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":288,"wb":184
+  ,"acc":[-8,32,-24,8,-12,2,-4,0]
+  ,"fs":[1,194,195,196,197,198,199,200,201,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91,17,18]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":561287293
+  ,"mb":32,"mbk":1
+  ,"gb":32,"gbk":1
+  ,"eb":32,"ebk":1
+  ,"rb":0,"wb":32
+  ,"acc":[-32,1]
+  ,"fs":[27,206,207,208,209,210,211,212,213,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":96,"tbk":2
+  ,"tl":561289053
+  ,"mb":96,"mbk":2
+  ,"gb":48,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":272,"wb":256
+  ,"acc":[-8,20,-16,8,-8,14,-8,10,-8,6]
+  ,"fs":[1,183,184,185,186,187,214,215,216,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":128,"tbk":2
+  ,"tl":561288569
+  ,"mb":128,"mbk":2
+  ,"gb":64,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":144,"wb":128
+  ,"acc":[-56,4,-8,6]
+  ,"fs":[1,183,184,185,186,187,217,218,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":48,"tbk":2
+  ,"tl":9779
+  ,"mb":24,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":64,"wb":48
+  ,"acc":[-8,6,-16,4]
+  ,"fs":[1,183,184,185,186,187,219,220,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91,17]
+  }
+ ,{"tb":608,"tbk":2
+  ,"tl":1122563454
+  ,"mb":608,"mbk":2
+  ,"gb":608,"gbk":2
+  ,"eb":608,"ebk":2
+  ,"rb":16,"wb":176
+  ,"acc":[-8,4,-8,0,-8,2,-8,0,-8,4,-8,2,-8,4,-8,2,-8,4,-8,2,-224,0]
+  ,"fs":[27,221,222,223,224,225,226,227,202,203,204,205,80,81,82,83,84,85,86,87,88,89,90,91]
+  }
+ ,{"tb":64,"tbk":2
+  ,"tl":690
+  ,"mb":32,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":64,"wb":112
+  ,"acc":[-8,4,-24,6]
+  ,"fs":[25,26,228,229,230,231,232,233]
+  }
+ ,{"tb":304,"tbk":2
+  ,"tl":610
+  ,"mb":152,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":48,"wb":32
+  ,"acc":[-8,6,-8,4,-136,0]
+  ,"fs":[27,28,29,30,228,229,230,231,232,233]
+  }
+ ,{"tb":64,"tbk":2
+  ,"tl":442
+  ,"mb":32,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":64
+  ,"acc":[-32,2]
+  ,"fs":[25,31,30,228,229,230,231,232,233]
+  }
+ ,{"tb":64,"tbk":2
+  ,"tl":561275944
+  ,"mb":0,"mbk":0
+  ,"gb":32,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":64,"wb":64
+  ,"acc":[-32,4]
+  ,"fs":[27,206,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252]
+  }
+ ,{"tb":16384,"tbk":2
+  ,"tl":561271749
+  ,"mb":8192,"mbk":1
+  ,"gb":8192,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":43825,"wb":43825
+  ,"fs":[1,253,254,255,256,257,258,259,260,261,262,263,244,245,246]
+  }
+ ,{"tb":37,"tbk":1
+  ,"tl":616
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":4,"wb":37
+  ,"acc":[-4,2,-33,1]
+  ,"fs":[27,264,265,266,267,268,269,270,271,261,262,263,244,245]
+  }
+ ,{"tb":8,"tbk":1
+  ,"tl":1488
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":4,"wb":4
+  ,"acc":[-4,2,-4,0]
+  ,"fs":[1,272,273,274,275,276,277,278,279,271,261,262]
+  }
+ ,{"tb":351,"tbk":15
+  ,"tl":16139
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":269,"wb":269
+  ,"fs":[1,272,273,274,275,276,277,280,281,271,261,262]
+  }
+ ,{"tb":8,"tbk":1
+  ,"tl":1998
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":8,"wb":8
+  ,"acc":[-8,2]
+  ,"fs":[1,272,273,274,275,276,277,278,282,271,261,262]
+  }
+ ,{"tb":8,"tbk":1
+  ,"tl":1197
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1,"wb":1
+  ,"acc":[2,-7,0]
+  ,"fs":[1,283,284,285,286,287,288,289,290,291,292,293,294,295,271,261,262,263]
+  }
+ ,{"tb":39055,"tbk":2295
+  ,"tl":559831484
+  ,"mb":0,"mbk":0
+  ,"gb":7,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":114870,"wb":39055
+  ,"fs":[27,264,265,266,267,268,296,297,271,261,262,263,244,245]
+  }
+ ,{"tb":36760,"tbk":2295
+  ,"tl":556118090
+  ,"mb":0,"mbk":0
+  ,"gb":6,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":41350,"wb":36760
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,308,309,271,261,262,263]
+  }
+ ,{"tb":287992,"tbk":5357
+  ,"tl":18461069
+  ,"mb":144,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":413576,"wb":263480
+  ,"fs":[1,253,254,310,311,312,313,314,315,316,317,318,319,271,261]
+  }
+ ,{"tb":40580,"tbk":2295
+  ,"tl":537357658
+  ,"mb":30,"mbk":1
+  ,"gb":8,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":48235,"wb":36760
+  ,"fs":[1,272,273,274,320,321,322,323,324,325,318,319,271]
+  }
+ ,{"tb":220320,"tbk":2295
+  ,"tl":529964453
+  ,"mb":96,"mbk":1
+  ,"gb":96,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":55080,"wb":55080
+  ,"acc":[-24,4590,-72,0]
+  ,"fs":[1,326,327,328,329,330,331,332,333,334,335,336,318,319,271,261,262,263]
+  }
+ ,{"tb":287992,"tbk":5357
+  ,"tl":20594709
+  ,"mb":160,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":459588,"wb":263480
+  ,"fs":[1,253,254,310,311,312,313,314,315,316,337,338,339,319,271]
+  }
+ ,{"tb":37559,"tbk":4599
+  ,"tl":6346290
+  ,"mb":9,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":27578,"wb":27578
+  ,"fs":[1,272,273,274,320,321,322,323,324,340,338,339,319]
+  }
+ ,{"tb":27578,"tbk":4599
+  ,"tl":48185812
+  ,"mb":25,"mbk":4
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":32171,"wb":27578
+  ,"fs":[1,341,342,343,344,345,346,347,348,349,350,351,352,338,339,319,271,261,262,263,244,245]
+  }
+ ,{"tb":881536,"tbk":3826
+  ,"tl":17837821
+  ,"mb":512,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":627660,"wb":636832
+  ,"fs":[1,272,273,353,354,355,356,357,338,339,319,271,261]
+  }
+ ,{"tb":13002,"tbk":2295
+  ,"tl":5874739
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":16822,"wb":13002
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,376,377,339,319,271,261]
+  }
+ ,{"tb":10,"tbk":2
+  ,"tl":750
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":10,"wb":10
+  ,"acc":[-5,4]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,379,380,381,377,339,319]
+  }
+ ,{"tb":11,"tbk":2
+  ,"tl":647
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2,"wb":11
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,382,381,377,339,319,271]
+  }
+ ,{"tb":6,"tbk":1
+  ,"tl":375
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6,"wb":6
+  ,"acc":[-6,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,379,383,381,377,339,319]
+  }
+ ,{"tb":18,"tbk":2
+  ,"tl":1111295
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":54,"wb":18
+  ,"acc":[-9,8]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,384,385,381,377,339,319]
+  }
+ ,{"tb":20,"tbk":2
+  ,"tl":203057
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":20,"wb":20
+  ,"acc":[-10,4]
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,386,387,388,389,390,319]
+  }
+ ,{"tb":35240,"tbk":3062
+  ,"tl":3687556
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":26043,"wb":26043
+  ,"fs":[1,272,273,274,275,276,277,280,391,319,271,261]
+  }
+ ,{"tb":18360,"tbk":2295
+  ,"tl":2703503
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2295,"wb":2295
+  ,"acc":[4590,-7,0]
+  ,"fs":[1,283,284,285,286,287,288,289,290,291,292,293,294,392,319,271,261,262]
+  }
+ ,{"tb":5,"tbk":1
+  ,"tl":379
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":5,"wb":5
+  ,"acc":[-5,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,379,393,394,377,339,319]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":52886
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":18,"wb":9
+  ,"acc":[-9,3]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,384,395,394,377,339,319]
+  }
+ ,{"tb":3,"tbk":2
+  ,"tl":103109
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6,"wb":3
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,384,396,394,377,339,319]
+  }
+ ,{"tb":7,"tbk":2
+  ,"tl":924
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":7,"wb":7
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,384,397,398,394,377,339]
+  }
+ ,{"tb":128,"tbk":1
+  ,"tl":51379
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":132,"wb":64
+  ,"acc":[-8,2,-8,5,-8,4,3,-7,1,-8,2,-8,5,-8,4,3,-7,1,-64,0]
+  ,"fs":[1,272,273,399,400,401,402,403,394,377,339,319,271]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":44822
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9,"wb":9
+  ,"acc":[-9,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,404,389,390,319,271,261,262,263,244,245]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":197308
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":45,"wb":9
+  ,"acc":[-9,6]
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,405,406,388,389,390,319]
+  }
+ ,{"tb":64,"tbk":1
+  ,"tl":197092
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":100,"wb":64
+  ,"acc":[-8,2,-8,4,-9,3,-7,1,-8,2,-8,4,-9,3,-7,1]
+  ,"fs":[1,253,254,407,408,409,410,411,412,406,388,389,390,319,271]
+  }
+ ,{"tb":3,"tbk":2
+  ,"tl":392880
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6,"wb":3
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,413,414,410,411,412,406,388,389,390,319,271]
+  }
+ ,{"tb":308,"tbk":1
+  ,"tl":194456
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":334,"wb":94
+  ,"acc":[-216,0,-8,2,-8,6,-8,5,-8,2,-8,5,-8,4,-8,2,-8,4,-8,8,10,-15,7,3,-3,2]
+  ,"fs":[1,183,184,415,416,417,418,419,420,421,422,423,424,425,426,427,428,406]
+  }
+ ,{"tb":12,"tbk":1
+  ,"tl":41451
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":12,"wb":12
+  ,"acc":[-12,2]
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,429,406,388,389,390,319]
+  }
+ ,{"tb":72,"tbk":1
+  ,"tl":38296
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":96,"wb":72
+  ,"acc":[-8,3,-8,2,-8,3,-16,2,-8,4,-8,3,-16,1]
+  ,"fs":[1,183,184,185,186,187,430,431,389,390,319,271,261,262,263,244]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":37817
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9,"wb":9
+  ,"acc":[-9,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,432,389,390,319,271,261,262,263,244,245]
+  }
+ ,{"tb":64,"tbk":1
+  ,"tl":37866
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":66,"wb":64
+  ,"acc":[-8,2,-8,3,-9,2,-7,1,-8,2,-8,3,-9,2,-7,1]
+  ,"fs":[1,253,254,407,408,409,433,434,435,389,390,319,271,261,262]
+  }
+ ,{"tb":3,"tbk":2
+  ,"tl":74428
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":3,"wb":3
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,413,414,433,434,435,389,390,319,271,261,262]
+  }
+ ,{"tb":176,"tbk":7
+  ,"tl":57473
+  ,"mb":64,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":218,"wb":149
+  ,"fs":[1,272,273,274,275,276,277,436,437,438,389,390]
+  }
+ ,{"tb":247,"tbk":6
+  ,"tl":4097
+  ,"mb":94,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":178,"wb":178
+  ,"fs":[1,272,273,274,275,276,277,439,440,438,389,390]
+  }
+ ,{"tb":235312,"tbk":764
+  ,"tl":1105325119
+  ,"mb":0,"mbk":0
+  ,"gb":616,"gbk":2
+  ,"eb":308,"ebk":1
+  ,"rb":479660,"wb":88626
+  ,"acc":[-216,0,-8,1528,-8,8402,-8,7639,-8,1528,-8,6110,-8,6875,-8,4584,-8,7637,-8,12219,6876,-15,6875,1528,-3,1527]
+  ,"fs":[1,183,184,415,416,417,418,441,442,443,444,445,446,447,390]
+  }
+ ,{"tb":6876,"tbk":764
+  ,"tl":1037832821
+  ,"mb":0,"mbk":0
+  ,"gb":18,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":61866,"wb":6876
+  ,"acc":[-9,7638]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,448,449,450,451,443,444,445,446,447,390]
+  }
+ ,{"tb":48896,"tbk":764
+  ,"tl":1037870138
+  ,"mb":0,"mbk":0
+  ,"gb":128,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":128318,"wb":48896
+  ,"acc":[-8,1528,-8,4583,-9,3819,-7,764,-8,1528,-8,4583,-9,3819,-7,764]
+  ,"fs":[1,253,254,407,408,409,433,434,452,453,449,450,451,443,444]
+  }
+ ,{"tb":2292,"tbk":1528
+  ,"tl":2074746916
+  ,"mb":0,"mbk":0
+  ,"gb":6,"gbk":4
+  ,"eb":0,"ebk":0
+  ,"rb":6873,"wb":2292
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,413,414,433,434,452,453,449,450,451,443,444]
+  }
+ ,{"tb":3820,"tbk":764
+  ,"tl":1891562
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":3820,"wb":3820
+  ,"acc":[-5,1528]
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,454,455,447,390,319,271]
+  }
+ ,{"tb":6112,"tbk":764
+  ,"tl":7064912
+  ,"mb":8,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1528,"wb":764
+  ,"acc":[2292,-7,0]
+  ,"fs":[1,272,273,274,320,321,322,323,324,456,338,339,319]
+  }
+ ,{"tb":6112,"tbk":764
+  ,"tl":6447600
+  ,"mb":8,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":1528,"wb":764
+  ,"acc":[2292,-7,0]
+  ,"fs":[1,272,273,274,457,458,459,338,339,319,271,261,262]
+  }
+ ,{"tb":3056,"tbk":764
+  ,"tl":276656
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":3056,"wb":3056
+  ,"acc":[-4,1528]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,379,460,461,377,339,319]
+  }
+ ,{"tb":6876,"tbk":764
+  ,"tl":12019656
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":13752,"wb":6876
+  ,"acc":[-9,2292]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,384,462,461,377,339,319]
+  }
+ ,{"tb":4584,"tbk":764
+  ,"tl":215732
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":4584
+  ,"acc":[-6,764]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,463,461,377,339,319,271,261]
+  }
+ ,{"tb":4584,"tbk":764
+  ,"tl":289076
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":4584,"wb":4584
+  ,"acc":[-6,1528]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,378,379,464,461,377,339,319]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":707100
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":764
+  ,"acc":[764]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,465,371,372,373,374,466,467,461,377,339,319,271]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":362156
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":2292,"wb":764
+  ,"acc":[3056]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,465,371,372,373,374,375,468,469,467,461,377,339]
+  }
+ ,{"tb":73344,"tbk":764
+  ,"tl":10053724
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":91680,"wb":36672
+  ,"acc":[-8,4584,-8,1528,-8,764,-8,5348,-8,2292,-8,1528,-48,0]
+  ,"fs":[1,272,273,470,471,472,473,474,461,377,339,319,271]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":516384
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":764
+  ,"acc":[764]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,475,371,372,373,374,466,467,461,377,339,319,271]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":9429148
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":764,"wb":764
+  ,"acc":[1528]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,475,371,372,373,374,375,468,469,467,461,377,339]
+  }
+ ,{"tb":73344,"tbk":764
+  ,"tl":8912388
+  ,"mb":96,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":55008,"wb":18336
+  ,"acc":[-8,1528,-16,3820,-72,0]
+  ,"fs":[1,272,273,476,477,478,479,480,461,377,339,319,271]
+  }
+ ,{"tb":12224,"tbk":764
+  ,"tl":3062184
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":12224,"wb":12224
+  ,"acc":[-16,1528]
+  ,"fs":[1,253,254,481,482,483,484,485,486,487,488,489,490,390,319]
+  }
+ ,{"tb":18336,"tbk":764
+  ,"tl":2019324
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":18336,"wb":18336
+  ,"acc":[-24,1528]
+  ,"fs":[1,253,254,491,492,493,494,489,490,390,319,271,261,262]
+  }
+ ,{"tb":36672,"tbk":764
+  ,"tl":783878848
+  ,"mb":0,"mbk":0
+  ,"gb":96,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":140520,"wb":73344
+  ,"acc":[-8,6110,-8,3819,-8,1528,-8,6874,-8,4583,-8,3819]
+  ,"fs":[1,253,254,495,496,497,498,499,489,490,390,319,271,261]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":782880300
+  ,"mb":0,"mbk":0
+  ,"gb":2,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":2291,"wb":764
+  ,"acc":[3055]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,500,501,489,490,390,319,271,261,262,263]
+  }
+ ,{"tb":96,"tbk":1
+  ,"tl":227283
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":80,"wb":24
+  ,"acc":[-8,2,-8,6,-8,5,-72,0]
+  ,"fs":[1,272,273,274,502,503,504,505,506,507,508,489,490,390]
+  }
+ ,{"tb":13752,"tbk":764
+  ,"tl":2241068
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":7640,"wb":7640
+  ,"acc":[-10,1528,-8,0]
+  ,"fs":[1,509,510,511,512,513,514,515,516,517,518,519,520,521,522,523,489,490,390,319,271,261]
+  }
+ ,{"tb":6876,"tbk":764
+  ,"tl":102009357
+  ,"mb":0,"mbk":0
+  ,"gb":9,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":6876,"wb":6876
+  ,"acc":[-9,1528]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,524,525,526,390,319,271,261,262,263,244]
+  }
+ ,{"tb":18336,"tbk":764
+  ,"tl":102057737
+  ,"mb":0,"mbk":0
+  ,"gb":24,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":42784,"wb":18336
+  ,"acc":[-8,1528,-16,3056]
+  ,"fs":[1,253,254,527,528,529,530,531,532,525,526,390,319,271,261]
+  }
+ ,{"tb":36672,"tbk":764
+  ,"tl":101673445
+  ,"mb":0,"mbk":0
+  ,"gb":48,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":55008,"wb":36672
+  ,"acc":[-8,2292,-8,1528,-8,764,-8,3056,-8,2292,-8,1528]
+  ,"fs":[1,253,254,533,534,535,536,537,538,530,531,532,525,526,390,319]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":101198237
+  ,"mb":0,"mbk":0
+  ,"gb":1,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":764,"wb":764
+  ,"acc":[1528]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,539,540,536,537,538,530,531,532,525,526,390,319]
+  }
+ ,{"tb":220032,"tbk":764
+  ,"tl":101091141
+  ,"mb":288,"mbk":1
+  ,"gb":288,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":73344,"wb":55008
+  ,"acc":[-8,2292,-8,1528,-8,2292,-16,1528,-8,3056,-8,2292,-16,764,-216,0]
+  ,"fs":[1,272,273,541,542,543,544,545,525,526,390,319,271]
+  }
+ ,{"tb":91680,"tbk":3056
+  ,"tl":30390998
+  ,"mb":64,"mbk":1
+  ,"gb":64,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":117656,"wb":80220
+  ,"fs":[1,272,273,274,275,276,277,436,437,546,526,390]
+  }
+ ,{"tb":127588,"tbk":2292
+  ,"tl":1594134
+  ,"mb":106,"mbk":1
+  ,"gb":106,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":90152,"wb":90152
+  ,"fs":[1,272,273,274,275,276,277,439,440,546,526,390]
+  }
+ ,{"tb":4584,"tbk":764
+  ,"tl":2326172
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":4584,"wb":4584
+  ,"acc":[-6,1528]
+  ,"fs":[1,253,254,298,299,300,301,302,303,304,305,306,307,454,547,526,390,319,271]
+  }
+ ,{"tb":20985600,"tbk":1526
+  ,"tl":1103241800
+  ,"mb":0,"mbk":0
+  ,"gb":73200,"gbk":2
+  ,"eb":0,"ebk":0
+  ,"rb":30361280,"wb":14008680
+  ,"fs":[1,253,254,527,528,529,548,549,550,453,449,450,451,443,444]
+  }
+ ,{"tb":13990368,"tbk":291466
+  ,"tl":446775083119
+  ,"mb":0,"mbk":0
+  ,"gb":73200,"gbk":1525
+  ,"eb":0,"ebk":0
+  ,"rb":53587016,"wb":13990368
+  ,"acc":[-8,7120,-8,50989,-8,29322,-8,36442,-8,14775,-8,50989]
+  ,"fs":[1,253,254,533,534,535,536,537,538,548,549,550,453,449,450,451]
+  }
+ ,{"tb":291466,"tbk":291466
+  ,"tl":446593791267
+  ,"mb":0,"mbk":0
+  ,"gb":1525,"gbk":1525
+  ,"eb":0,"ebk":0
+  ,"rb":873635,"wb":291466
+  ,"acc":[50989]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,539,540,536,537,538,548,549,550,453,449,450,451]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":923224
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9,"wb":9
+  ,"acc":[-9,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,551,389,390,319,271,261,262,263,244,245]
+  }
+ ,{"tb":64,"tbk":1
+  ,"tl":923270
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":32,"wb":64
+  ,"acc":[-16,2,-16,1,-16,2,-16,1]
+  ,"fs":[1,253,254,407,408,409,433,434,452,552,389,390,319,271,261]
+  }
+ ,{"tb":3,"tbk":2
+  ,"tl":1845244
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":3
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,413,414,433,434,452,552,389,390,319,271,261]
+  }
+ ,{"tb":18336,"tbk":1
+  ,"tl":1095821
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24448,"wb":18336
+  ,"fs":[1,253,254,527,528,529,548,549,550,552,389,390,319,271,261]
+  }
+ ,{"tb":36672,"tbk":764
+  ,"tl":496072446
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24448,"wb":36672
+  ,"acc":[-8,1528,-16,764,-8,2292,-8,1528,-8,764]
+  ,"fs":[1,253,254,533,534,535,536,537,538,548,549,550,552,389,390,319]
+  }
+ ,{"tb":764,"tbk":764
+  ,"tl":495597238
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":764
+  ,"acc":[764]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,539,540,536,537,538,548,549,550,552,389,390,319]
+  }
+ ,{"tb":72,"tbk":1
+  ,"tl":23053
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":48,"wb":72
+  ,"acc":[-8,3,-8,2,-8,3,-8,2,-40,1]
+  ,"fs":[1,183,184,185,186,187,553,554,389,390,319,271,261,262,263,244]
+  }
+ ,{"tb":9,"tbk":1
+  ,"tl":22844
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":9,"wb":9
+  ,"acc":[-9,2]
+  ,"fs":[1,358,359,360,361,362,363,364,365,366,367,368,369,555,389,390,319,271,261,262,263,244,245]
+  }
+ ]
+,"ftbl":
+ ["[root]"
+ ,"0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x4918F5E: __fopen_internal (iofopen.c:65)"
+ ,"0x4918F5E: fopen@@GLIBC_2.2.5 (iofopen.c:86)"
+ ,"0x4931195: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:85)"
+ ,"0x1D0087: get_stack_start (stack_overflow.rs:431)"
+ ,"0x1D0087: stack_start_aligned (stack_overflow.rs:454)"
+ ,"0x1D0087: install_main_guard_linux (stack_overflow.rs:512)"
+ ,"0x1D0087: install_main_guard (stack_overflow.rs:479)"
+ ,"0x1D0087: init (stack_overflow.rs:167)"
+ ,"0x1D0087: init (mod.rs:38)"
+ ,"0x1D0087: init (rt.rs:118)"
+ ,"0x1D0087: {closure#0} (rt.rs:173)"
+ ,"0x1D0087: do_call<std::rt::lang_start_internal::{closure_env#0}, isize> (panicking.rs:573)"
+ ,"0x1D0087: catch_unwind<isize, std::rt::lang_start_internal::{closure_env#0}> (panicking.rs:541)"
+ ,"0x1D0087: catch_unwind<std::rt::lang_start_internal::{closure_env#0}, isize> (panic.rs:359)"
+ ,"0x1D0087: std::rt::lang_start_internal (rt.rs:171)"
+ ,"0x1A20A6: std::rt::lang_start::<()> (rt.rs:205)"
+ ,"0x14D0BD: main (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x4919E64: getdelim (iogetdelim.c:65)"
+ ,"0x49312EE: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:122)"
+ ,"0x4918294: _IO_file_doallocate (filedoalloc.c:101)"
+ ,"0x4928603: _IO_doallocbuf (genops.c:347)"
+ ,"0x4925963: _IO_file_underflow@@GLIBC_2.2.5 (fileops.c:486)"
+ ,"0x4919EEF: getdelim (iogetdelim.c:77)"
+ ,"0x484DB80: realloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x4931059: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:180)"
+ ,"0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x492CF5A: __pthread_attr_extension (pthread_attr_extension.c:28)"
+ ,"0x492D29F: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:45)"
+ ,"0x49310E7: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:194)"
+ ,"0x492D2B8: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:51)"
+ ,"0x1D38B7: alloc (alloc.rs:131)"
+ ,"0x1D38B7: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1D38B7: alloc_impl (alloc.rs:430)"
+ ,"0x1D38B7: allocate (alloc.rs:548)"
+ ,"0x1D38B7: try_clone_from_ref_in<str, alloc::alloc::Global> (boxed.rs:898)"
+ ,"0x1D38B7: clone_from_ref_in<str, alloc::alloc::Global> (boxed.rs:858)"
+ ,"0x1D38B7: clone_from_ref<str> (boxed.rs:812)"
+ ,"0x1D38B7: from (convert.rs:138)"
+ ,"0x1D38B7: call_once<fn(&str) -> alloc::boxed::Box<str, alloc::alloc::Global>, (&str)> (function.rs:250)"
+ ,"0x1D38B7: map<&str, alloc::boxed::Box<str, alloc::alloc::Global>, fn(&str) -> alloc::boxed::Box<str, alloc::alloc::Global>> (option.rs:1165)"
+ ,"0x1D38B7: {closure#0} (thread_info.rs:114)"
+ ,"0x1D38B7: {closure#0}<std::sys::pal::unix::stack_overflow::thread_info::set_current_info::{closure_env#0}, core::option::Option<alloc::boxed::Box<str, alloc::alloc::Global>>> (current.rs:234)"
+ ,"0x1D38B7: try_with_current<std::thread::current::with_current_name::{closure_env#0}<std::sys::pal::unix::stack_overflow::thread_info::set_current_info::{closure_env#0}, core::option::Option<alloc::boxed::Box<str, alloc::alloc::Global>>>, core::option::Option<alloc::boxed::Box<str, alloc::alloc::Global>>> (current.rs:204)"
+ ,"0x1D38B7: with_current_name<std::sys::pal::unix::stack_overflow::thread_info::set_current_info::{closure_env#0}, core::option::Option<alloc::boxed::Box<str, alloc::alloc::Global>>> (current.rs:216)"
+ ,"0x1D38B7: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (thread_info.rs:114)"
+ ,"0x1D01AD: init (stack_overflow.rs:194)"
+ ,"0x1D01AD: init (mod.rs:38)"
+ ,"0x1D01AD: init (rt.rs:118)"
+ ,"0x1D01AD: {closure#0} (rt.rs:173)"
+ ,"0x1D01AD: do_call<std::rt::lang_start_internal::{closure_env#0}, isize> (panicking.rs:573)"
+ ,"0x1D01AD: catch_unwind<isize, std::rt::lang_start_internal::{closure_env#0}> (panicking.rs:541)"
+ ,"0x1D01AD: catch_unwind<std::rt::lang_start_internal::{closure_env#0}, isize> (panic.rs:359)"
+ ,"0x1D01AD: std::rt::lang_start_internal (rt.rs:171)"
+ ,"0x1D3ADD: alloc (alloc.rs:131)"
+ ,"0x1D3ADD: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1D3ADD: alloc_impl (alloc.rs:430)"
+ ,"0x1D3ADD: allocate (alloc.rs:548)"
+ ,"0x1D3ADD: try_new_uninit_in<alloc::collections::btree::node::LeafNode<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo>, alloc::alloc::Global> (boxed.rs:547)"
+ ,"0x1D3ADD: new_uninit_in<alloc::collections::btree::node::LeafNode<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo>, alloc::alloc::Global> (boxed.rs:514)"
+ ,"0x1D3ADD: new<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global> (node.rs:88)"
+ ,"0x1D3ADD: new_leaf<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global> (node.rs:224)"
+ ,"0x1D3ADD: insert_entry<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global> (entry.rs:452)"
+ ,"0x1D3ADD: insert<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global> (entry.rs:426)"
+ ,"0x1D3ADD: insert<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global> (map.rs:1054)"
+ ,"0x1D3ADD: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (thread_info.rs:122)"
+ ,"0x1D087B: alloc (alloc.rs:131)"
+ ,"0x1D087B: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1D087B: alloc_impl (alloc.rs:430)"
+ ,"0x1D087B: allocate (alloc.rs:548)"
+ ,"0x1D087B: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1D087B: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1D087B: with_capacity_in<std::ffi::os_str::OsString, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1D087B: with_capacity_in<std::ffi::os_str::OsString, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1D087B: with_capacity<std::ffi::os_str::OsString> (mod.rs:525)"
+ ,"0x1D087B: args (unix.rs:24)"
+ ,"0x1D087B: std::env::args_os (env.rs:864)"
+ ,"0x14CC73: rustgres::data_dir (main.rs:22)"
+ ,"0x14C2AB: rustgres::main (main.rs:41)"
+ ,"0x16E7CA: <fn() as core::ops::function::FnOnce<()>>::call_once (function.rs:250)"
+ ,"0x18B65D: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> (backtrace.rs:166)"
+ ,"0x1A20C0: std::rt::lang_start::<()>::{closure#0} (rt.rs:206)"
+ ,"0x1D0287: call_once<(), (dyn core::ops::function::Fn<(), Output=i32> + core::marker::Sync + core::panic::unwind_safe::RefUnwindSafe)> (function.rs:287)"
+ ,"0x1D0287: do_call<&(dyn core::ops::function::Fn<(), Output=i32> + core::marker::Sync + core::panic::unwind_safe::RefUnwindSafe), i32> (panicking.rs:573)"
+ ,"0x1D0287: catch_unwind<i32, &(dyn core::ops::function::Fn<(), Output=i32> + core::marker::Sync + core::panic::unwind_safe::RefUnwindSafe)> (panicking.rs:541)"
+ ,"0x1D0287: catch_unwind<&(dyn core::ops::function::Fn<(), Output=i32> + core::marker::Sync + core::panic::unwind_safe::RefUnwindSafe), i32> (panic.rs:359)"
+ ,"0x1D0287: {closure#0} (rt.rs:175)"
+ ,"0x1D0287: do_call<std::rt::lang_start_internal::{closure_env#0}, isize> (panicking.rs:573)"
+ ,"0x1D0287: catch_unwind<isize, std::rt::lang_start_internal::{closure_env#0}> (panicking.rs:541)"
+ ,"0x1D0287: catch_unwind<std::rt::lang_start_internal::{closure_env#0}, isize> (panic.rs:359)"
+ ,"0x1D0287: std::rt::lang_start_internal (rt.rs:171)"
+ ,"0x1D092F: alloc (alloc.rs:131)"
+ ,"0x1D092F: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1D092F: alloc_impl (alloc.rs:430)"
+ ,"0x1D092F: allocate (alloc.rs:548)"
+ ,"0x1D092F: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1D092F: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1D092F: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1D092F: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1D092F: to_vec<u8, alloc::alloc::Global> (slice.rs:448)"
+ ,"0x1D092F: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x1D092F: to_vec<u8> (slice.rs:376)"
+ ,"0x1D092F: args (unix.rs:58)"
+ ,"0x1D092F: std::env::args_os (env.rs:864)"
+ ,"0x1BC64F: alloc (alloc.rs:131)"
+ ,"0x1BC64F: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1BC64F: alloc_impl (alloc.rs:430)"
+ ,"0x1BC64F: allocate (alloc.rs:548)"
+ ,"0x1BC64F: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1BC64F: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1BC64F: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1BC64F: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1BC64F: to_vec<u8, alloc::alloc::Global> (slice.rs:448)"
+ ,"0x1BC64F: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x1BC64F: to_vec<u8> (slice.rs:376)"
+ ,"0x1BC64F: std::sys::env::unix::getenv::{closure#0} (unix.rs:123)"
+ ,"0x1D25A0: run_with_cstr_stack<core::option::Option<std::ffi::os_str::OsString>> (small_c_string.rs:48)"
+ ,"0x1D25A0: run_with_cstr<core::option::Option<std::ffi::os_str::OsString>> (small_c_string.rs:28)"
+ ,"0x1D25A0: std::sys::env::unix::getenv (unix.rs:115)"
+ ,"0x1D57AB: std::env::var::inner (env.rs:230)"
+ ,"0x1A46D0: std::env::var::<&str> (env.rs:235)"
+ ,"0x14CD2F: rustgres::data_dir (main.rs:32)"
+ ,"0x1BFFC9: alloc (alloc.rs:131)"
+ ,"0x1BFFC9: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1BFFC9: alloc_impl (alloc.rs:430)"
+ ,"0x1BFFC9: allocate (alloc.rs:548)"
+ ,"0x1BFFC9: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1BFFC9: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1BFFC9: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1BFFC9: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1BFFC9: to_vec<u8, alloc::alloc::Global> (slice.rs:448)"
+ ,"0x1BFFC9: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x1BFFC9: to_vec<u8> (slice.rs:376)"
+ ,"0x1BFFC9: to_owned (bytes.rs:306)"
+ ,"0x1BFFC9: to_os_string (os_str.rs:985)"
+ ,"0x1BFFC9: to_path_buf (path.rs:2529)"
+ ,"0x1BFFC9: <std::path::Path>::_join (path.rs:3082)"
+ ,"0x15A11E: <std::path::Path>::join::<&str> (path.rs:3078)"
+ ,"0x1580F8: rustgres::wal::load_checkpoint (wal.rs:789)"
+ ,"0x152E46: <rustgres::wal::Wal>::open (wal.rs:586)"
+ ,"0x14C30F: rustgres::main (main.rs:45)"
+ ,"0x152F5D: <rustgres::wal::Wal>::open (wal.rs:587)"
+ ,"0x1BB36D: alloc (alloc.rs:131)"
+ ,"0x1BB36D: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1BB36D: alloc_impl (alloc.rs:430)"
+ ,"0x1BB36D: allocate (alloc.rs:548)"
+ ,"0x1BB36D: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1BB36D: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1BB36D: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1BB36D: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1BB36D: with_capacity<u8> (mod.rs:525)"
+ ,"0x1BB36D: with_capacity<std::io::stdio::StdoutRaw> (bufwriter.rs:132)"
+ ,"0x1BB36D: with_capacity<std::io::stdio::StdoutRaw> (linewriter.rs:112)"
+ ,"0x1BB36D: new<std::io::stdio::StdoutRaw> (linewriter.rs:91)"
+ ,"0x1BB36D: {closure#0} (stdio.rs:722)"
+ ,"0x1BB36D: {closure#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::io::stdio::stdout::{closure_env#0}> (once_lock.rs:350)"
+ ,"0x1BB36D: {closure#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::sync::once_lock::{impl#0}::get_or_init::{closure_env#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::io::stdio::stdout::{closure_env#0}>, !> (once_lock.rs:572)"
+ ,"0x1BB36D: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>>>::get_or_init<std::io::stdio::stdout::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0} (once.rs:227)"
+ ,"0x1BF3E8: <std::sys::sync::once::futex::Once>::call (futex.rs:183)"
+ ,"0x1AD225: call_once_force<std::sync::once_lock::{impl#0}::initialize::{closure_env#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::sync::once_lock::{impl#0}::get_or_init::{closure_env#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::io::stdio::stdout::{closure_env#0}>, !>> (once.rs:227)"
+ ,"0x1AD225: <std::sync::once_lock::OnceLock<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>>>::get_or_init<std::io::stdio::stdout::{closure#0}>::{closure#0}, !> (once_lock.rs:571)"
+ ,"0x1D137C: get_or_try_init<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::sync::once_lock::{impl#0}::get_or_init::{closure_env#0}<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::io::stdio::stdout::{closure_env#0}>, !> (once_lock.rs:439)"
+ ,"0x1D137C: get_or_init<std::sync::reentrant_lock::ReentrantLock<core::cell::RefCell<alloc::io::buffered::linewriter::LineWriter<std::io::stdio::StdoutRaw>>>, std::io::stdio::stdout::{closure_env#0}> (once_lock.rs:350)"
+ ,"0x1D137C: stdout (stdio.rs:722)"
+ ,"0x1D137C: print_to<std::io::stdio::Stdout> (stdio.rs:1167)"
+ ,"0x1D137C: std::io::stdio::_print (stdio.rs:1275)"
+ ,"0x153904: <rustgres::wal::Wal>::open (wal.rs:635)"
+ ,"0x1BFC4C: alloc (alloc.rs:131)"
+ ,"0x1BFC4C: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1BFC4C: alloc_impl (alloc.rs:430)"
+ ,"0x1BFC4C: allocate (alloc.rs:548)"
+ ,"0x1BFC4C: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1BFC4C: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1BFC4C: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1BFC4C: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1BFC4C: to_vec<u8, alloc::alloc::Global> (slice.rs:448)"
+ ,"0x1BFC4C: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x1BFC4C: to_vec<u8> (slice.rs:376)"
+ ,"0x1BFC4C: to_owned (bytes.rs:306)"
+ ,"0x1BFC4C: to_os_string (os_str.rs:985)"
+ ,"0x1BFC4C: <std::path::Path>::to_path_buf (path.rs:2529)"
+ ,"0x15395F: <rustgres::wal::Wal>::open (wal.rs:645)"
+ ,"0x15DF86: alloc (alloc.rs:131)"
+ ,"0x15DF86: <alloc::alloc::Global>::alloc_impl_runtime (alloc.rs:308)"
+ ,"0x17E176: alloc_impl (alloc.rs:430)"
+ ,"0x17E176: allocate (alloc.rs:548)"
+ ,"0x17E176: alloc::boxed::box_new_uninit (boxed.rs:251)"
+ ,"0x18C567: new<alloc::sync::ArcInner<std::sync::poison::mutex::Mutex<rustgres::storage::Database>>> (boxed.rs:292)"
+ ,"0x18C567: <alloc::sync::Arc<std::sync::poison::mutex::Mutex<rustgres::storage::Database>>>::new (sync.rs:447)"
+ ,"0x14C636: rustgres::main (main.rs:59)"
+ ,"0x18C477: new<alloc::sync::ArcInner<std::sync::poison::mutex::Mutex<rustgres::wal::Wal>>> (boxed.rs:292)"
+ ,"0x18C477: <alloc::sync::Arc<std::sync::poison::mutex::Mutex<rustgres::wal::Wal>>>::new (sync.rs:447)"
+ ,"0x14C6DE: rustgres::main (main.rs:60)"
+ ,"0x1C69EE: alloc (unix.rs:31)"
+ ,"0x1C69EE: alloc_impl (alloc.rs:161)"
+ ,"0x1C69EE: allocate (alloc.rs:223)"
+ ,"0x1C69EE: {closure#0}<std::thread::thread::Inner, std::alloc::System> (sync.rs:753)"
+ ,"0x1C69EE: allocate_for_layout<core::mem::maybe_uninit::MaybeUninit<std::thread::thread::Inner>, alloc::sync::{impl#17}::new_uninit_in::{closure_env#0}<std::thread::thread::Inner, std::alloc::System>, fn(*mut u8) -> *mut alloc::sync::ArcInner<core::mem::maybe_uninit::MaybeUninit<std::thread::thread::Inner>>> (sync.rs:2297)"
+ ,"0x1C69EE: new_uninit_in<std::thread::thread::Inner, std::alloc::System> (sync.rs:751)"
+ ,"0x1C69EE: <std::thread::thread::Thread>::new (thread.rs:102)"
+ ,"0x187330: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:47)"
+ ,"0x1A8153: <std::thread::builder::Builder>::spawn_unchecked::<rustgres::main::{closure#0}, ()> (builder.rs:261)"
+ ,"0x189613: spawn<rustgres::main::{closure_env#0}, ()> (builder.rs:191)"
+ ,"0x189613: std::thread::functions::spawn::<rustgres::main::{closure#0}, ()> (functions.rs:131)"
+ ,"0x14CA34: rustgres::main (main.rs:73)"
+ ,"0x48DA643: __cxa_thread_atexit_impl (cxa_thread_atexit_impl.c:106)"
+ ,"0x1D1B5E: get_or_init_slow<core::cell::Cell<std::thread::spawnhook::SpawnHooks>> (eager.rs:55)"
+ ,"0x1D1B5E: get<core::cell::Cell<std::thread::spawnhook::SpawnHooks>> (eager.rs:38)"
+ ,"0x1D1B5E: {closure#0} (mod.rs:68)"
+ ,"0x1D1B5E: call_once<std::thread::spawnhook::SPAWN_HOOKS::{constant#0}::{closure_env#0}, (core::option::Option<&mut core::option::Option<core::cell::Cell<std::thread::spawnhook::SpawnHooks>>>)> (function.rs:250)"
+ ,"0x1D1B5E: try_with<core::cell::Cell<std::thread::spawnhook::SpawnHooks>, std::thread::spawnhook::run_spawn_hooks::{closure_env#0}, std::thread::spawnhook::SpawnHooks> (local.rs:462)"
+ ,"0x1D1B5E: std::thread::spawnhook::run_spawn_hooks (spawnhook.rs:122)"
+ ,"0x187368: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:52)"
+ ,"0x1874C7: new<alloc::sync::ArcInner<std::thread::lifecycle::Packet<()>>> (boxed.rs:292)"
+ ,"0x1874C7: new<std::thread::lifecycle::Packet<()>> (sync.rs:447)"
+ ,"0x1874C7: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:56)"
+ ,"0x187712: new<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<rustgres::main::{closure_env#0}, ()>> (boxed.rs:292)"
+ ,"0x187712: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:86)"
+ ,"0x1878A4: new<std::thread::lifecycle::ThreadInit> (boxed.rs:292)"
+ ,"0x1878A4: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:94)"
+ ,"0x40145AB: calloc (rtld-malloc.h:44)"
+ ,"0x40145AB: allocate_dtv (dl-tls.c:370)"
+ ,"0x40145AB: _dl_allocate_tls (dl-tls.c:629)"
+ ,"0x49306F6: allocate_stack (allocatestack.c:429)"
+ ,"0x49306F6: pthread_create@@GLIBC_2.34 (pthread_create.c:655)"
+ ,"0x1BF191: <std::sys::thread::unix::Thread>::new (unix.rs:107)"
+ ,"0x187943: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()> (lifecycle.rs:110)"
+ ,"0x1D4964: current_guard (stack_overflow.rs:674)"
+ ,"0x1D4964: std::sys::pal::unix::stack_overflow::imp::make_handler (stack_overflow.rs:258)"
+ ,"0x1D50AD: new (stack_overflow.rs:13)"
+ ,"0x1D50AD: <std::sys::thread::unix::Thread>::new::thread_start (unix.rs:125)"
+ ,"0x492FB83: start_thread (pthread_create.c:447)"
+ ,"0x49BCB63: clone (clone.S:100)"
+ ,"0x1C6BF0: get_or_init_slow<core::cell::Cell<std::thread::spawnhook::SpawnHooks>> (eager.rs:55)"
+ ,"0x1C6BF0: get<core::cell::Cell<std::thread::spawnhook::SpawnHooks>> (eager.rs:38)"
+ ,"0x1C6BF0: {closure#0} (mod.rs:68)"
+ ,"0x1C6BF0: call_once<std::thread::spawnhook::SPAWN_HOOKS::{constant#0}::{closure_env#0}, (core::option::Option<&mut core::option::Option<core::cell::Cell<std::thread::spawnhook::SpawnHooks>>>)> (function.rs:250)"
+ ,"0x1C6BF0: initialize_with<core::cell::Cell<std::thread::spawnhook::SpawnHooks>, std::thread::local::{impl#5}::set::{closure_env#0}<std::thread::spawnhook::SpawnHooks>, ()> (local.rs:485)"
+ ,"0x1C6BF0: set<std::thread::spawnhook::SpawnHooks> (local.rs:524)"
+ ,"0x1C6BF0: <std::thread::spawnhook::ChildSpawnHooks>::inherit_and_run (spawnhook.rs:154)"
+ ,"0x1880A1: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0}::{closure#0} (lifecycle.rs:63)"
+ ,"0x18B66D: std::sys::backtrace::__rust_begin_short_backtrace::<std::thread::lifecycle::spawn_unchecked<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0}::{closure#0}, ()> (backtrace.rs:166)"
+ ,"0x187FF8: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0} (lifecycle.rs:63)"
+ ,"0x18C3DF: <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once (unwind_safe.rs:275)"
+ ,"0x1A4A10: std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0}>, ()> (panicking.rs:573)"
+ ,"0x18815A: __rust_try (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x187D27: catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<rustgres::main::{closure_env#0}, ()>>> (panicking.rs:541)"
+ ,"0x187D27: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<rustgres::main::{closure_env#0}, ()>>, ()> (panic.rs:359)"
+ ,"0x187D27: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()>::{closure#1} (lifecycle.rs:62)"
+ ,"0x16C94D: <std::thread::lifecycle::spawn_unchecked<rustgres::main::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} (function.rs:250)"
+ ,"0x1D50B8: call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> (boxed.rs:2366)"
+ ,"0x1D50B8: <std::sys::thread::unix::Thread>::new::thread_start (unix.rs:127)"
+ ,"0x1DC0CF: <alloc::raw_vec::RawVecInner>::try_allocate_in (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x18BF67: <alloc::raw_vec::RawVecInner>::with_capacity_in (mod.rs:445)"
+ ,"0x196752: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x196752: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x196752: with_capacity<u8> (mod.rs:525)"
+ ,"0x196752: <alloc::io::buffered::bufwriter::BufWriter<std::net::tcp::TcpStream>>::with_capacity (bufwriter.rs:132)"
+ ,"0x1967FB: <alloc::io::buffered::bufwriter::BufWriter<std::net::tcp::TcpStream>>::new (bufwriter.rs:99)"
+ ,"0x17A033: rustgres::server::handle_connection (server.rs:100)"
+ ,"0x14D2F2: rustgres::main::{closure#0} (main.rs:73)"
+ ,"0x18B675: std::sys::backtrace::__rust_begin_short_backtrace::<rustgres::main::{closure#0}, ()> (backtrace.rs:166)"
+ ,"0x188039: std::thread::lifecycle::spawn_unchecked::<rustgres::main::{closure#0}, ()>::{closure#1}::{closure#0} (lifecycle.rs:64)"
+ ,"0x1DC0B9: <alloc::raw_vec::RawVecInner>::try_allocate_in (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x195F72: with_capacity_zeroed_in<alloc::alloc::Global> (mod.rs:602)"
+ ,"0x195F72: with_capacity_zeroed_in<u8, alloc::alloc::Global> (mod.rs:223)"
+ ,"0x195F72: <u8 as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global> (spec_from_elem.rs:52)"
+ ,"0x17F12E: alloc::vec::from_elem::<u8> (mod.rs:3820)"
+ ,"0x14BF69: rustgres::protocol::read_startup (protocol.rs:88)"
+ ,"0x17688A: rustgres::server::run_connection (server.rs:114)"
+ ,"0x17A082: rustgres::server::handle_connection (server.rs:101)"
+ ,"0x1DBF89: <alloc::raw_vec::RawVecInner>::finish_grow (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x1DC024: <alloc::raw_vec::RawVecInner>::grow_amortized (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x1DB0FF: <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global> (in /home/hatch/workspace/rustgres/target/debug/rustgres)"
+ ,"0x181F39: <alloc::vec::Vec<u8>>::append_elements (mod.rs:2995)"
+ ,"0x18307C: <alloc::vec::Vec<u8> as alloc::vec::spec_extend::SpecExtend<&u8, core::slice::iter::Iter<u8>>>::spec_extend (spec_extend.rs:58)"
+ ,"0x180380: <alloc::vec::Vec<u8>>::extend_from_slice (mod.rs:3648)"
+ ,"0x14B9D1: <rustgres::protocol::MsgBuilder>::i32 (protocol.rs:136)"
+ ,"0x176A24: rustgres::server::run_connection (server.rs:131)"
+ ,"0x14BA66: <rustgres::protocol::MsgBuilder>::cstr (protocol.rs:141)"
+ ,"0x177F74: rustgres::server::run_connection (server.rs:144)"
+ ,"0x176CB7: rustgres::server::run_connection (server.rs:154)"
+ ,"0x1E686D: alloc (alloc.rs:131)"
+ ,"0x1E686D: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1E686D: alloc_impl (alloc.rs:430)"
+ ,"0x1E686D: allocate (alloc.rs:548)"
+ ,"0x1E686D: <alloc::raw_vec::RawVecInner>::finish_grow (mod.rs:575)"
+ ,"0x1E67E2: grow_amortized<alloc::alloc::Global> (mod.rs:542)"
+ ,"0x1E67E2: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x1E67E2: <alloc::raw_vec::RawVec<u8>>::grow_one (mod.rs:190)"
+ ,"0x1816DA: <alloc::vec::Vec<u8>>::push_mut (mod.rs:1041)"
+ ,"0x181677: <alloc::vec::Vec<u8>>::push (mod.rs:1004)"
+ ,"0x14B92B: <rustgres::protocol::MsgBuilder>::u8 (protocol.rs:126)"
+ ,"0x16F503: rustgres::server::send_ready (server.rs:230)"
+ ,"0x176DC8: rustgres::server::run_connection (server.rs:160)"
+ ,"0x14BC76: rustgres::protocol::read_message (protocol.rs:103)"
+ ,"0x176F04: rustgres::server::run_connection (server.rs:166)"
+ ,"0x15BF14: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x15BF14: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x15BF14: <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:448)"
+ ,"0x15ED7B: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x15ED7B: to_vec<u8> (slice.rs:376)"
+ ,"0x15ED7B: to_owned<u8> (slice.rs:857)"
+ ,"0x15ED7B: to_owned (str.rs:254)"
+ ,"0x15ED7B: from (string.rs:3186)"
+ ,"0x15ED7B: <str as alloc::string::SpecToString>::spec_to_string (string.rs:3117)"
+ ,"0x18A8F9: <str as alloc::string::ToString>::to_string (string.rs:2966)"
+ ,"0x14B22E: <rustgres::protocol::Cursor>::read_cstring (protocol.rs:63)"
+ ,"0x1771F8: rustgres::server::run_connection (server.rs:183)"
+ ,"0x182816: with_capacity_in<char, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x182816: with_capacity_in<char, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x182816: with_capacity<char> (mod.rs:525)"
+ ,"0x182816: <alloc::vec::Vec<char> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<char, core::str::iter::Chars>>::from_iter (spec_from_iter_nested.rs:30)"
+ ,"0x1823E9: <alloc::vec::Vec<char> as alloc::vec::spec_from_iter::SpecFromIter<char, core::str::iter::Chars>>::from_iter (spec_from_iter.rs:33)"
+ ,"0x17FB63: <alloc::vec::Vec<char> as core::iter::traits::collect::FromIterator<char>>::from_iter::<core::str::iter::Chars> (mod.rs:4043)"
+ ,"0x18C059: <core::str::iter::Chars as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<char>> (iterator.rs:2086)"
+ ,"0x19D469: rustgres::sql::split_statements (sql.rs:755)"
+ ,"0x172F35: rustgres::server::handle_query (server.rs:283)"
+ ,"0x177312: rustgres::server::run_connection (server.rs:184)"
+ ,"0x18A267: reserve (string.rs:1255)"
+ ,"0x18A267: <alloc::string::String as core::iter::traits::collect::Extend<char>>::extend::<core::iter::adapters::cloned::Cloned<core::slice::iter::Iter<char>>> (string.rs:2545)"
+ ,"0x18A2DE: <alloc::string::String as core::iter::traits::collect::Extend<&char>>::extend::<core::slice::iter::Iter<char>> (string.rs:2564)"
+ ,"0x18A19F: <alloc::string::String as core::iter::traits::collect::FromIterator<&char>>::from_iter::<core::slice::iter::Iter<char>> (string.rs:2453)"
+ ,"0x185B89: <core::slice::iter::Iter<char> as core::iter::traits::iterator::Iterator>::collect::<alloc::string::String> (iterator.rs:2086)"
+ ,"0x19D5BD: rustgres::sql::split_statements (sql.rs:818)"
+ ,"0x1C21BF: alloc (alloc.rs:131)"
+ ,"0x1C21BF: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1C21BF: alloc_impl (alloc.rs:430)"
+ ,"0x1C21BF: allocate (alloc.rs:548)"
+ ,"0x1C21BF: <alloc::raw_vec::RawVecInner>::finish_grow (mod.rs:575)"
+ ,"0x1C1ABE: grow_amortized<alloc::alloc::Global> (mod.rs:542)"
+ ,"0x1C1ABE: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x1C1ABE: <alloc::raw_vec::RawVec<alloc::vec::Vec<u8>>>::grow_one (mod.rs:190)"
+ ,"0x180C54: <alloc::vec::Vec<alloc::string::String>>::push_mut (mod.rs:1041)"
+ ,"0x180BF9: <alloc::vec::Vec<alloc::string::String>>::push (mod.rs:1004)"
+ ,"0x19D69E: rustgres::sql::split_statements (sql.rs:820)"
+ ,"0x19E2E1: rustgres::sql::tokenize (sql.rs:54)"
+ ,"0x19CE8B: rustgres::sql::parse_statement (sql.rs:376)"
+ ,"0x173104: rustgres::server::handle_query (server.rs:284)"
+ ,"0x19FA16: rustgres::sql::tokenize (sql.rs:208)"
+ ,"0x1E5692: alloc (alloc.rs:131)"
+ ,"0x1E5692: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1E5692: alloc_impl (alloc.rs:430)"
+ ,"0x1E5692: allocate (alloc.rs:548)"
+ ,"0x1E5692: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1E5692: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1E5692: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1E5692: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1E5692: with_capacity<u8> (mod.rs:525)"
+ ,"0x1E5692: convert_while_ascii (str.rs:958)"
+ ,"0x1E5692: <str>::to_lowercase (str.rs:444)"
+ ,"0x19FA80: rustgres::sql::tokenize (sql.rs:209)"
+ ,"0x18BADD: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x18BADD: <alloc::raw_vec::RawVec<rustgres::sql::Token>>::grow_one (mod.rs:190)"
+ ,"0x180F76: <alloc::vec::Vec<rustgres::sql::Token>>::push_mut (mod.rs:1041)"
+ ,"0x180F19: <alloc::vec::Vec<rustgres::sql::Token>>::push (mod.rs:1004)"
+ ,"0x19FAC2: rustgres::sql::tokenize (sql.rs:209)"
+ ,"0x1E6FCE: alloc (alloc.rs:131)"
+ ,"0x1E6FCE: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1E6FCE: alloc_impl (alloc.rs:430)"
+ ,"0x1E6FCE: allocate (alloc.rs:548)"
+ ,"0x1E6FCE: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1E6FCE: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1E6FCE: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1E6FCE: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1E6FCE: to_vec<u8, alloc::alloc::Global> (slice.rs:448)"
+ ,"0x1E6FCE: to_vec_in<u8, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x1E6FCE: clone<u8, alloc::alloc::Global> (mod.rs:3925)"
+ ,"0x1E6FCE: <alloc::string::String as core::clone::Clone>::clone (string.rs:2426)"
+ ,"0x1A04C1: <rustgres::sql::Token as core::clone::Clone>::clone (sql.rs:39)"
+ ,"0x1A6881: call_once<fn(&rustgres::sql::Token) -> rustgres::sql::Token, (&rustgres::sql::Token)> (function.rs:250)"
+ ,"0x1A6881: map<&rustgres::sql::Token, rustgres::sql::Token, fn(&rustgres::sql::Token) -> rustgres::sql::Token> (option.rs:1165)"
+ ,"0x1A6881: <core::option::Option<&rustgres::sql::Token>>::cloned (option.rs:2166)"
+ ,"0x19BC25: <rustgres::sql::Parser>::peek (sql.rs:392)"
+ ,"0x19BB11: <rustgres::sql::Parser>::next (sql.rs:396)"
+ ,"0x19BE5A: <rustgres::sql::Parser>::parse_top (sql.rs:448)"
+ ,"0x19CFC2: rustgres::sql::parse_statement (sql.rs:378)"
+ ,"0x1978D7: <rustgres::sql::Parser>::eat_keyword (sql.rs:404)"
+ ,"0x19B304: <rustgres::sql::Parser>::expect_keyword (sql.rs:414)"
+ ,"0x196F93: <rustgres::sql::Parser>::parse_drop (sql.rs:738)"
+ ,"0x19C084: <rustgres::sql::Parser>::parse_top (sql.rs:456)"
+ ,"0x197034: <rustgres::sql::Parser>::parse_drop (sql.rs:739)"
+ ,"0x19705D: <rustgres::sql::Parser>::parse_drop (sql.rs:740)"
+ ,"0x1979D2: <rustgres::sql::Parser>::expect_ident (sql.rs:426)"
+ ,"0x19709F: <rustgres::sql::Parser>::parse_drop (sql.rs:745)"
+ ,"0x168763: rustgres::exec::exec_drop (exec.rs:461)"
+ ,"0x167885: rustgres::exec::execute (exec.rs:56)"
+ ,"0x17A749: rustgres::server::autocommit_execute (server.rs:474)"
+ ,"0x17458E: rustgres::server::run_statement (server.rs:395)"
+ ,"0x173394: rustgres::server::handle_query (server.rs:297)"
+ ,"0x173BB3: rustgres::server::handle_query (server.rs:312)"
+ ,"0x173087: rustgres::server::handle_query (server.rs:317)"
+ ,"0x197BEB: <rustgres::sql::Parser>::parse_create (sql.rs:507)"
+ ,"0x19BFC7: <rustgres::sql::Parser>::parse_top (sql.rs:453)"
+ ,"0x197C88: <rustgres::sql::Parser>::parse_create (sql.rs:508)"
+ ,"0x197E79: <rustgres::sql::Parser>::parse_create (sql.rs:512)"
+ ,"0x19B4E5: <rustgres::sql::Parser>::parse_col_type (sql.rs:496)"
+ ,"0x197F80: <rustgres::sql::Parser>::parse_create (sql.rs:513)"
+ ,"0x18BD5D: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x18BD5D: <alloc::raw_vec::RawVec<(alloc::string::String, rustgres::storage::ColType)>>::grow_one (mod.rs:190)"
+ ,"0x181486: <alloc::vec::Vec<(alloc::string::String, rustgres::storage::ColType)>>::push_mut (mod.rs:1041)"
+ ,"0x181429: <alloc::vec::Vec<(alloc::string::String, rustgres::storage::ColType)>>::push (mod.rs:1004)"
+ ,"0x1980AE: <rustgres::sql::Parser>::parse_create (sql.rs:514)"
+ ,"0x17A3CB: rustgres::server::autocommit_execute (server.rs:464)"
+ ,"0x16061C: rustgres::exec::exec_create (exec.rs:93)"
+ ,"0x1676EE: rustgres::exec::execute (exec.rs:44)"
+ ,"0x189CD1: with_capacity_in<(alloc::string::String, rustgres::storage::ColType), alloc::alloc::Global> (mod.rs:179)"
+ ,"0x189CD1: with_capacity_in<(alloc::string::String, rustgres::storage::ColType), alloc::alloc::Global> (mod.rs:977)"
+ ,"0x189CD1: <(alloc::string::String, rustgres::storage::ColType) as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:425)"
+ ,"0x18A69A: to_vec_in<(alloc::string::String, rustgres::storage::ColType), alloc::alloc::Global> (slice.rs:400)"
+ ,"0x18A69A: <[(alloc::string::String, rustgres::storage::ColType)]>::to_vec (slice.rs:376)"
+ ,"0x160633: rustgres::exec::exec_create (exec.rs:95)"
+ ,"0x16EE03: <(alloc::string::String, rustgres::storage::ColType) as core::clone::Clone>::clone (clone.rs:236)"
+ ,"0x18A033: <(alloc::string::String, rustgres::storage::ColType) as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:432)"
+ ,"0x15E118: alloc_impl (alloc.rs:430)"
+ ,"0x15E118: <alloc::alloc::Global as core::alloc::Allocator>::allocate (alloc.rs:548)"
+ ,"0x192C1D: do_alloc<alloc::alloc::Global> (src/alloc.rs:18)"
+ ,"0x192C1D: <hashbrown::raw::RawTableInner>::new_uninitialized::<alloc::alloc::Global> (src/raw.rs:1576)"
+ ,"0x193040: <hashbrown::raw::RawTableInner>::fallible_with_capacity::<alloc::alloc::Global> (src/raw.rs:1634)"
+ ,"0x1910DC: prepare_resize<alloc::alloc::Global> (src/raw.rs:2696)"
+ ,"0x1910DC: resize_inner<alloc::alloc::Global> (src/raw.rs:2898)"
+ ,"0x1910DC: reserve_rehash_inner<alloc::alloc::Global> (src/raw.rs:2784)"
+ ,"0x1910DC: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)>>::reserve_rehash::<hashbrown::map::make_hasher<alloc::string::String, rustgres::storage::Table, std::hash::random::RandomState>::{closure#0}> (src/raw.rs:962)"
+ ,"0x19239E: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)>>::reserve::<hashbrown::map::make_hasher<alloc::string::String, rustgres::storage::Table, std::hash::random::RandomState>::{closure#0}> (src/raw.rs:914)"
+ ,"0x191A0E: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)>>::find_or_find_insert_index::<hashbrown::map::equivalent_key<alloc::string::String, alloc::string::String, rustgres::storage::Table>::{closure#0}, hashbrown::map::make_hasher<alloc::string::String, rustgres::storage::Table, std::hash::random::RandomState>::{closure#0}> (src/raw.rs:1126)"
+ ,"0x15D98B: <hashbrown::map::HashMap<alloc::string::String, rustgres::storage::Table, std::hash::random::RandomState>>::insert (src/map.rs:1812)"
+ ,"0x1A8F35: <std::collections::hash::map::HashMap<alloc::string::String, rustgres::storage::Table>>::insert (map.rs:1333)"
+ ,"0x1606FC: rustgres::exec::exec_create (exec.rs:92)"
+ ,"0x16072C: rustgres::exec::exec_create (exec.rs:100)"
+ ,"0x17AD4D: new_uninit<[rustgres::wal::WalRecord; 1]> (boxed.rs:324)"
+ ,"0x17AD4D: rustgres::server::autocommit_execute (server.rs:485)"
+ ,"0x17AD94: rustgres::server::autocommit_execute (server.rs:486)"
+ ,"0x183A86: to_vec_in<(alloc::string::String, rustgres::storage::ColType), alloc::alloc::Global> (slice.rs:400)"
+ ,"0x183A86: <alloc::vec::Vec<(alloc::string::String, rustgres::storage::ColType)> as core::clone::Clone>::clone (mod.rs:3925)"
+ ,"0x17ADD0: rustgres::server::autocommit_execute (server.rs:487)"
+ ,"0x151667: <rustgres::wal::Enc>::u64 (wal.rs:216)"
+ ,"0x1528FE: <rustgres::wal::Wal>::append_batch (wal.rs:665)"
+ ,"0x17B3AF: rustgres::server::autocommit_execute (server.rs:496)"
+ ,"0x151611: <rustgres::wal::Enc>::u32 (wal.rs:212)"
+ ,"0x152AC3: <rustgres::wal::Wal>::append_batch (wal.rs:674)"
+ ,"0x194AA9: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)>>::new_uninitialized (src/raw.rs:637)"
+ ,"0x19555A: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)> as core::clone::Clone>::clone (src/raw.rs:3301)"
+ ,"0x15DBE1: <hashbrown::map::HashMap<alloc::string::String, rustgres::storage::Table, std::hash::random::RandomState> as core::clone::Clone>::clone (src/map.rs:191)"
+ ,"0x1A8F7B: <std::collections::hash::map::HashMap<alloc::string::String, rustgres::storage::Table> as core::clone::Clone>::clone (map.rs:1438)"
+ ,"0x145A0B: <rustgres::storage::Database as core::clone::Clone>::clone (storage.rs:102)"
+ ,"0x17BCE2: rustgres::server::txn_begin (server.rs:515)"
+ ,"0x174438: rustgres::server::run_statement (server.rs:378)"
+ ,"0x16ED83: <(alloc::string::String, rustgres::storage::Table) as core::clone::Clone>::clone (clone.rs:236)"
+ ,"0x195235: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)>>::clone_from_impl (src/raw.rs:3461)"
+ ,"0x195642: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)> as hashbrown::raw::RawTableClone>::clone_from_spec (src/raw.rs:3402)"
+ ,"0x19557D: <hashbrown::raw::RawTable<(alloc::string::String, rustgres::storage::Table)> as core::clone::Clone>::clone (src/raw.rs:3321)"
+ ,"0x145961: <rustgres::storage::Table as core::clone::Clone>::clone (storage.rs:88)"
+ ,"0x16ED9A: <(alloc::string::String, rustgres::storage::Table) as core::clone::Clone>::clone (clone.rs:236)"
+ ,"0x17B8D0: rustgres::server::cmd (server.rs:328)"
+ ,"0x17BEC9: rustgres::server::txn_begin (server.rs:521)"
+ ,"0x1A00A1: rustgres::sql::tokenize (sql.rs:199)"
+ ,"0x15E6C1: reserve (string.rs:1255)"
+ ,"0x15E6C1: <alloc::string::String>::push (string.rs:1454)"
+ ,"0x19EB99: rustgres::sql::tokenize (sql.rs:128)"
+ ,"0x1983EB: <rustgres::sql::Parser>::parse_insert (sql.rs:555)"
+ ,"0x19C006: <rustgres::sql::Parser>::parse_top (sql.rs:454)"
+ ,"0x19849A: <rustgres::sql::Parser>::parse_insert (sql.rs:556)"
+ ,"0x19858D: <rustgres::sql::Parser>::parse_insert (sql.rs:557)"
+ ,"0x198648: <rustgres::sql::Parser>::parse_insert (sql.rs:577)"
+ ,"0x1A0508: <rustgres::sql::Token as core::clone::Clone>::clone (sql.rs:40)"
+ ,"0x19B8F7: <rustgres::sql::Parser>::parse_insert_value (sql.rs:611)"
+ ,"0x198A74: <rustgres::sql::Parser>::parse_insert (sql.rs:583)"
+ ,"0x19A19B: <rustgres::sql::Parser>::parse_literal (sql.rs:530)"
+ ,"0x19B933: <rustgres::sql::Parser>::parse_insert_value (sql.rs:616)"
+ ,"0x18BA5D: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x18BA5D: <alloc::raw_vec::RawVec<rustgres::sql::InsertValue>>::grow_one (mod.rs:190)"
+ ,"0x180E70: <alloc::vec::Vec<rustgres::sql::InsertValue>>::push_mut (mod.rs:1041)"
+ ,"0x180E19: <alloc::vec::Vec<rustgres::sql::InsertValue>>::push (mod.rs:1004)"
+ ,"0x198B77: <rustgres::sql::Parser>::parse_insert (sql.rs:583)"
+ ,"0x1A054F: <rustgres::sql::Token as core::clone::Clone>::clone (sql.rs:41)"
+ ,"0x18B7DD: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x18B7DD: <alloc::raw_vec::RawVec<alloc::vec::Vec<rustgres::sql::InsertValue>>>::grow_one (mod.rs:190)"
+ ,"0x180850: <alloc::vec::Vec<alloc::vec::Vec<rustgres::sql::InsertValue>>>::push_mut (mod.rs:1041)"
+ ,"0x1807F9: <alloc::vec::Vec<alloc::vec::Vec<rustgres::sql::InsertValue>>>::push (mod.rs:1004)"
+ ,"0x198C4E: <rustgres::sql::Parser>::parse_insert (sql.rs:595)"
+ ,"0x183590: with_capacity_in<usize, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x183590: with_capacity_in<usize, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x183590: with_capacity<usize> (mod.rs:525)"
+ ,"0x183590: <alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::ops::range::Range<usize>>>::from_iter (spec_from_iter_nested.rs:52)"
+ ,"0x182419: <alloc::vec::Vec<usize> as alloc::vec::spec_from_iter::SpecFromIter<usize, core::ops::range::Range<usize>>>::from_iter (spec_from_iter.rs:33)"
+ ,"0x17FC13: <alloc::vec::Vec<usize> as core::iter::traits::collect::FromIterator<usize>>::from_iter::<core::ops::range::Range<usize>> (mod.rs:4043)"
+ ,"0x196169: <core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<usize>> (iterator.rs:2086)"
+ ,"0x160ACB: rustgres::exec::exec_insert (exec.rs:154)"
+ ,"0x167776: rustgres::exec::execute (exec.rs:49)"
+ ,"0x174557: rustgres::server::run_statement (server.rs:387)"
+ ,"0x17FECC: with_capacity_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x17FECC: with_capacity_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x17FECC: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>>>::with_capacity (mod.rs:525)"
+ ,"0x160BEC: rustgres::exec::exec_insert (exec.rs:157)"
+ ,"0x1A832B: with_capacity_in<rustgres::storage::Value, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1A832B: with_capacity_in<rustgres::storage::Value, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1A832B: <rustgres::storage::Value as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global> (spec_from_elem.rs:14)"
+ ,"0x17F105: alloc::vec::from_elem::<rustgres::storage::Value> (mod.rs:3820)"
+ ,"0x160EBA: rustgres::exec::exec_insert (exec.rs:169)"
+ ,"0x164232: rustgres::exec::coerce_literal (exec.rs:115)"
+ ,"0x1611A4: rustgres::exec::exec_insert (exec.rs:183)"
+ ,"0x181A23: reserve<alloc::alloc::Global> (mod.rs:691)"
+ ,"0x181A23: reserve<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (mod.rs:350)"
+ ,"0x181A23: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>>>::reserve (mod.rs:1473)"
+ ,"0x1818D8: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>>>::append_elements (mod.rs:2995)"
+ ,"0x182E5C: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>> as alloc::vec::spec_extend::SpecExtend<alloc::vec::Vec<rustgres::storage::Value>, alloc::vec::into_iter::IntoIter<alloc::vec::Vec<rustgres::storage::Value>>>>::spec_extend (spec_extend.rs:35)"
+ ,"0x17FC96: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>> as core::iter::traits::collect::Extend<alloc::vec::Vec<rustgres::storage::Value>>>::extend::<alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>>> (mod.rs:4112)"
+ ,"0x160D3E: rustgres::exec::exec_insert (exec.rs:188)"
+ ,"0x1E6ECA: alloc (alloc.rs:131)"
+ ,"0x1E6ECA: alloc_impl_runtime (alloc.rs:308)"
+ ,"0x1E6ECA: alloc_impl (alloc.rs:430)"
+ ,"0x1E6ECA: allocate (alloc.rs:548)"
+ ,"0x1E6ECA: try_allocate_in<alloc::alloc::Global> (mod.rs:477)"
+ ,"0x1E6ECA: with_capacity_in<alloc::alloc::Global> (mod.rs:445)"
+ ,"0x1E6ECA: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1E6ECA: with_capacity_in<u8, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1E6ECA: with_capacity<u8> (mod.rs:525)"
+ ,"0x1E6ECA: with_capacity (string.rs:494)"
+ ,"0x1E6ECA: alloc::fmt::format::format_inner (fmt.rs:652)"
+ ,"0x16EED0: alloc::fmt::format::{closure#0} (fmt.rs:659)"
+ ,"0x1A5EF0: <core::option::Option<&str>>::map_or_else::<alloc::string::String, alloc::fmt::format::{closure#0}, <str as alloc::borrow::ToOwned>::to_owned> (option.rs:1278)"
+ ,"0x1A93D4: alloc::fmt::format (fmt.rs:659)"
+ ,"0x160DB2: rustgres::exec::exec_insert (exec.rs:190)"
+ ,"0x1599AC: rustgres::wal::diff_dbs (wal.rs:489)"
+ ,"0x16F8C5: rustgres::server::txn_commit (server.rs:537)"
+ ,"0x174453: rustgres::server::run_statement (server.rs:379)"
+ ,"0x17F651: with_capacity_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x17F651: with_capacity_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x17F651: <alloc::vec::Vec<rustgres::storage::Value> as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:425)"
+ ,"0x18030A: to_vec_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x18030A: <[alloc::vec::Vec<rustgres::storage::Value>]>::to_vec (slice.rs:376)"
+ ,"0x159A36: rustgres::wal::diff_dbs (wal.rs:490)"
+ ,"0x1A8481: with_capacity_in<rustgres::storage::Value, alloc::alloc::Global> (mod.rs:179)"
+ ,"0x1A8481: with_capacity_in<rustgres::storage::Value, alloc::alloc::Global> (mod.rs:977)"
+ ,"0x1A8481: <rustgres::storage::Value as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:425)"
+ ,"0x183A26: to_vec_in<rustgres::storage::Value, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x183A26: <alloc::vec::Vec<rustgres::storage::Value> as core::clone::Clone>::clone (mod.rs:3925)"
+ ,"0x17F9C5: <alloc::vec::Vec<rustgres::storage::Value> as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:432)"
+ ,"0x145626: <rustgres::storage::Value as core::clone::Clone>::clone (storage.rs:44)"
+ ,"0x1A87F5: <rustgres::storage::Value as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> (slice.rs:432)"
+ ,"0x18BBDD: grow_one<alloc::alloc::Global> (mod.rs:506)"
+ ,"0x18BBDD: <alloc::raw_vec::RawVec<rustgres::wal::WalRecord>>::grow_one (mod.rs:190)"
+ ,"0x1811AF: <alloc::vec::Vec<rustgres::wal::WalRecord>>::push_mut (mod.rs:1041)"
+ ,"0x181149: <alloc::vec::Vec<rustgres::wal::WalRecord>>::push (mod.rs:1004)"
+ ,"0x159A9F: rustgres::wal::diff_dbs (wal.rs:488)"
+ ,"0x16FAEB: rustgres::server::txn_commit (server.rs:540)"
+ ,"0x16FE19: rustgres::server::txn_commit (server.rs:550)"
+ ,"0x183846: to_vec_in<alloc::vec::Vec<rustgres::storage::Value, alloc::alloc::Global>, alloc::alloc::Global> (slice.rs:400)"
+ ,"0x183846: <alloc::vec::Vec<alloc::vec::Vec<rustgres::storage::Value>> as core::clone::Clone>::clone (mod.rs:3925)"
+ ,"0x145974: <rustgres::storage::Table as core::clone::Clone>::clone (storage.rs:89)"
+ ,"0x17A648: rustgres::server::autocommit_execute (server.rs:467)"
+ ,"0x17A67E: rustgres::server::autocommit_execute (server.rs:468)"
+ ,"0x17A964: new_uninit<[rustgres::wal::WalRecord; 1]> (boxed.rs:324)"
+ ,"0x17A964: rustgres::server::autocommit_execute (server.rs:491)"
+ ,"0x17AFD0: rustgres::server::autocommit_execute (server.rs:491)"
+ ]
+}

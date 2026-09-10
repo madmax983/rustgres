@@ -56,12 +56,14 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ExecResult, ExecError> 
         Stmt::DropTable { if_exists, name } => exec_drop(db, name, *if_exists),
         // Transaction control never reaches the executor (server.rs
         // intercepts it); reaching here is a bug in the session layer.
+        // Same for Stmt::Checkpoint (v0.4).
         Stmt::Begin
         | Stmt::Commit
         | Stmt::Rollback
         | Stmt::Savepoint { .. }
         | Stmt::RollbackTo { .. }
-        | Stmt::Release { .. } => Err(exec_err(
+        | Stmt::Release { .. }
+        | Stmt::Checkpoint => Err(exec_err(
             "25001",
             "transaction control statements must go through the session",
         )),

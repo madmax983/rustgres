@@ -1,14 +1,94 @@
-# rustgres v0.3 — "it takes transactions"
+# rustgres v0.4 — "carved in stone"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 3 of the road to Postgres 19 feature parity. v0.3 adds
-**transactions**: `BEGIN`/`COMMIT`/`ROLLBACK` with full ACID-ish
-isolation-via-snapshot, `SAVEPOINT`/`ROLLBACK TO`/`RELEASE`, the aborted-
-transaction state (`25P02`) with `ReadyForQuery` status bytes `I`/`T`/`E`,
-multi-statement simple-query strings (each statement atomic), and `$N`
-parameters in `INSERT ... VALUES`.
+Milestone 4 of the road to Postgres 19 feature parity. v0.4 adds
+**durability**: a write-ahead log for committed DML and DDL, `fsync` on
+every commit, checkpoints with WAL truncation, and crash recovery that
+replays committed batches and drops uncommitted ones. Kill `-9` the
+server mid-transaction and restart it — committed data is there,
+uncommitted data is not.
+
+## What v0.4 adds (durability)
+
+- **Write-ahead log** (`src/wal.rs`, pure std, zero crates). The storage
+  engine has no pages — it is a `HashMap<String, Table>` — so the WAL is
+  *logical*, at the granularity the engine actually mutates:
+  - `CreateTable { name, columns }`, `InsertRows { table, rows }`,
+    `DropTable { name }`
+  - `FullTable { name, columns, rows }` — fallback when a commit's delta
+    is not a pure append (e.g. a transaction whose working copy predates
+    another session's commit, so the diff degrades to a whole-table
+    image; replay overwrites exactly as the in-memory swap did).
+- **Commit batches are atomic on disk.** One commit = one frame:
+  `u32 frame_len | u64 txn_id | u32 nrecords | records… | u32 crc32`
+  (all big-endian; the CRC covers everything after `frame_len`). COMMIT
+  does `write_all` + `fsync` **before** publishing to the in-memory
+  database and before replying to the client. Recovery stops at the first
+  undecodable frame, so a torn tail from a crash mid-write can only ever
+  drop a partial batch — whole committed batches replay atomically.
+- **Diff-at-commit.** Explicit transactions still commit by swapping the
+  session's working copy into the shared database (v0.3); at COMMIT the
+  server diffs the pre-commit database against the working copy and logs
+  the delta. Each delta is relative to the then-current committed state,
+  so replaying deltas in order reproduces every published state, even
+  under last-writer-wins concurrency. Autocommit statements derive their
+  records from the statement itself while holding the db lock (INSERT
+  logs the appended row suffix — O(changed rows), no full clone).
+- **A failed WAL write never becomes visible.** Autocommit executes
+  against the in-memory database, then fsyncs the WAL; if the fsync
+  fails, the mutation is rolled back from its before-image (INSERT
+  truncates the appended suffix, CREATE drops the new table, DROP
+  restores the old one) and the client gets `58000` (`system_error`).
+  Explicit COMMIT diffs first and publishes only after a successful
+  fsync. Successful writes are never visible before they are durable.
+- **Checkpoints.** `CHECKPOINT` (new SQL statement, rejected inside an
+  explicit transaction with `25001`) writes a full database image to
+  `checkpoint.dat.tmp`, fsyncs it, atomically renames it over
+  `checkpoint.dat`, fsyncs the data directory, then resets `wal.log` to
+  a fresh generation. Crash-safe at every step: a crash before the
+  rename leaves the old checkpoint; between rename and WAL reset, the
+  old WAL replays but already-checkpointed frames are skipped by LSN;
+  during the WAL reset, an empty/torn file becomes a fresh generation.
+- **Logical sequence numbers across WAL generations.**
+  `wal.log` starts with a 16-byte header (`"RGSWAL01"` + `u64 base_lsn`);
+  a frame's LSN is `base_lsn + (physical_offset − 16)`. The checkpoint
+  stores the logical `wal_end` it covers, and the post-checkpoint WAL
+  generation starts its `base_lsn` exactly there — so recovery replays
+  precisely the frames with `lsn >= wal_end` no matter how many
+  checkpoints truncated the physical file before them. (Comparing a
+  stored pre-truncation *physical* offset against a post-truncation file
+  length would silently skip or misread the new generation — the classic
+  bug this scheme exists to avoid.)
+- **Crash recovery at startup.** Loads the checkpoint (a present but
+  undecodable `checkpoint.dat` refuses startup loudly rather than
+  silently losing data), then replays WAL frames after it. Uncommitted
+  transactions never reached the WAL — they die with the process, as
+  they should. ROLLBACK needs no undo logging for the same reason.
+- **Data directory.** `./rustgres-data` by default; override with
+  `--data-dir PATH` (or `--data-dir=PATH`) or the `RUSTGRES_DATA_DIR`
+  environment variable. A missing/empty directory starts an empty
+  database. Layout: `wal.log` + `checkpoint.dat` (+ `.tmp` transiently).
+- **`SO_REUSEADDR` on the listener** (`src/net.rs`): restart-after-`kill
+  -9` must rebind `127.0.0.1:5433` even with old connections in
+  `TIME_WAIT`. Pure std has no `setsockopt`, so on Linux/x86_64 the
+  socket is built with raw syscalls (`socket`/`setsockopt`/`bind`/
+  `listen` via inline `asm!`) and wrapped in a `TcpListener`; other
+  platforms fall back to `TcpListener::bind`.
+
+Known v0.4 deviations/limitations (all documented, none silent):
+**one fsync per commit, no group commit** — `insert` throughput drops
+229 → 144 qps vs v0.3, honestly measured in `benches/BASELINE.md`;
+this is the price of durability, not a regression to optimize away by
+weakening it. **No `pg_wal` segment files / archival / point-in-time
+recovery** — one flat `wal.log`, truncated at each checkpoint; there is
+no replay-to-a-timestamp. **No checksums on the checkpoint image**
+(corruption → loud startup refusal, not silent repair). **Full-database
+images per checkpoint** (O(database) write each time — fine for now).
+WAL records are **logical, not physical**: no page layout to keep stable.
+`CHECKPOINT` takes the database lock for the whole procedure (writers
+block briefly — no concurrent checkpointing yet).
 
 ## What v0.1 implements
 
@@ -147,23 +227,30 @@ silently ignored (matches PG).
 
 ```
 src/
-  main.rs      TCP accept loop, one thread per connection
+  main.rs      TCP accept loop, one thread per connection; data-dir + CLI args
+  net.rs       listening socket with SO_REUSEADDR (raw syscalls, Linux/x86_64)
   protocol.rs  message framing: startup/Message read, Int16/Int32/CString, builders
   server.rs    startup handshake + simple-protocol message dispatch loop
   sql.rs       tokenizer + recursive-descent parser → AST
   exec.rs      executor: AST → in-memory storage, SQLSTATE errors
   storage.rs   HashMap tables, Value/ColType, text-format encoding
+  wal.rs       write-ahead log, checkpoints, crash recovery (v0.4)
 tests/
   protocol_test.py   raw-socket handshake + simple-protocol tests (v0.1)
   protocol_test2.py  raw-socket extended-protocol tests (v0.2)
   protocol_test3.py  raw-socket transaction tests (v0.3)
+  protocol_test4.py  raw-socket durability tests: kill -9 + restart (v0.4)
 ```
 
 ## How to run
 
 ```bash
 cd ~/workspace/rustgres
-cargo run        # listens on 127.0.0.1:5433
+cargo run        # listens on 127.0.0.1:5433, data in ./rustgres-data
+
+# data directory: --data-dir wins, then $RUSTGRES_DATA_DIR, then ./rustgres-data
+cargo run -- --data-dir /tmp/rgdata
+RUSTGRES_DATA_DIR=/tmp/rgdata cargo run
 ```
 
 ## How to test
@@ -171,10 +258,12 @@ cargo run        # listens on 127.0.0.1:5433
 ```bash
 # terminal 1
 cargo run
-# terminal 2 (fresh server per suite — the suites create tables)
+# terminal 2 (fresh server per suite — the suites create tables; the v0.4
+# suite manages its own servers and data dirs, just needs a free 5433)
 python3 tests/protocol_test.py   # v0.1: simple protocol, 40 checks
 python3 tests/protocol_test2.py  # v0.2: extended protocol, 91 checks
 python3 tests/protocol_test3.py  # v0.3: transactions, 93 checks
+python3 tests/protocol_test4.py  # v0.4: durability, 35 checks
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts
@@ -197,6 +286,18 @@ DDL rollback, and extended-protocol `Parse`/`Bind`/`Execute` inside a
 transaction (including `$N` in `INSERT` and inference from a
 transaction-created table). The v0.1/v0.2 suites are re-run to prove no
 regressions.
+The v0.4 suite drives the server itself: it starts `rustgres` with a
+fresh temp data dir, runs SQL over raw sockets, `kill -9`s the server at
+chosen moments (mid-transaction, right after a COMMIT ack, after a
+checkpoint), restarts it against the same data dir, and asserts over the
+wire that committed data survived and uncommitted data did not. It
+covers: committed INSERTs surviving `kill -9`; uncommitted transaction
+and uncommitted DDL disappearing; committed CREATE/DROP surviving; all
+200 acked commits durable; `CHECKPOINT` snapshotting + resetting the WAL
+to a fresh 16-byte generation header; writes after (two) checkpoints
+replaying via logical LSNs; a 1500-row WAL replaying with no checkpoint;
+`ROLLBACK`ed data absent; `CHECKPOINT` inside a transaction → `25001`;
+and nested data-dir auto-creation.
 If you have a real `psql` client handy:
 
 ```bash
@@ -235,7 +336,7 @@ the profile → optimize loop starts there.
   overlay (documented last-writer-wins limitation — MVCC deferred).
   ✅ done (v0.3)
 - **M4 — Persistence:** write-ahead log + checkpoints/snapshots, crash
-  recovery, `fsync` discipline. ← next
+  recovery, `fsync` discipline. ✅ done (v0.4)
 - **M5 — Types & expressions:** `NUMERIC`, `TIMESTAMP`/`DATE`/`INTERVAL`,
   `JSONB` + operators, arrays, `UUID`, casts, a real expression/operator engine
   (`>`, `<`, `LIKE`, `IN`, arithmetic, aggregates, `GROUP BY`/`ORDER BY`).

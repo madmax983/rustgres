@@ -1,8 +1,8 @@
 //! In-memory table storage for rustgres.
 //!
-//! v0.1 keeps everything in a `HashMap<String, Table>` behind a
-//! `Mutex`, shared across connection threads. Persistence arrives
-//! in a later milestone (WAL + snapshots).
+//! v0.4 adds durability: the in-memory image is backed by a write-ahead
+//! log plus checkpoints (see `wal.rs`). The committed database is still
+//! shared across connection threads behind a `Mutex`.
 
 use std::collections::HashMap;
 

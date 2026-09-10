@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::exec::{self, ExecError, ExecResult};
 use crate::protocol::{read_message, read_startup, Cursor, MsgBuilder};
 use crate::sql::{self, Stmt};
-use crate::storage::{ColType, Database, Value};
+use crate::storage::{ColType, Database, Table, Value};
+use crate::wal::{self, Wal, WalRecord};
 
 /// Buffered sink for server→client traffic. Reads still go through the
 /// raw `TcpStream`; every message-loop iteration ends with a `flush()`.
@@ -86,19 +87,28 @@ impl Session {
     }
 }
 
-pub fn handle_connection(stream: TcpStream, db: Arc<Mutex<Database>>) {
+pub fn handle_connection(
+    stream: TcpStream,
+    db: Arc<Mutex<Database>>,
+    wal: Arc<Mutex<Wal>>,
+) {
     // Reads use the raw socket; writes go through a BufWriter so each
     // message's small write_all calls (type byte, length, payload) — and,
     // crucially, thousands of DataRows — coalesce into a few large TCP
     // segments. Without this, TCP_NODELAY turns every row into its own
     // packet (see benches/BASELINE.md).
     let writer = BufWriter::new(stream.try_clone().expect("try_clone failed"));
-    if let Err(e) = run_connection(stream, writer, db) {
+    if let Err(e) = run_connection(stream, writer, db, wal) {
         eprintln!("connection closed with error: {}", e);
     }
 }
 
-fn run_connection(mut reader: TcpStream, mut writer: Writer, db: Arc<Mutex<Database>>) -> io::Result<()> {
+fn run_connection(
+    mut reader: TcpStream,
+    mut writer: Writer,
+    db: Arc<Mutex<Database>>,
+    wal: Arc<Mutex<Wal>>,
+) -> io::Result<()> {
     // --- Startup handshake -------------------------------------------------
     loop {
         let (proto, _params) = read_startup(&mut reader)?;
@@ -171,12 +181,12 @@ fn run_connection(mut reader: TcpStream, mut writer: Writer, db: Arc<Mutex<Datab
             b'Q' => {
                 let mut cur = Cursor::new(&msg.payload);
                 let sql_text = cur.read_cstring()?;
-                handle_query(&mut writer, &db, &mut session, &sql_text)?;
+                handle_query(&mut writer, &db, &wal, &mut session, &sql_text)?;
             }
             b'P' => handle_parse(&mut writer, &mut session, &msg.payload)?,
             b'B' => handle_bind(&mut writer, &db, &mut session, &msg.payload)?,
             b'D' => handle_describe(&mut writer, &db, &mut session, &msg.payload)?,
-            b'E' => handle_execute(&mut writer, &db, &mut session, &msg.payload)?,
+            b'E' => handle_execute(&mut writer, &db, &wal, &mut session, &msg.payload)?,
             b'C' => handle_close(&mut writer, &mut session, &msg.payload)?,
             b'X' => break, // Terminate
             b'H' => {
@@ -259,6 +269,7 @@ fn protocol_error(
 fn handle_query(
     stream: &mut Writer,
     db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     sql_text: &str,
 ) -> io::Result<()> {
@@ -283,7 +294,7 @@ fn handle_query(
             send_error(stream, e.code, &e.message)?;
             break;
         }
-        match run_statement(db, session, &stmt) {
+        match run_statement(db, wal, session, &stmt) {
             Err(e) => {
                 send_error(stream, e.code, &e.message)?;
                 break;
@@ -336,14 +347,20 @@ fn allowed_in_aborted(stmt: &Stmt) -> bool {
 
 /// Execute one statement with transaction semantics:
 /// - transaction control statements manipulate the session's txn state;
+/// - `CHECKPOINT` (v0.4) snapshots the committed database and truncates
+///   the WAL; refused inside a transaction block, like Postgres;
 /// - inside an explicit transaction, data statements run against the
 ///   session-private working copy (a failure aborts the transaction);
-/// - in autocommit they run directly against the committed database.
+/// - in autocommit they run directly against the committed database, and
+///   every write is WAL-logged + fsynced before it returns (each
+///   autocommit statement is its own durable mini-transaction).
 ///   Statement atomicity in autocommit comes from the executor's
 ///   validate-then-apply discipline: every statement fully validates
-///   before mutating anything, so a failed statement leaves no trace.
+///   before mutating anything, so a failed statement leaves no trace —
+///   and nothing is logged for it.
 fn run_statement(
     db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
@@ -359,11 +376,12 @@ fn run_statement(
     }
     match stmt {
         Stmt::Begin => txn_begin(db, session),
-        Stmt::Commit => txn_commit(db, session),
+        Stmt::Commit => txn_commit(db, wal, session),
         Stmt::Rollback => txn_rollback(session),
         Stmt::Savepoint { name } => txn_savepoint(session, name),
         Stmt::RollbackTo { name } => txn_rollback_to(session, name),
         Stmt::Release { name } => txn_release(session, name),
+        Stmt::Checkpoint => txn_checkpoint(db, wal, session),
         _ => {
             if let Some(t) = session.txn.as_mut() {
                 match exec::execute(&mut t.working, stmt) {
@@ -374,11 +392,115 @@ fn run_statement(
                     }
                 }
             } else {
-                let mut db = db.lock().unwrap();
-                exec::execute(&mut db, stmt)
+                autocommit_execute(db, wal, stmt)
             }
         }
     }
+}
+
+/// A WAL/filesystem failure becomes SQLSTATE 58000 (system_error).
+fn wal_err(e: io::Error) -> ExecError {
+    ExecError {
+        code: "58000",
+        message: format!("WAL write failed: {}", e),
+    }
+}
+
+/// Before-image of an autocommit write, used both to derive the WAL
+/// records and to undo the in-memory mutation if the WAL append/fsync
+/// fails. A failed WAL write must leave the committed database exactly
+/// as it was: the client gets a 58000 error and nothing undurable is
+/// ever visible.
+enum Undo {
+    /// INSERT: truncate the table's rows back to this length.
+    Truncate { table: String, len: usize },
+    /// CREATE TABLE: remove the newly created table.
+    Remove { name: String },
+    /// DROP TABLE: restore the removed table.
+    Restore { name: String, table: Table },
+    /// Read-only statement, or a write that cannot have mutated.
+    None,
+}
+
+impl Undo {
+    fn apply(self, db: &mut Database) {
+        match self {
+            Undo::Truncate { table, len } => {
+                if let Some(t) = db.tables.get_mut(&table) {
+                    t.rows.truncate(len);
+                }
+            }
+            Undo::Remove { name } => {
+                db.tables.remove(&name);
+            }
+            Undo::Restore { name, table } => {
+                db.tables.insert(name, table);
+            }
+            Undo::None => {}
+        }
+    }
+}
+
+/// Autocommit write path (v0.4): the statement executes against the
+/// committed database under the db lock, then its logical change is
+/// appended to the WAL and fsynced *before* we return. Each autocommit
+/// statement is its own durable mini-transaction. The records are derived
+/// from the before-image (rather than diffing the whole database), which
+/// keeps this O(changed rows): INSERT logs the appended row suffix via a
+/// before/after row count, CREATE/DROP log their schema/name.
+fn autocommit_execute(
+    db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
+    stmt: &Stmt,
+) -> Result<ExecResult, ExecError> {
+    let mut db_guard = db.lock().unwrap();
+    // Capture the before-image while holding the db lock (no one else
+    // can mutate concurrently).
+    let undo = match stmt {
+        Stmt::Insert { table, .. } => Undo::Truncate {
+            table: table.clone(),
+            len: db_guard.tables.get(table).map(|t| t.rows.len()).unwrap_or(0),
+        },
+        Stmt::CreateTable { name, .. } => Undo::Remove { name: name.clone() },
+        Stmt::DropTable { name, .. } => match db_guard.tables.get(name) {
+            Some(t) => Undo::Restore {
+                name: name.clone(),
+                table: t.clone(),
+            },
+            None => Undo::None, // execute will fail (or be a no-op); nothing to undo
+        },
+        _ => Undo::None,
+    };
+    let result = exec::execute(&mut db_guard, stmt)?;
+    // Derive the WAL records from the same before-image.
+    let records: Vec<WalRecord> = match &undo {
+        Undo::Truncate { table, len } => match db_guard.tables.get(table) {
+            Some(t) if t.rows.len() > *len => vec![WalRecord::InsertRows {
+                table: table.clone(),
+                rows: t.rows[*len..].to_vec(),
+            }],
+            _ => Vec::new(),
+        },
+        Undo::Remove { name } => match stmt {
+            Stmt::CreateTable { columns, .. } => vec![WalRecord::CreateTable {
+                name: name.clone(),
+                columns: columns.clone(),
+            }],
+            _ => Vec::new(),
+        },
+        Undo::Restore { name, .. } => vec![WalRecord::DropTable { name: name.clone() }],
+        Undo::None => Vec::new(),
+    };
+    // Lock order is always db -> wal.
+    if !records.is_empty() {
+        if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+            // WAL is not durable: roll back the in-memory mutation so a
+            // failed commit never becomes visible, then report 58000.
+            undo.apply(&mut db_guard);
+            return Err(wal_err(e));
+        }
+    }
+    Ok(result)
 }
 
 fn txn_begin(
@@ -401,18 +523,54 @@ fn txn_begin(
 
 fn txn_commit(
     db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
 ) -> Result<ExecResult, ExecError> {
     match session.txn.take() {
         None => Ok(cmd("COMMIT")), // Postgres: WARNING, no-op
         Some(t) if t.failed => Ok(cmd("ROLLBACK")), // COMMIT of an aborted txn rolls back
         Some(t) => {
+            let mut db_guard = db.lock().unwrap();
+            // Diff the pre-commit database against the working copy and
+            // make the delta durable BEFORE publishing it: COMMIT returns
+            // only after the WAL frame is fsynced.
+            let records = wal::diff_dbs(&db_guard, &t.working);
+            if !records.is_empty() {
+                // Lock order is always db -> wal.
+                if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+                    // Nothing was published; hand the transaction back so
+                    // the session can retry the COMMIT or ROLLBACK.
+                    session.txn = Some(t);
+                    return Err(wal_err(e));
+                }
+            }
             // Publish the working copy. (Concurrent transactions are
-            // last-writer-wins in v0.3; real MVCC is a later milestone.)
-            *db.lock().unwrap() = t.working;
+            // last-writer-wins in v0.4; real MVCC is a later milestone.)
+            *db_guard = t.working;
             Ok(cmd("COMMIT"))
         }
     }
+}
+
+/// v0.4: snapshot the committed database and truncate the WAL.
+/// Refused inside a transaction block, like Postgres.
+fn txn_checkpoint(
+    db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &Session,
+) -> Result<ExecResult, ExecError> {
+    if session.txn.is_some() {
+        return Err(ExecError {
+            code: "25001",
+            message: "CHECKPOINT cannot be executed inside a transaction block".to_string(),
+        });
+    }
+    let db_guard = db.lock().unwrap();
+    wal.lock()
+        .unwrap()
+        .checkpoint(&db_guard)
+        .map_err(wal_err)?;
+    Ok(cmd("CHECKPOINT"))
 }
 
 fn txn_rollback(session: &mut Session) -> Result<ExecResult, ExecError> {
@@ -806,6 +964,7 @@ fn describe_prepared(
 fn handle_execute(
     stream: &mut Writer,
     db: &Arc<Mutex<Database>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -852,7 +1011,7 @@ fn handle_execute(
     // First Execute: run the statement, caching SELECT rows for suspension.
     if session.portals[&portal_name].pending.is_none() {
         let stmt = session.portals[&portal_name].stmt.clone().unwrap();
-        match run_statement(db, session, &stmt) {
+        match run_statement(db, wal, session, &stmt) {
             Err(e) => return protocol_error(stream, session, e.code, &e.message),
             Ok(ExecResult::Select { rows, .. }) => {
                 session.portals.get_mut(&portal_name).unwrap().pending =
@@ -960,4 +1119,63 @@ fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
         }
     }
     b.send(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::ColType;
+
+    fn sample_db() -> Database {
+        let mut db = Database::new();
+        db.tables.insert(
+            "t".to_string(),
+            Table {
+                columns: vec![("a".to_string(), ColType::Int)],
+                rows: vec![vec![Value::Int(1)]],
+            },
+        );
+        db
+    }
+
+    #[test]
+    fn undo_truncate_restores_row_count() {
+        let mut db = sample_db();
+        // Simulate a successful INSERT of two rows followed by WAL failure.
+        db.tables.get_mut("t").unwrap().rows.push(vec![Value::Int(2)]);
+        db.tables.get_mut("t").unwrap().rows.push(vec![Value::Int(3)]);
+        Undo::Truncate {
+            table: "t".into(),
+            len: 1,
+        }
+        .apply(&mut db);
+        assert_eq!(db.tables["t"].rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn undo_remove_drops_created_table() {
+        let mut db = sample_db();
+        db.tables.insert(
+            "new".to_string(),
+            Table {
+                columns: vec![],
+                rows: vec![],
+            },
+        );
+        Undo::Remove { name: "new".into() }.apply(&mut db);
+        assert!(!db.tables.contains_key("new"));
+        assert!(db.tables.contains_key("t")); // untouched
+    }
+
+    #[test]
+    fn undo_restore_brings_back_dropped_table() {
+        let mut db = sample_db();
+        let t = db.tables.remove("t").unwrap();
+        Undo::Restore {
+            name: "t".into(),
+            table: t,
+        }
+        .apply(&mut db);
+        assert_eq!(db.tables["t"].rows, vec![vec![Value::Int(1)]]);
+    }
 }

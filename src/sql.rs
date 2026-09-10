@@ -321,6 +321,8 @@ pub enum Stmt {
     Savepoint { name: String },
     RollbackTo { name: String },
     Release { name: String },
+    // --- v0.4: checkpoint (handled by the session, not the executor)
+    Checkpoint,
 }
 
 impl Stmt {
@@ -463,6 +465,8 @@ impl Parser {
                 Ok(Stmt::Begin)
             }
             "commit" | "end" => Ok(Stmt::Commit),
+            // --- v0.4: CHECKPOINT (snapshot + WAL truncation)
+            "checkpoint" => Ok(Stmt::Checkpoint),
             "rollback" | "abort" => {
                 if self.eat_keyword("to") {
                     // ROLLBACK TO [SAVEPOINT] name
