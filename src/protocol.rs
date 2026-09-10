@@ -64,6 +64,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// One message received from the frontend: type byte + payload.
+#[derive(Debug)]
 pub struct FrontendMessage {
     pub typ: u8,
     pub payload: Vec<u8>,
@@ -77,19 +78,28 @@ fn read_i32_from(stream: &mut TcpStream) -> io::Result<i32> {
 
 /// Read the startup packet (no type byte): Int32 len, Int32 protocol, params.
 /// Returns (protocol, raw parameter bytes).
+///
+/// v0.12: hardened against allocation-DoS — the length field is untrusted
+/// client input, so we cap the packet (16 MiB; real startup packets are a
+/// few hundred bytes) and read incrementally, allocating only for bytes
+/// that actually arrive. A lying length that never delivers can no longer
+/// pin gigabytes. Oversize packets fail with ERRCODE_PROTOCOL_VIOLATION
+/// (08P01), like PostgreSQL's "invalid message length".
 pub fn read_startup(stream: &mut TcpStream) -> io::Result<(i32, Vec<u8>)> {
     let len = read_i32_from(stream)?;
     if len < 8 {
         return invalid(format!("bad startup packet length {}", len));
     }
-    let mut buf = vec![0u8; (len - 4) as usize];
-    stream.read_exact(&mut buf)?;
+    let buf = read_bounded(stream, (len - 4) as i64, MAX_STARTUP_BYTES, "startup packet")?;
     let mut cur = Cursor::new(&buf);
     let proto = cur.read_i32()?;
     Ok((proto, buf))
 }
 
 /// Read one framed frontend message: Byte1 type, Int32 len, payload.
+///
+/// v0.12: same hardening as read_startup — 1 GiB cap (PostgreSQL's own
+/// maximum message size) and incremental allocation.
 pub fn read_message(stream: &mut TcpStream) -> io::Result<FrontendMessage> {
     let mut typ = [0u8; 1];
     stream.read_exact(&mut typ)?;
@@ -97,12 +107,47 @@ pub fn read_message(stream: &mut TcpStream) -> io::Result<FrontendMessage> {
     if len < 4 {
         return invalid(format!("bad message length {}", len));
     }
-    let mut payload = vec![0u8; (len - 4) as usize];
-    stream.read_exact(&mut payload)?;
+    let payload = read_bounded(stream, (len - 4) as i64, MAX_MESSAGE_BYTES, "message")?;
     Ok(FrontendMessage {
         typ: typ[0],
         payload,
     })
+}
+
+/// v0.12: maximum inbound frontend message size — 1 GiB, matching
+/// PostgreSQL's documented maximum message size.
+pub const MAX_MESSAGE_BYTES: usize = 1 << 30;
+
+/// v0.12: maximum startup packet size — 16 MiB (real ones are < 1 KiB).
+pub const MAX_STARTUP_BYTES: usize = 16 << 20;
+
+/// Read `total` bytes from `stream` in 64 KiB chunks, failing if `total`
+/// exceeds `cap`. Incremental: memory grows only with bytes actually
+/// received, never with the claimed length alone.
+fn read_bounded(
+    stream: &mut TcpStream,
+    total: i64,
+    cap: usize,
+    what: &str,
+) -> io::Result<Vec<u8>> {
+    if total < 0 || total as u64 > cap as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            // 08P01 surfaces in the fuzzer tests; the io error kind is what
+            // callers see, the message carries the SQLSTATE context.
+            format!("{} length {} exceeds maximum {} bytes (08P01)", what, total, cap),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut remaining = total as usize;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        stream.read_exact(&mut chunk[..n])?;
+        out.extend_from_slice(&chunk[..n]);
+        remaining -= n;
+    }
+    Ok(out)
 }
 
 /// Builder for one backend message.
@@ -153,5 +198,76 @@ impl MsgBuilder {
         stream.write_all(&len.to_be_bytes())?;
         stream.write_all(&self.payload)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// Feed a header claiming a 2 GiB payload, then deliver *nothing*.
+    /// read_message must reject the lie without allocating 2 GiB.
+    #[test]
+    fn oversize_message_rejected_without_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // type 'Q' + length claiming ~2 GiB payload (i32::MAX).
+        client.write_all(&[b'Q']).unwrap();
+        client.write_all(&i32::MAX.to_be_bytes()).unwrap();
+        client.flush().unwrap();
+        let err = read_message(&mut server).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds maximum"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    /// Same for the startup packet: claim 1 GiB, deliver nothing.
+    #[test]
+    fn oversize_startup_rejected_without_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(&i32::MAX.to_be_bytes()).unwrap();
+        client.flush().unwrap();
+        let err = read_startup(&mut server).unwrap_err();
+        assert!(format!("{}", err).contains("exceeds maximum"));
+    }
+
+    /// A truncated-but-honest message fails cleanly instead of hanging.
+    #[test]
+    fn truncated_message_is_io_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(&[b'Q']).unwrap();
+        client.write_all(&104i32.to_be_bytes()).unwrap(); // claims 100 payload bytes
+        client.write_all(b"short").unwrap();
+        drop(client); // EOF mid-message
+        let err = read_message(&mut server).unwrap_err();
+        assert!(
+            err.kind() == io::ErrorKind::UnexpectedEof
+                || format!("{}", err).contains("failed to fill whole buffer"),
+            "unexpected error: {} ({:?})",
+            err,
+            err.kind()
+        );
     }
 }

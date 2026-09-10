@@ -57,6 +57,14 @@ fn err_undefined(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// A parse-time 42701 (duplicate_column), like Postgres.
+fn err_duplicate(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "42701",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Ident(String), // folded to lowercase unless double-quoted
@@ -1081,7 +1089,9 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
     for item in &items {
         if let TableItem::Col(c) = item {
             if def.columns.iter().any(|(n, _)| n == &c.name) {
-                return Err(err(format!(
+                // v0.12: PostgreSQL reports duplicate_column (42701) here,
+                // not a syntax error.
+                return Err(err_duplicate(format!(
                     "column \"{}\" specified more than once",
                     c.name
                 )));

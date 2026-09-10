@@ -1578,7 +1578,15 @@ fn plan_upsert(
     // Validate DO UPDATE's target columns once.
     let mut set_cols = Vec::new();
     if let ConflictAction::DoUpdate { sets, .. } = &oc.action {
+        // v0.12: duplicate SET targets are 42701 in PostgreSQL.
+        let mut seen = std::collections::HashSet::new();
         for (name, _) in sets {
+            if !seen.insert(name) {
+                return Err(exec_err(
+                    "42701",
+                    format!("multiple assignments to same column \"{}\"", name),
+                ));
+            }
             set_cols.push(meta.column_index(name).ok_or_else(|| {
                 exec_err(
                     "42703",
@@ -1652,6 +1660,19 @@ fn exec_insert(
         require_column_privs(eng, ctx, table, cols, crate::storage::PRIV_INSERT, "INSERT")?;
     } else {
         require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
+    }
+    // v0.12: duplicate target columns are 42701 in PostgreSQL
+    // ("multiple assignments to same column"), not silently accepted.
+    if let Some(cols) = columns {
+        let mut seen = std::collections::HashSet::new();
+        for c in cols {
+            if !seen.insert(c) {
+                return Err(exec_err(
+                    "42701",
+                    format!("multiple assignments to same column \"{}\"", c),
+                ));
+            }
+        }
     }
     // v0.10: WITH materialization (validated; plain INSERT cannot reference
     // the CTEs, but subqueries in RETURNING/ON CONFLICT can).
@@ -2275,6 +2296,19 @@ fn exec_update(
         crate::storage::PRIV_UPDATE,
         "UPDATE",
     )?;
+    // v0.12: duplicate SET targets are 42701 in PostgreSQL
+    // ("multiple assignments to same column"), not silently accepted.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in sets {
+            if !seen.insert(name) {
+                return Err(exec_err(
+                    "42701",
+                    format!("multiple assignments to same column \"{}\"", name),
+                ));
+            }
+        }
+    }
     // v0.10: WITH materialization; the CTEs are visible to subqueries in
     // SET/WHERE and in the RETURNING list.
     let ctes = materialize_dml_ctes(eng, ctx, with)?;

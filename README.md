@@ -1,22 +1,72 @@
-# rustgres v0.11 — "SCRAM auth, roles, grants"
+# rustgres v0.12 — "concurrency stress, soak testing, protocol hardening"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 11 of the road to Postgres 19 feature parity. v0.11 adds
-**SCRAM-SHA-256 authentication** (pure-std crypto: SHA-256, HMAC,
-PBKDF2, constant-time verifier comparison), **roles** (`CREATE/ALTER/
-DROP ROLE`, `LOGIN`/`NOLOGIN`, `SUPERUSER`, passwords, `CONNECTION
-LIMIT`, `VALID UNTIL`, transactional DDL), **role memberships**
-(`GRANT`/`REVOKE` role-to-role with transitive inheritance, cycle
-rejection, `pg_auth_members`), **privileges** (`GRANT`/`REVOKE` on
-tables, columns, sequences, and the database, incl. column-level
-`SELECT`/`INSERT`/`UPDATE`/`REFERENCES` with per-column enforcement
-through `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`*`), **ownership**
-checks on DDL (`ANALYZE`/`VACUUM`/`CREATE OR REPLACE VIEW` now require
-owner or superuser), and the `pg_authid`/`pg_roles`/`pg_user`/
-`pg_auth_members` catalogs (passwords masked, `rolvaliduntil`
-exposed). 986 cumulative protocol tests pass (118 new in v0.11).
+Milestone 12 of the road to Postgres 19 feature parity. v0.12 is a
+robustness milestone: **concurrency stress testing** (threaded mixed
+read/write/DDL/grant workloads with invariant checks), a **randomized
+soak test** (30k statements, `SIGKILL` mid-run, crash recovery verified),
+**wire-protocol hardening** (allocation-DoS resistance, `08P01` FATAL on
+unknown message types, `CancelRequest`/`SSLRequest` handling,
+poisoned-lock recovery), and an **SQLSTATE audit** (65 new protocol
+checks pinning exact error codes, including newly-corrected `42701`
+duplicate-column/assignment reporting). 1051 cumulative protocol tests
+pass (65 new in v0.12), plus 50 unit tests.
+
+## What v0.12 adds (concurrency, soak, hardening)
+
+- **Allocation-DoS resistance.** Frontend message lengths are validated
+  *before* allocating: reads proceed in bounded 64 KiB chunks, startup
+  packets are capped at 16 MiB, and regular frontend messages at 1 GiB
+  (PostgreSQL's documented ceiling). A client claiming a 2 GiB message
+  no longer makes the server allocate 2 GiB.
+- **Protocol correctness.** Unknown frontend message types now return
+  `08P01` (protocol violation) and FATAL-close the connection, as
+  PostgreSQL does (previously `0A000` without closing).
+  `CancelRequest` (`80877102`) is recognized and the connection closed
+  quietly; `SSLRequest` is refused with `N`, then normal startup works.
+- **Poisoned-lock recovery.** If a worker thread panics while holding
+  the engine or WAL mutex, subsequent connections no longer die from
+  mutex poisoning: the lock is recovered and a warning logged. (Mid-
+  statement panic consistency is not formally guaranteed.)
+- **Concurrency stress.** `tests/protocol_test12.py` runs threaded
+  workloads: mixed inserters/readers/transactional updaters with a
+  primary-key uniqueness invariant, same-name `CREATE`/`DROP` races,
+  concurrent `GRANT`/`REVOKE` vs privilege enforcement (readers observe
+  both allow and deny, never a wrong code), concurrent `nextval`
+  uniqueness (160/160 unique), `CHECKPOINT`/`VACUUM` under write load,
+  and 150 rapid connect/disconnect cycles. No stuck threads, no wrong
+  answers. Lock-order audit: every nested site locks engine → WAL,
+  never the reverse.
+- **Soak + crash recovery.** A randomized 120 s soak (30k statements:
+  DML, transactions, DDL, indexes, checkpoints, CTEs, aggregates) ran
+  with zero unexpected SQLSTATEs and flat RSS (9→11 MB), then the
+  server was `SIGKILL`ed mid-run and restarted: all soak tables
+  readable after WAL recovery.
+- **SQLSTATE audit.** Duplicate column definitions
+  (`CREATE TABLE t(a INT, a INT)`), duplicate `INSERT` target columns,
+  duplicate `UPDATE ... SET` targets, and duplicate `ON CONFLICT DO
+  UPDATE SET` targets all now return `42701` (previously `42601` or
+  silently accepted). New pins cover `08P01`, `34000`, `26000`,
+  `42501`, `23505`/`23503`/`23502`/`23514`, `42P01`/`42P07`,
+  `42703`/`42702`/`42701`, `42803`, `42883`, `22P02`, `22012`,
+  `40001`, `25P02`, `25001`, `3B001`, `28P01`, and more.
+- **Performance.** Valgrind memcheck over a threaded stress workload: 0
+  bytes definitely/indirectly lost, 0 memory errors. Callgrind: no
+  v0.12-specific hotspots (top named costs are pre-existing i128
+  numeric arithmetic and allocation). DHAT: 72 MB total allocated,
+  all short-lived, no heap bloat. Wire fuzz sustained ~5,000 qps
+  through a 3,000-query flood.
+
+Known v0.12 deviations/limitations (all documented, none silent):
+**`CancelRequest` closes quietly without cancelling a backend**;
+`COPY` inside explicit transactions uses a throwaway snapshot;
+extended-protocol `COPY` is absent; `DELETE … WHERE id IN (subquery)`
+is unsupported; `INSERT … SELECT` skips complete target-column
+coercion; **no group commit** (WAL fsync per commit holds the engine
+lock); the engine is globally mutex-serialized (correctness over
+throughput for now); `server_version` still reports `16.0`.
 
 ## What v0.11 adds (SCRAM auth, roles, grants)
 

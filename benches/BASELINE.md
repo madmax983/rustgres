@@ -2,6 +2,52 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.12 baseline — 2026-09-10
+
+Environment: same sandbox, **release build** (`cargo build --release`),
+fresh temp data dir, 5 s per workload. v0.12 is a robustness milestone
+(protocol hardening, concurrency stress, soak testing); no hot-path
+rewrites. NOTE: a second, unrelated build job was running on this
+shared 2-CPU VM during measurement (load avg 13–25), so qps numbers
+below are heavily polluted — p50 on CPU-bound workloads is the honest
+signal, and it matches v0.11.
+
+| workload   | qps      | p50        | p99        | vs v0.11 |
+|------------|----------|------------|------------|---------|
+| `select1`  | 7,191    | 0.026 ms   | 2.028 ms   | p50 same (qps: load noise) |
+| `expr`     | 3,865    | 0.067 ms   | 3.067 ms   | p50 same (qps: load noise) |
+| `scan`     | 12.4     | 65.16 ms   | 312.74 ms  | degraded: load noise (fsync-heavy under contention) |
+| `insert`   | 44.9     | 15.07 ms   | 137.01 ms  | degraded: load noise (fsync-heavy under contention) |
+| `prepared` | 7,735    | 0.059 ms   | 1.860 ms   | p50 same (qps: load noise) |
+| `txn`      | 5,587    | 0.071 ms   | 1.776 ms   | p50 same/better |
+| `mvcc`     | 920      | 0.620 ms   | 6.943 ms   | p50 same |
+| `join`     | 0.4      | 2662.9 ms  | 2679.4 ms  | degraded: load noise |
+| `idxscan`  | 4,884    | 0.043 ms   | 2.408 ms   | p50 same (qps: load noise) |
+| `window`   | 1.1      | 859.3 ms   | 1747.3 ms  | degraded: load noise |
+| `copy`     | 10.7     | 75.60 ms   | 372.83 ms  | degraded: load noise (fsync-heavy under contention) |
+
+CPU-bound p50 latencies (`select1`, `expr`, `prepared`, `txn`, `mvcc`,
+`idxscan`) are unchanged vs v0.11 — the v0.12 changes (bounded wire
+reads, poisoned-lock recovery helpers, 42701 duplicate-target checks)
+add no per-query hot-path cost. fsync/data-heavy workloads degraded
+only under the concurrent build's I/O+CPU contention.
+
+Concurrency/robustness numbers (new in v0.12, debug build):
+120 s randomized soak: 29,953 statements, 0 unexpected SQLSTATEs, RSS
+9→11 MB flat, SIGKILL mid-run → clean WAL recovery. Wire fuzz: 27/27
+checks, ~5,021 qps sustained through a 3,000-query flood, server alive
+after every corpus group. 150 rapid connect/disconnect cycles < 30 s.
+
+Valgrind memcheck over a threaded stress workload (4 workers, 500
+inserts + 800 mixed stmts + extended-protocol + error paths): **0
+bytes definitely lost, 0 indirectly lost**, 0 memory errors (38
+"error" contexts are the SIGTERM shutdown at `accept`, not memory
+errors). Callgrind on the bench workload: no v0.12-specific hotspots;
+top named costs are pre-existing i128 numeric arithmetic (~4.4%),
+allocation (~2.3%), and QCol iteration (~2%). DHAT on 600 mixed
+statements: 72.4 MB total allocated in 256k blocks, all short-lived
+(max-live ≤ 64 KB) — no heap bloat.
+
 ## v0.11 baseline — 2026-09-10
 
 Environment: same sandbox, **release build** (`cargo build --release`),

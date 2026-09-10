@@ -21,6 +21,10 @@ use crate::wal::{self, Wal};
 type Writer = BufWriter<TcpStream>;
 
 const SSL_REQUEST_CODE: i32 = 80877103;
+/// v0.12: CancelRequest's magic protocol number. We don't support query
+/// cancellation — PG would forward this to the target backend; we close
+/// quietly instead (documented in README limitations).
+const CANCEL_REQUEST_CODE: i32 = 80877102;
 const PROTOCOL_V3: i32 = 196608;
 
 /// A prepared statement created by Parse (parameters not yet bound).
@@ -121,7 +125,7 @@ struct ConnSlot {
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
-        let mut counts = session_counts().lock().unwrap();
+        let mut counts = lock_counts();
         if let Some(n) = counts.get_mut(&self.role) {
             *n = n.saturating_sub(1);
         }
@@ -130,6 +134,52 @@ impl Drop for ConnSlot {
 
 fn session_counts() -> &'static Mutex<HashMap<String, usize>> {
     SESSION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// v0.12: poison-recovering lock helpers.
+///
+/// Every worker thread shares the global engine/wal mutexes, so a panic
+/// in one statement poisons the mutex and — with a plain `.unwrap()` —
+/// would wedge the whole server: every subsequent connection thread
+/// would panic on lock and die. Recovering with `into_inner()` keeps the
+/// server alive (per-statement undo paths make a mid-statement panic
+/// leave consistent state in the common cases) and logs loudly so the
+/// underlying bug is not silent. This is the pragmatic middle ground
+/// between "wedge forever" and PostgreSQL's "restart the postmaster".
+fn lock_engine(engine: &Arc<Mutex<Engine>>) -> std::sync::MutexGuard<'_, Engine> {
+    match engine.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            eprintln!(
+                "v0.12 WARNING: engine lock was poisoned by a panicking worker thread; \
+                 recovering the lock so the server stays up"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn lock_wal(wal: &Arc<Mutex<Wal>>) -> std::sync::MutexGuard<'_, Wal> {
+    match wal.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            eprintln!(
+                "v0.12 WARNING: wal lock was poisoned by a panicking worker thread; \
+                 recovering the lock so the server stays up"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn lock_counts() -> std::sync::MutexGuard<'static, HashMap<String, usize>> {
+    match session_counts().lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            eprintln!("v0.12 WARNING: session-count lock was poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// v0.11: authentication mode. `RUSTGRES_AUTH=scram-sha-256` (or `scram`)
@@ -202,6 +252,10 @@ fn run_connection(
             writer.write_all(b"N")?;
             writer.flush()?;
             continue;
+        }
+        if proto == CANCEL_REQUEST_CODE {
+            // No cancellation support: close quietly without an error log.
+            return Ok(());
         }
         if proto != PROTOCOL_V3 {
             return Err(io::Error::new(
@@ -297,7 +351,7 @@ fn authenticate(
 ) -> io::Result<Option<(String, ConnSlot)>> {
     // Snapshot the auth catalogs once for the whole exchange.
     let (snap, role) = {
-        let guard = engine.lock().unwrap();
+        let guard = lock_engine(engine);
         let snap = guard.take_snapshot();
         let role = guard.db.find_role(user, &snap, 0).cloned();
         (snap, role)
@@ -351,7 +405,7 @@ fn finish_login(
     database: &str,
 ) -> io::Result<Option<ConnSlot>> {
     {
-        let guard = engine.lock().unwrap();
+        let guard = lock_engine(engine);
         if !crate::storage::db_connect_allowed(&guard.db, &role.name, snap, 0) {
             send_error(
                 writer,
@@ -363,7 +417,7 @@ fn finish_login(
         }
     }
     if role.connlimit >= 0 {
-        let counts = session_counts().lock().unwrap();
+        let counts = lock_counts();
         let n = counts.get(&role.name).copied().unwrap_or(0);
         if n as i64 >= role.connlimit as i64 {
             send_error(
@@ -376,7 +430,7 @@ fn finish_login(
         }
     }
     // The guard's Drop releases the slot on every exit path.
-    let mut counts = session_counts().lock().unwrap();
+    let mut counts = lock_counts();
     *counts.entry(role.name.clone()).or_insert(0) += 1;
     drop(counts);
     Ok(Some(ConnSlot {
@@ -570,13 +624,19 @@ fn message_loop(
                 writer.flush()?;
             }
             other => {
+                // v0.12: PostgreSQL treats an unknown frontend message type
+                // as FATAL (ERRCODE_PROTOCOL_VIOLATION): send the error and
+                // close the connection rather than soldiering on.
                 send_error(
                     writer,
-                    "0A000",
-                    &format!("unimplemented message type '{}'", other as char),
+                    "08P01",
+                    &format!("invalid frontend message type '{}'", other as char),
                 )?;
-                send_ready(writer, session)?;
                 writer.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("protocol violation: unknown message type '{}'", other as char),
+                ));
             }
         }
         // Bulk responses (e.g. 10k DataRows) accumulate in the BufWriter
@@ -773,7 +833,7 @@ fn handle_copy_to(
         }
     }
     let (cols, rows) = {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = lock_engine(engine);
         // Snapshot/transaction handling mirrors txn_execute/autocommit.
         if session.txn.is_some() {
             let t = session.txn.as_mut().unwrap();
@@ -896,7 +956,7 @@ fn handle_copy_from(
     }
     // Resolve the column count first (validates table/columns).
     let ncols = {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = lock_engine(engine);
         let snap = guard.take_snapshot();
         // Use a throwaway xid for the snapshot owner (read-only).
         let xid = guard.begin_txn();
@@ -978,7 +1038,7 @@ fn handle_copy_from(
     };
     // Insert (transactional: uses the session txn if any, else autocommit).
     let insert_result = if session.txn.is_some() {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = lock_engine(engine);
         let t = session.txn.as_mut().unwrap();
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
         let r = {
@@ -997,7 +1057,7 @@ fn handle_copy_from(
         }
         r.map_err(|e| (e.code, e.message))
     } else {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = lock_engine(engine);
         let xid = guard.begin_txn();
         let snap = guard.take_snapshot();
         let mut writes: Vec<WriteOp> = Vec::new();
@@ -1034,7 +1094,7 @@ fn handle_copy_from(
                         return Ok(());
                     }
                 };
-                if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+                if let Err(e) = lock_wal(wal).append_batch(&records) {
                     undo_all(&mut guard, xid, &writes);
                     retire_txn(&mut guard, xid);
                     auto_vacuum(&mut guard, &writes);
@@ -1194,7 +1254,7 @@ fn txn_execute(
     session: &mut Session,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
-    let mut guard = engine.lock().unwrap();
+    let mut guard = lock_engine(engine);
     let t = session
         .txn
         .as_mut()
@@ -1245,7 +1305,7 @@ fn autocommit_execute(
     role: &str,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
-    let mut guard = engine.lock().unwrap();
+    let mut guard = lock_engine(engine);
     let xid = guard.begin_txn();
     let snap = guard.take_snapshot();
     let mut writes: Vec<WriteOp> = Vec::new();
@@ -1303,7 +1363,7 @@ fn autocommit_execute(
         }
     };
     // Lock order is always engine -> wal.
-    if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+    if let Err(e) = lock_wal(wal).append_batch(&records) {
         undo_all(&mut guard, xid, &writes);
         retire_txn(&mut guard, xid);
         auto_vacuum(&mut guard, &writes);
@@ -1379,7 +1439,7 @@ fn txn_begin(
         // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
         return Ok(cmd("BEGIN"));
     }
-    let xid = engine.lock().unwrap().begin_txn();
+    let xid = lock_engine(engine).begin_txn();
     session.txn = Some(Txn {
         xid,
         level,
@@ -1400,7 +1460,7 @@ fn txn_commit(
         None => return Ok(cmd("COMMIT")), // Postgres: WARNING, no-op
         Some(t) => t,
     };
-    let mut guard = engine.lock().unwrap();
+    let mut guard = lock_engine(engine);
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
         undo_all(&mut guard, t.xid, &t.writes);
@@ -1429,7 +1489,7 @@ fn txn_commit(
         }
     };
     // Lock order is always engine -> wal.
-    if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+    if let Err(e) = lock_wal(wal).append_batch(&records) {
         // Not durable: the transaction cannot commit. Hand it back marked
         // failed so the client can ROLLBACK (which undoes the staged
         // writes); a COMMIT retry would be meaningless.
@@ -1455,8 +1515,8 @@ fn txn_checkpoint(
             "CHECKPOINT cannot be executed inside a transaction block",
         ));
     }
-    let guard = engine.lock().unwrap();
-    wal.lock().unwrap().checkpoint(&guard).map_err(wal_err)?;
+    let guard = lock_engine(engine);
+    lock_wal(wal).checkpoint(&guard).map_err(wal_err)?;
     Ok(cmd("CHECKPOINT"))
 }
 
@@ -1473,7 +1533,7 @@ fn txn_vacuum(
             "VACUUM cannot be executed inside a transaction block",
         ));
     }
-    let mut guard = engine.lock().unwrap();
+    let mut guard = lock_engine(engine);
     // v0.11: VACUUM requires ownership (or superuser), like PostgreSQL.
     // The session role is the authenticated role. VACUUM runs outside
     // any transaction, so build a fresh snapshot from the live state.
@@ -1557,7 +1617,7 @@ fn txn_rollback(
     session: &mut Session,
 ) -> Result<ExecResult, ExecError> {
     if let Some(t) = session.txn.take() {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = lock_engine(engine);
         undo_all(&mut guard, t.xid, &t.writes);
         retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
@@ -1578,7 +1638,7 @@ fn txn_savepoint(
             // A savepoint is a position in the write log plus the current
             // row-lock count — no copies.
             let xid = t.xid;
-            let locks = engine.lock().unwrap().txn_lock_count(xid);
+            let locks = lock_engine(engine).txn_lock_count(xid);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
             Ok(cmd("SAVEPOINT"))
         }
@@ -1590,7 +1650,7 @@ fn txn_rollback_to(
     session: &mut Session,
     name: &str,
 ) -> Result<ExecResult, ExecError> {
-    let mut guard = engine.lock().unwrap();
+    let mut guard = lock_engine(engine);
     let t = session
         .txn
         .as_mut()
@@ -1803,7 +1863,7 @@ fn handle_bind(
             }
             let params = {
                 // Type resolution sees the session's own uncommitted data.
-                let mut guard = engine.lock().unwrap();
+                let mut guard = lock_engine(engine);
                 let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
                 exec::bind_params(&s, &prep.declared_oids, &raw, &guard, &snap, own)
             };
@@ -1905,7 +1965,7 @@ fn handle_describe(
             None => Vec::new(),
             Some(stmt) => {
                 let types = {
-                    let mut guard = engine.lock().unwrap();
+                    let mut guard = lock_engine(engine);
                     let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
                     exec::resolve_param_types(stmt, &prep.declared_oids, &guard, &snap, own)
                 };
@@ -1946,7 +2006,7 @@ fn describe_prepared(
     match &prep.stmt {
         None => Ok(None),
         Some(stmt) => {
-            let mut guard = engine.lock().unwrap();
+            let mut guard = lock_engine(engine);
             let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
             exec::describe_columns(stmt, &prep.declared_oids, &guard, &snap, own)
         }
@@ -2254,5 +2314,48 @@ mod tests {
         assert!(allowed_in_aborted(&rbt));
         assert!(allowed_in_aborted(&commit));
         assert!(!allowed_in_aborted(&sel));
+    }
+
+    /// v0.12: a worker thread panicking while holding the global engine
+    /// lock must not wedge the server — the helpers recover the lock.
+    #[test]
+    fn lock_helpers_recover_from_poison() {
+        // Poison a real Arc<Mutex<Engine>> the way a panicking worker
+        // thread holding the lock would.
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let victim = Arc::clone(&engine);
+        let h = std::thread::spawn(move || {
+            let _g = victim.lock().unwrap();
+            panic!("simulated worker-thread panic");
+        });
+        assert!(h.join().is_err());
+        assert!(engine.is_poisoned());
+        // lock_engine recovers instead of panicking; the lock stays
+        // usable afterwards (still flagged poisoned, but functional).
+        {
+            let _g = lock_engine(&engine);
+        }
+        {
+            let _g = lock_engine(&engine);
+        }
+        assert!(engine.is_poisoned());
+
+        // Same for the WAL lock, using a real Wal on a scratch dir.
+        let dir = std::env::temp_dir().join("rg12-poison-wal-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_eng, wal_inner) =
+            crate::wal::Wal::open(&dir).expect("wal open");
+        let wal = Arc::new(Mutex::new(wal_inner));
+        let victim = Arc::clone(&wal);
+        let h = std::thread::spawn(move || {
+            let _g = victim.lock().unwrap();
+            panic!("simulated worker-thread panic");
+        });
+        assert!(h.join().is_err());
+        assert!(wal.is_poisoned());
+        {
+            let _g = lock_wal(&wal);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
