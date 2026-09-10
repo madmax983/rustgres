@@ -1,18 +1,58 @@
-# rustgres v0.13 — "replication protocol, logical decoding"
+# rustgres v0.14 — "pg_regress conformance harness"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 13 of the road to Postgres 19 feature parity. v0.13 brings
-the **streaming replication protocol**: `replication=true` connections,
-`IDENTIFY_SYSTEM`, durable logical replication slots (WAL-logged and
-checkpointed, surviving `SIGKILL`), `START_REPLICATION` with walsender
-`CopyBoth` framing (`XLogData` + keepalives), standby status/flush
-tracking, the `pg_replication_slots` catalog view, and a built-in
-logical decoding plugin (`rustgres_decoding`) that emits
-`BEGIN`/`INSERT`/`UPDATE`/`DELETE`/`DDL`/`COMMIT` text with exact
-old/new row images. 1108 cumulative protocol tests pass (57 new in
-v0.13), plus 56 unit tests.
+Milestone 14 of the road to Postgres 19 feature parity. v0.14 brings
+the **pg_regress conformance harness**: a custom semantic runner
+(`tests/conformance/regress_runner.py`) that executes 22 selected
+PostgreSQL regression tests (boolean, char, name, text, varchar, int2,
+int4, int8, float4, float8, numeric, strings, select, select_distinct,
+select_having, case, union, subselect, join, transactions, insert,
+delete) against rustgres and scores them against PostgreSQL's expected
+outputs. To support the harness, v0.14 also adds type-name aliases
+(`int4`, `varchar`, `bpchar`, `name`, `serial`), optional typmods,
+`VACUUM ANALYZE`, boolean casts and unambiguous prefixes, PostgreSQL
+internal operator aliases (`booleq`, `boolne`, `int4eq`, `texteq`),
+function-style casts (`float8(x)`), `::` casts in INSERT VALUES,
+`CREATE TEMP TABLE` syntax, alias-less derived tables, `(VALUES ...)`
+in FROM, and auto-named indexes. A commit-time unique recheck closes a
+real race where concurrent transactions could commit duplicate keys.
+1152 cumulative protocol tests pass (44 new in v0.14), plus 57 unit
+tests and 53 isolation checks.
+
+## What v0.14 adds (pg_regress conformance harness)
+
+- **Conformance runner.** `python3 tests/conformance/regress_runner.py`
+  runs 22 PostgreSQL regression tests against rustgres, comparing
+  actual output to PostgreSQL's expected `.out` files with a semantic
+  (not textual) diff. Results are classified as PASS, EXPECTED-FAIL
+  (known gap with a documented reason), or REAL-FAIL (unexpected
+  divergence). Baseline: 1661 PASS (32.0%), 1644 EXPECTED-FAIL, 1888
+  REAL-FAIL out of 5193 statements.
+- **Isolation specs.** `tests/conformance/isolation_specs.py` translates
+  PostgreSQL's `simple-write-skew.spec` and
+  `insert-conflict-do-nothing.spec` plus a custom READ COMMITTED
+  visibility spec: 53 checks pass. Documents deviations: no SSI
+  predicate tracking (serial-equivalent outcomes observed), concurrent
+  `ON CONFLICT DO NOTHING` fails the loser with `40001` instead of
+  blocking, and READ COMMITTED losers can transiently see both rows.
+- **Commit-time unique recheck.** `Database::committed_unique_violation`
+  + `records_for_commit` re-verifies unique keys against rows committed
+  after the statement snapshot. Fixes a real race: two concurrent
+  transactions inserting the same primary key would both commit
+  duplicates. Now the loser gets `40001`.
+- **Parser/executor gaps closed for conformance.** Type aliases
+  (`int4`, `varchar`, `char`, `bpchar`, `name`, `serial`), typmods
+  (`varchar(10)`), `VACUUM ANALYZE`, int→bool casts, boolean
+  `'tru'`/`'of'` prefixes, `booleq`/`boolne`/`int4eq`/`texteq`,
+  `float8(x)` function-style casts, `1::int` in INSERT VALUES, `CREATE
+  TEMP TABLE` (parses as persistent; documented), alias-less FROM
+  subqueries, `(VALUES ...)` sources, auto-named `CREATE INDEX`.
+- **Known limitations.** Correlated `IN` subqueries are O(n²);
+  cartesian joins materialize fully (OOM risk on huge cross joins);
+  TEMP tables are fake-persistent; extended-protocol COPY absent;
+  `server_version` reports 16.0.
 
 ## What v0.13 adds (replication protocol, logical decoding)
 

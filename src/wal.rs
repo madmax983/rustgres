@@ -2046,6 +2046,21 @@ pub fn records_for_commit(
                     i += 1;
                     continue; // table dropped by a committed concurrent txn
                 }
+                // v0.14: commit-time unique recheck. A concurrent txn may
+                // have committed the same unique key after our
+                // statement-time check ran; committing would create a
+                // duplicate key. Fail the commit (40001 at the call site)
+                // instead of corrupting the unique index.
+                if let Some(cname) = eng
+                    .db
+                    .committed_unique_violation(&eng.txns, table, &values, *row_id, own)
+                {
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}\" \
+                         (committed by a concurrent transaction)",
+                        cname
+                    ));
+                }
                 let row = WalRow {
                     id: *row_id,
                     xmin: own,

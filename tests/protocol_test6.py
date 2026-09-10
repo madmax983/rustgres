@@ -411,9 +411,12 @@ def t_derived_table():
             "WHERE t.total > 10 ORDER BY t.uid"
         )
         check("derived table", rows == [["1", "30"]], str(rows))
-        # alias is required, like Postgres
-        _, _, codes = c.q("SELECT * FROM (SELECT 1)")
-        check("derived table without alias errors", codes != [], str(codes))
+        # v0.14: alias-less derived tables are allowed (auto-named
+        # `unnamed_subquery`); PostgreSQL requires an alias, but the
+        # pg_regress conformance corpus uses them, so rustgres is
+        # intentionally more permissive here.
+        _, rows, codes = c.q("SELECT * FROM (SELECT 1)")
+        check("derived table without alias works", not codes, str(codes))
         # derived table columns are addressable by the alias
         _, rows, _ = c.q("SELECT s.a FROM (SELECT 1 AS a, 2 AS b) s")
         check("derived table projection", rows == [["1"]], str(rows))

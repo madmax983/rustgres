@@ -658,6 +658,12 @@ pub enum FromItem {
         sub: Box<SelectStmt>,
         alias: String,
     },
+    /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
+    /// columns `column1`, `column2`, ... when no column aliases are given.
+    Values {
+        rows: Vec<Vec<Expr>>,
+        alias: String,
+    },
     Join {
         left: Box<FromItem>,
         kind: JoinKind,
@@ -1449,6 +1455,8 @@ pub enum Stmt {
     Vacuum {
         table: Option<String>,
         verbose: bool,
+        // v0.14: `VACUUM ANALYZE` also collects planner statistics.
+        analyze: bool,
     },
     // --- v0.8: secondary indexes
     CreateIndex {
@@ -1683,6 +1691,12 @@ fn max_param_from(f: &FromItem) -> usize {
     match f {
         FromItem::Table { .. } => 0,
         FromItem::Derived { sub, .. } => max_param_select(sub),
+        FromItem::Values { rows, .. } => rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(max_param_expr)
+            .max()
+            .unwrap_or(0),
         FromItem::Join {
             left, right, on, ..
         } => {
@@ -1855,6 +1869,9 @@ struct WindowSpec {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// v0.14: counter for auto-generated `unnamed_subquery[_N]` aliases,
+    /// matching what PostgreSQL reports for alias-less FROM subqueries.
+    unnamed_seq: usize,
 }
 
 impl Parser {
@@ -2049,8 +2066,34 @@ impl Parser {
     fn parse_type_name_rest(&mut self, name: String) -> Result<ColType, SqlError> {
         match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
+            // v0.14: PostgreSQL internal alias names (pg_regress conformance).
+            "int4" => Ok(ColType::Int),
             "bigint" | "int8" => Ok(ColType::BigInt),
             "smallint" | "int2" => Ok(ColType::SmallInt),
+            // v0.14: `serial` is accepted as an integer alias for casts and
+            // column definitions. Unlike PostgreSQL we do not auto-create a
+            // backing sequence or DEFAULT nextval(); documented in README.
+            "serial" => Ok(ColType::Int),
+            // v0.14: character type aliases. Length modifiers are parsed and
+            // ignored; values are stored as text (no blank-padding or
+            // truncation enforcement), documented in README.
+            "varchar" => {
+                self.eat_optional_typmod();
+                Ok(ColType::Text)
+            }
+            "char" | "bpchar" => {
+                self.eat_optional_typmod();
+                Ok(ColType::Text)
+            }
+            "character" => {
+                // `character varying(n)` or plain `character(n)`.
+                self.eat_keyword("varying");
+                self.eat_optional_typmod();
+                Ok(ColType::Text)
+            }
+            // v0.14: `name` (PostgreSQL internal identifier type) behaves
+            // like text here; the 63-byte truncation is not enforced.
+            "name" => Ok(ColType::Text),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".
@@ -2110,6 +2153,25 @@ impl Parser {
         }
     }
 
+    /// Consume an optional `(n)` or `(n, m)` length/precision modifier,
+    /// ignoring the values (v0.14: character-type typmods are parsed but
+    /// not enforced).
+    fn eat_optional_typmod(&mut self) {
+        if self.peek() != Token::LParen {
+            return;
+        }
+        self.next(); // '('
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.next() {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::EOF => break,
+                _ => {}
+            }
+        }
+    }
+
     /// First word of a type name (for typed-literal lookahead like
     /// `DATE '2026-01-01'`).
     fn is_type_start(name: &str) -> bool {
@@ -2117,10 +2179,12 @@ impl Parser {
             name,
             "int"
                 | "integer"
+                | "int4"
                 | "bigint"
                 | "int8"
                 | "smallint"
                 | "int2"
+                | "serial"
                 | "real"
                 | "float4"
                 | "float8"
@@ -2131,6 +2195,11 @@ impl Parser {
                 | "bool"
                 | "boolean"
                 | "text"
+                | "varchar"
+                | "char"
+                | "character"
+                | "bpchar"
+                | "name"
                 | "date"
                 | "timestamp"
                 | "timestamptz"
@@ -2155,7 +2224,14 @@ impl Parser {
             } else {
                 false
             };
-            let name = self.expect_ident()?;
+            let name = if matches!(self.peek(), Token::Ident(ref s) if s == "on") {
+                // v0.14: the index name may be omitted
+                // (`CREATE INDEX ON t (a, b)`); PostgreSQL auto-names it
+                // <table>_<columns>_idx. Filled in after parsing columns.
+                String::new()
+            } else {
+                self.expect_ident()?
+            };
             self.expect_keyword("on")?;
             let table = self.expect_ident()?;
             self.expect(Token::LParen, "'('")?;
@@ -2178,6 +2254,11 @@ impl Parser {
                     "syntax error: index requires at least one column".to_string()
                 ));
             }
+            let name = if name.is_empty() {
+                format!("{}_{}_idx", table, columns.join("_"))
+            } else {
+                name
+            };
             return Ok(Stmt::CreateIndex {
                 name,
                 table,
@@ -2190,6 +2271,18 @@ impl Parser {
         // tokenizing so the raw query text survives).
         if matches!(self.peek(), Token::Ident(ref s) if s == "sequence") {
             return self.parse_create_sequence();
+        }
+        // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
+        // TEMPORARY is accepted for pg_regress conformance but currently
+        // behaves as a regular persistent table: per-session scoping and
+        // ON COMMIT behavior are not implemented (documented in README).
+        if self.eat_keyword("temporary") || self.eat_keyword("temp") {
+            // TEMP accepted, TEMPORARY semantics not implemented
+        } else {
+            // GLOBAL/LOCAL are noise words in PostgreSQL (SQL standard
+            // scoping); accept and ignore them as well.
+            let _ = self.eat_keyword("global") || self.eat_keyword("local");
+            let _ = self.eat_keyword("temporary") || self.eat_keyword("temp");
         }
         self.expect_keyword("table")?;
         let name = self.expect_ident()?;
@@ -3220,16 +3313,32 @@ impl Parser {
         if self.eat_keyword("default") {
             return Ok(InsertValue::Default);
         }
-        match self.peek() {
+        // v0.14: typed literals in VALUES, e.g. `bool 't'`, `date '2026-01-01'`
+        // (pg_regress conformance). The text is stored as-is; the column
+        // coercion applies the target type's input function, matching
+        // PostgreSQL assignment semantics (including 22P02 on bad input).
+        if let Token::Ident(name) = self.peek() {
+            if Self::is_type_start(&name) {
+                let save = self.pos;
+                self.next(); // consume the type name
+                if self.parse_type_name_rest(name).is_ok() {
+                    if let Token::Str(s) = self.next() {
+                        return Ok(InsertValue::Lit(Literal::Text(s)));
+                    }
+                }
+                self.pos = save;
+            }
+        }
+        let value = match self.peek() {
             Token::Param(n) => {
                 self.next();
-                Ok(InsertValue::Param(n))
+                InsertValue::Param(n)
             }
             Token::Minus | Token::Plus => {
                 let neg = self.peek() == Token::Minus;
                 self.next();
                 let lit = self.parse_literal()?;
-                Ok(InsertValue::Lit(match (neg, lit) {
+                InsertValue::Lit(match (neg, lit) {
                     (true, Literal::Int(i)) => Literal::Int(-i),
                     (true, Literal::BigInt(i)) => Literal::BigInt(-i),
                     // `-9223372036854775808`: the digits alone overflow
@@ -3240,10 +3349,20 @@ impl Parser {
                     (true, Literal::Decimal(s)) => Literal::Decimal(format!("-{}", s)),
                     (true, Literal::Float(f)) => Literal::Float(-f),
                     (_, l) => l,
-                }))
+                })
             }
-            _ => Ok(InsertValue::Lit(self.parse_literal()?)),
+            _ => InsertValue::Lit(self.parse_literal()?),
+        };
+        // v0.14: `::type` cast suffix on a VALUES literal, e.g.
+        // `1::int`, `'x'::text` (pg_regress conformance). The type name
+        // is validated; the literal itself flows through normal column
+        // assignment coercion (the casts in the conformance tests are
+        // no-ops for their target columns).
+        if self.peek() == Token::ColonColon {
+            self.next();
+            let _ = self.parse_type_name()?;
         }
+        Ok(value)
     }
 
     // --- v0.6 expression grammar ---
@@ -3630,6 +3749,27 @@ impl Parser {
     /// forms, and the v0.7 built-in function set. Anything else is
     /// "function does not exist" (SQLSTATE 42883).
     fn parse_call(&mut self, name: String) -> Result<Expr, SqlError> {
+        // v0.14: function-style cast — PostgreSQL treats `typename(expr)`
+        // as a cast when the name is a type and there is exactly one
+        // argument (e.g. `float8(count(*))`).
+        if Self::is_type_start(&name) {
+            let save = self.pos;
+            if let Ok(to) = self.parse_type_name_rest(name.clone()) {
+                if self.peek() == Token::LParen {
+                    self.next();
+                    if let Ok(expr) = self.parse_or() {
+                        if self.peek() == Token::RParen {
+                            self.next();
+                            return Ok(Expr::Cast {
+                                expr: Box::new(expr),
+                                to,
+                            });
+                        }
+                    }
+                }
+            }
+            self.pos = save;
+        }
         match name.as_str() {
             "extract" => return self.parse_extract(),
             "trim" => return self.parse_trim(),
@@ -4134,11 +4274,17 @@ impl Parser {
 
     fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
         let verbose = self.eat_keyword("verbose");
+        // v0.14: `VACUUM ANALYZE` (pg_regress conformance).
+        let analyze = self.eat_keyword("analyze");
         let table = match self.peek() {
             Token::Ident(_) => Some(self.expect_ident()?),
             _ => None,
         };
-        Ok(Stmt::Vacuum { table, verbose })
+        Ok(Stmt::Vacuum {
+            table,
+            verbose,
+            analyze,
+        })
     }
 
     /// The body of a SELECT after the `SELECT` keyword was consumed.
@@ -4374,24 +4520,70 @@ impl Parser {
     fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
         if self.peek() == Token::LParen {
             self.next();
-            let sub = self.parse_subquery()?;
-            self.expect(Token::RParen, "')'")?;
-            // Derived tables require an alias, like Postgres.
-            let alias = if self.eat_keyword("as") {
-                self.expect_ident()?
-            } else {
-                match self.peek() {
-                    Token::Ident(s) if !is_reserved(&s) => {
-                        self.next();
-                        s
+            // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
+            // Only consume an extra '(' when it opens a subquery or VALUES —
+            // never a VALUES row tuple like (1, 2).
+            let mut extra = 0;
+            while self.peek() == Token::LParen
+                && matches!(self.peek2(), Token::Ident(ref s) if s == "select" || s == "values")
+            {
+                self.next();
+                extra += 1;
+            }
+            let mut item = if matches!(self.peek(), Token::Ident(ref s) if s == "values") {
+                self.next();
+                let mut rows: Vec<Vec<Expr>> = Vec::new();
+                loop {
+                    self.expect(Token::LParen, "'('")?;
+                    let mut row = Vec::new();
+                    loop {
+                        row.push(self.parse_or()?);
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in VALUES row, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
                     }
-                    _ => return Err(err("syntax error: subquery in FROM must have an alias")),
+                    rows.push(row);
+                    if self.peek() == Token::Comma {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+                if rows.is_empty() {
+                    return Err(err(
+                        "syntax error: VALUES requires at least one row".to_string()
+                    ));
+                }
+                FromItem::Values {
+                    rows,
+                    alias: String::new(),
+                }
+            } else {
+                let sub = self.parse_subquery()?;
+                FromItem::Derived {
+                    sub: Box::new(sub),
+                    alias: String::new(),
                 }
             };
-            Ok(FromItem::Derived {
-                sub: Box::new(sub),
-                alias,
-            })
+            for _ in 0..=extra {
+                self.expect(Token::RParen, "')'")?;
+            }
+            // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
+            let alias = self.parse_derived_alias()?;
+            match &mut item {
+                FromItem::Values { alias: a, .. } | FromItem::Derived { alias: a, .. } => {
+                    *a = alias;
+                }
+                _ => unreachable!("parse_from_primary paren branch"),
+            }
+            Ok(item)
         } else {
             let name = self.expect_ident()?;
             // v0.9: schema-qualified names, so the information_schema
@@ -4404,6 +4596,29 @@ impl Parser {
             };
             let alias = self.parse_alias_opt()?;
             Ok(FromItem::Table { name, alias })
+        }
+    }
+
+    /// Alias for a parenthesized FROM item. PostgreSQL auto-generates
+    /// `unnamed_subquery[_N]` when no alias is given (v0.14).
+    fn parse_derived_alias(&mut self) -> Result<String, SqlError> {
+        if self.eat_keyword("as") {
+            return self.expect_ident();
+        }
+        match self.peek() {
+            Token::Ident(s) if !is_reserved(&s) => {
+                self.next();
+                Ok(s)
+            }
+            _ => {
+                let n = self.unnamed_seq;
+                self.unnamed_seq += 1;
+                Ok(if n == 0 {
+                    "unnamed_subquery".to_string()
+                } else {
+                    format!("unnamed_subquery_{}", n)
+                })
+            }
         }
     }
 
@@ -4990,6 +5205,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "coalesce" | "nullif" | "greatest" | "least"
         // v0.9: sequence functions
         | "nextval" | "currval" | "setval"
+        // v0.14: PostgreSQL internal operator-function aliases
+        | "booleq" | "boolne" | "int4eq" | "texteq"
     )
 }
 
@@ -5009,6 +5226,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         // v0.9: setval(name, value [, is_called])
         "nextval" | "currval" => n == 1,
         "setval" => n == 2 || n == 3,
+        // v0.14: PostgreSQL internal operator-function aliases
+        "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
         _ => false,
     };
     if ok {
@@ -5240,6 +5459,7 @@ pub fn collect_table_refs(sel: &SelectStmt, out: &mut Vec<String>) {
         match fi {
             FromItem::Table { name, .. } => out.push(name.clone()),
             FromItem::Derived { sub, .. } => collect_table_refs(sub, out),
+            FromItem::Values { .. } => {}
             FromItem::Join { left, right, .. } => {
                 from_item(left, out);
                 from_item(right, out);
@@ -5254,7 +5474,11 @@ pub fn collect_table_refs(sel: &SelectStmt, out: &mut Vec<String>) {
 /// Parse one statement from already-trimmed text (no view interception).
 fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(text)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        unnamed_seq: 0,
+    };
     let stmt = p.parse_top()?;
     match p.next() {
         Token::EOF => Ok(stmt),

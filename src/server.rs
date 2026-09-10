@@ -1219,7 +1219,21 @@ fn run_statement(
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
         Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
-        Stmt::Vacuum { table, verbose } => txn_vacuum(engine, session, table.as_deref(), *verbose),
+        Stmt::Vacuum {
+            table,
+            verbose,
+            analyze,
+        } => {
+            let out = txn_vacuum(engine, session, table.as_deref(), *verbose)?;
+            // v0.14: `VACUUM ANALYZE` also collects planner statistics.
+            if *analyze {
+                let a = Stmt::Analyze {
+                    table: table.clone(),
+                };
+                autocommit_execute(engine, wal, session.sid, &session.role, &a)?;
+            }
+            Ok(out)
+        }
         _ => {
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)

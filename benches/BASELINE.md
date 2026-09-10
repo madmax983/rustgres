@@ -2,6 +2,17 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.14 baseline — 2026-09-10
+
+No full benchmark run for v0.14: the milestone is the pg_regress
+conformance harness plus parser gaps, with no hot-path rewrites on the
+normal query path. The one executor-adjacent change is the commit-time
+unique recheck (`records_for_commit` → `committed_unique_violation`),
+which runs once per INSERT commit and only when the table has unique
+indexes; tables without unique indexes skip the index scan entirely.
+v0.13 numbers below are carried forward as the v0.14 baseline pending
+a clean-box re-run.
+
 ## v0.13 baseline — 2026-09-10
 
 Environment: same sandbox, **release build** (`cargo build --release`),

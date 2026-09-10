@@ -81,6 +81,26 @@ impl ColType {
             ColType::Uuid => "uuid",
         }
     }
+
+    /// PostgreSQL `pg_type.typname` (v0.14): used as the default column
+    /// name for a bare `SELECT expr::type` cast, like Postgres.
+    pub fn pg_typname(&self) -> &'static str {
+        match self {
+            ColType::Int => "int4",
+            ColType::BigInt => "int8",
+            ColType::SmallInt => "int2",
+            ColType::Float => "float8",
+            ColType::Float4 => "float4",
+            ColType::Numeric => "numeric",
+            ColType::Text => "text",
+            ColType::Bool => "bool",
+            ColType::Date => "date",
+            ColType::Timestamp => "timestamp",
+            ColType::Timestamptz => "timestamptz",
+            ColType::Bytea => "bytea",
+            ColType::Uuid => "uuid",
+        }
+    }
 }
 
 /// Fixed-precision decimal (v0.7): value = `unscaled * 10^-scale`.
@@ -1168,6 +1188,57 @@ impl Database {
             };
             if alive {
                 return Some(id);
+            }
+        }
+        None
+    }
+
+    /// v0.14: commit-time unique recheck. Like [`Self::unique_violation`],
+    /// but against rows committed by OTHER transactions — i.e. visible to
+    /// a fresh snapshot, not to our own (possibly stale) one. Catches the
+    /// race where a concurrent transaction committed the same unique key
+    /// after our statement-time check ran (see
+    /// `tests/conformance/isolation_specs.py::insert-conflict-do-nothing`).
+    /// Returns the conflicting index name. `own_row_id` (our inserted row)
+    /// is excluded.
+    pub fn committed_unique_violation(
+        &self,
+        txns: &TxnManager,
+        table: &str,
+        values: &[Value],
+        own_row_id: u64,
+        own: u64,
+    ) -> Option<String> {
+        // Fresh snapshot: everything committed as of now is visible.
+        // `own` is still in `active`; row_visible would accept our own
+        // rows, so they are excluded explicitly by id below.
+        let fresh = Snapshot {
+            active: txns.active.iter().copied().collect(),
+            next_xid: txns.next_xid,
+        };
+        let t = self.find_table(table, &fresh, own)?;
+        for ix in self.visible_indexes_for(table, &fresh, own) {
+            if !ix.def.unique {
+                continue;
+            }
+            let key = ix.key_for(values);
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict
+            }
+            let Some(bucket) = ix.tree.get(&key) else {
+                continue;
+            };
+            for &id in bucket {
+                if id == own_row_id {
+                    continue;
+                }
+                let Some(pos) = t.row_pos(id) else {
+                    continue; // vacuumed away: cannot conflict
+                };
+                let r = &t.rows[pos];
+                if r.xmin != own && row_visible(r, &fresh, own) {
+                    return Some(ix.def.name.clone());
+                }
             }
         }
         None

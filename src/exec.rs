@@ -3350,7 +3350,7 @@ fn plan_order_scan(
         FromItem::Table { name, alias } => {
             (name.as_str(), alias.clone().unwrap_or_else(|| name.clone()))
         }
-        FromItem::Derived { .. } | FromItem::Join { .. } => return None,
+        FromItem::Derived { .. } | FromItem::Join { .. } | FromItem::Values { .. } => return None,
     };
     let t = eng.db.find_table(table_name, snap, own)?;
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a
@@ -3522,6 +3522,10 @@ enum PlanNode {
         rows: u64,
         child: Box<PlanNode>,
     },
+    /// v0.14: `(VALUES ...)` table source.
+    Values {
+        rows: u64,
+    },
 }
 
 impl PlanNode {
@@ -3537,6 +3541,7 @@ impl PlanNode {
             | PlanNode::Sort { rows, .. }
             | PlanNode::Limit { rows, .. }
             | PlanNode::SubqueryScan { rows, .. } => *rows,
+            PlanNode::Values { rows, .. } => *rows,
         }
     }
 
@@ -3747,6 +3752,10 @@ fn plan_from_item(
                 child: Box::new(child),
             })
         }
+        // v0.14: VALUES rows are uncorrelated constants.
+        FromItem::Values { rows, .. } => Ok(PlanNode::Values {
+            rows: rows.len() as u64,
+        }),
         // The executor runs joins as nested loops; the filter attaches to
         // the outermost Nested Loop node at the top level.
         FromItem::Join { left, right, .. } => {
@@ -3956,6 +3965,9 @@ fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             out.push(format!("{}Subquery Scan on {} (rows={})", pad, alias, rows));
             render_plan(child, depth + 1, out);
         }
+        PlanNode::Values { rows } => {
+            out.push(format!("{}Values (rows={})", pad, rows));
+        }
     }
 }
 
@@ -3977,6 +3989,27 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
         rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
     })
+}
+
+/// v0.14: best-effort `Value` -> `ColType` for VALUES column typing
+/// (first non-NULL value wins; all-NULL columns describe as TEXT).
+fn value_coltype(v: &Value) -> ColType {
+    match v {
+        Value::SmallInt(_) => ColType::SmallInt,
+        Value::Int(_) => ColType::Int,
+        Value::BigInt(_) => ColType::BigInt,
+        Value::Float4(_) => ColType::Float4,
+        Value::Float(_) => ColType::Float,
+        Value::Numeric(_) => ColType::Numeric,
+        Value::Text(_) => ColType::Text,
+        Value::Bool(_) => ColType::Bool,
+        Value::Date(_) => ColType::Date,
+        Value::Timestamp(_) => ColType::Timestamp,
+        Value::Timestamptz(_) => ColType::Timestamptz,
+        Value::Bytea(_) => ColType::Bytea,
+        Value::Uuid(_) => ColType::Uuid,
+        Value::Null => ColType::Text,
+    }
 }
 
 // --- ANALYZE -----------------------------------------------------------------
@@ -4763,6 +4796,7 @@ fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
                 out.push((qual, real));
             }
             FromItem::Derived { alias, .. } => out.push((alias.clone(), None)),
+            FromItem::Values { alias, .. } => out.push((alias.clone(), None)),
             FromItem::Join { left, right, .. } => {
                 walk(q, left, out);
                 walk(q, right, out);
@@ -5145,6 +5179,7 @@ fn from_refs_table(f: &FromItem, name: &str) -> bool {
     match f {
         FromItem::Table { name: n, .. } => n == name,
         FromItem::Derived { sub, .. } => stmt_refs_table(sub, name),
+        FromItem::Values { .. } => false,
         FromItem::Join { left, right, .. } => {
             from_refs_table(left, name) || from_refs_table(right, name)
         }
@@ -5368,6 +5403,14 @@ fn validate_from(f: &FromItem) -> Result<(), ExecError> {
     match f {
         FromItem::Table { .. } => Ok(()),
         FromItem::Derived { sub, .. } => validate_select(sub),
+        FromItem::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    validate_expr(e)?;
+                }
+            }
+            Ok(())
+        }
         FromItem::Join {
             left, right, on, ..
         } => {
@@ -6926,6 +6969,13 @@ fn collect_from_refs(f: &FromItem, out: &mut Vec<(Option<String>, String)>) {
             }
         }
         FromItem::Derived { sub, .. } => collect_stmt_refs(sub, out),
+        FromItem::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    collect_column_refs(e, out);
+                }
+            }
+        }
         FromItem::Table { .. } => {}
     }
 }
@@ -7269,6 +7319,53 @@ fn build_source(
                 .collect();
             let rows: Vec<QRow> = out
                 .rows
+                .into_iter()
+                .map(|cells| QRow {
+                    cells,
+                    prov: Vec::new(),
+                })
+                .collect();
+            Ok((schema, rows))
+        }
+        // v0.14: `(VALUES (e, ...) [, ...]) [AS] alias`. VALUES is
+        // uncorrelated, so every row evaluates with no scopes. Columns
+        // are named `column1`, `column2`, ... like PostgreSQL.
+        FromItem::Values { rows, alias } => {
+            let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut eval_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.len() != ncols {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "VALUES lists must all be the same length ({} vs {})",
+                            ncols,
+                            row.len()
+                        ),
+                    ));
+                }
+                let mut cells = Vec::with_capacity(ncols);
+                for e in row {
+                    cells.push(eval_expr(q, &[], e)?);
+                }
+                eval_rows.push(cells);
+            }
+            let schema: Vec<QCol> = (0..ncols)
+                .map(|i| {
+                    let ty = eval_rows
+                        .iter()
+                        .map(|r| &r[i])
+                        .find(|v| !matches!(v, Value::Null))
+                        .map(value_coltype)
+                        .unwrap_or(ColType::Text);
+                    QCol {
+                        qual: alias.clone(),
+                        name: format!("column{}", i + 1),
+                        ty,
+                    }
+                })
+                .collect();
+            let rows = eval_rows
                 .into_iter()
                 .map(|cells| QRow {
                     cells,
@@ -9256,14 +9353,40 @@ fn cast_to_numeric(v: &Value) -> Result<Numeric, ExecError> {
 fn cast_to_bool(v: &Value) -> Result<bool, ExecError> {
     match v {
         Value::Bool(b) => Ok(*b),
-        Value::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
-            "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
-            _ => Err(exec_err(
-                "22P02",
-                format!("invalid input syntax for type boolean: {:?}", s),
-            )),
-        },
+        // v0.14: PostgreSQL boolean input accepts unambiguous prefixes of
+        // true/false/yes/no/on/off (e.g. 'of' -> false, 'tru' -> true);
+        // a bare 'o' is ambiguous (on/off) and rejected, like PG.
+        Value::Text(s) => {
+            let l = s.trim().to_ascii_lowercase();
+            let parsed = match l.chars().next() {
+                Some('t') if "true".starts_with(l.as_str()) => Some(true),
+                Some('f') if "false".starts_with(l.as_str()) => Some(false),
+                Some('y') if "yes".starts_with(l.as_str()) => Some(true),
+                Some('n') if "no".starts_with(l.as_str()) => Some(false),
+                Some('o') => {
+                    let on = "on".starts_with(l.as_str());
+                    let off = "off".starts_with(l.as_str());
+                    match (on, off) {
+                        (true, false) => Some(true),
+                        (false, true) => Some(false),
+                        _ => None, // ambiguous ('o') or invalid
+                    }
+                }
+                Some('1') if l.len() == 1 => Some(true),
+                Some('0') if l.len() == 1 => Some(false),
+                _ => None,
+            };
+            parsed.ok_or_else(|| {
+                exec_err(
+                    "22P02",
+                    format!("invalid input syntax for type boolean: {:?}", s),
+                )
+            })
+        }
+        // v0.14: PostgreSQL casts integers to boolean (0 -> false, else true).
+        Value::SmallInt(i) => Ok(*i != 0),
+        Value::Int(i) => Ok(*i != 0),
+        Value::BigInt(i) => Ok(*i != 0),
         other => Err(cast_err(other, "boolean")),
     }
 }
@@ -9610,6 +9733,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "replace" | "split_part" | "trim" => n == 3,
         "now" | "current_date" | "current_timestamp" => n == 0,
         "coalesce" | "greatest" | "least" => n >= 1,
+        // v0.14: PostgreSQL internal operator-function aliases (pg_regress).
+        "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
         // v0.9: sequence functions.
         "nextval" | "currval" => n == 1,
         "setval" => n == 2 || n == 3,
@@ -9644,6 +9769,10 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             eval_datetime_func(name, vals)
         }
         "coalesce" | "nullif" | "greatest" | "least" => eval_cond_func(name, vals),
+        // v0.14: PostgreSQL internal operator-function aliases (pg_regress
+        // conformance): booleq(x,y) ≡ x = y, boolne(x,y) ≡ x <> y, etc.
+        "booleq" | "int4eq" | "texteq" => eval_cmp_vals(CmpOp::Eq, &vals[0], &vals[1]),
+        "boolne" => eval_cmp_vals(CmpOp::Ne, &vals[0], &vals[1]),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -10083,6 +10212,8 @@ fn func_result_type(
         "coalesce" | "nullif" | "greatest" | "least" => arg0(),
         // v0.9: sequence functions return bigint (INT here).
         "nextval" | "currval" | "setval" => Ok(ColType::Int),
+        // v0.14: PostgreSQL internal operator-function aliases return boolean.
+        "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -10410,6 +10541,25 @@ fn from_schema_item(
             );
             Ok(())
         }
+        // v0.14: VALUES columns are `column1`, ... typed from the first
+        // row's expressions (all-NULL columns describe as TEXT).
+        FromItem::Values { rows, alias } => {
+            let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let first = rows.first().cloned().unwrap_or_default();
+            out.push(
+                (0..ncols)
+                    .map(|i| QCol {
+                        qual: alias.clone(),
+                        name: format!("column{}", i + 1),
+                        ty: first
+                            .get(i)
+                            .and_then(|e| hint_type(eng, snap, own, &[], e))
+                            .unwrap_or(ColType::Text),
+                    })
+                    .collect(),
+            );
+            Ok(())
+        }
         FromItem::Join { left, right, .. } => {
             from_schema_item(eng, snap, own, left, out, visible, bindings)?;
             from_schema_item(eng, snap, own, right, out, visible, bindings)
@@ -10508,12 +10658,13 @@ fn describe_select_outer(
 }
 
 /// Default output column name when there is no alias: the column name for
-/// bare refs, the function name for aggregates, `?column?` otherwise —
-/// like Postgres.
+/// bare refs, the function name for aggregates, the type name for casts
+/// (v0.14, like Postgres), `?column?` otherwise.
 fn expr_col_name(e: &Expr) -> String {
     match e {
         Expr::Column { name, .. } => name.clone(),
         Expr::Agg { func, .. } => func.name().to_string(),
+        Expr::Cast { to, .. } => to.pg_typname().to_string(),
         _ => "?column?".to_string(),
     }
 }
@@ -11016,6 +11167,15 @@ fn infer_from(
         FromItem::Table { .. } => Ok(()),
         // Derived tables are uncorrelated (no LATERAL): no outer schemas.
         FromItem::Derived { sub, .. } => infer_select(sub, eng, snap, own, &[], out),
+        // v0.14: VALUES rows are uncorrelated constants.
+        FromItem::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    infer_expr(e, eng, snap, own, &[], out)?;
+                }
+            }
+            Ok(())
+        }
         FromItem::Join {
             left, right, on, ..
         } => {
@@ -11603,6 +11763,14 @@ fn subst_from(f: &mut FromItem, params: &[Option<Value>]) -> Result<(), ExecErro
     match f {
         FromItem::Table { .. } => Ok(()),
         FromItem::Derived { sub, .. } => subst_select(sub, params),
+        FromItem::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    subst_expr(e, params)?;
+                }
+            }
+            Ok(())
+        }
         FromItem::Join {
             left, right, on, ..
         } => {
