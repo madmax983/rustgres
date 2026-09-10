@@ -4,6 +4,7 @@
 //! engine backed by a write-ahead log. Zero external crates: builds
 //! offline with plain `cargo build`.
 
+mod copy;
 mod datetime;
 mod exec;
 mod index;

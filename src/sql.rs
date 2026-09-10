@@ -576,6 +576,61 @@ pub enum Expr {
         sub: Box<SelectStmt>,
         neg: bool,
     },
+    /// v0.10: `<func>(args) OVER (PARTITION BY ... ORDER BY ... frame)`.
+    /// `wid` is a per-query window id assigned by the executor's pre-pass
+    /// (the parser leaves it 0); identical window specs share one id.
+    /// `distinct` is only meaningful for `Agg` funcs.
+    Window {
+        func: WindowFunc,
+        args: Vec<Expr>,
+        distinct: bool,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderTerm>,
+        frame: WindowFrame,
+        wid: usize,
+    },
+}
+
+/// v0.10: window function kinds. `Agg` reuses the aggregate functions as
+/// windowed aggregates (`sum(x) OVER (...)`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Agg(AggFunc),
+}
+
+/// v0.10: window frame. `Default` follows the Postgres rule: with ORDER BY
+/// it is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, otherwise
+/// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowFrame {
+    Default,
+    Rows {
+        start: FrameBound,
+        end: FrameBound,
+    },
+    Range {
+        start: FrameBound,
+        end: FrameBound,
+    },
+}
+
+/// v0.10: one end of a window frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -620,6 +675,8 @@ pub enum JoinKind {
 /// A full SELECT statement (v0.6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectStmt {
+    /// v0.10: `WITH [RECURSIVE] ...` CTEs, in definition order.
+    pub with: Vec<CteDef>,
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Vec<FromItem>,
@@ -630,6 +687,28 @@ pub struct SelectStmt {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub for_update: bool,
+}
+
+/// v0.10: one Common Table Expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CteDef {
+    pub name: String,
+    pub col_aliases: Vec<String>,
+    pub body: CteBody,
+    pub recursive: bool,
+}
+
+/// v0.10: a CTE body. Plain CTEs hold one SELECT; recursive CTEs hold the
+/// `non_recursive UNION [ALL] recursive` pair (UNION elsewhere is not
+/// supported in v0.10).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CteBody {
+    Simple(SelectStmt),
+    Union {
+        left: Box<SelectStmt>,
+        right: Box<SelectStmt>,
+        all: bool,
+    },
 }
 
 /// Right-hand side of a `WHERE col = ...` comparison (UPDATE/DELETE only;
@@ -1103,6 +1182,24 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::ResolvedCol { .. } => {}
+        // v0.10: window functions — collect from args, PARTITION BY and
+        // ORDER BY.
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                collect_col_refs(a, out);
+            }
+            for p in partition_by {
+                collect_col_refs(p, out);
+            }
+            for o in order_by {
+                collect_col_refs(&o.expr, out);
+            }
+        }
     }
 }
 
@@ -1147,6 +1244,15 @@ pub enum Stmt {
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertValue>>,
+        /// v0.10: `INSERT INTO ... SELECT ...` source (mutually exclusive
+        /// with `rows`).
+        select: Option<SelectStmt>,
+        /// v0.10: `ON CONFLICT ...`.
+        on_conflict: Option<OnConflict>,
+        /// v0.10: `RETURNING ...`.
+        returning: Vec<SelectItem>,
+        /// v0.10: `WITH ...` CTEs visible to the statement.
+        with: Vec<CteDef>,
     },
     Select(SelectStmt),
     DropTable {
@@ -1160,10 +1266,26 @@ pub enum Stmt {
         /// (column, expression) assignments.
         sets: Vec<(String, Expr)>,
         where_: Vec<WhereCond>,
+        /// v0.10: `RETURNING ...`.
+        returning: Vec<SelectItem>,
+        /// v0.10: `WITH ...` CTEs visible to the statement.
+        with: Vec<CteDef>,
     },
     Delete {
         table: String,
         where_: Vec<WhereCond>,
+        /// v0.10: `RETURNING ...`.
+        returning: Vec<SelectItem>,
+        /// v0.10: `WITH ...` CTEs visible to the statement.
+        with: Vec<CteDef>,
+    },
+    // --- v0.10: COPY -------------------------------------------------------
+    Copy {
+        table: String,
+        columns: Option<Vec<String>>,
+        /// true = `TO STDOUT`, false = `FROM STDIN`.
+        to_stdout: bool,
+        options: CopyOptions,
     },
     // --- v0.3: transaction control (handled by the session, not the executor)
     Begin {
@@ -1209,6 +1331,63 @@ pub enum Stmt {
     },
 }
 
+/// v0.10: `INSERT ... ON CONFLICT ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnConflict {
+    pub arbiter: ConflictArbiter,
+    pub action: ConflictAction,
+}
+
+/// v0.10: conflict arbiter. `None` = no arbiter (`ON CONFLICT DO NOTHING`
+/// catches any unique violation).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConflictArbiter {
+    None,
+    Columns(Vec<String>),
+    Constraint(String),
+}
+
+/// v0.10: `ON CONFLICT` action.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConflictAction {
+    DoNothing,
+    DoUpdate {
+        sets: Vec<(String, Expr)>,
+        where_: Option<Expr>,
+    },
+}
+
+/// v0.10: `COPY` format options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CopyOptions {
+    pub format: CopyFormat,
+    pub delimiter: u8,
+    pub null: String,
+    pub header: bool,
+    pub quote: u8,
+    pub escape: u8,
+}
+
+/// v0.10: `COPY` data format (BINARY is not supported).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CopyFormat {
+    Text,
+    Csv,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        CopyOptions {
+            format: CopyFormat::Text,
+            delimiter: b'\t',
+            null: "\\N".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        }
+    }
+}
+
 /// Transaction isolation level (v0.5). `READ UNCOMMITTED` is accepted and
 /// treated as `READ COMMITTED`, like Postgres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1222,7 +1401,14 @@ impl Stmt {
     /// Highest `$N` referenced anywhere in the statement (0 = no params).
     pub fn max_param(&self) -> usize {
         match self {
-            Stmt::Insert { rows, .. } => {
+            Stmt::Insert {
+                rows,
+                select,
+                on_conflict,
+                returning,
+                with,
+                ..
+            } => {
                 let mut m = 0;
                 for row in rows {
                     for v in row {
@@ -1231,11 +1417,25 @@ impl Stmt {
                         }
                     }
                 }
+                if let Some(sel) = select {
+                    m = m.max(max_param_select(sel));
+                }
+                if let Some(oc) = on_conflict {
+                    m = m.max(max_param_on_conflict(oc));
+                }
+                m = m.max(max_param_returning(returning));
+                m = m.max(max_param_ctes(with));
                 m
             }
             Stmt::Select(sel) => max_param_select(sel),
             Stmt::Explain { stmt } => stmt.max_param(),
-            Stmt::Update { sets, where_, .. } => {
+            Stmt::Update {
+                sets,
+                where_,
+                returning,
+                with,
+                ..
+            } => {
                 let mut m = 0;
                 for (_, e) in sets {
                     m = m.max(max_param_expr(e));
@@ -1245,15 +1445,24 @@ impl Stmt {
                         m = m.max(n as usize);
                     }
                 }
+                m = m.max(max_param_returning(returning));
+                m = m.max(max_param_ctes(with));
                 m
             }
-            Stmt::Delete { where_, .. } => {
+            Stmt::Delete {
+                where_,
+                returning,
+                with,
+                ..
+            } => {
                 let mut m = 0;
                 for w in where_ {
                     if let WhereRhs::Param(n) = w.rhs {
                         m = m.max(n as usize);
                     }
                 }
+                m = m.max(max_param_returning(returning));
+                m = m.max(max_param_ctes(with));
                 m
             }
             _ => 0,
@@ -1261,8 +1470,50 @@ impl Stmt {
     }
 }
 
-fn max_param_select(s: &SelectStmt) -> usize {
+/// v0.10: params inside CTE definitions.
+fn max_param_ctes(ctes: &[CteDef]) -> usize {
     let mut m = 0;
+    for c in ctes {
+        match &c.body {
+            CteBody::Simple(s) => m = m.max(max_param_select(s)),
+            CteBody::Union { left, right, .. } => {
+                m = m.max(max_param_select(left).max(max_param_select(right)));
+            }
+        }
+    }
+    m
+}
+
+/// v0.10: params inside `ON CONFLICT ... DO UPDATE`.
+fn max_param_on_conflict(oc: &OnConflict) -> usize {
+    match &oc.action {
+        ConflictAction::DoNothing => 0,
+        ConflictAction::DoUpdate { sets, where_ } => {
+            let mut m = 0;
+            for (_, e) in sets {
+                m = m.max(max_param_expr(e));
+            }
+            if let Some(w) = where_ {
+                m = m.max(max_param_expr(w));
+            }
+            m
+        }
+    }
+}
+
+/// v0.10: params inside `RETURNING`.
+fn max_param_returning(items: &[SelectItem]) -> usize {
+    let mut m = 0;
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            m = m.max(max_param_expr(expr));
+        }
+    }
+    m
+}
+
+fn max_param_select(s: &SelectStmt) -> usize {
+    let mut m = max_param_ctes(&s.with);
     for item in &s.items {
         match item {
             SelectItem::Expr { expr, .. } => m = m.max(max_param_expr(expr)),
@@ -1334,6 +1585,31 @@ fn max_param_expr(e: &Expr) -> usize {
         Expr::ScalarSub(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
         Expr::Exists { sub, .. } => max_param_select(sub),
+        // v0.10: window functions.
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => args
+            .iter()
+            .map(max_param_expr)
+            .max()
+            .unwrap_or(0)
+            .max(
+                partition_by
+                    .iter()
+                    .map(max_param_expr)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .max(
+                order_by
+                    .iter()
+                    .map(|o| max_param_expr(&o.expr))
+                    .max()
+                    .unwrap_or(0),
+            ),
     }
 }
 
@@ -1402,6 +1678,7 @@ fn is_reserved(word: &str) -> bool {
             | "read"
             | "release"
             | "repeatable"
+            | "returning" // v0.10: RETURNING clause
             | "rollback"
             | "savepoint"
             | "select"
@@ -1412,12 +1689,34 @@ fn is_reserved(word: &str) -> bool {
             | "transaction"
             | "uncommitted"
             | "committed"
+            | "union" // v0.10: recursive CTEs
             | "update"
             | "vacuum"
             | "values"
             | "verbose"
             | "where"
     )
+}
+
+/// v0.10: output column count of a SELECT, when statically known
+/// (`SELECT *` makes it unknown).
+fn cte_width(s: &SelectStmt) -> Option<usize> {
+    let mut n = 0;
+    for item in &s.items {
+        match item {
+            SelectItem::Expr { .. } => n += 1,
+            SelectItem::All | SelectItem::AllOf(_) => return None,
+        }
+    }
+    Some(n)
+}
+
+/// v0.10: the parsed contents of `OVER (...)`, before conversion into
+/// `Expr::Window`.
+struct WindowSpec {
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderTerm>,
+    frame: WindowFrame,
 }
 
 struct Parser {
@@ -1588,6 +1887,9 @@ impl Parser {
                     "syntax error: expected TABLE or SEQUENCE after ALTER".to_string(),
                 )),
             },
+            // --- v0.10: WITH [RECURSIVE] ... / COPY
+            "with" => self.parse_with(),
+            "copy" => self.parse_copy(),
             _ => Err(err(format!("syntax error at or near \"{}\"", kw))),
         }
     }
@@ -2258,36 +2560,487 @@ impl Parser {
         } else {
             None
         };
-        self.expect_keyword("values")?;
-        let mut rows = Vec::new();
-        loop {
-            self.expect(Token::LParen, "'('")?;
-            let mut row = Vec::new();
+        // v0.10: `INSERT INTO ... SELECT ...` (or VALUES).
+        let (rows, select) = if self.eat_keyword("select") {
+            let sel = self.parse_select_rest()?;
+            (Vec::new(), Some(sel))
+        } else {
+            self.expect_keyword("values")?;
+            let mut rows = Vec::new();
             loop {
-                row.push(self.parse_insert_value()?);
-                match self.next() {
-                    Token::Comma => continue,
-                    Token::RParen => break,
-                    other => {
-                        return Err(err(format!(
-                            "syntax error: expected ',' or ')', found {:?}",
-                            other
-                        )));
+                self.expect(Token::LParen, "'('")?;
+                let mut row = Vec::new();
+                loop {
+                    row.push(self.parse_insert_value()?);
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
                     }
                 }
+                rows.push(row);
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
             }
-            rows.push(row);
+            (rows, None)
+        };
+        // v0.10: `ON CONFLICT ...`.
+        let on_conflict = self.parse_on_conflict()?;
+        // v0.10: `RETURNING ...`.
+        let returning = self.parse_returning()?;
+        Ok(Stmt::Insert {
+            table,
+            columns,
+            rows,
+            select,
+            on_conflict,
+            returning,
+            with: Vec::new(),
+        })
+    }
+
+    /// v0.10: `RETURNING * | expr [, ...]` after INSERT/UPDATE/DELETE.
+    /// Empty when the keyword is absent.
+    fn parse_returning(&mut self) -> Result<Vec<SelectItem>, SqlError> {
+        if !self.eat_keyword("returning") {
+            return Ok(Vec::new());
+        }
+        let mut items = Vec::new();
+        loop {
+            if self.peek() == Token::Star {
+                self.next();
+                items.push(SelectItem::All);
+            } else if let Token::Ident(q) = self.peek() {
+                if self.peek2() == Token::Dot && self.peek3() == Token::Star {
+                    self.next();
+                    self.next();
+                    self.next();
+                    items.push(SelectItem::AllOf(q));
+                } else {
+                    let expr = self.parse_or()?;
+                    let alias = self.parse_alias_opt()?;
+                    items.push(SelectItem::Expr { expr, alias });
+                }
+            } else {
+                let expr = self.parse_or()?;
+                let alias = self.parse_alias_opt()?;
+                items.push(SelectItem::Expr { expr, alias });
+            }
             if self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
             break;
         }
-        Ok(Stmt::Insert {
+        if items.is_empty() {
+            return Err(err("syntax error: RETURNING requires a select list"));
+        }
+        Ok(items)
+    }
+
+    /// v0.10: `ON CONFLICT [ ( cols ) | ON CONSTRAINT name ] DO NOTHING |
+    /// DO UPDATE SET ... [WHERE ...]`. Returns None when absent.
+    fn parse_on_conflict(&mut self) -> Result<Option<OnConflict>, SqlError> {
+        if !self.eat_keyword("on") {
+            return Ok(None);
+        }
+        self.expect_keyword("conflict")?;
+        let arbiter = if self.eat_keyword("on") {
+            self.expect_keyword("constraint")?;
+            ConflictArbiter::Constraint(self.expect_ident()?)
+        } else if self.peek() == Token::LParen {
+            self.next();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+            if cols.is_empty() {
+                return Err(err(
+                    "syntax error: ON CONFLICT arbiter requires at least one column".to_string(),
+                ));
+            }
+            ConflictArbiter::Columns(cols)
+        } else {
+            ConflictArbiter::None
+        };
+        // Optional index_predicate (`WHERE ...`) on the arbiter is not
+        // supported in v0.10.
+        if self.eat_keyword("where") {
+            return Err(SqlError {
+                message: "ON CONFLICT with a WHERE arbiter predicate is not supported yet"
+                    .to_string(),
+                code: "0A000",
+            });
+        }
+        let action = if self.eat_keyword("do") {
+            if self.eat_keyword("nothing") {
+                ConflictAction::DoNothing
+            } else if self.eat_keyword("update") {
+                self.expect_keyword("set")?;
+                let mut sets = Vec::new();
+                loop {
+                    let col = self.expect_ident()?;
+                    self.expect(Token::Eq, "'='")?;
+                    let expr = self.parse_or()?;
+                    sets.push((col, expr));
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                if sets.is_empty() {
+                    return Err(err(
+                        "syntax error: ON CONFLICT DO UPDATE requires at least one assignment"
+                            .to_string(),
+                    ));
+                }
+                let where_ = if self.eat_keyword("where") {
+                    Some(self.parse_or()?)
+                } else {
+                    None
+                };
+                ConflictAction::DoUpdate { sets, where_ }
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected NOTHING or UPDATE after ON CONFLICT DO, found {:?}",
+                    self.peek()
+                )));
+            }
+        } else {
+            return Err(err(format!(
+                "syntax error: expected DO after ON CONFLICT, found {:?}",
+                self.peek()
+            )));
+        };
+        Ok(Some(OnConflict { arbiter, action }))
+    }
+
+    /// v0.10: `WITH [RECURSIVE] name [(cols)] AS (select) [, ...]` followed
+    /// by SELECT / INSERT / UPDATE / DELETE.
+    fn parse_with(&mut self) -> Result<Stmt, SqlError> {
+        let recursive = self.eat_keyword("recursive");
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            let col_aliases = if self.peek() == Token::LParen {
+                self.next();
+                let mut aliases = Vec::new();
+                loop {
+                    aliases.push(self.expect_ident()?);
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
+                aliases
+            } else {
+                Vec::new()
+            };
+            self.expect_keyword("as")?;
+            self.expect(Token::LParen, "'('")?;
+            let body = self.parse_cte_body(recursive)?;
+            self.expect(Token::RParen, "')'")?;
+            if ctes.iter().any(|c: &CteDef| c.name == name) {
+                return Err(err(format!("duplicate CTE name \"{}\"", name)));
+            }
+            ctes.push(CteDef {
+                name,
+                col_aliases,
+                body,
+                recursive,
+            });
+            if self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        if ctes.is_empty() {
+            return Err(err("syntax error: WITH requires at least one CTE".to_string()));
+        }
+        let kw = match self.next() {
+            Token::Ident(kw) => kw,
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected SELECT, INSERT, UPDATE or DELETE after WITH, found {:?}",
+                    other
+                )))
+            }
+        };
+        match kw.as_str() {
+            "select" => {
+                let mut sel = self.parse_select_rest()?;
+                sel.with = ctes;
+                Ok(Stmt::Select(sel))
+            }
+            "insert" => {
+                let mut stmt = self.parse_insert()?;
+                match &mut stmt {
+                    Stmt::Insert { with, .. } => *with = ctes,
+                    _ => unreachable!(),
+                }
+                Ok(stmt)
+            }
+            "update" => {
+                let mut stmt = self.parse_update()?;
+                match &mut stmt {
+                    Stmt::Update { with, .. } => *with = ctes,
+                    _ => unreachable!(),
+                }
+                Ok(stmt)
+            }
+            "delete" => {
+                let mut stmt = self.parse_delete()?;
+                match &mut stmt {
+                    Stmt::Delete { with, .. } => *with = ctes,
+                    _ => unreachable!(),
+                }
+                Ok(stmt)
+            }
+            _ => Err(err(format!(
+                "syntax error: expected SELECT, INSERT, UPDATE or DELETE after WITH, found \"{}\"",
+                kw
+            ))),
+        }
+    }
+
+    /// v0.10: one CTE body. A recursive CTE may be
+    /// `non_recursive UNION [ALL] recursive`.
+    fn parse_cte_body(&mut self, recursive: bool) -> Result<CteBody, SqlError> {
+        // The body must start with SELECT.
+        match self.next() {
+            Token::Ident(kw) if kw == "select" => {}
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected SELECT in CTE body, found {:?}",
+                    other
+                )))
+            }
+        }
+        let first = self.parse_select_rest()?;
+        if self.eat_keyword("union") {
+            if !recursive {
+                return Err(SqlError {
+                    message: "UNION in a CTE body requires WITH RECURSIVE".to_string(),
+                    code: "0A000",
+                });
+            }
+            let all = if self.eat_keyword("all") {
+                true
+            } else {
+                self.eat_keyword("distinct");
+                false
+            };
+            match self.next() {
+                Token::Ident(kw) if kw == "select" => {}
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected SELECT after UNION in recursive CTE, found {:?}",
+                        other
+                    )))
+                }
+            }
+            let second = self.parse_select_rest()?;
+            // Both sides must produce the same number of columns (when
+            // statically known).
+            match (cte_width(&first), cte_width(&second)) {
+                (Some(n1), Some(n2)) if n1 != n2 => {
+                    return Err(err(format!(
+                        "recursive CTE: non-recursive and recursive terms have different column counts ({} vs {})",
+                        n1, n2
+                    )));
+                }
+                _ => {}
+            }
+            Ok(CteBody::Union {
+                left: Box::new(first),
+                right: Box::new(second),
+                all,
+            })
+        } else {
+            Ok(CteBody::Simple(first))
+        }
+    }
+
+    /// v0.10: `COPY table [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`.
+    fn parse_copy(&mut self) -> Result<Stmt, SqlError> {
+        let table = self.expect_ident()?;
+        let columns = if self.peek() == Token::LParen {
+            self.next();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+            Some(cols)
+        } else {
+            None
+        };
+        let to_stdout = if self.eat_keyword("from") {
+            // `FROM STDIN` (a filename is not supported).
+            if self.eat_keyword("stdin") {
+                false
+            } else {
+                return Err(SqlError {
+                    message: "COPY FROM a file is not supported; use COPY FROM STDIN".to_string(),
+                    code: "0A000",
+                });
+            }
+        } else if self.eat_keyword("to") {
+            if self.eat_keyword("stdout") {
+                true
+            } else {
+                return Err(SqlError {
+                    message: "COPY TO a file is not supported; use COPY TO STDOUT".to_string(),
+                    code: "0A000",
+                });
+            }
+        } else {
+            return Err(err(format!(
+                "syntax error: expected FROM or TO after COPY table, found {:?}",
+                self.peek()
+            )));
+        };
+        let mut options = CopyOptions::default();
+        let mut delimiter_set = false;
+        let mut null_set = false;
+        if self.eat_keyword("with") {
+            self.expect(Token::LParen, "'('")?;
+            loop {
+                let opt = self.expect_ident()?;
+                match opt.as_str() {
+                    "format" => {
+                        let fmt = self.expect_ident()?;
+                        options.format = match fmt.as_str() {
+                            "text" => CopyFormat::Text,
+                            "csv" => CopyFormat::Csv,
+                            "binary" => {
+                                return Err(SqlError {
+                                    message: "COPY FORMAT BINARY is not supported".to_string(),
+                                    code: "0A000",
+                                })
+                            }
+                            _ => {
+                                return Err(err(format!(
+                                    "syntax error: unknown COPY format \"{}\"",
+                                    fmt
+                                )))
+                            }
+                        };
+                    }
+                    "delimiter" => {
+                        options.delimiter = self.parse_copy_char("DELIMITER")?;
+                        delimiter_set = true;
+                    }
+                    "null" => {
+                        options.null = self.parse_copy_string("NULL")?;
+                        null_set = true;
+                    }
+                    "header" => {
+                        // `HEADER` or `HEADER true|false`.
+                        options.header = match self.peek() {
+                            Token::Ident(v) if v == "true" => {
+                                self.next();
+                                true
+                            }
+                            Token::Ident(v) if v == "false" => {
+                                self.next();
+                                false
+                            }
+                            _ => true,
+                        };
+                    }
+                    "quote" => {
+                        options.quote = self.parse_copy_char("QUOTE")?;
+                    }
+                    "escape" => {
+                        options.escape = self.parse_copy_char("ESCAPE")?;
+                    }
+                    _ => {
+                        return Err(err(format!("syntax error: unknown COPY option \"{}\"", opt)));
+                    }
+                }
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+        }
+        // v0.10: CSV defaults (like Postgres): comma delimiter and
+        // empty-string NULL unless explicitly set.
+        if options.format == CopyFormat::Csv {
+            if !delimiter_set {
+                options.delimiter = b',';
+            }
+            if !null_set {
+                options.null = String::new();
+            }
+        }
+        Ok(Stmt::Copy {
             table,
             columns,
-            rows,
+            to_stdout,
+            options,
         })
+    }
+
+    /// v0.10: one single-character COPY option value: `'c'` or `E'c'`.
+    fn parse_copy_char(&mut self, what: &str) -> Result<u8, SqlError> {
+        let s = self.parse_copy_string(what)?;
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                if encoded.len() == 1 {
+                    Ok(encoded.as_bytes()[0])
+                } else {
+                    Err(err(format!(
+                        "syntax error: COPY {} must be a single ASCII character",
+                        what
+                    )))
+                }
+            }
+            _ => Err(err(format!(
+                "syntax error: COPY {} must be a single character",
+                what
+            ))),
+        }
+    }
+
+    /// v0.10: a string literal for a COPY option (plain or E''-escaped).
+    fn parse_copy_string(&mut self, what: &str) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Str(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected string literal for COPY {}, found {:?}",
+                what, other
+            ))),
+        }
     }
 
     /// One INSERT value: a literal (with optional unary `+`/`-`), a
@@ -2745,12 +3498,33 @@ impl Parser {
                 None
             };
             self.expect(Token::RParen, "')'")?;
-            return Ok(Expr::Agg {
-                func,
-                arg,
+            let mut args = Vec::new();
+            if let Some(a) = arg {
+                args.push(*a);
+            }
+            if let Some(a) = arg2 {
+                args.push(*a);
+            }
+            let mut expr = Expr::Agg {
+                func: func.clone(),
+                arg: args.first().cloned().map(Box::new),
                 distinct,
-                arg2,
-            });
+                arg2: args.get(1).cloned().map(Box::new),
+            };
+            // v0.10: `<agg>(...) OVER (...)` — windowed aggregate.
+            if self.eat_keyword("over") {
+                let spec = self.parse_window_spec()?;
+                expr = Expr::Window {
+                    func: WindowFunc::Agg(func),
+                    args,
+                    distinct,
+                    partition_by: spec.partition_by,
+                    order_by: spec.order_by,
+                    frame: spec.frame,
+                    wid: 0,
+                };
+            }
+            return Ok(expr);
         }
         // Any `name(` is a function call. Unknown names and wrong
         // arities are 42883 (raised here for builtins, in exec for the
@@ -2772,9 +3546,190 @@ impl Parser {
             if is_builtin_fn(&name) {
                 check_builtin_arity(&name, args.len())?;
             }
+            // v0.10: `<func>(...) OVER (...)` — window function.
+            if self.eat_keyword("over") {
+                let func = match name.as_str() {
+                    "row_number" => WindowFunc::RowNumber,
+                    "rank" => WindowFunc::Rank,
+                    "dense_rank" => WindowFunc::DenseRank,
+                    "ntile" => WindowFunc::Ntile,
+                    "lag" => WindowFunc::Lag,
+                    "lead" => WindowFunc::Lead,
+                    "first_value" => WindowFunc::FirstValue,
+                    "last_value" => WindowFunc::LastValue,
+                    "nth_value" => WindowFunc::NthValue,
+                    _ => {
+                        return Err(SqlError {
+                            message: format!(
+                                "OVER specified, but {} is not a window function",
+                                name
+                            ),
+                            code: "42883",
+                        })
+                    }
+                };
+                let spec = self.parse_window_spec()?;
+                return Ok(Expr::Window {
+                    func,
+                    args,
+                    distinct: false,
+                    partition_by: spec.partition_by,
+                    order_by: spec.order_by,
+                    frame: spec.frame,
+                    wid: 0,
+                });
+            }
             return Ok(Expr::Func { name, args });
         }
         Err(err(format!("syntax error: expected '(', found {:?}", self.peek())))
+    }
+
+    /// v0.10: the parenthesized part of `OVER (...)`: optional PARTITION BY,
+    /// optional ORDER BY, optional frame clause.
+    fn parse_window_spec(&mut self) -> Result<WindowSpec, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut partition_by = Vec::new();
+        if self.eat_keyword("partition") {
+            self.expect_keyword("by")?;
+            loop {
+                partition_by.push(self.parse_or()?);
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        let mut order_by = Vec::new();
+        if self.eat_keyword("order") {
+            self.expect_keyword("by")?;
+            loop {
+                let expr = self.parse_or()?;
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                let nulls_first = if self.eat_keyword("nulls") {
+                    if self.eat_keyword("first") {
+                        Some(true)
+                    } else if self.eat_keyword("last") {
+                        Some(false)
+                    } else {
+                        return Err(err(format!(
+                            "syntax error: expected FIRST or LAST after NULLS, found {:?}",
+                            self.peek()
+                        )));
+                    }
+                } else {
+                    None
+                };
+                order_by.push(OrderTerm {
+                    expr,
+                    desc,
+                    nulls_first,
+                });
+                if self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        let frame = self.parse_window_frame()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(WindowSpec {
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    /// v0.10: `[ROWS|RANGE] BETWEEN <bound> AND <bound>`,
+    /// `[ROWS|RANGE] <bound>`, or absent (Default).
+    fn parse_window_frame(&mut self) -> Result<WindowFrame, SqlError> {
+        let mode = if self.eat_keyword("rows") {
+            Some(false)
+        } else if self.eat_keyword("range") {
+            Some(true)
+        } else {
+            None
+        };
+        let mode = match mode {
+            Some(m) => m,
+            None => return Ok(WindowFrame::Default),
+        };
+        let (start, end) = if self.eat_keyword("between") {
+            let s = self.parse_frame_bound()?;
+            self.expect_keyword("and")?;
+            let e = self.parse_frame_bound()?;
+            (s, e)
+        } else {
+            // `<bound>` alone = `BETWEEN <bound> AND CURRENT ROW`.
+            (self.parse_frame_bound()?, FrameBound::CurrentRow)
+        };
+        // Frame sanity: start must not come after end.
+        let rank = |b: &FrameBound| match b {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::Preceding(_) => 1,
+            FrameBound::CurrentRow => 2,
+            FrameBound::Following(_) => 3,
+            FrameBound::UnboundedFollowing => 4,
+        };
+        if rank(&start) > rank(&end) {
+            return Err(err(
+                "syntax error: frame starting from following row cannot end with current row"
+                    .to_string(),
+            ));
+        }
+        if mode {
+            Ok(WindowFrame::Range { start, end })
+        } else {
+            Ok(WindowFrame::Rows { start, end })
+        }
+    }
+
+    /// v0.10: one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`,
+    /// `CURRENT ROW`, or `<n> PRECEDING|FOLLOWING`.
+    fn parse_frame_bound(&mut self) -> Result<FrameBound, SqlError> {
+        if self.eat_keyword("unbounded") {
+            if self.eat_keyword("preceding") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            if self.eat_keyword("following") {
+                return Ok(FrameBound::UnboundedFollowing);
+            }
+            return Err(err(format!(
+                "syntax error: expected PRECEDING or FOLLOWING after UNBOUNDED, found {:?}",
+                self.peek()
+            )));
+        }
+        if self.eat_keyword("current") {
+            self.expect_keyword("row")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        match self.next() {
+            Token::Number(n) => {
+                let n: u64 = n.parse().map_err(|_| {
+                    err(format!("syntax error: bad frame offset \"{}\"", n))
+                })?;
+                if self.eat_keyword("preceding") {
+                    Ok(FrameBound::Preceding(n))
+                } else if self.eat_keyword("following") {
+                    Ok(FrameBound::Following(n))
+                } else {
+                    Err(err(format!(
+                        "syntax error: expected PRECEDING or FOLLOWING after frame offset, found {:?}",
+                        self.peek()
+                    )))
+                }
+            }
+            other => Err(err(format!(
+                "syntax error: expected frame bound, found {:?}",
+                other
+            ))),
+        }
     }
 
     /// `extract(field FROM expr)`.
@@ -2988,10 +3943,13 @@ impl Parser {
             return Err(err("syntax error: UPDATE requires at least one assignment"));
         }
         let where_ = self.parse_where_opt()?;
+        let returning = self.parse_returning()?;
         Ok(Stmt::Update {
             table,
             sets,
             where_,
+            returning,
+            with: Vec::new(),
         })
     }
 
@@ -2999,7 +3957,13 @@ impl Parser {
         self.expect_keyword("from")?;
         let table = self.expect_ident()?;
         let where_ = self.parse_where_opt()?;
-        Ok(Stmt::Delete { table, where_ })
+        let returning = self.parse_returning()?;
+        Ok(Stmt::Delete {
+            table,
+            where_,
+            returning,
+            with: Vec::new(),
+        })
     }
 
     fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
@@ -3170,6 +4134,7 @@ impl Parser {
             false
         };
         Ok(SelectStmt {
+            with: Vec::new(),
             distinct,
             items,
             from,
@@ -3782,6 +4747,11 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             }
             Ok(())
         }
+        // v0.10: windows are never valid in constraints.
+        Expr::Window { .. } => Err(err(format!(
+            "cannot use window function in {} constraint",
+            what
+        ))),
     }
 }
 
@@ -3965,12 +4935,13 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(expr, out);
             out.push(')');
         }
-        // Aggregates, subqueries and pre-resolved columns can never appear
-        // in a persisted CHECK / DEFAULT (validated at parse time).
+        // Aggregates, subqueries, windows and pre-resolved columns can never
+        // appear in a persisted CHECK / DEFAULT (validated at parse time).
         Expr::Agg { .. }
         | Expr::ScalarSub(_)
         | Expr::InSub { .. }
         | Expr::Exists { .. }
+        | Expr::Window { .. }
         | Expr::ResolvedCol { .. } => {
             out.push_str("(invalid)");
         }

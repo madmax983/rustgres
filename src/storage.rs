@@ -1048,6 +1048,51 @@ impl Database {
         }
         None
     }
+
+    /// v0.10: like `unique_violation`, but restricted to the named unique
+    /// index and returning the conflicting row version's id instead of the
+    /// index name. Used by `INSERT ... ON CONFLICT` to locate the row to
+    /// update (DO UPDATE) or skip (DO NOTHING).
+    pub fn unique_conflict_row(
+        &self,
+        table: &str,
+        index_name: &str,
+        values: &[Value],
+        exclude_row_id: Option<u64>,
+        snap: &Snapshot,
+        own: u64,
+    ) -> Option<u64> {
+        let t = self.find_table(table, snap, own)?;
+        let ix = self
+            .visible_indexes_for(table, snap, own)
+            .into_iter()
+            .find(|ix| ix.def.name == index_name && ix.def.unique)?;
+        let key = ix.key_for(values);
+        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            return None; // NULLs never conflict
+        }
+        let bucket = ix.tree.get(&key)?;
+        for &id in bucket {
+            if Some(id) == exclude_row_id {
+                continue;
+            }
+            let alive = match t.row_pos(id) {
+                Some(pos) => {
+                    let r = &t.rows[pos];
+                    if r.xmax == own {
+                        false // deleted by us: not a conflict
+                    } else {
+                        r.xmin == own || row_visible(r, snap, own)
+                    }
+                }
+                None => false, // vacuumed away: cannot conflict
+            };
+            if alive {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 /// Index DDL visibility: like a table version, but definitions are stored

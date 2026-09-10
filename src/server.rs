@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
-use crate::sql::{self, IsolationLevel, Stmt};
+use crate::sql::{self, CopyFormat, CopyOptions, IsolationLevel, Stmt};
 use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
+use crate::copy;
 
 /// Buffered sink for server→client traffic. Reads still go through the
 /// raw `TcpStream`; every message-loop iteration ends with a `flush()`.
@@ -42,6 +43,8 @@ struct Portal {
     last_tag: Option<String>,
     /// v0.8: the portal ran EXPLAIN — its completion tag is "EXPLAIN".
     explain: bool,
+    /// v0.10: the portal ran INSERT/UPDATE/DELETE — its completion tag.
+    dml_tag: Option<String>,
 }
 
 struct PendingRows {
@@ -205,7 +208,7 @@ fn message_loop(
             b'Q' => {
                 let mut cur = Cursor::new(&msg.payload);
                 let sql_text = cur.read_cstring()?;
-                handle_query(writer, engine, wal, session, &sql_text)?;
+                handle_query(reader, writer, engine, wal, session, &sql_text)?;
             }
             b'P' => handle_parse(writer, session, &msg.payload)?,
             b'B' => handle_bind(writer, engine, session, &msg.payload)?,
@@ -295,6 +298,7 @@ fn protocol_error(
 /// one is open. On the first error the remaining statements are skipped,
 /// like Postgres. Exactly one ReadyForQuery closes the message.
 fn handle_query(
+    reader: &mut TcpStream,
     stream: &mut Writer,
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -327,6 +331,28 @@ fn handle_query(
             send_error(stream, e.code, &e.message)?;
             break;
         }
+        // v0.10: COPY needs the protocol stream (CopyIn/CopyOut exchange).
+        if let Stmt::Copy {
+            table,
+            columns,
+            to_stdout,
+            options,
+        } = &stmt
+        {
+            let copy_ok = if *to_stdout {
+                handle_copy_to(stream, engine, wal, session, table, columns, options)
+            } else {
+                handle_copy_from(reader, stream, engine, wal, session, table, columns, options)
+            };
+            if let Err(e) = copy_ok {
+                // I/O errors abort the connection; SQL errors were already
+                // reported as ErrorResponse inside the handler.
+                if e.kind() != io::ErrorKind::InvalidData {
+                    return Err(e);
+                }
+            }
+            continue;
+        }
         match run_statement(engine, wal, session, &stmt) {
             Err(e) => {
                 send_error(stream, e.code, &e.message)?;
@@ -351,10 +377,346 @@ fn handle_query(
             Ok(ExecResult::Command { tag }) => {
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
+            // v0.10: DML with RETURNING sends rows like a SELECT, then the
+            // completion tag; without RETURNING it is just the tag.
+            // (RowDescription is sent even for zero rows, like Postgres.)
+            Ok(ExecResult::Dml { tag, columns, rows }) => {
+                if !columns.is_empty() {
+                    send_row_description(stream, &columns)?;
+                    for row in &rows {
+                        send_data_row(stream, row)?;
+                    }
+                }
+                MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
+            }
         }
     }
 
     send_ready(stream, session)?;
+    stream.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.10: COPY protocol
+// ---------------------------------------------------------------------------
+
+/// v0.10: `COPY table TO STDOUT` — CopyOutResponse, CopyData rows,
+/// CopyDone, then `COPY n`.
+fn handle_copy_to(
+    stream: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    _wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    options: &CopyOptions,
+) -> io::Result<()> {
+    // Run the SELECT under the session's transaction context (like
+    // run_statement: aborted txn -> 25P02).
+    if let Some(t) = &session.txn {
+        if t.failed {
+            send_error(
+                stream,
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+    let (cols, rows) = {
+        let mut guard = engine.lock().unwrap();
+        // Snapshot/transaction handling mirrors txn_execute/autocommit.
+        if session.txn.is_some() {
+            let t = session.txn.as_mut().unwrap();
+            let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+            let mut ctx = StmtCtx {
+                snap: &snap,
+                own: xid,
+                level,
+                session: session.sid,
+                writes: &mut t.writes,
+            };
+            match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
+                Ok(r) => r,
+                Err(e) => {
+                    t.failed = true;
+                    send_error(stream, e.code, &e.message)?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            let xid = guard.begin_txn();
+            let snap = guard.take_snapshot();
+            let mut writes: Vec<WriteOp> = Vec::new();
+            let result = {
+                let mut ctx = StmtCtx {
+                    snap: &snap,
+                    own: xid,
+                    level: IsolationLevel::ReadCommitted,
+                    session: session.sid,
+                    writes: &mut writes,
+                };
+                exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
+            };
+            // COPY TO is read-only; retire the xid.
+            retire_txn(&mut guard, xid);
+            match result {
+                Ok(r) => r,
+                Err(e) => {
+                    send_error(stream, e.code, &e.message)?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    // CopyOutResponse: format (0=text, 1=csv), column count, per-column
+    // format codes (all text=0).
+    let fmt: i8 = match options.format {
+        CopyFormat::Text => 0,
+        CopyFormat::Csv => 1,
+    };
+    let mut b = MsgBuilder::new(b'H');
+    b.u8(fmt as u8).i16(cols.len() as i16);
+    for _ in &cols {
+        b.i16(0);
+    }
+    b.send(stream)?;
+    // Header row (column names) when requested.
+    if options.header {
+        let mut data = Vec::new();
+        let names: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
+        let nulls = vec![false; names.len()];
+        copy::format_row(&names, &nulls, &mut data, options);
+        MsgBuilder::new(b'd').bytes(&data).send(stream)?;
+    }
+    // Data rows.
+    let mut data = Vec::new();
+    for row in &rows {
+        data.clear();
+        let mut fields = Vec::with_capacity(row.len());
+        let mut nulls = Vec::with_capacity(row.len());
+        for v in row {
+            match v.to_text() {
+                None => {
+                    fields.push(String::new());
+                    nulls.push(true);
+                }
+                Some(s) => {
+                    fields.push(s);
+                    nulls.push(false);
+                }
+            }
+        }
+        copy::format_row(&fields, &nulls, &mut data, options);
+        MsgBuilder::new(b'd').bytes(&data).send(stream)?;
+    }
+    MsgBuilder::new(b'c').send(stream)?; // CopyDone
+    MsgBuilder::new(b'C')
+        .cstr(&format!("COPY {}", rows.len()))
+        .send(stream)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// v0.10: `COPY table FROM STDIN` — CopyInResponse, then CopyData until
+/// CopyDone (or CopyFail), then parse+insert and `COPY n`.
+fn handle_copy_from(
+    reader: &mut TcpStream,
+    stream: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    options: &CopyOptions,
+) -> io::Result<()> {
+    if let Some(t) = &session.txn {
+        if t.failed {
+            send_error(
+                stream,
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+    // Resolve the column count first (validates table/columns).
+    let ncols = {
+        let mut guard = engine.lock().unwrap();
+        let snap = guard.take_snapshot();
+        // Use a throwaway xid for the snapshot owner (read-only).
+        let xid = guard.begin_txn();
+        let r = exec::copy_ncols(&*guard, &snap, xid, table, columns);
+        retire_txn(&mut guard, xid);
+        match r {
+            Ok(n) => n,
+            Err(e) => {
+                send_error(stream, e.code, &e.message)?;
+                stream.flush()?;
+                return Ok(());
+            }
+        }
+    };
+    // CopyInResponse.
+    let fmt: i8 = match options.format {
+        CopyFormat::Text => 0,
+        CopyFormat::Csv => 1,
+    };
+    let mut b = MsgBuilder::new(b'G');
+    b.u8(fmt as u8).i16(ncols as i16);
+    for _ in 0..ncols {
+        b.i16(0);
+    }
+    b.send(stream)?;
+    stream.flush()?;
+    // Collect CopyData until CopyDone / CopyFail.
+    let mut data = Vec::new();
+    loop {
+        let msg = read_message(reader)?;
+        match msg.typ {
+            b'd' => {
+                data.extend_from_slice(&msg.payload);
+            }
+            b'c' => break, // CopyDone
+            b'f' => {
+                // CopyFail: abort the copy.
+                let reason = String::from_utf8_lossy(&msg.payload);
+                send_error(
+                    stream,
+                    "57000",
+                    &format!("COPY failed: {}", reason),
+                )?;
+                stream.flush()?;
+                return Ok(());
+            }
+            b'X' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client terminated during COPY",
+                ));
+            }
+            _ => {
+                send_error(
+                    stream,
+                    "08P01",
+                    &format!(
+                        "unexpected message '{}' during COPY FROM STDIN",
+                        msg.typ as char
+                    ),
+                )?;
+                stream.flush()?;
+                return Ok(());
+            }
+        }
+    }
+    // Parse (line-numbered errors).
+    let parsed = match copy::parse_rows(&data, options, ncols) {
+        Ok(r) => r,
+        Err(e) => {
+            send_error(
+                stream,
+                "22P04",
+                &format!("COPY error on line {}: {}", e.line, e.message),
+            )?;
+            stream.flush()?;
+            // The failed COPY aborts the transaction (like Postgres).
+            if session.txn.is_some() {
+                let _ = txn_rollback(engine, session);
+            }
+            return Ok(());
+        }
+    };
+    // Insert (transactional: uses the session txn if any, else autocommit).
+    let insert_result = if session.txn.is_some() {
+        let mut guard = engine.lock().unwrap();
+        let t = session.txn.as_mut().unwrap();
+        let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+        let r = {
+            let mut ctx = StmtCtx {
+                snap: &snap,
+                own: xid,
+                level,
+                session: session.sid,
+                writes: &mut t.writes,
+            };
+            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
+        };
+        if r.is_err() {
+            t.failed = true;
+        }
+        r.map_err(|e| (e.code, e.message))
+    } else {
+        let mut guard = engine.lock().unwrap();
+        let xid = guard.begin_txn();
+        let snap = guard.take_snapshot();
+        let mut writes: Vec<WriteOp> = Vec::new();
+        let r = {
+            let mut ctx = StmtCtx {
+                snap: &snap,
+                own: xid,
+                level: IsolationLevel::ReadCommitted,
+                session: session.sid,
+                writes: &mut writes,
+            };
+            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
+        };
+        // Mirror autocommit_execute: undo+retire on failure; WAL+retire on
+        // success.
+        match r {
+            Ok(n) => {
+                let records = match wal::records_for_commit(&guard, xid, &writes) {
+                    Ok(r) => r,
+                    Err(msg) => {
+                        undo_all(&mut guard, xid, &writes);
+                        retire_txn(&mut guard, xid);
+                        auto_vacuum(&mut guard, &writes);
+                        send_error(
+                            stream,
+                            "40001",
+                            &format!(
+                                "could not serialize access due to concurrent update: {}",
+                                msg
+                            ),
+                        )?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
+                };
+                if let Err(e) = wal.lock().unwrap().append_batch(&records) {
+                    undo_all(&mut guard, xid, &writes);
+                    retire_txn(&mut guard, xid);
+                    auto_vacuum(&mut guard, &writes);
+                    send_error(stream, "58000", &format!("WAL write failed: {}", e))?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+                retire_txn(&mut guard, xid);
+                auto_vacuum(&mut guard, &writes);
+                Ok(n)
+            }
+            Err(e) => {
+                undo_all(&mut guard, xid, &writes);
+                retire_txn(&mut guard, xid);
+                auto_vacuum(&mut guard, &writes);
+                Err((e.code, e.message))
+            }
+        }
+    };
+    match insert_result {
+        Ok(n) => {
+            MsgBuilder::new(b'C')
+                .cstr(&format!("COPY {}", n))
+                .send(stream)?;
+        }
+        Err((code, msg)) => {
+            send_error(stream, code, &msg)?;
+        }
+    }
     stream.flush()?;
     Ok(())
 }
@@ -1079,6 +1441,7 @@ fn handle_bind(
             done: false,
             last_tag: None,
             explain: false,
+            dml_tag: None,
         },
     );
     MsgBuilder::new(b'2').send(stream)?; // BindComplete
@@ -1275,6 +1638,13 @@ fn handle_execute(
                 stream.flush()?;
                 return Ok(());
             }
+            // v0.10: DML rows (RETURNING) are cached like SELECT rows;
+            // the completion tag is the DML tag.
+            Ok(ExecResult::Dml { tag, rows, .. }) => {
+                let portal = session.portals.get_mut(&portal_name).unwrap();
+                portal.pending = Some(PendingRows { rows, pos: 0 });
+                portal.dml_tag = Some(tag);
+            }
         }
     }
 
@@ -1296,8 +1666,11 @@ fn handle_execute(
     } else {
         let total = pending.rows.len();
         // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
+        // v0.10: DML (INSERT/UPDATE/DELETE) completes with its own tag.
         let tag = if portal.explain {
             "EXPLAIN".to_string()
+        } else if let Some(t) = portal.dml_tag.clone() {
+            t
         } else {
             format!("SELECT {}", total)
         };

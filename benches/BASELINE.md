@@ -499,3 +499,18 @@ dominates. DHAT: 220 MB allocated over the workload, 7.2 MB peak live
 (the 50k-row table + index itself); top allocators are short-lived
 tokenizer buffers and per-INSERT `Vec<Value>` row buffers. Nothing
 retained, no leaks.
+
+## v0.10: window functions and COPY (2026-09-10)
+
+### New workloads
+
+`window`: 10k rows, 4 window functions (`row_number`/`rank`/`lag`/`sum`)
+with `PARTITION BY dept` (10 partitions) and a `ROWS` frame, `ORDER BY id`.
+Result: **1.3 qps, p50 752 ms** on the debug build. Window evaluation is
+O(n log n) for the partition sort plus O(n) per function; the 752 ms is
+dominated by the sort and per-row frame computation.
+
+`copy`: `COPY bench_c TO STDOUT` (text format) over 10k rows.
+Result: **40.2 qps, p50 22 ms** on the debug build. COPY TO is ~30x faster
+than an equivalent `SELECT *` because it skips the RowDescription/DataRow
+per-row framing overhead and writes the text format directly.

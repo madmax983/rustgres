@@ -1,23 +1,33 @@
-# rustgres v0.9 — "constraints, ALTER TABLE, views, sequences"
+# rustgres v0.10 — "CTEs, window functions, upsert, RETURNING, COPY"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 9 of the road to Postgres 19 feature parity. v0.9 adds **table
-constraints** (`PRIMARY KEY`, `FOREIGN KEY` with `CASCADE`/`SET NULL`/`SET
-DEFAULT` actions, `UNIQUE`, `NOT NULL`, `CHECK`), **`ALTER TABLE`**
-(`ADD`/`DROP`/`RENAME COLUMN`, `ADD`/`DROP CONSTRAINT`, `RENAME TO`),
-**views** (`CREATE [OR REPLACE] VIEW`, `DROP VIEW` with dependency
-tracking), **sequences** (`CREATE SEQUENCE` with `INCREMENT`/`MINVALUE`/
-`MAXVALUE`/`CYCLE`, `nextval`/`currval`/`setval`, `DEFAULT nextval()`),
-`information_schema` catalog views, transactional DDL with full rollback,
-and WAL-durable crash recovery for all new objects. 798 cumulative
-protocol tests pass (84 new in v0.9).
+Milestone 10 of the road to Postgres 19 feature parity. v0.10 adds **CTEs**
+(`WITH`, `WITH RECURSIVE`, multiple CTEs, DML CTEs), **window functions**
+(`row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
+`last_value`, `nth_value`, `ntile`, aggregate windows with `PARTITION BY` /
+`ORDER BY` / `ROWS`/`RANGE` frames), **UPSERT** (`ON CONFLICT (columns) DO
+UPDATE SET` / `DO NOTHING` with `EXCLUDED`), **RETURNING** for
+INSERT/UPDATE/DELETE, and **COPY** (`COPY TO/FROM STDOUT/STDIN` with text/CSV
+formats, options, and protocol messages). 868 cumulative protocol tests
+pass (70 new in v0.10).
 
-## What v0.9 adds (constraints, ALTER TABLE, views, sequences)
+## What v0.10 adds (CTEs, windows, upsert, RETURNING, COPY)
 
-- **Constraints.** `PRIMARY KEY`, `FOREIGN KEY ... REFERENCES` (with
-  `ON DELETE/UPDATE CASCADE|SET NULL|SET DEFAULT|RESTRICT`), `UNIQUE`,
+- **CTEs.** `WITH cte AS (...) SELECT ...`, `WITH RECURSIVE` (UNION ALL
+  iteration), multiple CTEs, CTEs referenced from joins/subqueries/DML.
+- **Window functions.** `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...
+  )` with ranking (`row_number`, `rank`, `dense_rank`, `ntile`), navigation
+  (`lag`, `lead`, `first_value`, `last_value`, `nth_value`), and aggregates
+  (`sum`, `avg`, `count`).
+- **UPSERT.** `INSERT ... ON CONFLICT (cols) DO UPDATE SET col = EXCLUDED.col`
+  and `DO NOTHING`, with unique-index/constraint inference.
+- **RETURNING.** `INSERT/UPDATE/DELETE ... RETURNING` with row-bearing
+  results in both simple and extended protocols.
+- **COPY.** `COPY t TO STDOUT` / `COPY t FROM STDIN` with text and CSV
+  formats, `DELIMITER`/`NULL`/`HEADER` options, and line-numbered errors
+  for malformed input.
   `NOT NULL`, `CHECK (expr)`. Proper SQLSTATE codes (`23502`, `23503`,
   `23505`, `23514`). FK actions cascade correctly across tables.
 - **ALTER TABLE.** `ADD COLUMN` (with `DEFAULT` backfill), `DROP COLUMN`

@@ -109,6 +109,51 @@ class Conn:
         self.s.sendall(msg(b"Q", cstr(sql)))
         return self.rd.read_until(b"Z")
 
+    def copy_to(self, sql):
+        """COPY ... TO STDOUT: returns (data_bytes, tag, sqlstate)."""
+        self.s.sendall(msg(b"Q", cstr(sql)))
+        data = bytearray()
+        tag = ""
+        code = "00000"
+        while True:
+            typ, payload = self.rd.read_msg()
+            if typ == b"H":  # CopyOutResponse
+                continue
+            elif typ == b"d":  # CopyData
+                data += payload[4:]
+            elif typ == b"c":  # CopyDone
+                continue
+            elif typ == b"C":  # CommandComplete
+                tag = payload[:-1].decode()
+            elif typ == b"Z":  # ReadyForQuery
+                break
+            elif typ == b"E":  # ErrorResponse
+                # Extract SQLSTATE code (field 'C')
+                i = 0
+                while i < len(payload):
+                    f = payload[i:i+1]
+                    i += 1
+                    if f == b"\x00":
+                        break
+                    j = payload.find(b"\x00", i)
+                    if j < 0:
+                        break
+                    val = payload[i:j].decode()
+                    i = j + 1
+                    if f == b"C":
+                        code = val
+                # Read until ReadyForQuery
+                while True:
+                    t2, p2 = self.rd.read_msg()
+                    if t2 == b"Z":
+                        break
+                    elif t2 == b"C":
+                        tag = p2[:-1].decode()
+                break
+            else:
+                continue
+        return bytes(data), tag, code
+
     def ext(self, parts):
         """Send concatenated extended-protocol messages + Sync, read to 'Z'."""
         self.s.sendall(b"".join(parts) + msg(b"S", b""))
@@ -417,6 +462,55 @@ def w_join(conn, seconds):
     return res
 
 
+def w_window(conn, seconds):
+    # v0.10: window functions over 10k rows: row_number/rank/dense_rank +
+    # lag/lead + sum() OVER with PARTITION BY and ROWS frame.
+    conn.simple("DROP TABLE IF EXISTS bench_w")
+    r = conn.simple("CREATE TABLE bench_w(id INT, dept INT, salary INT)")
+    assert tag_of(r) == "CREATE TABLE"
+    for j in range(0, 10000, 2000):
+        chunk = ",".join(f"({i},{i%10},{1000+i%5000})" for i in range(j, j + 2000))
+        r = conn.simple(f"INSERT INTO bench_w VALUES {chunk}")
+        assert tag_of(r) == "INSERT 0 2000", tag_of(r)
+
+    sql = ("SELECT id, dept, salary, "
+           "row_number() OVER (PARTITION BY dept ORDER BY salary DESC), "
+           "rank() OVER (PARTITION BY dept ORDER BY salary DESC), "
+           "lag(salary) OVER (PARTITION BY dept ORDER BY id), "
+           "sum(salary) OVER (PARTITION BY dept ORDER BY id "
+           "  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+           "FROM bench_w ORDER BY id")
+
+    def op():
+        msgs = conn.simple(sql)
+        assert tag_of(msgs) == "SELECT 10000", tag_of(msgs)
+    res = measure(op, seconds)
+    conn.simple("DROP TABLE bench_w")
+    res["note"] = ("10k rows, 4 window functions (row_number/rank/lag/sum), "
+                   "PARTITION BY dept (10 partitions), ROWS frame; one query per op")
+    return res
+
+
+def w_copy(conn, seconds):
+    # v0.10: COPY TO STDOUT throughput over 10k rows (text format).
+    conn.simple("DROP TABLE IF EXISTS bench_c")
+    r = conn.simple("CREATE TABLE bench_c(id INT, name TEXT, val INT)")
+    assert tag_of(r) == "CREATE TABLE"
+    for j in range(0, 10000, 2000):
+        chunk = ",".join(f"({i},'name{i}',{i*2})" for i in range(j, j + 2000))
+        r = conn.simple(f"INSERT INTO bench_c VALUES {chunk}")
+        assert tag_of(r) == "INSERT 0 2000", tag_of(r)
+
+    def op():
+        data, tag, code = conn.copy_to("COPY bench_c TO STDOUT")
+        assert tag == "COPY 10000", tag
+        assert code == "00000", code
+    res = measure(op, seconds)
+    conn.simple("DROP TABLE bench_c")
+    res["note"] = "COPY TO STDOUT (text format) over 10k rows; one COPY per op"
+    return res
+
+
 def w_expr(conn, seconds):
     # v0.7: expression-heavy SELECT exercising the new types, casts,
     # operators and built-ins: numeric arithmetic + power, string
@@ -511,6 +605,8 @@ WORKLOADS = {
     "mvcc": ("concurrent MVCC txn loop (4 threads)", w_mvcc),
     "join": ("filtered JOIN + GROUP BY (2k x 20k)", w_join),
     "idxscan": ("indexed vs sequential point/range/order scans (50k rows)", w_idxscan),
+    "window": ("window functions over 10k rows (v0.10)", w_window),
+    "copy": ("COPY TO STDOUT throughput over 10k rows (v0.10)", w_copy),
 }
 
 

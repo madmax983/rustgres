@@ -38,10 +38,11 @@
 
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
-    AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, DefaultExpr, Expr, FkAction, FkDef, FromItem,
-    InsertValue, IsolationLevel, JoinKind, Literal, OrderTerm, SelectItem, SelectStmt, SequenceOpts,
-    SqlError, Stmt, TableDef, UniqueDef, WhereCond, WhereRhs, collect_col_refs, collect_table_refs,
-    parse_statement, validate_constraint_expr,
+    AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody, CteDef,
+    DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem,
+    InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt,
+    SequenceOpts, SqlError, Stmt, TableDef, UniqueDef, WhereCond, WhereRhs, WindowFrame, WindowFunc,
+    collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
     ColStats, ColType, Database, Engine, Numeric, RowVersion, Sequence, Snapshot, Table, TableStats,
@@ -50,6 +51,7 @@ use crate::storage::{
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct ExecError {
@@ -100,6 +102,14 @@ pub enum ExecResult {
     },
     /// Tag for CommandComplete, e.g. "INSERT 0 2".
     Command { tag: String },
+    /// v0.10: INSERT/UPDATE/DELETE — always carries the completion tag;
+    /// with RETURNING it also carries the result rows (empty otherwise,
+    /// behaving exactly like Command on the wire).
+    Dml {
+        tag: String,
+        columns: Vec<(String, ColType)>,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
@@ -109,7 +119,11 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             table,
             columns,
             rows,
-        } => exec_insert(eng, ctx, table, columns, rows),
+            select,
+            with,
+            on_conflict,
+            returning,
+        } => exec_insert(eng, ctx, table, columns, rows, select, with, on_conflict, returning),
         Stmt::Select(sel) => {
             // FOR UPDATE locks (from every query level that asked for
             // them) are collected during the scan and acquired here, while
@@ -124,6 +138,8 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     session: ctx.session,
                     depth: 0,
                     lock_ids: &mut lock_ids,
+                    ctes: Vec::new(),
+                    wctx: None,
                 };
                 run_select(&mut q, sel, &[])?
             };
@@ -175,8 +191,21 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             table,
             sets,
             where_,
-        } => exec_update(eng, ctx, table, sets, where_),
-        Stmt::Delete { table, where_ } => exec_delete(eng, ctx, table, where_),
+            with,
+            returning,
+        } => exec_update(eng, ctx, table, sets, where_, with, returning),
+        Stmt::Delete {
+            table,
+            where_,
+            with,
+            returning,
+        } => exec_delete(eng, ctx, table, where_, with, returning),
+        // v0.10: COPY is handled by the server layer (it needs the raw
+        // frontend messages); reaching the executor is a bug.
+        Stmt::Copy { .. } => Err(exec_err(
+            "XX000",
+            "internal error: COPY reached the statement executor",
+        )),
         // Transaction control / checkpoint / vacuum never reach the
         // executor (server.rs intercepts them); reaching here is a bug in
         // the session layer.
@@ -467,6 +496,8 @@ fn eval_default(
                 session,
                 depth: 0,
                 lock_ids: &mut lock_ids,
+                ctes: Vec::new(),
+                wctx: None,
             };
             let v = eval_expr(&mut q, &[], e)?;
             coerce_value(v, ctype, cname)
@@ -517,6 +548,8 @@ fn check_row_constraints(
             session,
             depth: 0,
             lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
         };
         let frame = Scope {
             schema: &schema,
@@ -1083,13 +1116,291 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
     Err(assign_err(col_name, col_type, v.type_name()))
 }
 
+/// v0.10: materialize a DML statement's WITH list. DML bodies cannot
+/// reference the CTEs (except through subqueries in UPDATE's SET/WHERE or
+/// the RETURNING list), but the CTEs are still evaluated — like Postgres,
+/// which runs them for their side effects and validation.
+fn materialize_dml_ctes(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    with: &[CteDef],
+) -> Result<Vec<Rc<CteBinding>>, ExecError> {
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        session: ctx.session,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+    };
+    materialize_ctes(&mut q, with)?;
+    Ok(q.ctes)
+}
+
+/// v0.10: output column names/types for a RETURNING list, resolved
+/// against the target table's columns.
+fn describe_returning(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    table: &str,
+    returning: &[SelectItem],
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    let t = eng
+        .db
+        .find_table(table, snap, own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+    let schemas: Vec<Vec<QCol>> = vec![
+        t.columns
+            .iter()
+            .map(|(n, ty)| QCol {
+                qual: table.to_string(),
+                name: n.clone(),
+                ty: ty.clone(),
+            })
+            .collect(),
+    ];
+    let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
+    let mut out = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                let ty = expr_type(eng, snap, own, &refs, &[], expr)?;
+                let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
+                out.push((name, ty));
+            }
+            SelectItem::All | SelectItem::AllOf(_) => {
+                return Err(exec_err(
+                    "42601",
+                    "RETURNING * is not supported; list the columns explicitly",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v0.10: evaluate a RETURNING list against one affected row.
+fn project_returning(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schema: &[QCol],
+    values: &[Value],
+    returning: &[SelectItem],
+    ctes: &[Rc<CteBinding>],
+) -> Result<Vec<Value>, ExecError> {
+    let mut out = Vec::with_capacity(returning.len());
+    for item in returning {
+        if let SelectItem::Expr { expr, .. } = item {
+            out.push(eval_dml_expr(
+                eng,
+                snap,
+                own,
+                session,
+                &[(schema, values)],
+                expr,
+                ctes,
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+/// v0.10: resolved `ON CONFLICT` arbiter.
+struct UpsertPlan {
+    /// (index name, key column positions) for every arbitrating unique
+    /// index, in deterministic order.
+    indexes: Vec<(String, Vec<usize>)>,
+    /// Target column positions for DO UPDATE SET, in SET order.
+    set_cols: Vec<usize>,
+    action: ConflictAction,
+}
+
+fn plan_upsert(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    oc: &OnConflict,
+    meta: &TableMeta,
+) -> Result<UpsertPlan, ExecError> {
+    // (index name, key column positions, key column names), sorted.
+    let mut unique: Vec<(String, Vec<usize>, Vec<String>)> = eng
+        .db
+        .visible_indexes_for(table, ctx.snap, ctx.own)
+        .into_iter()
+        .filter(|ix| ix.def.unique)
+        .map(|ix| {
+            (
+                ix.def.name.clone(),
+                ix.def.cols.clone(),
+                ix.def.col_names.clone(),
+            )
+        })
+        .collect();
+    unique.sort_by(|a, b| a.0.cmp(&b.0));
+    let no_arbiter = || {
+        exec_err(
+            "42P10",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        )
+    };
+    let indexes: Vec<(String, Vec<usize>)> = match &oc.arbiter {
+        ConflictArbiter::None => {
+            if let ConflictAction::DoUpdate { .. } = &oc.action {
+                return Err(exec_err(
+                    "42601",
+                    "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+                ));
+            }
+            // DO NOTHING without an arbiter: every unique index arbitrates.
+            unique
+                .iter()
+                .map(|(n, cols, _)| (n.clone(), cols.clone()))
+                .collect()
+        }
+        ConflictArbiter::Columns(cols) => {
+            for c in cols {
+                if meta.column_index(c).is_none() {
+                    return Err(exec_err(
+                        "42703",
+                        format!("column \"{}\" of relation \"{}\" does not exist", c, table),
+                    ));
+                }
+            }
+            let mut want: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+            want.sort_unstable();
+            unique
+                .iter()
+                .find(|(_, _, cn)| {
+                    let mut have: Vec<&str> = cn.iter().map(|s| s.as_str()).collect();
+                    have.sort_unstable();
+                    have == want
+                })
+                .map(|(n, cols, _)| vec![(n.clone(), cols.clone())])
+                .ok_or_else(no_arbiter)?
+        }
+        ConflictArbiter::Constraint(name) => unique
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(n, cols, _)| vec![(n.clone(), cols.clone())])
+            .ok_or_else(no_arbiter)?,
+    };
+    if indexes.is_empty() {
+        // No unique index to arbitrate: DO NOTHING degrades to a plain
+        // insert; DO UPDATE (already rejected without an arbiter) would be
+        // meaningless.
+        if let ConflictAction::DoUpdate { .. } = &oc.action {
+            return Err(no_arbiter());
+        }
+    }
+    // Validate DO UPDATE's target columns once.
+    let mut set_cols = Vec::new();
+    if let ConflictAction::DoUpdate { sets, .. } = &oc.action {
+        for (name, _) in sets {
+            set_cols.push(meta.column_index(name).ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", name, table),
+                )
+            })?);
+        }
+    }
+    Ok(UpsertPlan {
+        indexes,
+        set_cols,
+        action: oc.action.clone(),
+    })
+}
+
+/// v0.10: locate an upsert conflict for a candidate row: returns the
+/// conflicting row version's id. Checks the table's unique indexes, like
+/// Postgres' speculative insertion.
+fn find_upsert_conflict(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    plan: &UpsertPlan,
+    values: &[Value],
+) -> Option<u64> {
+    for (iname, _) in &plan.indexes {
+        if let Some(id) = eng
+            .db
+            .unique_conflict_row(table, iname, values, None, ctx.snap, ctx.own)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// v0.10: current values of one row version, by id.
+fn row_values_by_id(eng: &Engine, ctx: &StmtCtx, table: &str, id: u64) -> Option<Vec<Value>> {
+    let t = eng.db.find_table(table, ctx.snap, ctx.own)?;
+    let pos = t.row_pos(id)?;
+    Some(t.rows[pos].values.clone())
+}
+
+/// v0.10: serialize an arbiter key for same-statement conflict tracking.
+fn arbiter_key(values: &[Value], key_cols: &[usize]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &c in key_cols {
+        value_key(&values[c], &mut out);
+        out.push(0xff);
+    }
+    out
+}
+
 fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<InsertValue>],
+    select: &Option<SelectStmt>,
+    with: &[CteDef],
+    on_conflict: &Option<OnConflict>,
+    returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.10: WITH materialization (validated; plain INSERT cannot reference
+    // the CTEs, but subqueries in RETURNING/ON CONFLICT can).
+    let ctes = materialize_dml_ctes(eng, ctx, with)?;
+    // v0.10: INSERT...SELECT: run the SELECT and convert rows to insert
+    // values. The CTEs are already materialized above.
+    let select_rows: Option<Vec<Vec<Value>>> = if let Some(sel) = select {
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            session: ctx.session,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: ctes.clone(),
+            wctx: None,
+        };
+        let out = run_select(&mut q, sel, &[])?;
+        Some(out.rows)
+    } else {
+        None
+    };
+    // v0.10: resolve the ON CONFLICT arbiter before building rows (needs
+    // the table metadata).
+    let meta_for_upsert = {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        TableMeta::of(t)
+    };
+    let upsert: Option<UpsertPlan> = match on_conflict {
+        None => None,
+        Some(oc) => Some(plan_upsert(eng, ctx, table, oc, &meta_for_upsert)?),
+    };
     // Validate everything before mutating (statement atomicity).
     let new_rows: Vec<Vec<Value>> = {
         let meta = {
@@ -1114,8 +1425,43 @@ fn exec_insert(
             None => (0..meta.columns.len()).collect(),
         };
         let ncols = meta.columns.len();
-        let mut built = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut built: Vec<Vec<Value>> = Vec::new();
+        // v0.10: INSERT...SELECT: validate column count and use the
+        // SELECT's rows directly (already Values).
+        if let Some(srows) = select_rows {
+            for cells in srows {
+                if cells.len() != targets.len() {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "INSERT has {} expressions but {} target columns",
+                            cells.len(),
+                            targets.len(),
+                        ),
+                    ));
+                }
+                let mut values = vec![Value::Null; ncols];
+                let mut explicit = vec![false; ncols];
+                for (j, v) in cells.into_iter().enumerate() {
+                    let ti = targets[j];
+                    values[ti] = v;
+                    explicit[ti] = true;
+                }
+                // Fill defaults, check constraints (same as VALUES path).
+                for (i, d) in meta.defaults.iter().enumerate() {
+                    if !explicit[i] {
+                        if let Some(d) = d {
+                            let (cname, ctype) = &meta.columns[i];
+                            values[i] = eval_default(eng, ctx.snap, ctx.own, ctx.session, d, ctype, cname)?;
+                        }
+                    }
+                }
+                check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &values)?;
+                built.push(values);
+            }
+        } else {
+            built = Vec::with_capacity(rows.len());
+            for row in rows {
             if row.len() != targets.len() {
                 return Err(exec_err(
                     "42601",
@@ -1156,10 +1502,14 @@ fn exec_insert(
             check_row_constraints(eng, ctx.snap, ctx.own, ctx.session, &meta, table, &values)?;
             built.push(values);
         }
+        } // end else (VALUES path)
         // v0.8: statement-atomic UNIQUE enforcement — every row is checked
         // against the indexes and against earlier rows of this statement
-        // before any version is pushed.
-        check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own)?;
+        // before any version is pushed. v0.10: skipped when there is an
+        // ON CONFLICT clause — conflicts are resolved per row instead.
+        if upsert.is_none() {
+            check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own)?;
+        }
         // v0.9: child-side foreign keys. Rows inserted earlier in the same
         // statement are visible to later rows (self-references).
         for (i, values) in built.iter().enumerate() {
@@ -1176,22 +1526,211 @@ fn exec_insert(
         }
         built
     };
-    // Apply: each row becomes a version owned by this transaction,
-    // invisible to everyone else until we commit.
-    let n = new_rows.len();
-    let mut ids = Vec::with_capacity(n);
-    for _ in 0..n {
-        ids.push(eng.alloc_row_id());
+    // v0.10: plan the per-row ON CONFLICT resolution. No mutation happens
+    // here, so a failed row still leaves the statement atomic. Tracks:
+    // - inserts: (new row id, values) to insert,
+    // - updates: (conflict row id, prev xmax, new values) for DO UPDATE,
+    // - ret_rows: RETURNING source rows in statement order (inserted values
+    //   or updated new values; skipped rows contribute nothing).
+    // Same-statement conflicts are detected via `key_map`: (index name,
+    // key bytes) -> row id of a planned insert.
+    let mut inserts: Vec<(u64, Vec<Value>)> = Vec::new();
+    let mut updates: Vec<(u64, u64, Vec<Value>)> = Vec::new();
+    let mut ret_rows: Vec<Vec<Value>> = Vec::new();
+    if let Some(plan) = &upsert {
+        let mut key_map: HashMap<(String, Vec<u8>), u64> = HashMap::new();
+        // Latest planned values per row id (planned inserts and the new
+        // values of planned updates), for chained same-statement conflicts.
+        let mut latest: HashMap<u64, Vec<Value>> = HashMap::new();
+        // Schemas for DO UPDATE evaluation: excluded first, target last
+        // (unqualified columns resolve to the target, like Postgres).
+        let mk_schemas = || {
+            let tgt: Vec<QCol> = meta_for_upsert
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                })
+                .collect();
+            let excl: Vec<QCol> = meta_for_upsert
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: "excluded".to_string(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                })
+                .collect();
+            (excl, tgt)
+        };
+        for values in &new_rows {
+            // 1. Conflict with a table row?
+            let mut conflict: Option<u64> =
+                find_upsert_conflict(eng, ctx, table, plan, values);
+            // 2. Conflict with a row planned earlier in this statement?
+            if conflict.is_none() {
+                for (iname, kcols) in &plan.indexes {
+                    // NULL key parts never conflict.
+                    if kcols.iter().any(|&c| values[c] == Value::Null) {
+                        continue;
+                    }
+                    if let Some(id) = key_map.get(&(iname.clone(), arbiter_key(values, kcols))) {
+                        conflict = Some(*id);
+                        break;
+                    }
+                }
+            }
+            let Some(tid) = conflict else {
+                // No conflict: insert.
+                let id = eng.alloc_row_id();
+                for (iname, kcols) in &plan.indexes {
+                    if kcols.iter().any(|&c| values[c] == Value::Null) {
+                        continue;
+                    }
+                    key_map.insert((iname.clone(), arbiter_key(values, kcols)), id);
+                }
+                latest.insert(id, values.clone());
+                inserts.push((id, values.clone()));
+                ret_rows.push(values.clone());
+                continue;
+            };
+            match &plan.action {
+                ConflictAction::DoNothing => {
+                    // Skipped: contributes no row and no RETURNING output.
+                }
+                ConflictAction::DoUpdate { sets, where_ } => {
+                    // Target values: latest planned, else the table row.
+                    let target_values: Vec<Value> = match latest.get(&tid) {
+                        Some(v) => v.clone(),
+                        None => row_values_by_id(eng, ctx, table, tid).ok_or_else(|| {
+                            exec_err("XX000", "upsert conflict target vanished")
+                        })?,
+                    };
+                    // Only real table rows need the concurrency checks;
+                    // planned rows are ours.
+                    let is_planned = latest.contains_key(&tid);
+                    if !is_planned {
+                        let t = eng.db.find_table(table, ctx.snap, ctx.own).expect(
+                            "table still visible; engine lock held throughout",
+                        );
+                        let pos = t.row_pos(tid).expect("conflict target still present");
+                        let r = &t.rows[pos];
+                        check_write_conflict(eng, r.xmax, ctx.level)?;
+                        check_row_lock(eng, table, tid, ctx.own)?;
+                    }
+                    let (excl_schema, tgt_schema) = mk_schemas();
+                    let frames: Vec<(&[QCol], &[Value])> = vec![
+                        (&excl_schema, &values[..]),
+                        (&tgt_schema, &target_values[..]),
+                    ];
+                    // Optional DO UPDATE ... WHERE: false means skip.
+                    if let Some(w) = where_ {
+                        let v = eval_dml_expr(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            &frames,
+                            w,
+                            &ctes,
+                        )?;
+                        if v != Value::Bool(true) {
+                            continue;
+                        }
+                    }
+                    let mut new_values = target_values.clone();
+                    for ((_, expr), &ci) in sets.iter().zip(plan.set_cols.iter()) {
+                        let v = eval_dml_expr(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            &frames,
+                            expr,
+                            &ctes,
+                        )?;
+                        let (cname, ctype) = &meta_for_upsert.columns[ci];
+                        new_values[ci] = coerce_value(v, ctype, cname)?;
+                    }
+                    // Same validations as a plain UPDATE row.
+                    if let Some(vname) = eng.db.unique_violation(
+                        table,
+                        &new_values,
+                        Some(tid),
+                        ctx.snap,
+                        ctx.own,
+                    ) {
+                        return Err(exec_err(
+                            "23505",
+                            format!(
+                                "duplicate key value violates unique constraint \"{}\"",
+                                vname
+                            ),
+                        ));
+                    }
+                    check_row_constraints(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        &meta_for_upsert,
+                        table,
+                        &new_values,
+                    )?;
+                    check_fk_child_row(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        &meta_for_upsert,
+                        table,
+                        &new_values,
+                        &[],
+                        Some(tid),
+                    )?;
+                    // prev xmax for the WAL undo record.
+                    let prev_xmax: u64 = if is_planned {
+                        0
+                    } else {
+                        let t = eng.db.find_table(table, ctx.snap, ctx.own).expect(
+                            "table still visible; engine lock held throughout",
+                        );
+                        t.rows[t.row_pos(tid).expect("conflict target still present")].xmax
+                    };
+                    // Refresh the same-statement key map when the key changed.
+                    for (iname, kcols) in &plan.indexes {
+                        let old_null = kcols.iter().any(|&c| target_values[c] == Value::Null);
+                        let new_null = kcols.iter().any(|&c| new_values[c] == Value::Null);
+                        if !old_null {
+                            key_map.remove(&(iname.clone(), arbiter_key(&target_values, kcols)));
+                        }
+                        if !new_null {
+                            key_map.insert((iname.clone(), arbiter_key(&new_values, kcols)), tid);
+                        }
+                    }
+                    latest.insert(tid, new_values.clone());
+                    updates.push((tid, prev_xmax, new_values.clone()));
+                    ret_rows.push(new_values);
+                }
+            }
+        }
+    } else {
+        // No ON CONFLICT: every candidate is inserted.
+        for values in &new_rows {
+            let id = eng.alloc_row_id();
+            inserts.push((id, values.clone()));
+            ret_rows.push(values.clone());
+        }
     }
-    // Apply: each row becomes a version owned by this transaction,
-    // invisible to everyone else until we commit. The table borrow ends
-    // before index maintenance (both need `eng.db` mutably).
+    let n = inserts.len() + updates.len();
+    // Apply inserts.
     {
         let t = eng
             .db
             .find_table_mut(table, ctx.snap, ctx.own)
             .expect("table still visible; engine lock held throughout");
-        for (values, id) in new_rows.iter().zip(ids.iter()) {
+        for (id, values) in &inserts {
             t.push_version(RowVersion {
                 id: *id,
                 values: values.clone(),
@@ -1204,12 +1743,80 @@ fn exec_insert(
             });
         }
     }
-    // v0.8: maintain secondary indexes for the new versions.
-    for (values, id) in new_rows.iter().zip(ids.iter()) {
+    for (id, values) in &inserts {
         eng.db.index_insert_row(table, *id, values);
     }
-    Ok(ExecResult::Command {
+    // Apply DO UPDATEs: delete old version + insert new version.
+    // Pre-allocate the new row ids (the table borrow below conflicts).
+    let mut update_ids = Vec::with_capacity(updates.len());
+    for _ in 0..updates.len() {
+        update_ids.push(eng.alloc_row_id());
+    }
+    let mut indexed: Vec<(u64, Vec<Value>)> = Vec::with_capacity(updates.len());
+    {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table still visible; engine lock held throughout");
+        for ((old_id, prev_xmax, new_values), new_id) in updates.iter().zip(update_ids) {
+            let pos = t
+                .row_pos(*old_id)
+                .expect("row version still present; engine lock held throughout");
+            t.rows[pos].xmax = ctx.own;
+            ctx.writes.push(WriteOp::DeleteRow {
+                table: table.to_string(),
+                row_id: *old_id,
+                prev_xmax: *prev_xmax,
+            });
+            t.push_version(RowVersion {
+                id: new_id,
+                values: new_values.clone(),
+                xmin: ctx.own,
+                xmax: 0,
+            });
+            ctx.writes.push(WriteOp::InsertRow {
+                table: table.to_string(),
+                row_id: new_id,
+            });
+            indexed.push((new_id, new_values.clone()));
+        }
+    }
+    for (new_id, new_values) in &indexed {
+        eng.db.index_insert_row(table, *new_id, new_values);
+    }
+    // v0.10: RETURNING.
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
+        let schema: Vec<QCol> = meta_for_upsert
+            .columns
+            .iter()
+            .map(|(n, ty)| QCol {
+                qual: table.to_string(),
+                name: n.clone(),
+                ty: ty.clone(),
+            })
+            .collect();
+        let mut out_rows = Vec::with_capacity(ret_rows.len());
+        for values in &ret_rows {
+            out_rows.push(project_returning(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                &schema,
+                values,
+                returning,
+                &ctes,
+            )?);
+        }
+        (cols, out_rows)
+    };
+    Ok(ExecResult::Dml {
         tag: format!("INSERT 0 {}", n),
+        columns: ret_cols,
+        rows: ret_out,
     })
 }
 
@@ -1317,7 +1924,12 @@ fn exec_update(
     table: &str,
     sets: &[(String, Expr)],
     where_: &[WhereCond],
+    with: &[CteDef],
+    returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.10: WITH materialization; the CTEs are visible to subqueries in
+    // SET/WHERE and in the RETURNING list.
+    let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first (validate + conflict-check), mutate after: a failed
     // UPDATE leaves no trace (statement atomicity).
     let plan: Vec<(u64, u64, Vec<Value>)> = {
@@ -1376,7 +1988,7 @@ fn exec_update(
             check_row_lock(eng, table, *id, ctx.own)?;
             let mut new_values = values.clone();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
-                let v = eval_update_expr(eng, ctx.snap, ctx.own, ctx.session, &schema, values, expr)?;
+                let v = eval_update_expr(eng, ctx.snap, ctx.own, ctx.session, &schema, values, expr, &ctes)?;
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
@@ -1506,8 +2118,44 @@ fn exec_update(
     for (new_id, new_values) in &indexed {
         eng.db.index_insert_row(table, *new_id, new_values);
     }
-    Ok(ExecResult::Command {
+    // v0.10: RETURNING evaluates against the NEW row values.
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
+        let schema: Vec<QCol> = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own)
+                .expect("table still visible; engine lock held throughout");
+            t.columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                })
+                .collect()
+        };
+        let mut out_rows = Vec::with_capacity(indexed.len());
+        for (_, new_values) in &indexed {
+            out_rows.push(project_returning(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                &schema,
+                new_values,
+                returning,
+                &ctes,
+            )?);
+        }
+        (cols, out_rows)
+    };
+    Ok(ExecResult::Dml {
         tag: format!("UPDATE {}", n),
+        columns: ret_cols,
+        rows: ret_out,
     })
 }
 
@@ -1516,7 +2164,12 @@ fn exec_delete(
     ctx: &mut StmtCtx,
     table: &str,
     where_: &[WhereCond],
+    with: &[CteDef],
+    returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v0.10: WITH materialization (validated; plain DELETE cannot reference
+    // the CTEs, but the RETURNING list can via subqueries).
+    let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first for statement atomicity (WHERE type errors must not
     // leave half the rows deleted).
     let plan: Vec<(u64, u64, Vec<Value>)> = {
@@ -1563,6 +2216,9 @@ fn exec_delete(
         plan
     };
     let n = plan.len();
+    // v0.10: DELETE RETURNING evaluates against the OLD row values —
+    // collect them before the plan is consumed by the apply loop.
+    let ret_vals: Vec<Vec<Value>> = plan.iter().map(|(_, _, v)| v.clone()).collect();
     let t = eng
         .db
         .find_table_mut(table, ctx.snap, ctx.own)
@@ -1578,8 +2234,44 @@ fn exec_delete(
             prev_xmax,
         });
     }
-    Ok(ExecResult::Command {
+    // v0.10: RETURNING.
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
+        let schema: Vec<QCol> = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own)
+                .expect("table still visible; engine lock held throughout");
+            t.columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                })
+                .collect()
+        };
+        let mut out_rows = Vec::with_capacity(ret_vals.len());
+        for values in &ret_vals {
+            out_rows.push(project_returning(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                &schema,
+                values,
+                returning,
+                &ctes,
+            )?);
+        }
+        (cols, out_rows)
+    };
+    Ok(ExecResult::Dml {
         tag: format!("DELETE {}", n),
+        columns: ret_cols,
+        rows: ret_out,
     })
 }
 
@@ -3245,6 +3937,39 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             distinct: *distinct,
             arg2: arg2.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
         }),
+        // v0.10: resolve columns inside window inputs.
+        Expr::Window {
+            func,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            frame,
+            wid,
+        } => Ok(Expr::Window {
+            func: func.clone(),
+            args: args
+                .iter()
+                .map(|a| r(a))
+                .collect::<Result<Vec<_>, _>>()?,
+            distinct: *distinct,
+            partition_by: partition_by
+                .iter()
+                .map(|p| r(p))
+                .collect::<Result<Vec<_>, _>>()?,
+            order_by: order_by
+                .iter()
+                .map(|o| {
+                    Ok(OrderTerm {
+                        expr: r(&o.expr)?,
+                        desc: o.desc,
+                        nulls_first: o.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            frame: frame.clone(),
+            wid: *wid,
+        }),
     }
 }
 
@@ -3260,6 +3985,33 @@ struct Q<'a, 'b> {
     /// Sink for (table, row-version id) pairs named by FOR UPDATE, at any
     /// query level. The top-level `execute` acquires them all at once.
     lock_ids: &'a mut Vec<(String, u64)>,
+    /// v0.10: materialized CTE bindings visible at this query level
+    /// (innermost last). Shared by reference-counting so subqueries
+    /// inherit them cheaply.
+    ctes: Vec<Rc<CteBinding>>,
+    /// v0.10: active window-function evaluation context. Set by the
+    /// window pre-pass before projection; `Expr::Window` evaluates by
+    /// looking up `values[wid][row]`.
+    wctx: Option<WindowCtx>,
+}
+
+/// v0.10: a materialized Common Table Expression: name, output schema and
+/// rows. Recursive CTEs hold the fixpoint result.
+#[derive(Clone, Debug)]
+struct CteBinding {
+    name: String,
+    schema: Vec<QCol>,
+    rows: Vec<QRow>,
+}
+
+/// v0.10: window-function evaluation state for one query level.
+/// `values[wid]` holds one value per input row (non-agg path) or per
+/// group (agg path); `row` is the input row / group currently being
+/// projected.
+#[derive(Clone, Debug, Default)]
+struct WindowCtx {
+    values: Vec<Vec<Value>>,
+    row: usize,
 }
 
 struct SelectOut {
@@ -3279,9 +4031,261 @@ struct OutRow {
     /// BY columns not in the select list) can still be evaluated; plain
     /// queries compute keys later in apply_order.
     sort_keys: Option<Vec<Value>>,
+    /// v0.10: pre-projection input row index, for ORDER BY terms that
+    /// contain window functions (set only when the query uses windows).
+    win_idx: Option<usize>,
 }
 
+/// v0.10: `WITH [RECURSIVE] ...` — materialize every CTE of this query
+/// level (in definition order, so later CTEs see earlier ones), run the
+/// inner query, then pop the bindings. The bindings live on the shared
+/// query context, so nested subqueries, derived tables and views see them
+/// too; sibling and outer levels are unaffected after the pop.
 fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
+    let base = q.ctes.len();
+    if !stmt.with.is_empty() {
+        materialize_ctes(q, &stmt.with)?;
+    }
+    let out = run_select_inner(q, stmt, outer);
+    q.ctes.truncate(base);
+    // v0.10: the window context is per query level; never leak it.
+    q.wctx = None;
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v0.10: Common Table Expressions
+// ---------------------------------------------------------------------------
+
+/// Materialize every CTE in definition order, pushing one binding each.
+/// CTE bodies are uncorrelated (like Postgres): they see sibling CTEs
+/// defined earlier, never the outer query's scopes.
+fn materialize_ctes(q: &mut Q, ctes: &[CteDef]) -> Result<(), ExecError> {
+    for cte in ctes {
+        let binding = eval_cte(q, cte)?;
+        q.ctes.push(Rc::new(binding));
+    }
+    Ok(())
+}
+
+fn eval_cte(q: &mut Q, cte: &CteDef) -> Result<CteBinding, ExecError> {
+    match &cte.body {
+        CteBody::Simple(sel) => {
+            let out = run_select(q, sel, &[])?;
+            Ok(cte_binding(cte, out.columns, out.rows))
+        }
+        CteBody::Union { left, right, all } => eval_recursive_cte(q, cte, left, right, *all),
+    }
+}
+
+fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Vec<Value>>) -> CteBinding {
+    let schema: Vec<QCol> = columns
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| QCol {
+            qual: cte.name.clone(),
+            name: cte.col_aliases.get(i).cloned().unwrap_or(name),
+            ty,
+        })
+        .collect();
+    let rows = rows
+        .into_iter()
+        .map(|cells| QRow {
+            cells,
+            prov: Vec::new(),
+        })
+        .collect();
+    CteBinding {
+        name: cte.name.clone(),
+        schema,
+        rows,
+    }
+}
+
+/// v0.10: `WITH RECURSIVE`: iterative fixpoint. The seed (non-recursive
+/// term) is evaluated once; then the recursive term is re-evaluated with
+/// the CTE name bound to the previous iteration's *new* rows until an
+/// iteration produces nothing new. UNION (distinct) deduplicates across
+/// iterations, so cyclic graphs terminate; UNION ALL keeps duplicates.
+/// A safety cap aborts runaway UNION ALL recursion (Postgres would loop
+/// forever).
+fn eval_recursive_cte(
+    q: &mut Q,
+    cte: &CteDef,
+    left: &SelectStmt,
+    right: &SelectStmt,
+    all: bool,
+) -> Result<CteBinding, ExecError> {
+    let seed = run_select(q, left, &[])?;
+    let width = seed.columns.len();
+    let mut binding = cte_binding(cte, seed.columns, seed.rows);
+    let seed_types: Vec<ColType> = binding.schema.iter().map(|c| c.ty.clone()).collect();
+    // v0.10: non-recursive UNION in WITH RECURSIVE: evaluate the right
+    // side once (it doesn't reference the CTE) and union.
+    if !stmt_refs_table(right, &cte.name) {
+        let other = run_select(q, right, &[])?;
+        if other.columns.len() != width {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "recursive CTE \"{}\": right side returns {} columns, expected {}",
+                    cte.name,
+                    other.columns.len(),
+                    width
+                ),
+            ));
+        }
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        if !all {
+            for r in &binding.rows {
+                let mut k = Vec::new();
+                for v in &r.cells {
+                    value_key(v, &mut k);
+                }
+                seen.insert(k);
+            }
+        }
+        for cells in other.rows {
+            let mut coerced = Vec::with_capacity(cells.len());
+            for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
+                coerced.push(coerce_value(v, ty, &cte.name)?);
+            }
+            if all {
+                binding.rows.push(QRow { cells: coerced, prov: Vec::new() });
+            } else {
+                let mut k = Vec::new();
+                for v in &coerced {
+                    value_key(v, &mut k);
+                }
+                if seen.insert(k) {
+                    binding.rows.push(QRow { cells: coerced, prov: Vec::new() });
+                }
+            }
+        }
+        return Ok(binding);
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    if !all {
+        for r in &binding.rows {
+            let mut k = Vec::new();
+            for v in &r.cells {
+                value_key(v, &mut k);
+            }
+            seen.insert(k);
+        }
+    }
+    let mut working: Vec<QRow> = binding.rows.clone();
+    // Cap iterations: UNION ALL over a cyclic graph never reaches a
+    // fixpoint.
+    for _ in 0..10_000 {
+        // Bind the CTE name to the previous iteration's new rows.
+        q.ctes.push(Rc::new(CteBinding {
+            name: cte.name.clone(),
+            schema: binding.schema.clone(),
+            rows: working,
+        }));
+        let delta = run_select(q, right, &[]);
+        q.ctes.pop();
+        let delta = delta?;
+        if delta.columns.len() != width {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "recursive CTE \"{}\": recursive term returns {} columns, expected {}",
+                    cte.name,
+                    delta.columns.len(),
+                    width
+                ),
+            ));
+        }
+        let mut new_rows: Vec<QRow> = Vec::new();
+        for cells in delta.rows {
+            // Coerce the recursive term's cells to the seed's column
+            // types (like UNION's type resolution, simplified).
+            let mut coerced = Vec::with_capacity(cells.len());
+            for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
+                coerced.push(coerce_value(v, ty, &cte.name)?);
+            }
+            let row = QRow {
+                cells: coerced,
+                prov: Vec::new(),
+            };
+            if all {
+                new_rows.push(row);
+            } else {
+                let mut k = Vec::new();
+                for v in &row.cells {
+                    value_key(v, &mut k);
+                }
+                if seen.insert(k) {
+                    new_rows.push(row);
+                }
+            }
+        }
+        if new_rows.is_empty() {
+            return Ok(binding);
+        }
+        binding.rows.extend(new_rows.clone());
+        working = new_rows;
+    }
+    Err(exec_err(
+        "54001",
+        format!(
+            "recursive CTE \"{}\" exceeded the 10000-iteration limit (cyclic UNION ALL?)",
+            cte.name
+        ),
+    ))
+}
+
+/// v0.10: validate one query level's CTEs: duplicate names (also caught by
+/// the parser), and the recursive-CTE shape rules — the non-recursive
+/// term must not reference the CTE, the recursive term must.
+fn validate_ctes(ctes: &[CteDef]) -> Result<(), ExecError> {
+    for cte in ctes {
+        if !cte.recursive {
+            continue;
+        }
+        let (left, right) = match &cte.body {
+            CteBody::Union { left, right, .. } => (left.as_ref(), right.as_ref()),
+            // v0.10: Postgres allows a non-recursive body in WITH
+            // RECURSIVE; skip the recursion checks.
+            CteBody::Simple(_) => continue,
+        };
+        if stmt_refs_table(left, &cte.name) {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "recursive CTE \"{}\": the non-recursive term must not reference the CTE",
+                    cte.name
+                ),
+            ));
+        }
+        if !stmt_refs_table(right, &cte.name) {
+            // v0.10: Postgres allows a non-recursive UNION in WITH
+            // RECURSIVE; treat it as a single union (no iteration).
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// True when the SELECT's FROM clause (descending into derived tables)
+/// names the given relation.
+fn stmt_refs_table(sel: &SelectStmt, name: &str) -> bool {
+    sel.from.iter().any(|f| from_refs_table(f, name))
+}
+
+fn from_refs_table(f: &FromItem, name: &str) -> bool {
+    match f {
+        FromItem::Table { name: n, .. } => n == name,
+        FromItem::Derived { sub, .. } => stmt_refs_table(sub, name),
+        FromItem::Join { left, right, .. } => {
+            from_refs_table(left, name) || from_refs_table(right, name)
+        }
+    }
+}
+
+fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
     if let Some(n) = stmt.limit {
         if n < 0 {
             return Err(exec_err("2201W", "LIMIT must not be negative"));
@@ -3295,24 +4299,33 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
     validate_select(stmt)?;
     // Column metadata first, so names/types are identical between
     // Describe and execution.
-    let out_cols = describe_select(&*q.eng, q.snap, q.own, stmt)?;
+    let out_cols = describe_select(&*q.eng, q.snap, q.own, stmt, &q.ctes)?;
     // v0.8: when the whole query is a plain single-table SELECT whose
     // ORDER BY matches an index, rows stream out of the index in ORDER BY
     // order and the sort step below is skipped.
     let order_hint = plan_order_scan(&*q.eng, q.snap, q.own, stmt);
+    // v0.10: collect window specs early — the early-limit optimization
+    // is unsafe with windows (LIMIT must apply after windows are
+    // computed over the complete input).
+    let windows = collect_windows(stmt);
+    let has_windows = !windows.is_empty();
     // v0.8: OFFSET+LIMIT row budget lets the index-order scan stop as
     // soon as enough visible rows are collected. Safe only together
     // with the order hint: there is no residual filter, DISTINCT, or
     // aggregation between the scan and the final truncation.
-    let early_limit = order_hint.as_ref().and(match (stmt.offset, stmt.limit) {
-        (_, Some(l)) => Some(
-            stmt.offset
-                .unwrap_or(0)
-                .max(0)
-                .saturating_add(l.max(0)) as usize,
-        ),
-        _ => None,
-    });
+    let early_limit = if has_windows {
+        None
+    } else {
+        order_hint.as_ref().and(match (stmt.offset, stmt.limit) {
+            (_, Some(l)) => Some(
+                stmt.offset
+                    .unwrap_or(0)
+                    .max(0)
+                    .saturating_add(l.max(0)) as usize,
+            ),
+            _ => None,
+        })
+    };
     let (schema, rows) = build_from(
         q,
         outer,
@@ -3323,20 +4336,43 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
         early_limit,
     )?;
     let rows = apply_where(q, outer, &schema, rows, stmt.where_.as_ref())?;
+    // v0.10: window functions — stamp each Expr::Window with its index
+    // (clone only when needed). `windows` was collected above.
+    let owned_stmt: SelectStmt;
+    let stmt: &SelectStmt = if windows.is_empty() {
+        stmt
+    } else {
+        let mut s = stmt.clone();
+        assign_window_ids(&mut s, &windows);
+        owned_stmt = s;
+        &owned_stmt
+    };
     let agg = is_agg_query(stmt);
+    // v0.10: precompute window values for the non-aggregated case
+    // (the aggregated case is handled inside exec_agg, where groups
+    // are available).
+    if !windows.is_empty() && !agg {
+        let inputs = gather_window_inputs_plain(q, outer, &schema, &rows, &windows)?;
+        install_windows(q, &windows, &inputs)?;
+    }
     // Non-aggregated queries with ORDER BY keep the full row around: an
     // ORDER BY term may reference a non-projected column (v0.1 behavior).
     let keep_full = !agg && !stmt.distinct && !stmt.order_by.is_empty();
     let mut orows: Vec<OutRow> = if agg {
-        exec_agg(q, outer, stmt, &schema, &rows, &out_cols)?
+        exec_agg(q, outer, stmt, &schema, &rows, &out_cols, &windows)?
     } else {
         let mut v = Vec::with_capacity(rows.len());
-        for r in rows {
+        for (ri, r) in rows.into_iter().enumerate() {
             let full = if keep_full {
                 r.cells.clone()
             } else {
                 Vec::new()
             };
+            // v0.10: point the window context at this input row before
+            // projecting (windows were precomputed above).
+            if let Some(wctx) = q.wctx.as_mut() {
+                wctx.row = ri;
+            }
             // project_row takes the row by value: plain `SELECT *` moves
             // it through with zero copies, and provenance moves rather
             // than cloning.
@@ -3346,6 +4382,9 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
                 prov,
                 full,
                 sort_keys: None,
+                // v0.10: ORDER BY terms with windows need the input
+                // row index.
+                win_idx: if windows.is_empty() { None } else { Some(ri) },
             });
         }
         v
@@ -3390,6 +4429,10 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
 /// like Postgres); FOR UPDATE is illegal with DISTINCT / GROUP BY /
 /// aggregates (0A000, like Postgres).
 fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
+    // v0.10: CTE shape rules (recursive UNION discipline).
+    validate_ctes(&stmt.with)?;
+    // v0.10: window-function placement rules.
+    validate_windows(stmt)?;
     if let Some(w) = &stmt.where_ {
         if contains_agg(w) {
             return Err(exec_err(
@@ -3397,11 +4440,23 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
                 "aggregates are not allowed in WHERE clause",
             ));
         }
+        if contains_window(w) {
+            return Err(exec_err(
+                "42803",
+                "window functions are not allowed in WHERE clause",
+            ));
+        }
         validate_expr(w)?;
     }
     for g in &stmt.group_by {
         if contains_agg(g) {
             return Err(exec_err("42803", "aggregates are not allowed in GROUP BY"));
+        }
+        if contains_window(g) {
+            return Err(exec_err(
+                "42803",
+                "window functions are not allowed in GROUP BY",
+            ));
         }
         validate_expr(g)?;
     }
@@ -3414,6 +4469,12 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
         validate_from(f)?;
     }
     if let Some(h) = &stmt.having {
+        if contains_window(h) {
+            return Err(exec_err(
+                "42803",
+                "window functions are not allowed in HAVING",
+            ));
+        }
         validate_expr(h)?;
     }
     for o in &stmt.order_by {
@@ -3548,6 +4609,1186 @@ fn contains_agg(e: &Expr) -> bool {
         Expr::InSub { expr, .. } => contains_agg(expr),
         // ScalarSub / Exists are separate query levels.
         Expr::ScalarSub(_) | Expr::Exists { .. } => false,
+        // v0.10: a window counts as an aggregate when any of its input
+        // expressions does (e.g. `sum(x) OVER (...)`).
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(contains_agg)
+                || partition_by.iter().any(contains_agg)
+                || order_by.iter().any(|o| contains_agg(&o.expr))
+        }
+    }
+}
+
+/// v0.10: true when the expression contains a window function (at any
+/// depth, but not crossing into subquery levels).
+fn contains_window(e: &Expr) -> bool {
+    match e {
+        Expr::Window { .. } => true,
+        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => false,
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
+        Expr::Cmp { left, right, .. } => contains_window(left) || contains_window(right),
+        Expr::Like {
+            expr, pattern, ..
+        } => contains_window(expr) || contains_window(pattern),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_window(expr) || contains_window(low) || contains_window(high),
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+            contains_window(x)
+        }
+        Expr::Cast { expr, .. } => contains_window(expr),
+        Expr::Func { args, .. } => args.iter().any(contains_window),
+        Expr::Agg { arg, arg2, .. } => {
+            arg.as_deref().map(contains_window).unwrap_or(false)
+                || arg2.as_deref().map(contains_window).unwrap_or(false)
+        }
+        Expr::Extract { from, .. } => contains_window(from),
+        Expr::InSub { expr, .. } => contains_window(expr),
+        // Subqueries are separate query levels.
+        Expr::ScalarSub(_) | Expr::Exists { .. } => false,
+    }
+}
+
+/// v0.10: COPY support — data layer for the server's COPY protocol.
+// ---------------------------------------------------------------------------
+
+/// v0.10: resolve the column count for a COPY target (explicit column
+/// list, or the table's full width).
+pub fn copy_ncols(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    table: &str,
+    columns: &Option<Vec<String>>,
+) -> Result<usize, ExecError> {
+    if let Some(cols) = columns {
+        // Validate the names while we're at it.
+        let t = eng
+            .db
+            .find_table(table, snap, own)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let meta = TableMeta::of(t);
+        for n in cols {
+            if !meta.columns.iter().any(|(c, _)| c == n) {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", n, table),
+                ));
+            }
+        }
+        Ok(cols.len())
+    } else {
+        let t = eng
+            .db
+            .find_table(table, snap, own)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        Ok(TableMeta::of(t).columns.len())
+    }
+}
+
+/// v0.10: COPY TO STDOUT — run `SELECT <cols> FROM <table>` and return
+/// the (name, type) columns and the visible rows.
+pub fn copy_to_rows(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    columns: &Option<Vec<String>>,
+) -> Result<(Vec<(String, ColType)>, Vec<Vec<Value>>), ExecError> {
+    // Validate the table/columns first (clean 42P01/42703 errors).
+    copy_ncols(eng, ctx.snap, ctx.own, table, columns)?;
+    let col_list = match columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "*".to_string(),
+    };
+    let sql = format!(
+        "SELECT {} FROM \"{}\"",
+        col_list,
+        table.replace('"', "\"\"")
+    );
+    let stmt = crate::sql::parse_statement(&sql).map_err(|e| ExecError {
+        code: e.code,
+        message: e.message,
+    })?;
+    match execute(eng, ctx, &stmt)? {
+        ExecResult::Select { columns, rows } => Ok((columns, rows)),
+        _ => Err(ExecError {
+            code: "XX000",
+            message: "internal error: COPY TO did not return rows".to_string(),
+        }),
+    }
+}
+
+/// v0.10: COPY FROM STDIN — insert pre-parsed rows. Returns the row count.
+pub fn copy_from_rows(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    rows: Vec<Vec<crate::copy::CopyField>>,
+) -> Result<u64, ExecError> {
+    use crate::copy::CopyField;
+    use crate::sql::Literal;
+    let insert_rows: Vec<Vec<InsertValue>> = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|f| match f {
+                    CopyField::Text(s) => InsertValue::Lit(Literal::Text(s)),
+                    CopyField::Null => InsertValue::Lit(Literal::Null),
+                })
+                .collect()
+        })
+        .collect();
+    let n = insert_rows.len() as u64;
+    // Reuse the full INSERT path: coercion, defaults, constraints,
+    // unique indexes, foreign keys, WAL — atomically.
+    let _ = exec_insert(eng, ctx, table, columns, &insert_rows, &None, &[], &None, &[])?;
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// v0.10: Window functions
+// ---------------------------------------------------------------------------
+
+/// v0.10: an executable window specification, deduplicated across the
+/// query level. `wid` indexes the precomputed values in the query
+/// context (`Q.wctx`).
+#[derive(Clone, Debug, PartialEq)]
+struct ExecWindow {
+    func: WindowFunc,
+    args: Vec<Expr>,
+    distinct: bool,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderTerm>,
+    frame: WindowFrame,
+}
+
+/// v0.10: validate every window function at this query level: arity,
+/// no nested windows, no window inside an aggregate argument, and
+/// frame discipline.
+fn validate_windows(stmt: &SelectStmt) -> Result<(), ExecError> {
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            validate_window_expr(expr, false)?;
+        }
+    }
+    for o in &stmt.order_by {
+        validate_window_expr(&o.expr, false)?;
+    }
+    Ok(())
+}
+
+/// v0.10: `in_window` tracks whether we are inside a window's input
+/// expressions (nested windows are forbidden); `in_agg` tracks
+/// aggregate arguments (windows are forbidden there).
+fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
+    match e {
+        Expr::Window {
+            func,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            frame,
+            ..
+        } => {
+            if in_agg {
+                return Err(exec_err(
+                    "42803",
+                    "window functions are not allowed in aggregate arguments",
+                ));
+            }
+            check_window_arity(func, args.len())?;
+            if *distinct {
+                return Err(exec_err(
+                    "0A000",
+                    "DISTINCT is not supported in window functions",
+                ));
+            }
+            for a in args {
+                if contains_window(a) {
+                    return Err(exec_err(
+                        "42803",
+                        "window functions cannot be nested",
+                    ));
+                }
+                validate_window_expr(a, false)?;
+            }
+            for p in partition_by {
+                if contains_window(p) {
+                    return Err(exec_err(
+                        "42803",
+                        "window functions cannot be nested",
+                    ));
+                }
+                validate_window_expr(p, false)?;
+            }
+            for o in order_by {
+                if contains_window(&o.expr) {
+                    return Err(exec_err(
+                        "42803",
+                        "window functions cannot be nested",
+                    ));
+                }
+                validate_window_expr(&o.expr, false)?;
+            }
+            check_window_frame(frame, order_by.len())?;
+            // Frame bounds must be constant.
+            Ok(())
+        }
+        Expr::Agg { arg, arg2, .. } => {
+            if let Some(a) = arg {
+                validate_window_expr(a, true)?;
+            }
+            if let Some(a) = arg2 {
+                validate_window_expr(a, true)?;
+            }
+            Ok(())
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Concat(left, right) => {
+            validate_window_expr(left, in_agg)?;
+            validate_window_expr(right, in_agg)
+        }
+        Expr::Cmp { left, right, .. } => {
+            validate_window_expr(left, in_agg)?;
+            validate_window_expr(right, in_agg)
+        }
+        Expr::Like {
+            expr, pattern, ..
+        } => {
+            validate_window_expr(expr, in_agg)?;
+            validate_window_expr(pattern, in_agg)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_window_expr(expr, in_agg)?;
+            validate_window_expr(low, in_agg)?;
+            validate_window_expr(high, in_agg)
+        }
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+            validate_window_expr(x, in_agg)
+        }
+        Expr::Cast { expr, .. } => validate_window_expr(expr, in_agg),
+        Expr::Func { args, .. } => {
+            for a in args {
+                validate_window_expr(a, in_agg)?;
+            }
+            Ok(())
+        }
+        Expr::Extract { from, .. } => validate_window_expr(from, in_agg),
+        Expr::InSub { expr, .. } => validate_window_expr(expr, in_agg),
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::ScalarSub(_)
+        | Expr::Exists { .. } => Ok(()),
+    }
+}
+
+/// v0.10: argument counts per window function (Postgres arities).
+fn check_window_arity(func: &WindowFunc, n: usize) -> Result<(), ExecError> {
+    let ok = match func {
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => n == 0,
+        WindowFunc::Ntile => n == 1,
+        WindowFunc::Lag | WindowFunc::Lead => n >= 1 && n <= 3,
+        WindowFunc::FirstValue | WindowFunc::LastValue => n == 1,
+        WindowFunc::NthValue => n == 2,
+        WindowFunc::Agg(f) => check_agg_window_arity(f, n),
+    };
+    if !ok {
+        return Err(exec_err(
+            "42883",
+            format!("wrong number of arguments to window function (got {})", n),
+        ));
+    }
+    Ok(())
+}
+
+/// v0.10: aggregate arities when used as window functions.
+fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
+    match f {
+        AggFunc::Count => n <= 1,
+        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => n == 1,
+        AggFunc::StringAgg => false,
+    }
+}
+
+/// v0.10: frame discipline (Postgres restrictions).
+fn check_window_frame(frame: &WindowFrame, order_len: usize) -> Result<(), ExecError> {
+    match frame {
+        WindowFrame::Default => Ok(()),
+        WindowFrame::Rows { .. } => Ok(()),
+        WindowFrame::Range { start, end } => {
+            if has_offset_bound(start) || has_offset_bound(end) {
+                if order_len != 1 {
+                    return Err(exec_err(
+                        "0A000",
+                        "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY expression",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// v0.10: true for `N PRECEDING` / `N FOLLOWING` bounds.
+fn has_offset_bound(b: &FrameBound) -> bool {
+    matches!(
+        b,
+        FrameBound::Preceding(_) | FrameBound::Following(_)
+    )
+}
+
+/// v0.10: collect the deduplicated window specifications used at this
+/// query level (SELECT list and ORDER BY).
+fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {    let mut out: Vec<ExecWindow> = Vec::new();
+    let mut visit = |e: &Expr| {
+        if let Expr::Window {
+            func,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            frame,
+            ..
+        } = e
+        {
+            let w = ExecWindow {
+                func: func.clone(),
+                args: args.clone(),
+                distinct: *distinct,
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                frame: frame.clone(),
+            };
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    };
+    // Walk select items and ORDER BY terms (windows are validated to
+    // live only there).
+    fn walk(e: &Expr, visit: &mut impl FnMut(&Expr)) {
+        match e {
+            Expr::Window { .. } => visit(e),
+            Expr::Arith { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right)
+            | Expr::Concat(left, right) => {
+                walk(left, visit);
+                walk(right, visit);
+            }
+            Expr::Cmp { left, right, .. } => {
+                walk(left, visit);
+                walk(right, visit);
+            }
+            Expr::Like {
+                expr, pattern, ..
+            } => {
+                walk(expr, visit);
+                walk(pattern, visit);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, visit);
+                walk(low, visit);
+                walk(high, visit);
+            }
+            Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+                walk(x, visit)
+            }
+            Expr::Cast { expr, .. } => walk(expr, visit),
+            Expr::Func { args, .. } => {
+                for a in args {
+                    walk(a, visit);
+                }
+            }
+            Expr::Agg { arg, arg2, .. } => {
+                if let Some(a) = arg {
+                    walk(a, visit);
+                }
+                if let Some(a) = arg2 {
+                    walk(a, visit);
+                }
+            }
+            Expr::Extract { from, .. } => walk(from, visit),
+            Expr::InSub { expr, .. } => walk(expr, visit),
+            _ => {}
+        }
+    }
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, &mut visit);
+        }
+    }
+    for o in &stmt.order_by {
+        walk(&o.expr, &mut visit);
+    }
+    out
+}
+
+/// v0.10: stamp each `Expr::Window` with its deduplicated index.
+fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
+    fn stamp(e: &mut Expr, windows: &[ExecWindow]) {
+        match e {
+            Expr::Window {
+                func,
+                args,
+                distinct,
+                partition_by,
+                order_by,
+                frame,
+                wid,
+            } => {
+                let w = ExecWindow {
+                    func: func.clone(),
+                    args: args.clone(),
+                    distinct: *distinct,
+                    partition_by: partition_by.clone(),
+                    order_by: order_by.clone(),
+                    frame: frame.clone(),
+                };
+                *wid = windows.iter().position(|x| x == &w).unwrap_or(0);
+            }
+            Expr::Arith { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right)
+            | Expr::Concat(left, right) => {
+                stamp(left, windows);
+                stamp(right, windows);
+            }
+            Expr::Cmp { left, right, .. } => {
+                stamp(left, windows);
+                stamp(right, windows);
+            }
+            Expr::Like {
+                expr, pattern, ..
+            } => {
+                stamp(expr, windows);
+                stamp(pattern, windows);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                stamp(expr, windows);
+                stamp(low, windows);
+                stamp(high, windows);
+            }
+            Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
+                stamp(x, windows)
+            }
+            Expr::Cast { expr, .. } => stamp(expr, windows),
+            Expr::Func { args, .. } => {
+                for a in args {
+                    stamp(a, windows);
+                }
+            }
+            Expr::Agg { arg, arg2, .. } => {
+                if let Some(a) = arg {
+                    stamp(a, windows);
+                }
+                if let Some(a) = arg2 {
+                    stamp(a, windows);
+                }
+            }
+            Expr::Extract { from, .. } => stamp(from, windows),
+            Expr::InSub { expr, .. } => stamp(expr, windows),
+            _ => {}
+        }
+    }
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            stamp(expr, windows);
+        }
+    }
+    for o in &mut stmt.order_by {
+        stamp(&mut o.expr, windows);
+    }
+}
+
+/// v0.10: precomputed input values for one window: partition keys,
+/// order keys, and argument values, one entry per input row.
+struct WindowInput {
+    part_keys: Vec<Vec<Value>>,
+    order_keys: Vec<Vec<Value>>,
+    arg_vals: Vec<Vec<Value>>,
+}
+
+/// v0.10: compare two order-key vectors using the window's ORDER BY
+/// terms (direction + null placement).
+fn compare_window_keys(
+    a: &[Value],
+    b: &[Value],
+    order_by: &[OrderTerm],
+) -> Result<Ordering, ExecError> {
+    for (i, o) in order_by.iter().enumerate() {
+        let av = a.get(i).unwrap_or(&Value::Null);
+        let bv = b.get(i).unwrap_or(&Value::Null);
+        let ord = compare_values(av, bv, o.desc, o.nulls_first)?;
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// v0.10: peer test for ranking and RANGE frames: all order keys equal
+/// (NULL = NULL for peer grouping, like Postgres).
+fn window_keys_equal(a: &[Value], b: &[Value]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        let eq = match (x, y) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => {
+                let mut ka = Vec::new();
+                let mut kb = Vec::new();
+                value_key(x, &mut ka);
+                value_key(y, &mut kb);
+                ka == kb
+            }
+        };
+        if !eq {
+            return false;
+        }
+    }
+    true
+}
+
+/// v0.10: resolve a ROWS frame bound to an inclusive row position.
+fn rows_bound(b: &FrameBound, pos: usize, n: usize) -> usize {
+    match b {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::Preceding(k) => pos.saturating_sub((*k).min(usize::MAX as u64) as usize),
+        FrameBound::CurrentRow => pos,
+        FrameBound::Following(k) => {
+            pos.saturating_add((*k).min(usize::MAX as u64) as usize)
+                .min(n.saturating_sub(1))
+        }
+        FrameBound::UnboundedFollowing => n.saturating_sub(1),
+    }
+}
+
+/// v0.10: resolve a window frame to an inclusive (start, end) position
+/// range within the ordered partition.
+fn resolve_frame(
+    spec: &ExecWindow,
+    input: &WindowInput,
+    idxs: &[usize],
+    pos: usize,
+) -> Result<(usize, usize), ExecError> {
+    let n = idxs.len();
+    if n == 0 {
+        return Ok((0, 0));
+    }
+    let order_len = spec.order_by.len();
+    // Effective frame (Postgres default rule).
+    let (is_range, start, end): (bool, FrameBound, FrameBound) = match &spec.frame {
+        WindowFrame::Default => {
+            if order_len > 0 {
+                (
+                    true,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::CurrentRow,
+                )
+            } else {
+                (
+                    false,
+                    FrameBound::UnboundedPreceding,
+                    FrameBound::UnboundedFollowing,
+                )
+            }
+        }
+        WindowFrame::Rows { start, end } => (false, start.clone(), end.clone()),
+        WindowFrame::Range { start, end } => (true, start.clone(), end.clone()),
+    };
+    if !is_range {
+        let s = rows_bound(&start, pos, n);
+        let e = rows_bound(&end, pos, n);
+        // v0.10: an inverted span is empty (not silently reversed).
+        if s > e {
+            return Ok((1, 0));
+        }
+        return Ok((s, e));
+    }
+    // RANGE mode without ORDER BY: no ordering values exist, so every
+    // row is a peer of every other; resolve positionally like ROWS.
+    let key_at = |p: usize| -> &[Value] { &input.order_keys[idxs[p]] };
+    if order_len == 0 {
+        let s = rows_bound(&start, pos, n);
+        let e = rows_bound(&end, pos, n);
+        if s > e {
+            return Ok((1, 0));
+        }
+        return Ok((s, e));
+    }
+    // RANGE mode: the frame is all rows whose single order key lies in
+    // the [lo, hi] value interval derived from the bounds (Postgres
+    // value-based RANGE semantics; CURRENT ROW expands to peers via the
+    // interval). NULL order keys never match.
+    if order_len > 1
+        && matches!(
+            (&start, &end),
+            (FrameBound::Preceding(_), _)
+                | (FrameBound::Following(_), _)
+                | (_, FrameBound::Preceding(_))
+                | (_, FrameBound::Following(_))
+        )
+    {
+        return Err(exec_err(
+            "0A000",
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY expression",
+        ));
+    }
+    let cur = key_at(pos).first().unwrap_or(&Value::Null).clone();
+    // v0.10: RANGE without offsets uses peer semantics (works for any
+    // orderable type, like Postgres); offsets require numeric.
+    let has_offset = has_offset_bound(&start) || has_offset_bound(&end);
+    if !has_offset {
+        // Peer-based: expand CURRENT ROW to the peer group.
+        // Use the ORDER BY direction for the comparison.
+        let (desc, nulls_first) = spec
+            .order_by
+            .first()
+            .map(|o| (o.desc, o.nulls_first))
+            .unwrap_or((false, None));
+        let is_peer = |a: &Value, b: &Value| -> bool {
+            // NULLs are peers of each other (they sort together).
+            match (a, b) {
+                (Value::Null, Value::Null) => true,
+                (Value::Null, _) | (_, Value::Null) => false,
+                _ => matches!(
+                    compare_values(a, b, desc, nulls_first),
+                    Ok(std::cmp::Ordering::Equal)
+                ),
+            }
+        };
+        let bound_pos = |b: &FrameBound, is_start: bool| -> usize {
+            match b {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::UnboundedFollowing => n - 1,
+                FrameBound::CurrentRow => {
+                    if is_start {
+                        // First peer at or before pos.
+                        let mut s = pos;
+                        while s > 0 && is_peer(key_at(s - 1).first().unwrap_or(&Value::Null), &cur) {
+                            s -= 1;
+                        }
+                        s
+                    } else {
+                        // Last peer at or after pos.
+                        let mut e = pos;
+                        while e + 1 < n && is_peer(key_at(e + 1).first().unwrap_or(&Value::Null), &cur) {
+                            e += 1;
+                        }
+                        e
+                    }
+                }
+                // Unreachable: has_offset is false.
+                FrameBound::Preceding(_) | FrameBound::Following(_) => pos,
+            }
+        };
+        let s = bound_pos(&start, true);
+        let e = bound_pos(&end, false);
+        // An inverted span (e.g. start after end) is empty.
+        if s > e {
+            return Ok((1, 0));
+        }
+        return Ok((s, e));
+    }
+    // RANGE with offsets: numeric interval semantics.
+    if matches!(cur, Value::Null) {
+        return Err(exec_err(
+            "0A000",
+            "RANGE offset requires a numeric ORDER BY expression",
+        ));
+    }
+    let to_f = |v: &Value| -> Result<f64, ExecError> {
+        match v {
+            Value::Int(i) => Ok(*i as f64),
+            Value::BigInt(i) => Ok(*i as f64),
+            Value::Float(f) => Ok(*f),
+            Value::Numeric(n) => Ok(n.to_f64()),
+            _ => Err(exec_err(
+                "0A000",
+                "RANGE offset requires a numeric ORDER BY expression",
+            )),
+        }
+    };
+    let cur_f = if matches!(cur, Value::Null) {
+        f64::NAN
+    } else {
+        to_f(&cur)?
+    };
+    let bound_val = |b: &FrameBound| -> Result<f64, ExecError> {
+        match b {
+            FrameBound::UnboundedPreceding => Ok(f64::NEG_INFINITY),
+            FrameBound::UnboundedFollowing => Ok(f64::INFINITY),
+            FrameBound::CurrentRow => Ok(cur_f),
+            FrameBound::Preceding(k) => Ok(cur_f - (*k as f64)),
+            FrameBound::Following(k) => Ok(cur_f + (*k as f64)),
+        }
+    };
+    // Note: for the start bound, PRECEDING gives lo; for the end bound,
+    // FOLLOWING gives hi. (A start FOLLOWING / end PRECEDING was
+    // rejected by the parser's frame sanity check.)
+    let lo = bound_val(&start)?;
+    let hi = bound_val(&end)?;
+    let mut s = n;
+    let mut e = n;
+    for p in 0..n {
+        let v = key_at(p).first().unwrap_or(&Value::Null);
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let f = to_f(v)?;
+        if f >= lo && f <= hi {
+            if s == n {
+                s = p;
+            }
+            e = p;
+        }
+    }
+    if s == n {
+        return Ok((1, 0)); // empty frame
+    }
+    Ok((s, e))
+}
+
+/// v0.10: gather window inputs (partition keys, order keys, argument
+/// values) for the non-aggregated case: one entry per filtered row.
+fn gather_window_inputs_plain(
+    q: &mut Q,
+    outer: &[Scope],
+    schema: &[QCol],
+    rows: &[QRow],
+    specs: &[ExecWindow],
+) -> Result<Vec<WindowInput>, ExecError> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut part_keys = Vec::with_capacity(rows.len());
+        let mut order_keys = Vec::with_capacity(rows.len());
+        let mut arg_vals = Vec::with_capacity(rows.len());
+        for r in rows {
+            let frame = Scope {
+                schema,
+                row: &r.cells,
+            };
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(frame);
+            // Window inputs cannot contain window functions (validated)
+            // or aggregates (that would make this an aggregate query).
+            let mut pk = Vec::with_capacity(spec.partition_by.len());
+            for p in &spec.partition_by {
+                pk.push(eval_expr(q, &scopes, p)?);
+            }
+            let mut ok = Vec::with_capacity(spec.order_by.len());
+            for o in &spec.order_by {
+                ok.push(eval_expr(q, &scopes, &o.expr)?);
+            }
+            let mut av = Vec::with_capacity(spec.args.len());
+            for a in &spec.args {
+                av.push(eval_expr(q, &scopes, a)?);
+            }
+            part_keys.push(pk);
+            order_keys.push(ok);
+            arg_vals.push(av);
+        }
+        out.push(WindowInput {
+            part_keys,
+            order_keys,
+            arg_vals,
+        });
+    }
+    Ok(out)
+}
+
+/// v0.10: gather window inputs for the aggregated case: one entry per
+/// group, evaluated with the group's context (aggregates and GROUP BY
+/// keys via `eval_grouped`).
+fn gather_window_inputs_grouped(
+    q: &mut Q,
+    outer: &[Scope],
+    schema: &[QCol],
+    rows: &[QRow],
+    groups: &[(Vec<Value>, Vec<usize>)],
+    // v0.10: indices of groups surviving HAVING (windows see only these,
+    // like Postgres).
+    surviving: &[usize],
+    group_by: &[Expr],
+    specs: &[ExecWindow],
+) -> Result<Vec<WindowInput>, ExecError> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut part_keys = Vec::with_capacity(surviving.len());
+        let mut order_keys = Vec::with_capacity(surviving.len());
+        let mut arg_vals = Vec::with_capacity(surviving.len());
+        for &gi in surviving {
+            let (key_vals, idxs) = &groups[gi];
+            let first: &[Value] = match idxs.first() {
+                Some(&i) => &rows[i].cells,
+                None => &[],
+            };
+            let gscope = Scope { schema, row: first };
+            let mut pk = Vec::with_capacity(spec.partition_by.len());
+            for p in &spec.partition_by {
+                pk.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, p,
+                )?);
+            }
+            let mut ok = Vec::with_capacity(spec.order_by.len());
+            for o in &spec.order_by {
+                ok.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by,
+                    &o.expr,
+                )?);
+            }
+            let mut av = Vec::with_capacity(spec.args.len());
+            for a in &spec.args {
+                av.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
+                )?);
+            }
+            part_keys.push(pk);
+            order_keys.push(ok);
+            arg_vals.push(av);
+        }
+        out.push(WindowInput {
+            part_keys,
+            order_keys,
+            arg_vals,
+        });
+    }
+    Ok(out)
+}
+
+/// v0.10: compute every window's value vector and install the query's
+/// window context.
+fn install_windows(
+    q: &mut Q,
+    specs: &[ExecWindow],
+    inputs: &[WindowInput],
+) -> Result<(), ExecError> {
+    let mut values = Vec::with_capacity(specs.len());
+    for (spec, input) in specs.iter().zip(inputs.iter()) {
+        values.push(compute_window_values(spec, input)?);
+    }
+    q.wctx = Some(WindowCtx { values, row: 0 });
+    Ok(())
+}
+
+/// v0.10: compute one window's value for every input row.
+fn compute_window_values(
+    spec: &ExecWindow,
+    input: &WindowInput,
+) -> Result<Vec<Value>, ExecError> {
+    let nrows = input.arg_vals.len();
+    let mut result = vec![Value::Null; nrows];
+    if nrows == 0 {
+        return Ok(result);
+    }
+    // Partition rows by partition-key.
+    let mut parts: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut part_order: Vec<Vec<u8>> = Vec::new();
+    for i in 0..nrows {
+        let mut k = Vec::new();
+        for v in &input.part_keys[i] {
+            value_key(v, &mut k);
+        }
+        if !parts.contains_key(&k) {
+            part_order.push(k.clone());
+        }
+        parts.entry(k).or_default().push(i);
+    }
+    for pk in &part_order {
+        let mut idxs = parts[pk].clone();
+        // Order within the partition (stable: ties keep input order).
+        if !spec.order_by.is_empty() {
+            let mut err: Option<ExecError> = None;
+            idxs.sort_by(|&a, &b| {
+                if err.is_some() {
+                    return Ordering::Equal;
+                }
+                match compare_window_keys(
+                    &input.order_keys[a],
+                    &input.order_keys[b],
+                    &spec.order_by,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        err = Some(e);
+                        Ordering::Equal
+                    }
+                }
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        let vals = compute_partition(spec, input, &idxs)?;
+        for (j, &row_idx) in idxs.iter().enumerate() {
+            result[row_idx] = vals[j].clone();
+        }
+    }
+    Ok(result)
+}
+
+/// v0.10: compute a window function over one ordered partition.
+/// `idxs` are input-row indices in partition order; returns one value
+/// per position.
+fn compute_partition(
+    spec: &ExecWindow,
+    input: &WindowInput,
+    idxs: &[usize],
+) -> Result<Vec<Value>, ExecError> {
+    let n = idxs.len();
+    let mut out = vec![Value::Null; n];
+    // Peer groups (for rank/dense_rank and RANGE): consecutive rows
+    // with equal order keys.
+    let mut peer_id = vec![0usize; n];
+    if !spec.order_by.is_empty() && n > 0 {
+        let mut p = 0;
+        for i in 1..n {
+            if !window_keys_equal(
+                &input.order_keys[idxs[i]],
+                &input.order_keys[idxs[i - 1]],
+            ) {
+                p += 1;
+            }
+            peer_id[i] = p;
+        }
+    }
+    let arg = |pos: usize, k: usize| -> Value {
+        input
+            .arg_vals
+            .get(idxs[pos])
+            .and_then(|v| v.get(k))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    match &spec.func {
+        WindowFunc::RowNumber => {
+            for (j, v) in out.iter_mut().enumerate() {
+                *v = Value::BigInt(j as i64 + 1);
+            }
+        }
+        WindowFunc::Rank => {
+            for j in 0..n {
+                // 1 + rows before the first peer.
+                let mut first = j;
+                while first > 0 && peer_id[first - 1] == peer_id[j] {
+                    first -= 1;
+                }
+                out[j] = Value::BigInt(first as i64 + 1);
+            }
+        }
+        WindowFunc::DenseRank => {
+            for j in 0..n {
+                out[j] = Value::BigInt(peer_id[j] as i64 + 1);
+            }
+        }
+        WindowFunc::Ntile => {
+            let k_val = arg(0, 0);
+            let k = match k_val {
+                Value::Int(i) => i as usize,
+                Value::BigInt(i) => i.max(0) as usize,
+                Value::Null => {
+                    return Err(exec_err("22004", "ntile argument must not be null"))
+                }
+                _ => {
+                    return Err(exec_err(
+                        "22003",
+                        "ntile argument must be an integer",
+                    ))
+                }
+            };
+            if k == 0 {
+                return Err(exec_err("22003", "ntile argument must be positive"));
+            }
+            // As evenly as possible, larger buckets first (Postgres).
+            let base = n / k;
+            let rem = n % k;
+            let mut pos = 0;
+            for b in 0..k {
+                let size = base + if b < rem { 1 } else { 0 };
+                for _ in 0..size {
+                    if pos < n {
+                        out[pos] = Value::Int((b + 1) as i64);
+                    }
+                    pos += 1;
+                }
+            }
+        }
+        WindowFunc::Lag | WindowFunc::Lead => {
+            let is_lag = matches!(spec.func, WindowFunc::Lag);
+            for j in 0..n {
+                let off_val = if input
+                    .arg_vals
+                    .get(idxs[j])
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+                    > 1
+                {
+                    arg(j, 1)
+                } else {
+                    Value::Int(1)
+                };
+                let off: i64 = match off_val {
+                    Value::Int(i) => i as i64,
+                    Value::BigInt(i) => i,
+                    Value::Null => {
+                        return Err(exec_err(
+                            "22004",
+                            "lag/lead offset must not be null",
+                        ))
+                    }
+                    _ => {
+                        return Err(exec_err(
+                            "22003",
+                            "lag/lead offset must be an integer",
+                        ))
+                    }
+                };
+                if off < 0 {
+                    return Err(exec_err(
+                        "22003",
+                        "lag/lead offset must not be negative",
+                    ));
+                }
+                let target = if is_lag {
+                    (j as i64) - off
+                } else {
+                    (j as i64) + off
+                };
+                out[j] = if target >= 0 && (target as usize) < n {
+                    arg(target as usize, 0)
+                } else if input
+                    .arg_vals
+                    .get(idxs[j])
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+                    > 2
+                {
+                    arg(j, 2)
+                } else {
+                    Value::Null
+                };
+            }
+        }
+        WindowFunc::FirstValue => {
+            for j in 0..n {
+                let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                out[j] = if s <= e { arg(s, 0) } else { Value::Null };
+            }
+        }
+        WindowFunc::LastValue => {
+            for j in 0..n {
+                let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                out[j] = if s <= e { arg(e, 0) } else { Value::Null };
+            }
+        }
+        WindowFunc::NthValue => {
+            for j in 0..n {
+                let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                let nth = match arg(j, 1) {
+                    Value::Int(i) => i as i64,
+                    Value::BigInt(i) => i,
+                    Value::Null => {
+                        return Err(exec_err("22004", "nth_value argument must not be null"))
+                    }
+                    _ => {
+                        return Err(exec_err(
+                            "22003",
+                            "nth_value argument must be an integer",
+                        ))
+                    }
+                };
+                out[j] = if nth >= 1 && s <= e && (s as i64) + nth - 1 <= e as i64 {
+                    arg((s as i64 + nth - 1) as usize, 0)
+                } else {
+                    Value::Null
+                };
+            }
+        }
+        WindowFunc::Agg(f) => {
+            // count(*) counts rows (NULLs included); other aggregates
+            // skip NULL inputs, like their grouped counterparts.
+            let count_star = *f == AggFunc::Count && spec.args.is_empty();
+            for j in 0..n {
+                let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                let mut vals: Vec<Value> = Vec::new();
+                if s <= e {
+                    for p in s..=e {
+                        let v = arg(p, 0);
+                        if count_star || !matches!(v, Value::Null) {
+                            vals.push(v);
+                        }
+                    }
+                }
+                out[j] = eval_window_agg(*f, &vals)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v0.10: evaluate a windowed aggregate over frame values.
+fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
+    match f {
+        AggFunc::Count => {
+            // count(x): non-null inputs; count(*): all rows. (NULLs are
+            // filtered by the caller for count(x).)
+            Ok(Value::BigInt(vals.len() as i64))
+        }
+        AggFunc::Sum => sum_vals(vals),
+        AggFunc::Avg => avg_vals(vals),
+        AggFunc::Min | AggFunc::Max => {
+            let mut best: Option<&Value> = None;
+            for v in vals {
+                match best {
+                    None => best = Some(v),
+                    Some(b) => {
+                        let ord =
+                            cmp_ordering(v, b, CmpOp::Lt)?.expect("non-null values compare");
+                        let better = if f == AggFunc::Min {
+                            ord == Ordering::Less
+                        } else {
+                            ord == Ordering::Greater
+                        };
+                        if better {
+                            best = Some(v);
+                        }
+                    }
+                }
+            }
+            Ok(best.cloned().unwrap_or(Value::Null))
+        }
+        AggFunc::StringAgg => Err(exec_err(
+            "0A000",
+            "string_agg is not supported as a window function",
+        )),
     }
 }
 
@@ -3821,6 +6062,23 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_stmt_refs(sub, out);
         }
         Expr::Exists { sub, .. } => collect_stmt_refs(sub, out),
+        // v0.10: collect column refs from window inputs.
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+            for p in partition_by {
+                collect_column_refs(p, out);
+            }
+            for o in order_by {
+                collect_column_refs(&o.expr, out);
+            }
+        }
     }
 }
 
@@ -3925,6 +6183,19 @@ fn build_source(
     match item {
         FromItem::Table { name, alias } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // v0.10: CTEs shadow everything (like Postgres).
+            if let Some(b) = q.ctes.iter().rev().find(|b| b.name == *name) {
+                let schema: Vec<QCol> = b
+                    .schema
+                    .iter()
+                    .map(|c| QCol {
+                        qual: qual.clone(),
+                        name: c.name.clone(),
+                        ty: c.ty.clone(),
+                    })
+                    .collect();
+                return Ok((schema, b.rows.clone()));
+            }
             // v0.9: information_schema virtual tables.
             if name == "information_schema.tables" {
                 let (schema, rows) = info_tables_scan(&q.eng.db, q.snap, q.own);
@@ -4104,6 +6375,8 @@ fn build_source(
                     session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
                 };
                 run_select(&mut sub_q, sub, &[])?
             };
@@ -4484,6 +6757,8 @@ fn exec_agg(
     schema: &[QCol],
     rows: &[QRow],
     out_cols: &[(String, ColType)],
+    // v0.10: deduplicated window specs for this query level.
+    windows: &[ExecWindow],
 ) -> Result<Vec<OutRow>, ExecError> {
     // Group rows by their GROUP BY key, remembering first-seen order.
     let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -4518,6 +6793,48 @@ fn exec_agg(
     if groups.is_empty() && stmt.group_by.is_empty() {
         groups.push((Vec::new(), Vec::new()));
     }
+    // v0.10: HAVING is evaluated BEFORE windows (Postgres: windows see
+    // only groups surviving HAVING). Collect surviving group indices.
+    let mut surviving = Vec::with_capacity(groups.len());
+    for (gi, (key_vals, idxs)) in groups.iter().enumerate() {
+        let first: &[Value] = match idxs.first() {
+            Some(&i) => &rows[i].cells,
+            None => &[],
+        };
+        let gscope = Scope { schema, row: first };
+        let keep = match &stmt.having {
+            None => true,
+            Some(h) => eval_grouped_bool(
+                q,
+                outer,
+                gscope,
+                schema,
+                rows,
+                idxs,
+                key_vals,
+                &stmt.group_by,
+                h,
+            )?,
+        };
+        if keep {
+            surviving.push(gi);
+        }
+    }
+    // v0.10: precompute window values over the surviving groups (one
+    // input row per group).
+    if !windows.is_empty() {
+        let inputs = gather_window_inputs_grouped(
+            q,
+            outer,
+            schema,
+            rows,
+            &groups,
+            &surviving,
+            &stmt.group_by,
+            windows,
+        )?;
+        install_windows(q, windows, &inputs)?;
+    }
     // ORDER BY resolution needs the output schema + select-item positions;
     // the per-group fallback evaluates group-level expressions (aggregates
     // and GROUP BY columns, like Postgres) while all group context is alive.
@@ -4531,30 +6848,23 @@ fn exec_agg(
         .collect();
     let item_pos = select_item_positions(stmt, schema);
     let mut out_rows = Vec::new();
-    for (key_vals, idxs) in &groups {
-        // Correlated subqueries inside HAVING / the select list see the
-        // first row of the group. Any correlated column must be group-bound
-        // for the query to be valid, so every row in the group agrees on it.
+    // v0.10: iterate surviving groups only (HAVING already applied).
+    // `wctx.row` is the position in the surviving list, matching the
+    // window input order.
+    for (fgi, &gi) in surviving.iter().enumerate() {
+        let (key_vals, idxs) = &groups[gi];
+        // v0.10: point the window context at this group.
+        if let Some(wctx) = q.wctx.as_mut() {
+            wctx.row = fgi;
+        }
+        // Correlated subqueries inside the select list see the first row
+        // of the group. Any correlated column must be group-bound for the
+        // query to be valid, so every row in the group agrees on it.
         let first: &[Value] = match idxs.first() {
             Some(&i) => &rows[i].cells,
             None => &[],
         };
         let gscope = Scope { schema, row: first };
-        if let Some(h) = &stmt.having {
-            if !eval_grouped_bool(
-                q,
-                outer,
-                gscope,
-                schema,
-                rows,
-                idxs,
-                key_vals,
-                &stmt.group_by,
-                h,
-            )? {
-                continue;
-            }
-        }
         let mut cells = Vec::new();
         for item in &stmt.items {
             match item {
@@ -4635,6 +6945,8 @@ fn exec_agg(
             prov: Vec::new(),
             full: Vec::new(),
             sort_keys,
+            // v0.10: ORDER BY terms with windows need the group index.
+            win_idx: if windows.is_empty() { None } else { Some(gi) },
         });
     }
     Ok(out_rows)
@@ -4851,6 +7163,22 @@ fn eval_grouped(
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
         }
+        // v0.10: a top-level window in the select list (or ORDER BY
+        // fallback) reads its precomputed value from the query's
+        // window context. Nested windows never reach here: validation
+        // rejects them, and window inputs are gathered separately.
+        Expr::Window { wid, .. } => {
+            let wctx = q.wctx.as_ref().ok_or_else(|| {
+                exec_err("XX000", "internal error: window without context")
+            })?;
+            wctx.values
+                .get(*wid)
+                .and_then(|v| v.get(wctx.row))
+                .cloned()
+                .ok_or_else(|| {
+                    exec_err("XX000", "internal error: window value missing")
+                })
+        }
     }
 }
 
@@ -4870,6 +7198,84 @@ fn eval_grouped_bool(
 }
 
 /// The aggregate functions over one group's rows.
+/// v0.10: `sum()` over non-null values (shared by grouped aggregates
+/// and windowed aggregates).
+fn sum_vals(vals: &[Value]) -> Result<Value, ExecError> {
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // v0.6 rule kept: sum returns the widest input kind among
+    // the rows (documented deviation: Postgres widens int->bigint).
+    let mut cat = NumCat::Small;
+    for v in vals {
+        match num_cat(v) {
+            Some(c) => cat = cat.max(c),
+            None => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function sum({}) does not exist", v.type_name()),
+                ));
+            }
+        }
+    }
+    if cat == NumCat::Numeric {
+        let mut acc = Numeric::zero();
+        for v in vals {
+            let n = to_numeric_opt(v)
+                .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
+            acc = acc
+                .checked_add(&n)
+                .ok_or_else(|| exec_err("22003", "numeric field overflow"))?;
+        }
+        Ok(Value::Numeric(acc))
+    } else if cat >= NumCat::Real {
+        let mut acc = 0.0;
+        for v in vals {
+            acc += to_f64v(v);
+        }
+        Ok(if cat == NumCat::Real {
+            Value::Float4(acc as f32)
+        } else {
+            Value::Float(acc)
+        })
+    } else {
+        let mut acc: i128 = 0;
+        for v in vals {
+            acc = acc
+                .checked_add(to_i128(v))
+                .ok_or_else(|| exec_err("22003", "integer out of range"))?;
+        }
+        let icat = if cat == NumCat::Small {
+            NumCat::Int
+        } else {
+            cat
+        };
+        fit_int_result(icat, acc)
+    }
+}
+
+/// v0.10: `avg()` over non-null values (shared by grouped aggregates
+/// and windowed aggregates).
+fn avg_vals(vals: &[Value]) -> Result<Value, ExecError> {
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // v0.6 rule kept: avg always returns double precision.
+    let mut sum = 0.0;
+    for v in vals {
+        match num_cat(v) {
+            Some(_) => sum += to_f64v(v),
+            None => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function avg({}) does not exist", v.type_name()),
+                ));
+            }
+        }
+    }
+    Ok(Value::Float(sum / vals.len() as f64))
+}
+
 fn eval_agg_func(
     q: &mut Q,
     outer: &[Scope],
@@ -4938,79 +7344,8 @@ fn eval_agg_func(
     }
     match func {
         AggFunc::Count => Ok(Value::BigInt(vals.len() as i64)),
-        AggFunc::Sum => {
-            if vals.is_empty() {
-                return Ok(Value::Null);
-            }
-            // v0.6 rule kept: sum returns the widest input kind among
-            // the rows (documented deviation: Postgres widens int->bigint).
-            let mut cat = NumCat::Small;
-            for v in &vals {
-                match num_cat(v) {
-                    Some(c) => cat = cat.max(c),
-                    None => {
-                        return Err(exec_err(
-                            "42883",
-                            format!("function sum({}) does not exist", v.type_name()),
-                        ));
-                    }
-                }
-            }
-            if cat == NumCat::Numeric {
-                let mut acc = Numeric::zero();
-                for v in &vals {
-                    let n = to_numeric_opt(v).ok_or_else(|| {
-                        exec_err("22003", "value out of range for numeric")
-                    })?;
-                    acc = acc
-                        .checked_add(&n)
-                        .ok_or_else(|| exec_err("22003", "numeric field overflow"))?;
-                }
-                Ok(Value::Numeric(acc))
-            } else if cat >= NumCat::Real {
-                let mut acc = 0.0;
-                for v in &vals {
-                    acc += to_f64v(v);
-                }
-                Ok(if cat == NumCat::Real {
-                    Value::Float4(acc as f32)
-                } else {
-                    Value::Float(acc)
-                })
-            } else {
-                let mut acc: i128 = 0;
-                for v in &vals {
-                    acc = acc.checked_add(to_i128(v)).ok_or_else(|| {
-                        exec_err("22003", "integer out of range")
-                    })?;
-                }
-                let icat = if cat == NumCat::Small {
-                    NumCat::Int
-                } else {
-                    cat
-                };
-                fit_int_result(icat, acc)
-            }
-        }
-        AggFunc::Avg => {
-            if vals.is_empty() {
-                return Ok(Value::Null);
-            }
-            // v0.6 rule kept: avg always returns double precision.
-            let mut sum = 0.0;
-            for v in &vals {
-                match num_cat(v) {
-                    Some(_) => sum += to_f64v(v),
-                    None => {
-                        return Err(exec_err(
-                            "42883",
-                            format!("function avg({}) does not exist", v.type_name()),
-                        ));
-                    }
-                }
-            }
-            Ok(Value::Float(sum / vals.len() as f64))
-        }
+        AggFunc::Sum => sum_vals(&vals),
+        AggFunc::Avg => avg_vals(&vals),
         AggFunc::Min | AggFunc::Max => {
             let mut best: Option<&Value> = None;
             for v in &vals {
@@ -5135,6 +7470,16 @@ fn apply_order(
                             "ORDER BY expression must appear in the select list",
                         ));
                     }
+                    // v0.10: ORDER BY terms containing windows evaluate
+                    // against the precomputed window values; point the
+                    // context at this row's pre-projection index.
+                    if contains_window(e) {
+                        if let Some(wi) = o.win_idx {
+                            if let Some(wctx) = q.wctx.as_mut() {
+                                wctx.row = wi;
+                            }
+                        }
+                    }
                     // Fall back to the full pre-projection row.
                     let frame = Scope {
                         schema,
@@ -5198,6 +7543,7 @@ fn apply_order(
             prov: std::mem::take(&mut orows[i].prov),
             full: std::mem::take(&mut orows[i].full),
             sort_keys: std::mem::take(&mut orows[i].sort_keys),
+            win_idx: orows[i].win_idx,
         });
     }
     *orows = sorted;
@@ -5357,6 +7703,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -5385,11 +7733,27 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     session: q.session,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
             let exists = !out.rows.is_empty();
             Ok(Value::Bool(if *neg { !exists } else { exists }))
+        }
+        // v0.10: window functions are precomputed per query level
+        // (Q.wctx) before projection; here we just look the value up.
+        Expr::Window { wid, .. } => {
+            let wctx = q.wctx.as_ref().ok_or_else(|| {
+                exec_err("XX000", "internal error: window without context")
+            })?;
+            wctx.values
+                .get(*wid)
+                .and_then(|v| v.get(wctx.row))
+                .cloned()
+                .ok_or_else(|| {
+                    exec_err("XX000", "internal error: window value missing")
+                })
         }
     }
 }
@@ -5412,6 +7776,8 @@ fn eval_in(
             session: q.session,
             depth: q.depth + 1,
             lock_ids: &mut *q.lock_ids,
+            ctes: q.ctes.clone(),
+            wctx: None,
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -5573,6 +7939,23 @@ fn eval_update_expr(
     schema: &[QCol],
     values: &[Value],
     e: &Expr,
+    ctes: &[Rc<CteBinding>],
+) -> Result<Value, ExecError> {
+    eval_dml_expr(eng, snap, own, session, &[(schema, values)], e, ctes)
+}
+
+/// v0.10: evaluate a DML expression (UPDATE SET, RETURNING, ON CONFLICT
+/// DO UPDATE) against one or more explicit frames. Frames are ordered
+/// outermost-first: unqualified column references resolve to the LAST
+/// frame (like nested scopes), so callers put the target table last.
+fn eval_dml_expr(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    frames: &[(&[QCol], &[Value])],
+    e: &Expr,
+    ctes: &[Rc<CteBinding>],
 ) -> Result<Value, ExecError> {
     let mut lock_ids = Vec::new();
     let mut q = Q {
@@ -5582,12 +7965,14 @@ fn eval_update_expr(
         session,
         depth: 0,
         lock_ids: &mut lock_ids,
+        ctes: ctes.to_vec(),
+        wctx: None,
     };
-    let frame = Scope {
-        schema,
-        row: values,
-    };
-    let v = eval_expr(&mut q, &[frame], e)?;
+    let scopes: Vec<Scope> = frames
+        .iter()
+        .map(|(schema, row)| Scope { schema, row })
+        .collect();
+    let v = eval_expr(&mut q, &scopes, e)?;
     // FOR UPDATE inside an UPDATE's SET subquery locks nothing: UPDATE is
     // not SELECT, so there is no statement-level lock flow to hand the
     // collected ids to (documented).
@@ -6805,8 +9190,9 @@ fn func_result_type(
     snap: &Snapshot,
     own: u64,
     schemas: &[&[QCol]],
+    ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
-    let arg0 = || expr_type(eng, snap, own, schemas, &args[0]);
+    let arg0 = || expr_type(eng, snap, own, schemas, ctes, &args[0]);
     match name {
         "upper" | "lower" | "substring" | "trim" | "replace" | "split_part" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
@@ -6821,7 +9207,7 @@ fn func_result_type(
         // Postgres returns numeric for sqrt(real)).
         "sqrt" | "power" => {
             for a in args {
-                match expr_type(eng, snap, own, schemas, a)? {
+                match expr_type(eng, snap, own, schemas, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -6830,7 +9216,7 @@ fn func_result_type(
         }
         "now" | "current_timestamp" => Ok(ColType::Timestamptz),
         "current_date" => Ok(ColType::Date),
-        "date_trunc" => match expr_type(eng, snap, own, schemas, &args[1])? {
+        "date_trunc" => match expr_type(eng, snap, own, schemas, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
             _ => Ok(ColType::Timestamp),
         },
@@ -6977,10 +9363,12 @@ fn from_schemas(
     snap: &Snapshot,
     own: u64,
     from: &[FromItem],
+    visible: &[CteDef],
+    bindings: &[Rc<CteBinding>],
 ) -> Result<Vec<Vec<QCol>>, ExecError> {
     let mut out = Vec::new();
     for item in from {
-        from_schema_item(eng, snap, own, item, &mut out)?;
+        from_schema_item(eng, snap, own, item, &mut out, visible, bindings)?;
     }
     Ok(out)
 }
@@ -6991,9 +9379,46 @@ fn from_schema_item(
     own: u64,
     item: &FromItem,
     out: &mut Vec<Vec<QCol>>,
+    visible: &[CteDef],
+    bindings: &[Rc<CteBinding>],
 ) -> Result<(), ExecError> {
     match item {
         FromItem::Table { name, alias } => {
+            // v0.10: materialized CTE bindings (e.g. the recursive CTE
+            // currently being evaluated) shadow everything.
+            if let Some(b) = bindings.iter().rev().find(|b| b.name == *name) {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                out.push(
+                    b.schema
+                        .iter()
+                        .map(|c| QCol {
+                            qual: qual.clone(),
+                            name: c.name.clone(),
+                            ty: c.ty.clone(),
+                        })
+                        .collect(),
+                );
+                return Ok(());
+            }
+            // v0.10: CTEs shadow everything (like Postgres). `visible`
+            // holds outer scopes' CTEs plus this query's own WITH list;
+            // only CTEs before this one (outer + earlier siblings) are
+            // visible to its body — a CTE never sees itself or later
+            // siblings.
+            if let Some(pos) = visible.iter().rposition(|c| c.name == *name) {
+                let schema = describe_cte(eng, snap, own, &visible[pos], &visible[..pos])?;
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                out.push(
+                    schema
+                        .into_iter()
+                        .map(|mut c| {
+                            c.qual = qual.clone();
+                            c
+                        })
+                        .collect(),
+                );
+                return Ok(());
+            }
             // v0.9: information_schema virtual tables.
             if name == "information_schema.tables" {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -7031,7 +9456,7 @@ fn from_schema_item(
                         ))
                     }
                 };
-                let cols = describe_select(eng, snap, own, &select)?;
+                let cols = describe_select(eng, snap, own, &select, &[])?;
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = cols
                     .into_iter()
@@ -7076,7 +9501,7 @@ fn from_schema_item(
             Ok(())
         }
         FromItem::Derived { sub, alias } => {
-            let cols = describe_select(eng, snap, own, sub)?;
+            let cols = describe_select_outer(eng, snap, own, sub, visible, &[])?;
             out.push(
                 cols.into_iter()
                     .map(|(n, ty)| QCol {
@@ -7089,10 +9514,36 @@ fn from_schema_item(
             Ok(())
         }
         FromItem::Join { left, right, .. } => {
-            from_schema_item(eng, snap, own, left, out)?;
-            from_schema_item(eng, snap, own, right, out)
+            from_schema_item(eng, snap, own, left, out, visible, bindings)?;
+            from_schema_item(eng, snap, own, right, out, visible, bindings)
         }
     }
+}
+
+/// v0.10: output schema of one CTE for the Describe path. `earlier` holds
+/// the CTEs visible to the body (outer scopes + earlier siblings — never
+/// the CTE itself). A recursive CTE describes as its non-recursive term.
+fn describe_cte(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    cte: &CteDef,
+    earlier: &[CteDef],
+) -> Result<Vec<QCol>, ExecError> {
+    let body = match &cte.body {
+        CteBody::Simple(s) => s,
+        CteBody::Union { left, .. } => left,
+    };
+    let cols = describe_select_outer(eng, snap, own, body, earlier, &[])?;
+    Ok(cols
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| QCol {
+            qual: cte.name.clone(),
+            name: cte.col_aliases.get(i).cloned().unwrap_or(name),
+            ty,
+        })
+        .collect())
 }
 
 /// (name, type) of every output column. Used by Describe and by execution
@@ -7102,8 +9553,25 @@ fn describe_select(
     snap: &Snapshot,
     own: u64,
     stmt: &SelectStmt,
+    bindings: &[Rc<CteBinding>],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
-    let schemas = from_schemas(eng, snap, own, &stmt.from)?;
+    describe_select_outer(eng, snap, own, stmt, &[], bindings)
+}
+
+/// v0.10: `outer` holds the CTE definitions visible from enclosing query
+/// levels (innermost last); the query's own WITH list is appended, so a
+/// CTE body only sees outer CTEs and earlier siblings.
+fn describe_select_outer(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    stmt: &SelectStmt,
+    outer: &[CteDef],
+    bindings: &[Rc<CteBinding>],
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    let mut visible: Vec<CteDef> = outer.to_vec();
+    visible.extend(stmt.with.iter().cloned());
+    let schemas = from_schemas(eng, snap, own, &stmt.from, &visible, bindings)?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
     for item in &stmt.items {
@@ -7133,7 +9601,7 @@ fn describe_select(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(eng, snap, own, &refs, expr)?;
+                let ty = expr_type(eng, snap, own, &refs, &visible, expr)?;
                 let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
                 out.push((name, ty));
             }
@@ -7158,6 +9626,7 @@ fn expr_type(
     snap: &Snapshot,
     own: u64,
     schemas: &[&[QCol]],
+    ctes: &[CteDef],
     e: &Expr,
 ) -> Result<ColType, ExecError> {
     match e {
@@ -7181,8 +9650,8 @@ fn expr_type(
         Expr::Literal(lit) => Ok(lit.col_type()),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
         Expr::Arith { op, left, right } => {
-            let ta = arith_operand_type(eng, snap, own, schemas, left, *op)?;
-            let tb = arith_operand_type(eng, snap, own, schemas, right, *op)?;
+            let ta = arith_operand_type(eng, snap, own, schemas, ctes, left, *op)?;
+            let tb = arith_operand_type(eng, snap, own, schemas, ctes, right, *op)?;
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
@@ -7197,20 +9666,67 @@ fn expr_type(
         | Expr::Between { .. }
         | Expr::InSub { .. }
         | Expr::Exists { .. } => Ok(ColType::Bool),
-        Expr::Func { name, args } => func_result_type(name, args, eng, snap, own, schemas),
+        Expr::Func { name, args } => func_result_type(name, args, eng, snap, own, schemas, ctes),
         Expr::Extract { .. } => Ok(ColType::Numeric),
         Expr::Agg {
             func,
             arg,
             distinct: _,
             arg2,
-        } => agg_result_type(eng, snap, own, schemas, *func, arg.as_deref(), arg2.as_deref()),
+        } => agg_result_type(eng, snap, own, schemas, ctes, *func, arg.as_deref(), arg2.as_deref()),
         Expr::ScalarSub(sub) => {
-            let cols = describe_select(eng, snap, own, sub)?;
+            let cols = describe_select_outer(eng, snap, own, sub, ctes, &[])?;
             if cols.len() != 1 {
                 return Err(exec_err("42601", "subquery must return only one column"));
             }
             Ok(cols[1 - 1].clone().1)
+        }
+        // v0.10: window function result types.
+        Expr::Window { func, args, .. } => window_result_type(
+            eng,
+            snap,
+            own,
+            schemas,
+            ctes,
+            func,
+            args,
+        ),
+    }
+}
+
+/// v0.10: result type of a window function.
+fn window_result_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    schemas: &[&[QCol]],
+    ctes: &[CteDef],
+    func: &WindowFunc,
+    args: &[Expr],
+) -> Result<ColType, ExecError> {
+    match func {
+        // Postgres returns bigint for the ranking functions, integer
+        // for ntile.
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+            Ok(ColType::BigInt)
+        }
+        WindowFunc::Ntile => Ok(ColType::Int),
+        // lag/lead/first_value/last_value/nth_value: type of the value
+        // argument.
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue => {
+            let a = args.first().ok_or_else(|| {
+                exec_err("42883", "window function requires an argument")
+            })?;
+            expr_type(eng, snap, own, schemas, ctes, a)
+        }
+        WindowFunc::Agg(f) => {
+            let arg = args.first();
+            let arg2 = args.get(1);
+            agg_result_type(eng, snap, own, schemas, ctes, *f, arg, arg2)
         }
     }
 }
@@ -7222,6 +9738,7 @@ fn arith_operand_type(
     snap: &Snapshot,
     own: u64,
     schemas: &[&[QCol]],
+    ctes: &[CteDef],
     e: &Expr,
     op: ArithOp,
 ) -> Result<Option<ColType>, ExecError> {
@@ -7230,20 +9747,20 @@ fn arith_operand_type(
         Expr::Literal(lit) => Ok(Some(lit.col_type())),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
         Expr::Column { .. } | Expr::ResolvedCol { .. } => {
-            Ok(Some(expr_type(eng, snap, own, schemas, e)?))
+            Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?))
         }
         Expr::Arith {
             op: inner,
             left,
             right,
         } => {
-            let ta = arith_operand_type(eng, snap, own, schemas, left, *inner)?;
-            let tb = arith_operand_type(eng, snap, own, schemas, right, *inner)?;
+            let ta = arith_operand_type(eng, snap, own, schemas, ctes, left, *inner)?;
+            let tb = arith_operand_type(eng, snap, own, schemas, ctes, right, *inner)?;
             Ok(Some(combine_arith_types(*inner, ta, tb)?))
         }
-        Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(eng, snap, own, schemas, e)?)),
+        Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?)),
         Expr::Cast { to, .. } => Ok(Some(*to)),
-        Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, schemas, e)?)),
+        Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, schemas, ctes, e)?)),
         // Boolean / predicate expressions can't be arithmetic operands.
         _ => Err(exec_err(
             "42883",
@@ -7370,6 +9887,7 @@ fn agg_result_type(
     snap: &Snapshot,
     own: u64,
     schemas: &[&[QCol]],
+    ctes: &[CteDef],
     func: AggFunc,
     arg: Option<&Expr>,
     arg2: Option<&Expr>,
@@ -7379,7 +9897,7 @@ fn agg_result_type(
         AggFunc::Count => Ok(ColType::BigInt),
         AggFunc::Avg => {
             if let Some(a) = arg {
-                numeric_agg_arg("avg", &expr_type(eng, snap, own, schemas, a)?)?;
+                numeric_agg_arg("avg", &expr_type(eng, snap, own, schemas, ctes, a)?)?;
             }
             Ok(ColType::Float)
         }
@@ -7387,7 +9905,7 @@ fn agg_result_type(
             // Only COUNT takes `*`; the parser guarantees it.
             None => Ok(ColType::Int),
             Some(a) => {
-                let t = expr_type(eng, snap, own, schemas, a)?;
+                let t = expr_type(eng, snap, own, schemas, ctes, a)?;
                 numeric_agg_arg("sum", &t)?;
                 // v0.6 rule kept (documented): sum returns the
                 // argument type; Postgres would widen int->bigint.
@@ -7396,13 +9914,13 @@ fn agg_result_type(
         },
         AggFunc::Min | AggFunc::Max => {
             let a = arg.expect("min/max always take an argument");
-            expr_type(eng, snap, own, schemas, a)
+            expr_type(eng, snap, own, schemas, ctes, a)
         }
         AggFunc::StringAgg => {
             // Delimiter should be text-ish; be permissive here (the
             // executor coerces via casts) and just require an argument.
             let a = arg.expect("string_agg always takes arguments");
-            let t = expr_type(eng, snap, own, schemas, a)?;
+            let t = expr_type(eng, snap, own, schemas, ctes, a)?;
             if !matches!(t, ColType::Text) {
                 return Err(exec_err(
                     "42883",
@@ -7476,7 +9994,7 @@ fn hint_type(
         Expr::Concat(..) => Some(ColType::Text),
         Expr::Extract { .. } => Some(ColType::Numeric),
         Expr::Func { name, args } => {
-            func_result_type(name, args, eng, snap, own, schemas).ok()
+            func_result_type(name, args, eng, snap, own, schemas, &[]).ok()
         }
         Expr::Agg {
             func,
@@ -7488,13 +10006,14 @@ fn hint_type(
             snap,
             own,
             schemas,
+            &[],
             *func,
             arg.as_deref(),
             arg2.as_deref(),
         )
         .ok(),
         Expr::ScalarSub(sub) => {
-            let cols = describe_select(eng, snap, own, sub).ok()?;
+            let cols = describe_select(eng, snap, own, sub, &[]).ok()?;
             if cols.len() == 1 {
                 Some(cols[0].1.clone())
             } else {
@@ -7573,7 +10092,7 @@ fn infer_expr(
             infer_select(sub, eng, snap, own, schemas, out)?;
             // `$N IN (SELECT col ...)` pins the param to the column type.
             if let Expr::Param(p) = **expr {
-                if let Ok(cols) = describe_select(eng, snap, own, sub) {
+                if let Ok(cols) = describe_select(eng, snap, own, sub, &[]) {
                     if cols.len() == 1 {
                         pin_param(out, p, cols[0].1.clone())?;
                     }
@@ -7625,7 +10144,9 @@ fn infer_select(
     out: &mut [Option<ColType>],
 ) -> Result<(), ExecError> {
     // Unknown tables are skipped (execution reports them).
-    let own_schemas = from_schemas(eng, snap, own, &s.from).unwrap_or_default();
+    // v0.10: this level's own CTEs are visible to the FROM clause.
+    let visible: Vec<CteDef> = s.with.clone();
+    let own_schemas = from_schemas(eng, snap, own, &s.from, &visible, &[]).unwrap_or_default();
     let mut refs: Vec<&[QCol]> = Vec::with_capacity(outer.len() + own_schemas.len());
     refs.extend_from_slice(outer);
     refs.extend(own_schemas.iter().map(|s| s.as_slice()));
@@ -7702,6 +10223,10 @@ pub fn infer_param_types(
         table,
         columns,
         rows,
+        with,
+        on_conflict,
+        returning,
+        ..
     } = stmt
     {
         if let Some(t) = eng.db.find_table(table, snap, own) {
@@ -7720,11 +10245,18 @@ pub fn infer_param_types(
                 }
             }
         }
+        // v0.10: CTE bodies, ON CONFLICT expressions and RETURNING list.
+        infer_ctes(with, eng, snap, own, &mut out);
+        infer_on_conflict(on_conflict, table, eng, snap, own, &mut out);
+        infer_returning(returning, table, eng, snap, own, &mut out);
     }
     if let Stmt::Update {
         table,
         sets,
         where_,
+        with,
+        returning,
+        ..
     } = stmt
     {
         if let Some(t) = eng.db.find_table(table, snap, own) {
@@ -7750,18 +10282,116 @@ pub fn infer_param_types(
             }
             infer_where(where_, Some(t), &mut out)?;
         }
+        // v0.10: CTE bodies and RETURNING list.
+        infer_ctes(with, eng, snap, own, &mut out);
+        infer_returning(returning, table, eng, snap, own, &mut out);
     }
     match stmt {
         Stmt::Select(sel) => {
             infer_select(sel, eng, snap, own, &[], &mut out)?;
         }
-        Stmt::Delete { table, where_ } => {
+        Stmt::Delete {
+            table,
+            where_,
+            with,
+            returning,
+            ..
+        } => {
             let tbl = infer_table(eng, &Some(table.clone()), snap, own);
             infer_where(where_, tbl, &mut out)?;
+            // v0.10: CTE bodies and RETURNING list.
+            infer_ctes(with, eng, snap, own, &mut out);
+            infer_returning(returning, table, eng, snap, own, &mut out);
         }
         _ => {}
     }
     Ok(out)
+}
+
+/// v0.10: best-effort parameter inference inside CTE bodies. Failures are
+/// swallowed (params stay unpinned and default to text) because bodies can
+/// reference sibling CTEs that only fully resolve at execution time.
+fn infer_ctes(
+    ctes: &[CteDef],
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    out: &mut [Option<ColType>],
+) {
+    for cte in ctes {
+        let body: &SelectStmt = match &cte.body {
+            CteBody::Simple(s) => s,
+            CteBody::Union { left, .. } => left,
+        };
+        let _ = infer_select(body, eng, snap, own, &[], out);
+    }
+}
+
+/// v0.10: best-effort inference for a RETURNING list against the target
+/// table's columns.
+fn infer_returning(
+    returning: &[SelectItem],
+    table: &str,
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    out: &mut [Option<ColType>],
+) {
+    if returning.is_empty() {
+        return;
+    }
+    if let Some(t) = eng.db.find_table(table, snap, own) {
+        let schemas: Vec<Vec<QCol>> = vec![
+            t.columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: String::new(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                })
+                .collect(),
+        ];
+        let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
+        for item in returning {
+            if let SelectItem::Expr { expr, .. } = item {
+                let _ = infer_expr(expr, eng, snap, own, &refs, out);
+            }
+        }
+    }
+}
+
+/// v0.10: best-effort inference for ON CONFLICT DO UPDATE expressions
+/// against the target table's columns.
+fn infer_on_conflict(
+    on_conflict: &Option<OnConflict>,
+    table: &str,
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    out: &mut [Option<ColType>],
+) {
+    if let Some(OnConflict {
+        action: ConflictAction::DoUpdate { sets, .. },
+        ..
+    }) = on_conflict
+    {
+        if let Some(t) = eng.db.find_table(table, snap, own) {
+            let schemas: Vec<Vec<QCol>> = vec![
+                t.columns
+                    .iter()
+                    .map(|(n, ty)| QCol {
+                        qual: String::new(),
+                        name: n.clone(),
+                        ty: ty.clone(),
+                    })
+                    .collect(),
+            ];
+            let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
+            for (_, expr) in sets {
+                let _ = infer_expr(expr, eng, snap, own, &refs, out);
+            }
+        }
+    }
 }
 
 fn oid_to_coltype(oid: i32, param_no: usize) -> Result<Option<ColType>, ExecError> {
@@ -7945,7 +10575,15 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
 /// Unbound `$N` (no value supplied) is 42P02, like Postgres.
 pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), ExecError> {
     match stmt {
-        Stmt::Insert { rows, .. } => {
+        Stmt::Insert {
+            rows,
+            select,
+            with,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            subst_ctes(with, params)?;
             for row in rows {
                 for v in row {
                     if let InsertValue::Param(p) = v {
@@ -7953,21 +10591,89 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
                     }
                 }
             }
+            if let Some(sel) = select {
+                subst_select(sel, params)?;
+            }
+            subst_on_conflict(on_conflict, params)?;
+            subst_returning(returning, params)?;
             Ok(())
         }
         Stmt::Select(sel) => subst_select(sel, params),
-        Stmt::Update { sets, where_, .. } => {
+        Stmt::Update {
+            sets,
+            where_,
+            with,
+            returning,
+            ..
+        } => {
+            subst_ctes(with, params)?;
             for (_, e) in sets {
                 subst_expr(e, params)?;
             }
-            subst_where(where_, params)
+            subst_where(where_, params)?;
+            subst_returning(returning, params)
         }
-        Stmt::Delete { where_, .. } => subst_where(where_, params),
+        Stmt::Delete {
+            where_,
+            with,
+            returning,
+            ..
+        } => {
+            subst_ctes(with, params)?;
+            subst_where(where_, params)?;
+            subst_returning(returning, params)
+        }
         _ => Ok(()),
     }
 }
 
+/// v0.10: substitute parameters inside every CTE body.
+fn subst_ctes(ctes: &mut [CteDef], params: &[Option<Value>]) -> Result<(), ExecError> {
+    for cte in ctes {
+        match &mut cte.body {
+            CteBody::Simple(s) => subst_select(s, params)?,
+            CteBody::Union { left, right, .. } => {
+                subst_select(left, params)?;
+                subst_select(right, params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.10: substitute parameters inside a RETURNING list.
+fn subst_returning(returning: &mut [SelectItem], params: &[Option<Value>]) -> Result<(), ExecError> {
+    for item in returning {
+        if let SelectItem::Expr { expr, .. } = item {
+            subst_expr(expr, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// v0.10: substitute parameters inside ON CONFLICT.
+fn subst_on_conflict(
+    on_conflict: &mut Option<OnConflict>,
+    params: &[Option<Value>],
+) -> Result<(), ExecError> {
+    if let Some(OnConflict {
+        action: ConflictAction::DoUpdate { sets, where_ },
+        ..
+    }) = on_conflict
+    {
+        for (_, e) in sets {
+            subst_expr(e, params)?;
+        }
+        if let Some(w) = where_ {
+            subst_expr(w, params)?;
+        }
+    }
+    Ok(())
+}
+
 fn subst_select(s: &mut SelectStmt, params: &[Option<Value>]) -> Result<(), ExecError> {
+    // v0.10: CTE bodies.
+    subst_ctes(&mut s.with, params)?;
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             subst_expr(expr, params)?;
@@ -8133,7 +10839,24 @@ pub fn describe_columns(
             let mut s = sel.clone();
             let dummy: Vec<Option<Value>> = eff.iter().map(|t| Some(dummy_value(t))).collect();
             subst_select(&mut s, &dummy)?;
-            Ok(Some(describe_select(eng, snap, own, &s)?))
+            Ok(Some(describe_select(eng, snap, own, &s, &[])?))
+        }
+        // v0.10: DML with RETURNING describes the RETURNING list; without
+        // it there are no result columns (like a plain command tag).
+        Stmt::Insert {
+            table, returning, ..
+        }
+        | Stmt::Update {
+            table, returning, ..
+        }
+        | Stmt::Delete {
+            table, returning, ..
+        } => {
+            if returning.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(describe_returning(eng, snap, own, table, returning)?))
+            }
         }
         _ => Ok(None),
     }
@@ -8215,6 +10938,7 @@ mod tests {
                 })
                 .collect(),
             ExecResult::Command { tag } => vec![vec![tag]],
+            ExecResult::Dml { tag, .. } => vec![vec![tag]],
         }
     }
 
@@ -8439,6 +11163,7 @@ mod tests {
         let mut eng = engine();
         match run(&mut eng, "UPDATE users SET name = 'ann2' WHERE id = 1").unwrap() {
             ExecResult::Command { tag } => assert_eq!(tag, "UPDATE 1"),
+            ExecResult::Dml { tag, .. } => assert_eq!(tag, "UPDATE 1"),
             _ => panic!("expected command"),
         }
         let rows = rows_of(run(&mut eng, "SELECT name FROM users WHERE id = 1").unwrap());
@@ -8979,6 +11704,8 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         }
         Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } | Expr::Agg { .. } => {}
         Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {}
+        // v0.10: windows cannot appear in constraints; nothing to rename.
+        Expr::Window { .. } => {}
     }
 }
 
