@@ -36,9 +36,9 @@ impl ColType {
     /// PostgreSQL type OID used in RowDescription.
     pub fn oid(&self) -> i32 {
         match self {
-            ColType::Int => 23,   // INT4
-            ColType::Text => 25,  // TEXT
-            ColType::Bool => 16,  // BOOL
+            ColType::Int => 23,    // INT4
+            ColType::Text => 25,   // TEXT
+            ColType::Bool => 16,   // BOOL
             ColType::Float => 701, // FLOAT8
         }
     }
@@ -203,12 +203,7 @@ impl Database {
     }
 
     /// Mutable variant of [`Database::find_table`].
-    pub fn find_table_mut(
-        &mut self,
-        name: &str,
-        snap: &Snapshot,
-        own: u64,
-    ) -> Option<&mut Table> {
+    pub fn find_table_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Table> {
         self.tables
             .get_mut(name)
             .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, own)))
@@ -261,6 +256,15 @@ pub struct TxnManager {
     pub active: HashSet<u64>,
     /// Current snapshot per active xid (for VACUUM's dead-to-all check).
     pub snapshots: HashMap<u64, Snapshot>,
+    /// Row-version locks from `SELECT ... FOR UPDATE` (v0.6): row-version
+    /// id -> holding xid. Locks are held to transaction end (commit,
+    /// rollback, or disconnect) and are never waited on: a conflicting
+    /// locker/writer fails fast with 40001 instead of blocking.
+    pub row_locks: HashMap<u64, u64>,
+    /// Acquisition order of the row locks above, per xid: xid -> row ids
+    /// in the order they were taken. Lets `ROLLBACK TO SAVEPOINT` release
+    /// exactly the locks taken after the savepoint.
+    pub lock_order: HashMap<u64, Vec<u64>>,
 }
 
 /// Everything shared between connections: the versioned database plus
@@ -282,6 +286,8 @@ impl Engine {
                 next_row_id: 1,
                 active: HashSet::new(),
                 snapshots: HashMap::new(),
+                row_locks: HashMap::new(),
+                lock_order: HashMap::new(),
             },
         }
     }
@@ -317,6 +323,57 @@ impl Engine {
         let id = self.txns.next_row_id;
         self.txns.next_row_id += 1;
         id
+    }
+
+    /// Try to take a `SELECT ... FOR UPDATE` lock on a row version for
+    /// `xid`. Re-locking your own rows is a no-op. Returns the conflicting
+    /// holder's xid when another *active* transaction holds the lock; a
+    /// lock whose holder is gone (should not happen — locks release at
+    /// txn end) is treated as stale and taken over.
+    pub fn try_row_lock(&mut self, row_id: u64, xid: u64) -> Result<(), u64> {
+        match self.txns.row_locks.get(&row_id) {
+            Some(&h) if h == xid => Ok(()),
+            Some(&h) if self.txns.active.contains(&h) => Err(h),
+            _ => {
+                self.txns.row_locks.insert(row_id, xid);
+                self.txns.lock_order.entry(xid).or_default().push(row_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Who holds the lock on this row version, if anyone.
+    pub fn row_lock_holder(&self, row_id: u64) -> Option<u64> {
+        self.txns.row_locks.get(&row_id).copied()
+    }
+
+    /// Release every row lock held by `xid`: commit, rollback, and the
+    /// disconnect-abort path all funnel through here, so locks never leak
+    /// past transaction end.
+    pub fn release_txn_locks(&mut self, xid: u64) {
+        self.txns.row_locks.retain(|_, h| *h != xid);
+        self.txns.lock_order.remove(&xid);
+    }
+
+    /// Release the locks `xid` took most recently, keeping the first
+    /// `keep` of them. Used by `ROLLBACK TO SAVEPOINT`, which records the
+    /// lock count alongside the write-log position when the savepoint is
+    /// established.
+    pub fn release_locks_after(&mut self, xid: u64, keep: usize) {
+        if let Some(order) = self.txns.lock_order.get_mut(&xid) {
+            for row_id in order.drain(keep..) {
+                // Only drop the lock if we still hold it (a stale entry
+                // must never release someone else's lock).
+                if self.txns.row_locks.get(&row_id) == Some(&xid) {
+                    self.txns.row_locks.remove(&row_id);
+                }
+            }
+        }
+    }
+
+    /// How many row locks `xid` currently holds (savepoint bookkeeping).
+    pub fn txn_lock_count(&self, xid: u64) -> usize {
+        self.txns.lock_order.get(&xid).map(|v| v.len()).unwrap_or(0)
     }
 
     /// A fresh snapshot of the currently active transactions.
@@ -432,14 +489,22 @@ pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
 /// failed statement) and, at commit, to derive the WAL records.
 #[derive(Clone, Debug)]
 pub enum WriteOp {
-    InsertRow { table: String, row_id: u64 },
+    InsertRow {
+        table: String,
+        row_id: u64,
+    },
     DeleteRow {
         table: String,
         row_id: u64,
         prev_xmax: u64,
     },
-    CreateTable { name: String },
-    DropTable { name: String, prev_xmax: u64 },
+    CreateTable {
+        name: String,
+    },
+    DropTable {
+        name: String,
+        prev_xmax: u64,
+    },
 }
 
 /// Undo a single write op. Each undo is conditional on the version still
@@ -566,10 +631,7 @@ mod tests {
         let mut eng = engine_with_table();
         eng.txns.active.insert(20);
         // Snapshot taken while deleter 8 was still active.
-        eng.txns.snapshots.insert(
-            20,
-            snap(&[8, 20], 10),
-        );
+        eng.txns.snapshots.insert(20, snap(&[8, 20], 10));
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmax = 8;
         // Deleter 8 has committed since, but txn 20's old snapshot could

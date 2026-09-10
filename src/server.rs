@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
-use crate::protocol::{read_message, read_startup, Cursor, MsgBuilder};
+use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
 use crate::sql::{self, IsolationLevel, Stmt};
-use crate::storage::{undo_write_op, ColType, Engine, Snapshot, Value, WriteOp};
+use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
 
 /// Buffered sink for server→client traffic. Reads still go through the
@@ -68,8 +68,10 @@ struct Txn {
     /// Uncommitted writes, in order: the undo log (abort / ROLLBACK TO)
     /// and the commit-time WAL source.
     writes: Vec<WriteOp>,
-    /// (name, writes.len()) stack for SAVEPOINT.
-    savepoints: Vec<(String, usize)>,
+    /// (name, writes.len(), row-lock count) stack for SAVEPOINT: rolling
+    /// back to a savepoint undoes staged writes AND releases the row locks
+    /// taken after it, like Postgres.
+    savepoints: Vec<(String, usize, usize)>,
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
@@ -394,18 +396,18 @@ fn run_statement(
         }
     }
     match stmt {
-        Stmt::Begin { level } => {
-            txn_begin(engine, session, level.unwrap_or(IsolationLevel::ReadCommitted))
-        }
+        Stmt::Begin { level } => txn_begin(
+            engine,
+            session,
+            level.unwrap_or(IsolationLevel::ReadCommitted),
+        ),
         Stmt::Commit => txn_commit(engine, wal, session),
         Stmt::Rollback => txn_rollback(engine, session),
-        Stmt::Savepoint { name } => txn_savepoint(session, name),
+        Stmt::Savepoint { name } => txn_savepoint(engine, session, name),
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
         Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
-        Stmt::Vacuum { table, verbose } => {
-            txn_vacuum(engine, session, table.as_deref(), *verbose)
-        }
+        Stmt::Vacuum { table, verbose } => txn_vacuum(engine, session, table.as_deref(), *verbose),
         _ => {
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
@@ -430,10 +432,7 @@ fn wal_err(e: io::Error) -> ExecError {
 /// for READ COMMITTED, or a fresh snapshot with owner 0 outside a
 /// transaction. Establishing the snapshot here (rather than only at
 /// Execute) means Bind/Describe see the same view the statement will.
-fn stmt_snapshot(
-    engine: &mut Engine,
-    txn: Option<&mut Txn>,
-) -> (Snapshot, u64, IsolationLevel) {
+fn stmt_snapshot(engine: &mut Engine, txn: Option<&mut Txn>) -> (Snapshot, u64, IsolationLevel) {
     match txn {
         Some(t) => {
             let xid = t.xid;
@@ -515,7 +514,7 @@ fn autocommit_execute(
         Ok(r) => r,
         Err(e) => {
             undo_all(&mut guard, xid, &writes);
-            guard.end_txn(xid);
+            retire_txn(&mut guard, xid);
             return Err(e);
         }
     };
@@ -529,22 +528,25 @@ fn autocommit_execute(
         Ok(r) => r,
         Err(msg) => {
             undo_all(&mut guard, xid, &writes);
-            guard.end_txn(xid);
+            retire_txn(&mut guard, xid);
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
                 code: "40001",
-                message: format!("could not serialize access due to concurrent update: {}", msg),
+                message: format!(
+                    "could not serialize access due to concurrent update: {}",
+                    msg
+                ),
             });
         }
     };
     // Lock order is always engine -> wal.
     if let Err(e) = wal.lock().unwrap().append_batch(&records) {
         undo_all(&mut guard, xid, &writes);
-        guard.end_txn(xid);
+        retire_txn(&mut guard, xid);
         auto_vacuum(&mut guard, &writes);
         return Err(wal_err(e));
     }
-    guard.end_txn(xid);
+    retire_txn(&mut guard, xid);
     auto_vacuum(&mut guard, &writes);
     Ok(result)
 }
@@ -554,6 +556,14 @@ fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
     for op in writes.iter().rev() {
         undo_write_op(engine, own, op);
     }
+}
+
+/// Retire `xid` and release every row lock it still holds (v0.6:
+/// SELECT ... FOR UPDATE). Locks live until transaction end — commit,
+/// rollback, failed autocommit, or disconnect cleanup — like Postgres.
+fn retire_txn(engine: &mut Engine, xid: u64) {
+    engine.end_txn(xid);
+    engine.release_txn_locks(xid);
 }
 
 /// Best-effort cleanup after a commit or abort: reclaim versions that are
@@ -615,7 +625,7 @@ fn txn_commit(
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
         undo_all(&mut guard, t.xid, &t.writes);
-        guard.end_txn(t.xid);
+        retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
         return Ok(cmd("ROLLBACK"));
     }
@@ -632,7 +642,10 @@ fn txn_commit(
             session.txn = Some(t);
             return Err(ExecError {
                 code: "40001",
-                message: format!("could not serialize access due to concurrent update: {}", msg),
+                message: format!(
+                    "could not serialize access due to concurrent update: {}",
+                    msg
+                ),
             });
         }
     };
@@ -646,7 +659,7 @@ fn txn_commit(
         session.txn = Some(t);
         return Err(wal_err(e));
     }
-    guard.end_txn(t.xid);
+    retire_txn(&mut guard, t.xid);
     auto_vacuum(&mut guard, &t.writes);
     Ok(cmd("COMMIT"))
 }
@@ -664,10 +677,7 @@ fn txn_checkpoint(
         ));
     }
     let guard = engine.lock().unwrap();
-    wal.lock()
-        .unwrap()
-        .checkpoint(&guard)
-        .map_err(wal_err)?;
+    wal.lock().unwrap().checkpoint(&guard).map_err(wal_err)?;
     Ok(cmd("CHECKPOINT"))
 }
 
@@ -738,18 +748,27 @@ fn txn_rollback(
     if let Some(t) = session.txn.take() {
         let mut guard = engine.lock().unwrap();
         undo_all(&mut guard, t.xid, &t.writes);
-        guard.end_txn(t.xid);
+        retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
     }
     Ok(cmd("ROLLBACK"))
 }
 
-fn txn_savepoint(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
+fn txn_savepoint(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    name: &str,
+) -> Result<ExecResult, ExecError> {
     match session.txn.as_mut() {
-        None => Err(err_25001("SAVEPOINT can only be used in transaction blocks")),
+        None => Err(err_25001(
+            "SAVEPOINT can only be used in transaction blocks",
+        )),
         Some(t) => {
-            // A savepoint is just a position in the write log — no copy.
-            t.savepoints.push((name.to_string(), t.writes.len()));
+            // A savepoint is a position in the write log plus the current
+            // row-lock count — no copies.
+            let xid = t.xid;
+            let locks = engine.lock().unwrap().txn_lock_count(xid);
+            t.savepoints.push((name.to_string(), t.writes.len(), locks));
             Ok(cmd("SAVEPOINT"))
         }
     }
@@ -761,24 +780,29 @@ fn txn_rollback_to(
     name: &str,
 ) -> Result<ExecResult, ExecError> {
     let mut guard = engine.lock().unwrap();
-    let t = session.txn.as_mut().ok_or_else(|| {
-        err_25001("ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
-    })?;
+    let t = session
+        .txn
+        .as_mut()
+        .ok_or_else(|| err_25001("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"))?;
     let idx = t
         .savepoints
         .iter()
-        .rposition(|(n, _)| n == name)
+        .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
     let to = t.savepoints[idx].1;
+    let keep_locks = t.savepoints[idx].2;
     let xid = t.xid;
     // Undo everything staged after the savepoint, newest first. Each undo
     // is conditional on the version still being ours (see undo_write_op).
     for op in t.writes.drain(to..).rev() {
         undo_write_op(&mut guard, xid, &op);
     }
+    // Row locks taken after the savepoint are released, like Postgres;
+    // locks from before it stay held.
+    guard.release_locks_after(xid, keep_locks);
     // Savepoints established after the named one are destroyed; the named
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
@@ -787,13 +811,14 @@ fn txn_rollback_to(
 }
 
 fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
-    let t = session.txn.as_mut().ok_or_else(|| {
-        err_25001("RELEASE SAVEPOINT can only be used in transaction blocks")
-    })?;
+    let t = session
+        .txn
+        .as_mut()
+        .ok_or_else(|| err_25001("RELEASE SAVEPOINT can only be used in transaction blocks"))?;
     let idx = t
         .savepoints
         .iter()
-        .rposition(|(n, _)| n == name)
+        .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
@@ -811,11 +836,7 @@ const ABORTED_MSG: &str =
 // ---------------------------------------------------------------------------
 
 /// Parse: statement name, query string, param OIDs. Stores the parsed AST.
-fn handle_parse(
-    stream: &mut Writer,
-    session: &mut Session,
-    payload: &[u8],
-) -> io::Result<()> {
+fn handle_parse(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> io::Result<()> {
     let mut cur = Cursor::new(payload);
     let name = cur.read_cstring()?;
     let query = cur.read_cstring()?;
@@ -839,7 +860,7 @@ fn handle_parse(
                     session,
                     "42601",
                     &format!("syntax error: {}", e.message),
-                )
+                );
             }
         }
     };
@@ -918,7 +939,7 @@ fn handle_bind(
                 session,
                 "26000",
                 &format!("prepared statement \"{}\" does not exist", stmt_name),
-            )
+            );
         }
     };
 
@@ -931,12 +952,7 @@ fn handle_bind(
 
     // v0.2 supports text format (0) only, for params and results alike.
     if pformats.iter().any(|&f| f != 0) || rformats.iter().any(|&f| f != 0) {
-        return protocol_error(
-            stream,
-            session,
-            "0A000",
-            "binary format not yet supported",
-        );
+        return protocol_error(stream, session, "0A000", "binary format not yet supported");
     }
 
     let stmt = match prep.stmt {
@@ -1019,7 +1035,7 @@ fn handle_describe(
                     session,
                     "26000",
                     &format!("prepared statement \"{}\" does not exist", name),
-                )
+                );
             }
         },
         b'P' => {
@@ -1031,7 +1047,7 @@ fn handle_describe(
                         session,
                         "34000",
                         &format!("portal \"{}\" does not exist", name),
-                    )
+                    );
                 }
             };
             match session.stmts.get(&stmt_name).cloned() {
@@ -1042,7 +1058,7 @@ fn handle_describe(
                         session,
                         "26000",
                         &format!("prepared statement \"{}\" does not exist", stmt_name),
-                    )
+                    );
                 }
             }
         }
@@ -1052,7 +1068,7 @@ fn handle_describe(
                 session,
                 "08P01",
                 "invalid describe target (expected 'S' or 'P')",
-            )
+            );
         }
     };
 
@@ -1153,9 +1169,7 @@ fn handle_execute(
         return Ok(());
     }
     // Re-executing a completed portal: replay the final tag, no rows.
-    if session.portals[&portal_name].done
-        && session.portals[&portal_name].pending.is_none()
-    {
+    if session.portals[&portal_name].done && session.portals[&portal_name].pending.is_none() {
         let tag = session.portals[&portal_name]
             .last_tag
             .clone()
@@ -1214,11 +1228,7 @@ fn handle_execute(
 
 /// Close: 'S'/'P' + name → CloseComplete. Closing a nonexistent
 /// statement/portal is silently ignored, like Postgres.
-fn handle_close(
-    stream: &mut Writer,
-    session: &mut Session,
-    payload: &[u8],
-) -> io::Result<()> {
+fn handle_close(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> io::Result<()> {
     let mut cur = Cursor::new(payload);
     let kind = cur.read_u8()?;
     let name = cur.read_cstring()?;
@@ -1235,7 +1245,7 @@ fn handle_close(
                 session,
                 "08P01",
                 "invalid close target (expected 'S' or 'P')",
-            )
+            );
         }
     }
     MsgBuilder::new(b'3').send(stream)?; // CloseComplete
@@ -1243,10 +1253,7 @@ fn handle_close(
     Ok(())
 }
 
-fn send_row_description(
-    stream: &mut Writer,
-    columns: &[(String, ColType)],
-) -> io::Result<()> {
+fn send_row_description(stream: &mut Writer, columns: &[(String, ColType)]) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'T');
     b.i16(columns.len() as i16);
     for (name, typ) in columns {
@@ -1333,7 +1340,8 @@ mod tests {
 
     #[test]
     fn savepoint_records_write_log_position() {
-        let (_engine, mut session) = session_with_txn(IsolationLevel::ReadCommitted);
+        let (engine, mut session) = session_with_txn(IsolationLevel::ReadCommitted);
+        let engine = Arc::new(Mutex::new(engine));
         let t = session.txn.as_mut().unwrap();
         t.writes.push(WriteOp::InsertRow {
             table: "t".into(),
@@ -1343,10 +1351,10 @@ mod tests {
             table: "t".into(),
             row_id: 2,
         });
-        txn_savepoint(&mut session, "sp1").unwrap();
+        txn_savepoint(&engine, &mut session, "sp1").unwrap();
         assert_eq!(
             session.txn.as_ref().unwrap().savepoints,
-            vec![("sp1".to_string(), 2)]
+            vec![("sp1".to_string(), 2, 0)]
         );
     }
 
@@ -1375,13 +1383,14 @@ mod tests {
         ];
         for (i, op) in writes.iter().enumerate() {
             if let WriteOp::InsertRow { row_id, .. } = op {
-                engine.db.tables.get_mut("t").unwrap()[0]
-                    .push_version(crate::storage::RowVersion {
+                engine.db.tables.get_mut("t").unwrap()[0].push_version(
+                    crate::storage::RowVersion {
                         id: *row_id,
                         values: vec![Value::Int(i as i64)],
                         xmin: xid,
                         xmax: 0,
-                    });
+                    },
+                );
             }
         }
         assert_eq!(engine.db.tables["t"][0].rows.len(), 2);
@@ -1393,9 +1402,7 @@ mod tests {
     fn aborted_txn_gate() {
         // Only ROLLBACK / ROLLBACK TO / COMMIT may run once failed.
         let rb = Stmt::Rollback;
-        let rbt = Stmt::RollbackTo {
-            name: "sp".into(),
-        };
+        let rbt = Stmt::RollbackTo { name: "sp".into() };
         let commit = Stmt::Commit;
         let sel = Stmt::Checkpoint;
         assert!(allowed_in_aborted(&rb));

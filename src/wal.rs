@@ -322,7 +322,11 @@ impl Enc {
 
     fn record(&mut self, r: &WalRecord) {
         match r {
-            WalRecord::CreateTable { name, columns, xmin } => {
+            WalRecord::CreateTable {
+                name,
+                columns,
+                xmin,
+            } => {
                 self.u8(1);
                 self.str(name);
                 self.columns(columns);
@@ -548,11 +552,16 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         }
     }
     match r {
-        WalRecord::CreateTable { name, columns, xmin } => {
-            eng.db.tables.entry(name.clone()).or_default().push(Table::new(
-                columns.clone(),
-                *xmin,
-            ));
+        WalRecord::CreateTable {
+            name,
+            columns,
+            xmin,
+        } => {
+            eng.db
+                .tables
+                .entry(name.clone())
+                .or_default()
+                .push(Table::new(columns.clone(), *xmin));
         }
         WalRecord::InsertRows { table, rows } => {
             let Some(t) = live_table(eng, table) else {
@@ -578,15 +587,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 });
             }
         }
-        WalRecord::DropTable { name, xmax } => {
-            match live_table(eng, name) {
-                Some(t) => t.dropped_xmax = *xmax,
-                None => eprintln!(
-                    "WAL replay: skipping DropTable \"{}\": no live table version",
-                    name
-                ),
-            }
-        }
+        WalRecord::DropTable { name, xmax } => match live_table(eng, name) {
+            Some(t) => t.dropped_xmax = *xmax,
+            None => eprintln!(
+                "WAL replay: skipping DropTable \"{}\": no live table version",
+                name
+            ),
+        },
         WalRecord::DeleteRows { table, ids, xmax } => {
             let Some(t) = live_table(eng, table) else {
                 eprintln!(
@@ -655,9 +662,7 @@ pub fn records_for_commit(
                     values,
                 };
                 match out.last_mut() {
-                    Some(WalRecord::InsertRows { table: t, rows }) if t == table => {
-                        rows.push(row)
-                    }
+                    Some(WalRecord::InsertRows { table: t, rows }) if t == table => rows.push(row),
                     _ => out.push(WalRecord::InsertRows {
                         table: table.clone(),
                         rows: vec![row],
@@ -675,10 +680,8 @@ pub fn records_for_commit(
                     // successor (an UPDATE pair), committing would leave
                     // BOTH versions live — a duplicate row. Fail the
                     // commit instead, like a write-write conflict.
-                    let paired_insert = matches!(
-                        writes.get(i + 1),
-                        Some(WriteOp::InsertRow { .. })
-                    );
+                    let paired_insert =
+                        matches!(writes.get(i + 1), Some(WriteOp::InsertRow { .. }));
                     if paired_insert {
                         return Err(format!(
                             "concurrent update on row id {} in table \"{}\"",
@@ -689,11 +692,11 @@ pub fn records_for_commit(
                     continue; // pure DELETE lost; the row stays deleted
                 }
                 match out.last_mut() {
-                    Some(WalRecord::DeleteRows { table: t, ids, xmax })
-                        if t == table && *xmax == own =>
-                    {
-                        ids.push(*row_id)
-                    }
+                    Some(WalRecord::DeleteRows {
+                        table: t,
+                        ids,
+                        xmax,
+                    }) if t == table && *xmax == own => ids.push(*row_id),
                     _ => out.push(WalRecord::DeleteRows {
                         table: table.clone(),
                         ids: vec![*row_id],
@@ -986,8 +989,7 @@ impl Wal {
         self.base_lsn = wal_end;
         println!(
             "rustgres v0.5 checkpoint: {} table version(s), WAL reset (base_lsn={})",
-            n_versions,
-            wal_end
+            n_versions, wal_end
         );
         Ok(())
     }
@@ -1055,15 +1057,21 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     let path = dir.join(CHKPT_NAME);
     let bytes = match fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Engine::new(), 0))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Engine::new(), 0)),
         Err(e) => return Err(e),
     };
     let mut d = Dec::new(&bytes);
-    let bad = |why: &str| io_err(format!("{} is corrupt ({}); refusing to start", path.display(), why));
+    let bad = |why: &str| {
+        io_err(format!(
+            "{} is corrupt ({}); refusing to start",
+            path.display(),
+            why
+        ))
+    };
     if d.take(8).map_err(|e| bad(&e))? != CHKPT_MAGIC {
-        return Err(bad("bad magic (a v0.4 checkpoint is not readable by v0.5; remove the data directory)"));
+        return Err(bad(
+            "bad magic (a v0.4 checkpoint is not readable by v0.5; remove the data directory)",
+        ));
     }
     if d.u32().map_err(|e| bad(&e))? != CHKPT_VERSION {
         return Err(bad("unsupported version"));
@@ -1095,7 +1103,12 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             if id >= eng.txns.next_row_id {
                 eng.txns.next_row_id = id + 1;
             }
-            rows.push(RowVersion { id, values, xmin, xmax });
+            rows.push(RowVersion {
+                id,
+                values,
+                xmin,
+                xmax,
+            });
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
@@ -1238,7 +1251,8 @@ mod tests {
         eng.db.tables.get_mut("t").unwrap()[0].created_xmin = 5;
         let xid = eng.begin_txn(); // 11
         // Our own uncommitted create of the same name.
-        eng.db.tables
+        eng.db
+            .tables
             .get_mut("t")
             .unwrap()
             .push(Table::new(vec![("a".into(), ColType::Int)], xid));

@@ -1,4 +1,4 @@
-//! rustgres v0.5 — a from-scratch PostgreSQL-compatible server in pure Rust.
+//! rustgres v0.6 — a from-scratch PostgreSQL-compatible server in pure Rust.
 //!
 //! Listens on 127.0.0.1:5433, one thread per connection, shared MVCC
 //! engine backed by a write-ahead log. Zero external crates: builds
@@ -37,7 +37,33 @@ fn data_dir() -> PathBuf {
     PathBuf::from("./rustgres-data")
 }
 
+/// Port to listen on. `--port N` (or `--port=N`) wins, then
+/// `RUSTGRES_PORT`, then 5433.
+fn port() -> u16 {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--port" {
+            if let Some(val) = args.next() {
+                if let Ok(p) = val.parse() {
+                    return p;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--port=") {
+            if let Ok(p) = val.parse() {
+                return p;
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("RUSTGRES_PORT") {
+        if let Ok(p) = val.parse() {
+            return p;
+        }
+    }
+    5433
+}
+
 fn main() {
+    let port = port();
     let data_dir = data_dir();
     // Crash recovery: load the latest checkpoint, replay WAL frames after
     // it. A missing/empty data dir yields an empty database — the server
@@ -45,17 +71,13 @@ fn main() {
     let (engine, wal) = match wal::Wal::open(&data_dir) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!(
-                "recovery failed for {}: {}",
-                data_dir.display(),
-                e
-            );
+            eprintln!("recovery failed for {}: {}", data_dir.display(), e);
             std::process::exit(1);
         }
     };
-    let listener = net::bind_listen("127.0.0.1:5433".parse().unwrap())
-        .expect("failed to bind 127.0.0.1:5433");
-    println!("rustgres v0.5 listening on 127.0.0.1:5433");
+    let listener = net::bind_listen(format!("127.0.0.1:{}", port).parse().unwrap())
+        .unwrap_or_else(|_| panic!("failed to bind 127.0.0.1:{}", port));
+    println!("rustgres v0.6 listening on 127.0.0.1:{}", port);
     let engine = Arc::new(Mutex::new(engine));
     let wal = Arc::new(Mutex::new(wal));
     for stream in listener.incoming() {

@@ -1,15 +1,64 @@
-# rustgres v0.5 — "many eyes"
+# rustgres v0.6 — "query engine"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 5 of the road to Postgres 19 feature parity. v0.5 replaces the
-v0.3/v0.4 full-database transaction overlay with **real MVCC**: every row
-is a chain of versions stamped with creator/deleter transaction ids
-(`xmin`/`xmax`), tables themselves are versioned the same way, and each
-transaction reads from a snapshot. On top of that: `READ COMMITTED`,
-`REPEATABLE READ`, and `SERIALIZABLE` isolation levels, `UPDATE`/`DELETE`,
-`VACUUM`, and — as a bonus the test suite demanded — `ORDER BY`.
+Milestone 6 of the road to Postgres 19 feature parity. v0.6 replaces the
+v0.1–v0.5 single-table `SELECT` with a **real query engine**: `FROM`
+sources are tables, derived tables, and `INNER`/`LEFT`/`CROSS` joins with
+arbitrary `ON` predicates; `WHERE` is a general boolean expression with
+SQL three-valued (NULL) logic; scalar, `IN`, and `EXISTS` subqueries
+(including correlated ones); hash-based `GROUP BY` with `COUNT`/`SUM`/
+`AVG`/`MIN`/`MAX` plus `HAVING`; `DISTINCT`; expression `ORDER BY`
+(including ordering by aggregates not in the select list); and
+`SELECT ... FOR UPDATE` row locking with full transaction lifecycle
+(commit/rollback/savepoint/disconnect release the locks).
+
+## What v0.6 adds (query engine)
+
+- **JOINs.** `INNER JOIN` / `LEFT JOIN` / `CROSS JOIN` with arbitrary `ON`
+  predicates (not just equijoins), comma joins, table aliases, qualified
+  `t.col` references, and derived tables (`FROM (SELECT ...) AS s`).
+  Ambiguous unqualified columns are `42702`, missing tables/columns are
+  `42P01`/`42703` — like Postgres. Execution is nested-loop with two
+  executor-level optimizations (see `benches/BASELINE.md`): single-source
+  `WHERE` conjuncts are pushed below the join, and unambiguous `ON`
+  predicates evaluate against two stack-resident frames with zero
+  allocation per row pair.
+- **Subqueries.** Scalar subqueries, `IN` (subquery and list forms), and
+  `EXISTS` — all correlatable to the outer query. Derived tables are
+  uncorrelated (no `LATERAL` support yet).
+- **Aggregates.** `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, multi-column
+  `GROUP BY`, `HAVING`, `COUNT(*)` vs `COUNT(col)` NULL semantics,
+  `sum()` of no rows is NULL, and `ORDER BY` an aggregate (or any
+  group-level expression) that isn't in the select list. Aggregates are
+  rejected in `WHERE`/`JOIN ON`/`GROUP BY` with `42803`, like Postgres.
+- **`SELECT ... FOR UPDATE`.** Row-level locks on the base-table versions
+  behind the result rows (through joins too). Lock conflicts fail
+  immediately with `40001` — there is **no lock waiting** (deliberate;
+  see below). Locks release on commit, rollback, savepoint rollback
+  (only locks taken after the savepoint), and disconnect. Writers still
+  check `FOR UPDATE` locks, so a locked row can't be concurrently
+  updated/deleted.
+- **Extended protocol throughout.** `$N` parameters work in `JOIN ON`,
+  subqueries, `HAVING`, and `ORDER BY`, with type inference and
+  `Describe` support.
+- **NULL semantics.** Three-valued predicate logic (`WHERE NULL` filters,
+  `NULL = NULL` is not true), `IS [NOT] NULL`, `COUNT(col)` skips NULLs,
+  and Postgres null placement in `ORDER BY`.
+
+Known v0.6 deviations/limitations (all documented, none silent): **no
+lock waiting** — `FOR UPDATE` on a locked row raises `40001` immediately
+instead of blocking; **no `LATERAL`** — derived tables can't correlate;
+**`FOR UPDATE` inside an `UPDATE ... SET` subquery is evaluated but
+takes no locks** (there is no statement-level lock flow for `UPDATE`;
+documented in `eval_update_expr`); **nested-loop joins only** — no hash
+join yet, no secondary indexes (every join scans the inner side; the
+`join` benchmark in `benches/BASELINE.md` quantifies this); **no CTEs,
+no window functions, no set operations** (`UNION`/`INTERSECT`/`EXCEPT`);
+**no `RIGHT`/`FULL` joins**; scalar subqueries must return exactly one
+row; still a small SQL/type/function surface (no `LIKE`, no casts, text
+sort is byte-wise).
 
 ## What v0.5 adds (MVCC + isolation)
 
@@ -354,6 +403,8 @@ python3 tests/protocol_test2.py  # v0.2: extended protocol, 91 checks
 python3 tests/protocol_test3.py  # v0.3: transactions, 93 checks
 python3 tests/protocol_test4.py  # v0.4: durability, 35 checks
 python3 tests/protocol_test5.py  # v0.5: MVCC + isolation, 85 checks
+python3 tests/protocol_test6.py  # v0.6: query engine, 79 checks (own
+                                 # ports per test; needs 55434+ free)
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts
@@ -444,12 +495,18 @@ the profile → optimize loop starts there.
   recovery, `fsync` discipline. ✅ done (v0.4)
 - **M5 — Types & expressions:** `NUMERIC`, `TIMESTAMP`/`DATE`/`INTERVAL`,
   `JSONB` + operators, arrays, `UUID`, casts, a real expression/operator engine
-  (`>`, `<`, `LIKE`, `IN`, arithmetic, aggregates, `GROUP BY`/`ORDER BY`).
+  (`>`, `<`, `LIKE`, `IN`, arithmetic). Partially done: v0.6 brought the
+  expression engine a long way (general predicates, `IN`/`EXISTS`, aggregates,
+  `GROUP BY`/`HAVING`/`ORDER BY`) — the remaining work is types (`NUMERIC`,
+  timestamps, `JSONB`, arrays, `UUID`), casts, and string/pattern operators.
 - **M6 — Indexes & planner:** B-tree indexes, `CREATE INDEX`, cost-based-ish
-  planning, `EXPLAIN`.
+  planning, `EXPLAIN`. ← the big next step: joins are nested-loop only and
+  every `WHERE` is a full version-chain scan (see `benches/BASELINE.md`).
 - **M7 — Catalog & tooling:** `pg_catalog` / `information_schema`, `COPY
   FROM/TO`, `LISTEN`/`NOTIFY`, sequence/`SERIAL`, views.
 - **M8 — Security:** real auth (md5 → SCRAM-SHA-256), roles, `GRANT`/
   privileges, SSL.
-- **M9+ — The long tail:** joins, subqueries, CTEs, window functions,
+- **M9+ — The long tail:** joins ✅ (v0.6: INNER/LEFT/CROSS + derived
+  tables; hash join still to come), subqueries ✅ (v0.6: scalar/IN/EXISTS,
+  correlated; no LATERAL yet), CTEs, window functions,
   constraints/FKs, triggers, rules, replication protocol, partitioning…

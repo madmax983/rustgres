@@ -7,16 +7,27 @@
 //!   SELECT expr [, ...]                      (no FROM: single row)
 //!   DROP TABLE [IF EXISTS] name
 //!
-//! v0.2 additions: `$N` parameter placeholders (1-based) and a tiny expression
+//! v0.2: `$N` parameter placeholders (1-based) and a tiny expression
 //! language for the SELECT list: literals, column refs, params, `+`, parens.
 //!
-//! v0.3 additions: transaction control statements
-//!   BEGIN [TRANSACTION] | START TRANSACTION
-//!   COMMIT | END
-//!   ROLLBACK | ABORT
-//!   SAVEPOINT name
-//!   ROLLBACK TO [SAVEPOINT] name
-//!   RELEASE [SAVEPOINT] name
+//! v0.3: transaction control statements (BEGIN/COMMIT/.../SAVEPOINT).
+//!
+//! v0.5: UPDATE / DELETE, VACUUM.
+//!
+//! v0.6: query engine.
+//!   SELECT [DISTINCT] items
+//!     FROM source [, ...]                     -- comma = CROSS JOIN
+//!          | t [AS] alias
+//!          | (SELECT ...) [AS] alias           -- derived table (alias required)
+//!          | source [INNER] JOIN source ON expr
+//!          | source LEFT [OUTER] JOIN source ON expr
+//!     [WHERE predicate] [GROUP BY expr, ...] [HAVING predicate]
+//!     [ORDER BY ...] [LIMIT n] [OFFSET n] [FOR UPDATE]
+//!   Predicates: AND / OR / NOT, comparisons (= <> < <= > >=),
+//!   IS [NOT] NULL, [NOT] IN (subquery), [NOT] EXISTS (subquery).
+//!   Expressions: qualified refs (t.col), `t.*`, aggregates
+//!   (COUNT(*)/COUNT(e)/SUM(e)/AVG(e)/MIN(e)/MAX(e)), scalar subqueries,
+//!   select-list aliases ([AS] name).
 //!
 //! Keywords are case-insensitive; unquoted identifiers fold to lowercase.
 //! String literals use single quotes with `''` as the escape for a quote.
@@ -47,6 +58,12 @@ enum Token {
     Star,
     Plus,
     Eq,
+    Dot,  // v0.6: qualified refs (t.col)
+    Lt,   // v0.6: <
+    Gt,   // v0.6: >
+    LtEq, // v0.6: <=
+    GtEq, // v0.6: >=
+    Neq,  // v0.6: <> and !=
     EOF,
 }
 
@@ -107,6 +124,35 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             '=' => {
                 toks.push(Token::Eq);
                 i += 1;
+            }
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    toks.push(Token::LtEq);
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    toks.push(Token::Neq);
+                    i += 2;
+                } else {
+                    toks.push(Token::Lt);
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    toks.push(Token::GtEq);
+                    i += 2;
+                } else {
+                    toks.push(Token::Gt);
+                    i += 1;
+                }
+            }
+            '!' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    toks.push(Token::Neq);
+                    i += 2;
+                } else {
+                    return Err(err(format!("unexpected character '{}'", c)));
+                }
             }
             '\'' => {
                 // single-quoted string, '' is an escaped quote
@@ -198,6 +244,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 }
                 toks.push(Token::Number(chars[start..i].iter().collect()));
             }
+            // A `.` that does not start a number is the qualifier dot.
+            '.' => {
+                toks.push(Token::Dot);
+                i += 1;
+            }
             _ if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < chars.len()
@@ -260,22 +311,161 @@ impl Literal {
     }
 }
 
-/// A SELECT-list / WHERE expression (v0.2: includes `$N` params and `+`).
-#[derive(Clone, Debug)]
+/// Comparison operators (v0.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CmpOp {
+    pub fn sql(&self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// Aggregate functions (v0.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        }
+    }
+}
+
+/// A SELECT-list / WHERE / ON / HAVING expression (v0.6: full predicates,
+/// qualified refs, aggregates, subqueries).
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-    Column(String),
+    Column {
+        table: Option<String>,
+        name: String,
+    },
+    /// Pre-resolved column position: `(scope frame, column index)` within one
+    /// fixed scope shape. Never produced by the parser — the executor builds
+    /// it once before a hot row-pair loop (JOIN ON) so per-row evaluation
+    /// skips name resolution entirely. Evaluates exactly like the `Column`
+    /// it was resolved from.
+    ResolvedCol {
+        frame: usize,
+        idx: usize,
+    },
     Literal(Literal),
     Param(u32), // 1-based $N; substituted with a Literal before execution
     Add(Box<Expr>, Box<Expr>),
+    Cmp {
+        op: CmpOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
+    IsNull {
+        expr: Box<Expr>,
+        neg: bool,
+    },
+    Agg {
+        func: AggFunc,
+        /// None = COUNT(*).
+        arg: Option<Box<Expr>>,
+    },
+    /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
+    ScalarSub(Box<SelectStmt>),
+    /// `[NOT] IN (subquery)`.
+    InSub {
+        expr: Box<Expr>,
+        sub: Box<SelectStmt>,
+        neg: bool,
+    },
+    /// `[NOT] EXISTS (subquery)`.
+    Exists {
+        sub: Box<SelectStmt>,
+        neg: bool,
+    },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SelectItem {
     All,
-    Expr(Expr),
+    /// `qualifier.*`
+    AllOf(String),
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
-/// Right-hand side of a `WHERE col = ...` comparison.
+/// A FROM source (v0.6).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FromItem {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
+    Derived {
+        sub: Box<SelectStmt>,
+        alias: String,
+    },
+    Join {
+        left: Box<FromItem>,
+        kind: JoinKind,
+        right: Box<FromItem>,
+        /// None for CROSS JOIN.
+        on: Option<Expr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Cross,
+}
+
+/// A full SELECT statement (v0.6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectStmt {
+    pub distinct: bool,
+    pub items: Vec<SelectItem>,
+    pub from: Vec<FromItem>,
+    pub where_: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    pub order_by: Vec<OrderTerm>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub for_update: bool,
+}
+
+/// Right-hand side of a `WHERE col = ...` comparison (UPDATE/DELETE only;
+///
+/// SELECT graduated to full predicates in v0.6).
 #[derive(Clone, Debug)]
 pub enum WhereRhs {
     Lit(Literal),
@@ -297,7 +487,7 @@ pub enum InsertValue {
 }
 
 /// One `ORDER BY` sort key: expression + direction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrderTerm {
     pub expr: Expr,
     pub desc: bool,
@@ -314,14 +504,11 @@ pub enum Stmt {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertValue>>,
     },
-    Select {
-        items: Vec<SelectItem>,
-        table: Option<String>,
-        where_: Vec<WhereCond>,
-        order_by: Vec<OrderTerm>,
-        limit: Option<i64>,
+    Select(SelectStmt),
+    DropTable {
+        if_exists: bool,
+        name: String,
     },
-    DropTable { if_exists: bool, name: String },
     // --- v0.5: UPDATE / DELETE with MVCC semantics
     Update {
         table: String,
@@ -339,9 +526,15 @@ pub enum Stmt {
     },
     Commit,
     Rollback,
-    Savepoint { name: String },
-    RollbackTo { name: String },
-    Release { name: String },
+    Savepoint {
+        name: String,
+    },
+    RollbackTo {
+        name: String,
+    },
+    Release {
+        name: String,
+    },
     // --- v0.4: checkpoint (handled by the session, not the executor)
     Checkpoint,
     // --- v0.5: vacuum (handled by the session, not the executor)
@@ -375,28 +568,7 @@ impl Stmt {
                 }
                 m
             }
-            Stmt::Select {
-                items,
-                where_,
-                order_by,
-                ..
-            } => {
-                let mut m = 0;
-                for item in items {
-                    if let SelectItem::Expr(e) = item {
-                        m = m.max(max_param_expr(e));
-                    }
-                }
-                for w in where_ {
-                    if let WhereRhs::Param(n) = w.rhs {
-                        m = m.max(n as usize);
-                    }
-                }
-                for o in order_by {
-                    m = m.max(max_param_expr(&o.expr));
-                }
-                m
-            }
+            Stmt::Select(sel) => max_param_select(sel),
             Stmt::Update { sets, where_, .. } => {
                 let mut m = 0;
                 for (_, e) in sets {
@@ -423,11 +595,61 @@ impl Stmt {
     }
 }
 
+fn max_param_select(s: &SelectStmt) -> usize {
+    let mut m = 0;
+    for item in &s.items {
+        match item {
+            SelectItem::Expr { expr, .. } => m = m.max(max_param_expr(expr)),
+            _ => {}
+        }
+    }
+    for f in &s.from {
+        m = m.max(max_param_from(f));
+    }
+    if let Some(e) = &s.where_ {
+        m = m.max(max_param_expr(e));
+    }
+    for e in &s.group_by {
+        m = m.max(max_param_expr(e));
+    }
+    if let Some(e) = &s.having {
+        m = m.max(max_param_expr(e));
+    }
+    for o in &s.order_by {
+        m = m.max(max_param_expr(&o.expr));
+    }
+    m
+}
+
+fn max_param_from(f: &FromItem) -> usize {
+    match f {
+        FromItem::Table { .. } => 0,
+        FromItem::Derived { sub, .. } => max_param_select(sub),
+        FromItem::Join {
+            left, right, on, ..
+        } => {
+            let mut m = max_param_from(left).max(max_param_from(right));
+            if let Some(e) = on {
+                m = m.max(max_param_expr(e));
+            }
+            m
+        }
+    }
+}
+
 fn max_param_expr(e: &Expr) -> usize {
     match e {
         Expr::Param(n) => *n as usize,
-        Expr::Add(a, b) => max_param_expr(a).max(max_param_expr(b)),
-        _ => 0,
+        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) => 0,
+        Expr::Add(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            max_param_expr(a).max(max_param_expr(b))
+        }
+        Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
+        Expr::Not(x) | Expr::IsNull { expr: x, .. } => max_param_expr(x),
+        Expr::Agg { arg, .. } => arg.as_ref().map_or(0, |x| max_param_expr(x)),
+        Expr::ScalarSub(s) => max_param_select(s),
+        Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
+        Expr::Exists { sub, .. } => max_param_select(sub),
     }
 }
 
@@ -446,6 +668,70 @@ pub fn parse_statement(input: &str) -> Result<Stmt, SqlError> {
     }
 }
 
+/// Keywords that can never be a bare (AS-less) alias or table alias.
+/// (A wordier list than Postgres needs, but it keeps the grammar
+/// unambiguous without much fuss.)
+fn is_reserved(word: &str) -> bool {
+    matches!(
+        word,
+        "all"
+            | "and"
+            | "as"
+            | "asc"
+            | "begin"
+            | "by"
+            | "checkpoint"
+            | "commit"
+            | "create"
+            | "cross"
+            | "delete"
+            | "desc"
+            | "distinct"
+            | "drop"
+            | "end"
+            | "exists"
+            | "for"
+            | "from"
+            | "group"
+            | "having"
+            | "in"
+            | "inner"
+            | "insert"
+            | "into"
+            | "is"
+            | "isolation"
+            | "join"
+            | "left"
+            | "level"
+            | "limit"
+            | "not"
+            | "null"
+            | "offset"
+            | "on"
+            | "or"
+            | "order"
+            | "outer"
+            | "read"
+            | "release"
+            | "repeatable"
+            | "rollback"
+            | "savepoint"
+            | "select"
+            | "serializable"
+            | "set"
+            | "table"
+            | "to"
+            | "transaction"
+            | "uncommitted"
+            | "committed"
+            | "update"
+            | "vacuum"
+            | "values"
+            | "verbose"
+            | "where"
+    )
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -454,6 +740,16 @@ struct Parser {
 impl Parser {
     fn peek(&self) -> Token {
         self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF)
+    }
+
+    /// Token after the next one (for `qual.*` / `NOT IN` lookahead).
+    fn peek2(&self) -> Token {
+        self.tokens.get(self.pos + 1).cloned().unwrap_or(Token::EOF)
+    }
+
+    /// Third token (for `qual.*` vs `qual.col` disambiguation).
+    fn peek3(&self) -> Token {
+        self.tokens.get(self.pos + 2).cloned().unwrap_or(Token::EOF)
     }
 
     fn next(&mut self) -> Token {
@@ -516,7 +812,7 @@ impl Parser {
         match kw.as_str() {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
-            "select" => self.parse_select(),
+            "select" => Ok(Stmt::Select(self.parse_select_rest()?)),
             "drop" => self.parse_drop(),
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
@@ -588,7 +884,7 @@ impl Parser {
                     return Err(err(format!(
                         "syntax error: expected ',' or ')', found {:?}",
                         other
-                    )))
+                    )));
                 }
             }
         }
@@ -603,7 +899,10 @@ impl Parser {
                 } else if let Ok(f) = raw.parse::<f64>() {
                     Ok(Literal::Float(f))
                 } else {
-                    Err(err(format!("syntax error: bad numeric literal \"{}\"", raw)))
+                    Err(err(format!(
+                        "syntax error: bad numeric literal \"{}\"",
+                        raw
+                    )))
                 }
             }
             Token::Str(s) => Ok(Literal::Text(s)),
@@ -635,7 +934,7 @@ impl Parser {
                         return Err(err(format!(
                             "syntax error: expected ',' or ')', found {:?}",
                             other
-                        )))
+                        )));
                     }
                 }
             }
@@ -657,7 +956,7 @@ impl Parser {
                         return Err(err(format!(
                             "syntax error: expected ',' or ')', found {:?}",
                             other
-                        )))
+                        )));
                     }
                 }
             }
@@ -686,8 +985,114 @@ impl Parser {
         }
     }
 
+    // --- v0.6 expression grammar ---
+    //
+    //   or      := and (`OR` and)*
+    //   and     := not (`AND` not)*
+    //   not     := `NOT` not | cmp
+    //   cmp     := add (cmpop add)? (`IS` [`NOT`] `NULL`)?
+    //              | add [`NOT`] `IN` `(` select `)`
+    //   add     := primary (`+` primary)*
+    //   primary := literal | param | column [`.' ident] | function call
+    //              | `EXISTS (select)` | `(select)` | `(` or `)`
+
+    fn parse_or(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_and()?;
+        while self.eat_keyword("or") {
+            let right = self.parse_and()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_not()?;
+        while self.eat_keyword("and") {
+            let right = self.parse_not()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr, SqlError> {
+        if self.eat_keyword("not") {
+            Ok(Expr::Not(Box::new(self.parse_not()?)))
+        } else {
+            self.parse_cmp()
+        }
+    }
+
+    fn parse_cmp(&mut self) -> Result<Expr, SqlError> {
+        let left = self.parse_add()?;
+        // `[NOT] IN (subquery)`
+        let not_in = if self.eat_keyword("not") {
+            if self.eat_keyword("in") {
+                true
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected IN after NOT, found {:?}",
+                    self.peek()
+                )));
+            }
+        } else {
+            false
+        };
+        if not_in || self.eat_keyword("in") {
+            self.expect(Token::LParen, "'('")?;
+            let sub = self.parse_subquery()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::InSub {
+                expr: Box::new(left),
+                sub: Box::new(sub),
+                neg: not_in,
+            });
+        }
+        let op = match self.peek() {
+            Token::Eq => Some(CmpOp::Eq),
+            Token::Neq => Some(CmpOp::Ne),
+            Token::Lt => Some(CmpOp::Lt),
+            Token::LtEq => Some(CmpOp::Le),
+            Token::Gt => Some(CmpOp::Gt),
+            Token::GtEq => Some(CmpOp::Ge),
+            _ => None,
+        };
+        let mut expr = match op {
+            Some(op) => {
+                self.next();
+                let right = self.parse_add()?;
+                Expr::Cmp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            }
+            None => left,
+        };
+        // `IS [NOT] NULL`
+        if self.eat_keyword("is") {
+            let neg = self.eat_keyword("not");
+            self.expect_keyword("null")?;
+            expr = Expr::IsNull {
+                expr: Box::new(expr),
+                neg,
+            };
+        }
+        Ok(expr)
+    }
+
+    /// `SELECT ...` inside parentheses (the `SELECT` keyword not yet consumed).
+    fn parse_subquery(&mut self) -> Result<SelectStmt, SqlError> {
+        match self.next() {
+            Token::Ident(s) if s == "select" => self.parse_select_rest(),
+            other => Err(err(format!(
+                "syntax error: expected SELECT, found {:?}",
+                other
+            ))),
+        }
+    }
+
     /// expr := primary (`+` primary)*
-    fn parse_expr(&mut self) -> Result<Expr, SqlError> {
+    fn parse_add(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_primary()?;
         while self.peek() == Token::Plus {
             self.next();
@@ -701,9 +1106,20 @@ impl Parser {
         match self.peek() {
             Token::LParen => {
                 self.next();
-                let e = self.parse_expr()?;
-                self.expect(Token::RParen, "')'")?;
-                Ok(e)
+                // `(SELECT ...)` = scalar subquery; otherwise parenthesized expr.
+                match self.peek() {
+                    Token::Ident(s) if s == "select" => {
+                        self.next();
+                        let sub = self.parse_select_rest()?;
+                        self.expect(Token::RParen, "')'")?;
+                        Ok(Expr::ScalarSub(Box::new(sub)))
+                    }
+                    _ => {
+                        let e = self.parse_or()?;
+                        self.expect(Token::RParen, "')'")?;
+                        Ok(e)
+                    }
+                }
             }
             Token::Param(n) => {
                 self.next();
@@ -713,11 +1129,76 @@ impl Parser {
             Token::Ident(ref s) if s == "true" || s == "false" || s == "null" => {
                 Ok(Expr::Literal(self.parse_literal()?))
             }
-            Token::Ident(_) => Ok(Expr::Column(self.expect_ident()?)),
+            Token::Ident(_) => {
+                let name = self.expect_ident()?;
+                // `EXISTS (SELECT ...)` — only when followed by `(` so a
+                // column actually named "exists" still works elsewhere.
+                if name == "exists" && self.peek() == Token::LParen {
+                    self.next();
+                    let sub = self.parse_subquery()?;
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(Expr::Exists {
+                        sub: Box::new(sub),
+                        neg: false,
+                    });
+                }
+                // Aggregate call `name(...)`?
+                if self.peek() == Token::LParen {
+                    return self.parse_agg_call(name);
+                }
+                // Qualified ref `table.column`?
+                if self.peek() == Token::Dot {
+                    self.next();
+                    let col = self.expect_ident()?;
+                    return Ok(Expr::Column {
+                        table: Some(name),
+                        name: col,
+                    });
+                }
+                Ok(Expr::Column { table: None, name })
+            }
             other => Err(err(format!(
                 "syntax error: expected expression, found {:?}",
                 other
             ))),
+        }
+    }
+
+    /// `count(*)`, `count(e)`, `sum(e)`, `avg(e)`, `min(e)`, `max(e)`.
+    /// Anything else followed by `(` is "function does not exist" (42883
+    /// at execution type-check; here a plain syntax-level error naming it).
+    fn parse_agg_call(&mut self, name: String) -> Result<Expr, SqlError> {
+        let func = match name.as_str() {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return Err(err(format!("function {}() does not exist", name))),
+        };
+        self.expect(Token::LParen, "'('")?;
+        let arg = if func == AggFunc::Count && self.peek() == Token::Star {
+            self.next();
+            None
+        } else {
+            Some(Box::new(self.parse_or()?))
+        };
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Agg { func, arg })
+    }
+
+    /// Optional `[AS] alias` after a select item or table source. A bare
+    /// (AS-less) alias may not be a reserved word.
+    fn parse_alias_opt(&mut self) -> Result<Option<String>, SqlError> {
+        if self.eat_keyword("as") {
+            return Ok(Some(self.expect_ident()?));
+        }
+        match self.peek() {
+            Token::Ident(s) if !is_reserved(&s) => {
+                self.next();
+                Ok(Some(s))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -752,11 +1233,15 @@ impl Parser {
                     other
                 ))),
             },
-            _ => Err(err(format!("syntax error: unknown isolation level \"{}\"", w))),
+            _ => Err(err(format!(
+                "syntax error: unknown isolation level \"{}\"",
+                w
+            ))),
         }
     }
 
-    /// Shared `WHERE col = lit|$N [AND ...]` tail for SELECT/UPDATE/DELETE.
+    /// Shared `WHERE col = lit|$N [AND ...]` tail for UPDATE/DELETE
+    /// (kept simple; SELECT uses full predicates since v0.6).
     fn parse_where_opt(&mut self) -> Result<Vec<WhereCond>, SqlError> {
         let mut where_ = Vec::new();
         if self.eat_keyword("where") {
@@ -787,7 +1272,7 @@ impl Parser {
         loop {
             let col = self.expect_ident()?;
             self.expect(Token::Eq, "'='")?;
-            let expr = self.parse_expr()?;
+            let expr = self.parse_or()?;
             sets.push((col, expr));
             if self.peek() == Token::Comma {
                 self.next();
@@ -799,7 +1284,11 @@ impl Parser {
             return Err(err("syntax error: UPDATE requires at least one assignment"));
         }
         let where_ = self.parse_where_opt()?;
-        Ok(Stmt::Update { table, sets, where_ })
+        Ok(Stmt::Update {
+            table,
+            sets,
+            where_,
+        })
     }
 
     fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
@@ -818,32 +1307,83 @@ impl Parser {
         Ok(Stmt::Vacuum { table, verbose })
     }
 
-    fn parse_select(&mut self) -> Result<Stmt, SqlError> {
-        let mut items = Vec::new();
-        if self.peek() == Token::Star {
-            self.next();
-            items.push(SelectItem::All);
+    /// The body of a SELECT after the `SELECT` keyword was consumed.
+    fn parse_select_rest(&mut self) -> Result<SelectStmt, SqlError> {
+        let distinct = if self.eat_keyword("distinct") {
+            true
         } else {
+            // ALL is the default; consume it if present.
+            self.eat_keyword("all");
+            false
+        };
+        let mut items = Vec::new();
+        loop {
+            // `*`
+            if self.peek() == Token::Star {
+                self.next();
+                items.push(SelectItem::All);
+            } else if let Token::Ident(q) = self.peek() {
+                // `qual.*` — but only when a `*` really follows the dot;
+                // `qual.col` is a normal expression.
+                if self.peek2() == Token::Dot && self.peek3() == Token::Star {
+                    self.next(); // qual
+                    self.next(); // dot
+                    self.next(); // star
+                    items.push(SelectItem::AllOf(q));
+                } else {
+                    let expr = self.parse_or()?;
+                    let alias = self.parse_alias_opt()?;
+                    items.push(SelectItem::Expr { expr, alias });
+                }
+            } else {
+                let expr = self.parse_or()?;
+                let alias = self.parse_alias_opt()?;
+                items.push(SelectItem::Expr { expr, alias });
+            }
+            if self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        if items.is_empty() {
+            return Err(err("syntax error: SELECT requires a select list"));
+        }
+        let from = if self.eat_keyword("from") {
+            self.parse_from()?
+        } else {
+            Vec::new()
+        };
+        let where_ = if self.eat_keyword("where") {
+            Some(self.parse_or()?)
+        } else {
+            None
+        };
+        let group_by = if self.eat_keyword("group") {
+            self.expect_keyword("by")?;
+            let mut groups = Vec::new();
             loop {
-                items.push(SelectItem::Expr(self.parse_expr()?));
+                groups.push(self.parse_or()?);
                 if self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
                 break;
             }
-        }
-        let table = if self.eat_keyword("from") {
-            Some(self.expect_ident()?)
+            groups
+        } else {
+            Vec::new()
+        };
+        let having = if self.eat_keyword("having") {
+            Some(self.parse_or()?)
         } else {
             None
         };
-        let where_ = self.parse_where_opt()?;
         let order_by = if self.eat_keyword("order") {
             self.expect_keyword("by")?;
             let mut terms = Vec::new();
             loop {
-                let expr = self.parse_expr()?;
+                let expr = self.parse_or()?;
                 let desc = if self.eat_keyword("desc") {
                     true
                 } else {
@@ -862,48 +1402,147 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let limit = if self.eat_keyword("limit") {
-            match self.next() {
-                Token::Number(raw) => match raw.parse::<i64>() {
-                    Ok(n) => Some(n),
-                    Err(_) => {
-                        return Err(err(format!("syntax error: bad LIMIT value \"{}\"", raw)));
+        // LIMIT and OFFSET in either order (both accepted, like Postgres).
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if limit.is_none() && self.eat_keyword("limit") {
+                match self.next() {
+                    Token::Number(raw) => match raw.parse::<i64>() {
+                        Ok(n) => limit = Some(n),
+                        Err(_) => {
+                            return Err(err(format!("syntax error: bad LIMIT value \"{}\"", raw)));
+                        }
+                    },
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected LIMIT count, found {:?}",
+                            other
+                        )));
                     }
-                },
-                other => {
-                    return Err(err(format!(
-                        "syntax error: expected LIMIT count, found {:?}",
-                        other
-                    )));
                 }
-            }
-        } else {
-            None
-        };
-        // `*` needs a FROM; bare literals only make sense without one.
-        let has_from = table.is_some();
-        for item in &items {
-            match item {
-                SelectItem::All if !has_from => {
-                    return Err(err("syntax error: SELECT * requires FROM"));
+            } else if offset.is_none() && self.eat_keyword("offset") {
+                match self.next() {
+                    Token::Number(raw) => match raw.parse::<i64>() {
+                        Ok(n) => offset = Some(n),
+                        Err(_) => {
+                            return Err(err(format!("syntax error: bad OFFSET value \"{}\"", raw)));
+                        }
+                    },
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected OFFSET count, found {:?}",
+                            other
+                        )));
+                    }
                 }
-                // A bare literal in the select list with FROM stays an error,
-                // exactly like v0.1 (params and `+` expressions are fine).
-                SelectItem::Expr(Expr::Literal(_)) if has_from => {
-                    return Err(err(
-                        "syntax error: literals not supported in select list with FROM",
-                    ));
-                }
-                _ => {}
+            } else {
+                break;
             }
         }
-        Ok(Stmt::Select {
+        let for_update = if self.eat_keyword("for") {
+            self.expect_keyword("update")?;
+            true
+        } else {
+            false
+        };
+        Ok(SelectStmt {
+            distinct,
             items,
-            table,
+            from,
             where_,
+            group_by,
+            having,
             order_by,
             limit,
+            offset,
+            for_update,
         })
+    }
+
+    /// FROM source [, ...] — commas become CROSS JOINs; explicit JOINs
+    /// bind tighter than commas.
+    fn parse_from(&mut self) -> Result<Vec<FromItem>, SqlError> {
+        let mut items = vec![self.parse_join_chain()?];
+        while self.peek() == Token::Comma {
+            self.next();
+            items.push(self.parse_join_chain()?);
+        }
+        let mut iter = items.into_iter();
+        let mut acc = iter.next().unwrap();
+        for next in iter {
+            acc = FromItem::Join {
+                left: Box::new(acc),
+                kind: JoinKind::Cross,
+                right: Box::new(next),
+                on: None,
+            };
+        }
+        Ok(vec![acc])
+    }
+
+    fn parse_join_chain(&mut self) -> Result<FromItem, SqlError> {
+        let mut left = self.parse_from_primary()?;
+        loop {
+            let kind = if self.eat_keyword("join") {
+                JoinKind::Inner
+            } else if self.eat_keyword("inner") {
+                self.expect_keyword("join")?;
+                JoinKind::Inner
+            } else if self.eat_keyword("left") {
+                self.eat_keyword("outer");
+                self.expect_keyword("join")?;
+                JoinKind::Left
+            } else if self.eat_keyword("cross") {
+                self.expect_keyword("join")?;
+                JoinKind::Cross
+            } else {
+                break;
+            };
+            let right = self.parse_from_primary()?;
+            let on = match kind {
+                JoinKind::Cross => None,
+                _ => {
+                    self.expect_keyword("on")?;
+                    Some(self.parse_or()?)
+                }
+            };
+            left = FromItem::Join {
+                left: Box::new(left),
+                kind,
+                right: Box::new(right),
+                on,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
+        if self.peek() == Token::LParen {
+            self.next();
+            let sub = self.parse_subquery()?;
+            self.expect(Token::RParen, "')'")?;
+            // Derived tables require an alias, like Postgres.
+            let alias = if self.eat_keyword("as") {
+                self.expect_ident()?
+            } else {
+                match self.peek() {
+                    Token::Ident(s) if !is_reserved(&s) => {
+                        self.next();
+                        s
+                    }
+                    _ => return Err(err("syntax error: subquery in FROM must have an alias")),
+                }
+            };
+            Ok(FromItem::Derived {
+                sub: Box::new(sub),
+                alias,
+            })
+        } else {
+            let name = self.expect_ident()?;
+            let alias = self.parse_alias_opt()?;
+            Ok(FromItem::Table { name, alias })
+        }
     }
 
     fn parse_drop(&mut self) -> Result<Stmt, SqlError> {

@@ -2,6 +2,114 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.6 baseline — 2026-09-10
+
+Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),
+valgrind 3.22.0. Server on `127.0.0.1:5433` with a fresh temp data dir.
+5 s measurement + 1 s warmup per workload. New workload `join`: 2k users x
+20k orders nested-loop equijoin with `WHERE u.id < 200` pushed below the
+join (200 x 20k pairs), hash GROUP BY, aggregate ORDER BY — one query per
+op, p50 in ms. The sandbox is noisy for contention-heavy workloads, so
+`mvcc`/`select1`/`prepared` ranges below come from repeated runs.
+
+| workload   | what                              | qps      | p50        | p99        | vs v0.5 |
+|------------|-----------------------------------|----------|------------|------------|---------|
+| `select1`  | simple-query `SELECT 1`           | ~25,600  | 0.032 ms   | 0.087 ms   | noise (24.8k–26.5k across runs) |
+| `prepared` | ext. protocol: Parse once, Bind($1)/Execute loop | ~14,800 | 0.062 ms | 0.113 ms | noise (14.6k–15.1k across runs) |
+| `insert`   | 1000-row multi-VALUES `INSERT`    | 132.8    | 6.616 ms   | 21.69 ms   | noise |
+| `scan`     | `SELECT *` over 10k-row table     | 52.7     | 15.45 ms   | 36.41 ms   | noise (see notes) |
+| `txn`      | `BEGIN` + 1-row `INSERT` + `COMMIT` loop | 6,210 | 0.143 ms   | 0.480 ms   | noise |
+| `mvcc`     | 4 threads x (`BEGIN`+`UPDATE`+`SELECT`+`COMMIT`) | ~1,200 | 0.688 ms | 2.3 ms | noise (0.85k–1.3k across runs, both versions) |
+| `join`     | filtered JOIN + GROUP BY (2k x 20k) | 0.5    | 2055 ms    | 2058 ms    | new |
+
+Release-build spot check (`cargo build --release`, same workload shape,
+best of 3): filtered join (2M pairs) 237 ms, join+aggregate 471 ms,
+unfiltered 40M-pair equijoin `count(*)` 4494 ms (~112 ns/pair).
+
+### What changed and why
+
+- **New `join` workload** exercises the v0.6 query engine end to end:
+  nested-loop equijoin, predicate pushdown, hash GROUP BY, and
+  aggregate ORDER BY.
+- **Predicate pushdown makes the filtered join 33x faster.** The first
+  v0.6 join implementation evaluated WHERE after generating the full
+  40M-pair cross product (release: 7.9 s for the filtered join). Single-
+  source WHERE conjuncts are now pushed below comma joins and to the
+  preserved side of LEFT JOINs before the nested loop runs (release:
+  237 ms for the same query). The full WHERE still applies after the
+  join, so pushdown is purely an optimization — and ambiguous-column
+  (42702) and missing-table behavior are unchanged.
+- **Zero-alloc join fast path.** When no ON predicate column reference
+  is ambiguous across the two sides (proven by a pre-pass over the
+  predicate), the ON clause evaluates against two stack-resident frames
+  instead of a combined row buffer allocated per pair. Ambiguous
+  predicates take the original combined-frame path and still raise
+  42702 exactly as before.
+- **A real scan regression was caught and fixed by this baseline.**
+  The first v0.6 build did 33 qps on `scan` vs v0.5's 56: the new
+  engine allocated a scope `Vec` per row in `project_row`, a provenance
+  `Vec`+`String` per base-table row, and rebuilt every row once more in
+  the comma-join accumulator. Fixes: single-FROM fast path (no
+  cross-product rebuild), provenance only under FOR UPDATE, `SELECT *`
+  moves the row through with zero copies, scope chain built only for
+  expression items. `scan` is back to 52.7 qps.
+- **No regressions anywhere else.** `mvcc` initially read 30% down, but
+  an A/B against a pristine v0.5 binary showed both versions ranging
+  0.85k–1.3k qps run to run — the sandbox's scheduling noise dominates
+  this 4-thread mutex-contention workload, not the engine.
+- **Pre-resolved JOIN ON columns: 1.63x on the filtered join.**
+  Callgrind on the join workload showed per-pair name resolution
+  (`resolve_col` 6.16% + string compares ~9% + iterator overhead ~5% —
+  roughly 20% of all instructions) as the single biggest cost: every one
+  of the 4M row pairs re-resolved `u.id`/`o.uid` by linear string scan,
+  even though the schemas never change across the loop. The executor now
+  resolves the ON predicate's column references once, before the loop,
+  into positional `ResolvedCol { frame, idx }` nodes (via the same
+  `resolve_col`, so 42702/42703 behavior is identical), and the fast path
+  evaluates positions with direct indexing. Resolution is skipped when
+  either input is empty, preserving the old "no error if the loop never
+  runs" timing. Release A/B (15 iterations, 2k x 20k fixture):
+  qualified `ON u.id = o.uid` median 478 ms -> 294 ms (**1.63x**);
+  unqualified full-match `ON amt = amt` (4M pairs all match, GROUP BY
+  dominates) 3376 ms -> 3223 ms (1.05x, Amdahl-limited as expected).
+- **Remaining join cost is the nested loop itself.** The unfiltered
+  40M-pair join is 4.5 s release (112 ns/pair, interpreted predicate).
+  A hash join for equi-joins is the known next step (see README);
+  secondary indexes would further cut the inner side.
+
+### Valgrind profile: join workload (debug build)
+
+`./benches/profile.sh --seconds 3 --workload join` — Callgrind
+(`benches/profiles/callgrind.out.20504`, 2.10B instructions) and DHAT
+(`benches/profiles/dhat.out.20777`). Profiled *before* the ON-column
+pre-resolution above; the `resolve_col` entries below are what that
+optimization removed.
+
+Callgrind hotspots (share of instructions):
+- `memcpy` 6.99% — row materialization (`combine_rows`, `Value::clone`).
+- `resolve_col` 6.16%, `String == &str` 2.89%, `memcmp` 2.53%,
+  `slice String == &str` 2.27%, `str::eq` 0.89%, resolve closures and
+  `QCol`/`Scope` iterator machinery ~5% — per-pair name resolution,
+  ~20% combined (eliminated by pre-resolution for the join fast path).
+- `eval_expr` ~4.8% across monomorphizations — interpreted predicate.
+- `build_source` 1.67%, `Value::clone` 1.16%, `_int_malloc` 1.15%,
+  tokenizer 1.11%.
+
+DHAT (whole 3 s session incl. fixture setup: 22k INSERTs):
+- Total allocated 44.6 MB in 314k blocks; peak live ~7.7 MB.
+- Largest sites are all setup-phase: `tokenize` 11.5 MB,
+  WAL encode (`wal::Enc::u32/u64`) ~5.9 MB, `split_statements` 2.3 MB,
+  `parse_insert`/`exec_insert`/`push_version` ~8 MB combined.
+- Steady-state join query allocation is small: per-row scan
+  materialization (`build_source` closure) 1.5 MB / 24k blocks (one
+  `QRow` per scanned row); the pair loop itself has no significant
+  allocation site — consistent with the zero-alloc fast path.
+- Tokenizer allocates per query (the workload re-parses every
+  iteration; no prepared statements): `tokenize` + token post-processing
+  (`call_once<fn(&Token) -> Token>` 424 KB / 128k blocks) are the
+  per-query parse cost to attack next if simple-protocol parse overhead
+  ever dominates.
+
 ## v0.3 baseline — 2026-09-10
 
 Environment: Ubuntu 24.04 sandbox, `cargo build` (debug, unoptimized),

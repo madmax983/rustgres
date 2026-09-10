@@ -385,6 +385,38 @@ def w_prepared(conn, seconds):
     return res
 
 
+def w_join(conn, seconds):
+    conn.simple("DROP TABLE IF EXISTS bench_o")
+    conn.simple("DROP TABLE IF EXISTS bench_u")
+    r = conn.simple("CREATE TABLE bench_u(id INT, name TEXT)")
+    assert tag_of(r) == "CREATE TABLE"
+    r = conn.simple("CREATE TABLE bench_o(id INT, uid INT, amt INT)")
+    assert tag_of(r) == "CREATE TABLE"
+    # 2k users, 20k orders (10 per user), 2000-row INSERT batches
+    rows = ",".join(f"({i},'u{i}')" for i in range(2000))
+    r = conn.simple(f"INSERT INTO bench_u VALUES {rows}")
+    assert tag_of(r) == "INSERT 0 2000", tag_of(r)
+    for j in range(0, 20000, 2000):
+        chunk = ",".join(f"({i},{i%2000},{i%100})" for i in range(j, j + 2000))
+        r = conn.simple(f"INSERT INTO bench_o VALUES {chunk}")
+        assert tag_of(r) == "INSERT 0 2000", tag_of(r)
+
+    sql = ("SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u "
+           "JOIN bench_o o ON u.id = o.uid WHERE u.id < 200 "
+           "GROUP BY u.name ORDER BY u.name")
+
+    def op():
+        msgs = conn.simple(sql)
+        assert tag_of(msgs) == "SELECT 200", tag_of(msgs)
+    res = measure(op, seconds)
+    conn.simple("DROP TABLE bench_o")
+    conn.simple("DROP TABLE bench_u")
+    res["note"] = ("2k x 20k nested-loop join (WHERE u.id < 200 pushed below "
+                   "the join: 200 x 20k pairs), hash GROUP BY + aggregate "
+                   "ORDER BY; one query per op")
+    return res
+
+
 WORKLOADS = {
     "select1": ("simple-query SELECT 1", w_select1),
     "scan": ("SELECT * over 10k rows", w_scan),
@@ -392,6 +424,7 @@ WORKLOADS = {
     "prepared": ("extended-protocol prepared loop", w_prepared),
     "txn": ("BEGIN + INSERT + COMMIT loop", w_txn),
     "mvcc": ("concurrent MVCC txn loop (4 threads)", w_mvcc),
+    "join": ("filtered JOIN + GROUP BY (2k x 20k)", w_join),
 }
 
 

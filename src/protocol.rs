@@ -54,12 +54,9 @@ impl<'a> Cursor<'a> {
         let end = self.buf[self.pos..]
             .iter()
             .position(|&b| b == 0)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "unterminated cstring")
-            })?;
-        let s = std::str::from_utf8(&self.buf[self.pos..self.pos + end]).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8 in cstring")
-        })?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unterminated cstring"))?;
+        let s = std::str::from_utf8(&self.buf[self.pos..self.pos + end])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8 in cstring"))?;
         let out = s.to_string();
         self.pos += end + 1;
         Ok(out)
