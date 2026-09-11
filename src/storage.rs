@@ -111,21 +111,127 @@ impl ColType {
 /// operations that would exceed it fail with 22003 rather than silently
 /// rounding — a deliberate v0.7 deviation from Postgres' arbitrary
 /// precision (documented in the README).
+///
+/// v0.18: adds PostgreSQL's non-finite numerics. `special` distinguishes
+/// `NaN`, `+Infinity`, `-Infinity` from finite values; the `unscaled` /
+/// `scale` fields are always zero for non-finite values so derived
+/// equality stays canonical.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Numeric {
     pub unscaled: i128,
     pub scale: u32,
+    pub special: NumericSpecial,
+}
+
+/// Non-finite numeric kinds (v0.18), mirroring PostgreSQL's
+/// `NUMERIC_NAN` / `NUMERIC_PINF` / `NUMERIC_NINF`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericSpecial {
+    Finite,
+    NaN,
+    PosInf,
+    NegInf,
 }
 
 impl Numeric {
+    /// Build without normalizing (v0.18): for fixed-scale internals
+    /// like the transcendental series that need exact scale control.
+    fn raw(unscaled: i128, scale: u32) -> Self {
+        Numeric {
+            unscaled,
+            scale,
+            special: NumericSpecial::Finite,
+        }
+    }
+
     /// Build and normalize.
     pub fn new(unscaled: i128, scale: u32) -> Self {
-        let mut n = Numeric { unscaled, scale };
+        let mut n = Numeric {
+            unscaled,
+            scale,
+            special: NumericSpecial::Finite,
+        };
         n.normalize();
         n
     }
 
+    /// NaN (v0.18).
+    pub fn nan() -> Self {
+        Numeric {
+            unscaled: 0,
+            scale: 0,
+            special: NumericSpecial::NaN,
+        }
+    }
+
+    /// +Infinity (v0.18).
+    pub fn infinity() -> Self {
+        Numeric {
+            unscaled: 0,
+            scale: 0,
+            special: NumericSpecial::PosInf,
+        }
+    }
+
+    /// -Infinity (v0.18).
+    pub fn neg_infinity() -> Self {
+        Numeric {
+            unscaled: 0,
+            scale: 0,
+            special: NumericSpecial::NegInf,
+        }
+    }
+
+    /// True for NaN / +/-Infinity (v0.18).
+    #[allow(dead_code)]
+    pub fn is_special(&self) -> bool {
+        self.special != NumericSpecial::Finite
+    }
+
+    /// True for NaN (v0.18).
+    pub fn is_nan(&self) -> bool {
+        self.special == NumericSpecial::NaN
+    }
+
+    /// Sign of the value: -1, 0, +1; NaN reports 0 (v0.18).
+    fn signum(&self) -> i8 {
+        match self.special {
+            NumericSpecial::NaN => 0,
+            NumericSpecial::PosInf => 1,
+            NumericSpecial::NegInf => -1,
+            NumericSpecial::Finite => {
+                if self.unscaled < 0 {
+                    -1
+                } else if self.unscaled > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Arithmetic negation (v0.18); NaN stays NaN, infinities flip.
+    #[allow(dead_code)]
+    pub fn neg(&self) -> Self {
+        match self.special {
+            NumericSpecial::NaN => Numeric::nan(),
+            NumericSpecial::PosInf => Numeric::neg_infinity(),
+            NumericSpecial::NegInf => Numeric::infinity(),
+            NumericSpecial::Finite => {
+                // `i128::MIN` is unreachable: parse() rejects magnitudes
+                // that large and arithmetic is overflow-checked.
+                Numeric::new(self.unscaled.saturating_neg(), self.scale)
+            }
+        }
+    }
+
     fn normalize(&mut self) {
+        if self.special != NumericSpecial::Finite {
+            self.unscaled = 0;
+            self.scale = 0;
+            return;
+        }
         if self.unscaled == 0 {
             self.scale = 0;
             return;
@@ -140,6 +246,7 @@ impl Numeric {
         Numeric {
             unscaled: 0,
             scale: 0,
+            special: NumericSpecial::Finite,
         }
     }
 
@@ -160,6 +267,19 @@ impl Numeric {
             Some(r) => (true, r),
             None => (false, s.strip_prefix('+').unwrap_or(s)),
         };
+        // v0.18: PostgreSQL's non-finite numerics, case-insensitive.
+        // A leading sign is accepted; `-NaN` is still NaN.
+        let lower: String = rest.to_lowercase();
+        if lower == "nan" {
+            return Ok(Numeric::nan());
+        }
+        if lower == "inf" || lower == "infinity" {
+            return Ok(if neg {
+                Numeric::neg_infinity()
+            } else {
+                Numeric::infinity()
+            });
+        }
         // Split off an exponent.
         let (mant, exp): (&str, i32) = match rest.find(['e', 'E']) {
             Some(i) => {
@@ -229,11 +349,20 @@ impl Numeric {
     }
 
     pub fn to_f64(&self) -> f64 {
-        self.unscaled as f64 * 10f64.powi(-(self.scale as i32))
+        match self.special {
+            NumericSpecial::NaN => f64::NAN,
+            NumericSpecial::PosInf => f64::INFINITY,
+            NumericSpecial::NegInf => f64::NEG_INFINITY,
+            NumericSpecial::Finite => self.unscaled as f64 * 10f64.powi(-(self.scale as i32)),
+        }
     }
 
-    /// Round half away from zero to an integer; overflow -> None.
+    /// Round half away from zero to an integer; overflow or a special
+    /// value -> None.
     pub fn to_i64(&self) -> Option<i64> {
+        if self.special != NumericSpecial::Finite {
+            return None;
+        }
         let half = 10i128.checked_pow(self.scale)? / 2;
         let rounded = if self.unscaled >= 0 {
             self.unscaled.checked_add(half)? / 10i128.checked_pow(self.scale)?
@@ -241,6 +370,12 @@ impl Numeric {
             self.unscaled.checked_sub(half)? / 10i128.checked_pow(self.scale)?
         };
         i64::try_from(rounded).ok()
+    }
+
+    /// v0.18: true for finite zero (specials are never zero).
+    #[allow(dead_code)]
+    pub fn is_zero(&self) -> bool {
+        self.special == NumericSpecial::Finite && self.unscaled == 0
     }
 
     /// Align `other` to our scale; used by add/sub. Overflow -> None.
@@ -255,56 +390,165 @@ impl Numeric {
         Some((a, b, scale))
     }
 
+    /// Addition with PostgreSQL's non-finite semantics (v0.18): NaN
+    /// propagates; `Inf + -Inf` is NaN; infinities otherwise dominate.
     pub fn checked_add(&self, other: &Numeric) -> Option<Numeric> {
-        let (a, b, scale) = self.aligned(other)?;
-        Some(Numeric::new(a.checked_add(b)?, scale))
+        match (self.special, other.special) {
+            (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
+            (NumericSpecial::Finite, NumericSpecial::Finite) => {
+                let (a, b, scale) = self.aligned(other)?;
+                Some(Numeric::new(a.checked_add(b)?, scale))
+            }
+            (a, b) => {
+                if (a == NumericSpecial::PosInf && b == NumericSpecial::NegInf)
+                    || (a == NumericSpecial::NegInf && b == NumericSpecial::PosInf)
+                {
+                    return Some(Numeric::nan());
+                }
+                Some(
+                    if a == NumericSpecial::PosInf || b == NumericSpecial::PosInf {
+                        Numeric::infinity()
+                    } else {
+                        Numeric::neg_infinity()
+                    },
+                )
+            }
+        }
     }
 
+    /// Subtraction via negation (v0.18 keeps PG's special-value rules).
     pub fn checked_sub(&self, other: &Numeric) -> Option<Numeric> {
-        let (a, b, scale) = self.aligned(other)?;
-        Some(Numeric::new(a.checked_sub(b)?, scale))
+        self.checked_add(&other.neg())
     }
 
+    /// Multiplication with PostgreSQL's non-finite semantics (v0.18):
+    /// NaN propagates; `0 * Inf` is NaN; infinities otherwise dominate
+    /// with the product's sign.
     pub fn checked_mul(&self, other: &Numeric) -> Option<Numeric> {
-        Some(Numeric::new(
-            self.unscaled.checked_mul(other.unscaled)?,
-            self.scale.checked_add(other.scale)?,
-        ))
+        match (self.special, other.special) {
+            (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
+            (NumericSpecial::Finite, NumericSpecial::Finite) => Some(Numeric::new(
+                self.unscaled.checked_mul(other.unscaled)?,
+                self.scale.checked_add(other.scale)?,
+            )),
+            _ => {
+                if self.is_zero() || other.is_zero() {
+                    return Some(Numeric::nan());
+                }
+                let neg = (self.signum() < 0) != (other.signum() < 0);
+                Some(if neg {
+                    Numeric::neg_infinity()
+                } else {
+                    Numeric::infinity()
+                })
+            }
+        }
     }
 
     /// Division with 10 guard digits after the decimal point
     /// (documented v0.7 fixed scale). Division by zero -> None with the
     /// `is_zero` flag distinguishable by the caller via `other.is_zero()`.
+    /// v0.18: NaN propagates; `finite / Inf` is 0; `Inf / Inf` is NaN;
+    /// `Inf / finite` is a signed infinity; division by zero stays None.
     pub fn checked_div(&self, other: &Numeric) -> Option<Numeric> {
-        if other.unscaled == 0 {
-            return None;
+        use NumericSpecial::*;
+        match (self.special, other.special) {
+            (NaN, _) | (_, NaN) => Some(Numeric::nan()),
+            (_, Finite) if other.unscaled == 0 => None,
+            (Finite, PosInf) | (Finite, NegInf) => Some(Numeric::zero()),
+            (PosInf, Finite) | (NegInf, Finite) => {
+                let neg = (self.special == NegInf) != (other.unscaled < 0);
+                Some(if neg {
+                    Numeric::neg_infinity()
+                } else {
+                    Numeric::infinity()
+                })
+            }
+            (PosInf, PosInf) | (PosInf, NegInf) | (NegInf, PosInf) | (NegInf, NegInf) => {
+                Some(Numeric::nan())
+            }
+            (Finite, Finite) => {
+                // a/b = (ua * 10^(sb+10)) / (ub * 10^sa), scale 10.
+                let num = self
+                    .unscaled
+                    .checked_mul(10i128.checked_pow(other.scale + 10)?)?;
+                let den = other
+                    .unscaled
+                    .checked_mul(10i128.checked_pow(self.scale)?)?;
+                Some(Numeric::new(num.checked_div(den)?, 10))
+            }
         }
-        // a/b = (ua * 10^(sb+10)) / (ub * 10^sa), scale 10.
-        let num = self
-            .unscaled
-            .checked_mul(10i128.checked_pow(other.scale + 10)?)?;
-        let den = other
-            .unscaled
-            .checked_mul(10i128.checked_pow(self.scale)?)?;
-        Some(Numeric::new(num.checked_div(den)?, 10))
+    }
+
+    /// v0.18: Divide at a specific output scale, rescaling inputs to avoid
+    /// overflow. Returns None on overflow or division by zero.
+    pub fn div_at_scale(&self, other: &Numeric, out_scale: u32) -> Option<Numeric> {
+        use NumericSpecial::*;
+        match (self.special, other.special) {
+            (NaN, _) | (_, NaN) => Some(Numeric::nan()),
+            (_, Finite) if other.unscaled == 0 => None,
+            (Finite, PosInf) | (Finite, NegInf) => Some(Numeric::zero()),
+            (PosInf, Finite) | (NegInf, Finite) => {
+                let neg = (self.special == NegInf) != (other.unscaled < 0);
+                Some(if neg {
+                    Numeric::neg_infinity()
+                } else {
+                    Numeric::infinity()
+                })
+            }
+            (PosInf, PosInf) | (PosInf, NegInf) | (NegInf, PosInf) | (NegInf, NegInf) => {
+                Some(Numeric::nan())
+            }
+            (Finite, Finite) => {
+                // Use f64 for the division to avoid overflow complexities.
+                // This gives ~15-16 significant digits, sufficient for out_scale <= 16.
+                let ratio = self.to_f64() / other.to_f64();
+                if !ratio.is_finite() {
+                    return None;
+                }
+                let scaled = (ratio * 10f64.powi(out_scale as i32)).round() as i128;
+                Some(Numeric::new(scaled, out_scale))
+            }
+        }
     }
 
     /// Remainder, sign follows the dividend (like Rust's `%` and PG's
-    /// numeric mod). Division by zero -> None.
+    /// numeric mod). Division by zero -> None. v0.18: NaN propagates and
+    /// any infinite operand yields NaN, like PostgreSQL.
     pub fn checked_rem(&self, other: &Numeric) -> Option<Numeric> {
-        if other.unscaled == 0 {
-            return None;
+        use NumericSpecial::*;
+        match (self.special, other.special) {
+            (NaN, _) | (_, NaN) => Some(Numeric::nan()),
+            (_, Finite) if other.unscaled == 0 => None,
+            (Finite, Finite) => {
+                let (a, b, scale) = self.aligned(other)?;
+                Some(Numeric::new(a.checked_rem(b)?, scale))
+            }
+            _ => Some(Numeric::nan()),
         }
-        let (a, b, scale) = self.aligned(other)?;
-        Some(Numeric::new(a.checked_rem(b)?, scale))
     }
 
+    /// Absolute value (v0.18): NaN stays NaN, -Infinity becomes +Infinity.
     pub fn abs(&self) -> Numeric {
-        Numeric::new(self.unscaled.abs(), self.scale)
+        match self.special {
+            NumericSpecial::NaN => Numeric::nan(),
+            NumericSpecial::NegInf => Numeric::infinity(),
+            _ => {
+                if self.special == NumericSpecial::Finite {
+                    Numeric::new(self.unscaled.abs(), self.scale)
+                } else {
+                    Numeric::infinity()
+                }
+            }
+        }
     }
 
     /// Round to `scale` fractional digits, half away from zero.
+    /// v0.18: specials round to themselves (PostgreSQL).
     pub fn round_to(&self, scale: u32) -> Option<Numeric> {
+        if self.special != NumericSpecial::Finite {
+            return Some(self.clone());
+        }
         if scale >= self.scale {
             let mul = 10i128.checked_pow(scale - self.scale)?;
             return Some(Numeric::new(self.unscaled.checked_mul(mul)?, scale));
@@ -319,7 +563,11 @@ impl Numeric {
         ))
     }
 
+    /// v0.18: specials are fixed points of floor/ceil.
     pub fn floor(&self) -> Option<Numeric> {
+        if self.special != NumericSpecial::Finite {
+            return Some(self.clone());
+        }
         let div = 10i128.checked_pow(self.scale)?;
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
@@ -331,7 +579,11 @@ impl Numeric {
         Some(Numeric::new(q, 0))
     }
 
+    /// v0.18: specials are fixed points of floor/ceil.
     pub fn ceil(&self) -> Option<Numeric> {
+        if self.special != NumericSpecial::Finite {
+            return Some(self.clone());
+        }
         let div = 10i128.checked_pow(self.scale)?;
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
@@ -344,8 +596,15 @@ impl Numeric {
     }
 
     /// Square root via f64 (documented precision limit: ~15-16
-    /// significant digits). Negative -> None.
+    /// significant digits). Negative finite -> None (caller: 2201F).
+    /// v0.18: NaN -> NaN, +Infinity -> +Infinity, -Infinity -> None.
     pub fn sqrt(&self) -> Option<Numeric> {
+        match self.special {
+            NumericSpecial::NaN => return Some(Numeric::nan()),
+            NumericSpecial::PosInf => return Some(Numeric::infinity()),
+            NumericSpecial::NegInf => return None,
+            NumericSpecial::Finite => {}
+        }
         let f = self.to_f64();
         if f < 0.0 {
             return None;
@@ -356,9 +615,41 @@ impl Numeric {
     /// Exact power for integer exponents (repeated squaring). `None`
     /// on overflow or absurd exponents (callers fall back to f64 or
     /// raise 22003). Negative exponents divide, with 10 guard digits.
+    /// v0.18: NaN base -> NaN; infinite base follows PG's sign rules;
+    /// `0^0` is 1 (PostgreSQL).
     pub fn pow(&self, exp: i64) -> Option<Numeric> {
+        match self.special {
+            NumericSpecial::NaN => return Some(Numeric::nan()),
+            NumericSpecial::PosInf => {
+                return Some(if exp == 0 {
+                    Numeric::new(1, 0)
+                } else if exp > 0 {
+                    Numeric::infinity()
+                } else {
+                    Numeric::zero()
+                });
+            }
+            NumericSpecial::NegInf => {
+                return Some(if exp == 0 {
+                    Numeric::new(1, 0)
+                } else if exp > 0 {
+                    if exp % 2 == 0 {
+                        Numeric::infinity()
+                    } else {
+                        Numeric::neg_infinity()
+                    }
+                } else {
+                    Numeric::zero()
+                });
+            }
+            NumericSpecial::Finite => {}
+        }
         if exp == 0 {
             return Some(Numeric::new(1, 0));
+        }
+        if self.is_zero() && exp < 0 {
+            // 0 raised to a negative power: division by zero.
+            return None;
         }
         if exp.unsigned_abs() > 10_000 {
             return None;
@@ -386,12 +677,22 @@ impl Numeric {
         }
     }
 
-    pub fn is_zero(&self) -> bool {
-        self.unscaled == 0
-    }
-
+    /// Total order with PostgreSQL's non-finite rules (v0.18):
+    /// `-Infinity < finite < +Infinity < NaN`; NaN equals NaN.
     pub fn cmp(&self, other: &Numeric) -> std::cmp::Ordering {
+        use NumericSpecial::*;
         use std::cmp::Ordering;
+        match (self.special, other.special) {
+            (NaN, NaN) => return Ordering::Equal,
+            (NaN, _) => return Ordering::Greater,
+            (_, NaN) => return Ordering::Less,
+            (NegInf, NegInf) | (PosInf, PosInf) => return Ordering::Equal,
+            (NegInf, _) => return Ordering::Less,
+            (_, NegInf) => return Ordering::Greater,
+            (PosInf, _) => return Ordering::Greater,
+            (_, PosInf) => return Ordering::Less,
+            (Finite, Finite) => {}
+        }
         if self.unscaled == 0 && other.unscaled == 0 {
             return Ordering::Equal;
         }
@@ -430,7 +731,15 @@ impl Numeric {
     }
 
     /// Canonical decimal text: no trailing fractional zeros.
+    /// v0.18: specials render as PostgreSQL does (`NaN`, `Infinity`,
+    /// `-Infinity`).
     pub fn to_text(&self) -> String {
+        match self.special {
+            NumericSpecial::NaN => return "NaN".to_string(),
+            NumericSpecial::PosInf => return "Infinity".to_string(),
+            NumericSpecial::NegInf => return "-Infinity".to_string(),
+            NumericSpecial::Finite => {}
+        }
         if self.unscaled == 0 {
             return "0".to_string();
         }
@@ -462,6 +771,449 @@ impl Numeric {
 pub enum NumericParseError {
     Syntax,
     Overflow,
+}
+
+/// v0.18: fixed scale-18 decimal for transcendental series evaluation.
+/// f64 carries only ~15.95 decimal digits, but PostgreSQL's numeric
+/// `exp`/`ln`/`log`/`power` round to 16 fractional digits, so the 16th
+/// digit must be computed correctly. A scale-18 fixed-point decimal in
+/// i128 gives ~18 digits with headroom; multiplications stay within
+/// i128 as long as operands are < ~4e18 (values < 4), which the series
+/// below guarantee by argument reduction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HpDec(i128);
+
+/// 10^18, the HpDec unit.
+const HP_ONE: i128 = 1_000_000_000_000_000_000;
+
+/// v0.18: Scale-36 ultra-high-precision decimal for transcendental series.
+/// Used where scale-18 HpDec loses too many digits (e.g. exp(f)×2^k
+/// amplifies truncation). Multiplication uses 18-digit half splitting
+/// to stay in i128 range.
+#[derive(Clone, Copy, Debug)]
+struct Hp36(i128);
+
+const HP36_ONE: i128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36
+const HP36_HALF: i128 = 1_000_000_000_000_000_000; // 10^18
+
+impl Hp36 {
+    fn one() -> Self {
+        Hp36(HP36_ONE)
+    }
+    fn add(self, o: Hp36) -> Option<Hp36> {
+        Some(Hp36(self.0.checked_add(o.0)?))
+    }
+    fn sub(self, o: Hp36) -> Option<Hp36> {
+        Some(Hp36(self.0.checked_sub(o.0)?))
+    }
+    /// Multiply with 18-digit splitting: a×b/10^36 stays in i128
+    /// for halves < ~4e18 (values < ~4 at scale 36).
+    fn mul(self, o: Hp36) -> Option<Hp36> {
+        let neg = (self.0 < 0) != (o.0 < 0);
+        let a = self.0.unsigned_abs();
+        let b = o.0.unsigned_abs();
+        let half = HP36_HALF as u128;
+        let a_hi = a / half;
+        let a_lo = a % half;
+        let b_hi = b / half;
+        let b_lo = b % half;
+        // a×b/10^36 = a_hi×b_hi + (a_hi×b_lo + a_lo×b_hi)/10^18 + a_lo×b_lo/10^36
+        let t0 = a_hi.checked_mul(b_hi)?;
+        let t1 = a_hi
+            .checked_mul(b_lo)?
+            .checked_add(a_lo.checked_mul(b_hi)?)?
+            / half;
+        let t2 = a_lo.checked_mul(b_lo)? / HP36_ONE as u128;
+        let p = t0.checked_add(t1)?.checked_add(t2)?;
+        if p > i128::MAX as u128 {
+            return None;
+        }
+        let v = p as i128;
+        Some(Hp36(if neg { -v } else { v }))
+    }
+    fn div_int(self, d: i128) -> Option<Hp36> {
+        if d == 0 {
+            return None;
+        }
+        Some(Hp36(self.0.checked_div(d)?))
+    }
+    fn cmp_abs(self, o: Hp36) -> std::cmp::Ordering {
+        self.0.unsigned_abs().cmp(&o.0.unsigned_abs())
+    }
+    /// Convert from scale-18 HpDec.
+    #[allow(dead_code)]
+    fn from_hp(h: HpDec) -> Option<Hp36> {
+        Some(Hp36(h.0.checked_mul(HP36_HALF)?))
+    }
+    /// Convert from a finite Numeric, rounding to 36 fractional digits.
+    #[allow(dead_code)]
+    fn from_numeric(n: &Numeric) -> Option<Hp36> {
+        if n.special != NumericSpecial::Finite {
+            return None;
+        }
+        if n.scale <= 36 {
+            let mul = 10i128.checked_pow(36 - n.scale)?;
+            Some(Hp36(n.unscaled.checked_mul(mul)?))
+        } else {
+            let div = 10i128.checked_pow(n.scale - 36)?;
+            let half = div / 2;
+            let q = if n.unscaled >= 0 {
+                (n.unscaled + half) / div
+            } else {
+                (n.unscaled - half) / div
+            };
+            Some(Hp36(q))
+        }
+    }
+    /// Convert to scale-18 HpDec (rounding to nearest).
+    #[allow(dead_code)]
+    fn to_hp(self) -> HpDec {
+        let q = self.0 / HP36_HALF;
+        let r = self.0 % HP36_HALF;
+        let adj = if r.abs() >= HP36_HALF / 2 {
+            if self.0 < 0 { -1 } else { 1 }
+        } else {
+            0
+        };
+        HpDec(q + adj)
+    }
+}
+
+/// v0.18: parses a "d.dddd" literal to scale-36, rounding to 36 digits.
+fn hp36_const(s: &str) -> Hp36 {
+    let mut parts = s.split('.');
+    let int: i128 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let frac = parts.next().unwrap_or("");
+    let frac36: String = if frac.len() > 36 {
+        let (keep, rest) = frac.split_at(36);
+        let mut v: i128 = keep.parse().unwrap_or(0);
+        if rest.chars().next().unwrap_or('0') >= '5' {
+            v += 1;
+        }
+        v.to_string()
+    } else {
+        frac.to_string()
+    };
+    let mut f: i128 = frac36.parse().unwrap_or(0);
+    for _ in frac36.len()..36 {
+        f = f.saturating_mul(10);
+    }
+    Hp36(int.saturating_mul(HP36_ONE).saturating_add(f))
+}
+
+impl HpDec {
+    #[allow(dead_code)]
+    fn zero() -> Self {
+        HpDec(0)
+    }
+
+    fn one() -> Self {
+        HpDec(HP_ONE)
+    }
+
+    /// Round a finite Numeric to scale 18. None on overflow.
+    #[allow(dead_code)]
+    fn from_numeric(n: &Numeric) -> Option<Self> {
+        if n.special != NumericSpecial::Finite {
+            return None;
+        }
+        if n.scale <= 18 {
+            let mul = 10i128.checked_pow(18 - n.scale)?;
+            Some(HpDec(n.unscaled.checked_mul(mul)?))
+        } else {
+            let div = 10i128.checked_pow(n.scale - 18)?;
+            let half = div / 2;
+            let adj = if n.unscaled >= 0 { half } else { -half };
+            Some(HpDec(n.unscaled.checked_add(adj)?.checked_div(div)?))
+        }
+    }
+
+    fn to_numeric(self) -> Numeric {
+        Numeric::new(self.0, 18)
+    }
+
+    #[allow(dead_code)]
+    fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    #[allow(dead_code)]
+    fn neg(self) -> Self {
+        HpDec(-self.0)
+    }
+
+    fn add(self, o: HpDec) -> Option<HpDec> {
+        Some(HpDec(self.0.checked_add(o.0)?))
+    }
+
+    fn sub(self, o: HpDec) -> Option<HpDec> {
+        Some(HpDec(self.0.checked_sub(o.0)?))
+    }
+
+    /// (a*b)/10^18. Caller keeps |operands| < 4e18.
+    fn mul(self, o: HpDec) -> Option<HpDec> {
+        Some(HpDec(self.0.checked_mul(o.0)?.checked_div(HP_ONE)?))
+    }
+
+    /// (a/b) at scale 18. Caller keeps |a| < 1.7e20 and b != 0.
+    fn div(self, o: HpDec) -> Option<HpDec> {
+        if o.0 == 0 {
+            return None;
+        }
+        Some(HpDec(self.0.checked_mul(HP_ONE)?.checked_div(o.0)?))
+    }
+
+    /// Divide by a small integer.
+    fn div_int(self, d: i128) -> Option<HpDec> {
+        if d == 0 {
+            return None;
+        }
+        Some(HpDec(self.0.checked_div(d)?))
+    }
+
+    /// Multiply by a small integer.
+    fn mul_int(self, m: i128) -> Option<HpDec> {
+        Some(HpDec(self.0.checked_mul(m)?))
+    }
+
+    fn cmp_abs(self, o: HpDec) -> std::cmp::Ordering {
+        self.0.unsigned_abs().cmp(&o.0.unsigned_abs())
+    }
+}
+
+/// ln(2) to 24 digits (v0.18).
+const HP_LN2: &str = "0.6931471805599453094172321";
+/// ln(10) to 24 digits (v0.18).
+const HP_LN10: &str = "2.3025850929940456840179915";
+
+fn hp_const(s: &str) -> HpDec {
+    // Parses a "d.dddd" literal, rounding the fraction to 18 digits.
+    let mut parts = s.split('.');
+    let int: i128 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let frac = parts.next().unwrap_or("");
+    let frac18: String = if frac.len() > 18 {
+        // Round to 18 digits.
+        let (keep, rest) = frac.split_at(18);
+        let mut v: i128 = keep.parse().unwrap_or(0);
+        if rest.chars().next().unwrap_or('0') >= '5' {
+            v += 1;
+        }
+        v.to_string()
+    } else {
+        frac.to_string()
+    };
+    let mut f: i128 = frac18.parse().unwrap_or(0);
+    for _ in frac18.len()..18 {
+        f *= 10;
+    }
+    HpDec(int * HP_ONE + f)
+}
+
+impl Numeric {
+    /// v0.18: e^self via Taylor series with `2^k` range reduction.
+    /// Returns `(mantissa, exp10)` with value = mantissa × 10^exp10,
+    /// mantissa in [1,10) at scale 18 (or zero for deep underflow).
+    /// `None` when e^self overflows i128 range (self > ~87.3).
+    /// Only finite inputs are accepted.
+    ///
+    /// Range reduction avoids the error-doubling of repeated squaring:
+    /// k = round(x/ln2), f = x - k·ln2 (|f| ≤ 0.35), e^x = 2^k · e^f,
+    /// and e^f comes from a short Taylor series with no squaring.
+    pub fn exp_sci(&self) -> Option<(Numeric, i32)> {
+        if self.special != NumericSpecial::Finite {
+            return None;
+        }
+        let x = self.to_f64();
+        if x > 87.3 {
+            return None;
+        }
+        if x < -60.0 {
+            return Some((Numeric::zero(), 0));
+        }
+        // k = round(x / ln2); f = x - k*ln2, computed at scale 36.
+        let k = (x / std::f64::consts::LN_2).round() as i64;
+        let x_h = Hp36::from_numeric(self)?;
+        // k*ln2 at scale 36: k up to ±126, fine.
+        let k_ln2 = Hp36(
+            hp36_const("0.693147180559945309417232121458176568")
+                .0
+                .checked_mul(k as i128)?,
+        );
+        let f = x_h.sub(k_ln2)?;
+        // Taylor at scale 36: sum f^n / n!, stopping when terms vanish.
+        let mut sum = Hp36::one();
+        let mut term = Hp36::one();
+        let mut n: i128 = 1;
+        loop {
+            term = term.mul(f)?.div_int(n)?;
+            sum = sum.add(term)?;
+            n += 1;
+            if term.cmp_abs(Hp36(10)) == std::cmp::Ordering::Less || n > 300 {
+                break;
+            }
+        }
+        // 2^k as M × 10^E with M an Hp36 in [1,10) (M.0 has 37 digits),
+        // computed at scale 36 so the final multiplication keeps full precision.
+        let (m2, e2) = if k >= 0 {
+            let v = 2i128.checked_pow(k as u32)?;
+            let digits = v.to_string().len() as i32;
+            let shift = digits - 37;
+            let m2_0 = if shift >= 0 {
+                let div = 10i128.checked_pow(shift as u32)?;
+                (v + div / 2) / div
+            } else {
+                v.checked_mul(10i128.checked_pow((-shift) as u32)?)?
+            };
+            (Hp36(m2_0), digits - 1)
+        } else {
+            // 2^k = 1/2^|k|: start from 10^36/2^|k| (scale-36 value < 1)
+            // and scale up to 37 digits.
+            let v = 2i128.checked_pow((-k) as u32)?;
+            let mut m = 10i128.checked_pow(36)?.checked_div(v)?;
+            let mut t: i32 = 0;
+            while m < HP36_ONE && m > 0 {
+                m = m.checked_mul(10)?;
+                t += 1;
+            }
+            // value = m × 10^(-t) as an Hp36 (m has 37 digits).
+            (Hp36(m), -t)
+        };
+        // result = sum × m2 at scale 36; value = result.0 × 10^(e2-36).
+        let r36 = sum.mul(m2)?;
+        if r36.0 == 0 {
+            return Some((Numeric::zero(), 0));
+        }
+        // Extract 19-digit mantissa and e10.
+        let d = r36.0.to_string().len() as i32; // digits (r36.0 > 0)
+        let div = 10i128.checked_pow((d - 19) as u32)?;
+        let rm = (r36.0 + div / 2) / div; // 19 digits, [10^18, 10^19)
+        let re10 = (e2 - 36) + (d - 19) + 18;
+        // Normalize rm into [10^18, 10^19) (rounding may have pushed it out).
+        let (rm, re10) = if rm >= 10 * HP_ONE {
+            (rm / 10, re10 + 1)
+        } else if rm < HP_ONE {
+            (rm * 10, re10 - 1)
+        } else {
+            (rm, re10)
+        };
+        Some((Numeric::raw(rm, 18), re10))
+    }
+
+    /// v0.18: Rescale to `new_scale`, rounding to nearest. Returns None on overflow.
+    pub fn rescale(&self, new_scale: u32) -> Option<Numeric> {
+        if self.special != NumericSpecial::Finite {
+            return Some(self.clone());
+        }
+        if new_scale == self.scale {
+            return Some(self.clone());
+        }
+        let unscaled = if new_scale > self.scale {
+            let mul = 10i128.checked_pow(new_scale - self.scale)?;
+            self.unscaled.checked_mul(mul)?
+        } else {
+            let div = 10i128.checked_pow(self.scale - new_scale)?;
+            let half = div / 2;
+            if self.unscaled >= 0 {
+                (self.unscaled + half) / div
+            } else {
+                (self.unscaled - half) / div
+            }
+        };
+        Some(Numeric::new(unscaled, new_scale))
+    }
+
+    /// v0.18: Truncate toward zero to `new_scale` (no rounding).
+    pub fn trunc_to_scale(&self, new_scale: u32) -> Numeric {
+        if self.special != NumericSpecial::Finite {
+            return self.clone();
+        }
+        if new_scale >= self.scale {
+            return self.clone();
+        }
+        let div = 10i128.pow(self.scale - new_scale);
+        Numeric::new(self.unscaled / div, new_scale)
+    }
+
+    /// v0.18: Convert a (mantissa, e10) scientific value to a Numeric
+    /// at `out_scale`, rounding to nearest. Returns None on overflow.
+    /// The mantissa is expected at scale 18 (as from exp_sci).
+    pub fn from_sci(mantissa: &Numeric, e10: i32, out_scale: u32) -> Option<Numeric> {
+        if mantissa.special != NumericSpecial::Finite {
+            return Some(mantissa.clone());
+        }
+        // value = mantissa.unscaled × 10^(e10-18).
+        // Want: unscaled_out × 10^-out_scale.
+        // unscaled_out = mantissa.unscaled × 10^(e10-18+out_scale).
+        let shift = e10 - 18 + out_scale as i32;
+        let unscaled = if shift >= 0 {
+            mantissa
+                .unscaled
+                .checked_mul(10i128.checked_pow(shift as u32)?)?
+        } else {
+            let div = 10i128.checked_pow((-shift) as u32)?;
+            let half = div / 2;
+            if mantissa.unscaled >= 0 {
+                (mantissa.unscaled + half) / div
+            } else {
+                (mantissa.unscaled - half) / div
+            }
+        };
+        Some(Numeric::new(unscaled, out_scale))
+    }
+
+    /// v0.18: ln(self) at scale 18 via range reduction + atanh series.
+
+    /// v0.18: ln(self) at scale 18 for finite self > 0. None otherwise.
+    /// Range reduction: self = d × 10^e10, ln = ln(d) + e10×ln(10),
+    /// ln(d) via k×ln2 + 2×atanh((m-1)/(m+1)) with m in [1,2).
+    pub fn ln_hp(&self) -> Option<Numeric> {
+        if self.special != NumericSpecial::Finite || self.unscaled <= 0 {
+            return None;
+        }
+        // Scientific split: self = d × 10^e10, d in [1, 10).
+        let digits = self.unscaled.unsigned_abs().to_string().len() as i32;
+        let e10 = (digits - 1) - self.scale as i32;
+        // d at scale 18: round(unscaled × 10^(18-(digits-1))).
+        let shift = 18 - (digits - 1);
+        let d_raw: i128 = if shift >= 0 {
+            let mul = 10i128.checked_pow(shift as u32)?;
+            self.unscaled.checked_mul(mul)?.unsigned_abs() as i128
+        } else {
+            let div = 10i128.checked_pow((-shift) as u32)?;
+            let half = div / 2;
+            let q = if self.unscaled >= 0 {
+                (self.unscaled + half) / div
+            } else {
+                (self.unscaled - half) / div
+            };
+            q.unsigned_abs() as i128
+        };
+        let d = HpDec(d_raw);
+        // k = floor(log2(d)), m = d / 2^k in [1, 2).
+        let d_f = d_raw as f64 / 1e18;
+        let k = d_f.log2().floor() as i32;
+        let m = d.div_int(1i128 << k)?;
+        // y = (m-1)/(m+1); ln(m) = 2*(y + y^3/3 + y^5/5 + ...).
+        let y = m.sub(HpDec::one())?.div(m.add(HpDec::one())?)?;
+        let y2 = y.mul(y)?;
+        let mut sum = y;
+        let mut num = y; // y^(2k+1)
+        let mut n: i128 = 1;
+        loop {
+            num = num.mul(y2)?; // y^(2k+3)
+            n += 2;
+            let term = num.div_int(n)?;
+            if term.cmp_abs(HpDec(10)) == std::cmp::Ordering::Less || n > 300 {
+                sum = sum.add(term)?;
+                break;
+            }
+            sum = sum.add(term)?;
+        }
+        let ln_m = sum.mul_int(2)?;
+        let ln_d = ln_m.add(hp_const(HP_LN2).mul_int(k as i128)?)?;
+        let result = ln_d.add(hp_const(HP_LN10).mul_int(e10 as i128)?)?;
+        Some(result.to_numeric())
+    }
 }
 
 impl PartialOrd for Numeric {
@@ -2400,5 +3152,75 @@ mod tests {
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = 7;
         undo_write_op(&mut eng, 7, &op);
         assert_eq!(eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax, 0);
+    }
+
+    // v0.18: numeric special values (NaN, Infinity, -Infinity).
+    #[test]
+    fn numeric_special_parse_case_insensitive() {
+        for (s, expect) in [
+            ("NaN", NumericSpecial::NaN),
+            ("nan", NumericSpecial::NaN),
+            ("NAN", NumericSpecial::NaN),
+            ("-NaN", NumericSpecial::NaN),
+            ("Inf", NumericSpecial::PosInf),
+            ("inf", NumericSpecial::PosInf),
+            ("INF", NumericSpecial::PosInf),
+            ("Infinity", NumericSpecial::PosInf),
+            ("infinity", NumericSpecial::PosInf),
+            ("-Infinity", NumericSpecial::NegInf),
+            ("-inf", NumericSpecial::NegInf),
+            ("+Inf", NumericSpecial::PosInf),
+        ] {
+            let n = Numeric::parse(s).expect(s);
+            assert_eq!(n.special, expect, "parse {}", s);
+        }
+    }
+
+    #[test]
+    fn numeric_special_canonical_output() {
+        assert_eq!(Numeric::nan().to_text(), "NaN");
+        assert_eq!(Numeric::infinity().to_text(), "Infinity");
+        assert_eq!(Numeric::neg_infinity().to_text(), "-Infinity");
+    }
+
+    #[test]
+    fn numeric_special_arithmetic() {
+        let nan = Numeric::nan();
+        let inf = Numeric::infinity();
+        let neg_inf = Numeric::neg_infinity();
+        let one = Numeric::from_i64(1);
+        let zero = Numeric::from_i64(0);
+
+        // NaN propagates
+        assert_eq!(nan.checked_add(&one).unwrap().special, NumericSpecial::NaN);
+        assert_eq!(
+            inf.checked_add(&neg_inf).unwrap().special,
+            NumericSpecial::NaN
+        );
+        assert_eq!(inf.checked_mul(&zero).unwrap().special, NumericSpecial::NaN);
+
+        // Infinity arithmetic
+        assert_eq!(
+            inf.checked_add(&one).unwrap().special,
+            NumericSpecial::PosInf
+        );
+        assert_eq!(
+            neg_inf.checked_mul(&one).unwrap().special,
+            NumericSpecial::NegInf
+        );
+    }
+
+    #[test]
+    fn numeric_special_ordering() {
+        // -Inf < finite < Inf < NaN
+        let neg_inf = Numeric::neg_infinity();
+        let one = Numeric::from_i64(1);
+        let inf = Numeric::infinity();
+        let nan = Numeric::nan();
+
+        assert!(neg_inf < one);
+        assert!(one < inf);
+        assert!(inf < nan);
+        assert!(neg_inf < nan);
     }
 }

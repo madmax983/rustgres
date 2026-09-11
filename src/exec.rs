@@ -2231,6 +2231,11 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
         (Value::Int(a), Literal::Decimal(b)) => {
             Ok((*a as f64) == b.parse::<f64>().unwrap_or(f64::NAN))
         }
+        // v0.18: decimal literals are numeric; compare exactly.
+        (Value::Numeric(a), Literal::Decimal(b)) => match crate::storage::Numeric::parse(b) {
+            Ok(n) => Ok(a == &n),
+            Err(_) => Ok(false),
+        },
         (Value::Text(a), Literal::Text(b)) => Ok(a == b),
         (Value::Bool(a), Literal::Bool(b)) => Ok(a == b),
         _ => Err(exec_err(
@@ -8988,6 +8993,36 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
 }
 
 fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    // v0.18: PG semantics: NaN != NaN (NaN is not equal to itself).
+    // This applies to = and <>; ORDER BY still sorts NaN last via cmp().
+    let a_is_nan = matches!(a, Value::Numeric(n) if n.is_nan());
+    let b_is_nan = matches!(b, Value::Numeric(n) if n.is_nan());
+    if a_is_nan || b_is_nan {
+        return Ok(Value::Bool(match op {
+            CmpOp::Eq => false,
+            CmpOp::Ne => true,
+            // For ordering ops with NaN, fall through to cmp (NaN sorts last).
+            _ => {
+                return match cmp_ordering(a, b, op)? {
+                    None => Ok(Value::Null),
+                    Some(ord) => Ok(Value::Bool(match op {
+                        CmpOp::Lt => ord == Ordering::Less,
+                        CmpOp::Le => ord != Ordering::Greater,
+                        CmpOp::Gt => ord == Ordering::Greater,
+                        CmpOp::Ge => ord != Ordering::Less,
+                        // Eq/Ne are handled above; any other operator is an
+                        // internal error, never a panic.
+                        _ => {
+                            return Err(exec_err(
+                                "XX000",
+                                "internal error: unexpected comparison operator",
+                            ));
+                        }
+                    })),
+                };
+            }
+        }));
+    }
     match cmp_ordering(a, b, op)? {
         None => Ok(Value::Null),
         Some(ord) => Ok(Value::Bool(match op {
@@ -9181,6 +9216,122 @@ fn to_f64v(v: &Value) -> f64 {
         Value::Float4(f) => *f as f64,
         Value::Float(f) => *f,
         _ => f64::NAN,
+    }
+}
+
+/// v0.18: Simple xorshift64* PRNG for random()/setseed().
+/// Seed stored in a static AtomicU64.
+static RANDOM_SEED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x853c49e6748fea9b);
+
+fn random_f64() -> f64 {
+    use std::sync::atomic::Ordering;
+    let mut s = RANDOM_SEED.load(Ordering::Relaxed);
+    // xorshift64*.
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    RANDOM_SEED.store(s, Ordering::Relaxed);
+    let r = s.wrapping_mul(0x2545F4914F6CDD1D);
+    // Convert to [0,1): use top 53 bits.
+    ((r >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+fn set_random_seed(seed: f64) {
+    use std::sync::atomic::Ordering;
+    // PG: setseed(float) in [-1,1]; hash to u64.
+    let bits = (seed * 9.223372036854776e18) as i64 as u64;
+    let s = if bits == 0 { 0x853c49e6748fea9b } else { bits };
+    RANDOM_SEED.store(s, Ordering::Relaxed);
+}
+
+/// v0.18: width_bucket(op, b1, b2, count) and width_bucket(op, thresholds).
+/// Returns integer bucket number (0..count+1, or 1-based index into thresholds).
+fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, ExecError> {
+    let to_f = |v: &Value| -> Result<f64, ExecError> {
+        match v {
+            Value::SmallInt(i) => Ok(*i as f64),
+            Value::Int(i) => Ok(*i as f64),
+            Value::BigInt(i) => Ok(*i as f64),
+            Value::Numeric(n) => Ok(n.to_f64()),
+            Value::Float4(f) => Ok(*f as f64),
+            Value::Float(f) => Ok(*f),
+            _ => Err(func_arg_err(name, v)),
+        }
+    };
+    if vals.len() == 4 {
+        // width_bucket(op, b1, b2, count)
+        let operand = to_f(op)?;
+        let b1 = to_f(&vals[1])?;
+        let b2 = to_f(&vals[2])?;
+        let count = match &vals[3] {
+            Value::SmallInt(i) => *i as i64,
+            Value::Int(i) => *i,
+            Value::BigInt(i) => *i,
+            Value::Numeric(n) => n.to_i64().ok_or_else(|| func_arg_err(name, &vals[3]))?,
+            _ => return Err(func_arg_err(name, &vals[3])),
+        };
+        if count <= 0 {
+            return Err(exec_err("2201F", "count must be greater than zero"));
+        }
+        let bucket = if operand < b1.min(b2) {
+            0
+        } else if operand >= b1.max(b2) {
+            count + 1
+        } else {
+            // PG: bucket = floor((op - b1) / (b2 - b1) * count) + 1
+            let b = ((operand - b1) / (b2 - b1) * count as f64).floor() as i64 + 1;
+            b.max(1).min(count)
+        };
+        // PG swaps for b1 > b2 (descending).
+        let result = if b1 > b2 { count + 1 - bucket } else { bucket };
+        Ok(Value::Int(result))
+    } else if vals.len() == 3 {
+        // width_bucket(op, thresholds[]): thresholds is an array; we don't have
+        // arrays, so accept a comma-separated string or fail gracefully.
+        return Err(exec_err(
+            "42883",
+            "width_bucket with array thresholds is not supported",
+        ));
+    } else {
+        Err(func_arg_err(name, op))
+    }
+}
+
+/// v0.18: log(b, x) = ln(x)/ln(b) for numerics.
+fn eval_log_base(
+    b: &crate::storage::Numeric,
+    x: &crate::storage::Numeric,
+    _name: &str,
+) -> Result<Value, ExecError> {
+    use crate::storage::{Numeric, NumericSpecial};
+    // Handle specials per PG semantics (simplified).
+    if b.is_nan() || x.is_nan() {
+        return Ok(Value::Numeric(Numeric::nan()));
+    }
+    // ln(b) and ln(x) must be defined.
+    if b.unscaled <= 0 || b.special != NumericSpecial::Finite {
+        return Err(exec_err(
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ));
+    }
+    if x.unscaled <= 0 || x.special != NumericSpecial::Finite {
+        return Err(exec_err(
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ));
+    }
+    if b.is_zero() || x.is_zero() {
+        return Err(exec_err("2201E", "cannot take logarithm of zero"));
+    }
+    let out_scale = (b.scale.max(x.scale) + 8).min(30).max(16);
+    match (b.ln_hp(), x.ln_hp()) {
+        (Some(ln_b), Some(ln_x)) => match ln_x.div_at_scale(&ln_b, out_scale) {
+            Some(r) => Ok(Value::Numeric(r)),
+            None => Err(exec_err("22003", "value overflows numeric format")),
+        },
+        _ => Err(exec_err("22003", "value overflows numeric format")),
     }
 }
 
@@ -9872,6 +10023,17 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
     let ok = match name {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "exp" | "ln" => n == 1,
+        "log" => n == 1 || n == 2,
+        "cbrt" | "factorial" => n == 1,
+        "scale" | "trim_scale" => n == 1,
+        "min_scale" => n == 1,
+        "pi" | "random" => n == 0,
+        "degrees" | "radians" => n == 1,
+        "setseed" => n == 1,
+        "gcd" | "lcm" => n == 2,
+        "div" => n == 2,
+        "width_bucket" => n == 3 || n == 4,
         "round" => n == 1 || n == 2,
         "substring" | "substr" => n == 2 || n == 3,
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
@@ -9928,6 +10090,12 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
+        // v0.18: numeric functions.
+        "exp" | "ln" | "log" | "cbrt" | "factorial" | "gcd" | "lcm" | "pi" | "degrees"
+        | "radians" | "scale" | "min_scale" | "trim_scale" | "div" | "width_bucket" => {
+            eval_math_func(name, vals)
+        }
+        "random" | "setseed" => eval_math_func(name, vals),
         "now"
         | "current_date"
         | "current_timestamp"
@@ -10239,6 +10407,97 @@ fn eval_power_op(
     }
     let base = to_numeric_opt(a).ok_or_else(|| bad(a))?;
     let exp = to_numeric_opt(b).ok_or_else(|| bad(b))?;
+    // v0.18: handle special values in power before integer-exponent path.
+    // PG: power('inf','-2')=0, power('-inf','3')=-Inf, power('-1','inf')=1,
+    //     power('-2','inf')=Inf, power('inf','inf')=Inf, etc.
+    use crate::storage::NumericSpecial;
+    match (base.special, exp.special) {
+        (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => {
+            return Ok(Value::Numeric(crate::storage::Numeric::nan()));
+        }
+        (NumericSpecial::PosInf, NumericSpecial::PosInf) => {
+            return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+        }
+        (NumericSpecial::PosInf, NumericSpecial::NegInf) => {
+            return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+        }
+        (NumericSpecial::NegInf, NumericSpecial::PosInf) => {
+            return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+        }
+        (NumericSpecial::NegInf, NumericSpecial::NegInf) => {
+            return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+        }
+        (NumericSpecial::PosInf, NumericSpecial::Finite) => {
+            // inf ^ x: x>0 -> inf, x<0 -> 0, x=0 -> 1
+            if exp.unscaled == 0 {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            } else if exp.unscaled > 0 {
+                return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+            } else {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+            }
+        }
+        (NumericSpecial::NegInf, NumericSpecial::Finite) => {
+            // (-inf) ^ x: needs integer check for sign
+            if exp.unscaled == 0 {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            }
+            // For non-integer, PG errors; for integer, sign depends on parity
+            if exp.scale == 0 {
+                if let Ok(e) = i64::try_from(exp.unscaled) {
+                    if e > 0 {
+                        if e % 2 == 0 {
+                            return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+                        } else {
+                            return Ok(Value::Numeric(crate::storage::Numeric::neg_infinity()));
+                        }
+                    } else {
+                        return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+                    }
+                }
+            }
+            return Err(exec_err(
+                "2201F",
+                "a negative number raised to a non-integer power yields a non-real result",
+            ));
+        }
+        (NumericSpecial::Finite, NumericSpecial::PosInf) => {
+            // x ^ inf: |x|>1 -> inf, |x|<1 -> 0, |x|=1 -> 1, x=0 -> 1 (PG: 0^inf=0? actually 0^inf=0)
+            // PG: power('-1','inf')=1, power('-2','inf')=Inf
+            let abs_base = base.abs();
+            let one = crate::storage::Numeric::from_i64(1);
+            if abs_base == one {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            }
+            let zero = crate::storage::Numeric::from_i64(0);
+            if base == zero {
+                return Ok(Value::Numeric(zero));
+            }
+            if abs_base > one {
+                return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+            } else {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+            }
+        }
+        (NumericSpecial::Finite, NumericSpecial::NegInf) => {
+            // x ^ -inf: |x|>1 -> 0, |x|<1 -> inf, |x|=1 -> 1
+            let abs_base = base.abs();
+            let one = crate::storage::Numeric::from_i64(1);
+            if abs_base == one {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            }
+            let zero = crate::storage::Numeric::from_i64(0);
+            if base == zero {
+                return Err(exec_err("22003", "value out of range for type numeric"));
+            }
+            if abs_base > one {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+            } else {
+                return Ok(Value::Numeric(crate::storage::Numeric::infinity()));
+            }
+        }
+        (NumericSpecial::Finite, NumericSpecial::Finite) => {}
+    }
     // Integer exponents are exact (like Postgres' numeric
     // power); anything else goes through f64.
     if exp.scale == 0 {
@@ -10264,6 +10523,22 @@ fn eval_power_op(
 }
 
 fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // v0.18: zero-argument functions must be handled before indexing vals[0].
+    match name {
+        "pi" => {
+            // PG: pi() = 3.14159265358979323846...
+            // (Parse is infallible for this literal; error is unreachable.)
+            return match Numeric::parse("3.14159265358979323846264338327950288") {
+                Ok(pi) => Ok(Value::Numeric(pi)),
+                Err(_) => Err(exec_err("22003", "value overflows numeric format")),
+            };
+        }
+        "random" => {
+            // v0.18: random() -> float8 in [0,1). Uses xorshift64*.
+            return Ok(Value::Float(random_f64()));
+        }
+        _ => {}
+    }
     let v = &vals[0];
     if v == &Value::Null || (vals.len() > 1 && vals[1] == Value::Null) {
         return Ok(Value::Null);
@@ -10330,7 +10605,315 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 )),
             }
         }
+        "exp" => {
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                // Postgres: exp(float8) -> float8.
+                return Ok(Value::Float(to_f64v(v).exp()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // Postgres special values: exp(NaN)=NaN, exp(Inf)=Inf, exp(-Inf)=0.
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            if n.special == crate::storage::NumericSpecial::PosInf {
+                return Ok(Value::Numeric(Numeric::infinity()));
+            }
+            if n.special == crate::storage::NumericSpecial::NegInf {
+                return Ok(Value::Numeric(Numeric::zero()));
+            }
+            // Scale: match PG's behavior (roughly input scale + 8, min 8).
+            let out_scale = (n.scale + 8).min(30).max(16);
+            match n.exp_sci() {
+                Some((m, e10)) => match Numeric::from_sci(&m, e10, out_scale) {
+                    Some(r) => Ok(Value::Numeric(r)),
+                    None => Err(exec_err("22003", "value overflows numeric format")),
+                },
+                // Overflow: PG raises 22003.
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
+        "ln" => {
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                let xv = to_f64v(v);
+                // PG errors on ln(0)/ln(negative) even for float8.
+                if xv <= 0.0 {
+                    return Err(exec_err("2201E", "cannot take logarithm"));
+                }
+                return Ok(Value::Float(xv.ln()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // Postgres: ln(NaN)=NaN, ln(Inf)=Inf, ln(-Inf) and ln(<=0) error.
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            if n.special == crate::storage::NumericSpecial::PosInf {
+                return Ok(Value::Numeric(Numeric::infinity()));
+            }
+            if n.special == crate::storage::NumericSpecial::NegInf || n.unscaled <= 0 {
+                return Err(exec_err(
+                    "2201E",
+                    "cannot take logarithm of a negative number",
+                ));
+            }
+            if n.is_zero() {
+                return Err(exec_err("2201E", "cannot take logarithm of zero"));
+            }
+            let out_scale = (n.scale + 8).min(30).max(16);
+            match n.ln_hp() {
+                Some(r) => match r.rescale(out_scale) {
+                    Some(rescaled) => Ok(Value::Numeric(rescaled)),
+                    None => Err(exec_err("22003", "value overflows numeric format")),
+                },
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
+        "log" => {
+            // log(x) = ln(x)/ln(10); log(b, x) = ln(x)/ln(b).
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                let xv = to_f64v(v);
+                // PG errors on log(0)/log(negative) even for float8.
+                // (NaN passes through to f64, which yields NaN.)
+                if vals.len() == 2 {
+                    let bv = to_f64v(&vals[1]);
+                    if xv <= 0.0 || bv <= 0.0 || bv == 1.0 {
+                        return Err(exec_err("2201E", "cannot take logarithm"));
+                    }
+                    return Ok(Value::Float(xv.log(bv)));
+                }
+                if xv <= 0.0 {
+                    return Err(exec_err("2201E", "cannot take logarithm"));
+                }
+                return Ok(Value::Float(xv.log10()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if vals.len() == 2 {
+                let x = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
+                // log(b, x): n is base (first arg), x is value (second arg).
+                // log(b, x) = ln(x)/ln(b).
+                return eval_log_base(&n, &x, name);
+            }
+            // log(x) = ln(x)/ln(10).
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            if n.special == crate::storage::NumericSpecial::PosInf {
+                return Ok(Value::Numeric(Numeric::infinity()));
+            }
+            if n.special == crate::storage::NumericSpecial::NegInf || n.unscaled <= 0 {
+                return Err(exec_err(
+                    "2201E",
+                    "cannot take logarithm of a negative number",
+                ));
+            }
+            if n.is_zero() {
+                return Err(exec_err("2201E", "cannot take logarithm of zero"));
+            }
+            let out_scale = (n.scale + 8).min(30).max(16);
+            match n.ln_hp() {
+                Some(ln_x) => {
+                    // Divide by ln(10) at high precision using div_at_scale.
+                    let ln10 = match Numeric::parse("2.302585092994045684017991454684364207") {
+                        Ok(v) => v,
+                        Err(_) => return Err(exec_err("22003", "value overflows numeric format")),
+                    };
+                    match ln_x.div_at_scale(&ln10, out_scale) {
+                        Some(r) => Ok(Value::Numeric(r)),
+                        None => Err(exec_err("22003", "value overflows numeric format")),
+                    }
+                }
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
         "power" => eval_power_op(v, &vals[1], |w| func_arg_err(name, w)),
+        // v0.18: numeric functions.
+        "cbrt" => {
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                return Ok(Value::Float(to_f64v(v).cbrt()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            // cbrt via f64 (PG uses float internally for cbrt).
+            let f = n.to_f64().cbrt();
+            // Convert back to numeric.
+            match Numeric::parse(&format!("{:.15}", f)) {
+                Ok(r) => Ok(Value::Numeric(r)),
+                Err(_) => Ok(Value::Float(f)),
+            }
+        }
+        "factorial" => {
+            // factorial(numeric) -> numeric. PG: 0! = 1, negative errors.
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            // Must be a non-negative integer.
+            let iv = n
+                .to_i64()
+                .ok_or_else(|| exec_err("2201F", "factorial of non-integer"))?;
+            if iv < 0 {
+                return Err(exec_err("2201F", "factorial of negative value"));
+            }
+            if iv > 1000 {
+                return Err(exec_err("22003", "value overflows numeric format"));
+            }
+            let mut result: i128 = 1;
+            for i in 2..=iv as i128 {
+                result = result
+                    .checked_mul(i)
+                    .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+            }
+            Ok(Value::Numeric(Numeric::new(result, 0)))
+        }
+        "gcd" | "lcm" => {
+            let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            let ai = a.to_i64().ok_or_else(|| func_arg_err(name, v))?;
+            let bi = b.to_i64().ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            // Euclidean algorithm in u128: ai.abs() would panic on i64::MIN
+            // (negation overflow); unsigned_abs is exact for all i64 inputs.
+            let mut x = (ai as i128).unsigned_abs();
+            let mut y = (bi as i128).unsigned_abs();
+            while y != 0 {
+                let t = x % y;
+                x = y;
+                y = t;
+            }
+            let g = x; // gcd (always >= 0), as u128
+            if name == "gcd" {
+                // PG's gcd returns bigint: a result of exactly 2^63 (possible
+                // only when an input is i64::MIN) is out of range -> 22003.
+                if g > i64::MAX as u128 {
+                    return Err(exec_err("22003", "bigint out of range"));
+                }
+                Ok(Value::Numeric(Numeric::new(g as i128, 0)))
+            } else {
+                // lcm(a,b) = |a*b|/gcd. lcm(0,0) = 0.
+                if g == 0 {
+                    Ok(Value::Numeric(Numeric::zero()))
+                } else {
+                    let l = (ai as i128).unsigned_abs() / g * (bi as i128).unsigned_abs();
+                    if l > i64::MAX as u128 {
+                        return Err(exec_err("22003", "bigint out of range"));
+                    }
+                    Ok(Value::Numeric(Numeric::new(l as i128, 0)))
+                }
+            }
+        }
+        "degrees" => {
+            // degrees(radians) = radians * 180/pi.
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                return Ok(Value::Float(to_f64v(v).to_degrees()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            // n * 180 / pi.
+            let pi = match Numeric::parse("3.14159265358979323846264338327950288") {
+                Ok(v) => v,
+                Err(_) => return Err(exec_err("22003", "value overflows numeric format")),
+            };
+            let n180 = n
+                .checked_mul(&Numeric::new(180, 0))
+                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+            // v0.18-repair: checked_div's 10-guard-digit rescale overflows i128
+            // when the divisor has a large scale (pi is scale 38); div_at_scale
+            // does the division in f64 at the engine's standard 10-digit scale.
+            match n180.div_at_scale(&pi, 10) {
+                Some(r) => Ok(Value::Numeric(r)),
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
+        "radians" => {
+            // radians(degrees) = degrees * pi/180.
+            if matches!(v, Value::Float4(_) | Value::Float(_)) {
+                return Ok(Value::Float(to_f64v(v).to_radians()));
+            }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if n.is_nan() {
+                return Ok(Value::Numeric(Numeric::nan()));
+            }
+            let pi = match Numeric::parse("3.14159265358979323846264338327950288") {
+                Ok(v) => v,
+                Err(_) => return Err(exec_err("22003", "value overflows numeric format")),
+            };
+            let npi = n
+                .checked_mul(&pi)
+                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+            // v0.18-repair: see degrees() — div_at_scale avoids the i128
+            // rescale overflow in checked_div.
+            match npi.div_at_scale(&Numeric::new(180, 0), 10) {
+                Some(r) => Ok(Value::Numeric(r)),
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
+        "scale" => {
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // scale(numeric) -> integer (the stored scale).
+            Ok(Value::Int(n.scale as i64))
+        }
+        "min_scale" => {
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // min_scale: minimum scale needed (trailing zeros removed).
+            // PG returns NULL for NaN/Infinity.
+            if n.special != crate::storage::NumericSpecial::Finite {
+                return Ok(Value::Null);
+            }
+            let mut unscaled = n.unscaled.abs();
+            let mut scale = n.scale;
+            while scale > 0 && unscaled % 10 == 0 {
+                unscaled /= 10;
+                scale -= 1;
+            }
+            Ok(Value::Int(scale as i64))
+        }
+        "trim_scale" => {
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // trim_scale: remove trailing zeros.
+            if n.special != crate::storage::NumericSpecial::Finite {
+                return Ok(Value::Numeric(n.clone()));
+            }
+            let mut unscaled = n.unscaled;
+            let mut scale = n.scale;
+            while scale > 0 && unscaled % 10 == 0 {
+                unscaled /= 10;
+                scale -= 1;
+            }
+            Ok(Value::Numeric(Numeric::new(unscaled, scale)))
+        }
+        "div" => {
+            // div(numeric, numeric): truncating division.
+            let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            if b.is_zero() {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            // Truncate toward zero.
+            match a.checked_div(&b) {
+                Some(q) => {
+                    // Truncate to integer (scale 0).
+                    let truncated = q.trunc_to_scale(0);
+                    Ok(Value::Numeric(truncated))
+                }
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
+        "width_bucket" => {
+            // width_bucket(op, b1, b2, count) or width_bucket(op, thresholds).
+            return eval_width_bucket(v, vals, name);
+        }
+        "setseed" => {
+            // v0.18: setseed(float) -> void (sets PRNG seed).
+            let s = to_f64v(v);
+            // PG: setseed takes float in [-1,1].
+            if s < -1.0 || s > 1.0 {
+                return Err(exec_err("2201F", "setseed parameter out of range"));
+            }
+            set_random_seed(s);
+            return Ok(Value::Null);
+        }
         "mod" => {
             // Postgres resolves mod() to numeric.
             let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
@@ -10349,6 +10932,10 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Value::Int(i) => Ok(Value::Int(i.signum())),
             Value::BigInt(i) => Ok(Value::BigInt(i.signum())),
             Value::Numeric(n) => {
+                // v0.18: sign('NaN') is NaN, like PostgreSQL.
+                if n.is_nan() {
+                    return Ok(Value::Numeric(Numeric::nan()));
+                }
                 let s = match n.cmp(&Numeric::new(0, 0)) {
                     std::cmp::Ordering::Less => -1i128,
                     std::cmp::Ordering::Equal => 0,
@@ -10677,6 +11264,35 @@ fn func_result_type(
             }
             Ok(ColType::Numeric)
         }
+        // v0.18: exp/ln/log return numeric (or float if any arg is float).
+        "exp" | "ln" | "log" => {
+            for a in args {
+                match expr_type(eng, snap, own, schemas, ctes, a)? {
+                    ColType::Float4 | ColType::Float => return Ok(ColType::Float),
+                    _ => {}
+                }
+            }
+            Ok(ColType::Numeric)
+        }
+        // v0.18: numeric function batch. These must mirror eval_math_func's
+        // actual return types exactly: without them, type resolution raises
+        // 42883 before evaluation is ever reached.
+        "cbrt" | "degrees" | "radians" => {
+            for a in args {
+                match expr_type(eng, snap, own, schemas, ctes, a)? {
+                    ColType::Float4 | ColType::Float => return Ok(ColType::Float),
+                    _ => {}
+                }
+            }
+            Ok(ColType::Numeric)
+        }
+        "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" => Ok(ColType::Numeric),
+        "scale" | "min_scale" | "width_bucket" => Ok(ColType::Int),
+        "random" => Ok(ColType::Float),
+        // setseed() returns void in Postgres (OID 2278); rustgres has no void
+        // ColType and the implementation always returns NULL, so declare Text
+        // like the NULL literal type inference does (see Value::Null arm).
+        "setseed" => Ok(ColType::Text),
         "now" | "current_timestamp" => Ok(ColType::Timestamptz),
         // v0.17: transaction/clock timestamps are timestamptz.
         "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => {
@@ -11158,6 +11774,8 @@ fn expr_col_name(e: &Expr) -> String {
         Expr::Column { name, .. } => name.clone(),
         Expr::Agg { func, .. } => func.name().to_string(),
         Expr::Cast { to, .. } => to.pg_typname().to_string(),
+        // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
+        Expr::Func { name, .. } => name.clone(),
         _ => "?column?".to_string(),
     }
 }

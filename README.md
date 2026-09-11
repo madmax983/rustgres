@@ -1,23 +1,68 @@
-# rustgres v0.17 — "conformance burn-down: READ ONLY, datetime, COPY, version"
+# rustgres v0.18 — "conformance burn-down: numeric type cluster"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 17 of the road to Postgres 19 feature parity. v0.17 burns down
-the next four conformance clusters: READ ONLY transaction enforcement
-(SQLSTATE 25006 for writes in read-only transactions/sessions, including
-`SET TRANSACTION`, `SET SESSION CHARACTERISTICS`, and
-`default_transaction_read_only`), high-value date/time built-ins
-(`date_part`, `to_date`/`to_timestamp`/`to_char`, `make_date`/`make_timestamp`,
-`timezone` (UTC), `clock_timestamp`/`statement_timestamp`/`transaction_timestamp`),
-extended-protocol COPY (Parse/Bind/Describe/Execute with CopyIn/CopyOut
-sequencing), and honest version reporting (rustgres reports its own
-`0.17.0`, not a fake PostgreSQL version). The required Valgrind/Callgrind/DHAT
-profiling pass on the new workload found no hotspots and no leaks.
-Conformance baseline: **TBD PASS**, TBD EXPECTED-FAIL, TBD REAL-FAIL
-(pending pg_regress run).
-1388 cumulative protocol tests pass (132 new in v0.17), plus 60 unit tests
+Milestone 18 of the road to Postgres 19 feature parity. v0.18 burns down
+the numeric conformance cluster: case-insensitive `NaN`/`Infinity` parsing
+for the `numeric` type (this alone ends a 423-error `25P02` cascade that was
+failing whole pg_regress files), NaN/Infinity propagation through arithmetic,
+comparisons, and ordering (`-Inf < finite < Inf < NaN`, `NaN != NaN`),
+high-precision `exp`/`ln`/`log` (~15 digits), and the missing numeric
+built-ins: `cbrt`, `factorial`, `gcd`/`lcm`, `pi`, `degrees`/`radians`,
+`scale`/`min_scale`/`trim_scale`, `div`, `width_bucket`, `random`/`setseed`
+— plus function-derived column names (`SELECT sqrt(2)` names its column
+`sqrt`, not `?column?`). Version reporting is now single-sourced: the
+startup banners read the same `SERVER_VERSION` constant as
+`SHOW server_version` / `version()`, so they can never drift again
+(they did in v0.17: the binary announced v0.16 while Cargo said 0.17.0).
+Valgrind memcheck/callgrind/DHAT were not run for v0.18: Valgrind is not
+installed in this environment and apt could not install it (lock held by
+another process); this is recorded, not hand-waved.
+Conformance baseline: **2385 PASS (45.9%)**, 1556 EXPECTED-FAIL, 1252
+REAL-FAIL over 5193 pg_regress statements (+521/−521 vs v0.17).
+1515 cumulative protocol tests pass (32 new in v0.18), plus 73 unit tests
 and 53 isolation checks.
+
+## What v0.18 adds (conformance burn-down: numeric type cluster)
+
+- **NaN/Infinity numerics.** `'NaN'::numeric`, `'inf'`, `'Infinity'` (any
+  case, optional sign) parse to proper non-finite numerics. Previously an
+  `INSERT` of NaN aborted the transaction and every later statement in the
+  pg_regress file failed with `25P02` — a 423-error cascade from one missing
+  feature. NaN/Infinity propagate through `+ - * /`, comparisons, and
+  ordering with PG semantics (`-Inf < finite < Inf < NaN`; `NaN != NaN`
+  while `ORDER BY` still sorts NaN last).
+- **exp/ln/log at ~15 digits.** `exp`, `ln`, `log` (1- and 2-arg) compute in
+  extended precision instead of erroring or returning float noise. Specials
+  and SQLSTATEs match PG: `ln(0)`/`ln(negative)`/`log(0)`/`log(negative)` →
+  `2201E` (numeric and float8 paths), `exp` overflow → `22003`.
+- **Missing numeric built-ins.** `cbrt`, `factorial` (negative/non-integer
+  → `2201F`, overflow → `22003`, capped at 1000 iterations),
+  `gcd`/`lcm`, `pi()`, `degrees`/`radians` (numeric path at the engine's
+  standard 10-digit division scale; float inputs stay float8),
+  `scale`/`min_scale`/`trim_scale`, truncating `div` (divide-by-zero →
+  `22012`), `width_bucket` (4-arg form; array-threshold form honestly
+  reports `42883` as unimplemented), `random()`/`setseed()`.
+- **Function column names.** `SELECT sqrt(2)`, `SELECT cbrt(8)`, etc. name
+  the result column after the function instead of `?column?`.
+- **Repair note.** The v0.18 development pass initially left most of these
+  functions unreachable: the type resolver had no result-type entries for
+  them, so every call died with `42883` before evaluation, and `pi()` /
+  `random()` panicked the backend on their zero-argument call path
+  (`vals[0]` on an empty slice). Independent review then caught three more
+  panics the worker's tests missed: `gcd`/`lcm` called `i64::abs()` on
+  their inputs, so `gcd(-2^63, 0)` killed the backend with a negation
+  overflow instead of PG's `22003 "bigint out of range"` (now computed in
+  `u128` with the range check); float8 `ln`/`log` returned `-Infinity`
+  for `log(0)` instead of PG's `2201E`; and `min_scale('NaN')` returned
+  `0` instead of PG's `NULL`. All fixed and covered by new wire-protocol
+  checks in `tests/protocol_test18.py` (Groups F and G).
+- **Known limitations.** `pi()` returns `numeric`, not PG's `float8`;
+  extreme-scale `degrees`/`radians` inputs can hit the engine's general
+  i128 `22003` overflow limit, exactly like plain `*`/`/` on the same
+  magnitudes; variance/stddev aggregates and `VALUES` in derived tables
+  remain unimplemented.
 
 ## What v0.17 adds (conformance burn-down: READ ONLY, datetime, COPY, version)
 

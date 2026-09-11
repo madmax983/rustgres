@@ -425,8 +425,11 @@ def t_functions():
               and one(c, "SELECT sqrt(16::numeric)") == "4")
         # sqrt(float8 negative) -> NaN in PG; numeric negative -> 2201F.
         check("sqrt negative -> 2201F", errcode(c, "SELECT sqrt(-1::numeric)") == "2201F")
+        # v0.18: decimal literals are numeric, so sqrt(-1.0) errors like PG.
+        check("sqrt numeric negative -> 2201F",
+              errcode(c, "SELECT sqrt(-1.0)") == "2201F")
         check("sqrt float negative -> NaN",
-              one(c, "SELECT sqrt(-1.0)") == "NaN")
+              one(c, "SELECT sqrt(-1.0::float8)") == "NaN")
         check("mod()", one(c, "SELECT mod(10, 3)") == "1")
         check("mod by zero -> 22012", errcode(c, "SELECT mod(10, 0)") == "22012")
         check("power()", one(c, "SELECT power(2, 10)") == "1024")

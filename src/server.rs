@@ -89,11 +89,13 @@ pub(crate) struct Session {
 /// a PostgreSQL version it claims to be: the server speaks protocol 3.0
 /// but is not feature-identical to any PG release, so advertising "16.0"
 /// was misleading (it implied PG 16 compatibility we do not have).
-/// `SERVER_VERSION_NUM` applies PG's XXYYZZ scheme to our own 0.17.0.
+/// `SERVER_VERSION_NUM` applies PG's XXYYZZ scheme to our own version.
 /// `SHOW server_version`, `SHOW server_version_num`, `version()`, and the
 /// startup ParameterStatus all read these constants so they agree.
-pub(crate) const SERVER_VERSION: &str = "0.17.0";
-pub(crate) const SERVER_VERSION_NUM: &str = "1700";
+/// v0.18-repair: the startup banners in main.rs/wal.rs now read this
+/// constant too, instead of hardcoding a stale version string.
+pub(crate) const SERVER_VERSION: &str = "0.18.0";
+pub(crate) const SERVER_VERSION_NUM: &str = "1800";
 
 /// Connection ids; process-local is fine (currval is in-memory only).
 static NEXT_SID: AtomicU64 = AtomicU64::new(1);

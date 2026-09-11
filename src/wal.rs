@@ -2650,7 +2650,8 @@ impl Wal {
         eng.txns.snapshots.clear();
         let tables: usize = eng.db.tables.values().map(|vs| vs.len()).sum();
         println!(
-            "rustgres v0.15 recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            "rustgres v{} recovery: {} table version(s), replayed {} WAL batch(es) / {} record(s) from {}",
+            crate::server::SERVER_VERSION,
             tables,
             batches,
             records,

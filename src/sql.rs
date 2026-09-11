@@ -359,7 +359,9 @@ impl Literal {
             Literal::Int(_) => "integer",
             Literal::BigInt(_) => "bigint",
             Literal::SmallInt(_) => "smallint",
-            Literal::Float(_) | Literal::Decimal(_) => "double precision",
+            Literal::Float(_) => "double precision",
+            // v0.18: decimal literals are numeric, like PostgreSQL.
+            Literal::Decimal(_) => "numeric",
             Literal::Real(_) => "real",
             Literal::Numeric(_) => "numeric",
             Literal::Text(_) => "text",
@@ -379,7 +381,9 @@ impl Literal {
             Literal::Int(_) => ColType::Int,
             Literal::BigInt(_) => ColType::BigInt,
             Literal::SmallInt(_) => ColType::SmallInt,
-            Literal::Float(_) | Literal::Decimal(_) => ColType::Float,
+            Literal::Float(_) => ColType::Float,
+            // v0.18: decimal literals are numeric, like PostgreSQL.
+            Literal::Decimal(_) => ColType::Numeric,
             Literal::Real(_) => ColType::Float4,
             Literal::Numeric(_) => ColType::Numeric,
             Literal::Text(_) => ColType::Text,
@@ -401,7 +405,16 @@ impl Literal {
             Literal::BigInt(i) => Value::BigInt(i),
             Literal::SmallInt(i) => Value::SmallInt(i),
             Literal::Float(f) => Value::Float(f),
-            Literal::Decimal(s) => Value::Float(s.parse().unwrap_or(f64::NAN)),
+            // v0.18: decimal literals are numeric, like PostgreSQL.
+            // Absurd magnitudes that exceed i128 fall back to float8
+            // (documented deviation: PG would keep arbitrary precision).
+            Literal::Decimal(s) => match crate::storage::Numeric::parse(s.as_str()) {
+                Ok(n) => Value::Numeric(n),
+                Err(crate::storage::NumericParseError::Overflow) => {
+                    Value::Float(s.parse().unwrap_or(f64::NAN))
+                }
+                Err(_) => Value::Float(f64::NAN),
+            },
             Literal::Real(f) => Value::Float4(f),
             Literal::Numeric(n) => Value::Numeric(n),
             Literal::Text(s) => Value::Text(s),
@@ -6440,7 +6453,7 @@ impl<'a> SexprParser<'a> {
             "numeric" => {
                 let unscaled: i128 = self.atom()?.parse().map_err(|_| "bad numeric")?;
                 let scale: u32 = self.atom()?.parse().map_err(|_| "bad numeric")?;
-                Literal::Numeric(crate::storage::Numeric { unscaled, scale })
+                Literal::Numeric(crate::storage::Numeric::new(unscaled, scale))
             }
             "text" => Literal::Text(self.atom()?),
             "bool" => Literal::Bool(self.atom()?.parse().map_err(|_| "bad bool")?),

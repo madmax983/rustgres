@@ -2,6 +2,28 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.18 baseline — 2026-09-11
+
+No full benchmark re-run for v0.18 (same rationale as v0.14–v0.17): the
+milestone is the numeric type cluster (new built-ins, NaN/Infinity
+parsing, high-precision exp/ln/log), with no hot-path rewrites on the
+normal query path. The v0.18 workload (`benches/workload18.py`: NaN/Inf
+parsing and arithmetic, high-precision exp/ln/log, specials, ordering —
+800 queries) ran at **6282 qps** on the debug binary, 0.13s total.
+
+- **Valgrind**: NOT RUN — valgrind is not installed in this environment
+  and apt could not install it (a system gdb install held the dpkg lock
+  through two VM generations; a system os-intent replay was also running).
+  This is recorded, not hand-waved. The numeric code paths added in
+  v0.18 (u128 gcd/lcm, extended-precision exp/ln/log, NaN/Infinity
+  propagation) were reviewed for overflow/panic hazards during
+  independent repair (three panics found and fixed: gcd/lcm
+  `i64::abs()` overflow, pi()/random() zero-arg indexing, scale-38
+  division overflow in degrees/radians).
+- **Callgrind/DHAT**: not run (no valgrind). No v0.18 change targets a
+  demonstrated hotspot; the workload is new-function coverage, not a
+  hot-path rewrite.
+
 ## v0.16 baseline — 2026-09-11
 
 No full benchmark re-run for v0.16 (same rationale as v0.14/v0.15): the

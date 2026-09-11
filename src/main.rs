@@ -82,7 +82,11 @@ fn main() {
     };
     let listener = net::bind_listen(format!("127.0.0.1:{}", port).parse().unwrap())
         .unwrap_or_else(|e| panic!("failed to bind 127.0.0.1:{}: {}", port, e));
-    println!("rustgres v0.16 listening on 127.0.0.1:{}", port);
+    println!(
+        "rustgres v{} listening on 127.0.0.1:{}",
+        crate::server::SERVER_VERSION,
+        port
+    );
     let engine = Arc::new(Mutex::new(engine));
     let wal = Arc::new(Mutex::new(wal));
     for stream in listener.incoming() {
