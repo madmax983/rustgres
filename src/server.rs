@@ -3,6 +3,7 @@
 //! protocol's parameter resolution.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use crate::copy;
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
 use crate::repl;
-use crate::sql::{self, CopyFormat, CopyOptions, IsolationLevel, Stmt};
+use crate::sql::{self, CopyFormat, CopyOptions, FetchDir, IsolationLevel, Stmt};
 use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
 
@@ -69,6 +70,8 @@ pub(crate) struct Session {
     in_error: bool,
     /// Explicit transaction state; None = autocommit.
     txn: Option<Txn>,
+    /// v0.16: open SQL cursors (DECLARE), keyed by cursor name.
+    cursors: HashMap<String, SqlCursor>,
 }
 
 /// Connection ids; process-local is fine (currval is in-memory only).
@@ -97,6 +100,8 @@ struct Txn {
     /// back to a savepoint undoes staged writes AND releases the row locks
     /// taken after it, like Postgres.
     savepoints: Vec<(String, usize, usize)>,
+    /// v0.16: cursor marks in lockstep with `savepoints`.
+    cursor_marks: Vec<CursorMark>,
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
@@ -111,8 +116,30 @@ impl Session {
             portals: HashMap::new(),
             in_error: false,
             txn: None,
+            cursors: HashMap::new(),
         }
     }
+}
+
+/// v0.16: an open SQL cursor. The DECLARE-time query result is
+/// materialized (columns + rows + position); FETCH advances `pos`.
+/// (Named `SqlCursor` — `protocol::Cursor` is the wire-protocol cursor.)
+pub(crate) struct SqlCursor {
+    cols: Vec<(String, ColType)>,
+    rows: Vec<Vec<Value>>,
+    /// Current row index: -1 = before the first row, rows.len() = after
+    /// the last row (Postgres positions the cursor on the last row
+    /// retrieved).
+    pos: i64,
+    with_hold: bool,
+}
+
+/// v0.16: cursor state captured at SAVEPOINT time, kept in lockstep with
+/// `Txn::savepoints`. On ROLLBACK TO, cursor positions rewind and cursors
+/// created after the savepoint are closed — like Postgres.
+struct CursorMark {
+    positions: HashMap<String, i64>,
+    names: HashSet<String>,
 }
 
 /// v0.11: live connection counts per role, enforcing CONNECTION LIMIT.
@@ -1182,6 +1209,165 @@ fn allowed_in_aborted(stmt: &Stmt) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// v0.16: SQL cursors (DECLARE / FETCH / CLOSE / MOVE)
+// ---------------------------------------------------------------------------
+
+/// Resolve a FETCH/MOVE direction to `(start, end, new_pos)` against a
+/// materialized cursor with `len` rows. `pos` is the current row index
+/// (`-1` = before the first row, `len` = after the last row): Postgres
+/// leaves the cursor *on* the last row retrieved, so RELATIVE moves from
+/// the current row, BACKWARD excludes it, and NEXT skips past it.
+/// Indices are clamped into `[0, len]`; an empty window parks the cursor
+/// after the last row (forward) or before the first row (backward).
+fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usize, i64) {
+    let n = len as i64;
+    enum Kind {
+        Fwd,
+        Bwd,
+        At,
+    }
+    let (s, e, kind): (i64, i64, Kind) = match dir {
+        FetchDir::Forward(None) => (pos + 1, n, Kind::Fwd),
+        FetchDir::Forward(Some(c)) if *c >= 0 => (pos + 1, pos + 1 + c, Kind::Fwd),
+        // A negative count reverses direction, like Postgres.
+        FetchDir::Forward(Some(c)) => (pos + c, pos, Kind::Bwd),
+        FetchDir::Backward(None) => (0, pos, Kind::Bwd),
+        FetchDir::Backward(Some(c)) if *c >= 0 => (pos - c, pos, Kind::Bwd),
+        FetchDir::Backward(Some(c)) => (pos + 1, pos + 1 - c, Kind::Fwd),
+        FetchDir::Absolute(c) => {
+            // ABSOLUTE 0 parks before the first row and returns nothing.
+            if *c == 0 {
+                return (0, 0, -1);
+            }
+            let t = if *c > 0 { c - 1 } else { n + c };
+            (t, t + 1, Kind::At)
+        }
+        FetchDir::Relative(c) => (pos + c, pos + c + 1, Kind::At),
+        FetchDir::First => (0, 1, Kind::At),
+        FetchDir::Last => (n - 1, n, Kind::At),
+    };
+    let neg = s < 0;
+    let s = s.clamp(0, n);
+    let e = e.clamp(0, n);
+    if s >= e {
+        let new = match kind {
+            Kind::Fwd => n,
+            Kind::Bwd => -1,
+            Kind::At => {
+                if neg {
+                    -1
+                } else {
+                    n
+                }
+            }
+        };
+        return (0, 0, new);
+    }
+    let new = match kind {
+        Kind::Fwd => e - 1,
+        Kind::Bwd => s,
+        Kind::At => e - 1,
+    };
+    (s as usize, e as usize, new)
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_window_for_test(
+    dir: &crate::sql::FetchDir,
+    pos: i64,
+    len: usize,
+) -> (usize, usize, i64) {
+    cursor_window(dir, pos, len)
+}
+
+fn cursor_declare(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    name: &str,
+    query: &sql::SelectStmt,
+    with_hold: bool,
+) -> Result<ExecResult, ExecError> {
+    if session.txn.is_none() && !with_hold {
+        return Err(err_25001(
+            "DECLARE CURSOR can only be used in transaction blocks",
+        ));
+    }
+    if session.cursors.contains_key(name) {
+        return Err(ExecError {
+            code: "42P11",
+            message: format!("cursor \"{}\" already exists", name),
+        });
+    }
+    let sel = Stmt::Select(query.clone());
+    let result = if session.txn.is_some() {
+        txn_execute(engine, session, &sel)
+    } else {
+        autocommit_execute(engine, wal, session.sid, &session.role, &sel)
+    };
+    match result {
+        Ok(ExecResult::Select { columns, rows }) => {
+            session.cursors.insert(
+                name.to_string(),
+                SqlCursor {
+                    cols: columns,
+                    rows,
+                    pos: -1,
+                    with_hold,
+                },
+            );
+            Ok(cmd("DECLARE CURSOR"))
+        }
+        Ok(_) => Err(ExecError {
+            code: "XX000",
+            message: "internal error: DECLARE query did not return rows".to_string(),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+fn cursor_fetch(
+    session: &mut Session,
+    name: &str,
+    dir: &FetchDir,
+    is_move: bool,
+) -> Result<ExecResult, ExecError> {
+    let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
+        code: "34000",
+        message: format!("cursor \"{}\" does not exist", name),
+    })?;
+    let (s, e, new_pos) = cursor_window(dir, cur.pos, cur.rows.len());
+    let rows: Vec<Vec<Value>> = cur.rows[s..e].to_vec();
+    let cols = cur.cols.clone();
+    cur.pos = new_pos;
+    let n = rows.len();
+    if is_move {
+        return Ok(cmd(&format!("MOVE {}", n)));
+    }
+    // Dml carries rows like a SELECT but completes with the FETCH tag.
+    Ok(ExecResult::Dml {
+        tag: format!("FETCH {}", n),
+        columns: cols,
+        rows,
+    })
+}
+
+fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult, ExecError> {
+    match name {
+        Some(n) => {
+            if session.cursors.remove(n).is_none() {
+                return Err(ExecError {
+                    code: "34000",
+                    message: format!("cursor \"{}\" does not exist", n),
+                });
+            }
+        }
+        None => session.cursors.clear(),
+    }
+    Ok(cmd("CLOSE CURSOR"))
+}
+
 /// Execute one statement with MVCC transaction semantics:
 /// - transaction control statements manipulate the session's txn state;
 /// - `CHECKPOINT` snapshots the committed engine and truncates the WAL;
@@ -1231,6 +1417,16 @@ fn run_statement(
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
         Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
+        // v0.16: SQL cursors are session-level (the cursor map lives on
+        // the Session, next to the prepared statements).
+        Stmt::Declare {
+            name,
+            query,
+            with_hold,
+        } => cursor_declare(engine, wal, session, name, query, *with_hold),
+        Stmt::Fetch { name, dir } => cursor_fetch(session, name, dir, false),
+        Stmt::Close { name } => cursor_close(session, name.as_deref()),
+        Stmt::Move { name, dir } => cursor_fetch(session, name, dir, true),
         Stmt::Vacuum {
             table,
             verbose,
@@ -1500,6 +1696,7 @@ fn txn_begin(
         snapshot: None,
         writes: Vec::new(),
         savepoints: Vec::new(),
+        cursor_marks: Vec::new(),
         failed: false,
     });
     Ok(cmd("BEGIN"))
@@ -1532,6 +1729,9 @@ fn txn_commit(
         retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
+        // v0.16: every cursor dies with the aborted transaction
+        // (even WITH HOLD ones — there is no committed data to hold).
+        session.cursors.clear();
         if chain {
             // AND CHAIN: new transaction with the same characteristics.
             return txn_begin(engine, session, level, read_only, deferrable);
@@ -1571,6 +1771,8 @@ fn txn_commit(
     retire_txn(&mut guard, t.xid);
     auto_vacuum(&mut guard, &t.writes);
     drop(guard);
+    // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
+    session.cursors.retain(|_, c| c.with_hold);
     if chain {
         // AND CHAIN: immediately start a new transaction with the same
         // characteristics as the just-committed one (SQL standard). The
@@ -1702,6 +1904,8 @@ fn txn_rollback(
         undo_all(&mut guard, t.xid, &t.writes);
         retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
+        // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
+        session.cursors.clear();
         Some(chained)
     } else {
         None
@@ -1732,6 +1936,15 @@ fn txn_savepoint(
             let xid = t.xid;
             let locks = lock_engine(engine).txn_lock_count(xid);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
+            // v0.16: also snapshot cursor positions and the cursor set.
+            t.cursor_marks.push(CursorMark {
+                positions: session
+                    .cursors
+                    .iter()
+                    .map(|(k, c)| (k.clone(), c.pos))
+                    .collect(),
+                names: session.cursors.keys().cloned().collect(),
+            });
             Ok(cmd("SAVEPOINT"))
         }
     }
@@ -1778,6 +1991,27 @@ fn txn_rollback_to(
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
     t.failed = false;
+    // v0.16: rewind cursor positions to the savepoint and close cursors
+    // created after it — like Postgres. (NLL: `t` is dead after this.)
+    let mark = session
+        .txn
+        .as_ref()
+        .and_then(|t| t.cursor_marks.get(idx))
+        .map(|m| (m.positions.clone(), m.names.clone()));
+    if let Some((positions, names)) = mark {
+        for (k, c) in session.cursors.iter_mut() {
+            if let Some(p) = positions.get(k) {
+                c.pos = *p;
+            }
+        }
+        session.cursors.retain(|k, _| names.contains(k));
+    }
+    session
+        .txn
+        .as_mut()
+        .expect("transaction checked above")
+        .cursor_marks
+        .truncate(idx + 1);
     Ok(cmd("ROLLBACK"))
 }
 
@@ -1796,6 +2030,8 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         })?;
     // Destroys the named savepoint and all established after it.
     t.savepoints.truncate(idx);
+    // v0.16: cursor marks die with their savepoints.
+    t.cursor_marks.truncate(idx);
     Ok(cmd("RELEASE"))
 }
 
@@ -2097,6 +2333,16 @@ fn describe_prepared(
 ) -> Result<Option<Vec<(String, ColType)>>, exec::ExecError> {
     match &prep.stmt {
         None => Ok(None),
+        // v0.16: Describe of a FETCH returns the open cursor's row
+        // description (like Postgres); MOVE returns no rows.
+        Some(Stmt::Fetch { name, .. }) => match session.cursors.get(name) {
+            Some(cur) => Ok(Some(cur.cols.clone())),
+            None => Err(exec::ExecError {
+                code: "34000",
+                message: format!("cursor \"{}\" does not exist", name),
+            }),
+        },
+        Some(Stmt::Move { .. }) => Ok(None),
         Some(stmt) => {
             let mut guard = lock_engine(engine);
             let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
@@ -2297,6 +2543,7 @@ mod tests {
             stmts: HashMap::new(),
             portals: HashMap::new(),
             in_error: false,
+            cursors: HashMap::new(),
             txn: Some(Txn {
                 xid,
                 level,
@@ -2305,6 +2552,7 @@ mod tests {
                 snapshot: None,
                 writes: Vec::new(),
                 savepoints: Vec::new(),
+                cursor_marks: Vec::new(),
                 failed: false,
             }),
         };

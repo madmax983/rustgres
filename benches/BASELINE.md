@@ -2,6 +2,35 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.16 baseline — 2026-09-11
+
+No full benchmark re-run for v0.16 (same rationale as v0.14/v0.15): the
+milestone is new built-ins, cursors, and TRUNCATE plus the required
+profiling gate, with no hot-path rewrites on the normal query path. The
+profiling gate on a 10-round v0.16 workload (`benches/workload16.py`:
+new functions, TRUNCATE, DECLARE/FETCH/MOVE/CLOSE in all directions,
+savepoints — ~120 statements) found nothing to fix:
+
+- **Valgrind memcheck** (release binary): **0 errors from 0 contexts**,
+  0 bytes definitely/indirectly lost. "Possibly lost" 3.8 KiB in 26
+  blocks are Rust interior-pointer artifacts (`Table::with_def`,
+  `Engine::new`, `String::clone`) at SIGTERM shutdown — the same known
+  shutdown-noise class as v0.15, not real leaks.
+- **Callgrind** on the same workload (5.5M instructions): top consumers
+  are libc malloc/free (~30% combined on this tiny workload),
+  `parse_statement_inner` 3.4%, tokenizer keyword `to_lowercase` 1.2%.
+  No v0.16 code path (`cursor_window`, radix converters, truncate
+  writer) registers above the noise floor.
+- **DHAT**: ~734 KiB total allocated, 64 KiB max-live — the largest
+  allocation point is the v0.15 thread-local `read_bounded` scratch
+  buffer, grown once to 64 KiB and reused per message (the v0.15 fix
+  holding). Tokenizer `Vec<Token>` 134 KiB total / 4 KiB max-live;
+  `parse_call` expr vecs 61 KiB total / 6 KiB max-live. Nothing
+  retained, no v0.16-specific allocation pathology.
+
+v0.13 numbers below are carried forward as the v0.16 query-path baseline
+pending a clean-box re-run.
+
 ## v0.15 baseline — 2026-09-11
 
 No full benchmark re-run for v0.15 (same rationale as v0.14): the milestone

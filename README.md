@@ -1,26 +1,56 @@
-# rustgres v0.15 — "conformance burn-down: transaction syntax"
+# rustgres v0.16 — "conformance burn-down: functions, cursors, truncate"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 15 of the road to Postgres 19 feature parity. v0.15 burns down
-the largest syntax cluster in the conformance baseline: full
-PostgreSQL transaction-control syntax — `BEGIN [WORK | TRANSACTION]`,
-`START TRANSACTION` with comma-separated modes (`ISOLATION LEVEL ...`,
-`READ WRITE` / `READ ONLY`, `[NOT] DEFERRABLE`), and `COMMIT` / `END` /
-`ROLLBACK` / `ABORT` with `[WORK | TRANSACTION]` and `AND CHAIN` /
-`AND NO CHAIN`. `AND CHAIN` returns the proper `COMMIT`/`ROLLBACK`
-command tag and opens the next transaction inheriting the previous
-characteristics. The required Valgrind/Callgrind/DHAT profiling pass for
-the milestone found and fixed a real read-path waste: every inbound
-protocol message allocated and zeroed a fresh 64 KiB scratch buffer
-(DHAT: 18.5 MiB allocated for 200 small statements, max-live 283 B;
-76% of callgrind instructions). The buffer is now a per-connection-thread
-thread-local reused across messages.
-Conformance baseline: **1815 PASS (35.0%)**, 1582 EXPECTED-FAIL, 1796
-REAL-FAIL out of 5193 statements (was 1661/1644/1888 in v0.14).
-1161 cumulative protocol tests pass (9 new in v0.15), plus 58 unit
-tests and 53 isolation checks.
+Milestone 16 of the road to Postgres 19 feature parity. v0.16 burns down
+the next three conformance clusters: ten commonly-used string/numeric
+built-ins (`substr`, `concat`, `concat_ws`, `to_hex`, `to_oct`, `to_bin`,
+`sign`, `left`, `right`, `reverse`), SQL cursors (`DECLARE ... CURSOR FOR
+SELECT`, `FETCH` in all directions, `MOVE`, `CLOSE`, `WITH HOLD`), and
+transactional `TRUNCATE` (including FK `RESTRICT`/`CASCADE`). The required
+Valgrind/Callgrind/DHAT profiling pass on the new workload found no
+hotspots and no leaks: memcheck reports 0 errors, 0 bytes definitely
+lost; the 64 KiB max-live allocation point is the v0.15 thread-local
+read scratch, grown once and reused; callgrind shows the new code paths
+below the noise floor.
+Conformance baseline: **1835 PASS (35.3%)**, 1582 EXPECTED-FAIL, 1776
+REAL-FAIL out of 5193 statements (was 1815/1582/1796 in v0.15).
+1256 cumulative protocol tests pass (90 new in v0.16; the v0.15 README
+understated the pre-v0.16 cumulative total as 1161 — the correct figure
+was 1166), plus 60 unit tests and 53 isolation checks.
+
+## What v0.16 adds (conformance burn-down: functions, cursors, truncate)
+
+- **String/numeric built-ins.** `substr` (1-based, negative start counts
+  from the end, grapheme-aware via `chars`), `concat` (variadic,
+  skips NULLs, `concat()` → `''`), `concat_ws` (NULL separator → NULL,
+  skips NULL args), `to_hex`/`to_oct`/`to_bin` (two's-complement width
+  follows the argument type: int4 → 32-bit, bigint → 64-bit),
+  `sign` (int, bigint, numeric, float), `left`/`right` (negative
+  length trims from the opposite end), `reverse` (Unicode-aware).
+- **SQL cursors.** `DECLARE name CURSOR [WITH HOLD] FOR SELECT ...`
+  materializes the query result per session; `FETCH` supports `NEXT`,
+  `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD n`,
+  `BACKWARD n`, `ALL`, and bare counts, with rows emitted in travel
+  direction and correct `FETCH n` completion tags. `MOVE` repositions
+  without returning rows. `WITH HOLD` cursors survive `COMMIT`;
+  ordinary cursors close at transaction end; `ROLLBACK` closes all.
+  `ROLLBACK TO SAVEPOINT` preserves FETCH positions (matching
+  PostgreSQL) but still closes cursors declared after the savepoint.
+  Cursor statement errors (`34000` invalid cursor name, and friends)
+  mark an explicit transaction failed, like any other statement error.
+- **Transactional TRUNCATE.** `TRUNCATE [TABLE] name [, ...]
+  [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]` deletes
+  all rows via versioned write ops, so it rolls back with the
+  transaction; FK `RESTRICT` (default) raises `2BP01` when referenced
+  rows exist, `CASCADE` truncates dependents. `RESTART IDENTITY`
+  is parsed but returns `0A000` — sequence ownership is not tracked
+  yet.
+- **Known limitations.** `RESTART IDENTITY` unsupported (`0A000`);
+  cursors are materialized (no `SCROLL` sensitivity to concurrent
+  writes); `FETCH` inside extended-protocol portals not yet wired;
+  server_version still reports 16.0.
 
 ## What v0.15 adds (conformance burn-down: transaction syntax)
 
@@ -759,6 +789,8 @@ tests/
   protocol_test11.py roles, ACLs, row-level locks, advisory locks (v0.11)
   protocol_test12.py concurrency stress, soak, wire hardening (v0.12)
   protocol_test13.py replication protocol, logical decoding (v0.13)
+  protocol_test14.py conformance burn-down: txn syntax (v0.15), 58 checks
+  protocol_test16.py functions, cursors, TRUNCATE (v0.16), 90 checks
 ```
 
 ## How to run
@@ -796,6 +828,10 @@ python3 tests/protocol_test11.py # v0.11: roles/ACLs/locks, 118 checks
 python3 tests/protocol_test12.py # v0.12: concurrency/soak/hardening, 65 checks
 python3 tests/protocol_test13.py # v0.13: replication/logical decoding,
                                  # 57 checks
+python3 tests/protocol_test14.py # v0.14/v0.15: conformance burn-down,
+                                 # 58 checks
+python3 tests/protocol_test16.py # v0.16: functions/cursors/TRUNCATE,
+                                 # 90 checks
 ```
 
 The v0.2 test does the extended-protocol dance with raw sockets and asserts

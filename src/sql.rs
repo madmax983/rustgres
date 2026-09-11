@@ -1301,6 +1301,19 @@ pub enum GrantObject {
     Database,
 }
 
+/// v0.16: FETCH / MOVE direction. Counts are row counts; `None` means ALL.
+#[derive(Clone, Debug)]
+pub enum FetchDir {
+    /// `NEXT`, bare `FETCH`, or `FORWARD [n]`.
+    Forward(Option<i64>),
+    /// `PRIOR` or `BACKWARD [n]`.
+    Backward(Option<i64>),
+    Absolute(i64),
+    Relative(i64),
+    First,
+    Last,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -1425,6 +1438,34 @@ pub enum Stmt {
         returning: Vec<SelectItem>,
         /// v0.10: `WITH ...` CTEs visible to the statement.
         with: Vec<CteDef>,
+    },
+    // --- v0.16: TRUNCATE ----------------------------------------------------
+    Truncate {
+        tables: Vec<String>,
+        /// `RESTART IDENTITY`: reset sequences owned by the truncated
+        /// tables (without it, sequences are untouched).
+        restart_identity: bool,
+        /// `CASCADE`: skip the referenced-by-foreign-key check (without
+        /// it, truncating an FK-referenced table is an error, like PG).
+        cascade: bool,
+    },
+    // --- v0.16: SQL cursors --------------------------------------------------
+    Declare {
+        name: String,
+        query: SelectStmt,
+        with_hold: bool,
+    },
+    Fetch {
+        name: String,
+        dir: FetchDir,
+    },
+    Close {
+        /// None = `CLOSE ALL`.
+        name: Option<String>,
+    },
+    Move {
+        name: String,
+        dir: FetchDir,
     },
     // --- v0.10: COPY -------------------------------------------------------
     Copy {
@@ -1802,15 +1843,18 @@ fn is_reserved(word: &str) -> bool {
             | "by"
             | "cast" // v0.7
             | "checkpoint"
+            | "close" // v0.16: cursors
             | "commit"
             | "create"
             | "cross"
+            | "declare" // v0.16: cursors
             | "delete"
             | "desc"
             | "distinct"
             | "drop"
             | "end"
             | "exists"
+            | "fetch" // v0.16: cursors
             | "for"
             | "from"
             | "group"
@@ -1827,6 +1871,7 @@ fn is_reserved(word: &str) -> bool {
             | "level"
             | "like" // v0.7
             | "limit"
+            | "move" // v0.16: cursors
             | "not"
             | "null"
             | "nulls" // v0.7
@@ -1976,6 +2021,12 @@ impl Parser {
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
             "delete" => self.parse_delete(),
+            // --- v0.16: TRUNCATE / cursors
+            "truncate" => self.parse_truncate(),
+            "declare" => self.parse_declare(),
+            "fetch" => self.parse_fetch(),
+            "close" => self.parse_close(),
+            "move" => self.parse_move(),
             // --- v0.5: VACUUM
             "vacuum" => self.parse_vacuum(),
             // --- v0.3: transaction control
@@ -4349,6 +4400,187 @@ impl Parser {
         })
     }
 
+    // --- v0.16: TRUNCATE / SQL cursors -----------------------------------
+    fn parse_truncate(&mut self) -> Result<Stmt, SqlError> {
+        // TRUNCATE [ TABLE ] name [, ...]
+        //   [ RESTART IDENTITY | CONTINUE IDENTITY ] [ CASCADE | RESTRICT ]
+        let _ = self.eat_keyword("table");
+        let mut tables = vec![self.expect_ident()?];
+        while self.peek() == Token::Comma {
+            self.next();
+            tables.push(self.expect_ident()?);
+        }
+        let restart_identity = if self.eat_keyword("restart") {
+            self.expect_keyword("identity")?;
+            true
+        } else {
+            let _ = self.eat_keyword("continue");
+            let _ = self.eat_keyword("identity");
+            false
+        };
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            let _ = self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::Truncate {
+            tables,
+            restart_identity,
+            cascade,
+        })
+    }
+
+    fn parse_declare(&mut self) -> Result<Stmt, SqlError> {
+        // DECLARE name [BINARY] [INSENSITIVE] [SCROLL | NO SCROLL]
+        //   CURSOR [WITH HOLD | WITHOUT HOLD] FOR select
+        let name = self.expect_ident()?;
+        let _ = self.eat_keyword("binary");
+        let _ = self.eat_keyword("insensitive");
+        if self.eat_keyword("no") {
+            self.expect_keyword("scroll")?;
+        } else {
+            let _ = self.eat_keyword("scroll");
+        }
+        self.expect_keyword("cursor")?;
+        let with_hold = if self.eat_keyword("with") {
+            self.expect_keyword("hold")?;
+            true
+        } else if self.eat_keyword("without") {
+            self.expect_keyword("hold")?;
+            false
+        } else {
+            false
+        };
+        self.expect_keyword("for")?;
+        // `parse_select_rest` expects the SELECT keyword already
+        // consumed (like `parse_top` does for a top-level SELECT).
+        self.expect_keyword("select")?;
+        let query = self.parse_select_rest()?;
+        Ok(Stmt::Declare {
+            name,
+            query,
+            with_hold,
+        })
+    }
+
+    /// An optional `-` followed by an integer literal, for FETCH counts.
+    fn parse_fetch_count(&mut self) -> Result<i64, SqlError> {
+        let neg = self.peek() == Token::Minus && {
+            self.next();
+            true
+        };
+        match self.next() {
+            Token::Number(s) => {
+                let n: i64 = s
+                    .parse()
+                    .map_err(|_| err(format!("syntax error: invalid FETCH count \"{}\"", s)))?;
+                Ok(if neg { -n } else { n })
+            }
+            other => Err(err(format!(
+                "syntax error: expected FETCH count, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn try_parse_fetch_count(&mut self) -> Option<i64> {
+        // Peek for [Minus] Number without consuming on mismatch.
+        let save = self.pos;
+        if self.peek() == Token::Minus {
+            self.next();
+        }
+        let is_num = matches!(self.peek(), Token::Number(_));
+        self.pos = save;
+        if !is_num {
+            return None;
+        }
+        self.parse_fetch_count().ok()
+    }
+
+    /// FETCH / MOVE direction. With no direction word this is NEXT (one
+    /// row), like Postgres.
+    fn parse_fetch_dir(&mut self) -> Result<FetchDir, SqlError> {
+        if self.eat_keyword("next") {
+            return Ok(FetchDir::Forward(Some(1)));
+        }
+        if self.eat_keyword("prior") {
+            return Ok(FetchDir::Backward(Some(1)));
+        }
+        if self.eat_keyword("first") {
+            return Ok(FetchDir::First);
+        }
+        if self.eat_keyword("last") {
+            return Ok(FetchDir::Last);
+        }
+        if self.eat_keyword("absolute") {
+            return Ok(FetchDir::Absolute(self.parse_fetch_count()?));
+        }
+        if self.eat_keyword("relative") {
+            return Ok(FetchDir::Relative(self.parse_fetch_count()?));
+        }
+        if self.eat_keyword("forward") {
+            if self.eat_keyword("all") {
+                return Ok(FetchDir::Forward(None));
+            }
+            if let Some(n) = self.try_parse_fetch_count() {
+                return Ok(FetchDir::Forward(Some(n)));
+            }
+            return Ok(FetchDir::Forward(Some(1)));
+        }
+        if self.eat_keyword("backward") {
+            if self.eat_keyword("all") {
+                return Ok(FetchDir::Backward(None));
+            }
+            if let Some(n) = self.try_parse_fetch_count() {
+                return Ok(FetchDir::Backward(Some(n)));
+            }
+            return Ok(FetchDir::Backward(Some(1)));
+        }
+        if self.eat_keyword("all") {
+            return Ok(FetchDir::Forward(None));
+        }
+        if let Some(n) = self.try_parse_fetch_count() {
+            return Ok(FetchDir::Forward(Some(n)));
+        }
+        Ok(FetchDir::Forward(Some(1)))
+    }
+
+    fn parse_fetch(&mut self) -> Result<Stmt, SqlError> {
+        // FETCH [ direction ] { FROM | IN } name
+        let dir = self.parse_fetch_dir()?;
+        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
+            return Err(err(format!(
+                "syntax error: expected FROM or IN in FETCH, found {:?}",
+                self.peek()
+            )));
+        }
+        let name = self.expect_ident()?;
+        Ok(Stmt::Fetch { name, dir })
+    }
+
+    fn parse_move(&mut self) -> Result<Stmt, SqlError> {
+        // MOVE [ direction ] { FROM | IN } name
+        let dir = self.parse_fetch_dir()?;
+        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
+            return Err(err(format!(
+                "syntax error: expected FROM or IN in MOVE, found {:?}",
+                self.peek()
+            )));
+        }
+        let name = self.expect_ident()?;
+        Ok(Stmt::Move { name, dir })
+    }
+
+    fn parse_close(&mut self) -> Result<Stmt, SqlError> {
+        // CLOSE name | CLOSE ALL
+        if self.eat_keyword("all") {
+            return Ok(Stmt::Close { name: None });
+        }
+        let name = self.expect_ident()?;
+        Ok(Stmt::Close { name: Some(name) })
+    }
+
     fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
         let verbose = self.eat_keyword("verbose");
         // v0.14: `VACUUM ANALYZE` (pg_regress conformance).
@@ -5273,9 +5505,12 @@ pub fn is_builtin_fn(name: &str) -> bool {
         name,
         // string
         "upper" | "lower" | "length" | "char_length" | "character_length"
-        | "substring" | "trim" | "position" | "replace" | "split_part"
+        | "substring" | "substr" | "trim" | "position" | "replace" | "split_part"
+        | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin"
+        | "left" | "right" | "reverse"
         // math
         | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod"
+        | "sign"
         // date/time
         | "now" | "current_date" | "current_timestamp" | "date_trunc"
         // conditional
@@ -5294,11 +5529,17 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
         "now" | "current_date" | "current_timestamp" => n == 0,
-        "substring" => n == 2 || n == 3,
+        "substring" | "substr" => n == 2 || n == 3,
         "trim" => n == 1 || n == 3,
         "position" | "power" | "mod" | "nullif" | "date_trunc" => n == 2,
         "replace" | "split_part" => n == 3,
         "round" => n == 1 || n == 2,
+        // v0.16: concat() with no args is '' (Postgres); concat_ws(sep, ...)
+        // needs >= 1 (a lone separator yields the empty string).
+        "concat" => true,
+        "concat_ws" => n >= 1,
+        "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
+        "left" | "right" => n == 2,
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.9: setval(name, value [, is_called])
         "nextval" | "currval" => n == 1,

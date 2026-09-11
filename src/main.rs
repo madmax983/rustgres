@@ -1,4 +1,4 @@
-//! rustgres v0.15 — a from-scratch PostgreSQL-compatible server in pure Rust.
+//! rustgres v0.16 — a from-scratch PostgreSQL-compatible server in pure Rust.
 //!
 //! Listens on 127.0.0.1:5433, one thread per connection, shared MVCC
 //! engine backed by a write-ahead log. Zero external crates: builds
@@ -82,7 +82,7 @@ fn main() {
     };
     let listener = net::bind_listen(format!("127.0.0.1:{}", port).parse().unwrap())
         .unwrap_or_else(|e| panic!("failed to bind 127.0.0.1:{}: {}", port, e));
-    println!("rustgres v0.15 listening on 127.0.0.1:{}", port);
+    println!("rustgres v0.16 listening on 127.0.0.1:{}", port);
     let engine = Arc::new(Mutex::new(engine));
     let wal = Arc::new(Mutex::new(wal));
     for stream in listener.incoming() {

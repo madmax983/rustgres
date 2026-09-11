@@ -384,6 +384,21 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             with,
             returning,
         } => exec_delete(eng, ctx, table, where_, with, returning),
+        // v0.16: TRUNCATE is executor-level (transactional row removal).
+        Stmt::Truncate {
+            tables,
+            restart_identity,
+            cascade,
+        } => exec_truncate(eng, ctx, tables, *restart_identity, *cascade),
+        // v0.16: cursor statements are session-level (server.rs owns the
+        // cursor map); reaching the executor is a bug in the session
+        // layer.
+        Stmt::Declare { .. } | Stmt::Fetch { .. } | Stmt::Close { .. } | Stmt::Move { .. } => {
+            Err(exec_err(
+                "XX000",
+                "internal error: cursor statement reached the statement executor",
+            ))
+        }
         // v0.10: COPY is handled by the server layer (it needs the raw
         // frontend messages); reaching the executor is a bug.
         Stmt::Copy { .. } => Err(exec_err(
@@ -2675,6 +2690,98 @@ fn exec_delete(
         tag: format!("DELETE {}", n),
         columns: ret_cols,
         rows: ret_out,
+    })
+}
+
+// --- v0.16: TRUNCATE ---------------------------------------------------------
+fn exec_truncate(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    tables: &[String],
+    restart_identity: bool,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    if restart_identity {
+        // Sequence ownership is not tracked by the engine yet; refusing
+        // is more honest than silently not resetting.
+        return Err(exec_err(
+            "0A000",
+            "TRUNCATE ... RESTART IDENTITY is not supported yet",
+        ));
+    }
+    // Resolve the table closure first (statement atomicity: a missing
+    // table or FK violation fails before anything is removed).
+    let mut targets: Vec<String> = tables.to_vec();
+    if cascade {
+        // Like Postgres, CASCADE pulls in every table holding a foreign
+        // key that references a truncated table (transitively).
+        let mut i = 0;
+        while i < targets.len() {
+            let t = targets[i].clone();
+            for (child, _) in fks_referencing(eng, ctx.snap, ctx.own, &t) {
+                if !targets.contains(&child) {
+                    targets.push(child);
+                }
+            }
+            i += 1;
+        }
+    } else {
+        for t in tables {
+            let refs = fks_referencing(eng, ctx.snap, ctx.own, t);
+            if let Some((child, _)) = refs.first() {
+                return Err(exec_err(
+                    "2BP01",
+                    format!(
+                        "cannot truncate a table referenced in a foreign key constraint (\"{}\" references \"{}\")",
+                        child, t
+                    ),
+                ));
+            }
+        }
+    }
+    for t in &targets {
+        require_table_priv(eng, ctx, t, crate::storage::PRIV_TRUNCATE, "TRUNCATE")?;
+        if eng.db.find_table(t, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", t),
+            ));
+        }
+    }
+    // Delete every visible row, staging the same WriteOps as DELETE so
+    // ROLLBACK / ROLLBACK TO SAVEPOINT restore the table exactly.
+    for table in &targets {
+        let plan: Vec<(u64, u64)> = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own)
+                .expect("table checked above; engine lock held throughout");
+            let mut plan = Vec::new();
+            for rv in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+                check_write_conflict(eng, rv.xmax, ctx.level)?;
+                check_row_lock(eng, table, rv.id, ctx.own)?;
+                plan.push((rv.id, rv.xmax));
+            }
+            plan
+        };
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own)
+            .expect("table checked above; engine lock held throughout");
+        for (id, prev_xmax) in plan {
+            let pos = t
+                .row_pos(id)
+                .expect("row version still present; engine lock held throughout");
+            t.rows[pos].xmax = ctx.own;
+            ctx.writes.push(WriteOp::DeleteRow {
+                table: table.to_string(),
+                row_id: id,
+                prev_xmax,
+            });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "TRUNCATE TABLE".to_string(),
     })
 }
 
@@ -9728,9 +9835,14 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
         "round" => n == 1 || n == 2,
-        "substring" => n == 2 || n == 3,
+        "substring" | "substr" => n == 2 || n == 3,
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
         "replace" | "split_part" | "trim" => n == 3,
+        // v0.16: new string/math built-ins.
+        "concat" => true, // concat() with no args is '' (Postgres).
+        "concat_ws" => n >= 1,
+        "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
+        "left" | "right" => n == 2,
         "now" | "current_date" | "current_timestamp" => n == 0,
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress).
@@ -9759,10 +9871,13 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
 /// Dispatch on pre-evaluated argument values (used by the grouped path).
 fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     check_builtin_arity(name, vals)?;
+    // v0.16: `substr` is a true alias of `substring` (same semantics).
+    let name = if name == "substr" { "substring" } else { name };
     match name {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "substring"
-        | "trim" | "position" | "replace" | "split_part" => eval_str_func(name, vals),
-        "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" => {
+        | "trim" | "position" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
+        | "to_oct" | "to_bin" | "left" | "right" | "reverse" => eval_str_func(name, vals),
+        "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
         "now" | "current_date" | "current_timestamp" | "date_trunc" => {
@@ -9937,6 +10052,106 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             };
             Ok(Value::Text(r.to_string()))
         }
+        // --- v0.16: missing built-ins (pg_regress 42883 cluster) -----------
+        "concat" => {
+            // NULL arguments are ignored; every other type is coerced via
+            // its text output, like Postgres.
+            let mut out = String::new();
+            for v in vals {
+                if let Some(t) = v.to_text() {
+                    out.push_str(&t);
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        "concat_ws" => {
+            // A NULL separator makes the whole result NULL; NULL
+            // arguments are skipped (no stray separators), like Postgres.
+            let sep = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let mut out = String::new();
+            let mut first = true;
+            for v in &vals[1..] {
+                if let Some(t) = v.to_text() {
+                    if !first {
+                        out.push_str(sep);
+                    }
+                    out.push_str(&t);
+                    first = false;
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        "to_hex" | "to_oct" | "to_bin" => {
+            // Postgres width rule: int2/int4 render negatives as 32-bit
+            // two's complement, int8 as 64-bit two's complement; the
+            // width comes from the *type* of the argument, not its range
+            // (so -1234::bigint is 64-bit). Non-negative values render
+            // with no leading zeros.
+            let (wide, v): (bool, i64) = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::SmallInt(i) => (false, *i as i64),
+                Value::Int(i) => (false, *i),
+                Value::BigInt(i) => (true, *i),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let r = if wide {
+                let u = v as u64;
+                match name {
+                    "to_hex" => format!("{:x}", u),
+                    "to_oct" => format!("{:o}", u),
+                    _ => format!("{:b}", u),
+                }
+            } else {
+                let u = (v as i32) as u32;
+                match name {
+                    "to_hex" => format!("{:x}", u),
+                    "to_oct" => format!("{:o}", u),
+                    _ => format!("{:b}", u),
+                }
+            };
+            Ok(Value::Text(r))
+        }
+        "left" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            // Negative n drops the last |n| characters (Postgres rule).
+            let take = if n >= 0 { n.min(len) } else { (len + n).max(0) };
+            Ok(Value::Text(chars[..take as usize].iter().collect()))
+        }
+        "right" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            // Negative n drops the first |n| characters (Postgres rule).
+            let skip = if n >= 0 {
+                (len - n).max(0)
+            } else {
+                (-n).min(len)
+            };
+            Ok(Value::Text(chars[skip as usize..].iter().collect()))
+        }
+        "reverse" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::Text(s.chars().rev().collect()),
+        }),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -10062,6 +10277,24 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 .map(Value::Numeric)
                 .ok_or_else(|| exec_err("22003", "numeric field overflow"))
         }
+        // v0.16: sign() returns -1/0/1 in the input's own type, like
+        // Postgres (NaN stays NaN for floats).
+        "sign" => match v {
+            Value::SmallInt(i) => Ok(Value::SmallInt(i.signum())),
+            Value::Int(i) => Ok(Value::Int(i.signum())),
+            Value::BigInt(i) => Ok(Value::BigInt(i.signum())),
+            Value::Numeric(n) => {
+                let s = match n.cmp(&Numeric::new(0, 0)) {
+                    std::cmp::Ordering::Less => -1i128,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                Ok(Value::Numeric(Numeric::new(s, 0)))
+            }
+            Value::Float4(f) => Ok(Value::Float4(f.signum())),
+            Value::Float(f) => Ok(Value::Float(f.signum())),
+            other => Err(func_arg_err(name, other)),
+        },
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -10183,9 +10416,11 @@ fn func_result_type(
 ) -> Result<ColType, ExecError> {
     let arg0 = || expr_type(eng, snap, own, schemas, ctes, &args[0]);
     match name {
-        "upper" | "lower" | "substring" | "trim" | "replace" | "split_part" => Ok(ColType::Text),
+        "upper" | "lower" | "substring" | "substr" | "trim" | "replace" | "split_part"
+        | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin" | "left" | "right"
+        | "reverse" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
-        "abs" => arg0(),
+        "abs" | "sign" => arg0(),
         "round" | "mod" => Ok(ColType::Numeric),
         "floor" | "ceil" | "ceiling" => match arg0()? {
             ColType::Float4 => Ok(ColType::Float4),
@@ -12239,6 +12474,125 @@ mod tests {
         }
         let rows = rows_of(run(&mut eng, "SELECT name FROM users WHERE id = 1").unwrap());
         assert_eq!(rows, vec![vec!["ann2".to_string()]]);
+    }
+
+    // v0.16: new string/numeric built-ins.
+    #[test]
+    fn v16_string_and_numeric_functions() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        // substr: 1-based, Unicode-aware.
+        assert_eq!(one(&mut eng, "SELECT substr('hello', 2, 3)"), "ell");
+        assert_eq!(one(&mut eng, "SELECT substr('héllo', 2, 3)"), "éll");
+        assert_eq!(one(&mut eng, "SELECT substr('hello', -2, 4)"), "h");
+        assert_eq!(one(&mut eng, "SELECT substr('hello', 99)"), "");
+        // concat / concat_ws: NULL handling.
+        assert_eq!(one(&mut eng, "SELECT concat('a', NULL, 1, true)"), "a1t");
+        assert_eq!(
+            one(&mut eng, "SELECT concat_ws(',', 'a', NULL, 'b')"),
+            "a,b"
+        );
+        assert_eq!(one(&mut eng, "SELECT concat_ws(',', 'a', 'b')"), "a,b");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT concat_ws(NULL, 'a')").unwrap())[0][0],
+            "NULL"
+        );
+        // to_hex / to_oct / to_bin: int4 width vs bigint width (PG parity).
+        assert_eq!(one(&mut eng, "SELECT to_hex(-1234)"), "fffffb2e");
+        assert_eq!(one(&mut eng, "SELECT to_hex(255)"), "ff");
+        assert_eq!(one(&mut eng, "SELECT to_oct(-1234)"), "37777775456");
+        assert_eq!(
+            one(&mut eng, "SELECT to_bin(-1234)"),
+            "11111111111111111111101100101110"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_hex(-1234::bigint)"),
+            "fffffffffffffb2e"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_oct(-1234::bigint)"),
+            "1777777777777777775456"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_bin(-1234::bigint)"),
+            "1111111111111111111111111111111111111111111111111111101100101110"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_bin(9223372036854775807::bigint)"),
+            "111111111111111111111111111111111111111111111111111111111111111"
+        );
+        // sign across int / numeric / float.
+        assert_eq!(one(&mut eng, "SELECT sign(-5)"), "-1");
+        assert_eq!(one(&mut eng, "SELECT sign(0)"), "0");
+        assert_eq!(one(&mut eng, "SELECT sign(2.5)"), "1");
+        assert_eq!(one(&mut eng, "SELECT sign(-2.5::float8)"), "-1");
+        assert_eq!(one(&mut eng, "SELECT sign(0.0::numeric)"), "0");
+        // left / right with negative and oversized counts.
+        assert_eq!(one(&mut eng, "SELECT left('abcdef', 2)"), "ab");
+        assert_eq!(one(&mut eng, "SELECT left('abcdef', -2)"), "abcd");
+        assert_eq!(one(&mut eng, "SELECT left('abcdef', 99)"), "abcdef");
+        assert_eq!(one(&mut eng, "SELECT right('abcdef', 2)"), "ef");
+        assert_eq!(one(&mut eng, "SELECT right('abcdef', -2)"), "cdef");
+        assert_eq!(one(&mut eng, "SELECT left('héllo', 2)"), "hé");
+        // reverse, Unicode-aware.
+        assert_eq!(one(&mut eng, "SELECT reverse('abc')"), "cba");
+        assert_eq!(one(&mut eng, "SELECT reverse('héllo')"), "olléh");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT reverse(NULL)").unwrap())[0][0],
+            "NULL"
+        );
+    }
+
+    // v0.16: cursor_window positioning semantics (Postgres rules).
+    #[test]
+    fn v16_cursor_window() {
+        use crate::server::cursor_window_for_test;
+        use crate::sql::FetchDir;
+        // 4 rows; cursor starts before the first row (-1).
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Forward(Some(1)), -1, 4),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Forward(Some(2)), 0, 4),
+            (1, 3, 2)
+        );
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Forward(None), 2, 4),
+            (3, 4, 3)
+        );
+        // Past the end: empty, parked after the last row.
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Forward(Some(1)), 3, 4),
+            (0, 0, 4)
+        );
+        // BACKWARD excludes the current row and lands on the first returned.
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Backward(Some(3)), 4, 4),
+            (1, 4, 1)
+        );
+        // RELATIVE is relative to the current row (cursor on row 2).
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Relative(-1), 1, 4),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Absolute(2), -1, 4),
+            (1, 2, 1)
+        );
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Absolute(-1), -1, 4),
+            (3, 4, 3)
+        );
+        // ABSOLUTE 0: before the first row, no rows.
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Absolute(0), 2, 4),
+            (0, 0, -1)
+        );
+        assert_eq!(cursor_window_for_test(&FetchDir::First, 2, 4), (0, 1, 0));
+        assert_eq!(cursor_window_for_test(&FetchDir::Last, 2, 4), (3, 4, 3));
     }
 }
 
