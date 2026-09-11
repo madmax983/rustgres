@@ -92,7 +92,7 @@ pub fn parse_date(s: &str) -> Result<i32, String> {
 }
 
 /// Split micros-since-epoch into (days, micros-of-day), Euclidean.
-fn split_micros(micros: i64) -> (i64, i64) {
+pub fn split_micros(micros: i64) -> (i64, i64) {
     const PER_DAY: i64 = 86_400_000_000;
     let mut days = micros / PER_DAY;
     let mut tod = micros % PER_DAY;
@@ -384,6 +384,405 @@ pub fn extract_date(field: &str, days: i32) -> Result<f64, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.17: to_date / to_timestamp / to_char format strings.
+//
+// A documented subset of Postgres' formatting patterns:
+//
+// ```text
+// YYYY  4-digit year (1-4 digits accepted on input)
+// YY    2-digit year (00-69 -> 2000s, 70-99 -> 1900s, Postgres rule)
+// MM    month 01-12
+// DD    day of month 01-31
+// HH24  hour 00-23
+// HH12  hour 01-12 (HH is the same)
+// MI    minutes 00-59
+// SS    seconds 00-59
+// MS    milliseconds (1-3 digits)
+// US    microseconds (1-6 digits)
+// AM/PM meridian indicator (case-insensitive, requires HH12)
+// ```
+//
+// Anything else made of ASCII letters is an *unsupported pattern
+// element* (`FmtErr::Unsupported`, SQLSTATE 0A000). Non-letter
+// characters are literal separators that must match the input
+// (case-insensitively); input that does not match is
+// `FmtErr::Invalid` (SQLSTATE 22008). Missing date parts default to
+// the current date (Postgres behavior); missing time parts default to
+// midnight. A trailing run of whitespace in the input is ignored.
+
+/// Format-string processing error. The exec layer maps `Unsupported`
+/// to SQLSTATE 0A000 and `Invalid` to SQLSTATE 22008.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FmtErr {
+    Unsupported(String),
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FmtTok {
+    Year4,
+    Year2,
+    Month,
+    Day,
+    Hour24,
+    Hour12,
+    Minute,
+    Second,
+    Millis,
+    Micros,
+    AmPm,
+    Lit(char),
+}
+
+/// Split a format string into pattern/literal tokens. Matching is
+/// case-insensitive; the longest pattern wins ("HH24" before "HH").
+fn tokenize_format(fmt: &str) -> Result<Vec<FmtTok>, FmtErr> {
+    // Longest-first so "HH24" is not read as "HH" + literal "24".
+    const PATS: &[(&str, FmtTok)] = &[
+        ("YYYY", FmtTok::Year4),
+        ("HH24", FmtTok::Hour24),
+        ("HH12", FmtTok::Hour12),
+        ("YY", FmtTok::Year2),
+        ("MM", FmtTok::Month),
+        ("DD", FmtTok::Day),
+        ("HH", FmtTok::Hour12),
+        ("MI", FmtTok::Minute),
+        ("SS", FmtTok::Second),
+        ("MS", FmtTok::Millis),
+        ("US", FmtTok::Micros),
+        ("AM", FmtTok::AmPm),
+        ("PM", FmtTok::AmPm),
+    ];
+    let mut toks = Vec::new();
+    let mut rest = fmt;
+    while !rest.is_empty() {
+        let c = match rest.chars().next() {
+            Some(c) => c,
+            None => break, // unreachable: rest is non-empty
+        };
+        if c.is_ascii_alphabetic() {
+            let mut matched = false;
+            for (pat, tok) in PATS {
+                if rest.len() >= pat.len()
+                    && rest.as_bytes()[..pat.len()].eq_ignore_ascii_case(pat.as_bytes())
+                {
+                    toks.push(tok.clone());
+                    rest = &rest[pat.len()..];
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                let run: String = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphabetic())
+                    .collect();
+                return Err(FmtErr::Unsupported(format!(
+                    "pattern element {run:?} is not supported \
+                     (supported: YYYY YY MM DD HH24 HH12 HH MI SS MS US AM PM)"
+                )));
+            }
+        } else {
+            toks.push(FmtTok::Lit(c));
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    Ok(toks)
+}
+
+/// Components parsed from a to_date/to_timestamp input string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedDt {
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
+    pub hour24: Option<u32>,
+    pub hour12: Option<u32>,
+    pub pm: Option<bool>,
+    pub minute: Option<u32>,
+    pub second: Option<u32>,
+    /// Sub-second part as microseconds within the second.
+    pub micros: Option<u32>,
+}
+
+fn fmt_mismatch(input: &str, fmt: &str) -> FmtErr {
+    FmtErr::Invalid(format!("input {input:?} does not match format {fmt:?}"))
+}
+
+/// Take 1..=max ASCII digits from the front of `s`; returns the value
+/// and the byte length consumed.
+fn take_digits(s: &str, max: usize, input: &str, fmt: &str) -> Result<(u32, usize), FmtErr> {
+    let n = s
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .take(max)
+        .count();
+    if n == 0 {
+        return Err(fmt_mismatch(input, fmt));
+    }
+    match s[..n].parse::<u32>() {
+        Ok(v) => Ok((v, n)),
+        Err(_) => Err(fmt_mismatch(input, fmt)),
+    }
+}
+
+fn take_ranged(
+    s: &str,
+    max: usize,
+    lo: u32,
+    hi: u32,
+    input: &str,
+    fmt: &str,
+) -> Result<(u32, usize), FmtErr> {
+    let (v, n) = take_digits(s, max, input, fmt)?;
+    if v < lo || v > hi {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: {v} in input {input:?}"
+        )));
+    }
+    Ok((v, n))
+}
+
+/// Parse `input` against a to_date/to_timestamp/to_char `format`
+/// string. Last occurrence of a repeated pattern wins.
+pub fn parse_with_format(input: &str, fmt: &str) -> Result<ParsedDt, FmtErr> {
+    let toks = tokenize_format(fmt)?;
+    let mut p = ParsedDt::default();
+    let mut s = input.trim();
+    for tok in &toks {
+        match tok {
+            FmtTok::Lit(c) => match s.chars().next() {
+                Some(ch) if ch.eq_ignore_ascii_case(c) => {
+                    s = &s[ch.len_utf8()..];
+                }
+                _ => return Err(fmt_mismatch(input, fmt)),
+            },
+            FmtTok::Year4 => {
+                let (v, n) = take_digits(s, 4, input, fmt)?;
+                p.year = Some(v as i32);
+                s = &s[n..];
+            }
+            FmtTok::Year2 => {
+                let (v, n) = take_digits(s, 2, input, fmt)?;
+                // Postgres rule: 00-69 -> 2000s, 70-99 -> 1900s.
+                p.year = Some(if v <= 69 {
+                    2000 + v as i32
+                } else {
+                    1900 + v as i32
+                });
+                s = &s[n..];
+            }
+            FmtTok::Month => {
+                let (v, n) = take_ranged(s, 2, 1, 12, input, fmt)?;
+                p.month = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Day => {
+                let (v, n) = take_ranged(s, 2, 1, 31, input, fmt)?;
+                p.day = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Hour24 => {
+                let (v, n) = take_ranged(s, 2, 0, 23, input, fmt)?;
+                p.hour24 = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Hour12 => {
+                let (v, n) = take_ranged(s, 2, 1, 12, input, fmt)?;
+                p.hour12 = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Minute => {
+                let (v, n) = take_ranged(s, 2, 0, 59, input, fmt)?;
+                p.minute = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Second => {
+                let (v, n) = take_ranged(s, 2, 0, 59, input, fmt)?;
+                p.second = Some(v);
+                s = &s[n..];
+            }
+            FmtTok::Millis => {
+                let (v, n) = take_digits(s, 3, input, fmt)?;
+                p.micros = Some(v * 10u32.pow(6 - n as u32));
+                s = &s[n..];
+            }
+            FmtTok::Micros => {
+                let (v, n) = take_digits(s, 6, input, fmt)?;
+                p.micros = Some(v * 10u32.pow(6 - n as u32));
+                s = &s[n..];
+            }
+            FmtTok::AmPm => {
+                if s.len() >= 2 && s.as_bytes()[..2].eq_ignore_ascii_case(b"am") {
+                    p.pm = Some(false);
+                    s = &s[2..];
+                } else if s.len() >= 2 && s.as_bytes()[..2].eq_ignore_ascii_case(b"pm") {
+                    p.pm = Some(true);
+                    s = &s[2..];
+                } else {
+                    return Err(fmt_mismatch(input, fmt));
+                }
+            }
+        }
+    }
+    if !s.trim_start().is_empty() {
+        return Err(FmtErr::Invalid(format!(
+            "trailing characters {:?} after input {:?} for format {:?}",
+            s, input, fmt
+        )));
+    }
+    Ok(p)
+}
+
+/// Resolve the hour of day from HH24 / HH12 + AM/PM. HH12 without a
+/// meridian is taken as-is (documented simplification).
+fn resolve_hour(p: &ParsedDt) -> Result<u32, FmtErr> {
+    if p.pm.is_some() && p.hour24.is_some() {
+        return Err(FmtErr::Invalid("cannot use AM/PM with HH24".to_string()));
+    }
+    match (p.hour12, p.pm) {
+        (Some(12), Some(false)) => Ok(0),
+        (Some(12), Some(true)) => Ok(12),
+        (Some(h), Some(true)) => Ok(h + 12),
+        (Some(h), _) => Ok(h),
+        (None, Some(_)) => Err(FmtErr::Invalid("AM/PM requires HH12".to_string())),
+        (None, None) => Ok(p.hour24.unwrap_or(0)),
+    }
+}
+
+/// Validate year/month/day and convert to days since 1970-01-01.
+fn validate_ymd(y: i64, m: i64, d: i64) -> Result<i32, FmtErr> {
+    if !(1..=12).contains(&m) {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: month {m}"
+        )));
+    }
+    let y32 = i32::try_from(y)
+        .map_err(|_| FmtErr::Invalid(format!("date/time field value out of range: year {y}")))?;
+    let dim = days_in_month(y32, m as u32);
+    if d < 1 || d > i64::from(dim) {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: day {d} for month {m}"
+        )));
+    }
+    let days = days_from_civil(y32, m as u32, d as u32);
+    i32::try_from(days)
+        .map_err(|_| FmtErr::Invalid("date/time field value out of range: date".to_string()))
+}
+
+/// `to_date(input, format)` -> days since 1970-01-01. Missing date
+/// parts default to the current date; time patterns are accepted but
+/// ignored (Postgres behavior).
+pub fn to_date_parsed(input: &str, fmt: &str) -> Result<i32, FmtErr> {
+    let p = parse_with_format(input, fmt)?;
+    let (ty, tm, td) = civil_from_days(i64::from(today_days()));
+    let y = p.year.unwrap_or(ty);
+    let m = p.month.unwrap_or(tm);
+    let d = p.day.unwrap_or(td);
+    validate_ymd(i64::from(y), i64::from(m), i64::from(d))
+}
+
+/// `to_timestamp(input, format)` -> micros since 1970-01-01 00:00:00
+/// UTC. Missing date parts default to the current date; missing time
+/// parts default to midnight.
+pub fn to_timestamp_parsed(input: &str, fmt: &str) -> Result<i64, FmtErr> {
+    let p = parse_with_format(input, fmt)?;
+    let (ty, tm, td) = civil_from_days(i64::from(today_days()));
+    let y = p.year.unwrap_or(ty);
+    let m = p.month.unwrap_or(tm);
+    let d = p.day.unwrap_or(td);
+    let days = validate_ymd(i64::from(y), i64::from(m), i64::from(d))?;
+    let h = resolve_hour(&p)?;
+    let mi = p.minute.unwrap_or(0);
+    let se = p.second.unwrap_or(0);
+    let us = p.micros.unwrap_or(0);
+    let tod =
+        (i64::from(h) * 3600 + i64::from(mi) * 60 + i64::from(se)) * 1_000_000 + i64::from(us);
+    Ok(i64::from(days) * 86_400_000_000 + tod)
+}
+
+/// `make_date(year, month, day)` -> days since 1970-01-01.
+pub fn make_date_checked(y: i64, m: i64, d: i64) -> Result<i32, FmtErr> {
+    validate_ymd(y, m, d)
+}
+
+/// `make_timestamp(y, mo, d, h, mi, seconds)` -> micros since
+/// 1970-01-01 00:00:00 UTC. `seconds` may carry a fractional part;
+/// it must satisfy 0.0 <= s < 60.0 (a value rounding up to 60 is
+/// rejected, like Postgres' "date/time field value out of range").
+pub fn make_timestamp_checked(
+    y: i64,
+    mo: i64,
+    d: i64,
+    h: i64,
+    mi: i64,
+    s: f64,
+) -> Result<i64, FmtErr> {
+    let days = validate_ymd(y, mo, d)?;
+    if !(0..=23).contains(&h) {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: hour {h}"
+        )));
+    }
+    if !(0..=59).contains(&mi) {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: minute {mi}"
+        )));
+    }
+    if !s.is_finite() || s < 0.0 || s >= 61.0 {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: seconds {s}"
+        )));
+    }
+    let mut whole = s.floor() as u32; // s < 61, so no overflow
+    let mut frac = ((s - f64::from(whole)) * 1_000_000.0).round() as u32;
+    if frac >= 1_000_000 {
+        frac -= 1_000_000;
+        whole += 1;
+    }
+    if whole >= 60 {
+        return Err(FmtErr::Invalid(format!(
+            "date/time field value out of range: seconds {s}"
+        )));
+    }
+    let tod = (h * 3600 + mi * 60 + i64::from(whole)) * 1_000_000 + i64::from(frac);
+    Ok(i64::from(days) * 86_400_000_000 + tod)
+}
+
+/// `to_char` formatting with the same pattern subset. `days` is the
+/// civil day count, `tod_micros` the (normalized, 0..86400e6)
+/// microseconds of day — pass 0 for plain dates.
+pub fn format_with_pattern(days: i64, tod_micros: i64, fmt: &str) -> Result<String, FmtErr> {
+    let toks = tokenize_format(fmt)?;
+    let (y, m, d) = civil_from_days(days);
+    let hh = tod_micros / 3_600_000_000;
+    let mi = (tod_micros / 60_000_000) % 60;
+    let ss = (tod_micros / 1_000_000) % 60;
+    let us = tod_micros % 1_000_000;
+    let mut out = String::new();
+    for tok in &toks {
+        match tok {
+            FmtTok::Lit(c) => out.push(*c),
+            FmtTok::Year4 => out.push_str(&format!("{y:04}")),
+            FmtTok::Year2 => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            FmtTok::Month => out.push_str(&format!("{m:02}")),
+            FmtTok::Day => out.push_str(&format!("{d:02}")),
+            FmtTok::Hour24 => out.push_str(&format!("{hh:02}")),
+            FmtTok::Hour12 => {
+                let h12 = hh % 12;
+                out.push_str(&format!("{:02}", if h12 == 0 { 12 } else { h12 }));
+            }
+            FmtTok::Minute => out.push_str(&format!("{mi:02}")),
+            FmtTok::Second => out.push_str(&format!("{ss:02}")),
+            FmtTok::Millis => out.push_str(&format!("{:03}", us / 1000)),
+            FmtTok::Micros => out.push_str(&format!("{us:06}")),
+            FmtTok::AmPm => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +834,250 @@ mod tests {
         assert_eq!(extract("month", ts).unwrap(), 9.0);
         assert_eq!(extract("dow", ts).unwrap(), 4.0); // Thursday
         assert_eq!(extract("quarter", ts).unwrap(), 3.0);
+    }
+
+    #[test]
+    fn format_tokenizer() {
+        let toks = tokenize_format("YYYY-MM-DD HH24:MI:SS").unwrap();
+        assert_eq!(toks.len(), 11); // 6 patterns + 5 literal separators
+        assert!(tokenize_format("YYYY-QQ").is_err());
+        assert!(matches!(
+            tokenize_format("YYYY-QQ"),
+            Err(FmtErr::Unsupported(_))
+        ));
+        // Longest match wins: HH24, not HH + "24".
+        assert_eq!(tokenize_format("HH24").unwrap(), vec![FmtTok::Hour24]);
+        // Case-insensitive patterns.
+        assert_eq!(tokenize_format("yyyy/mm/dd").unwrap()[0], FmtTok::Year4);
+    }
+
+    #[test]
+    fn to_date_happy_path() {
+        assert_eq!(
+            format_date(to_date_parsed("2026-01-15", "YYYY-MM-DD").unwrap()),
+            "2026-01-15"
+        );
+        assert_eq!(
+            format_date(to_date_parsed("2026-1-5", "YYYY-MM-DD").unwrap()),
+            "2026-01-05"
+        );
+        assert_eq!(
+            format_date(to_date_parsed("15/01/2026", "DD/MM/YYYY").unwrap()),
+            "2026-01-15"
+        );
+        // YY rule: 00-69 -> 2000s, 70-99 -> 1900s.
+        assert_eq!(
+            format_date(to_date_parsed("26-09-11", "YY-MM-DD").unwrap()),
+            "2026-09-11"
+        );
+        assert_eq!(
+            format_date(to_date_parsed("69-09-11", "YY-MM-DD").unwrap()),
+            "2069-09-11"
+        );
+        assert_eq!(
+            format_date(to_date_parsed("70-09-11", "YY-MM-DD").unwrap()),
+            "1970-09-11"
+        );
+        // Leap day accepted in a leap year.
+        assert_eq!(
+            format_date(to_date_parsed("2024-02-29", "YYYY-MM-DD").unwrap()),
+            "2024-02-29"
+        );
+        // Time patterns are accepted but ignored by to_date.
+        assert_eq!(
+            format_date(to_date_parsed("2026-09-11 23:59", "YYYY-MM-DD HH24:MI").unwrap()),
+            "2026-09-11"
+        );
+    }
+
+    #[test]
+    fn to_date_errors() {
+        // Month 13 / Feb 30 -> 22008-class Invalid.
+        assert!(matches!(
+            to_date_parsed("2026-13-01", "YYYY-MM-DD"),
+            Err(FmtErr::Invalid(_))
+        ));
+        assert!(matches!(
+            to_date_parsed("2026-02-30", "YYYY-MM-DD"),
+            Err(FmtErr::Invalid(_))
+        ));
+        assert!(matches!(
+            to_date_parsed("2023-02-29", "YYYY-MM-DD"),
+            Err(FmtErr::Invalid(_))
+        ));
+        // Input not matching the format -> Invalid.
+        assert!(matches!(
+            to_date_parsed("2026/01/15", "YYYY-MM-DD"),
+            Err(FmtErr::Invalid(_))
+        ));
+        assert!(matches!(
+            to_date_parsed("2026-01-15 junk", "YYYY-MM-DD"),
+            Err(FmtErr::Invalid(_))
+        ));
+        // Unsupported pattern element -> Unsupported (0A000).
+        assert!(matches!(
+            to_date_parsed("2026-01-15", "YYYY-MM-DDD"),
+            Err(FmtErr::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn to_timestamp_happy_path() {
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 13:25:01", "YYYY-MM-DD HH24:MI:SS").unwrap()
+            ),
+            "2026-09-11 13:25:01"
+        );
+        assert_eq!(
+            format_timestamp(to_timestamp_parsed("2026-09-11", "YYYY-MM-DD").unwrap()),
+            "2026-09-11 00:00:00"
+        );
+        // Fractional seconds: MS pads to 3 digits, US to 6.
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 13:25:01.5", "YYYY-MM-DD HH24:MI:SS.MS").unwrap()
+            ),
+            "2026-09-11 13:25:01.5"
+        );
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 13:25:01.123456", "YYYY-MM-DD HH24:MI:SS.US")
+                    .unwrap()
+            ),
+            "2026-09-11 13:25:01.123456"
+        );
+        // 12-hour clock with meridian.
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 01:25 PM", "YYYY-MM-DD HH12:MI AM").unwrap()
+            ),
+            "2026-09-11 13:25:00"
+        );
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 12:00 AM", "YYYY-MM-DD HH12:MI AM").unwrap()
+            ),
+            "2026-09-11 00:00:00"
+        );
+        assert_eq!(
+            format_timestamp(
+                to_timestamp_parsed("2026-09-11 12:00 PM", "YYYY-MM-DD HH12:MI AM").unwrap()
+            ),
+            "2026-09-11 12:00:00"
+        );
+        // HH alone is the 12-hour clock.
+        assert_eq!(
+            format_timestamp(to_timestamp_parsed("2026-09-11 03:00", "YYYY-MM-DD HH:MI").unwrap()),
+            "2026-09-11 03:00:00"
+        );
+    }
+
+    #[test]
+    fn to_timestamp_errors() {
+        // Hour 25, minute 61.
+        assert!(matches!(
+            to_timestamp_parsed("2026-09-11 25:00", "YYYY-MM-DD HH24:MI"),
+            Err(FmtErr::Invalid(_))
+        ));
+        assert!(matches!(
+            to_timestamp_parsed("2026-09-11 13:61", "YYYY-MM-DD HH24:MI"),
+            Err(FmtErr::Invalid(_))
+        ));
+        // AM/PM with HH24 is rejected.
+        assert!(matches!(
+            to_timestamp_parsed("2026-09-11 13:00 PM", "YYYY-MM-DD HH24:MI AM"),
+            Err(FmtErr::Invalid(_))
+        ));
+        // AM/PM without HH12 is rejected.
+        assert!(matches!(
+            to_timestamp_parsed("2026-09-11 PM", "YYYY-MM-DD AM"),
+            Err(FmtErr::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn make_date_checked_cases() {
+        assert_eq!(
+            format_date(make_date_checked(2026, 2, 28).unwrap()),
+            "2026-02-28"
+        );
+        assert_eq!(
+            format_date(make_date_checked(2024, 2, 29).unwrap()),
+            "2024-02-29"
+        );
+        // Invalid: month 13, Feb 30, day 0, Feb 29 in a common year.
+        assert!(make_date_checked(2026, 13, 1).is_err());
+        assert!(make_date_checked(2026, 2, 30).is_err());
+        assert!(make_date_checked(2026, 1, 0).is_err());
+        assert!(make_date_checked(2023, 2, 29).is_err());
+        assert!(make_date_checked(2026, 0, 10).is_err());
+    }
+
+    #[test]
+    fn make_timestamp_checked_cases() {
+        assert_eq!(
+            format_timestamp(make_timestamp_checked(2026, 9, 11, 13, 25, 1.5).unwrap()),
+            "2026-09-11 13:25:01.5"
+        );
+        assert_eq!(
+            format_timestamp(make_timestamp_checked(2026, 1, 1, 0, 0, 0.0).unwrap()),
+            "2026-01-01 00:00:00"
+        );
+        // Fractional rounding carries into the whole second.
+        assert_eq!(
+            format_timestamp(make_timestamp_checked(2026, 1, 1, 0, 0, 1.9999999).unwrap()),
+            "2026-01-01 00:00:02"
+        );
+        // Invalid: hour 24, minute 60, seconds >= 60, negative seconds.
+        assert!(make_timestamp_checked(2026, 1, 1, 24, 0, 0.0).is_err());
+        assert!(make_timestamp_checked(2026, 1, 1, 0, 60, 0.0).is_err());
+        assert!(make_timestamp_checked(2026, 1, 1, 0, 0, 60.0).is_err());
+        assert!(make_timestamp_checked(2026, 1, 1, 0, 0, -1.0).is_err());
+        assert!(make_timestamp_checked(2026, 1, 1, 0, 0, f64::NAN).is_err());
+        assert!(make_timestamp_checked(2026, 13, 1, 0, 0, 0.0).is_err());
+    }
+
+    #[test]
+    fn format_with_pattern_cases() {
+        let ts = parse_timestamp("2026-09-11 13:25:01.123456").unwrap();
+        let (days, tod) = split_micros(ts);
+        assert_eq!(
+            format_with_pattern(days, tod, "YYYY/MM/DD").unwrap(),
+            "2026/09/11"
+        );
+        assert_eq!(
+            format_with_pattern(days, tod, "DD-MM-YY").unwrap(),
+            "11-09-26"
+        );
+        assert_eq!(
+            format_with_pattern(days, tod, "HH24:MI:SS").unwrap(),
+            "13:25:01"
+        );
+        assert_eq!(
+            format_with_pattern(days, tod, "HH12:MI:SS AM").unwrap(),
+            "01:25:01 PM"
+        );
+        assert_eq!(format_with_pattern(days, tod, "SS.MS").unwrap(), "01.123");
+        assert_eq!(
+            format_with_pattern(days, tod, "SS.US").unwrap(),
+            "01.123456"
+        );
+        // Midnight renders 12 AM.
+        let (d0, t0) = split_micros(parse_timestamp("2026-09-11 00:00:00").unwrap());
+        assert_eq!(format_with_pattern(d0, t0, "HH12 AM").unwrap(), "12 AM");
+        // Plain date: time fields render zero.
+        assert_eq!(
+            format_with_pattern(days_from_civil(2026, 9, 11), 0, "YYYY-MM-DD HH24:MI").unwrap(),
+            "2026-09-11 00:00"
+        );
+        // Unsupported pattern -> Unsupported.
+        assert!(matches!(
+            format_with_pattern(days, tod, "YYYY-Q"),
+            Err(FmtErr::Unsupported(_))
+        ));
+        // Literals pass through verbatim (letters that do not form a
+        // supported pattern are rejected, so literals use punctuation).
+        assert_eq!(format_with_pattern(days, tod, "[YYYY]").unwrap(), "[2026]");
     }
 }

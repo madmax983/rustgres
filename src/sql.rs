@@ -1532,6 +1532,37 @@ pub enum Stmt {
     Analyze {
         table: Option<String>,
     },
+    // --- v0.17: transaction characteristics / GUCs -------------------------
+    /// `SET TRANSACTION mode [, ...]` — set characteristics of the
+    /// current transaction (no-op with no transaction, like PG's
+    /// WARNING-less path; we have no NOTICE channel).
+    SetTransaction {
+        level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+        deferrable: Option<bool>,
+    },
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]` —
+    /// defaults for subsequent transactions of this session.
+    SetSessionCharacteristics {
+        level: Option<IsolationLevel>,
+        read_only: Option<bool>,
+        deferrable: Option<bool>,
+    },
+    /// `SET name = value` / `SET name TO value` — session GUC.
+    /// Only `default_transaction_read_only` is honored; anything else
+    /// is 42704 (the GUC surface is intentionally small, documented).
+    Set {
+        name: String,
+        value: SetValue,
+    },
+    /// `SHOW name`.
+    Show {
+        name: String,
+    },
+    /// `RESET name` / `RESET ALL`.
+    Reset {
+        name: String,
+    },
 }
 
 /// v0.10: `INSERT ... ON CONFLICT ...`.
@@ -1589,6 +1620,16 @@ impl Default for CopyOptions {
             escape: b'"',
         }
     }
+}
+
+/// v0.17: value of a `SET name = value` statement.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetValue {
+    /// `DEFAULT` — reset to the built-in default.
+    Default,
+    /// String literal, identifier, or number, as written (idents are
+    /// already case-folded by the tokenizer).
+    Str(String),
 }
 
 /// Transaction isolation level (v0.5). `READ UNCOMMITTED` is accepted and
@@ -2129,6 +2170,16 @@ impl Parser {
                     "syntax error: expected TABLE, SEQUENCE or ROLE after ALTER".to_string(),
                 )),
             },
+            // --- v0.17: SET / SHOW / RESET
+            "set" => self.parse_set(),
+            "show" => Ok(Stmt::Show {
+                name: self.expect_ident()?,
+            }),
+            "reset" => {
+                // RESET name | RESET ALL
+                let name = self.expect_ident()?;
+                Ok(Stmt::Reset { name })
+            }
             // --- v0.10: WITH [RECURSIVE] ... / COPY
             "with" => self.parse_with(),
             "copy" => self.parse_copy(),
@@ -4256,7 +4307,20 @@ impl Parser {
     /// Remainder of BEGIN / START TRANSACTION after the optional
     /// TRANSACTION keyword: `[ISOLATION LEVEL ...]`.
     fn parse_begin_rest(&mut self) -> Result<Stmt, SqlError> {
-        // BEGIN / START TRANSACTION [transaction_mode [, ...]]
+        let (level, read_only, deferrable) = self.parse_txn_modes()?;
+        Ok(Stmt::Begin {
+            level,
+            read_only,
+            deferrable,
+        })
+    }
+
+    /// v0.17: shared `transaction_mode [, ...]` list used by BEGIN,
+    /// START TRANSACTION, SET TRANSACTION, and SET SESSION
+    /// CHARACTERISTICS. Returns (level, read_only, deferrable).
+    fn parse_txn_modes(
+        &mut self,
+    ) -> Result<(Option<IsolationLevel>, Option<bool>, Option<bool>), SqlError> {
         // transaction_mode :=
         //     ISOLATION LEVEL { SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED }
         //   | READ WRITE | READ ONLY
@@ -4300,11 +4364,69 @@ impl Parser {
                 break;
             }
         }
-        Ok(Stmt::Begin {
-            level,
-            read_only,
-            deferrable,
-        })
+        Ok((level, read_only, deferrable))
+    }
+
+    /// v0.17: `SET TRANSACTION ...`, `SET SESSION CHARACTERISTICS ...`,
+    /// or `SET name = value` / `SET name TO value`.
+    fn parse_set(&mut self) -> Result<Stmt, SqlError> {
+        if self.eat_keyword("transaction") {
+            // SET TRANSACTION transaction_mode [, ...]
+            let (level, read_only, deferrable) = self.parse_txn_modes()?;
+            return Ok(Stmt::SetTransaction {
+                level,
+                read_only,
+                deferrable,
+            });
+        }
+        if self.eat_keyword("session") {
+            // SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]
+            self.expect_keyword("characteristics")?;
+            self.expect_keyword("as")?;
+            self.expect_keyword("transaction")?;
+            let (level, read_only, deferrable) = self.parse_txn_modes()?;
+            return Ok(Stmt::SetSessionCharacteristics {
+                level,
+                read_only,
+                deferrable,
+            });
+        }
+        // SET name = value | SET name TO value | SET name TO DEFAULT
+        let name = self.expect_ident()?;
+        if self.eat_keyword("to") {
+            // consumed TO
+        } else if self.peek() == Token::Eq {
+            self.next();
+        } else {
+            return Err(err(format!(
+                "syntax error: expected TO or '=' after SET {}, found {:?}",
+                name,
+                self.peek()
+            )));
+        }
+        let value = match self.next() {
+            Token::Str(s) => SetValue::Str(s),
+            Token::Number(num) => {
+                self.next();
+                SetValue::Str(num)
+            }
+            Token::Ident(kw) => {
+                // A bare keyword value (ON, OFF, TRUE, ...): fold to the
+                // lowercased keyword text. DEFAULT resets the parameter.
+                if kw == "default" {
+                    SetValue::Default
+                } else {
+                    SetValue::Str(kw.to_ascii_lowercase())
+                }
+            }
+            other => {
+                return Err(err(format!(
+                    "syntax error: unexpected SET value {:?}",
+                    other
+                )));
+            }
+        };
+        Ok(Stmt::Set { name, value })
     }
 
     fn parse_isolation_level(&mut self) -> Result<IsolationLevel, SqlError> {

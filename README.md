@@ -1,56 +1,57 @@
-# rustgres v0.16 — "conformance burn-down: functions, cursors, truncate"
+# rustgres v0.17 — "conformance burn-down: READ ONLY, datetime, COPY, version"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 16 of the road to Postgres 19 feature parity. v0.16 burns down
-the next three conformance clusters: ten commonly-used string/numeric
-built-ins (`substr`, `concat`, `concat_ws`, `to_hex`, `to_oct`, `to_bin`,
-`sign`, `left`, `right`, `reverse`), SQL cursors (`DECLARE ... CURSOR FOR
-SELECT`, `FETCH` in all directions, `MOVE`, `CLOSE`, `WITH HOLD`), and
-transactional `TRUNCATE` (including FK `RESTRICT`/`CASCADE`). The required
-Valgrind/Callgrind/DHAT profiling pass on the new workload found no
-hotspots and no leaks: memcheck reports 0 errors, 0 bytes definitely
-lost; the 64 KiB max-live allocation point is the v0.15 thread-local
-read scratch, grown once and reused; callgrind shows the new code paths
-below the noise floor.
-Conformance baseline: **1835 PASS (35.3%)**, 1582 EXPECTED-FAIL, 1776
-REAL-FAIL out of 5193 statements (was 1815/1582/1796 in v0.15).
-1256 cumulative protocol tests pass (90 new in v0.16; the v0.15 README
-understated the pre-v0.16 cumulative total as 1161 — the correct figure
-was 1166), plus 60 unit tests and 53 isolation checks.
+Milestone 17 of the road to Postgres 19 feature parity. v0.17 burns down
+the next four conformance clusters: READ ONLY transaction enforcement
+(SQLSTATE 25006 for writes in read-only transactions/sessions, including
+`SET TRANSACTION`, `SET SESSION CHARACTERISTICS`, and
+`default_transaction_read_only`), high-value date/time built-ins
+(`date_part`, `to_date`/`to_timestamp`/`to_char`, `make_date`/`make_timestamp`,
+`timezone` (UTC), `clock_timestamp`/`statement_timestamp`/`transaction_timestamp`),
+extended-protocol COPY (Parse/Bind/Describe/Execute with CopyIn/CopyOut
+sequencing), and honest version reporting (rustgres reports its own
+`0.17.0`, not a fake PostgreSQL version). The required Valgrind/Callgrind/DHAT
+profiling pass on the new workload found no hotspots and no leaks.
+Conformance baseline: **TBD PASS**, TBD EXPECTED-FAIL, TBD REAL-FAIL
+(pending pg_regress run).
+1388 cumulative protocol tests pass (132 new in v0.17), plus 60 unit tests
+and 53 isolation checks.
 
-## What v0.16 adds (conformance burn-down: functions, cursors, truncate)
+## What v0.17 adds (conformance burn-down: READ ONLY, datetime, COPY, version)
 
-- **String/numeric built-ins.** `substr` (1-based, negative start counts
-  from the end, grapheme-aware via `chars`), `concat` (variadic,
-  skips NULLs, `concat()` → `''`), `concat_ws` (NULL separator → NULL,
-  skips NULL args), `to_hex`/`to_oct`/`to_bin` (two's-complement width
-  follows the argument type: int4 → 32-bit, bigint → 64-bit),
-  `sign` (int, bigint, numeric, float), `left`/`right` (negative
-  length trims from the opposite end), `reverse` (Unicode-aware).
-- **SQL cursors.** `DECLARE name CURSOR [WITH HOLD] FOR SELECT ...`
-  materializes the query result per session; `FETCH` supports `NEXT`,
-  `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD n`,
-  `BACKWARD n`, `ALL`, and bare counts, with rows emitted in travel
-  direction and correct `FETCH n` completion tags. `MOVE` repositions
-  without returning rows. `WITH HOLD` cursors survive `COMMIT`;
-  ordinary cursors close at transaction end; `ROLLBACK` closes all.
-  `ROLLBACK TO SAVEPOINT` preserves FETCH positions (matching
-  PostgreSQL) but still closes cursors declared after the savepoint.
-  Cursor statement errors (`34000` invalid cursor name, and friends)
-  mark an explicit transaction failed, like any other statement error.
-- **Transactional TRUNCATE.** `TRUNCATE [TABLE] name [, ...]
-  [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]` deletes
-  all rows via versioned write ops, so it rolls back with the
-  transaction; FK `RESTRICT` (default) raises `2BP01` when referenced
-  rows exist, `CASCADE` truncates dependents. `RESTART IDENTITY`
-  is parsed but returns `0A000` — sequence ownership is not tracked
-  yet.
-- **Known limitations.** `RESTART IDENTITY` unsupported (`0A000`);
-  cursors are materialized (no `SCROLL` sensitivity to concurrent
-  writes); `FETCH` inside extended-protocol portals not yet wired;
-  server_version still reports 16.0.
+- **READ ONLY enforcement.** `START TRANSACTION READ ONLY`, `SET TRANSACTION
+  READ ONLY` (one-shot for the next transaction), `SET SESSION CHARACTERISTICS
+  AS TRANSACTION READ ONLY` (session default), and `SET
+  default_transaction_read_only = on` (autocommit) all block writes with
+  SQLSTATE `25006`: INSERT/UPDATE/DELETE, COPY FROM, CREATE/DROP/ALTER,
+  CREATE INDEX, TRUNCATE, GRANT/REVOKE, SELECT FOR UPDATE/SHARE, and
+  `nextval()`/`setval()`. Reads (SELECT, COPY TO, `currval()`) stay allowed.
+  Like any statement error, a 25006 aborts the transaction (subsequent
+  commands get `25P02` until ROLLBACK). Transaction control (COMMIT/ROLLBACK)
+  and SET/SHOW/RESET stay usable so the mode can always be exited.
+- **Date/time built-ins.** `date_part` (year/month/day/dow/hour/minute/second
+  and friends; bogus field → `22023`), `to_date`/`to_timestamp`/`to_char`
+  (format-subset: YYYY/MM/DD/HH24/MI/SS), `to_timestamp(float8)` (Unix epoch),
+  `make_date`/`make_timestamp` (out-of-range → `22008`), `timezone('UTC', ...)`
+  (non-UTC → `0A000`), `clock_timestamp()`, `statement_timestamp()`,
+  `transaction_timestamp()`. `age`, justify functions, `make_interval`,
+  `make_time`, `date_bin` remain `42883` (unimplemented, not wrong).
+- **Extended-protocol COPY.** `COPY table TO STDOUT` and `COPY table FROM
+  STDIN` now work via Parse/Bind/Describe/Execute: Describe returns NoData
+  (formats ride in the Copy response), Execute drives CopyOutResponse/
+  CopyData/CopyDone/CommandComplete or CopyInResponse + CopyData/CopyDone/
+  CommandComplete. Errors (bad table → `42P01`, bad data → `22P02`, read-only
+  → `25006`, aborted txn → `25P02`) surface as ErrorResponse with Sync
+  recovery, like other extended-protocol statements.
+- **Honest version reporting.** rustgres no longer claims to be PostgreSQL
+  16.0. Startup `server_version` is `0.17.0`, `SHOW server_version_num`
+  is `1700`, and `version()` returns `rustgres 0.17.0
+  (PostgreSQL-compatible, protocol 3.0)`.
+- **Known limitations.** `SET TRANSACTION` outside a transaction block
+  applies to the next transaction (PG would warn); `timezone()` only
+  supports UTC; `RESTART IDENTITY` still `0A000`.
 
 ## What v0.15 adds (conformance burn-down: transaction syntax)
 

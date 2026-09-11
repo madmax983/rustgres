@@ -87,6 +87,10 @@ pub struct StmtCtx<'a> {
     /// v0.11: authenticated role executing this statement (lowercased).
     /// Owners, grants, and privilege checks all key off this.
     pub role: &'a str,
+    /// v0.17: statement runs read-only — sequence advances (nextval,
+    /// setval) fail with 25006. Set by the server from the effective
+    /// transaction mode.
+    pub read_only: bool,
 }
 
 /// Outcome of executing one statement.
@@ -271,6 +275,7 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     own: ctx.own,
                     session: ctx.session,
                     role: ctx.role,
+                    read_only: ctx.read_only,
                     depth: 0,
                     lock_ids: &mut lock_ids,
                     ctes: Vec::new(),
@@ -415,7 +420,14 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         | Stmt::RollbackTo { .. }
         | Stmt::Release { .. }
         | Stmt::Checkpoint
-        | Stmt::Vacuum { .. } => Err(exec_err(
+        | Stmt::Vacuum { .. }
+        // v0.17: SET/SHOW/RESET and transaction-characteristic statements
+        // are intercepted by server.rs; reaching here is a session bug.
+        | Stmt::SetTransaction { .. }
+        | Stmt::SetSessionCharacteristics { .. }
+        | Stmt::Set { .. }
+        | Stmt::Show { .. }
+        | Stmt::Reset { .. } => Err(exec_err(
             "25001",
             "transaction control statements must go through the session",
         )),
@@ -705,6 +717,9 @@ fn eval_default(
                 own,
                 session,
                 role,
+                // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
+                // statement-blocked when read-only, so this is false.
+                read_only: false,
                 depth: 0,
                 lock_ids: &mut lock_ids,
                 ctes: Vec::new(),
@@ -760,6 +775,9 @@ fn check_row_constraints(
             own,
             session,
             role,
+            // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
+            // statement-blocked when read-only, so this is false.
+            read_only: false,
             depth: 0,
             lock_ids: &mut lock_ids,
             ctes: Vec::new(),
@@ -1421,6 +1439,7 @@ fn materialize_dml_ctes(
         own: ctx.own,
         session: ctx.session,
         role: ctx.role,
+        read_only: ctx.read_only,
         depth: 0,
         lock_ids: &mut lock_ids,
         ctes: Vec::new(),
@@ -1703,6 +1722,7 @@ fn exec_insert(
             own: ctx.own,
             session: ctx.session,
             role: ctx.role,
+            read_only: ctx.read_only,
             depth: 0,
             lock_ids: &mut lock_ids,
             ctes: ctes.clone(),
@@ -4812,6 +4832,8 @@ struct Q<'a, 'b> {
     /// v0.11: acting role, for privilege checks during scans and
     /// sequence-function evaluation.
     role: &'a str,
+    /// v0.17: session is read-only — nextval/setval fail with 25006.
+    read_only: bool,
     /// v0.11: qualifier -> real table name per query level (innermost
     /// last), for the column-privilege pre-pass. `None` = not a base
     /// table (view/CTE/derived); those are checked at their own level.
@@ -7407,6 +7429,7 @@ fn build_source(
                     own: q.own,
                     session: q.session,
                     role: q.role,
+                    read_only: q.read_only,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
@@ -8201,7 +8224,16 @@ fn eval_grouped(
             if matches!(name.as_str(), "nextval" | "currval" | "setval") {
                 check_builtin_arity(name, &vals)?;
                 let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
-                return eval_sequence_func(eng, snap, own, session, q.role, name, &vals);
+                return eval_sequence_func(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    q.role,
+                    q.read_only,
+                    name,
+                    &vals,
+                );
             }
             // Grouped context: no correlated subqueries inside function
             // args here (subqueries take the eval_expr path); dispatch on
@@ -8779,6 +8811,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     own: q.own,
                     session: q.session,
                     role: q.role,
+                    read_only: q.read_only,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
@@ -8811,6 +8844,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     own: q.own,
                     session: q.session,
                     role: q.role,
+                    read_only: q.read_only,
                     depth: q.depth + 1,
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
@@ -8855,6 +8889,7 @@ fn eval_in(
             own: q.own,
             session: q.session,
             role: q.role,
+            read_only: q.read_only,
             depth: q.depth + 1,
             lock_ids: &mut *q.lock_ids,
             ctes: q.ctes.clone(),
@@ -9048,6 +9083,9 @@ fn eval_dml_expr(
         own,
         session,
         role,
+        // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
+        // statement-blocked when read-only, so this is false.
+        read_only: false,
         depth: 0,
         lock_ids: &mut lock_ids,
         ctes: ctes.to_vec(),
@@ -9818,7 +9856,7 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         }
         check_builtin_arity(name, &vals)?;
         let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
-        return eval_sequence_func(eng, snap, own, session, q.role, name, &vals);
+        return eval_sequence_func(eng, snap, own, session, q.role, q.read_only, name, &vals);
     }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
@@ -9844,6 +9882,16 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
         "left" | "right" => n == 2,
         "now" | "current_date" | "current_timestamp" => n == 0,
+        // v0.17: transaction/clock timestamps.
+        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => n == 0,
+        // v0.17: version() takes no arguments.
+        "version" => n == 0,
+        // v0.17: date/time built-in batch.
+        "date_part" | "to_char" | "timezone" => n == 2,
+        "to_date" => n == 2,
+        "to_timestamp" => n == 1 || n == 2, // (float8) or (text, text)
+        "make_date" => n == 3,
+        "make_timestamp" => n == 6,
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress).
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
@@ -9880,9 +9928,26 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
-        "now" | "current_date" | "current_timestamp" | "date_trunc" => {
-            eval_datetime_func(name, vals)
-        }
+        "now"
+        | "current_date"
+        | "current_timestamp"
+        | "date_trunc"
+        | "date_part"
+        | "to_date"
+        | "to_timestamp"
+        | "to_char"
+        | "make_date"
+        | "make_timestamp"
+        | "timezone"
+        | "clock_timestamp"
+        | "statement_timestamp"
+        | "transaction_timestamp" => eval_datetime_func(name, vals),
+        // v0.17: version() reports our own version, not a PG version we
+        // claim to be (see SERVER_VERSION in server.rs).
+        "version" => Ok(Value::Text(format!(
+            "rustgres {} (PostgreSQL-compatible, protocol 3.0)",
+            crate::server::SERVER_VERSION
+        ))),
         "coalesce" | "nullif" | "greatest" | "least" => eval_cond_func(name, vals),
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress
         // conformance): booleq(x,y) ≡ x = y, boolne(x,y) ≡ x <> y, etc.
@@ -10313,6 +10378,15 @@ fn round_scale(n: &Numeric, s: i64) -> Option<Numeric> {
     Some(Numeric::new(rounded.unscaled.checked_mul(mag)?, 0))
 }
 
+/// Map a format-string error to its SQLSTATE: unsupported pattern
+/// elements are 0A000, bad input values are 22008.
+fn fmt_exec_err(e: crate::datetime::FmtErr) -> ExecError {
+    match e {
+        crate::datetime::FmtErr::Unsupported(msg) => exec_err("0A000", msg),
+        crate::datetime::FmtErr::Invalid(msg) => exec_err("22008", msg),
+    }
+}
+
 fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "now" | "current_timestamp" => Ok(Value::Timestamptz(crate::datetime::now_micros())),
@@ -10345,6 +10419,171 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 }),
                 Err(e) => Err(exec_err("22023", e)),
             }
+        }
+        // v0.17: function form of EXTRACT; identical semantics (and
+        // identical numeric result) to `extract(field FROM x)`.
+        "date_part" => {
+            let field = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            eval_extract(field, &vals[1])
+        }
+        // v0.17: parse with a format string (documented pattern subset
+        // in datetime.rs); unsupported patterns are 0A000, bad input
+        // is 22008.
+        "to_date" => {
+            let input = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            match crate::datetime::to_date_parsed(input, fmt) {
+                Ok(d) => Ok(Value::Date(d)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        "to_timestamp" => {
+            if vals.len() == 1 {
+                // to_timestamp(float8): Unix epoch seconds -> timestamptz.
+                let v = &vals[0];
+                if v == &Value::Null {
+                    return Ok(Value::Null);
+                }
+                let secs = match v {
+                    Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric(_)
+                    | Value::Float4(_)
+                    | Value::Float(_) => to_f64v(v),
+                    other => return Err(func_arg_err(name, other)),
+                };
+                let micros = secs * 1_000_000.0;
+                if !micros.is_finite() || micros.abs() >= i64::MAX as f64 {
+                    return Err(exec_err("22008", "timestamp out of range"));
+                }
+                return Ok(Value::Timestamptz(micros.round() as i64));
+            }
+            let input = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            match crate::datetime::to_timestamp_parsed(input, fmt) {
+                Ok(m) => Ok(Value::Timestamp(m)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v0.17: format a date/timestamp/timestamptz with the same
+        // documented pattern subset; renders in UTC (server is
+        // UTC-only).
+        "to_char" => {
+            let v = &vals[0];
+            if v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let (days, tod) = match v {
+                Value::Date(d) => (i64::from(*d), 0),
+                Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::split_micros(*m),
+                other => return Err(func_arg_err(name, other)),
+            };
+            match crate::datetime::format_with_pattern(days, tod, fmt) {
+                Ok(s) => Ok(Value::Text(s)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v0.17: make_date(y, m, d) -> date; out-of-range parts are 22008.
+        "make_date" => {
+            let y = match int_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let m = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let d = match int_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            match crate::datetime::make_date_checked(y, m, d) {
+                Ok(days) => Ok(Value::Date(days)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v0.17: make_timestamp(y, mo, d, h, mi, seconds float8) ->
+        // timestamp. There is no TIME type in the engine, so
+        // make_time() stays 42883 (documented).
+        "make_timestamp" => {
+            let mut ints = [0i64; 5];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                *slot = match int_arg(name, &vals[i])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+            }
+            let secs_v = &vals[5];
+            if secs_v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let secs = match secs_v {
+                Value::SmallInt(_)
+                | Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Numeric(_)
+                | Value::Float4(_)
+                | Value::Float(_) => to_f64v(secs_v),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let [y, mo, d, h, mi] = ints;
+            match crate::datetime::make_timestamp_checked(y, mo, d, h, mi, secs) {
+                Ok(m) => Ok(Value::Timestamp(m)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v0.17: timezone(text, timestamptz) -> timestamp and
+        // timezone(text, timestamp) -> timestamptz. The server is
+        // UTC-only, so only 'UTC' (case-insensitive) is accepted;
+        // anything else is 0A000 (documented).
+        "timezone" => {
+            let zone = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            if !zone.eq_ignore_ascii_case("utc") {
+                return Err(exec_err(
+                    "0A000",
+                    format!("time zone {zone:?} is not supported (server is UTC-only)"),
+                ));
+            }
+            let v = &vals[1];
+            if v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            match v {
+                Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
+                Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+                other => Err(func_arg_err(name, other)),
+            }
+        }
+        // v0.17: the engine does not pin transaction-start time, so
+        // statement_timestamp() and transaction_timestamp() return the
+        // execution time, exactly like clock_timestamp() — a documented
+        // deviation from Postgres, where now()/transaction_timestamp()
+        // are frozen at transaction start.
+        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => {
+            Ok(Value::Timestamptz(crate::datetime::now_micros()))
         }
         _ => Err(exec_err(
             "42883",
@@ -10439,10 +10678,29 @@ fn func_result_type(
             Ok(ColType::Numeric)
         }
         "now" | "current_timestamp" => Ok(ColType::Timestamptz),
+        // v0.17: transaction/clock timestamps are timestamptz.
+        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => {
+            Ok(ColType::Timestamptz)
+        }
         "current_date" => Ok(ColType::Date),
         "date_trunc" => match expr_type(eng, snap, own, schemas, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
             _ => Ok(ColType::Timestamp),
+        },
+        // v0.17: date/time built-in batch.
+        "date_part" => Ok(ColType::Numeric),
+        "to_date" | "make_date" => Ok(ColType::Date),
+        "to_timestamp" => Ok(ColType::Timestamptz),
+        "to_char" => Ok(ColType::Text),
+        // v0.17: version() returns text.
+        "version" => Ok(ColType::Text),
+        "make_timestamp" => Ok(ColType::Timestamp),
+        "timezone" => match expr_type(eng, snap, own, schemas, ctes, &args[1])? {
+            ColType::Timestamptz => Ok(ColType::Timestamp),
+            ColType::Timestamp => Ok(ColType::Timestamptz),
+            // Other inputs are a runtime 42883; Describe still needs a
+            // type, so fall back to timestamptz.
+            _ => Ok(ColType::Timestamptz),
         },
         "coalesce" | "nullif" | "greatest" | "least" => arg0(),
         // v0.9: sequence functions return bigint (INT here).
@@ -12227,6 +12485,7 @@ mod tests {
             writes: &mut writes,
             session: 0,
             role: "postgres",
+            read_only: false,
         };
         execute(eng, &mut ctx, &stmt)
     }
@@ -12418,6 +12677,7 @@ mod tests {
             writes: &mut writes,
             session: 0,
             role: "postgres",
+            read_only: false,
         };
         let sel = parse_statement("SELECT * FROM users WHERE id = 1 FOR UPDATE").unwrap();
         execute(&mut eng, &mut ctx, &sel).unwrap();
@@ -12432,6 +12692,7 @@ mod tests {
             writes: &mut writes2,
             session: 0,
             role: "postgres",
+            read_only: false,
         };
         let upd = parse_statement("UPDATE users SET name = 'x' WHERE id = 1").unwrap();
         let e = execute(&mut eng, &mut ctx2, &upd).unwrap_err();
@@ -12543,6 +12804,239 @@ mod tests {
             rows_of(run(&mut eng, "SELECT reverse(NULL)").unwrap())[0][0],
             "NULL"
         );
+    }
+
+    // v0.17: date/time built-in batch.
+    #[test]
+    fn v17_datetime_functions() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        let err_code =
+            |eng: &mut Engine, sql: &str| -> &'static str { run(eng, sql).unwrap_err().code };
+        // date_part: function form of extract, numeric result.
+        assert_eq!(
+            one(&mut eng, "SELECT date_part('year', DATE '2026-09-11')"),
+            "2026"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT date_part('month', TIMESTAMP '2026-09-11 13:25:01')"
+            ),
+            "9"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT date_part('hour', TIMESTAMPTZ '2026-09-11 13:25:01+00')"
+            ),
+            "13"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT date_part('dow', DATE '2026-09-11')"),
+            "5"
+        ); // Friday
+        assert_eq!(
+            one(&mut eng, "SELECT date_part('quarter', DATE '2026-09-11')"),
+            "3"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT date_part('epoch', DATE '1970-01-02')"),
+            "86400"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT date_part('year', NULL::date)").unwrap())[0][0],
+            "NULL"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT date_part('bogus', DATE '2026-09-11')"),
+            "22023"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT date_part('year', 42)"), "42883");
+        assert_eq!(err_code(&mut eng, "SELECT date_part('year')"), "42883");
+        // to_date with format strings.
+        assert_eq!(
+            one(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-DD')"),
+            "2026-01-15"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_date('15/01/2026', 'DD/MM/YYYY')"),
+            "2026-01-15"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_date('09-11-26', 'MM-DD-YY')"),
+            "2026-09-11"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT to_date(NULL, 'YYYY-MM-DD')").unwrap())[0][0],
+            "NULL"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT to_date('2026-13-01', 'YYYY-MM-DD')"),
+            "22008"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT to_date('2026-02-30', 'YYYY-MM-DD')"),
+            "22008"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
+            "22008"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-QQ')"),
+            "0A000"
+        );
+        // to_timestamp with format strings.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT to_timestamp('2026-09-11 13:25:01', 'YYYY-MM-DD HH24:MI:SS')"
+            ),
+            "2026-09-11 13:25:01"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT to_timestamp('2026-09-11 01:25 PM', 'YYYY-MM-DD HH12:MI AM')"
+            ),
+            "2026-09-11 13:25:00"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_timestamp('2026-09-11', 'YYYY-MM-DD')"),
+            "2026-09-11 00:00:00"
+        );
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "SELECT to_timestamp('2026-09-11 25:00', 'YYYY-MM-DD HH24:MI')"
+            ),
+            "22008"
+        );
+        // to_timestamp(float8): epoch seconds -> timestamptz.
+        assert_eq!(
+            one(&mut eng, "SELECT to_timestamp(0)"),
+            "1970-01-01 00:00:00+00"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_timestamp(86400.5)"),
+            "1970-01-02 00:00:00.5+00"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT to_timestamp(-1)"),
+            "1969-12-31 23:59:59+00"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT to_timestamp(NULL::float8)").unwrap())[0][0],
+            "NULL"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT to_timestamp('x')"), "42883");
+        // to_char formatting.
+        assert_eq!(
+            one(&mut eng, "SELECT to_char(DATE '2026-09-11', 'YYYY/MM/DD')"),
+            "2026/09/11"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT to_char(TIMESTAMP '2026-09-11 13:25:01', 'DD-MM-YYYY HH24:MI:SS')"
+            ),
+            "11-09-2026 13:25:01"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT to_char(TIMESTAMP '2026-09-11 13:25:01', 'HH12:MI AM')"
+            ),
+            "01:25 PM"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT to_char(TIMESTAMPTZ '2026-09-11 13:25:01+00', 'YYYY-MM-DD')"
+            ),
+            "2026-09-11"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT to_char(NULL::date, 'YYYY')").unwrap())[0][0],
+            "NULL"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'QQ')"),
+            "0A000"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT to_char(42, 'YYYY')"), "42883");
+        // make_date / make_timestamp.
+        assert_eq!(one(&mut eng, "SELECT make_date(2026, 9, 11)"), "2026-09-11");
+        assert_eq!(one(&mut eng, "SELECT make_date(2024, 2, 29)"), "2024-02-29");
+        assert_eq!(err_code(&mut eng, "SELECT make_date(2026, 13, 1)"), "22008");
+        assert_eq!(err_code(&mut eng, "SELECT make_date(2026, 2, 30)"), "22008");
+        assert_eq!(err_code(&mut eng, "SELECT make_date(2023, 2, 29)"), "22008");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT make_date(2026, NULL, 1)").unwrap())[0][0],
+            "NULL"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT make_timestamp(2026, 9, 11, 13, 25, 1.5)"),
+            "2026-09-11 13:25:01.5"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT make_timestamp(2026, 1, 1, 0, 0, 0)"),
+            "2026-01-01 00:00:00"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT make_timestamp(2026, 1, 1, 24, 0, 0)"),
+            "22008"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT make_timestamp(2026, 1, 1, 0, 0, 60)"),
+            "22008"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT make_time(1, 2, 3)"), "42883");
+        // timezone(): UTC-only.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT timezone('UTC', TIMESTAMPTZ '2026-09-11 13:25:01+00')"
+            ),
+            "2026-09-11 13:25:01"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT timezone('utc', TIMESTAMP '2026-09-11 13:25:01')"
+            ),
+            "2026-09-11 13:25:01+00"
+        );
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "SELECT timezone('America/Chicago', TIMESTAMPTZ '2026-09-11 13:25:01+00')"
+            ),
+            "0A000"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT timezone('UTC', DATE '2026-09-11')"),
+            "42883"
+        );
+        // clock/statement/transaction timestamps return timestamptz now.
+        let ts = one(&mut eng, "SELECT clock_timestamp()");
+        assert!(ts.len() >= 19, "clock_timestamp() returned {ts:?}");
+        let ts2 = one(&mut eng, "SELECT statement_timestamp()");
+        assert!(ts2.len() >= 19);
+        let ts3 = one(&mut eng, "SELECT transaction_timestamp()");
+        assert!(ts3.len() >= 19);
+        assert_eq!(err_code(&mut eng, "SELECT clock_timestamp(1)"), "42883");
+        // Deliberately unimplemented: 42883.
+        assert_eq!(err_code(&mut eng, "SELECT age(now())"), "42883");
+        assert_eq!(err_code(&mut eng, "SELECT make_interval(1)"), "42883");
+        assert_eq!(
+            err_code(&mut eng, "SELECT date_bin('1 day', now(), now())"),
+            "42883"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT justify_days(now())"), "42883");
     }
 
     // v0.16: cursor_window positioning semantics (Postgres rules).
@@ -13655,6 +14149,7 @@ fn eval_sequence_func(
     own: u64,
     session: u64,
     role: &str,
+    read_only: bool,
     name: &str,
     vals: &[Value],
 ) -> Result<Value, ExecError> {
@@ -13670,6 +14165,13 @@ fn eval_sequence_func(
     };
     match name {
         "nextval" => {
+            // v0.17: advancing a sequence is a write — blocked read-only.
+            if read_only {
+                return Err(exec_err(
+                    "25006",
+                    "cannot execute nextval() in a read-only transaction".to_string(),
+                ));
+            }
             let s = seq_name(&vals[0])?;
             Ok(Value::BigInt(seq_nextval(
                 eng, snap, own, session, role, &s,
@@ -13682,6 +14184,13 @@ fn eval_sequence_func(
             )?))
         }
         "setval" => {
+            // v0.17: like nextval, setting a sequence is a write.
+            if read_only {
+                return Err(exec_err(
+                    "25006",
+                    "cannot execute setval() in a read-only transaction".to_string(),
+                ));
+            }
             let s = seq_name(&vals[0])?;
             let v = match vals[1] {
                 Value::Int(i) => i as i64,

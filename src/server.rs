@@ -14,7 +14,7 @@ use crate::copy;
 use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
 use crate::repl;
-use crate::sql::{self, CopyFormat, CopyOptions, FetchDir, IsolationLevel, Stmt};
+use crate::sql::{self, CopyFormat, CopyOptions, FetchDir, IsolationLevel, SetValue, Stmt};
 use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
 
@@ -72,7 +72,28 @@ pub(crate) struct Session {
     txn: Option<Txn>,
     /// v0.16: open SQL cursors (DECLARE), keyed by cursor name.
     cursors: HashMap<String, SqlCursor>,
+    // --- v0.17: session transaction defaults ---------------------------
+    // SET SESSION CHARACTERISTICS AS TRANSACTION ... stores the defaults
+    // for the next explicit transaction (like PG). None = not specified.
+    default_txn_level: Option<IsolationLevel>,
+    default_txn_read_only: Option<bool>,
+    default_txn_deferrable: Option<bool>,
+    // v0.17: SET TRANSACTION outside a transaction block stores
+    // characteristics for the NEXT transaction only (one-shot).
+    next_txn_level: Option<IsolationLevel>,
+    next_txn_read_only: Option<bool>,
+    next_txn_deferrable: Option<bool>,
 }
+
+/// v0.17: honest version identity. rustgres reports its OWN version, not
+/// a PostgreSQL version it claims to be: the server speaks protocol 3.0
+/// but is not feature-identical to any PG release, so advertising "16.0"
+/// was misleading (it implied PG 16 compatibility we do not have).
+/// `SERVER_VERSION_NUM` applies PG's XXYYZZ scheme to our own 0.17.0.
+/// `SHOW server_version`, `SHOW server_version_num`, `version()`, and the
+/// startup ParameterStatus all read these constants so they agree.
+pub(crate) const SERVER_VERSION: &str = "0.17.0";
+pub(crate) const SERVER_VERSION_NUM: &str = "1700";
 
 /// Connection ids; process-local is fine (currval is in-memory only).
 static NEXT_SID: AtomicU64 = AtomicU64::new(1);
@@ -86,7 +107,8 @@ struct Txn {
     xid: u64,
     level: IsolationLevel,
     /// v0.15: READ ONLY / READ WRITE mode (None = not specified).
-    /// Parsed for PostgreSQL compatibility; not yet enforced.
+    /// v0.17: enforced — writes fail with 25006 (see
+    /// `check_read_only` in run_statement).
     read_only: Option<bool>,
     /// v0.15: [NOT] DEFERRABLE mode (None = not specified).
     /// Parsed for PostgreSQL compatibility; not yet enforced.
@@ -117,6 +139,12 @@ impl Session {
             in_error: false,
             txn: None,
             cursors: HashMap::new(),
+            default_txn_level: None,
+            default_txn_read_only: None,
+            default_txn_deferrable: None,
+            next_txn_level: None,
+            next_txn_read_only: None,
+            next_txn_deferrable: None,
         }
     }
 }
@@ -332,7 +360,7 @@ fn run_connection(
 
     // ParameterStatus
     let params: &[(&str, &str)] = &[
-        ("server_version", "16.0"),
+        ("server_version", SERVER_VERSION),
         ("server_encoding", "UTF8"),
         ("client_encoding", "UTF8"),
         ("DateStyle", "ISO, MDY"),
@@ -664,7 +692,7 @@ fn message_loop(
             b'P' => handle_parse(writer, session, &msg.payload)?,
             b'B' => handle_bind(writer, engine, session, &msg.payload)?,
             b'D' => handle_describe(writer, engine, session, &msg.payload)?,
-            b'E' => handle_execute(writer, engine, wal, session, &msg.payload)?,
+            b'E' => handle_execute(reader, writer, engine, wal, session, &msg.payload)?,
             b'C' => handle_close(writer, session, &msg.payload)?,
             b'X' => break, // Terminate
             b'H' => {
@@ -799,6 +827,16 @@ fn handle_query(
             options,
         } = &stmt
         {
+            // v0.17: READ ONLY enforcement — COPY FROM is a write.
+            // (COPY TO is a read and stays allowed.)
+            if !to_stdout && effective_read_only(session) {
+                send_error(
+                    stream,
+                    "25006",
+                    "cannot execute COPY in a read-only transaction",
+                )?;
+                break;
+            }
             let copy_ok = if *to_stdout {
                 handle_copy_to(stream, engine, wal, session, table, columns, options)
             } else {
@@ -863,80 +901,126 @@ fn handle_query(
 // v0.10: COPY protocol
 // ---------------------------------------------------------------------------
 
-/// v0.10: `COPY table TO STDOUT` — CopyOutResponse, CopyData rows,
-/// CopyDone, then `COPY n`.
-fn handle_copy_to(
-    stream: &mut Writer,
+/// v0.17: outcome of reading the COPY FROM data stream.
+enum CopyFromRead {
+    /// CopyDone received — the raw accumulated bytes.
+    Done(Vec<u8>),
+    /// CopyFail or an unexpected message — (SQLSTATE, message) for the
+    /// caller to report through its protocol path.
+    SqlError(String, String),
+}
+
+/// v0.17: read CopyData until CopyDone / CopyFail — shared by the simple
+/// and extended protocol COPY FROM paths. A client Terminate ('X') or a
+/// transport failure is an io error (abort the connection); anything else
+/// unexpected becomes an 08P01 SQL error for the caller to report.
+fn copy_from_read(reader: &mut TcpStream) -> io::Result<CopyFromRead> {
+    let mut data = Vec::new();
+    loop {
+        let msg = read_message(reader)?;
+        match msg.typ {
+            b'd' => {
+                data.extend_from_slice(&msg.payload);
+            }
+            b'c' => return Ok(CopyFromRead::Done(data)), // CopyDone
+            b'f' => {
+                // CopyFail: the client reports why.
+                let reason = String::from_utf8_lossy(&msg.payload);
+                return Ok(CopyFromRead::SqlError(
+                    "57000".to_string(),
+                    format!("COPY failed: {}", reason),
+                ));
+            }
+            b'X' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client terminated during COPY",
+                ));
+            }
+            _ => {
+                return Ok(CopyFromRead::SqlError(
+                    "08P01".to_string(),
+                    format!(
+                        "unexpected message '{}' during COPY FROM STDIN",
+                        msg.typ as char
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// v0.17: COPY TO data fetch — shared by the simple and extended
+/// protocol paths. Runs under the session's transaction context
+/// (aborted txn -> 25P02; data errors mark the txn failed, like
+/// run_statement). Returns ExecError for the caller to report through
+/// its own protocol path.
+fn copy_to_fetch(
     engine: &Arc<Mutex<Engine>>,
-    _wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     table: &str,
     columns: &Option<Vec<String>>,
-    options: &CopyOptions,
-) -> io::Result<()> {
-    // Run the SELECT under the session's transaction context (like
-    // run_statement: aborted txn -> 25P02).
+) -> Result<(Vec<(String, ColType)>, Vec<Vec<Value>>), exec::ExecError> {
     if let Some(t) = &session.txn {
         if t.failed {
-            send_error(
-                stream,
-                "25P02",
-                "current transaction is aborted, commands ignored until end of transaction block",
-            )?;
-            stream.flush()?;
-            return Ok(());
+            return Err(exec::ExecError {
+                code: "25P02",
+                message:
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                        .to_string(),
+            });
         }
     }
-    let (cols, rows) = {
-        let mut guard = lock_engine(engine);
-        // Snapshot/transaction handling mirrors txn_execute/autocommit.
-        if session.txn.is_some() {
-            let t = session.txn.as_mut().unwrap();
-            let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+    let mut guard = lock_engine(engine);
+    if session.txn.is_some() {
+        let t = session.txn.as_mut().unwrap();
+        let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: xid,
+            level,
+            session: session.sid,
+            role: &session.role,
+            read_only: t.read_only == Some(true),
+            writes: &mut t.writes,
+        };
+        match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                t.failed = true;
+                Err(e)
+            }
+        }
+    } else {
+        let xid = guard.begin_txn();
+        let snap = guard.take_snapshot();
+        let mut writes: Vec<WriteOp> = Vec::new();
+        let result = {
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
-                level,
+                level: IsolationLevel::ReadCommitted,
                 session: session.sid,
                 role: &session.role,
-                writes: &mut t.writes,
+                read_only: session.default_txn_read_only == Some(true),
+                writes: &mut writes,
             };
-            match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
-                Ok(r) => r,
-                Err(e) => {
-                    t.failed = true;
-                    send_error(stream, e.code, &e.message)?;
-                    stream.flush()?;
-                    return Ok(());
-                }
-            }
-        } else {
-            let xid = guard.begin_txn();
-            let snap = guard.take_snapshot();
-            let mut writes: Vec<WriteOp> = Vec::new();
-            let result = {
-                let mut ctx = StmtCtx {
-                    snap: &snap,
-                    own: xid,
-                    level: IsolationLevel::ReadCommitted,
-                    session: session.sid,
-                    role: &session.role,
-                    writes: &mut writes,
-                };
-                exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
-            };
-            // COPY TO is read-only; retire the xid.
-            retire_txn(&mut guard, xid);
-            match result {
-                Ok(r) => r,
-                Err(e) => {
-                    send_error(stream, e.code, &e.message)?;
-                    stream.flush()?;
-                    return Ok(());
-                }
-            }
-        }
-    };
+            exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
+        };
+        // COPY TO is read-only; retire the xid.
+        retire_txn(&mut guard, xid);
+        result
+    }
+}
+
+/// v0.17: send CopyOutResponse + CopyData (header + rows) + CopyDone —
+/// shared by the simple and extended protocol COPY TO paths.
+fn send_copy_out(
+    stream: &mut Writer,
+    cols: &[(String, ColType)],
+    rows: &[Vec<Value>],
+    options: &CopyOptions,
+) -> io::Result<()> {
     // CopyOutResponse: format (0=text, 1=csv), column count, per-column
     // format codes (all text=0).
     let fmt: i8 = match options.format {
@@ -945,7 +1029,7 @@ fn handle_copy_to(
     };
     let mut b = MsgBuilder::new(b'H');
     b.u8(fmt as u8).i16(cols.len() as i16);
-    for _ in &cols {
+    for _ in cols {
         b.i16(0);
     }
     b.send(stream)?;
@@ -959,7 +1043,7 @@ fn handle_copy_to(
     }
     // Data rows.
     let mut data = Vec::new();
-    for row in &rows {
+    for row in rows {
         data.clear();
         let mut fields = Vec::with_capacity(row.len());
         let mut nulls = Vec::with_capacity(row.len());
@@ -979,6 +1063,153 @@ fn handle_copy_to(
         MsgBuilder::new(b'd').bytes(&data).send(stream)?;
     }
     MsgBuilder::new(b'c').send(stream)?; // CopyDone
+    Ok(())
+}
+
+/// v0.17: resolve the COPY FROM column count (validates table/columns) —
+/// shared by the simple and extended protocol paths.
+fn copy_from_ncols(
+    engine: &Arc<Mutex<Engine>>,
+    table: &str,
+    columns: &Option<Vec<String>>,
+) -> Result<usize, exec::ExecError> {
+    let mut guard = lock_engine(engine);
+    let snap = guard.take_snapshot();
+    // Use a throwaway xid for the snapshot owner (read-only).
+    let xid = guard.begin_txn();
+    let r = exec::copy_ncols(&*guard, &snap, xid, table, columns);
+    retire_txn(&mut guard, xid);
+    r
+}
+
+/// v0.17: parse COPY FROM bytes and insert — shared by the simple and
+/// extended protocol paths. A parse error rolls back the transaction
+/// (if any), like the v0.10 simple-protocol behavior; an insert error
+/// marks it failed. Returns the inserted row count.
+fn copy_from_ingest(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    options: &CopyOptions,
+    ncols: usize,
+    data: &[u8],
+) -> Result<u64, exec::ExecError> {
+    // Parse (line-numbered errors).
+    let parsed = match copy::parse_rows(data, options, ncols) {
+        Ok(r) => r,
+        Err(e) => {
+            // The failed COPY aborts the transaction (like Postgres).
+            if session.txn.is_some() {
+                let _ = txn_rollback(engine, session, false);
+            }
+            return Err(exec::ExecError {
+                code: "22P04",
+                message: format!("COPY error on line {}: {}", e.line, e.message),
+            });
+        }
+    };
+    // Insert (transactional: uses the session txn if any, else autocommit).
+    if session.txn.is_some() {
+        let mut guard = lock_engine(engine);
+        let t = session.txn.as_mut().unwrap();
+        let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+        let r = {
+            let mut ctx = StmtCtx {
+                snap: &snap,
+                own: xid,
+                level,
+                session: session.sid,
+                role: &session.role,
+                read_only: t.read_only == Some(true),
+                writes: &mut t.writes,
+            };
+            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
+        };
+        if r.is_err() {
+            t.failed = true;
+        }
+        r
+    } else {
+        let mut guard = lock_engine(engine);
+        let xid = guard.begin_txn();
+        let snap = guard.take_snapshot();
+        let mut writes: Vec<WriteOp> = Vec::new();
+        let r = {
+            let mut ctx = StmtCtx {
+                snap: &snap,
+                own: xid,
+                level: IsolationLevel::ReadCommitted,
+                session: session.sid,
+                role: &session.role,
+                read_only: session.default_txn_read_only == Some(true),
+                writes: &mut writes,
+            };
+            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
+        };
+        // Mirror autocommit_execute: undo+retire on failure; WAL+retire on
+        // success.
+        match r {
+            Ok(n) => {
+                let records = match wal::records_for_commit(&guard, xid, &writes) {
+                    Ok(r) => r,
+                    Err(msg) => {
+                        undo_all(&mut guard, xid, &writes);
+                        retire_txn(&mut guard, xid);
+                        auto_vacuum(&mut guard, &writes);
+                        return Err(exec::ExecError {
+                            code: "40001",
+                            message: format!(
+                                "could not serialize access due to concurrent update: {}",
+                                msg
+                            ),
+                        });
+                    }
+                };
+                if let Err(e) = lock_wal(wal).append_batch(&records) {
+                    undo_all(&mut guard, xid, &writes);
+                    retire_txn(&mut guard, xid);
+                    auto_vacuum(&mut guard, &writes);
+                    return Err(exec::ExecError {
+                        code: "58000",
+                        message: format!("WAL write failed: {}", e),
+                    });
+                }
+                retire_txn(&mut guard, xid);
+                auto_vacuum(&mut guard, &writes);
+                Ok(n)
+            }
+            Err(e) => {
+                undo_all(&mut guard, xid, &writes);
+                retire_txn(&mut guard, xid);
+                auto_vacuum(&mut guard, &writes);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// v0.10: `COPY table TO STDOUT` — CopyOutResponse, CopyData rows,
+/// CopyDone, then `COPY n`.
+fn handle_copy_to(
+    stream: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    _wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    options: &CopyOptions,
+) -> io::Result<()> {
+    let (cols, rows) = match copy_to_fetch(engine, session, table, columns) {
+        Ok(r) => r,
+        Err(e) => {
+            send_error(stream, e.code, &e.message)?;
+            stream.flush()?;
+            return Ok(());
+        }
+    };
+    send_copy_out(stream, &cols, &rows, options)?;
     MsgBuilder::new(b'C')
         .cstr(&format!("COPY {}", rows.len()))
         .send(stream)?;
@@ -1010,20 +1241,12 @@ fn handle_copy_from(
         }
     }
     // Resolve the column count first (validates table/columns).
-    let ncols = {
-        let mut guard = lock_engine(engine);
-        let snap = guard.take_snapshot();
-        // Use a throwaway xid for the snapshot owner (read-only).
-        let xid = guard.begin_txn();
-        let r = exec::copy_ncols(&*guard, &snap, xid, table, columns);
-        retire_txn(&mut guard, xid);
-        match r {
-            Ok(n) => n,
-            Err(e) => {
-                send_error(stream, e.code, &e.message)?;
-                stream.flush()?;
-                return Ok(());
-            }
+    let ncols = match copy_from_ncols(engine, table, columns) {
+        Ok(n) => n,
+        Err(e) => {
+            send_error(stream, e.code, &e.message)?;
+            stream.flush()?;
+            return Ok(());
         }
     };
     // CopyInResponse.
@@ -1039,148 +1262,114 @@ fn handle_copy_from(
     b.send(stream)?;
     stream.flush()?;
     // Collect CopyData until CopyDone / CopyFail.
-    let mut data = Vec::new();
-    loop {
-        let msg = read_message(reader)?;
-        match msg.typ {
-            b'd' => {
-                data.extend_from_slice(&msg.payload);
-            }
-            b'c' => break, // CopyDone
-            b'f' => {
-                // CopyFail: abort the copy.
-                let reason = String::from_utf8_lossy(&msg.payload);
-                send_error(stream, "57000", &format!("COPY failed: {}", reason))?;
-                stream.flush()?;
-                return Ok(());
-            }
-            b'X' => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "client terminated during COPY",
-                ));
-            }
-            _ => {
-                send_error(
-                    stream,
-                    "08P01",
-                    &format!(
-                        "unexpected message '{}' during COPY FROM STDIN",
-                        msg.typ as char
-                    ),
-                )?;
-                stream.flush()?;
-                return Ok(());
-            }
-        }
-    }
-    // Parse (line-numbered errors).
-    let parsed = match copy::parse_rows(&data, options, ncols) {
-        Ok(r) => r,
-        Err(e) => {
-            send_error(
-                stream,
-                "22P04",
-                &format!("COPY error on line {}: {}", e.line, e.message),
-            )?;
+    let data = match copy_from_read(reader)? {
+        CopyFromRead::Done(d) => d,
+        CopyFromRead::SqlError(code, msg) => {
+            send_error(stream, &code, &msg)?;
             stream.flush()?;
-            // The failed COPY aborts the transaction (like Postgres).
-            if session.txn.is_some() {
-                let _ = txn_rollback(engine, session, false);
-            }
             return Ok(());
         }
     };
-    // Insert (transactional: uses the session txn if any, else autocommit).
-    let insert_result = if session.txn.is_some() {
-        let mut guard = lock_engine(engine);
-        let t = session.txn.as_mut().unwrap();
-        let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
-        let r = {
-            let mut ctx = StmtCtx {
-                snap: &snap,
-                own: xid,
-                level,
-                session: session.sid,
-                role: &session.role,
-                writes: &mut t.writes,
-            };
-            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
-        };
-        if r.is_err() {
-            t.failed = true;
-        }
-        r.map_err(|e| (e.code, e.message))
-    } else {
-        let mut guard = lock_engine(engine);
-        let xid = guard.begin_txn();
-        let snap = guard.take_snapshot();
-        let mut writes: Vec<WriteOp> = Vec::new();
-        let r = {
-            let mut ctx = StmtCtx {
-                snap: &snap,
-                own: xid,
-                level: IsolationLevel::ReadCommitted,
-                session: session.sid,
-                role: &session.role,
-                writes: &mut writes,
-            };
-            exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
-        };
-        // Mirror autocommit_execute: undo+retire on failure; WAL+retire on
-        // success.
-        match r {
-            Ok(n) => {
-                let records = match wal::records_for_commit(&guard, xid, &writes) {
-                    Ok(r) => r,
-                    Err(msg) => {
-                        undo_all(&mut guard, xid, &writes);
-                        retire_txn(&mut guard, xid);
-                        auto_vacuum(&mut guard, &writes);
-                        send_error(
-                            stream,
-                            "40001",
-                            &format!(
-                                "could not serialize access due to concurrent update: {}",
-                                msg
-                            ),
-                        )?;
-                        stream.flush()?;
-                        return Ok(());
-                    }
-                };
-                if let Err(e) = lock_wal(wal).append_batch(&records) {
-                    undo_all(&mut guard, xid, &writes);
-                    retire_txn(&mut guard, xid);
-                    auto_vacuum(&mut guard, &writes);
-                    send_error(stream, "58000", &format!("WAL write failed: {}", e))?;
-                    stream.flush()?;
-                    return Ok(());
-                }
-                retire_txn(&mut guard, xid);
-                auto_vacuum(&mut guard, &writes);
-                Ok(n)
-            }
-            Err(e) => {
-                undo_all(&mut guard, xid, &writes);
-                retire_txn(&mut guard, xid);
-                auto_vacuum(&mut guard, &writes);
-                Err((e.code, e.message))
-            }
-        }
-    };
-    match insert_result {
+    // Parse + insert.
+    match copy_from_ingest(engine, wal, session, table, columns, options, ncols, &data) {
         Ok(n) => {
             MsgBuilder::new(b'C')
                 .cstr(&format!("COPY {}", n))
                 .send(stream)?;
         }
-        Err((code, msg)) => {
-            send_error(stream, code, &msg)?;
+        Err(e) => {
+            send_error(stream, e.code, &e.message)?;
         }
     }
     stream.flush()?;
     Ok(())
+}
+
+/// v0.17: extended-protocol COPY — driven from `handle_execute` when the
+/// portal's statement is `Stmt::Copy`. Uses the shared fetch/format/ingest
+/// helpers; errors go through `protocol_error` (ErrorResponse + mark the
+/// transaction failed + wait for Sync), matching extended-protocol
+/// recovery semantics.
+///
+/// Wire sequence for COPY TO: CopyOutResponse ('H'), CopyData ('d') * N,
+/// CopyDone ('c'), CommandComplete ('C').
+/// Wire sequence for COPY FROM: CopyInResponse ('G'), then the server
+/// reads CopyData ('d') / CopyDone ('c') / CopyFail ('f'), then
+/// CommandComplete ('C') or ErrorResponse.
+fn handle_copy_extended(
+    reader: &mut TcpStream,
+    stream: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    portal_name: &str,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    to_stdout: bool,
+    options: &CopyOptions,
+) -> io::Result<()> {
+    // v0.17: READ ONLY enforcement applies to extended COPY too (COPY
+    // FROM is a write; COPY TO is a read).
+    if !to_stdout && effective_read_only(session) {
+        return protocol_error(
+            stream,
+            session,
+            "25006",
+            "cannot execute COPY in a read-only transaction",
+        );
+    }
+    if to_stdout {
+        let (cols, rows) = match copy_to_fetch(engine, session, table, columns) {
+            Ok(r) => r,
+            Err(e) => return protocol_error(stream, session, e.code, &e.message),
+        };
+        send_copy_out(stream, &cols, &rows, options)?;
+        let tag = format!("COPY {}", rows.len());
+        MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
+        let portal = session.portals.get_mut(portal_name).unwrap();
+        portal.done = true;
+        portal.last_tag = Some(tag);
+        stream.flush()?;
+        Ok(())
+    } else {
+        // Resolve the column count first (validates table/columns).
+        let ncols = match copy_from_ncols(engine, table, columns) {
+            Ok(n) => n,
+            Err(e) => return protocol_error(stream, session, e.code, &e.message),
+        };
+        // CopyInResponse.
+        let fmt: i8 = match options.format {
+            CopyFormat::Text => 0,
+            CopyFormat::Csv => 1,
+        };
+        let mut b = MsgBuilder::new(b'G');
+        b.u8(fmt as u8).i16(ncols as i16);
+        for _ in 0..ncols {
+            b.i16(0);
+        }
+        b.send(stream)?;
+        stream.flush()?;
+        // Collect CopyData until CopyDone / CopyFail.
+        let data = match copy_from_read(reader)? {
+            CopyFromRead::Done(d) => d,
+            CopyFromRead::SqlError(code, msg) => {
+                return protocol_error(stream, session, &code, &msg);
+            }
+        };
+        // Parse + insert.
+        match copy_from_ingest(engine, wal, session, table, columns, options, ncols, &data) {
+            Ok(n) => {
+                let tag = format!("COPY {}", n);
+                MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
+                let portal = session.portals.get_mut(portal_name).unwrap();
+                portal.done = true;
+                portal.last_tag = Some(tag);
+                stream.flush()?;
+                Ok(())
+            }
+            Err(e) => protocol_error(stream, session, e.code, &e.message),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,7 +1493,14 @@ fn cursor_declare(
     let result = if session.txn.is_some() {
         txn_execute(engine, session, &sel)
     } else {
-        autocommit_execute(engine, wal, session.sid, &session.role, &sel)
+        autocommit_execute(
+            engine,
+            wal,
+            session.sid,
+            &session.role,
+            session.default_txn_read_only == Some(true),
+            &sel,
+        )
     };
     match result {
         Ok(ExecResult::Select { columns, rows }) => {
@@ -1383,6 +1579,200 @@ fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult,
 ///   Statement atomicity comes from the executor's validate-then-apply
 ///   discipline: a failed statement stages no writes, so there is nothing
 ///   to undo — and nothing is logged for it.
+/// v0.17: effective read-only-ness for the next statement. Inside an
+/// explicit transaction the transaction's own mode governs (set at BEGIN
+/// from the statement's modes or the session defaults); in autocommit
+/// the `default_transaction_read_only` GUC governs.
+fn effective_read_only(session: &Session) -> bool {
+    match &session.txn {
+        Some(t) => t.read_only == Some(true),
+        None => session.default_txn_read_only == Some(true),
+    }
+}
+
+/// v0.17: classify a statement for read-only enforcement. Returns the
+/// command name for the 25006 error when the statement writes or locks
+/// rows and the session is read-only; None when the statement is a
+/// pure read (or transaction/session control, which must stay usable).
+fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
+    match stmt {
+        Stmt::Insert { .. } => Some("INSERT"),
+        Stmt::Update { .. } => Some("UPDATE"),
+        Stmt::Delete { .. } => Some("DELETE"),
+        // COPY FROM STDIN writes; COPY TO STDOUT is a read.
+        Stmt::Copy { to_stdout, .. } => {
+            if *to_stdout {
+                None
+            } else {
+                Some("COPY")
+            }
+        }
+        Stmt::Truncate { .. } => Some("TRUNCATE"),
+        Stmt::Select(s) if s.for_update => Some("SELECT FOR UPDATE"),
+        // DDL (schema and privilege changes are writes).
+        Stmt::CreateTable { .. } => Some("CREATE TABLE"),
+        Stmt::AlterTable { .. } => Some("ALTER TABLE"),
+        Stmt::DropTable { .. } => Some("DROP TABLE"),
+        Stmt::CreateIndex { .. } => Some("CREATE INDEX"),
+        Stmt::DropIndex { .. } => Some("DROP INDEX"),
+        Stmt::CreateView { .. } => Some("CREATE VIEW"),
+        Stmt::DropView { .. } => Some("DROP VIEW"),
+        Stmt::CreateSequence { .. } => Some("CREATE SEQUENCE"),
+        Stmt::AlterSequence { .. } => Some("ALTER SEQUENCE"),
+        Stmt::DropSequence { .. } => Some("DROP SEQUENCE"),
+        Stmt::CreateRole { .. } => Some("CREATE ROLE"),
+        Stmt::AlterRole { .. } => Some("ALTER ROLE"),
+        Stmt::DropRole { .. } => Some("DROP ROLE"),
+        Stmt::Grant { .. } => Some("GRANT"),
+        Stmt::Revoke { .. } => Some("REVOKE"),
+        Stmt::GrantRole { .. } => Some("GRANT"),
+        Stmt::RevokeRole { .. } => Some("REVOKE"),
+        _ => None,
+    }
+}
+
+/// v0.17: GUC metadata for the tiny supported set. Only
+/// `default_transaction_read_only` is honored; anything else is 42704.
+fn guc_value(session: &Session, name: &str) -> Option<String> {
+    match name {
+        "default_transaction_read_only" => Some(
+            if session.default_txn_read_only == Some(true) {
+                "on"
+            } else {
+                "off"
+            }
+            .to_string(),
+        ),
+        "server_version" => Some(SERVER_VERSION.to_string()),
+        "server_version_num" => Some(SERVER_VERSION_NUM.to_string()),
+        "transaction_isolation" => {
+            let level = session
+                .txn
+                .as_ref()
+                .map(|t| t.level)
+                .or(session.default_txn_level)
+                .unwrap_or(IsolationLevel::ReadCommitted);
+            Some(
+                match level {
+                    IsolationLevel::ReadCommitted => "read committed",
+                    IsolationLevel::RepeatableRead => "repeatable read",
+                    IsolationLevel::Serializable => "serializable",
+                }
+                .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// v0.17: `SET TRANSACTION mode [, ...]` — applies the modes to the
+/// current transaction (like PG). With no transaction open it is a
+/// no-op returning the SET tag (PG would emit a WARNING; we have no
+/// NOTICE channel). Unlike PG we accept it after the first statement;
+/// the new modes apply going forward.
+fn stmt_set_transaction(
+    session: &mut Session,
+    level: Option<IsolationLevel>,
+    read_only: Option<bool>,
+    deferrable: Option<bool>,
+) -> Result<ExecResult, ExecError> {
+    if let Some(t) = session.txn.as_mut() {
+        // Inside a transaction: apply to the current transaction (PG).
+        if let Some(l) = level {
+            t.level = l;
+        }
+        if let Some(ro) = read_only {
+            t.read_only = Some(ro);
+        }
+        if let Some(d) = deferrable {
+            t.deferrable = Some(d);
+        }
+    } else {
+        // Outside: store for the NEXT transaction (one-shot).
+        if level.is_some() {
+            session.next_txn_level = level;
+        }
+        if read_only.is_some() {
+            session.next_txn_read_only = read_only;
+        }
+        if deferrable.is_some() {
+            session.next_txn_deferrable = deferrable;
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "SET".to_string(),
+    })
+}
+
+/// v0.17: boolean-ish GUC spellings, mirroring PG's accepted variants.
+fn parse_bool_guc(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// v0.17: `SET name = value`. Only `default_transaction_read_only` is
+/// honored; unknown parameters are 42704 (undefined_object), like PG.
+fn stmt_set_guc(
+    session: &mut Session,
+    name: &str,
+    value: &SetValue,
+) -> Result<ExecResult, ExecError> {
+    match name {
+        "default_transaction_read_only" => {
+            let ro = match value {
+                SetValue::Default => false,
+                SetValue::Str(s) => parse_bool_guc(s).ok_or_else(|| ExecError {
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?,
+            };
+            session.default_txn_read_only = Some(ro);
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
+        _ => Err(ExecError {
+            code: "42704",
+            message: format!("unrecognized configuration parameter \"{}\"", name),
+        }),
+    }
+}
+
+/// v0.17: `SHOW name` — one row, one text column named for the
+/// parameter, like PG.
+fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError> {
+    match guc_value(session, name) {
+        Some(v) => Ok(ExecResult::Select {
+            columns: vec![(name.to_string(), ColType::Text)],
+            rows: vec![vec![Value::Text(v)]],
+        }),
+        None => Err(ExecError {
+            code: "42704",
+            message: format!("unrecognized configuration parameter \"{}\"", name),
+        }),
+    }
+}
+
+/// v0.17: `RESET name` / `RESET ALL` (tag "RESET", like PG). Session
+/// transaction characteristics are not GUCs and survive RESET ALL.
+fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
+    match name {
+        "all" | "default_transaction_read_only" => {
+            session.default_txn_read_only = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        _ => Err(ExecError {
+            code: "42704",
+            message: format!("unrecognized configuration parameter \"{}\"", name),
+        }),
+    }
+}
+
 fn run_statement(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -1399,18 +1789,41 @@ fn run_statement(
             });
         }
     }
+    // v0.17: READ ONLY enforcement (SQLSTATE 25006). Transaction and
+    // session control stay usable so the mode can always be exited.
+    // Like any statement error, this aborts the transaction.
+    if effective_read_only(session) {
+        if let Some(cmd) = read_only_violation(stmt) {
+            if let Some(t) = session.txn.as_mut() {
+                t.failed = true;
+            }
+            return Err(ExecError {
+                code: "25006",
+                message: format!("cannot execute {} in a read-only transaction", cmd),
+            });
+        }
+    }
     match stmt {
         Stmt::Begin {
             level,
             read_only,
             deferrable,
-        } => txn_begin(
-            engine,
-            session,
-            level.unwrap_or(IsolationLevel::ReadCommitted),
-            *read_only,
-            *deferrable,
-        ),
+        } => {
+            // v0.17: statement modes win; then one-shot SET TRANSACTION
+            // (cleared after use); then session defaults (SET SESSION
+            // CHARACTERISTICS); otherwise PG defaults.
+            let lvl = (*level)
+                .or(session.next_txn_level.take())
+                .or(session.default_txn_level)
+                .unwrap_or(IsolationLevel::ReadCommitted);
+            let ro = (*read_only)
+                .or(session.next_txn_read_only.take())
+                .or(session.default_txn_read_only);
+            let def = (*deferrable)
+                .or(session.next_txn_deferrable.take())
+                .or(session.default_txn_deferrable);
+            txn_begin(engine, session, lvl, ro, def)
+        }
         Stmt::Commit { chain } => txn_commit(engine, wal, session, *chain),
         Stmt::Rollback { chain } => txn_rollback(engine, session, *chain),
         Stmt::Savepoint { name } => txn_savepoint(engine, session, name),
@@ -1438,15 +1851,56 @@ fn run_statement(
                 let a = Stmt::Analyze {
                     table: table.clone(),
                 };
-                autocommit_execute(engine, wal, session.sid, &session.role, &a)?;
+                autocommit_execute(
+                    engine,
+                    wal,
+                    session.sid,
+                    &session.role,
+                    session.default_txn_read_only == Some(true),
+                    &a,
+                )?;
             }
             Ok(out)
         }
+        // --- v0.17: transaction characteristics / GUCs -------------------
+        Stmt::SetTransaction {
+            level,
+            read_only,
+            deferrable,
+        } => stmt_set_transaction(session, *level, *read_only, *deferrable),
+        Stmt::SetSessionCharacteristics {
+            level,
+            read_only,
+            deferrable,
+        } => {
+            if let Some(l) = level {
+                session.default_txn_level = Some(*l);
+            }
+            if let Some(ro) = read_only {
+                session.default_txn_read_only = Some(*ro);
+            }
+            if let Some(d) = deferrable {
+                session.default_txn_deferrable = Some(*d);
+            }
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
+        Stmt::Set { name, value } => stmt_set_guc(session, name, value),
+        Stmt::Show { name } => stmt_show_guc(session, name),
+        Stmt::Reset { name } => stmt_reset_guc(session, name),
         _ => {
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(engine, wal, session.sid, &session.role, stmt)
+                autocommit_execute(
+                    engine,
+                    wal,
+                    session.sid,
+                    &session.role,
+                    session.default_txn_read_only == Some(true),
+                    stmt,
+                )
             }
         }
     }
@@ -1511,6 +1965,7 @@ fn txn_execute(
             level,
             session: session.sid,
             role: &session.role,
+            read_only: t.read_only == Some(true),
             writes: &mut t.writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -1547,6 +2002,9 @@ fn autocommit_execute(
     wal: &Arc<Mutex<Wal>>,
     sid: u64,
     role: &str,
+    // v0.17: effective read-only for this implicit transaction (from
+    // `default_transaction_read_only`); gates nextval/setval.
+    read_only: bool,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
     let mut guard = lock_engine(engine);
@@ -1560,6 +2018,7 @@ fn autocommit_execute(
             level: IsolationLevel::ReadCommitted,
             session: sid,
             role,
+            read_only,
             writes: &mut writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -2343,6 +2802,9 @@ fn describe_prepared(
             }),
         },
         Some(Stmt::Move { .. }) => Ok(None),
+        // v0.17: Describe of COPY returns NoData — the column formats
+        // ride in the CopyInResponse/CopyOutResponse instead.
+        Some(Stmt::Copy { .. }) => Ok(None),
         Some(stmt) => {
             let mut guard = lock_engine(engine);
             let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
@@ -2354,6 +2816,7 @@ fn describe_prepared(
 /// Execute: portal name, max rows (0 = all). Honors max-rows via
 /// PortalSuspended; the final CommandComplete carries the total row count.
 fn handle_execute(
+    reader: &mut TcpStream,
     stream: &mut Writer,
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -2396,6 +2859,33 @@ fn handle_execute(
         MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
         stream.flush()?;
         return Ok(());
+    }
+
+    // v0.17: extended-protocol COPY — bypass run_statement (which would
+    // route Stmt::Copy to the executor's XX000 arm) and drive the COPY
+    // sub-protocol directly, with extended-protocol error recovery.
+    let copy_stmt = match &session.portals[&portal_name].stmt {
+        Some(Stmt::Copy {
+            table,
+            columns,
+            to_stdout,
+            options,
+        }) => Some((table.clone(), columns.clone(), *to_stdout, options.clone())),
+        _ => None,
+    };
+    if let Some((table, columns, to_stdout, options)) = copy_stmt {
+        return handle_copy_extended(
+            reader,
+            stream,
+            engine,
+            wal,
+            session,
+            &portal_name,
+            &table,
+            &columns,
+            to_stdout,
+            &options,
+        );
     }
 
     // First Execute: run the statement, caching SELECT rows for suspension.
@@ -2544,6 +3034,12 @@ mod tests {
             portals: HashMap::new(),
             in_error: false,
             cursors: HashMap::new(),
+            default_txn_level: None,
+            default_txn_read_only: None,
+            default_txn_deferrable: None,
+            next_txn_level: None,
+            next_txn_read_only: None,
+            next_txn_deferrable: None,
             txn: Some(Txn {
                 xid,
                 level,
