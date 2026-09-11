@@ -134,6 +134,16 @@ pub const MAX_MESSAGE_BYTES: usize = 1 << 30;
 /// v0.12: maximum startup packet size — 16 MiB (real ones are < 1 KiB).
 pub const MAX_STARTUP_BYTES: usize = 16 << 20;
 
+thread_local! {
+    /// Scratch chunk for `read_bounded`, reused across all messages on a
+    /// connection thread. v0.15: this used to be `vec![0u8; 64 * 1024]`
+    /// allocated per call; DHAT showed 18.5 MiB allocated for 200 small
+    /// statements (max-live 283 B), dominating the callgrind profile at 76%
+    /// of instructions. Thread-per-connection (see main.rs) makes the
+    /// thread-local safe: one buffer per connection thread, never shared.
+    static READ_CHUNK: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+}
+
 /// Read `total` bytes from `stream` in 64 KiB chunks, failing if `total`
 /// exceeds `cap`. Incremental: memory grows only with bytes actually
 /// received, never with the claimed length alone.
@@ -150,15 +160,20 @@ fn read_bounded(stream: &mut TcpStream, total: i64, cap: usize, what: &str) -> i
         ));
     }
     let mut out = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    let mut remaining = total as usize;
-    while remaining > 0 {
-        let n = remaining.min(chunk.len());
-        stream.read_exact(&mut chunk[..n])?;
-        out.extend_from_slice(&chunk[..n]);
-        remaining -= n;
-    }
-    Ok(out)
+    READ_CHUNK.with(|cell| {
+        let mut chunk = cell.borrow_mut();
+        if chunk.len() < 64 * 1024 {
+            chunk.resize(64 * 1024, 0);
+        }
+        let mut remaining = total as usize;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            stream.read_exact(&mut chunk[..n])?;
+            out.extend_from_slice(&chunk[..n]);
+            remaining -= n;
+        }
+        Ok(out)
+    })
 }
 
 /// Builder for one backend message.
@@ -295,5 +310,54 @@ mod tests {
             err,
             err.kind()
         );
+    }
+
+    /// v0.15: the read_bounded scratch buffer is a reused thread-local.
+    /// Hammer read_message with back-to-back messages of varying sizes
+    /// (including one larger than the 64 KiB chunk) and verify every
+    /// payload comes back byte-exact — no stale data from a previous
+    /// message may leak into the next.
+    #[test]
+    fn repeated_read_message_reuses_scratch_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut payloads: Vec<Vec<u8>> = vec![
+            b"tiny".to_vec(),
+            vec![0xAB; 70000], // larger than one 64 KiB chunk
+            b"after the big one".to_vec(),
+            vec![0xCD; 3],
+        ];
+        // Deterministic pattern for the big payload so stale bytes are visible.
+        for (i, b) in payloads[1].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        for p in &payloads {
+            client.write_all(&[b'Q']).unwrap();
+            client
+                .write_all(&((p.len() + 4) as i32).to_be_bytes())
+                .unwrap();
+            client.write_all(p).unwrap();
+        }
+        client.flush().unwrap();
+        for expected in &payloads {
+            let msg = read_message(&mut server).unwrap();
+            assert_eq!(msg.typ, b'Q');
+            assert_eq!(&msg.payload, expected, "payload corruption across reuse");
+        }
+        // One more small message after the burst, on the same thread.
+        let tail = b"final".to_vec();
+        client.write_all(&[b'Q']).unwrap();
+        client
+            .write_all(&((tail.len() + 4) as i32).to_be_bytes())
+            .unwrap();
+        client.write_all(&tail).unwrap();
+        client.flush().unwrap();
+        let msg = read_message(&mut server).unwrap();
+        assert_eq!(&msg.payload, &tail);
     }
 }

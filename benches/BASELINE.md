@@ -2,16 +2,33 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
-## v0.14 baseline — 2026-09-10
+## v0.15 baseline — 2026-09-11
 
-No full benchmark run for v0.14: the milestone is the pg_regress
-conformance harness plus parser gaps, with no hot-path rewrites on the
-normal query path. The one executor-adjacent change is the commit-time
-unique recheck (`records_for_commit` → `committed_unique_violation`),
-which runs once per INSERT commit and only when the table has unique
-indexes; tables without unique indexes skip the index scan entirely.
-v0.13 numbers below are carried forward as the v0.14 baseline pending
-a clean-box re-run.
+No full benchmark re-run for v0.15 (same rationale as v0.14): the milestone
+is transaction-control syntax plus the required profiling gate, with no
+hot-path rewrites on the normal query path. The profiling gate itself
+produced one real fix:
+
+- **Valgrind memcheck** (release binary, 200-statement txn-heavy workload
+  covering every new `BEGIN`/`START TRANSACTION`/`COMMIT`/`ROLLBACK`
+  variant, savepoints, `AND CHAIN`): zero invalid reads/writes, zero
+  definitely/indirectly lost bytes. (The 27 reported "errors" are
+  valgrind's per-thread SIGTERM-shutdown notices, not memory errors.)
+- **Callgrind + DHAT** on the same workload: `read_bounded`
+  (`src/protocol.rs`) allocated and zeroed a fresh 64 KiB scratch buffer
+  for *every inbound message* — 18.5 MiB total for the workload at
+  283 B max-live, 76% of all profiled instructions. Fixed by reusing a
+  per-connection-thread thread-local scratch buffer; behavior unchanged
+  (new `repeated_read_message_reuses_scratch_cleanly` unit test + full
+  protocol suite green). No new v0.15 hotspot: `txn_begin`/`txn_commit`
+  show 48 calls at negligible cost; remaining profile is parser +
+  allocator noise on a tiny workload.
+- **Native micro-timing** (release, `/tmp` data dir): BEGIN/COMMIT
+  0.04 ms/stmt, autocommit INSERT 0.03 ms/stmt, SELECT count(*) 0.06
+  ms/stmt, SAVEPOINT/ROLLBACK TO 0.04 ms/stmt.
+
+v0.13 numbers below are carried forward as the v0.15 query-path baseline
+pending a clean-box re-run.
 
 ## v0.13 baseline — 2026-09-10
 

@@ -1,25 +1,54 @@
-# rustgres v0.14 — "pg_regress conformance harness"
+# rustgres v0.15 — "conformance burn-down: transaction syntax"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 14 of the road to Postgres 19 feature parity. v0.14 brings
-the **pg_regress conformance harness**: a custom semantic runner
-(`tests/conformance/regress_runner.py`) that executes 22 selected
-PostgreSQL regression tests (boolean, char, name, text, varchar, int2,
-int4, int8, float4, float8, numeric, strings, select, select_distinct,
-select_having, case, union, subselect, join, transactions, insert,
-delete) against rustgres and scores them against PostgreSQL's expected
-outputs. To support the harness, v0.14 also adds type-name aliases
-(`int4`, `varchar`, `bpchar`, `name`, `serial`), optional typmods,
-`VACUUM ANALYZE`, boolean casts and unambiguous prefixes, PostgreSQL
-internal operator aliases (`booleq`, `boolne`, `int4eq`, `texteq`),
-function-style casts (`float8(x)`), `::` casts in INSERT VALUES,
-`CREATE TEMP TABLE` syntax, alias-less derived tables, `(VALUES ...)`
-in FROM, and auto-named indexes. A commit-time unique recheck closes a
-real race where concurrent transactions could commit duplicate keys.
-1152 cumulative protocol tests pass (44 new in v0.14), plus 57 unit
+Milestone 15 of the road to Postgres 19 feature parity. v0.15 burns down
+the largest syntax cluster in the conformance baseline: full
+PostgreSQL transaction-control syntax — `BEGIN [WORK | TRANSACTION]`,
+`START TRANSACTION` with comma-separated modes (`ISOLATION LEVEL ...`,
+`READ WRITE` / `READ ONLY`, `[NOT] DEFERRABLE`), and `COMMIT` / `END` /
+`ROLLBACK` / `ABORT` with `[WORK | TRANSACTION]` and `AND CHAIN` /
+`AND NO CHAIN`. `AND CHAIN` returns the proper `COMMIT`/`ROLLBACK`
+command tag and opens the next transaction inheriting the previous
+characteristics. The required Valgrind/Callgrind/DHAT profiling pass for
+the milestone found and fixed a real read-path waste: every inbound
+protocol message allocated and zeroed a fresh 64 KiB scratch buffer
+(DHAT: 18.5 MiB allocated for 200 small statements, max-live 283 B;
+76% of callgrind instructions). The buffer is now a per-connection-thread
+thread-local reused across messages.
+Conformance baseline: **1815 PASS (35.0%)**, 1582 EXPECTED-FAIL, 1796
+REAL-FAIL out of 5193 statements (was 1661/1644/1888 in v0.14).
+1161 cumulative protocol tests pass (9 new in v0.15), plus 58 unit
 tests and 53 isolation checks.
+
+## What v0.15 adds (conformance burn-down: transaction syntax)
+
+- **Full transaction-control syntax.** `BEGIN [WORK | TRANSACTION]`;
+  `START TRANSACTION` with `ISOLATION LEVEL {SERIALIZABLE |
+  REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED}`, `READ WRITE` /
+  `READ ONLY`, `[NOT] DEFERRABLE` in any comma-separated combination;
+  `COMMIT` / `END` / `ROLLBACK` / `ABORT` with optional `WORK` /
+  `TRANSACTION` and `AND CHAIN` / `AND NO CHAIN`. Transactions retain
+  isolation, read-only, and deferrable characteristics; `AND CHAIN`
+  commits/rolls back with the correct command tag and immediately opens
+  the next transaction with the same characteristics, like PostgreSQL.
+  transactions regression test: 275 PASS / 37 REAL-FAIL (was 257/55).
+- **Read-path profiling fix.** Valgrind memcheck on a 200-statement
+  txn-heavy workload: zero invalid accesses, zero leaks. Callgrind+DHAT
+  showed `read_bounded` allocating a fresh 64 KiB zeroed scratch buffer
+  per inbound message — 18.5 MiB total for the workload at 283 B
+  max-live, 76% of all profiled instructions. The scratch chunk is now a
+  thread-local reused across messages on each connection thread
+  (thread-per-connection makes this safe); behavior is unchanged and
+  covered by a new `repeated_read_message_reuses_scratch_cleanly` unit
+  test plus the full protocol suite.
+- **Known limitations.** `READ ONLY` is parsed and retained but not
+  enforced (a write inside `START TRANSACTION READ ONLY` still
+  executes); the largest remaining conformance clusters are missing
+  built-ins (`substr`, `concat`, `concat_ws`, `to_hex`, `sign`,
+  `left`/`right`, `reverse`, ...), `FETCH` cursor syntax, and bare
+  `TRUNCATE`.
 
 ## What v0.14 adds (pg_regress conformance harness)
 

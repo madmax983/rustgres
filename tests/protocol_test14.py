@@ -379,6 +379,66 @@ def t_nameless_index(c):
     c.q("DROP TABLE t_idx")
 
 
+def t_txn_syntax(c):
+    # v0.15: PostgreSQL transaction-control syntax variants.
+    c.q("CREATE TABLE t_txn (x int)")
+    # START TRANSACTION with comma-separated modes.
+    _, _, codes, _ = c.q(
+        "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE"
+    )
+    check("k-start-modes", not codes, f"{codes}")
+    c.q("INSERT INTO t_txn VALUES (1)")
+    # COMMIT AND CHAIN: commits, then begins a new txn (still in txn).
+    # Tag must be COMMIT (PostgreSQL reports the command that ran).
+    tags, _, codes, _ = c.q("COMMIT AND CHAIN")
+    check("k-commit-chain", not codes, f"{codes}")
+    check("k-commit-chain-tag", tags == ["COMMIT"], f"{tags}")
+    c.q("INSERT INTO t_txn VALUES (2)")
+    c.q("COMMIT")
+    _, rows, codes, _ = c.q("SELECT x FROM t_txn ORDER BY x")
+    check("k-chain-rows", not codes and rows == [("1",), ("2",)], f"{rows} {codes}")
+    # COMMIT TRANSACTION / COMMIT WORK variants.
+    c.q("BEGIN")
+    c.q("INSERT INTO t_txn VALUES (3)")
+    _, _, codes, _ = c.q("COMMIT TRANSACTION")
+    check("k-commit-txn", not codes, f"{codes}")
+    c.q("BEGIN")
+    c.q("INSERT INTO t_txn VALUES (4)")
+    _, _, codes, _ = c.q("COMMIT WORK")
+    check("k-commit-work", not codes, f"{codes}")
+    # ROLLBACK AND CHAIN: rolls back, then begins a new txn.
+    # Tag must be ROLLBACK.
+    c.q("BEGIN TRANSACTION READ ONLY")
+    c.q("INSERT INTO t_txn VALUES (5)")
+    tags, _, codes, _ = c.q("ROLLBACK AND CHAIN")
+    check("k-rollback-chain", not codes, f"{codes}")
+    check("k-rollback-chain-tag", tags == ["ROLLBACK"], f"{tags}")
+    c.q("ROLLBACK")  # roll back the chained (empty) txn
+    _, rows, codes, _ = c.q("SELECT x FROM t_txn ORDER BY x")
+    check(
+        "k-rollback-rows",
+        not codes and rows == [("1",), ("2",), ("3",), ("4",)],
+        f"{rows} {codes}",
+    )
+    # BEGIN WORK and START TRANSACTION READ WRITE.
+    _, _, codes, _ = c.q("BEGIN WORK")
+    check("k-begin-work", not codes, f"{codes}")
+    c.q("ROLLBACK")
+    _, _, codes, _ = c.q("START TRANSACTION READ WRITE")
+    check("k-start-rw", not codes, f"{codes}")
+    c.q("ROLLBACK")
+    # COMMIT AND CHAIN with no open transaction: still COMMIT tag, and a
+    # chained transaction is now open (next INSERT must be committable).
+    tags, _, codes, _ = c.q("COMMIT AND CHAIN")
+    check("k-chain-no-txn", not codes, f"{codes}")
+    check("k-chain-no-txn-tag", tags == ["COMMIT"], f"{tags}")
+    c.q("INSERT INTO t_txn VALUES (6)")
+    c.q("COMMIT")
+    _, rows, codes, _ = c.q("SELECT x FROM t_txn WHERE x = 6")
+    check("k-chain-no-txn-rows", not codes and rows == [("6",)], f"{rows} {codes}")
+    c.q("DROP TABLE t_txn")
+
+
 TESTS = [
     t_type_aliases,
     t_vacuum_analyze,
@@ -391,6 +451,7 @@ TESTS = [
     t_from_extras,
     t_func_casts,
     t_nameless_index,
+    t_txn_syntax,
 ]
 
 if __name__ == "__main__":

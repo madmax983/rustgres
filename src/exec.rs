@@ -394,8 +394,8 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         // executor (server.rs intercepts them); reaching here is a bug in
         // the session layer.
         Stmt::Begin { .. }
-        | Stmt::Commit
-        | Stmt::Rollback
+        | Stmt::Commit { .. }
+        | Stmt::Rollback { .. }
         | Stmt::Savepoint { .. }
         | Stmt::RollbackTo { .. }
         | Stmt::Release { .. }

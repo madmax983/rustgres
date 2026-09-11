@@ -1437,9 +1437,22 @@ pub enum Stmt {
     // --- v0.3: transaction control (handled by the session, not the executor)
     Begin {
         level: Option<IsolationLevel>,
+        /// v0.15: READ ONLY / READ WRITE mode (None = not specified).
+        /// Parsed for PostgreSQL syntax compatibility; not yet enforced.
+        read_only: Option<bool>,
+        /// v0.15: [NOT] DEFERRABLE mode (None = not specified).
+        /// Parsed for PostgreSQL syntax compatibility; not yet enforced.
+        deferrable: Option<bool>,
     },
-    Commit,
-    Rollback,
+    Commit {
+        /// v0.15: COMMIT AND CHAIN — commit, then immediately start a new
+        /// transaction with the same characteristics (SQL standard).
+        chain: bool,
+    },
+    Rollback {
+        /// v0.15: ROLLBACK AND CHAIN.
+        chain: bool,
+    },
     Savepoint {
         name: String,
     },
@@ -1967,15 +1980,27 @@ impl Parser {
             "vacuum" => self.parse_vacuum(),
             // --- v0.3: transaction control
             "begin" => {
-                // BEGIN [TRANSACTION] [ISOLATION LEVEL ...]
-                self.eat_keyword("transaction");
+                // BEGIN [WORK | TRANSACTION] [transaction_mode [, ...]]
+                let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
                 self.parse_begin_rest()
             }
             "start" => {
                 self.expect_keyword("transaction")?;
                 self.parse_begin_rest()
             }
-            "commit" | "end" => Ok(Stmt::Commit),
+            "commit" | "end" => {
+                // COMMIT [WORK | TRANSACTION] [AND [NO] CHAIN]
+                // (END is COMMIT's alias and takes the same clauses.)
+                let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
+                let chain = if self.eat_keyword("and") {
+                    let no = self.eat_keyword("no");
+                    self.expect_keyword("chain")?;
+                    !no
+                } else {
+                    false
+                };
+                Ok(Stmt::Commit { chain })
+            }
             // --- v0.4: CHECKPOINT (snapshot + WAL truncation)
             "checkpoint" => Ok(Stmt::Checkpoint),
             "rollback" | "abort" => {
@@ -1986,7 +2011,17 @@ impl Parser {
                         name: self.expect_ident()?,
                     })
                 } else {
-                    Ok(Stmt::Rollback)
+                    // ROLLBACK [WORK | TRANSACTION] [AND [NO] CHAIN]
+                    // (ABORT is ROLLBACK's alias; accept the same clauses.)
+                    let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
+                    let chain = if self.eat_keyword("and") {
+                        let no = self.eat_keyword("no");
+                        self.expect_keyword("chain")?;
+                        !no
+                    } else {
+                        false
+                    };
+                    Ok(Stmt::Rollback { chain })
                 }
             }
             "savepoint" => Ok(Stmt::Savepoint {
@@ -4170,13 +4205,55 @@ impl Parser {
     /// Remainder of BEGIN / START TRANSACTION after the optional
     /// TRANSACTION keyword: `[ISOLATION LEVEL ...]`.
     fn parse_begin_rest(&mut self) -> Result<Stmt, SqlError> {
-        let level = if self.eat_keyword("isolation") {
-            self.expect_keyword("level")?;
-            Some(self.parse_isolation_level()?)
-        } else {
-            None
-        };
-        Ok(Stmt::Begin { level })
+        // BEGIN / START TRANSACTION [transaction_mode [, ...]]
+        // transaction_mode :=
+        //     ISOLATION LEVEL { SERIALIZABLE | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED }
+        //   | READ WRITE | READ ONLY
+        //   | [NOT] DEFERRABLE
+        let mut level: Option<IsolationLevel> = None;
+        let mut read_only: Option<bool> = None;
+        let mut deferrable: Option<bool> = None;
+        loop {
+            if self.eat_keyword("isolation") {
+                self.expect_keyword("level")?;
+                if level.is_some() {
+                    return Err(err(
+                        "syntax error: multiple ISOLATION LEVEL clauses".to_string()
+                    ));
+                }
+                level = Some(self.parse_isolation_level()?);
+            } else if self.eat_keyword("read") {
+                let w = self.expect_ident()?;
+                match w.as_str() {
+                    "write" => read_only = Some(false),
+                    "only" => read_only = Some(true),
+                    _ => {
+                        return Err(err(format!(
+                            "syntax error: expected WRITE or ONLY, found {:?}",
+                            w
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("deferrable")?;
+                deferrable = Some(false);
+            } else if self.eat_keyword("deferrable") {
+                deferrable = Some(true);
+            } else {
+                break;
+            }
+            // Modes are comma-separated; a missing comma ends the list.
+            if self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::Begin {
+            level,
+            read_only,
+            deferrable,
+        })
     }
 
     fn parse_isolation_level(&mut self) -> Result<IsolationLevel, SqlError> {

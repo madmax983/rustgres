@@ -82,6 +82,12 @@ static NEXT_SID: AtomicU64 = AtomicU64::new(1);
 struct Txn {
     xid: u64,
     level: IsolationLevel,
+    /// v0.15: READ ONLY / READ WRITE mode (None = not specified).
+    /// Parsed for PostgreSQL compatibility; not yet enforced.
+    read_only: Option<bool>,
+    /// v0.15: [NOT] DEFERRABLE mode (None = not specified).
+    /// Parsed for PostgreSQL compatibility; not yet enforced.
+    deferrable: Option<bool>,
     /// Pinned at the first data statement for RR/SERIALIZABLE.
     snapshot: Option<Snapshot>,
     /// Uncommitted writes, in order: the undo log (abort / ROLLBACK TO)
@@ -351,7 +357,7 @@ fn run_connection(
     // Postgres aborts the transaction on disconnect; do the same on every
     // exit path — clean Terminate, client EOF, and read errors alike.
     if session.txn.is_some() {
-        let _ = txn_rollback(&engine, &mut session);
+        let _ = txn_rollback(&engine, &mut session, false);
     }
     result
 }
@@ -1053,7 +1059,7 @@ fn handle_copy_from(
             stream.flush()?;
             // The failed COPY aborts the transaction (like Postgres).
             if session.txn.is_some() {
-                let _ = txn_rollback(engine, session);
+                let _ = txn_rollback(engine, session, false);
             }
             return Ok(());
         }
@@ -1172,7 +1178,7 @@ fn err_25001(msg: impl Into<String>) -> ExecError {
 fn allowed_in_aborted(stmt: &Stmt) -> bool {
     matches!(
         stmt,
-        Stmt::Rollback | Stmt::RollbackTo { .. } | Stmt::Commit
+        Stmt::Rollback { .. } | Stmt::RollbackTo { .. } | Stmt::Commit { .. }
     )
 }
 
@@ -1208,13 +1214,19 @@ fn run_statement(
         }
     }
     match stmt {
-        Stmt::Begin { level } => txn_begin(
+        Stmt::Begin {
+            level,
+            read_only,
+            deferrable,
+        } => txn_begin(
             engine,
             session,
             level.unwrap_or(IsolationLevel::ReadCommitted),
+            *read_only,
+            *deferrable,
         ),
-        Stmt::Commit => txn_commit(engine, wal, session),
-        Stmt::Rollback => txn_rollback(engine, session),
+        Stmt::Commit { chain } => txn_commit(engine, wal, session, *chain),
+        Stmt::Rollback { chain } => txn_rollback(engine, session, *chain),
         Stmt::Savepoint { name } => txn_savepoint(engine, session, name),
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
@@ -1471,6 +1483,8 @@ fn txn_begin(
     engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
     level: IsolationLevel,
+    read_only: Option<bool>,
+    deferrable: Option<bool>,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
         // Postgres: WARNING "there is already a transaction in progress",
@@ -1481,6 +1495,8 @@ fn txn_begin(
     session.txn = Some(Txn {
         xid,
         level,
+        read_only,
+        deferrable,
         snapshot: None,
         writes: Vec::new(),
         savepoints: Vec::new(),
@@ -1493,17 +1509,33 @@ fn txn_commit(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
+    chain: bool,
 ) -> Result<ExecResult, ExecError> {
     let t = match session.txn.take() {
-        None => return Ok(cmd("COMMIT")), // Postgres: WARNING, no-op
+        None => {
+            // Postgres: WARNING, no-op. AND CHAIN without a transaction
+            // still starts a new one with default characteristics; the
+            // tag stays COMMIT.
+            if chain {
+                txn_begin(engine, session, IsolationLevel::ReadCommitted, None, None)?;
+            }
+            return Ok(cmd("COMMIT"));
+        }
         Some(t) => t,
     };
+    // Remember characteristics for AND CHAIN before the txn is consumed.
+    let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
     let mut guard = lock_engine(engine);
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
         undo_all(&mut guard, t.xid, &t.writes);
         retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
+        drop(guard);
+        if chain {
+            // AND CHAIN: new transaction with the same characteristics.
+            return txn_begin(engine, session, level, read_only, deferrable);
+        }
         return Ok(cmd("ROLLBACK"));
     }
     // Derive the records from the write log and make them durable BEFORE
@@ -1538,6 +1570,14 @@ fn txn_commit(
     }
     retire_txn(&mut guard, t.xid);
     auto_vacuum(&mut guard, &t.writes);
+    drop(guard);
+    if chain {
+        // AND CHAIN: immediately start a new transaction with the same
+        // characteristics as the just-committed one (SQL standard). The
+        // command tag stays COMMIT — PostgreSQL reports the command that
+        // ran, not the implicitly started transaction.
+        txn_begin(engine, session, level, read_only, deferrable)?;
+    }
     Ok(cmd("COMMIT"))
 }
 
@@ -1653,12 +1693,26 @@ fn txn_vacuum(
 fn txn_rollback(
     engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
+    chain: bool,
 ) -> Result<ExecResult, ExecError> {
-    if let Some(t) = session.txn.take() {
+    // Remember characteristics for AND CHAIN before the txn is consumed.
+    let chained = if let Some(t) = session.txn.take() {
+        let chained = (t.level, t.read_only, t.deferrable);
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, t.xid, &t.writes);
         retire_txn(&mut guard, t.xid);
         auto_vacuum(&mut guard, &t.writes);
+        Some(chained)
+    } else {
+        None
+    };
+    if chain {
+        // AND CHAIN: new transaction with the same characteristics as the
+        // just-rolled-back one (or defaults if there was no transaction).
+        // The command tag stays ROLLBACK, like PostgreSQL.
+        let (level, read_only, deferrable) =
+            chained.unwrap_or((IsolationLevel::ReadCommitted, None, None));
+        txn_begin(engine, session, level, read_only, deferrable)?;
     }
     Ok(cmd("ROLLBACK"))
 }
@@ -2246,6 +2300,8 @@ mod tests {
             txn: Some(Txn {
                 xid,
                 level,
+                read_only: None,
+                deferrable: None,
                 snapshot: None,
                 writes: Vec::new(),
                 savepoints: Vec::new(),
@@ -2347,9 +2403,9 @@ mod tests {
     #[test]
     fn aborted_txn_gate() {
         // Only ROLLBACK / ROLLBACK TO / COMMIT may run once failed.
-        let rb = Stmt::Rollback;
+        let rb = Stmt::Rollback { chain: false };
         let rbt = Stmt::RollbackTo { name: "sp".into() };
-        let commit = Stmt::Commit;
+        let commit = Stmt::Commit { chain: false };
         let sel = Stmt::Checkpoint;
         assert!(allowed_in_aborted(&rb));
         assert!(allowed_in_aborted(&rbt));
