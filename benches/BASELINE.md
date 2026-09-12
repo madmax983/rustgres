@@ -2,6 +2,85 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Parser::eat_keyword` allocation — baseline — 2026-09-12
+
+Every version of this file back to v0.7 has recorded the same finding under
+Callgrind/DHAT: per-query SQL text parsing (`tokenize`, `Parser::peek`,
+`Token::clone`, `split_statements`) dominates the profile for short queries,
+never the feature code being added. Nobody had gone back to fix the parsing
+cost itself. This entry does.
+
+**Workload**: `benches/profile_fixed.py` — a new *fixed-iteration-count*
+driver (as opposed to `bench.py`'s time-boxed workloads) that sends an exact
+number of identical queries over the real wire protocol, so two profiling
+runs (before/after a code change) execute identical work and their
+instruction/allocation counts are directly comparable. Time-boxed workloads
+under valgrind vary in query count run-to-run with wall-clock jitter, which
+would confound a before/after diff.
+
+Query used here (`--sql`, run 1500 times against a 3-row table after
+`--setup`):
+
+```sql
+SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10
+```
+
+This is a keyword-dense, realistic query shape (filtered SELECT + ORDER BY +
+LIMIT) chosen specifically because it exercises the parser's keyword-dispatch
+path (`Parser::eat_keyword`) far more per query than the `expr` workload
+does — `expr` is mostly literals/function calls and undercounts this cost.
+
+**Profile** (Callgrind, debug build, `valgrind --tool=callgrind
+--cache-sim=yes --branch-sim=yes`, 1500 iterations):
+
+`Parser::eat_keyword` is called 239 times across the parser's call sites,
+every optional-keyword probe during statement dispatch. Its old
+implementation:
+
+```rust
+fn eat_keyword(&mut self, kw: &str) -> bool {
+    match self.peek() {                    // clones the current Token
+        Token::Ident(ref s) if s == kw => { ... }
+        _ => false,
+    }
+}
+```
+
+`Parser::peek` returns an owned `Token` by cloning `self.tokens[pos]`. For
+the overwhelmingly common case — the current token is `Token::Ident(String)`
+(every keyword *and* every identifier is tokenized as `Ident`) — that clone
+heap-allocates a fresh `String`, compares it, then immediately drops it.
+Every one of the 239 call sites pays this even on failed keyword probes
+(the majority case in keyword-driven statement dispatch), independent of
+this particular query's `WHERE`/`ORDER BY`/`LIMIT` clauses.
+
+**Baseline numbers** (this commit, `eat_keyword` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 1500 iterations) | 574,441,689 |
+| DHAT total allocations (blocks) | 414,338 |
+| DHAT total bytes allocated | 18,749,059 |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -22   # PROGRAM TOTALS Ir
+```
+
+The fix itself and the after-numbers are in the following commit.
+
 ## v0.20.1 baseline — 2026-09-12
 
 No benchmark re-run for v0.20.1 (targeted correctness repair, no hot-path
