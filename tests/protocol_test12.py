@@ -557,7 +557,7 @@ ERROR_PINS = [
     ("SELECT a FROM (SELECT 1 AS a) t1, (SELECT 2 AS a) t2", "42702"),
     ("SELECT 'abc'::INT", "22P02"),
     ("SELECT 1/0", "22012"),
-    ("SELECT 1 + 'abc'", "42883"),
+    ("SELECT 1 + 'abc'", "22P02"),  # PG coerces unknown literal then fails conversion
     ("SELECT COUNT(*) FROM (SELECT 1 AS a) t GROUP BY a HAVING COUNT(*) > 0 ORDER BY b", "42703"),
     ("SELECT sum(a) FROM (SELECT 'x' AS a) t", "42883"),  # no sum(text): undefined_function
     ("BEGIN; SELECT 1; COMMIT; COMMIT", None),  # PG: WARNING only, no error

@@ -1,28 +1,38 @@
-# rustgres v0.20.1 — "join repair: native RIGHT/FULL"
+# rustgres v0.21 — "conformance burn-down: float8 cluster"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-v0.20.1 is a targeted repair of the v0.20 join cluster. Independent review
-caught two defects in `RIGHT`/`FULL JOIN`: the parser ate `RIGHT` and `FULL`
-as bare table aliases (`is_reserved` was missing both, so `FROM j1 RIGHT
-JOIN j2` parsed as `FROM j1 AS right INNER JOIN j2` and the `ON` clause's
-qualified refs died with `42703`), and the executor's RIGHT-as-swapped-LEFT
-trick inverted the preservation flags (it would have emitted unmatched
-*left* rows and dropped unmatched *right* rows — precisely backwards) plus
-unsound WHERE pushdown. Both are fixed: `right`/`full` are reserved against
-bare-alias use, and the executor handles RIGHT/FULL natively — no side
-swap, `preserve_left = LEFT|FULL`, `preserve_right = RIGHT|FULL`, with
-pushdown restricted to the preserved side (INNER/CROSS both, LEFT left-only,
-RIGHT right-only, FULL neither). 22 new edge-case checks and 7 wire-protocol
-regressions cover the repair.
+Milestone 21 of the road to Postgres 19 feature parity. v0.21 burns down
+the float8 conformance cluster: Infinity/NaN arithmetic and underflow
+checks, `float8send`, `FROM (VALUES...) AS t(x)` column aliases, `erfc`
+small-value accuracy, exact positive-integer `lgamma`, VALUES type coercion
+across all rows (highest type wins), `sign(0.0) = 0`, approximate TEMP
+TABLE replacement behavior, and dozens of float math functions
+(`sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
+`exp`/`ln`/`log`/`power`/`sqrt`/`cbrt`, `erf`/`erfc`/`lgamma`, `trunc`/
+`round`/`ceil`/`floor`, `degrees`/`radians`/`pi`, and more) plus prefix
+operators (`@` abs, `|/` sqrt, `||/` cbrt). The float8 regression cluster
+went from 71 REAL-FAIL to 5 (158 PASS / 86.8%, 19 EXPECTED-FAIL, 2 SKIP).
+Five float8 REAL-FAILs remain queued: `round(1e200::float8)` (blocked by
+the i128-backed numeric), complex `UPDATE...WHERE` parsing, ordered float
+output mismatch, TEMP/permanent table shadowing, and `CREATE TYPE xfloat8`.
+Conformance: **2605 PASS (50.2%)**, 1557 EXPECTED-FAIL, 1031 REAL-FAIL over
+5193 pg_regress statements (+98/−98 vs v0.20). 1595 cumulative protocol
+tests pass (including 53 new float8 checks in `protocol_test21.py`), plus
+81 unit tests and 53 isolation checks. New `benches/workload21.py`
+float8-heavy workload: ~9445 qps.
+Valgrind memcheck/callgrind/DHAT were not run for v0.21: the locally built
+Valgrind 3.22.0 cannot start in this environment (the stripped
+`ld-linux-x86-64.so.2` lacks the `strlen` symbol Valgrind requires for its
+mandatory function redirection); this is recorded, not hand-waved.
 
-**Known limitations.** Two v0.20 rough edges remain queued: `USING` keeps
-both copies of the merged column (unqualified refs can raise `42702`;
-Postgres merges them into one), and table column aliases parse but are not
-yet fully applied.
+**Known limitations (v0.21).** `USING` keeps both copies of the merged
+column (unqualified refs can raise `42702`; Postgres merges them into one),
+and table column aliases are applied for VALUES but not yet fully for all
+table-source forms. Five float8 REAL-FAILs remain (listed above).
 
-## What v0.20 adds (conformance burn-down: join type cluster)
+## What v0.20.1 adds (native RIGHT/FULL JOIN repair)
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
