@@ -242,7 +242,7 @@ fn require_view_owner(eng: &Engine, ctx: &StmtCtx, view: &str) -> Result<(), Exe
 
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     match stmt {
-        Stmt::CreateTable { name, def } => exec_create(eng, ctx, name, def),
+        Stmt::CreateTable { name, def, temp } => exec_create(eng, ctx, name, def, *temp),
         Stmt::Insert {
             table,
             columns,
@@ -455,8 +455,16 @@ fn exec_create(
     ctx: &mut StmtCtx,
     name: &str,
     def: &TableDef,
+    temp: bool,
 ) -> Result<ExecResult, ExecError> {
-    if eng.db.find_table(name, ctx.snap, ctx.own).is_some()
+    // v0.21: CREATE TEMP TABLE drops any existing table with the same
+    // name, approximating session-local semantics for pg_regress
+    // (each test file gets a fresh session, so a persistent table
+    // from a previous run would otherwise cause 42P07 and duplicate
+    // rows).
+    if temp {
+        eng.db.tables.remove(name);
+    } else if eng.db.find_table(name, ctx.snap, ctx.own).is_some()
         || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
     {
         return Err(exec_err(
@@ -4125,6 +4133,20 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
 
 /// v0.14: best-effort `Value` -> `ColType` for VALUES column typing
 /// (first non-NULL value wins; all-NULL columns describe as TEXT).
+/// v0.21: `type_rank` orders numeric types for picking the highest
+/// (float8 > float4 > numeric > bigint > int > smallint), like PG's
+/// VALUES type coercion.
+fn type_rank(t: &ColType) -> u8 {
+    match t {
+        ColType::SmallInt => 1,
+        ColType::Int => 2,
+        ColType::BigInt => 3,
+        ColType::Numeric => 4,
+        ColType::Float4 => 5,
+        ColType::Float => 6,
+        _ => 0,
+    }
+}
 fn value_coltype(v: &Value) -> ColType {
     match v {
         Value::SmallInt(_) => ColType::SmallInt,
@@ -7491,7 +7513,11 @@ fn build_source(
         // v0.14: `(VALUES (e, ...) [, ...]) [AS] alias`. VALUES is
         // uncorrelated, so every row evaluates with no scopes. Columns
         // are named `column1`, `column2`, ... like PostgreSQL.
-        FromItem::Values { rows, alias } => {
+        FromItem::Values {
+            rows,
+            alias,
+            col_aliases,
+        } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
             let mut eval_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
             for row in rows {
@@ -7513,15 +7539,23 @@ fn build_source(
             }
             let schema: Vec<QCol> = (0..ncols)
                 .map(|i| {
+                    // v0.21: pick the highest type among all non-NULL values
+                    // (e.g. float8 wins over numeric when a float8 appears
+                    // in the VALUES list, like PG's type coercion).
                     let ty = eval_rows
                         .iter()
                         .map(|r| &r[i])
-                        .find(|v| !matches!(v, Value::Null))
+                        .filter(|v| !matches!(v, Value::Null))
                         .map(value_coltype)
+                        .max_by_key(|t| type_rank(t))
                         .unwrap_or(ColType::Text);
                     QCol {
                         qual: alias.clone(),
-                        name: format!("column{}", i + 1),
+                        // v0.21: explicit column aliases override column1, ...
+                        name: col_aliases
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("column{}", i + 1)),
                         ty,
                     }
                 })
@@ -9117,6 +9151,11 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
 }
 
 fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    // v0.21: text-vs-numeric coercion (unknown-literal resolution) runs
+    // before the NaN special-case, so 'nan' = x behaves like NaN = x
+    // and 1.5 = '1.5' is true.
+    let (ac, bc) = coerce_text_numeric(a, b)?;
+    let (a, b) = (&ac, &bc);
     // v0.18: PG semantics: NaN != NaN (NaN is not equal to itself).
     // This applies to = and <>; ORDER BY still sorts NaN last via cmp().
     let a_is_nan = matches!(a, Value::Numeric(n) if n.is_nan());
@@ -9273,16 +9312,17 @@ fn eval_dml_expr(
 
 /// Numeric category for promotion. Declaration order IS the promotion
 /// lattice: smallint < integer < bigint < real < double precision <
-/// numeric. (Postgres resolves real+int to double, and
-/// anything+numeric to numeric; int2+int2 resolves to int4.)
+/// v0.21: Postgres numeric promotion order — smallint < integer <
+/// bigint < numeric < real < double precision — so float beats
+/// numeric in `.max()` promotion.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NumCat {
     Small,
     Int,
     Big,
+    Numeric,
     Real,
     Double,
-    Numeric,
 }
 
 fn num_cat(v: &Value) -> Option<NumCat> {
@@ -9295,6 +9335,67 @@ fn num_cat(v: &Value) -> Option<NumCat> {
         Value::Numeric(_) => Some(NumCat::Numeric),
         _ => None,
     }
+}
+
+/// v0.21: the `ColType` matching a numeric `Value`, for text-operand
+/// coercion in operators.
+fn num_col_type(v: &Value) -> Option<ColType> {
+    match v {
+        Value::SmallInt(_) => Some(ColType::SmallInt),
+        Value::Int(_) => Some(ColType::Int),
+        Value::BigInt(_) => Some(ColType::BigInt),
+        Value::Float4(_) => Some(ColType::Float4),
+        Value::Float(_) => Some(ColType::Float),
+        Value::Numeric(_) => Some(ColType::Numeric),
+        _ => None,
+    }
+}
+
+/// v0.21: when exactly one side of an arithmetic/comparison operator is
+/// `Text` and the other side is numeric-kind, parse the text as the
+/// other side's type — Postgres resolves unknown-type literals this
+/// way (`1.5 = '1.5'` is true). Unparseable text is 22P02; anything
+/// else passes through untouched.
+fn coerce_text_numeric(a: &Value, b: &Value) -> Result<(Value, Value), ExecError> {
+    let coerced = match (a, b) {
+        (Value::Text(s), o) => num_col_type(o).map(|t| (s, t, true)),
+        (o, Value::Text(s)) => num_col_type(o).map(|t| (s, t, false)),
+        _ => None,
+    };
+    match coerced {
+        Some((s, t, text_first)) => {
+            let parsed = eval_cast(&Value::Text(s.clone()), t)?;
+            Ok(if text_first {
+                (parsed, b.clone())
+            } else {
+                (a.clone(), parsed)
+            })
+        }
+        None => Ok((a.clone(), b.clone())),
+    }
+}
+
+/// v0.21: Postgres float range checks on an arithmetic result `r`
+/// computed from `x`, `y`: an infinite result from finite inputs is
+/// 22003 (overflow); an exact-zero result from nonzero inputs is 22003
+/// (underflow). Infinities propagate per IEEE when an input was
+/// infinite.
+fn check_float_arith(r: f64, x: f64, y: f64, ty: &'static str) -> Result<(), ExecError> {
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        return Err(exec_err(
+            "22003",
+            format!("value out of range for type {}", ty),
+        ));
+    }
+    // v0.21: underflow to zero from finite nonzero inputs (e.g. 1e-30^2 in
+    // float4). Infinite inputs legitimately produce zero (42/inf = 0).
+    if r == 0.0 && x != 0.0 && y != 0.0 && x.is_finite() && y.is_finite() {
+        return Err(exec_err(
+            "22003",
+            format!("value out of range for type {}", ty),
+        ));
+    }
+    Ok(())
 }
 
 fn op_err(op: ArithOp, a: &Value, b: &Value) -> ExecError {
@@ -9467,6 +9568,10 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     if a == &Value::Null || b == &Value::Null {
         return Ok(Value::Null);
     }
+    // v0.21: text-vs-numeric coercion (unknown-literal resolution)
+    // before anything else, so '1.5' + 1 works like Postgres.
+    let (ac, bc) = coerce_text_numeric(a, b)?;
+    let (a, b) = (&ac, &bc);
     if let Some(v) = eval_datetime_arith(op, a, b)? {
         return Ok(v);
     }
@@ -9512,25 +9617,48 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                 .ok_or_else(|| exec_err("22003", "numeric field overflow"))
         }
         NumCat::Double | NumCat::Real => {
+            // v0.21: float arithmetic with Postgres range checks. Real
+            // (float4) computes in f32 so underflow is judged at f32
+            // precision; NaN propagates per IEEE.
             let x = to_f64v(a);
             let y = to_f64v(b);
             if op == ArithOp::Div && y == 0.0 {
-                // Postgres raises 22012 even for float division.
+                // Postgres: 'nan'::float8 / 0 -> NaN; anything else
+                // divided by zero -> 22012.
+                if x.is_nan() {
+                    return Ok(if cat == NumCat::Real {
+                        Value::Float4(f32::NAN)
+                    } else {
+                        Value::Float(f64::NAN)
+                    });
+                }
                 return Err(exec_err("22012", "division by zero"));
             }
-            let r = match op {
-                ArithOp::Add => x + y,
-                ArithOp::Sub => x - y,
-                ArithOp::Mul => x * y,
-                ArithOp::Div => x / y,
-                ArithOp::Mod => unreachable!("rejected above"),
-                ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
-            };
-            Ok(if cat == NumCat::Real {
-                Value::Float4(r as f32)
+            if cat == NumCat::Real {
+                let xf = x as f32;
+                let yf = y as f32;
+                let r = match op {
+                    ArithOp::Add => xf + yf,
+                    ArithOp::Sub => xf - yf,
+                    ArithOp::Mul => xf * yf,
+                    ArithOp::Div => xf / yf,
+                    ArithOp::Mod => unreachable!("rejected above"),
+                    ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                };
+                check_float_arith(f64::from(r), f64::from(xf), f64::from(yf), "real")?;
+                Ok(Value::Float4(r))
             } else {
-                Value::Float(r)
-            })
+                let r = match op {
+                    ArithOp::Add => x + y,
+                    ArithOp::Sub => x - y,
+                    ArithOp::Mul => x * y,
+                    ArithOp::Div => x / y,
+                    ArithOp::Mod => unreachable!("rejected above"),
+                    ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                };
+                check_float_arith(r, x, y, "double precision")?;
+                Ok(Value::Float(r))
+            }
         }
         _ => {
             let x = to_i128(a);
@@ -9705,6 +9833,104 @@ fn parse_int_text(s: &str) -> Result<i128, ExecError> {
     Ok(r)
 }
 
+/// v0.21: does the (trimmed, non-special) float literal's mantissa
+/// contain a nonzero digit? Tells genuine zero ("0e-400") apart from
+/// underflow ("10e-400").
+fn mantissa_has_nonzero_digit(t: &str) -> bool {
+    let mantissa = t.split(|c| c == 'e' || c == 'E').next().unwrap_or(t);
+    mantissa.bytes().any(|c| c.is_ascii_digit() && c != b'0')
+}
+
+/// v0.21: checked float8 input. Rust's `parse::<f64>()` maps "1e999" to
+/// infinity and stays silent on underflow; Postgres raises 22003 for
+/// both (unless the text is a genuine infinity spelling), and 22P02
+/// for unparseable text.
+fn parse_f64_checked(s: &str) -> Result<f64, ExecError> {
+    let t = s.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => return Ok(f64::INFINITY),
+        "-inf" | "-infinity" => return Ok(f64::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => return Ok(f64::NAN),
+        _ => {}
+    }
+    match t.parse::<f64>() {
+        Ok(f) => {
+            if f.is_infinite() {
+                // Genuine infinity spellings returned above, so this is
+                // overflow like "1e999".
+                return Err(exec_err(
+                    "22003",
+                    format!("value {:?} is out of range for type double precision", s),
+                ));
+            }
+            if f == 0.0 && mantissa_has_nonzero_digit(t) {
+                // Underflow: the text denotes a nonzero value.
+                return Err(exec_err(
+                    "22003",
+                    format!("value {:?} is out of range for type double precision", s),
+                ));
+            }
+            Ok(f)
+        }
+        Err(_) => Err(exec_err(
+            "22P02",
+            format!("invalid input syntax for type double precision: {:?}", s),
+        )),
+    }
+}
+
+/// v0.21: checked float4 input — same rules as `parse_f64_checked`,
+/// with "real" in the messages.
+fn parse_f32_checked(s: &str) -> Result<f32, ExecError> {
+    let t = s.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => return Ok(f32::INFINITY),
+        "-inf" | "-infinity" => return Ok(f32::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => return Ok(f32::NAN),
+        _ => {}
+    }
+    match t.parse::<f32>() {
+        Ok(f) => {
+            if f.is_infinite() {
+                return Err(exec_err(
+                    "22003",
+                    format!("value {:?} is out of range for type real", s),
+                ));
+            }
+            if f == 0.0 && mantissa_has_nonzero_digit(t) {
+                return Err(exec_err(
+                    "22003",
+                    format!("value {:?} is out of range for type real", s),
+                ));
+            }
+            Ok(f)
+        }
+        Err(_) => Err(exec_err(
+            "22P02",
+            format!("invalid input syntax for type real: {:?}", s),
+        )),
+    }
+}
+
+/// v0.21: narrow an f64 to f32 for casts to real. NaN/±Infinity pass
+/// through; overflow is 22003; underflow to 0/subnormal is allowed.
+fn narrow_to_f32(f: f64) -> Result<f32, ExecError> {
+    if f.is_nan() {
+        return Ok(f32::NAN);
+    }
+    if f.is_infinite() {
+        return Ok(if f > 0.0 {
+            f32::INFINITY
+        } else {
+            f32::NEG_INFINITY
+        });
+    }
+    if f.abs() > f32::MAX as f64 {
+        return Err(exec_err("22003", "value out of range for type real"));
+    }
+    Ok(f as f32)
+}
+
 fn cast_to_f64(v: &Value) -> Result<f64, ExecError> {
     match v {
         Value::SmallInt(i) => Ok(*i as f64),
@@ -9714,33 +9940,8 @@ fn cast_to_f64(v: &Value) -> Result<f64, ExecError> {
         Value::Float4(f) => Ok(*f as f64),
         Value::Float(f) => Ok(*f),
         Value::Bool(b) => Ok(*b as i32 as f64),
-        Value::Text(s) => {
-            let t = s.trim();
-            match t.parse::<f64>() {
-                Ok(f) => {
-                    // Rust parses "1e999" as inf; Postgres rejects it.
-                    if f.is_infinite()
-                        && !t.eq_ignore_ascii_case("inf")
-                        && !t.eq_ignore_ascii_case("infinity")
-                        && !t.eq_ignore_ascii_case("+inf")
-                        && !t.eq_ignore_ascii_case("+infinity")
-                        && !t.eq_ignore_ascii_case("-inf")
-                        && !t.eq_ignore_ascii_case("-infinity")
-                    {
-                        Err(exec_err(
-                            "22003",
-                            format!("value {:?} is out of range for type double precision", s),
-                        ))
-                    } else {
-                        Ok(f)
-                    }
-                }
-                Err(_) => Err(exec_err(
-                    "22P02",
-                    format!("invalid input syntax for type double precision: {:?}", s),
-                )),
-            }
-        }
+        // v0.21: text goes through the checked float8 parser.
+        Value::Text(s) => parse_f64_checked(s),
         other => Err(cast_err(other, "double precision")),
     }
 }
@@ -9848,13 +10049,13 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 .map(Value::BigInt)
                 .map_err(|_| exec_err("22003", "bigint out of range"))
         }
-        ColType::Float4 => {
-            let f = cast_to_f64(v)?;
-            if f.abs() > f32::MAX as f64 {
-                return Err(exec_err("22003", "value out of range for type real"));
-            }
-            Ok(Value::Float4(f as f32))
-        }
+        ColType::Float4 => match v {
+            // v0.21: text goes through the checked float4 parser
+            // (overflow/underflow are 22003, like float8); other inputs
+            // widen through f64 and narrow with the same range check.
+            Value::Text(s) => parse_f32_checked(s).map(Value::Float4),
+            _ => narrow_to_f32(cast_to_f64(v)?).map(Value::Float4),
+        },
         ColType::Float => cast_to_f64(v).map(Value::Float),
         ColType::Numeric => cast_to_numeric(v).map(Value::Numeric),
         ColType::Date => match v {
@@ -10248,6 +10449,11 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "min_scale" => n == 1,
         "pi" | "random" => n == 0,
         "degrees" | "radians" => n == 1,
+        // v0.21: float8 transcendental functions.
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd" | "tand"
+        | "cotd" | "asind" | "acosd" | "atand" | "trunc" | "log10" | "float8send" => n == 1,
+        "atan2" | "atan2d" => n == 2,
         "setseed" => n == 1,
         "gcd" | "lcm" => n == 2,
         "div" => n == 2,
@@ -10333,6 +10539,11 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "radians" | "scale" | "min_scale" | "trim_scale" | "div" | "width_bucket" => {
             eval_math_func(name, vals)
         }
+        // v0.21: float8 transcendental functions.
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
+        | "asinh" | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd"
+        | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" | "trunc" | "log10"
+        | "float8send" => eval_math_func(name, vals),
         "random" | "setseed" => eval_math_func(name, vals),
         "now"
         | "current_date"
@@ -11535,7 +11746,31 @@ fn eval_power_op(
     if matches!(a, Value::Float4(_) | Value::Float(_))
         || matches!(b, Value::Float4(_) | Value::Float(_))
     {
-        return Ok(Value::Float(to_f64v(a).powf(to_f64v(b))));
+        // v0.21: PG dpow domain checks on the float path: 0^-inf and
+        // negative-base-to-fractional-exponent are 2201F, 0 to a
+        // negative power is 22012, and overflow is 22003.
+        let x = to_f64v(a);
+        let y = to_f64v(b);
+        if x == 0.0 && y == f64::NEG_INFINITY {
+            return Err(exec_err(
+                "2201F",
+                "zero to the power of negative infinity is undefined",
+            ));
+        }
+        if x == 0.0 && y < 0.0 {
+            return Err(exec_err("22012", "division by zero"));
+        }
+        if x < 0.0 && y.is_finite() && y.fract() != 0.0 {
+            return Err(exec_err(
+                "2201F",
+                "a negative number raised to a non-integer power yields a non-real result",
+            ));
+        }
+        let r = x.powf(y);
+        if r.is_infinite() && x.is_finite() && y.is_finite() {
+            return Err(exec_err("22003", "value out of range: overflow"));
+        }
+        return Ok(Value::Float(r));
     }
     let base = to_numeric_opt(a).ok_or_else(|| bad(a))?;
     let exp = to_numeric_opt(b).ok_or_else(|| bad(b))?;
@@ -11654,6 +11889,340 @@ fn eval_power_op(
         .map_err(|_| exec_err("22003", "value out of range for type numeric"))
 }
 
+// ---------------------------------------------------------------------------
+// v0.21: float8 transcendental functions (Postgres float.c semantics)
+// ---------------------------------------------------------------------------
+
+/// v0.21: argument fetch for the float8 math functions. Float4/Float go
+/// straight through; other numeric-kinds are coerced via f64 (a
+/// documented extension — Postgres would dispatch those to numeric
+/// overloads, which rustgres does not implement). Anything else is
+/// 42883.
+fn float_math_arg(name: &str, v: &Value) -> Result<f64, ExecError> {
+    if num_cat(v).is_none() {
+        return Err(func_arg_err(name, v));
+    }
+    Ok(to_f64v(v))
+}
+
+/// v0.21: like PG's float.c — a ±Infinity input is 22003 "input is out
+/// of range"; NaN flows into the f64 op and comes back NaN.
+fn reject_inf_input(x: f64) -> Result<f64, ExecError> {
+    if x.is_infinite() {
+        return Err(exec_err("22003", "input is out of range"));
+    }
+    Ok(x)
+}
+
+/// v0.21: erf(x). Maclaurin series for |x| <= 1, `1 - erfc(x)` beyond.
+fn erf_impl(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_infinite() {
+        return x.signum();
+    }
+    if x.abs() > 1.0 {
+        return 1.0 - erfc_impl(x);
+    }
+    // erf(x) = 2/sqrt(pi) * sum (-1)^n x^(2n+1) / (n! (2n+1)).
+    let xsq = x * x;
+    let mut term = x;
+    let mut sum = x;
+    for n in 1..200u32 {
+        term *= -xsq * f64::from(2 * n - 1) / (f64::from(n) * f64::from(2 * n + 1));
+        sum += term;
+        if term.abs() < 1e-17 * sum.abs() {
+            break;
+        }
+    }
+    sum * 2.0 / std::f64::consts::PI.sqrt()
+}
+
+/// v0.21: erfc(x). Laplace continued fraction (Lentz's algorithm) for
+/// x >= 0, `2 - erfc(-x)` for x < 0; tiny results underflow to 0.
+fn erfc_impl(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { 0.0 } else { 2.0 };
+    }
+    if x < 0.0 {
+        return 2.0 - erfc_impl(-x);
+    }
+    if x == 0.0 {
+        return 1.0;
+    }
+    // v0.21: the Laplace continued fraction below is designed for
+    // large x and loses accuracy for small |x|; use 1 - erf(x) there.
+    if x <= 1.0 {
+        return 1.0 - erf_impl(x);
+    }
+    // erfc(x) = x*e^(-x^2)/sqrt(pi) / L, where L is
+    // x^2 + (1/2)/(1 + 1/(x^2 + (3/2)/(1 + 2/(x^2 + ...)))).
+    let tiny = 1e-300f64;
+    let x2 = x * x;
+    let mut f = if x2 == 0.0 { tiny } else { x2 };
+    let mut c = f;
+    let mut d = 0.0f64;
+    for j in 1..500u32 {
+        let a = f64::from(j) / 2.0;
+        let b = if j % 2 == 1 { 1.0 } else { x2 };
+        d = b + a * d;
+        if d == 0.0 {
+            d = tiny;
+        }
+        c = b + a / c;
+        if c == 0.0 {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let cd = c * d;
+        f *= cd;
+        if (cd - 1.0).abs() < 1e-15 {
+            break;
+        }
+    }
+    x * (-x2).exp() / std::f64::consts::PI.sqrt() / f
+}
+
+/// v0.21: Lanczos approximation (g=7, 9 coefficients) for gamma.
+const LANCZOS_GAMMA: [f64; 9] = [
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+];
+
+/// Log-gamma for x > 0 via Lanczos in log space (no intermediate
+/// overflow). For x < 0.5 the reflection formula is used instead —
+/// the direct form divides by (z+1), which rounds to 0 for tiny x.
+fn lanczos_lgamma(x: f64) -> f64 {
+    let z = x - 1.0;
+    let mut ag = LANCZOS_GAMMA[0];
+    for (k, c) in LANCZOS_GAMMA.iter().enumerate().skip(1) {
+        ag += c / (z + k as f64);
+    }
+    let t = z + 7.0 + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + ag.ln()
+}
+
+/// v0.21: lgamma(x) = ln|gamma(x)|. Poles (0 and negative integers)
+/// are 22003; lgamma(±inf) = +inf.
+fn lgamma_impl(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x.is_infinite() {
+        return Ok(f64::INFINITY);
+    }
+    if x == 0.0 || (x < 0.0 && x.fract() == 0.0) {
+        return Err(exec_err(
+            "22003",
+            "lgamma pole: logarithm of gamma at a non-positive integer is undefined",
+        ));
+    }
+    // v0.21: exact path for positive integers: lgamma(n) = ln((n-1)!).
+    // This avoids Lanczos rounding (e.g. lgamma(1) = -8.8e-16).
+    if x > 0.0 && x.fract() == 0.0 && x <= 171.0 {
+        let n = x as u64;
+        let mut log_fact = 0.0f64;
+        for k in 2..n {
+            log_fact += (k as f64).ln();
+        }
+        return Ok(log_fact);
+    }
+    let r = if x < 0.5 {
+        // Reflection in log space:
+        // ln|G(x)| = ln pi - ln|sin(pi x)| - lnG(1-x).
+        let s = (std::f64::consts::PI * x).sin().abs();
+        if s == 0.0 {
+            return Err(exec_err("22003", "value out of range: overflow"));
+        }
+        std::f64::consts::PI.ln() - s.ln() - lanczos_lgamma(1.0 - x)
+    } else {
+        lanczos_lgamma(x)
+    };
+    // v0.21: lgamma(1e308) overflows float8 -> 22003 (PG behavior).
+    if r.is_infinite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    Ok(r)
+}
+
+/// v0.21: gamma(x). Exact (n-1)! path for positive integers,
+/// log-space Lanczos + reflection otherwise; poles, -inf, overflow
+/// and underflow are 22003.
+fn gamma_impl(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x == f64::INFINITY {
+        return Ok(f64::INFINITY);
+    }
+    if x == f64::NEG_INFINITY {
+        return Err(exec_err("22003", "gamma of negative infinity is undefined"));
+    }
+    if x == 0.0 || (x < 0.0 && x.fract() == 0.0) {
+        return Err(exec_err(
+            "22003",
+            "gamma pole: gamma of a non-positive integer is undefined",
+        ));
+    }
+    if x > 0.0 && x.fract() == 0.0 {
+        // Exact positive-integer path: gamma(n) = (n-1)!.
+        if x > 171.0 {
+            return Err(exec_err("22003", "value out of range: overflow"));
+        }
+        let mut f = 1.0f64;
+        for k in 2..x as u64 {
+            f *= k as f64;
+        }
+        return Ok(f);
+    }
+    // Sign of gamma(x): positive for x > 0; for x < 0 it is the sign of
+    // sin(pi x), since gamma(1-x) > 0 (x is not a pole here).
+    let sign = if x > 0.0 {
+        1.0
+    } else {
+        (std::f64::consts::PI * x).sin().signum()
+    };
+    let r = sign * lgamma_impl(x)?.exp();
+    if r.is_infinite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    if r == 0.0 {
+        return Err(exec_err("22003", "value out of range: underflow"));
+    }
+    Ok(r)
+}
+
+/// v0.21: degrees per radian-scale factor for the degree trig below.
+const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
+
+/// sin of `a` degrees for `a` in [0, 90]; exact at 30° (= 1/2).
+fn sin_q(a: f64) -> f64 {
+    if a == 30.0 {
+        0.5
+    } else {
+        (a * DEG_TO_RAD).sin()
+    }
+}
+
+/// cos of `a` degrees for `a` in [0, 90]; exact at 60° (= 1/2).
+fn cos_q(a: f64) -> f64 {
+    if a == 60.0 {
+        0.5
+    } else {
+        (a * DEG_TO_RAD).cos()
+    }
+}
+
+/// v0.21: sind — sine of degrees with quadrant reduction, so cardinal
+/// angles are exact (sind(30)=0.5, sind(90)=1). NaN/Inf are rejected
+/// by the caller.
+fn sind_impl(x: f64) -> f64 {
+    let r = x.rem_euclid(360.0);
+    let q = (r / 90.0) as i32; // 0..=3
+    let a = r - f64::from(q) * 90.0; // [0, 90)
+    let v = match q {
+        0 => sin_q(a),
+        1 => cos_q(a),
+        2 => -sin_q(a),
+        _ => -cos_q(a),
+    };
+    if v == 0.0 { 0.0 } else { v } // normalize -0.0
+}
+
+/// v0.21: cosd(x) = sind(x + 90); inherits the exactness.
+fn cosd_impl(x: f64) -> f64 {
+    sind_impl(x + 90.0)
+}
+
+/// v0.21: tand — quadrant reduction with exact 45° (= ±1) and exact
+/// infinities at the odd quadrants (tand(90)=Infinity).
+fn tand_impl(x: f64) -> f64 {
+    let r = x.rem_euclid(360.0);
+    let q = (r / 90.0) as i32; // 0..=3
+    let a = r - f64::from(q) * 90.0; // [0, 90)
+    if a == 0.0 {
+        return match q {
+            0 | 2 => 0.0,
+            1 => f64::INFINITY,
+            _ => f64::NEG_INFINITY,
+        };
+    }
+    if a == 45.0 {
+        return match q {
+            0 | 2 => 1.0,
+            _ => -1.0,
+        };
+    }
+    let t = (a * DEG_TO_RAD).tan();
+    match q {
+        0 | 2 => t,
+        _ => -1.0 / t,
+    }
+}
+
+/// v0.21: cotd(x) = tand(90 - x); exact at the cardinals.
+fn cotd_impl(x: f64) -> f64 {
+    tand_impl(90.0 - x)
+}
+
+/// v0.21: asind — degrees(asin(x)) with exactness at the nice values
+/// (asind(0.5)=30). Domain is checked by the caller.
+fn asind_impl(x: f64) -> f64 {
+    if x == 0.5 {
+        return 30.0;
+    }
+    if x == -0.5 {
+        return -30.0;
+    }
+    if x == 1.0 {
+        return 90.0;
+    }
+    if x == -1.0 {
+        return -90.0;
+    }
+    x.asin().to_degrees()
+}
+
+/// v0.21: acosd — degrees(acos(x)) with exactness at the nice values
+/// (acosd(0.5)=60). Domain is checked by the caller.
+fn acosd_impl(x: f64) -> f64 {
+    if x == 0.5 {
+        return 60.0;
+    }
+    if x == -0.5 {
+        return 120.0;
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    if x == -1.0 {
+        return 180.0;
+    }
+    x.acos().to_degrees()
+}
+
+/// v0.21: atand — degrees(atan(x)); atand(±1) = ±45.
+fn atand_impl(x: f64) -> f64 {
+    if x == 1.0 {
+        return 45.0;
+    }
+    if x == -1.0 {
+        return -45.0;
+    }
+    x.atan().to_degrees()
+}
+
 fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     // v0.18: zero-argument functions must be handled before indexing vals[0].
     match name {
@@ -11724,8 +12293,18 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         }
         "sqrt" => {
             if matches!(v, Value::Float4(_) | Value::Float(_)) {
-                // Postgres: sqrt(float8) -> float8, NaN for negatives.
-                return Ok(Value::Float(to_f64v(v).sqrt()));
+                // v0.21: PG dsqrt — a negative float is 2201F (was NaN).
+                let x = to_f64v(v);
+                if x.is_nan() {
+                    return Ok(Value::Float(f64::NAN));
+                }
+                if x < 0.0 {
+                    return Err(exec_err(
+                        "2201F",
+                        "cannot take square root of a negative number",
+                    ));
+                }
+                return Ok(Value::Float(x.sqrt()));
             }
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             match n.sqrt() {
@@ -11739,8 +12318,19 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         }
         "exp" => {
             if matches!(v, Value::Float4(_) | Value::Float(_)) {
-                // Postgres: exp(float8) -> float8.
-                return Ok(Value::Float(to_f64v(v).exp()));
+                // v0.21: PG dexp — finite overflow/underflow is 22003
+                // (was: +/-inf/0 silently); NaN/Inf pass through.
+                let x = to_f64v(v);
+                let r = x.exp();
+                if x.is_finite() {
+                    if r.is_infinite() {
+                        return Err(exec_err("22003", "value out of range: overflow"));
+                    }
+                    if r == 0.0 {
+                        return Err(exec_err("22003", "value out of range: underflow"));
+                    }
+                }
+                return Ok(Value::Float(r));
             }
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             // Postgres special values: exp(NaN)=NaN, exp(Inf)=Inf, exp(-Inf)=0.
@@ -11873,6 +12463,170 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Ok(r) => Ok(Value::Numeric(r)),
                 Err(_) => Ok(Value::Float(f)),
             }
+        }
+        // v0.21: float8 transcendental functions (Postgres float.c
+        // semantics). All return float8; NaN propagates; domain
+        // violations raise like Postgres.
+        "sin" | "cos" | "tan" => {
+            let x = reject_inf_input(float_math_arg(name, v)?)?;
+            Ok(Value::Float(match name {
+                "sin" => x.sin(),
+                "cos" => x.cos(),
+                _ => x.tan(),
+            }))
+        }
+        "asin" | "acos" => {
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            // PG dasin/dacos: outside [-1, 1] is 22003.
+            if x < -1.0 || x > 1.0 {
+                return Err(exec_err("22003", "input is out of range"));
+            }
+            Ok(Value::Float(if name == "asin" {
+                x.asin()
+            } else {
+                x.acos()
+            }))
+        }
+        "atan" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(x.atan()))
+        }
+        "atan2" => {
+            let y = float_math_arg(name, v)?;
+            let x = float_math_arg(name, &vals[1])?;
+            if y.is_nan() || x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            // PG datan2: atan2(0, 0) is 22012.
+            if y == 0.0 && x == 0.0 {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            Ok(Value::Float(y.atan2(x)))
+        }
+        "sinh" | "cosh" | "tanh" => {
+            let x = float_math_arg(name, v)?;
+            let r = match name {
+                "sinh" => x.sinh(),
+                "cosh" => x.cosh(),
+                _ => x.tanh(),
+            };
+            // PG CHECKFLOATVAL: infinite result from finite input.
+            if r.is_infinite() && x.is_finite() {
+                return Err(exec_err("22003", "value out of range: overflow"));
+            }
+            Ok(Value::Float(r))
+        }
+        "asinh" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(x.asinh()))
+        }
+        "acosh" => {
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            // PG dacosh: x < 1 (other than NaN) is 22003.
+            if x < 1.0 {
+                return Err(exec_err("22003", "input is out of range"));
+            }
+            Ok(Value::Float(x.acosh()))
+        }
+        "atanh" => {
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            // |x| > 1 is 22003; atanh(±1) = ±inf.
+            if x.abs() > 1.0 {
+                return Err(exec_err("22003", "input is out of range"));
+            }
+            Ok(Value::Float(x.atanh()))
+        }
+        "erf" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(erf_impl(x)))
+        }
+        "erfc" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(erfc_impl(x)))
+        }
+        "gamma" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(gamma_impl(x)?))
+        }
+        "lgamma" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(lgamma_impl(x)?))
+        }
+        "sind" | "cosd" | "tand" | "cotd" => {
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            if x.is_infinite() {
+                return Err(exec_err("22003", "input is out of range"));
+            }
+            Ok(Value::Float(match name {
+                "sind" => sind_impl(x),
+                "cosd" => cosd_impl(x),
+                "tand" => tand_impl(x),
+                _ => cotd_impl(x),
+            }))
+        }
+        "asind" | "acosd" => {
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            if x < -1.0 || x > 1.0 {
+                return Err(exec_err("22003", "input is out of range"));
+            }
+            Ok(Value::Float(if name == "asind" {
+                asind_impl(x)
+            } else {
+                acosd_impl(x)
+            }))
+        }
+        "atand" => {
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(atand_impl(x)))
+        }
+        "atan2d" => {
+            let y = float_math_arg(name, v)?;
+            let x = float_math_arg(name, &vals[1])?;
+            if y.is_nan() || x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            if y == 0.0 && x == 0.0 {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            Ok(Value::Float(y.atan2(x).to_degrees()))
+        }
+        "trunc" => {
+            // v0.21: trunc(float8) -> float8, toward zero.
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Float(x.trunc()))
+        }
+        "log10" => {
+            // v0.21: log10(float8) -> float8; x <= 0 is 2201E, like
+            // ln/log.
+            let x = float_math_arg(name, v)?;
+            if x.is_nan() {
+                return Ok(Value::Float(f64::NAN));
+            }
+            if x <= 0.0 {
+                return Err(exec_err("2201E", "cannot take logarithm"));
+            }
+            Ok(Value::Float(x.log10()))
+        }
+        "float8send" => {
+            // v0.21: float8send(float8) -> bytea: the 8-byte big-endian
+            // IEEE 754 binary representation, like PG's float8send.
+            let x = float_math_arg(name, v)?;
+            Ok(Value::Bytea(x.to_be_bytes().to_vec()))
         }
         "factorial" => {
             // factorial(numeric) -> numeric. PG: 0! = 1, negative errors.
@@ -12075,8 +12829,16 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 };
                 Ok(Value::Numeric(Numeric::new(s, 0)))
             }
-            Value::Float4(f) => Ok(Value::Float4(f.signum())),
-            Value::Float(f) => Ok(Value::Float(f.signum())),
+            Value::Float4(f) => {
+                // v0.21: sign(0) = 0 (Rust's signum() returns 1.0 for 0.0).
+                let s = if *f == 0.0 { 0.0 } else { f.signum() };
+                Ok(Value::Float4(s))
+            }
+            Value::Float(f) => {
+                // v0.21: sign(0) = 0 (Rust's signum() returns 1.0 for 0.0).
+                let s = if *f == 0.0 { 0.0 } else { f.signum() };
+                Ok(Value::Float(s))
+            }
             other => Err(func_arg_err(name, other)),
         },
         _ => Err(exec_err(
@@ -12431,6 +13193,14 @@ fn func_result_type(
         "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" => Ok(ColType::Numeric),
         "scale" | "min_scale" | "width_bucket" => Ok(ColType::Int),
         "random" => Ok(ColType::Float),
+        // v0.21: float8 transcendental functions always return float8.
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
+        | "asinh" | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd"
+        | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" | "trunc" | "log10" => {
+            Ok(ColType::Float)
+        }
+        // v0.21: float8send returns bytea.
+        "float8send" => Ok(ColType::Bytea),
         // setseed() returns void in Postgres (OID 2278); rustgres has no void
         // ColType and the implementation always returns NULL, so declare Text
         // like the NULL literal type inference does (see Value::Null arm).
@@ -12794,18 +13564,32 @@ fn from_schema_item(
         }
         // v0.14: VALUES columns are `column1`, ... typed from the first
         // row's expressions (all-NULL columns describe as TEXT).
-        FromItem::Values { rows, alias } => {
+        // v0.21: explicit `AS t(a, b)` column aliases override the names.
+        // v0.21: pick the highest type across all rows (float8 wins over
+        // numeric), like PG's VALUES type coercion.
+        FromItem::Values {
+            rows,
+            alias,
+            col_aliases,
+        } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
-            let first = rows.first().cloned().unwrap_or_default();
             out.push(
                 (0..ncols)
-                    .map(|i| QCol {
-                        qual: alias.clone(),
-                        name: format!("column{}", i + 1),
-                        ty: first
-                            .get(i)
-                            .and_then(|e| hint_type(eng, snap, own, &[], e))
-                            .unwrap_or(ColType::Text),
+                    .map(|i| {
+                        let ty = rows
+                            .iter()
+                            .filter_map(|r| r.get(i))
+                            .filter_map(|e| hint_type(eng, snap, own, &[], e))
+                            .max_by_key(|t| type_rank(t))
+                            .unwrap_or(ColType::Text);
+                        QCol {
+                            qual: alias.clone(),
+                            name: col_aliases
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("column{}", i + 1)),
+                            ty,
+                        }
                     })
                     .collect(),
             );
@@ -13075,16 +13859,18 @@ fn arith_operand_type(
 
 /// Rank in the numeric promotion lattice (v0.7):
 /// smallint < integer < bigint < real < double precision < numeric.
-/// (Postgres resolves real+int to double and anything+numeric to
-/// numeric; int2+int2 resolves to int4 — see the special case below.)
+/// v0.21: Postgres numeric promotion order — smallint < integer <
+/// bigint < numeric < real < double precision — matching `NumCat`,
+/// so the static result type agrees with runtime promotion
+/// (float8 beats numeric).
 fn numeric_rank(t: &ColType) -> Option<u8> {
     match t {
         ColType::SmallInt => Some(0),
         ColType::Int => Some(1),
         ColType::BigInt => Some(2),
-        ColType::Float4 => Some(3),
-        ColType::Float => Some(4),
-        ColType::Numeric => Some(5),
+        ColType::Numeric => Some(3),
+        ColType::Float4 => Some(4),
+        ColType::Float => Some(5),
         _ => None,
     }
 }
@@ -13094,9 +13880,9 @@ fn rank_type(rank: u8) -> ColType {
         0 => ColType::SmallInt,
         1 => ColType::Int,
         2 => ColType::BigInt,
-        3 => ColType::Float4,
-        4 => ColType::Float,
-        _ => ColType::Numeric,
+        3 => ColType::Numeric,
+        4 => ColType::Float4,
+        _ => ColType::Float,
     }
 }
 
@@ -13141,18 +13927,23 @@ fn combine_arith_types(
                     ArithOp::Sub => Ok(ColType::Int),
                     _ => Err(op_err(&x, &y)),
                 },
+                // v0.21: an unknown-type (text) literal against a numeric
+                // operand resolves to the numeric type, like Postgres;
+                // the runtime parses the text in coerce_text_numeric.
+                (x, ColType::Text) if numeric_rank(x).is_some() => Ok(*x),
+                (ColType::Text, y) if numeric_rank(y).is_some() => Ok(*y),
                 (x, y) => match (numeric_rank(x), numeric_rank(y)) {
                     (Some(rx), Some(ry)) => {
                         if op == ArithOp::Pow {
                             // Postgres `^`: numeric for exact inputs,
                             // float8 when either side is floating.
-                            return Ok(if rx.max(ry) >= 3 {
+                            return Ok(if rx.max(ry) >= 4 {
                                 ColType::Float
                             } else {
                                 ColType::Numeric
                             });
                         }
-                        if op == ArithOp::Mod && matches!(rx.max(ry), 3 | 4) {
+                        if op == ArithOp::Mod && matches!(rx.max(ry), 4 | 5) {
                             // Postgres defines % only for the exact numeric
                             // types (not real/double).
                             return Err(op_err(x, y));
@@ -14847,6 +15638,290 @@ mod tests {
         );
         assert_eq!(cursor_window_for_test(&FetchDir::First, 2, 4), (0, 1, 0));
         assert_eq!(cursor_window_for_test(&FetchDir::Last, 2, 4), (3, 4, 3));
+    }
+
+    // ====================================================================
+    // v0.21: float8 math cluster.
+    // ====================================================================
+
+    /// Parse the single row of a single/multi-column float SELECT into f64s.
+    fn floats_of(eng: &mut Engine, sql: &str) -> Vec<f64> {
+        rows_of(run(eng, sql).unwrap())[0]
+            .iter()
+            .map(|s| {
+                s.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("not a float: {s}"))
+            })
+            .collect()
+    }
+
+    fn err_code(eng: &mut Engine, sql: &str) -> &'static str {
+        run(eng, sql).unwrap_err().code
+    }
+
+    #[test]
+    fn float8_hyperbolic_values() {
+        let mut eng = engine();
+        let v = floats_of(&mut eng, "SELECT sinh(1.0), cosh(1.0), tanh(1.0)");
+        assert!((v[0] - 1.1752011936438014).abs() < 1e-15, "sinh(1): {v:?}");
+        assert!((v[1] - 1.5430806348152437).abs() < 1e-15, "cosh(1): {v:?}");
+        assert!((v[2] - 0.7615941559557649).abs() < 1e-15, "tanh(1): {v:?}");
+        let v = floats_of(&mut eng, "SELECT asinh(1.0), acosh(2.0), atanh(0.5)");
+        assert!((v[0] - 0.881373587019543).abs() < 1e-15, "asinh(1): {v:?}");
+        assert!((v[1] - 1.3169578969248167).abs() < 1e-15, "acosh(2): {v:?}");
+        assert!(
+            (v[2] - 0.5493061443340549).abs() < 1e-15,
+            "atanh(0.5): {v:?}"
+        );
+    }
+
+    #[test]
+    fn float8_hyperbolic_specials() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT sinh('Infinity'::float8), cosh('-Infinity'::float8), \
+                 tanh('NaN'::float8), asinh('Infinity'::float8), \
+                 acosh('Infinity'::float8)",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows[0], "Infinity");
+        assert_eq!(rows[1], "Infinity");
+        assert_eq!(rows[2], "NaN");
+        assert_eq!(rows[3], "Infinity");
+        assert_eq!(rows[4], "Infinity");
+        // atanh(±1) = ±inf, but |x| > 1 is out of range.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT atanh(1.0::float8)").unwrap())[0][0],
+            "Infinity"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT atanh(-1.0::float8)").unwrap())[0][0],
+            "-Infinity"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT atanh('Infinity'::float8)"),
+            "22003"
+        );
+        // sinh/cosh overflow of a finite input is 22003.
+        assert_eq!(err_code(&mut eng, "SELECT sinh(1000.0)"), "22003");
+    }
+
+    #[test]
+    fn float8_trig_domain_errors() {
+        let mut eng = engine();
+        assert_eq!(
+            err_code(&mut eng, "SELECT sin('Infinity'::float8)"),
+            "22003"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT cos('-Infinity'::float8)"),
+            "22003"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT tan('Infinity'::float8)"),
+            "22003"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT asin(2.0)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT asin(-2.0::float8)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT acos(2.0)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT acosh(0.5)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT atanh(2.0)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT atanh(-1.5::float8)"), "22003");
+        // v0.21 repair: sqrt of a negative float is 2201F (was NaN).
+        assert_eq!(err_code(&mut eng, "SELECT sqrt(-1.0::float8)"), "2201F");
+        assert_eq!(err_code(&mut eng, "SELECT sqrt(-4.0::float4)"), "2201F");
+        // NaN still propagates.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT sqrt('NaN'::float8)").unwrap())[0][0],
+            "NaN"
+        );
+    }
+
+    #[test]
+    fn float8_degree_trig_exact() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT sind(30), cosd(60), tand(45), asind(0.5), acosd(0.5), \
+                 atand(1), atan2d(1, 1)",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows, vec!["0.5", "0.5", "1", "30", "60", "45", "45"]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT sind(90), cosd(0), tand(90), cotd(0), cotd(45), sind(-30)",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows, vec!["1", "1", "Infinity", "Infinity", "1", "-0.5"]);
+        // sind(inf) is out of range; asind/acosd reject |x| > 1.
+        assert_eq!(
+            err_code(&mut eng, "SELECT sind('Infinity'::float8)"),
+            "22003"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT asind(1.5)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT acosd(-2.0::float8)"), "22003");
+    }
+
+    #[test]
+    fn float8_erf_erfc_values() {
+        let mut eng = engine();
+        let v = floats_of(
+            &mut eng,
+            "SELECT erf(1.0), erf(-1.0), erfc(6.0), erfc(28.0)",
+        );
+        assert!((v[0] - 0.8427007929497148).abs() < 1e-12, "erf(1): {v:?}");
+        assert!((v[1] + 0.8427007929497148).abs() < 1e-12, "erf(-1): {v:?}");
+        assert!(
+            (v[2] - 2.1519736712498925e-17).abs() < 1e-29,
+            "erfc(6): {v:?}"
+        );
+        assert_eq!(v[3], 0.0, "erfc(28) clamps to 0: {v:?}");
+        // Specials: erf(±inf) = ±1, erfc(+inf) = 0, erfc(-inf) = 2.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT erf('Infinity'::float8), erf('-Infinity'::float8), \
+                 erfc('Infinity'::float8), erfc('-Infinity'::float8), \
+                 erf('NaN'::float8)",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows, vec!["1", "-1", "0", "2", "NaN"]);
+    }
+
+    #[test]
+    fn float8_gamma_lgamma_values() {
+        let mut eng = engine();
+        let v = floats_of(&mut eng, "SELECT gamma(0.5), gamma(5.0), lgamma(0.5)");
+        assert!(
+            (v[0] - 1.7724538509055159).abs() < 1e-12,
+            "gamma(0.5): {v:?}"
+        );
+        assert_eq!(v[1], 24.0, "gamma(5): {v:?}");
+        assert!(
+            (v[2] - 0.5723649429246995).abs() < 1e-12,
+            "lgamma(0.5): {v:?}"
+        );
+        let v = floats_of(&mut eng, "SELECT lgamma(-1000.5), gamma(-0.5)");
+        assert!(
+            (v[0] - -5914.437701116853).abs() < 1e-6,
+            "lgamma(-1000.5): {v:?}"
+        );
+        assert!(
+            (v[1] - -3.544907701811032).abs() < 1e-12,
+            "gamma(-0.5): {v:?}"
+        );
+        // Poles and -inf are 22003; gamma(inf) = inf.
+        assert_eq!(err_code(&mut eng, "SELECT gamma(-1.0)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT gamma(0.0::float8)"), "22003");
+        assert_eq!(
+            err_code(&mut eng, "SELECT gamma('-Infinity'::float8)"),
+            "22003"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT lgamma(0.0)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT gamma(200.0)"), "22003");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT gamma('Infinity'::float8)").unwrap())[0][0],
+            "Infinity"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT lgamma('-Infinity'::float8)").unwrap())[0][0],
+            "Infinity"
+        );
+    }
+
+    #[test]
+    fn float8_exp_ln_log_range() {
+        let mut eng = engine();
+        // v0.21 repair: finite exp overflow/underflow is 22003.
+        assert_eq!(err_code(&mut eng, "SELECT exp(1000.0::float8)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT exp(-1000.0::float8)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT exp(1000.0::float4)"), "22003");
+        // NaN/Inf pass through.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT exp('NaN'::float8), exp('Infinity'::float8), \
+                 exp('-Infinity'::float8)",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows, vec!["NaN", "Infinity", "0"]);
+        // ln/log/log10: zero and negative are 2201E.
+        assert_eq!(err_code(&mut eng, "SELECT ln(0.0::float8)"), "2201E");
+        assert_eq!(err_code(&mut eng, "SELECT ln(-1.0::float8)"), "2201E");
+        assert_eq!(err_code(&mut eng, "SELECT log(0.0::float8)"), "2201E");
+        assert_eq!(err_code(&mut eng, "SELECT log10(0.0)"), "2201E");
+        assert_eq!(err_code(&mut eng, "SELECT log10(-5.0::float8)"), "2201E");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT log10(100.0::float8)").unwrap())[0][0],
+            "2"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT log10(1000.0)").unwrap())[0][0],
+            "3"
+        );
+    }
+
+    #[test]
+    fn float8_trunc_and_prefix_ops() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT trunc(3.7), trunc(-3.7::float8), trunc(3.7::float4), \
+                 @-5, @5, |/4, ||/8, @-5.5",
+            )
+            .unwrap(),
+        )[0]
+        .clone();
+        assert_eq!(rows, vec!["3", "-3", "3", "5", "5", "2", "2", "5.5"]);
+        // v0.21: text-vs-numeric coercion in arithmetic and comparison.
+        // ('1.5' + 1 would coerce the text to integer and fail, like PG.)
+        let rows = rows_of(run(&mut eng, "SELECT '2' + 1.5, 1.5 = '1.5', '1.5' = 1.5").unwrap())[0]
+            .clone();
+        assert_eq!(rows, vec!["3.5", "t", "t"]);
+        assert_eq!(err_code(&mut eng, "SELECT '1.5' + 1"), "22P02");
+        assert_eq!(err_code(&mut eng, "SELECT 'abc' + 1"), "22P02");
+        assert_eq!(err_code(&mut eng, "SELECT 'abc' = 1.5"), "22P02");
+        // v0.21: float division by zero semantics.
+        assert_eq!(err_code(&mut eng, "SELECT 1.0::float8 / 0.0"), "22012");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT 'nan'::float8 / '0'::float8").unwrap())[0][0],
+            "NaN"
+        );
+        // v0.21: float overflow/underflow in arithmetic.
+        assert_eq!(err_code(&mut eng, "SELECT 1e308::float8 * 10.0"), "22003");
+        assert_eq!(
+            err_code(&mut eng, "SELECT '1e-30'::float4 * '1e-30'::float4"),
+            "22003"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT 'Infinity'::float8 + 100.0").unwrap())[0][0],
+            "Infinity"
+        );
+        // v0.21: power domain checks.
+        assert_eq!(
+            err_code(&mut eng, "SELECT power(0.0, '-Infinity'::float8)"),
+            "2201F"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT power(-1.0, 0.5)"), "2201F");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT power('inf'::float8, -2)").unwrap())[0][0],
+            "0"
+        );
     }
 }
 

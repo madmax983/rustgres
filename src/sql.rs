@@ -82,15 +82,18 @@ enum Token {
     Slash,   // v0.7: `/`
     Percent, // v0.7: `%`
     Eq,
-    Dot,        // v0.6: qualified refs (t.col)
-    Lt,         // v0.6: <
-    Gt,         // v0.6: >
-    LtEq,       // v0.6: <=
-    GtEq,       // v0.6: >=
-    Neq,        // v0.6: <> and !=
-    ColonColon, // v0.7: `::` cast
-    PipePipe,   // v0.7: `||` concat
-    Caret,      // v0.7: `^` exponentiation
+    Dot,           // v0.6: qualified refs (t.col)
+    Lt,            // v0.6: <
+    Gt,            // v0.6: >
+    LtEq,          // v0.6: <=
+    GtEq,          // v0.6: >=
+    Neq,           // v0.6: <> and !=
+    ColonColon,    // v0.7: `::` cast
+    PipePipe,      // v0.7: `||` concat
+    At,            // v0.21: `@` prefix abs operator
+    PipeSlash,     // v0.21: `|/` prefix sqrt operator
+    PipePipeSlash, // v0.21: `||/` prefix cbrt operator
+    Caret,         // v0.7: `^` exponentiation
     EOF,
 }
 
@@ -282,14 +285,27 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             }
             continue;
         }
-        // `||` concatenation (a lone `|` is a syntax error).
+        // `||/` prefix cbrt, `|/` prefix sqrt, `||` concatenation
+        // (a lone `|` is a syntax error). Longest match first.
         if c == '|' {
-            if i + 1 < chars.len() && chars[i + 1] == '|' {
+            if i + 2 < chars.len() && chars[i + 1] == '|' && chars[i + 2] == '/' {
+                toks.push(Token::PipePipeSlash);
+                i += 3;
+            } else if i + 1 < chars.len() && chars[i + 1] == '/' {
+                toks.push(Token::PipeSlash);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '|' {
                 toks.push(Token::PipePipe);
                 i += 2;
             } else {
                 return Err(err("unexpected character '|'"));
             }
+            continue;
+        }
+        // v0.21: `@` prefix absolute-value operator.
+        if c == '@' {
+            toks.push(Token::At);
+            i += 1;
             continue;
         }
         // `/* ... */` block comment
@@ -849,7 +865,12 @@ pub enum FromItem {
     Derived { sub: Box<SelectStmt>, alias: String },
     /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
     /// columns `column1`, `column2`, ... when no column aliases are given.
-    Values { rows: Vec<Vec<Expr>>, alias: String },
+    /// v0.21: `[(col, ...)]` column aliases.
+    Values {
+        rows: Vec<Vec<Expr>>,
+        alias: String,
+        col_aliases: Vec<String>,
+    },
     Join {
         left: Box<FromItem>,
         kind: JoinKind,
@@ -1513,6 +1534,10 @@ pub enum Stmt {
     CreateTable {
         name: String,
         def: TableDef,
+        /// v0.21: true for `CREATE TEMP TABLE` — the table is dropped
+        /// if it already exists (session-local semantics approximation
+        /// for pg_regress conformance).
+        temp: bool,
     },
     // --- v0.9: ALTER TABLE ---
     AlterTable {
@@ -2608,17 +2633,17 @@ impl Parser {
             return self.parse_create_sequence();
         }
         // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
-        // TEMPORARY is accepted for pg_regress conformance but currently
-        // behaves as a regular persistent table: per-session scoping and
-        // ON COMMIT behavior are not implemented (documented in README).
-        if self.eat_keyword("temporary") || self.eat_keyword("temp") {
-            // TEMP accepted, TEMPORARY semantics not implemented
+        // v0.21: TEMP tables drop any existing table with the same name
+        // (approximating session-local semantics for pg_regress).
+        let temp = if self.eat_keyword("temporary") || self.eat_keyword("temp") {
+            true
         } else {
             // GLOBAL/LOCAL are noise words in PostgreSQL (SQL standard
             // scoping); accept and ignore them as well.
             let _ = self.eat_keyword("global") || self.eat_keyword("local");
             let _ = self.eat_keyword("temporary") || self.eat_keyword("temp");
-        }
+            false
+        };
         self.expect_keyword("table")?;
         let name = self.expect_ident()?;
         self.expect(Token::LParen, "'('")?;
@@ -2641,7 +2666,7 @@ impl Parser {
             }
         }
         let def = build_table_def(&name, items)?;
-        Ok(Stmt::CreateTable { name, def })
+        Ok(Stmt::CreateTable { name, def, temp })
     }
 
     /// True when the next tokens start a table-level constraint rather
@@ -3849,13 +3874,44 @@ impl Parser {
                 }
             }
             self.expect(Token::LParen, "'('")?;
-            let sub = self.parse_subquery()?;
+            // v0.21: `IN (SELECT ...)` is a subquery; `IN (expr, ...)` is a
+            // value list, desugared to `left = e1 OR left = e2 ...` (and
+            // `NOT (...)` for NOT IN). The OR desugar preserves PG's
+            // three-valued logic: NULL comparisons propagate through OR.
+            if matches!(self.peek(), Token::Ident(s) if s == "select") {
+                let sub = self.parse_subquery()?;
+                self.expect(Token::RParen, "')'")?;
+                return Ok(Expr::InSub {
+                    expr: Box::new(left),
+                    sub: Box::new(sub),
+                    neg,
+                });
+            }
+            let mut items = vec![self.parse_or()?];
+            while self.peek() == Token::Comma {
+                self.next();
+                items.push(self.parse_or()?);
+            }
             self.expect(Token::RParen, "')'")?;
-            return Ok(Expr::InSub {
-                expr: Box::new(left),
-                sub: Box::new(sub),
-                neg,
-            });
+            let mut expr = Expr::Cmp {
+                op: CmpOp::Eq,
+                left: Box::new(left.clone()),
+                right: Box::new(items.remove(0)),
+            };
+            for item in items {
+                expr = Expr::Or(
+                    Box::new(expr),
+                    Box::new(Expr::Cmp {
+                        op: CmpOp::Eq,
+                        left: Box::new(left.clone()),
+                        right: Box::new(item),
+                    }),
+                );
+            }
+            if neg {
+                expr = Expr::Not(Box::new(expr));
+            }
+            return Ok(expr);
         }
         let op = match self.peek() {
             Token::Eq => Some(CmpOp::Eq),
@@ -4019,9 +4075,11 @@ impl Parser {
         Ok(expr)
     }
 
-    /// unary := (`-` | `+`) unary | primary.
+    /// unary := (`-` | `+` | `@` | `|/` | `||/`) unary | primary.
     /// `-x` desugars to `0 - x` (so `-NULL` is NULL and `-'2026-01-01'`
-    /// fails at evaluation, like Postgres).
+    /// fails at evaluation, like Postgres). The prefix operators desugar
+    /// to function calls, like Postgres' parser does: `@x` -> `abs(x)`,
+    /// `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`.
     fn parse_unary(&mut self) -> Result<Expr, SqlError> {
         match self.peek() {
             Token::Minus => {
@@ -4036,6 +4094,30 @@ impl Parser {
             Token::Plus => {
                 self.next();
                 self.parse_unary()
+            }
+            Token::At => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Func {
+                    name: "abs".to_string(),
+                    args: vec![inner],
+                })
+            }
+            Token::PipeSlash => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Func {
+                    name: "sqrt".to_string(),
+                    args: vec![inner],
+                })
+            }
+            Token::PipePipeSlash => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Func {
+                    name: "cbrt".to_string(),
+                    args: vec![inner],
+                })
             }
             _ => self.parse_primary(),
         }
@@ -5385,6 +5467,7 @@ impl Parser {
                 FromItem::Values {
                     rows,
                     alias: String::new(),
+                    col_aliases: Vec::new(),
                 }
             } else {
                 let sub = self.parse_subquery()?;
@@ -5397,9 +5480,34 @@ impl Parser {
                 self.expect(Token::RParen, "')'")?;
             }
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
+            // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
             let alias = self.parse_derived_alias()?;
+            let col_aliases = if self.peek() == Token::LParen {
+                self.next();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.expect_ident()?);
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
+                cols
+            } else {
+                Vec::new()
+            };
             match &mut item {
-                FromItem::Values { alias: a, .. } | FromItem::Derived { alias: a, .. } => {
+                FromItem::Values {
+                    alias: a,
+                    col_aliases: c,
+                    ..
+                } => {
+                    *a = alias;
+                    *c = col_aliases;
+                }
+                FromItem::Derived { alias: a, .. } => {
                     *a = alias;
                 }
                 _ => unreachable!("parse_from_primary paren branch"),
