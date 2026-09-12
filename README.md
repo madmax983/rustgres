@@ -1,4 +1,28 @@
-# rustgres v0.20 — "conformance burn-down: join type cluster"
+# rustgres v0.20.1 — "join repair: native RIGHT/FULL"
+
+A from-scratch PostgreSQL-compatible database server written in pure Rust —
+**zero external crates**, so it builds offline with plain `cargo build`.
+
+v0.20.1 is a targeted repair of the v0.20 join cluster. Independent review
+caught two defects in `RIGHT`/`FULL JOIN`: the parser ate `RIGHT` and `FULL`
+as bare table aliases (`is_reserved` was missing both, so `FROM j1 RIGHT
+JOIN j2` parsed as `FROM j1 AS right INNER JOIN j2` and the `ON` clause's
+qualified refs died with `42703`), and the executor's RIGHT-as-swapped-LEFT
+trick inverted the preservation flags (it would have emitted unmatched
+*left* rows and dropped unmatched *right* rows — precisely backwards) plus
+unsound WHERE pushdown. Both are fixed: `right`/`full` are reserved against
+bare-alias use, and the executor handles RIGHT/FULL natively — no side
+swap, `preserve_left = LEFT|FULL`, `preserve_right = RIGHT|FULL`, with
+pushdown restricted to the preserved side (INNER/CROSS both, LEFT left-only,
+RIGHT right-only, FULL neither). 22 new edge-case checks and 7 wire-protocol
+regressions cover the repair.
+
+**Known limitations.** Two v0.20 rough edges remain queued: `USING` keeps
+both copies of the merged column (unqualified refs can raise `42702`;
+Postgres merges them into one), and table column aliases parse but are not
+yet fully applied.
+
+## What v0.20 adds (conformance burn-down: join type cluster)
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
@@ -17,15 +41,16 @@ Conformance: **2507 PASS (48.3%)**, 1557 EXPECTED-FAIL, 1129 REAL-FAIL over
 1542 cumulative protocol tests pass, plus 73 unit tests and 53 isolation
 checks.
 
-**Known limitations.** The v0.20 join executor has three rough edges that
-independent review caught: `RIGHT JOIN` with qualified `ON` conditions can
-fail with `42703` (the executor runs RIGHT as a LEFT with the sides
-swapped, which breaks column resolution on the swapped side); `USING`
-keeps both copies of the merged column, so an unqualified reference to a
+**Known limitations (v0.20, since repaired in v0.20.1 for RIGHT/FULL).** The
+v0.20 join executor shipped with three rough edges that independent review
+caught: `RIGHT JOIN` with qualified `ON` conditions failed with `42703`
+(two root causes — the parser ate `RIGHT`/`FULL` as bare table aliases, and
+the executor's RIGHT-as-swapped-LEFT inverted preservation); `USING` keeps
+both copies of the merged column, so an unqualified reference to a
 using-column can raise ambiguous-column `42702` (Postgres merges them into
-one); table column aliases parse but are not yet fully applied. All three
-are queued for the next join pass — the parser groundwork in v0.20 is what
-unblocks it.
+one); table column aliases parse but are not yet fully applied. The RIGHT /
+FULL defects are fixed in v0.20.1 above; `USING`-merge and column aliases
+remain queued.
 
 ## What v0.19 adds (conformance burn-down: strings type cluster)
 

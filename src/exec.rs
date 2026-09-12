@@ -7555,14 +7555,13 @@ fn build_source(
             } else {
                 using.clone()
             };
-            // v0.20: RIGHT JOIN runs as LEFT with the sides swapped; the
-            // output schema/rows are un-swapped at the end.
-            let swapped = *kind == JoinKind::Right;
-            let (lschema, lrows, rschema, rrows) = if swapped {
-                (rschema0.clone(), rrows0, lschema0.clone(), lrows0)
-            } else {
-                (lschema0.clone(), lrows0, rschema0.clone(), rrows0)
-            };
+            // v0.20.1: native RIGHT/FULL support — no side swapping. Each
+            // side keeps its original schema/rows/order; preservation is
+            // driven directly by the join kind below. (The v0.20 swap
+            // trick inverted preserve_left/preserve_right and broke
+            // predicate pushdown for RIGHT.)
+            let (lschema, lrows) = (lschema0.clone(), lrows0);
+            let (rschema, rrows) = (rschema0.clone(), rrows0);
             // v0.20: USING (cols) — build `left.col = right.col AND ...`.
             let on_expr: Option<Expr> = if !using_cols.is_empty() {
                 let mut cond: Option<Expr> = None;
@@ -7604,22 +7603,28 @@ fn build_source(
             // Predicate pushdown, inner joins only below nested joins:
             // each side is filtered here only when it is a leaf source
             // (table or derived table), so a conjunct is never pushed at
-            // two levels. For INNER/CROSS both sides filter; for LEFT only
-            // the preserved (left) side — filtering the right side of a
-            // LEFT JOIN would change NULL-extension. The full WHERE still
-            // applies after the join, so this is purely an optimization.
+            // two levels. Pushing a WHERE conjunct to the non-preserved
+            // side of an outer join is unsound (e.g. `WHERE b.y IS NULL`
+            // on a LEFT JOIN would turn non-matches into matches), so:
+            // INNER/CROSS push both sides; LEFT pushes left only; RIGHT
+            // pushes right only; FULL pushes neither. The full WHERE
+            // still applies after the join, so this is purely an
+            // optimization.
+            let push_left = matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left);
+            let push_right = matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Right);
             let lquals: HashSet<String> = lschema.iter().map(|c| c.qual.clone()).collect();
             let rquals: HashSet<String> = rschema.iter().map(|c| c.qual.clone()).collect();
-            let lrows = if matches!(
-                left.as_ref(),
-                FromItem::Table { .. } | FromItem::Derived { .. }
-            ) {
+            let lrows = if push_left
+                && matches!(
+                    left.as_ref(),
+                    FromItem::Table { .. } | FromItem::Derived { .. }
+                ) {
                 let push = pushdown_for(where_, &lquals, &rquals, &lschema, &rschema);
                 filter_rows(q, outer, &lschema, lrows, &push)?
             } else {
                 lrows
             };
-            let rrows = if *kind != JoinKind::Left
+            let rrows = if push_right
                 && matches!(
                     right.as_ref(),
                     FromItem::Table { .. } | FromItem::Derived { .. }
@@ -7640,10 +7645,12 @@ fn build_source(
             let mut rows = Vec::new();
             let is_cross = *kind == JoinKind::Cross;
             let on_pred: Option<&Expr> = if is_cross { None } else { on_expr.as_ref() };
-            // v0.20: RIGHT runs as LEFT (sides swapped); FULL preserves both.
-            let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
-            let preserve_right = matches!(kind, JoinKind::Full);
-            // v0.20: FULL JOIN tracks which right rows matched.
+            // v0.20.1: native preservation flags — LEFT keeps unmatched
+            // left rows, RIGHT keeps unmatched right rows, FULL keeps
+            // both, INNER/CROSS keep neither.
+            let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+            let preserve_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            // v0.20: RIGHT/FULL JOIN track which right rows matched.
             let mut matched_right = vec![false; rrows.len()];
             let fast = is_cross || on_pred.map_or(false, |p| join_fast_path(p, &lschema, &rschema));
             // Pre-resolve the ON predicate's column references once: the
@@ -7767,27 +7774,14 @@ fn build_source(
                     }
                 }
             }
-            // v0.20: FULL JOIN — add right rows that never matched, with
-            // NULLs for the left columns.
+            // v0.20: RIGHT/FULL JOIN — add right rows that never matched,
+            // with NULLs for the left columns. Rows are already in
+            // (left, right) order; no un-swapping needed.
             if preserve_right {
                 for (ri, r) in rrows.iter().enumerate() {
                     if !matched_right[ri] {
                         rows.push(right_null_row(&lschema, r));
                     }
-                }
-            }
-            // v0.20: RIGHT JOIN ran with swapped sides; un-swap the row
-            // cells back to (left, right) order. The schema is already in
-            // original order.
-            if swapped {
-                let llen = lschema0.len();
-                let rlen = rschema0.len();
-                for row in rows.iter_mut() {
-                    let mut new_cells = Vec::with_capacity(llen + rlen);
-                    // Currently: [R..., L...]; want: [L..., R...]
-                    new_cells.extend(row.cells[rlen..].iter().cloned());
-                    new_cells.extend(row.cells[..rlen].iter().cloned());
-                    row.cells = new_cells;
                 }
             }
             Ok((schema, rows))

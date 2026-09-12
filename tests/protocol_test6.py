@@ -304,6 +304,50 @@ def t_cross_join():
         srv.cleanup()
 
 
+def t_right_full_join():
+    print("== RIGHT/FULL JOIN (v0.20.1: native, no swap) ==")
+    srv = fresh_server()
+    try:
+        c = conns(srv)
+        c.q("CREATE TABLE jl(id INT, v TEXT)")
+        c.q("CREATE TABLE jr(id INT, w TEXT)")
+        c.q("INSERT INTO jl VALUES (1, 'a1'), (2, 'a2')")
+        c.q("INSERT INTO jr VALUES (2, 'b2'), (3, 'b3')")
+        # RIGHT keeps unmatched right rows; LEFT unmatched rows vanish.
+        _, rows, codes = c.q(
+            "SELECT jl.id, jr.id FROM jl RIGHT JOIN jr ON jl.id = jr.id ORDER BY 2"
+        )
+        check("right join rows", rows == [["2", "2"], [None, "3"]], str(rows))
+        check("right join no error", codes == [], str(codes))
+        # FULL keeps both sides.
+        _, rows, _ = c.q(
+            "SELECT jl.id, jr.id FROM jl FULL JOIN jr ON jl.id = jr.id ORDER BY 1, 2"
+        )
+        check("full join rows", rows == [["1", None], ["2", "2"], [None, "3"]], str(rows))
+        # v0.20.1 parser regression: RIGHT/FULL must not be eaten as table aliases.
+        _, rows, codes = c.q(
+            "SELECT jl.id, jr.id FROM jl RIGHT JOIN jr ON jl.id = jr.id"
+        )
+        check("right not parsed as alias", codes == [], str(codes))
+        # Aliased RIGHT JOIN.
+        _, rows, _ = c.q(
+            "SELECT x.id, y.id FROM jl AS x RIGHT JOIN jr AS y ON x.id = y.id ORDER BY 2"
+        )
+        check("aliased right join", rows == [["2", "2"], [None, "3"]], str(rows))
+        # Empty left input: RIGHT JOIN still yields unmatched right rows.
+        c.q("CREATE TABLE je(id INT)")
+        _, rows, _ = c.q("SELECT je.id, jr.id FROM je RIGHT JOIN jr ON je.id = jr.id ORDER BY 2")
+        check("right join empty left", rows == [[None, "2"], [None, "3"]], str(rows))
+        # WHERE on the preserved side stays sound with pushdown.
+        _, rows, _ = c.q(
+            "SELECT jl.id, jr.id FROM jl RIGHT JOIN jr ON jl.id = jr.id WHERE jr.id = 3"
+        )
+        check("right join where pushdown", rows == [[None, "3"]], str(rows))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def t_join_errors():
     print("== join resolution errors ==")
     srv = fresh_server()
@@ -812,6 +856,7 @@ def main():
     t_inner_join()
     t_join_aliases()
     t_left_join()
+    t_right_full_join()
     t_join_general_on()
     t_cross_join()
     t_join_errors()

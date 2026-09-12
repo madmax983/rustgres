@@ -2092,6 +2092,7 @@ fn is_reserved(word: &str) -> bool {
             | "fetch" // v0.16: cursors
             | "for"
             | "from"
+            | "full" // v0.20.1: RIGHT/FULL JOIN (was eaten as a table alias)
             | "group"
             | "having"
             | "ilike" // v0.7
@@ -2119,6 +2120,7 @@ fn is_reserved(word: &str) -> bool {
             | "release"
             | "repeatable"
             | "returning" // v0.10: RETURNING clause
+            | "right" // v0.20.1: RIGHT JOIN (was eaten as a table alias)
             | "rollback"
             | "savepoint"
             | "select"

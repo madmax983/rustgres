@@ -2,6 +2,19 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.20.1 baseline — 2026-09-12
+
+No benchmark re-run for v0.20.1 (targeted correctness repair, no hot-path
+change): the RIGHT/FULL executor drops the side-swap (removing a per-row
+cell-rearrangement pass) and tightens WHERE pushdown by join kind; the
+three nested-loop paths are otherwise unchanged in shape.
+
+- **Valgrind**: NOT RUN on the v0.20.1 tree. (Valgrind 3.22.0 became
+  locally available after v0.20 via a manually extracted launcher, but
+  Memcheck/Callgrind/DHAT were not run on the v0.20 exact tree and are not
+  run here either; this is recorded, not hand-waved.)
+- **Callgrind/DHAT**: not run.
+
 ## v0.20 baseline — 2026-09-12
 
 No full benchmark re-run for v0.20 (same rationale as v0.14–v0.19 for
