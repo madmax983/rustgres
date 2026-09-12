@@ -2220,8 +2220,8 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, kw: &str) -> bool {
-        match self.peek() {
-            Token::Ident(ref s) if s == kw => {
+        match self.tokens.get(self.pos) {
+            Some(Token::Ident(s)) if s == kw => {
                 self.pos += 1;
                 true
             }

@@ -2,6 +2,151 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Parser::eat_keyword` allocation — baseline — 2026-09-12
+
+Every version of this file back to v0.7 has recorded the same finding under
+Callgrind/DHAT: per-query SQL text parsing (`tokenize`, `Parser::peek`,
+`Token::clone`, `split_statements`) dominates the profile for short queries,
+never the feature code being added. Nobody had gone back to fix the parsing
+cost itself. This entry does.
+
+**Workload**: `benches/profile_fixed.py` — a new *fixed-iteration-count*
+driver (as opposed to `bench.py`'s time-boxed workloads) that sends an exact
+number of identical queries over the real wire protocol, so two profiling
+runs (before/after a code change) execute identical work and their
+instruction/allocation counts are directly comparable. Time-boxed workloads
+under valgrind vary in query count run-to-run with wall-clock jitter, which
+would confound a before/after diff.
+
+Query used here (`--sql`, run 1500 times against a 3-row table after
+`--setup`):
+
+```sql
+SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10
+```
+
+This is a keyword-dense, realistic query shape (filtered SELECT + ORDER BY +
+LIMIT) chosen specifically because it exercises the parser's keyword-dispatch
+path (`Parser::eat_keyword`) far more per query than the `expr` workload
+does — `expr` is mostly literals/function calls and undercounts this cost.
+
+**Profile** (Callgrind, debug build, `valgrind --tool=callgrind
+--cache-sim=yes --branch-sim=yes`, 1500 iterations):
+
+`Parser::eat_keyword` is called 239 times across the parser's call sites,
+every optional-keyword probe during statement dispatch. Its old
+implementation:
+
+```rust
+fn eat_keyword(&mut self, kw: &str) -> bool {
+    match self.peek() {                    // clones the current Token
+        Token::Ident(ref s) if s == kw => { ... }
+        _ => false,
+    }
+}
+```
+
+`Parser::peek` returns an owned `Token` by cloning `self.tokens[pos]`. For
+the overwhelmingly common case — the current token is `Token::Ident(String)`
+(every keyword *and* every identifier is tokenized as `Ident`) — that clone
+heap-allocates a fresh `String`, compares it, then immediately drops it.
+Every one of the 239 call sites pays this even on failed keyword probes
+(the majority case in keyword-driven statement dispatch), independent of
+this particular query's `WHERE`/`ORDER BY`/`LIMIT` clauses.
+
+**Baseline numbers** (this commit, `eat_keyword` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 1500 iterations) | 574,441,689 |
+| DHAT total allocations (blocks) | 414,338 |
+| DHAT total bytes allocated | 18,749,059 |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -22   # PROGRAM TOTALS Ir
+```
+
+**Fix** (this commit): `eat_keyword` no longer goes through `peek()`.
+It borrows the current token directly:
+
+```rust
+fn eat_keyword(&mut self, kw: &str) -> bool {
+    match self.tokens.get(self.pos) {
+        Some(Token::Ident(s)) if s == kw => {
+            self.pos += 1;
+            true
+        }
+        _ => false,
+    }
+}
+```
+
+Same behavior (all 81 unit/integration tests pass unchanged; no test
+expectations touched), zero heap allocations for the check instead of one
+per call. `Parser::peek`, `Parser::next`, and the rest of the token stream
+are untouched — the parser does backtrack (`self.pos = save` at 4 call
+sites), so `next()`/`peek()` can't destructively consume tokens without
+separate work; `eat_keyword` never needed ownership in the first place,
+only a comparison.
+
+**After numbers** (same harness, same query, same iteration count):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 574,441,689 | 543,723,769 | **-5.35%** |
+| DHAT total allocations (blocks) | 414,338 | 340,814 | **-17.75%** |
+| DHAT total bytes allocated | 18,749,059 | 18,450,464 | -1.59% |
+
+Both the instruction-count floor (≥5%) and the allocation-count floor
+(≥10%) are cleared. (The `expr` workload from `bench.py`, which has far
+fewer `eat_keyword` probes per query, was tried first and only reached
+-4.06% Ir / -7.87% allocations / -0.59% bytes — below the impact floor.
+Recorded here so nobody re-measures on `expr` and concludes this isn't
+worth shipping; the effect is real, just workload-dependent on how
+keyword-dense the query is.)
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -22   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tb`/`tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**:
+this environment's clippy (rust 1.94.1) fails with 235 pre-existing
+`collapsible_if`-family errors across the codebase (unrelated files,
+e.g. `src/main.rs`), independent of this change — reproduced on the
+pristine tree before this commit. `cargo clippy --all-targets
+--all-features` (without `-D warnings`) shows no new warnings near
+`eat_keyword` or introduced by this diff. Not fixed here: 235 unrelated
+lint fixes are out of scope for a targeted performance change.
+
 ## v0.20.1 baseline — 2026-09-12
 
 No benchmark re-run for v0.20.1 (targeted correctness repair, no hot-path
