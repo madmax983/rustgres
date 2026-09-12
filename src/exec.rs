@@ -4726,11 +4726,13 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             pattern,
             not,
             ilike,
+            escape,
         } => Ok(Expr::Like {
             expr: Box::new(r(expr)?),
             pattern: Box::new(r(pattern)?),
             not: *not,
             ilike: *ilike,
+            escape: escape.as_ref().map(|e| r(e)).transpose()?.map(Box::new),
         }),
         Expr::Between {
             expr,
@@ -8185,6 +8187,7 @@ fn eval_grouped(
             pattern,
             not,
             ilike,
+            escape,
         } => {
             let va = eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
@@ -8192,7 +8195,13 @@ fn eval_grouped(
             let vb = eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, pattern,
             )?;
-            eval_like(&va, &vb, *not, *ilike)
+            let ve = match escape {
+                Some(e) => Some(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, e,
+                )?),
+                None => None,
+            };
+            eval_like(&va, &vb, ve.as_ref(), *not, *ilike)
         }
         Expr::Between {
             expr,
@@ -8755,10 +8764,15 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             pattern,
             not,
             ilike,
+            escape,
         } => {
             let va = eval_expr(q, scopes, expr)?;
             let vb = eval_expr(q, scopes, pattern)?;
-            eval_like(&va, &vb, *not, *ilike)
+            let ve = match escape {
+                Some(e) => Some(eval_expr(q, scopes, e)?),
+                None => None,
+            };
+            eval_like(&va, &vb, ve.as_ref(), *not, *ilike)
         }
         Expr::Between {
             expr,
@@ -9824,12 +9838,13 @@ enum PatTok {
     Star, // `%`
 }
 
-/// Tokenize a LIKE pattern; backslash escapes the next character.
-fn tokenize_like(pat: &[char]) -> Vec<PatTok> {
+/// Tokenize a LIKE pattern; the escape character (default backslash)
+/// escapes the next character. A trailing escape is a literal.
+fn tokenize_like(pat: &[char], escape: char) -> Vec<PatTok> {
     let mut toks = Vec::new();
     let mut i = 0;
     while i < pat.len() {
-        if pat[i] == '\\' && i + 1 < pat.len() {
+        if pat[i] == escape && i + 1 < pat.len() {
             toks.push(PatTok::Lit(pat[i + 1]));
             i += 2;
         } else if pat[i] == '%' {
@@ -9844,6 +9859,51 @@ fn tokenize_like(pat: &[char]) -> Vec<PatTok> {
         }
     }
     toks
+}
+
+/// Byte-oriented LIKE matcher for bytea (wildcards are ASCII % and _).
+fn match_like_bytes(s: &[u8], pat: &[u8], escape: u8) -> bool {
+    // Tokenize: 0 = literal byte follows, 1 = _, 2 = %.
+    let mut toks: Vec<(u8, u8)> = Vec::new();
+    let mut i = 0;
+    while i < pat.len() {
+        if pat[i] == escape && i + 1 < pat.len() {
+            toks.push((0, pat[i + 1]));
+            i += 2;
+        } else if pat[i] == b'%' {
+            toks.push((2, 0));
+            i += 1;
+        } else if pat[i] == b'_' {
+            toks.push((1, 0));
+            i += 1;
+        } else {
+            toks.push((0, pat[i]));
+            i += 1;
+        }
+    }
+    let (mut si, mut ti) = (0, 0);
+    let mut star_ti: Option<usize> = None;
+    let mut star_si = 0;
+    while si < s.len() {
+        if ti < toks.len() && (toks[ti].0 == 1 || (toks[ti].0 == 0 && toks[ti].1 == s[si])) {
+            si += 1;
+            ti += 1;
+        } else if ti < toks.len() && toks[ti].0 == 2 {
+            star_ti = Some(ti);
+            star_si = si;
+            ti += 1;
+        } else if let Some(st) = star_ti {
+            ti = st + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while ti < toks.len() && toks[ti].0 == 2 {
+        ti += 1;
+    }
+    ti == toks.len()
 }
 
 /// Classic backtracking LIKE matcher over tokenized pattern.
@@ -9875,9 +9935,57 @@ fn match_like(s: &[char], toks: &[PatTok]) -> bool {
     ti == toks.len()
 }
 
-fn eval_like(a: &Value, pattern: &Value, not: bool, ilike: bool) -> Result<Value, ExecError> {
+fn eval_like(
+    a: &Value,
+    pattern: &Value,
+    escape: Option<&Value>,
+    not: bool,
+    ilike: bool,
+) -> Result<Value, ExecError> {
+    // No ESCAPE clause -> PG default escape is backslash.
+    // ESCAPE NULL -> NULL result. ESCAPE must be a single character/byte.
+    // Returns (text_escape, bytea_escape); only one is used per branch.
+    let (esc_char, esc_byte): (Option<char>, Option<u8>) = match escape {
+        None => (Some('\\'), Some(b'\\')),
+        Some(Value::Null) => (None, None),
+        Some(Value::Text(e)) => {
+            let mut ch = e.chars();
+            match (ch.next(), ch.next()) {
+                (Some(c), None) => (Some(c), None),
+                _ => {
+                    return Err(exec_err(
+                        "22023",
+                        "ESCAPE string must be empty or one character",
+                    ));
+                }
+            }
+        }
+        Some(Value::Bytea(b)) => {
+            if b.len() == 1 {
+                (None, Some(b[0]))
+            } else {
+                return Err(exec_err(
+                    "22023",
+                    "ESCAPE string must be empty or one character",
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(exec_err(
+                "42883",
+                format!("ESCAPE must be text, not {}", other.type_name()),
+            ));
+        }
+    };
+    let esc_is_null = esc_char.is_none() && esc_byte.is_none();
     match (a, pattern) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        _ if esc_is_null => Ok(Value::Null),
+        (Value::Bytea(s), Value::Bytea(p)) => {
+            // bytea LIKE: match on raw bytes; % and _ are ASCII wildcards.
+            let m = match_like_bytes(s, p, esc_byte.unwrap_or(b'\\'));
+            Ok(Value::Bool(if not { !m } else { m }))
+        }
         (Value::Text(s), Value::Text(p)) => {
             let (s, p) = if ilike {
                 (s.to_lowercase(), p.to_lowercase())
@@ -9886,7 +9994,7 @@ fn eval_like(a: &Value, pattern: &Value, not: bool, ilike: bool) -> Result<Value
             };
             let sc: Vec<char> = s.chars().collect();
             let pc: Vec<char> = p.chars().collect();
-            let m = match_like(&sc, &tokenize_like(&pc));
+            let m = match_like(&sc, &tokenize_like(&pc, esc_char.unwrap_or('\\')));
             Ok(Value::Bool(if not { !m } else { m }))
         }
         _ => Err(exec_err(
@@ -10038,6 +10146,21 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "substring" | "substr" => n == 2 || n == 3,
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
         "replace" | "split_part" | "trim" => n == 3,
+        "encode" | "decode" => n == 2,
+        "crc32c" => n == 1,
+        "sha224" | "sha256" | "sha384" | "sha512" => n == 1,
+        "strpos" => n == 2,
+        "translate" => n == 3,
+        "unistr" => n == 1,
+        "overlay" => n == 3 || n == 4,
+        "regexp_like" => (2..=3).contains(&n),
+        "regexp_count" => (2..=4).contains(&n),
+        "regexp_instr" => (2..=7).contains(&n),
+        "regexp_substr" => (2..=6).contains(&n),
+        "regexp_replace" => (3..=6).contains(&n),
+        "similar_to" => (2..=3).contains(&n),
+        "substring_similar" => (2..=3).contains(&n),
+        "substring_from" => n == 2,
         // v0.16: new string/math built-ins.
         "concat" => true, // concat() with no args is '' (Postgres).
         "concat_ws" => n >= 1,
@@ -10086,7 +10209,12 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "substring"
         | "trim" | "position" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
-        | "to_oct" | "to_bin" | "left" | "right" | "reverse" => eval_str_func(name, vals),
+        | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "decode" | "crc32c"
+        | "sha224" | "sha256" | "sha384" | "sha512" | "strpos" | "translate" | "unistr"
+        | "overlay" | "regexp_like" | "regexp_count" | "regexp_instr" | "regexp_substr"
+        | "regexp_replace" | "similar_to" | "substring_similar" | "substring_from" => {
+            eval_str_func(name, vals)
+        }
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -10206,6 +10334,21 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::Text(r))
         }
         "position" => {
+            // bytea position: 1-based byte index, 0 if not found.
+            if let (Value::Bytea(sub), Value::Bytea(s)) = (&vals[0], &vals[1]) {
+                if sub.is_empty() {
+                    return Ok(Value::Int(1));
+                }
+                let pos = s
+                    .windows(sub.len())
+                    .position(|w| w == sub.as_slice())
+                    .map(|i| i as i64 + 1)
+                    .unwrap_or(0);
+                return Ok(Value::Int(pos));
+            }
+            if matches!(&vals[0], Value::Null) || matches!(&vals[1], Value::Null) {
+                return Ok(Value::Null);
+            }
             let sub = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -10265,15 +10408,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 ));
             }
             let parts: Vec<&str> = if delim.is_empty() {
-                // Split into characters (Postgres behavior).
-                let mut v: Vec<&str> = Vec::new();
-                let mut i = 0;
-                for c in s.chars() {
-                    let l = c.len_utf8();
-                    v.push(&s[i..i + l]);
-                    i += l;
-                }
-                v
+                // Empty delimiter: PG does not split; the whole string is
+                // field 1 (and field -1).
+                vec![s]
             } else {
                 s.split(delim).collect()
             };
@@ -10381,15 +10518,900 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             };
             Ok(Value::Text(chars[skip as usize..].iter().collect()))
         }
-        "reverse" => Ok(match str_arg(name, &vals[0])? {
-            None => Value::Null,
-            Some(s) => Value::Text(s.chars().rev().collect()),
+        "reverse" => Ok(match &vals[0] {
+            Value::Null => Value::Null,
+            Value::Bytea(b) => Value::Bytea(b.iter().rev().copied().collect()),
+            v => match str_arg(name, v)? {
+                None => Value::Null,
+                Some(s) => Value::Text(s.chars().rev().collect()),
+            },
         }),
+        "encode" => {
+            let data: &[u8] = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                v => match str_arg(name, v)? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s.as_bytes(),
+                },
+            };
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(f) => f.to_lowercase(),
+            };
+            match fmt.as_str() {
+                "hex" => Ok(Value::Text(hex_encode(data))),
+                "base64" => Ok(Value::Text(base64_encode(data, false))),
+                "base64url" => Ok(Value::Text(base64_encode(data, true))),
+                "escape" => Ok(Value::Text(bytea_escape(data))),
+                _ => Err(exec_err("22023", format!("unknown encode format: {}", fmt))),
+            }
+        }
+        "decode" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(f) => f.to_lowercase(),
+            };
+            match fmt.as_str() {
+                "hex" => match hex_decode(s) {
+                    Some(b) => Ok(Value::Bytea(b)),
+                    None => Err(exec_err("22023", "invalid hex string")),
+                },
+                "base64" => match base64_decode(s, false) {
+                    Some(b) => Ok(Value::Bytea(b)),
+                    None => Err(exec_err("22023", "invalid base64 string")),
+                },
+                "base64url" => match base64_decode(s, true) {
+                    Some(b) => Ok(Value::Bytea(b)),
+                    None => Err(exec_err("22023", "invalid base64url string")),
+                },
+                "escape" => match bytea_unescape(s) {
+                    Some(b) => Ok(Value::Bytea(b)),
+                    None => Err(exec_err("22023", "invalid escape string")),
+                },
+                _ => Err(exec_err("22023", format!("unknown decode format: {}", fmt))),
+            }
+        }
+        "crc32c" => {
+            let data: &[u8] = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                Value::Text(s) => s.as_bytes(),
+                other => {
+                    return Err(exec_err(
+                        "42883",
+                        format!("crc32c({}) not supported", other.type_name()),
+                    ));
+                }
+            };
+            Ok(Value::BigInt(crc32c(data) as i64))
+        }
+        "sha224" | "sha256" | "sha384" | "sha512" => {
+            let data: &[u8] = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                Value::Text(s) => s.as_bytes(),
+                other => {
+                    return Err(exec_err(
+                        "42883",
+                        format!("{}({}) not supported", name, other.type_name()),
+                    ));
+                }
+            };
+            let bytes: Vec<u8> = match name {
+                "sha224" => crate::crypto::sha224(data).to_vec(),
+                "sha256" => crate::crypto::sha256(data).to_vec(),
+                "sha384" => crate::crypto::sha384(data).to_vec(),
+                _ => crate::crypto::sha512(data).to_vec(),
+            };
+            Ok(Value::Bytea(bytes))
+        }
+        "strpos" => {
+            // Alias of position(substring IN string); empty substring -> 1.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let sub = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            if sub.is_empty() {
+                return Ok(Value::Int(1));
+            }
+            let sc: Vec<char> = s.chars().collect();
+            let nc: Vec<char> = sub.chars().collect();
+            let pos = sc
+                .windows(nc.len())
+                .position(|w| w == nc.as_slice())
+                .map(|i| i as i64 + 1)
+                .unwrap_or(0);
+            Ok(Value::Int(pos))
+        }
+        "translate" => {
+            // translate(s, from, to): each char in `from` is replaced by the
+            // char at the same position in `to`; chars with no counterpart
+            // are deleted.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let from = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let to = match str_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let from_c: Vec<char> = from.chars().collect();
+            let to_c: Vec<char> = to.chars().collect();
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match from_c.iter().position(|&f| f == c) {
+                    Some(i) => {
+                        if let Some(&t) = to_c.get(i) {
+                            out.push(t);
+                        }
+                        // else: char is deleted.
+                    }
+                    None => out.push(c),
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        "unistr" => {
+            // unistr(s): interpret \uXXXX and \UXXXXXXXX escapes.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            match unistr_decode(s) {
+                Some(t) => Ok(Value::Text(t)),
+                None => Err(exec_err("22023", "invalid Unicode escape")),
+            }
+        }
+        // --- v0.19: regexp_* functions -----------------------------------
+        "regexp_like" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let flags = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(f) => f,
+                }
+            } else {
+                ""
+            };
+            let ci = flags.contains('i');
+            let re = crate::regex::compile(pat, ci)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            Ok(Value::Bool(re.is_match(&sc)))
+        }
+        "regexp_count" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = if vals.len() > 2 {
+                match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                }
+            } else {
+                1
+            };
+            let flags = if vals.len() > 3 {
+                match str_arg(name, &vals[3])? {
+                    None => return Ok(Value::Null),
+                    Some(f) => f,
+                }
+            } else {
+                ""
+            };
+            let ci = flags.contains('i');
+            let re = crate::regex::compile(pat, ci)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let start_idx = (start.max(1) - 1) as usize;
+            let mut count = 0i64;
+            let mut pos = start_idx.min(sc.len());
+            while pos <= sc.len() {
+                match re.find_at(&sc, pos) {
+                    Some((ms, me, _)) => {
+                        count += 1;
+                        // Avoid infinite loop on empty matches.
+                        pos = if me > ms { me } else { ms + 1 };
+                    }
+                    None => break,
+                }
+            }
+            Ok(Value::Int(count))
+        }
+        "regexp_instr" => {
+            // regexp_instr(s, pat [, start [, occurrence [, end_option [, flags [, subexpr]]]]])
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = get_int_arg(name, vals, 2, 1)?;
+            let occurrence = get_int_arg(name, vals, 3, 1)?;
+            let end_option = get_int_arg(name, vals, 4, 0)?;
+            let flags = get_str_arg(name, vals, 5, "")?;
+            let subexpr = get_int_arg(name, vals, 6, 0)? as usize;
+            if occurrence < 1 {
+                return Err(exec_err("22023", "occurrence must be positive"));
+            }
+            let ci = flags.contains('i');
+            let re = crate::regex::compile(pat, ci)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let mut pos = ((start.max(1) - 1) as usize).min(sc.len());
+            let mut found = None;
+            for _ in 0..occurrence {
+                match re.find_at(&sc, pos) {
+                    Some((ms, me, caps)) => {
+                        found = Some((ms, me, caps));
+                        pos = if me > ms { me } else { ms + 1 };
+                    }
+                    None => break,
+                }
+            }
+            match found {
+                Some((ms, me, caps)) => {
+                    // subexpr: 0 = whole match, N = Nth group.
+                    let (rs, re_) = if subexpr == 0 {
+                        (ms, me)
+                    } else {
+                        match caps.groups.get(subexpr).copied().flatten() {
+                            Some((gs, ge)) => (gs, ge),
+                            None => return Ok(Value::Int(0)),
+                        }
+                    };
+                    // end_option: 0 = start position, 1 = end position + 1.
+                    let result = if end_option == 0 { rs + 1 } else { re_ + 1 };
+                    Ok(Value::Int(result as i64))
+                }
+                None => Ok(Value::Int(0)),
+            }
+        }
+        "regexp_substr" => {
+            // regexp_substr(s, pat [, start [, occurrence [, flags [, subexpr]]]])
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = get_int_arg(name, vals, 2, 1)?;
+            let occurrence = get_int_arg(name, vals, 3, 1)?;
+            let flags = get_str_arg(name, vals, 4, "")?;
+            let subexpr = get_int_arg(name, vals, 5, 0)? as usize;
+            if occurrence < 1 {
+                return Err(exec_err("22023", "occurrence must be positive"));
+            }
+            let ci = flags.contains('i');
+            let re = crate::regex::compile(pat, ci)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let mut pos = ((start.max(1) - 1) as usize).min(sc.len());
+            let mut found = None;
+            for _ in 0..occurrence {
+                match re.find_at(&sc, pos) {
+                    Some((ms, me, caps)) => {
+                        found = Some((ms, me, caps));
+                        pos = if me > ms { me } else { ms + 1 };
+                    }
+                    None => break,
+                }
+            }
+            match found {
+                Some((ms, me, caps)) => {
+                    let (rs, re_) = if subexpr == 0 {
+                        (ms, me)
+                    } else {
+                        match caps.groups.get(subexpr).copied().flatten() {
+                            Some((gs, ge)) => (gs, ge),
+                            None => return Ok(Value::Null),
+                        }
+                    };
+                    Ok(Value::Text(sc[rs..re_].iter().collect()))
+                }
+                None => Ok(Value::Null),
+            }
+        }
+        "substring_similar" => {
+            // SUBSTRING(s SIMILAR pat [ESCAPE 'c']): extract the substring
+            // matching the pattern; if the pattern has a group, return the
+            // first group.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let escape = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(e) => {
+                        let mut ch = e.chars();
+                        match (ch.next(), ch.next()) {
+                            (Some(c), None) => c,
+                            _ => {
+                                return Err(exec_err(
+                                    "22023",
+                                    "ESCAPE string must be empty or one character",
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                '\\'
+            };
+            let regex_pat = similar_to_regex(pat, escape)
+                .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+            let re = crate::regex::compile(&regex_pat, false)
+                .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            // Must match entire string.
+            match re.find_at(&sc, 0) {
+                Some((ms, me, caps)) if ms == 0 && me == sc.len() => {
+                    // If there's a captured group, return it; else whole match.
+                    if re.group_count() >= 1 {
+                        match caps.groups.get(1).copied().flatten() {
+                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            None => Ok(Value::Null),
+                        }
+                    } else {
+                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "substring_from" => {
+            // SUBSTRING(s FROM pat): POSIX regex substring. If the pattern
+            // contains a group, return the first group; else the whole match.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            // The second arg could be text (pattern) or int (start).
+            // If it's an integer, fall back to substring(s, start).
+            // Check the type directly to avoid int_arg's type error.
+            match &vals[1] {
+                Value::Int(n) => {
+                    let sc: Vec<char> = s.chars().collect();
+                    let total = sc.len() as i64;
+                    let from = (*n).max(1);
+                    let lo = (from - 1).max(0).min(total) as usize;
+                    return Ok(Value::Text(sc[lo..].iter().collect()));
+                }
+                Value::Null => return Ok(Value::Null),
+                Value::Text(_) => {} // Fall through to pattern handling.
+                other => return Err(func_arg_err(name, other)),
+            }
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let re = crate::regex::compile(pat, false)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            match re.find_at(&sc, 0) {
+                Some((ms, me, caps)) => {
+                    if re.group_count() >= 1 {
+                        match caps.groups.get(1).copied().flatten() {
+                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            None => Ok(Value::Null),
+                        }
+                    } else {
+                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                    }
+                }
+                None => Ok(Value::Null),
+            }
+        }
+        "similar_to" => {
+            // SIMILAR TO pattern [ESCAPE 'c']: translate to regex and match.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let escape = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(e) => {
+                        let mut ch = e.chars();
+                        match (ch.next(), ch.next()) {
+                            (Some(c), None) => c,
+                            _ => {
+                                return Err(exec_err(
+                                    "22023",
+                                    "ESCAPE string must be empty or one character",
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                '\\'
+            };
+            let regex_pat = similar_to_regex(pat, escape)
+                .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+            let re = crate::regex::compile(&regex_pat, false)
+                .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            // SIMILAR TO must match the entire string.
+            let matched = match re.find_at(&sc, 0) {
+                Some((ms, me, _)) => ms == 0 && me == sc.len(),
+                None => false,
+            };
+            Ok(Value::Bool(matched))
+        }
+        "regexp_replace" => {
+            // regexp_replace(s, pat, repl [, start [, count [, flags]]])
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let repl = match str_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = get_int_arg(name, vals, 3, 1)?;
+            let count = get_int_arg(name, vals, 4, 0)?; // 0 = all (if 'g' flag)
+            let flags = get_str_arg(name, vals, 5, "")?;
+            let ci = flags.contains('i');
+            let global = flags.contains('g');
+            let re = crate::regex::compile(pat, ci)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let start_idx = ((start.max(1) - 1) as usize).min(sc.len());
+            let mut out = String::new();
+            out.extend(sc[..start_idx].iter());
+            let mut pos = start_idx;
+            let mut replaced = 0i64;
+            // count: 0 means "all" only if global flag; otherwise 1.
+            let max_replace = if count > 0 {
+                count
+            } else if global {
+                i64::MAX
+            } else {
+                1
+            };
+            while pos <= sc.len() && replaced < max_replace {
+                match re.find_at(&sc, pos) {
+                    Some((ms, me, caps)) => {
+                        // Copy text before match.
+                        out.extend(sc[pos..ms].iter());
+                        // Expand replacement.
+                        out.push_str(&expand_replacement(repl, &sc, &caps));
+                        replaced += 1;
+                        pos = if me > ms { me } else { ms + 1 };
+                        // If empty match at end, avoid infinite loop.
+                        if ms == sc.len() && me == ms {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            out.extend(sc[pos..].iter());
+            Ok(Value::Text(out))
+        }
+        "overlay" => {
+            // overlay(s, replacement, start [, len]); omitted len defaults
+            // to length(replacement). 1-based start; start < 1 is clamped.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let r = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let start = match int_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let len = if vals.len() > 3 {
+                match int_arg(name, &vals[3])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => {
+                        if n < 0 {
+                            return Err(exec_err("22011", "negative overlay length not allowed"));
+                        }
+                        n
+                    }
+                }
+            } else {
+                r.chars().count() as i64
+            };
+            let sc: Vec<char> = s.chars().collect();
+            let total = sc.len() as i64;
+            // 1-based start, clamped to [1, total+1].
+            let from = start.max(1).min(total + 1) as usize;
+            let upto = (from as i64 + len).min(total + 1).max(from as i64) as usize;
+            let mut out: String = sc[..from - 1].iter().collect();
+            out.push_str(r);
+            out.extend(sc[upto - 1..].iter());
+            Ok(Value::Text(out))
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
         )),
     }
+}
+
+/// CRC32C (Castagnoli) checksum, as in PG's crc32c() function.
+fn crc32c(data: &[u8]) -> u32 {
+    // Bit-by-bit implementation (no table); adequate for test-size inputs.
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0x82F6_3B78;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Lowercase hex encode.
+fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for &b in data {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Hex decode; None on invalid input.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Base64 encode (standard or URL-safe alphabet, with padding).
+fn base64_encode(data: &[u8], url_safe: bool) -> String {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let alpha: &[u8; 64] = if url_safe { URL } else { STD };
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        out.push(alpha[(b0 >> 2) as usize] as char);
+        out.push(alpha[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < data.len() {
+            out.push(alpha[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < data.len() {
+            out.push(alpha[(b2 & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+
+/// Base64 decode; None on invalid input.
+fn base64_decode(s: &str, url_safe: bool) -> Option<Vec<u8>> {
+    let mut vals = Vec::with_capacity(s.len());
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' if !url_safe => 62,
+            b'/' if !url_safe => 63,
+            b'-' if url_safe => 62,
+            b'_' if url_safe => 63,
+            b'=' => 64, // padding marker
+            _ if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        vals.push(v);
+    }
+    if vals.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vals.len() / 4 * 3);
+    let mut i = 0;
+    while i < vals.len() {
+        let a = vals[i];
+        let b = vals[i + 1];
+        let c = vals[i + 2];
+        let d = vals[i + 3];
+        if a == 64 || b == 64 {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if c != 64 {
+            out.push(((b & 15) << 4) | (c >> 2));
+        }
+        if d != 64 {
+            out.push(((c & 3) << 6) | d);
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+/// PG bytea `escape` output format: printable ASCII as-is, backslash as
+/// `\\`, others as `\ooo` octal.
+fn bytea_escape(data: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in data {
+        if b == b'\\' {
+            out.push_str("\\\\");
+        } else if b >= 32 && b < 127 {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\{:03o}", b));
+        }
+    }
+    out
+}
+
+/// Translate a SQL SIMILAR TO pattern to a regex pattern.
+/// SIMILAR TO: `%` = any sequence, `_` = any char, `|` = alternation,
+/// `*`/`+`/`?`/`{m,n}` = repetition, `(...)` = group, `[...]` = class.
+fn similar_to_regex(pat: &str, escape: char) -> Result<String, String> {
+    let mut out = String::with_capacity(pat.len() * 2);
+    let chars: Vec<char> = pat.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == escape {
+            i += 1;
+            if i >= chars.len() {
+                return Err("trailing escape".to_string());
+            }
+            // Escaped char is literal; escape regex metachars.
+            let e = chars[i];
+            if ".^$*+?{}[]\\|()".contains(e) {
+                out.push('\\');
+            }
+            out.push(e);
+            i += 1;
+        } else if c == '%' {
+            out.push_str(".*");
+            i += 1;
+        } else if c == '_' {
+            out.push('.');
+            i += 1;
+        } else if ".^$*+?{}[]\\|()".contains(c) {
+            // Regex metachars that are literal in SIMILAR TO (except those
+            // with special meaning: | * + ? { } ( ) [ ]).
+            // Actually in SIMILAR TO: | * + ? { } ( ) [ ] are special.
+            // . ^ $ \\ are literal but need escaping for regex.
+            if c == '|'
+                || c == '*'
+                || c == '+'
+                || c == '?'
+                || c == '{'
+                || c == '}'
+                || c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+            {
+                out.push(c);
+            } else {
+                out.push('\\');
+                out.push(c);
+            }
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Get an optional integer argument with a default value.
+fn get_int_arg(fname: &str, vals: &[Value], idx: usize, default: i64) -> Result<i64, ExecError> {
+    if idx >= vals.len() {
+        return Ok(default);
+    }
+    match int_arg(fname, &vals[idx])? {
+        None => Err(exec_err("22004", "null argument not allowed here")),
+        Some(n) => Ok(n),
+    }
+}
+
+/// Get an optional string argument with a default value.
+fn get_str_arg<'a>(
+    fname: &str,
+    vals: &'a [Value],
+    idx: usize,
+    default: &'a str,
+) -> Result<&'a str, ExecError> {
+    if idx >= vals.len() {
+        return Ok(default);
+    }
+    match str_arg(fname, &vals[idx])? {
+        None => Err(exec_err("22004", "null argument not allowed here")),
+        Some(s) => Ok(s),
+    }
+}
+
+/// Expand `\1`-`\9` and `\&` in a regexp_replace replacement string.
+/// `\\` is a literal backslash.
+fn expand_replacement(repl: &str, s: &[char], caps: &crate::regex::Captures) -> String {
+    let mut out = String::new();
+    let b = repl.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            let c = repl[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            out.push('\\');
+            break;
+        }
+        match b[i] {
+            b'\\' => {
+                out.push('\\');
+                i += 1;
+            }
+            b'&' => {
+                // Whole match.
+                if let Some((ms, me)) = caps.groups[0] {
+                    out.extend(s[ms..me].iter());
+                }
+                i += 1;
+            }
+            b'0'..=b'9' => {
+                let g = (b[i] - b'0') as usize;
+                if let Some(Some((gs, ge))) = caps.groups.get(g) {
+                    out.extend(s[*gs..*ge].iter());
+                }
+                i += 1;
+            }
+            _ => {
+                // Unknown escape: treat as literal char (PG behavior).
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Decode `\uXXXX` and `\UXXXXXXXX` escapes (unistr and U&'' literals).
+/// `\\` produces a literal backslash. Returns None on invalid escapes.
+fn unistr_decode(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 1;
+            if i >= b.len() {
+                return None;
+            }
+            if b[i] == b'\\' {
+                out.push('\\');
+                i += 1;
+            } else if b[i] == b'u' || b[i] == b'U' {
+                let digits = if b[i] == b'u' { 4 } else { 8 };
+                i += 1;
+                if i + digits > b.len() {
+                    return None;
+                }
+                let hex = &s[i..i + digits];
+                let cp = u32::from_str_radix(hex, 16).ok()?;
+                out.push(char::from_u32(cp)?);
+                i += digits;
+            } else {
+                return None;
+            }
+        } else {
+            // Copy one UTF-8 char.
+            let c = s[i..].chars().next()?;
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    Some(out)
+}
+
+/// Parse PG bytea `escape` format; None on invalid input.
+fn bytea_unescape(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 1;
+            if i >= b.len() {
+                return None;
+            }
+            if b[i] == b'\\' {
+                out.push(b'\\');
+                i += 1;
+            } else if i + 2 < b.len()
+                && (b[i] as char).is_digit(8)
+                && (b[i + 1] as char).is_digit(8)
+                && (b[i + 2] as char).is_digit(8)
+            {
+                let v = ((b[i] - b'0') as u32) * 64
+                    + ((b[i + 1] - b'0') as u32) * 8
+                    + ((b[i + 2] - b'0') as u32);
+                out.push(v as u8);
+                i += 3;
+            } else {
+                return None;
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Shared `power(a, b)` / `a ^ b` implementation. `bad` builds the
@@ -11244,7 +12266,17 @@ fn func_result_type(
     match name {
         "upper" | "lower" | "substring" | "substr" | "trim" | "replace" | "split_part"
         | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin" | "left" | "right"
-        | "reverse" => Ok(ColType::Text),
+        | "reverse" | "encode" => Ok(ColType::Text),
+        "decode" => Ok(ColType::Bytea),
+        "crc32c" => Ok(ColType::BigInt),
+        "sha224" | "sha256" | "sha384" | "sha512" => Ok(ColType::Bytea),
+        "strpos" => Ok(ColType::Int),
+        "translate" | "unistr" | "overlay" => Ok(ColType::Text),
+        "regexp_like" => Ok(ColType::Bool),
+        "regexp_count" | "regexp_instr" => Ok(ColType::Int),
+        "regexp_substr" | "regexp_replace" => Ok(ColType::Text),
+        "similar_to" => Ok(ColType::Bool),
+        "substring_similar" | "substring_from" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
         "abs" | "sign" => arg0(),
         "round" | "mod" => Ok(ColType::Numeric),

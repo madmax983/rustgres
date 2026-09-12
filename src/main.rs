@@ -11,6 +11,7 @@ mod exec;
 mod index;
 mod net;
 mod protocol;
+mod regex;
 mod repl;
 mod server;
 mod sql;

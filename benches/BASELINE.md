@@ -2,6 +2,17 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.19 baseline — 2026-09-12
+
+The v0.19 workload (`benches/workload19.py`: bytea hex/escape/base64 I/O,
+encode/decode, CRC32C, SHA-224/256/384/512, regexp_* functions, SIMILAR TO,
+LIKE..ESCAPE, string functions — 440 queries) ran at **1610 qps** on the
+debug binary, 0.27s total.
+
+- **Valgrind**: NOT RUN — valgrind is not installed in this environment
+  and apt could not install it (dpkg lock held by another process).
+  This is recorded, not hand-waved.
+
 ## v0.18 baseline — 2026-09-11
 
 No full benchmark re-run for v0.18 (same rationale as v0.14–v0.17): the

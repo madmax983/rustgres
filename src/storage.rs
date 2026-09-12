@@ -1339,17 +1339,18 @@ fn uuid_text(u: &[u8; 16]) -> String {
 /// Parse `\xdeadbeef` (or a bare even-length hex string) into bytes.
 /// `Err(())` = malformed (caller maps to 22P02).
 pub fn parse_bytea(s: &str) -> Result<Vec<u8>, ()> {
-    // Hex format: `\x` followed by an even number of hex digits.
+    // Hex format: `\x` followed by hex digits. PG ignores whitespace
+    // between the hex digits (e.g. '\x De Ad Be Ef ').
     if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
-        if hex.len() % 2 != 0 {
+        let digits: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        if digits.len() % 2 != 0 {
             return Err(());
         }
-        let mut out = Vec::with_capacity(hex.len() / 2);
-        let bytes = hex.as_bytes();
+        let mut out = Vec::with_capacity(digits.len() / 2);
         let mut i = 0;
-        while i < bytes.len() {
-            let hi = (bytes[i] as char).to_digit(16).ok_or(())?;
-            let lo = (bytes[i + 1] as char).to_digit(16).ok_or(())?;
+        while i < digits.len() {
+            let hi = (digits[i] as char).to_digit(16).ok_or(())?;
+            let lo = (digits[i + 1] as char).to_digit(16).ok_or(())?;
             out.push((hi * 16 + lo) as u8);
             i += 2;
         }

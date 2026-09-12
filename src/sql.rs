@@ -70,7 +70,8 @@ enum Token {
     Ident(String), // folded to lowercase unless double-quoted
     Number(String),
     Str(String),
-    Param(u32), // $N parameter placeholder, 1-based
+    UStr(String), // v0.19: U&'...' raw content (UESCAPE handled by parser)
+    Param(u32),   // $N parameter placeholder, 1-based
     LParen,
     RParen,
     Comma,
@@ -91,6 +92,161 @@ enum Token {
     PipePipe,   // v0.7: `||` concat
     Caret,      // v0.7: `^` exponentiation
     EOF,
+}
+
+/// Parse a single-quoted string starting at `chars[*i]` (which must be `'`);
+/// `''` is an escaped quote. Advances `*i` past the closing quote.
+fn parse_single_quoted(chars: &[char], i: &mut usize) -> Result<String, SqlError> {
+    assert_eq!(chars[*i], '\'');
+    *i += 1;
+    let mut s = String::new();
+    loop {
+        if *i >= chars.len() {
+            return Err(err("unterminated string literal"));
+        }
+        if chars[*i] == '\'' {
+            if *i + 1 < chars.len() && chars[*i + 1] == '\'' {
+                s.push('\'');
+                *i += 2;
+            } else {
+                *i += 1;
+                break;
+            }
+        } else {
+            s.push(chars[*i]);
+            *i += 1;
+        }
+    }
+    Ok(s)
+}
+
+/// Process `E'...'` escape sequences: `\n`, `\t`, `\b`, `\f`, `\r`,
+/// `\\`, `\'`, `\uXXXX`, `\UXXXXXXXX`, and octal `\ooo`.
+fn unescape_e_string(s: &str) -> Result<String, SqlError> {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            let c = s[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            return Err(err("unterminated escape sequence"));
+        }
+        match b[i] {
+            b'n' => {
+                out.push('\n');
+                i += 1;
+            }
+            b't' => {
+                out.push('\t');
+                i += 1;
+            }
+            b'b' => {
+                out.push('\x08');
+                i += 1;
+            }
+            b'f' => {
+                out.push('\x0c');
+                i += 1;
+            }
+            b'r' => {
+                out.push('\r');
+                i += 1;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 1;
+            }
+            b'\'' => {
+                out.push('\'');
+                i += 1;
+            }
+            b'u' => {
+                // \uXXXX
+                if i + 4 >= b.len() {
+                    return Err(err("invalid \\u escape"));
+                }
+                let hex = &s[i + 1..i + 5];
+                let cp = u32::from_str_radix(hex, 16).map_err(|_| err("invalid \\u escape"))?;
+                out.push(char::from_u32(cp).ok_or_else(|| err("invalid \\u escape"))?);
+                i += 5;
+            }
+            b'U' => {
+                // \UXXXXXXXX
+                if i + 8 >= b.len() {
+                    return Err(err("invalid \\U escape"));
+                }
+                let hex = &s[i + 1..i + 9];
+                let cp = u32::from_str_radix(hex, 16).map_err(|_| err("invalid \\U escape"))?;
+                out.push(char::from_u32(cp).ok_or_else(|| err("invalid \\U escape"))?);
+                i += 9;
+            }
+            b'0'..=b'7' => {
+                // Octal \ooo (up to 3 digits).
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                    val = val * 8 + (b[i] - b'0') as u32;
+                    i += 1;
+                    n += 1;
+                }
+                out.push(char::from_u32(val).ok_or_else(|| err("invalid octal escape"))?);
+            }
+            _ => return Err(err(format!("invalid escape sequence '\\{}'", b[i] as char))),
+        }
+    }
+    Ok(out)
+}
+
+/// Decode a `U&'...'` string with the given escape character.
+/// `\\` followed by 4 hex digits = 16-bit code unit, `\\+` followed by 6
+/// hex digits = 32-bit code point. `\\` followed by the escape char itself
+/// is a literal escape char. Returns None on invalid escapes.
+fn decode_ustr(s: &str, escape: char) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != escape {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Escape sequence.
+        i += 1;
+        if i >= chars.len() {
+            return None;
+        }
+        if chars[i] == escape {
+            out.push(escape);
+            i += 1;
+        } else if chars[i] == '+' {
+            // \+XXXXXX (6 hex digits).
+            i += 1;
+            if i + 6 > chars.len() {
+                return None;
+            }
+            let hex: String = chars[i..i + 6].iter().collect();
+            let cp = u32::from_str_radix(&hex, 16).ok()?;
+            out.push(char::from_u32(cp)?);
+            i += 6;
+        } else {
+            // \\XXXX (4 hex digits).
+            if i + 4 > chars.len() {
+                return None;
+            }
+            let hex: String = chars[i..i + 4].iter().collect();
+            let cp = u32::from_str_radix(&hex, 16).ok()?;
+            out.push(char::from_u32(cp)?);
+            i += 4;
+        }
+    }
+    Some(out)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
@@ -146,6 +302,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 return Err(err("unterminated block comment"));
             }
             i += 2;
+            continue;
+        }
+        // v0.19: `U&'...'` Unicode escape string prefix (must come before
+        // the identifier branch, since `&` is not an identifier char).
+        if (c == 'u' || c == 'U')
+            && i + 2 < chars.len()
+            && chars[i + 1] == '&'
+            && chars[i + 2] == '\''
+        {
+            i += 2; // consume `U&`, now at the quote
+            let s = parse_single_quoted(&chars, &mut i)?;
+            toks.push(Token::UStr(s));
+            continue;
+        }
+        // v0.19: `E'...'` escape string prefix.
+        if (c == 'e' || c == 'E') && i + 1 < chars.len() && chars[i + 1] == '\'' {
+            i += 1; // consume `E`, now at the quote
+            let s = parse_single_quoted(&chars, &mut i)?;
+            toks.push(Token::Str(unescape_e_string(&s)?));
             continue;
         }
         match c {
@@ -539,6 +714,7 @@ pub enum Expr {
         pattern: Box<Expr>,
         not: bool,
         ilike: bool,
+        escape: Option<Box<Expr>>,
     },
     /// v0.7: `[NOT] BETWEEN low AND high`.
     Between {
@@ -2933,6 +3109,36 @@ impl Parser {
                 }
             }
             Token::Str(s) => Ok(Literal::Text(s)),
+            Token::UStr(raw) => {
+                // v0.19: U&'...' with optional UESCAPE 'c' clause.
+                let escape = if self.eat_keyword("uescape") {
+                    match self.next() {
+                        Token::Str(e) => {
+                            let mut ch = e.chars();
+                            match (ch.next(), ch.next()) {
+                                (Some(c), None) => c,
+                                _ => {
+                                    return Err(err(
+                                        "UESCAPE string must be empty or one character",
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected string literal for UESCAPE, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                } else {
+                    '\\'
+                };
+                match decode_ustr(&raw, escape) {
+                    Some(t) => Ok(Literal::Text(t)),
+                    None => Err(err("invalid Unicode escape")),
+                }
+            }
             Token::Ident(s) => match s.as_str() {
                 "true" => Ok(Literal::Bool(true)),
                 "false" => Ok(Literal::Bool(false)),
@@ -3570,20 +3776,51 @@ impl Parser {
         }
         if self.eat_keyword("like") {
             let pattern = self.parse_concat()?;
+            let escape = if self.eat_keyword("escape") {
+                Some(Box::new(self.parse_concat()?))
+            } else {
+                None
+            };
             return Ok(Expr::Like {
                 expr: Box::new(left),
                 pattern: Box::new(pattern),
                 not: neg,
                 ilike: false,
+                escape,
             });
+        }
+        // v0.19: [NOT] SIMILAR TO pattern [ESCAPE 'c'].
+        // Desugars to similar_to(expr, pattern [, escape]).
+        if self.eat_keyword("similar") {
+            self.expect_keyword("to")?;
+            let pattern = self.parse_concat()?;
+            let mut args = vec![left, pattern];
+            if self.eat_keyword("escape") {
+                args.push(self.parse_concat()?);
+            }
+            let e = Expr::Func {
+                name: "similar_to".to_string(),
+                args,
+            };
+            if neg {
+                return Ok(Expr::Not(Box::new(e)));
+            } else {
+                return Ok(e);
+            }
         }
         if self.eat_keyword("ilike") {
             let pattern = self.parse_concat()?;
+            let escape = if self.eat_keyword("escape") {
+                Some(Box::new(self.parse_concat()?))
+            } else {
+                None
+            };
             return Ok(Expr::Like {
                 expr: Box::new(left),
                 pattern: Box::new(pattern),
                 not: neg,
                 ilike: true,
+                escape,
             });
         }
         if neg || self.eat_keyword("in") {
@@ -3818,7 +4055,28 @@ impl Parser {
                 self.next();
                 Ok(Expr::Param(n))
             }
-            Token::Number(_) | Token::Str(_) => Ok(Expr::Literal(self.parse_literal()?)),
+            Token::Number(_) | Token::Str(_) | Token::UStr(_) => {
+                // v0.19: adjacent string literals concatenate
+                // ('a' 'b' -> 'ab', per SQL standard).
+                let mut lit = self.parse_literal()?;
+                loop {
+                    let is_str = matches!(self.peek(), Token::Str(_) | Token::UStr(_));
+                    if !is_str {
+                        break;
+                    }
+                    // Only concatenate text literals.
+                    let next = self.parse_literal()?;
+                    match (&mut lit, next) {
+                        (Literal::Text(a), Literal::Text(b)) => a.push_str(&b),
+                        _ => {
+                            return Err(err(
+                                "syntax error: adjacent literals must both be strings",
+                            ));
+                        }
+                    }
+                }
+                Ok(Expr::Literal(lit))
+            }
             Token::Ident(ref s) if s == "true" || s == "false" || s == "null" => {
                 Ok(Expr::Literal(self.parse_literal()?))
             }
@@ -3925,6 +4183,7 @@ impl Parser {
             "trim" => return self.parse_trim(),
             "position" => return self.parse_position(),
             "substring" => return self.parse_substring(),
+            "overlay" => return self.parse_overlay(),
             _ => {}
         }
         let agg = match name.as_str() {
@@ -4268,34 +4527,109 @@ impl Parser {
         })
     }
 
-    /// `substring(str from start [for len])` or `substring(str, start [, len])`.
-    fn parse_substring(&mut self) -> Result<Expr, SqlError> {
+    /// `overlay(str placing replacement from start [for len])`.
+    /// Desugars to `overlay(str, replacement, start, len)`; omitted FOR
+    /// defaults to the replacement length (Postgres behavior).
+    fn parse_overlay(&mut self) -> Result<Expr, SqlError> {
         self.expect(Token::LParen, "'('")?;
         let s = self.parse_or()?;
-        let (start, len) = if self.eat_keyword("from") {
-            let start = self.parse_or()?;
-            let len = if self.eat_keyword("for") {
+        let (replacement, start, len) = if self.eat_keyword("placing") {
+            let r = self.parse_or()?;
+            self.expect_keyword("from")?;
+            let st = self.parse_or()?;
+            let ln = if self.eat_keyword("for") {
                 Some(self.parse_or()?)
             } else {
                 None
             };
-            (start, len)
+            (r, st, ln)
         } else {
+            let r = self.parse_or()?;
             self.expect(Token::Comma, "','")?;
-            let start = self.parse_or()?;
-            let len = if self.peek() == Token::Comma {
+            let st = self.parse_or()?;
+            let ln = if self.peek() == Token::Comma {
                 self.next();
                 Some(self.parse_or()?)
             } else {
                 None
             };
-            (start, len)
+            (r, st, ln)
         };
         self.expect(Token::RParen, "')'")?;
-        let mut args = vec![s, start];
-        if let Some(len) = len {
-            args.push(len);
+        // Default FOR = length(replacement); encode as a Func call.
+        let mut args = vec![s, replacement, start];
+        if let Some(l) = len {
+            args.push(l);
+        } else {
+            // Use a sentinel: overlay() with 3 args means "default length".
+            // We handle this in eval by computing length(replacement).
         }
+        Ok(Expr::Func {
+            name: "overlay".to_string(),
+            args,
+        })
+    }
+
+    /// `substring(str from start [for len])`, `substring(str, start [, len])`,
+    /// `substring(str from pattern)` (POSIX regex), `substring(str from pattern
+    /// for escape)` (SQL99 SIMILAR), or `substring(str similar pattern
+    /// [escape 'c'])` (SIMILAR).
+    fn parse_substring(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let s = self.parse_or()?;
+        // v0.19: SUBSTRING(s SIMILAR pat [ESCAPE 'c']).
+        if self.eat_keyword("similar") {
+            let pat = self.parse_or()?;
+            let mut args = vec![s, pat];
+            if self.eat_keyword("escape") {
+                args.push(self.parse_or()?);
+            }
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::Func {
+                name: "substring_similar".to_string(),
+                args,
+            });
+        }
+        if self.eat_keyword("from") {
+            let pat_or_start = self.parse_or()?;
+            if self.eat_keyword("for") {
+                let for_arg = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                // Distinguish integer (start, len) from text (pattern, escape).
+                // If both are integer literals, it's substring(s, start, len).
+                // Otherwise, it's the SQL99 SIMILAR form.
+                let is_int = |e: &Expr| matches!(e, Expr::Literal(crate::sql::Literal::Int(_)));
+                if is_int(&pat_or_start) && is_int(&for_arg) {
+                    return Ok(Expr::Func {
+                        name: "substring".to_string(),
+                        args: vec![s, pat_or_start, for_arg],
+                    });
+                } else {
+                    return Ok(Expr::Func {
+                        name: "substring_similar".to_string(),
+                        args: vec![s, pat_or_start, for_arg],
+                    });
+                }
+            }
+            self.expect(Token::RParen, "')'")?;
+            // SUBSTRING(s FROM pat): could be POSIX regex or (start) integer.
+            // We dispatch based on the type at runtime: if the second arg is
+            // text, treat as regex; if integer, treat as start position.
+            // For now, use a special function name and let eval decide.
+            return Ok(Expr::Func {
+                name: "substring_from".to_string(),
+                args: vec![s, pat_or_start],
+            });
+        }
+        // Comma form: substring(s, start [, len]).
+        self.expect(Token::Comma, "','")?;
+        let start = self.parse_or()?;
+        let mut args = vec![s, start];
+        if self.peek() == Token::Comma {
+            self.next();
+            args.push(self.parse_or()?);
+        }
+        self.expect(Token::RParen, "')'")?;
         Ok(Expr::Func {
             name: "substring".to_string(),
             args,
@@ -6105,6 +6439,7 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             pattern,
             not,
             ilike,
+            escape,
         } => {
             out.push_str(&format!(
                 "(like {} {} ",
@@ -6114,6 +6449,11 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(expr, out);
             out.push(' ');
             encode_expr_inner(pattern, out);
+            out.push(' ');
+            match escape {
+                Some(e) => encode_expr_inner(e, out),
+                None => out.push_str("(null)"),
+            }
             out.push(')');
         }
         Expr::Between {
@@ -6343,11 +6683,17 @@ impl<'a> SexprParser<'a> {
                 let ilike = self.atom()? == "1";
                 let x = self.expr()?;
                 let p = self.expr()?;
+                let e = self.expr()?;
+                let escape = match e {
+                    Expr::Literal(crate::sql::Literal::Null) => None,
+                    other => Some(Box::new(other)),
+                };
                 Expr::Like {
                     expr: Box::new(x),
                     pattern: Box::new(p),
                     not,
                     ilike,
+                    escape,
                 }
             }
             "between" => {

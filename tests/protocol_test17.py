@@ -13,7 +13,7 @@ Groups:
      (on/off/true/false/1/0), SHOW default_transaction_read_only,
      SHOW server_version / server_version_num, RESET name / RESET ALL.
   C. version reporting -- startup ParameterStatus server_version is
-     "0.18.0" (honest: not a fake "16.0"); SHOW server_version,
+     "0.19.0" (honest: not a fake "16.0"); SHOW server_version,
      server_version_num ("1700"), and version() agree.
   D. extended-protocol COPY -- Parse/Bind/Describe/Execute drives
      CopyOutResponse/CopyData/CopyDone/CommandComplete for COPY TO and
@@ -394,19 +394,19 @@ def group_b_gucs(c):
 
 def group_c_version(c):
     print("== C. version reporting ==")
-    check("startup server_version is 0.18.0",
-          c.startup_params.get("server_version") == "0.18.0",
+    check("startup server_version is 0.19.0",
+          c.startup_params.get("server_version") == "0.19.0",
           str(c.startup_params.get("server_version")))
     msgs = c.query("SHOW server_version")
-    check("SHOW server_version = 0.18.0", simple_single_value(msgs) == "0.18.0",
+    check("SHOW server_version = 0.19.0", simple_single_value(msgs) == "0.19.0",
           str(simple_single_value(msgs)))
     msgs = c.query("SHOW server_version_num")
-    check("SHOW server_version_num = 1800", simple_single_value(msgs) == "1800",
+    check("SHOW server_version_num = 1900", simple_single_value(msgs) == "1900",
           str(simple_single_value(msgs)))
     msgs = c.query("SELECT version()")
     v = simple_single_value(msgs)
-    check("version() mentions rustgres 0.18.0",
-          v is not None and "rustgres 0.18.0" in v, str(v))
+    check("version() mentions rustgres 0.19.0",
+          v is not None and "rustgres 0.19.0" in v, str(v))
     check("version() disclaims PG identity (no 'PostgreSQL 16')",
           v is not None and "PostgreSQL 16" not in v, str(v))
     check("server_version != fake 16.0",

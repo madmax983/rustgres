@@ -1,28 +1,33 @@
-# rustgres v0.18 — "conformance burn-down: numeric type cluster"
+# rustgres v0.19 — "conformance burn-down: strings type cluster"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 18 of the road to Postgres 19 feature parity. v0.18 burns down
-the numeric conformance cluster: case-insensitive `NaN`/`Infinity` parsing
-for the `numeric` type (this alone ends a 423-error `25P02` cascade that was
-failing whole pg_regress files), NaN/Infinity propagation through arithmetic,
-comparisons, and ordering (`-Inf < finite < Inf < NaN`, `NaN != NaN`),
-high-precision `exp`/`ln`/`log` (~15 digits), and the missing numeric
-built-ins: `cbrt`, `factorial`, `gcd`/`lcm`, `pi`, `degrees`/`radians`,
-`scale`/`min_scale`/`trim_scale`, `div`, `width_bucket`, `random`/`setseed`
-— plus function-derived column names (`SELECT sqrt(2)` names its column
-`sqrt`, not `?column?`). Version reporting is now single-sourced: the
-startup banners read the same `SERVER_VERSION` constant as
-`SHOW server_version` / `version()`, so they can never drift again
-(they did in v0.17: the binary announced v0.16 while Cargo said 0.17.0).
-Valgrind memcheck/callgrind/DHAT were not run for v0.18: Valgrind is not
-installed in this environment and apt could not install it (lock held by
-another process); this is recorded, not hand-waved.
-Conformance baseline: **2385 PASS (45.9%)**, 1556 EXPECTED-FAIL, 1252
-REAL-FAIL over 5193 pg_regress statements (+521/−521 vs v0.17).
-1515 cumulative protocol tests pass (32 new in v0.18), plus 73 unit tests
+Milestone 19 of the road to Postgres 19 feature parity. v0.19 burns down
+the strings conformance cluster: `bytea` hex I/O (with whitespace
+tolerance), `reverse`/`position`/`encode`/`decode`/`crc32c` for bytea,
+`sha224`/`sha256`/`sha384`/`sha512` (pure-std FIPS 180-4), a pure-std regex
+engine backing `regexp_like`/`regexp_count`/`regexp_instr`/`regexp_substr`/
+`regexp_replace`, `SIMILAR TO`/`NOT SIMILAR TO`, `LIKE...ESCAPE`, `strpos`,
+`translate`, `unistr`, `OVERLAY`, `E'...'`/`U&'...'` literals, adjacent
+literal concatenation, and POSIX `SUBSTRING(s FROM pattern)` — plus a fixed
+`SUBSTRING(s FROM n FOR m)` integer regression.
+Valgrind memcheck/callgrind/DHAT were not run for v0.19: Valgrind is not
+installed in this environment and apt could not install it (dpkg lock held
+by system processes across VM generations); this is recorded, not hand-waved.
+Conformance: **2504 PASS (48.2%)**, 1556 EXPECTED-FAIL, 1133 REAL-FAIL over
+5193 pg_regress statements (+119/−119 vs v0.18).
+1542 cumulative protocol tests pass (27 new in v0.19), plus 73 unit tests
 and 53 isolation checks.
+
+**Repair note.** The v0.19 development pass left four defects that
+independent review caught before publication: 10 of the 80 SHA-512 K
+constants were mistyped (sha512 digests were wrong; sha256 was clean),
+the SHA-384 IV had a typo (`85a` instead of `858`), the new regex VM hung
+forever on patterns like `a(b|c)*d` (a backtracking cycle — now bounded by
+a step budget that degrades to "no match" instead of hanging the backend),
+and the version strings were never bumped from 0.18.0. All four are fixed
+in the published tree.
 
 ## What v0.18 adds (conformance burn-down: numeric type cluster)
 
