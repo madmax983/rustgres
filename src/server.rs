@@ -94,8 +94,8 @@ pub(crate) struct Session {
 /// startup ParameterStatus all read these constants so they agree.
 /// v0.18-repair: the startup banners in main.rs/wal.rs now read this
 /// constant too, instead of hardcoding a stale version string.
-pub(crate) const SERVER_VERSION: &str = "0.19.0";
-pub(crate) const SERVER_VERSION_NUM: &str = "1900";
+pub(crate) const SERVER_VERSION: &str = "0.20.0";
+pub(crate) const SERVER_VERSION_NUM: &str = "2000";
 
 /// Connection ids; process-local is fine (currval is in-memory only).
 static NEXT_SID: AtomicU64 = AtomicU64::new(1);

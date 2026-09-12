@@ -163,7 +163,7 @@ def main():
         k, pos = parse_cstring(p, 0)
         v, _ = parse_cstring(p, pos)
         params[k] = v
-    check("server_version is 0.19.0", params.get("server_version") == "0.19.0", str(params))
+    check("server_version is 0.20.0", params.get("server_version") == "0.20.0", str(params))
     check("server_encoding is UTF8", params.get("server_encoding") == "UTF8")
     check("client_encoding is UTF8", params.get("client_encoding") == "UTF8")
     check("integer_datetimes is on", params.get("integer_datetimes") == "on")

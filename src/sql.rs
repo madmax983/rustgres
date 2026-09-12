@@ -841,24 +841,27 @@ pub enum FromItem {
     Table {
         name: String,
         alias: Option<String>,
+        /// v0.20: `FROM tbl [AS] x (a, b, c)` — column aliases rename the
+        /// table's output columns positionally.
+        col_aliases: Vec<String>,
     },
     /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
-    Derived {
-        sub: Box<SelectStmt>,
-        alias: String,
-    },
+    Derived { sub: Box<SelectStmt>, alias: String },
     /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
     /// columns `column1`, `column2`, ... when no column aliases are given.
-    Values {
-        rows: Vec<Vec<Expr>>,
-        alias: String,
-    },
+    Values { rows: Vec<Vec<Expr>>, alias: String },
     Join {
         left: Box<FromItem>,
         kind: JoinKind,
         right: Box<FromItem>,
         /// None for CROSS JOIN.
         on: Option<Expr>,
+        /// v0.20: `USING (cols)` — stored separately so the executor can
+        /// build the equijoin condition and project the merged columns.
+        using: Vec<String>,
+        /// v0.20: `NATURAL` — resolved to USING on common columns at
+        /// execution time (schemas not known at parse time).
+        natural: bool,
     },
 }
 
@@ -866,6 +869,8 @@ pub enum FromItem {
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
 }
 
@@ -2130,6 +2135,8 @@ fn is_reserved(word: &str) -> bool {
             | "values"
             | "verbose"
             | "where"
+            | "using" // v0.20: JOIN ... USING
+            | "natural" // v0.20: NATURAL JOIN
     )
 }
 
@@ -5254,6 +5261,8 @@ impl Parser {
                 kind: JoinKind::Cross,
                 right: Box::new(next),
                 on: None,
+                using: Vec::new(),
+                natural: false,
             };
         }
         Ok(vec![acc])
@@ -5262,6 +5271,8 @@ impl Parser {
     fn parse_join_chain(&mut self) -> Result<FromItem, SqlError> {
         let mut left = self.parse_from_primary()?;
         loop {
+            // v0.20: NATURAL [kind] JOIN — desugared at execution time.
+            let natural = self.eat_keyword("natural");
             let kind = if self.eat_keyword("join") {
                 JoinKind::Inner
             } else if self.eat_keyword("inner") {
@@ -5271,18 +5282,46 @@ impl Parser {
                 self.eat_keyword("outer");
                 self.expect_keyword("join")?;
                 JoinKind::Left
+            } else if self.eat_keyword("right") {
+                self.eat_keyword("outer");
+                self.expect_keyword("join")?;
+                JoinKind::Right
+            } else if self.eat_keyword("full") {
+                self.eat_keyword("outer");
+                self.expect_keyword("join")?;
+                JoinKind::Full
             } else if self.eat_keyword("cross") {
                 self.expect_keyword("join")?;
                 JoinKind::Cross
             } else {
+                if natural {
+                    return Err(err("NATURAL must be followed by a join type"));
+                }
                 break;
             };
             let right = self.parse_from_primary()?;
-            let on = match kind {
-                JoinKind::Cross => None,
+            let (on, using) = match kind {
+                JoinKind::Cross => (None, Vec::new()),
+                // v0.20: NATURAL has no ON/USING — condition is implicit.
+                _ if natural => (None, Vec::new()),
                 _ => {
-                    self.expect_keyword("on")?;
-                    Some(self.parse_or()?)
+                    if self.eat_keyword("using") {
+                        self.expect(Token::LParen, "'('")?;
+                        let mut cols = Vec::new();
+                        loop {
+                            cols.push(self.expect_ident()?);
+                            if self.peek() == Token::Comma {
+                                self.next();
+                                continue;
+                            }
+                            break;
+                        }
+                        self.expect(Token::RParen, "')'")?;
+                        (None, cols)
+                    } else {
+                        self.expect_keyword("on")?;
+                        (Some(self.parse_or()?), Vec::new())
+                    }
                 }
             };
             left = FromItem::Join {
@@ -5290,6 +5329,8 @@ impl Parser {
                 kind,
                 right: Box::new(right),
                 on,
+                using,
+                natural,
             };
         }
         Ok(left)
@@ -5373,7 +5414,28 @@ impl Parser {
                 name
             };
             let alias = self.parse_alias_opt()?;
-            Ok(FromItem::Table { name, alias })
+            // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
+            let col_aliases = if self.peek() == Token::LParen {
+                self.next();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.expect_ident()?);
+                    if self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
+                cols
+            } else {
+                Vec::new()
+            };
+            Ok(FromItem::Table {
+                name,
+                alias,
+                col_aliases,
+            })
         }
     }
 

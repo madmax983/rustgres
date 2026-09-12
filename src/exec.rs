@@ -3479,7 +3479,7 @@ fn plan_order_scan(
         return None;
     }
     let (table_name, qual) = match &stmt.from[0] {
-        FromItem::Table { name, alias } => {
+        FromItem::Table { name, alias, .. } => {
             (name.as_str(), alias.clone().unwrap_or_else(|| name.clone()))
         }
         FromItem::Derived { .. } | FromItem::Join { .. } | FromItem::Values { .. } => return None,
@@ -3782,7 +3782,7 @@ fn plan_from_item(
     own: u64,
 ) -> Result<PlanNode, ExecError> {
     match item {
-        FromItem::Table { name, alias } => {
+        FromItem::Table { name, alias, .. } => {
             // v0.9: information_schema virtual tables plan as scans.
             if name == "information_schema.tables" || name == "information_schema.columns" {
                 return Ok(PlanNode::SeqScan {
@@ -4918,7 +4918,7 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
 fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
     fn walk(q: &Q, item: &FromItem, out: &mut Vec<(String, Option<String>)>) {
         match item {
-            FromItem::Table { name, alias } => {
+            FromItem::Table { name, alias, .. } => {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let is_cte = q.ctes.iter().rev().any(|b| b.name == *name);
                 let real = if is_cte {
@@ -7157,6 +7157,17 @@ fn left_null_row(l: &QRow, rschema: &[QCol]) -> QRow {
     }
 }
 
+/// v0.20: for FULL JOIN — NULL left cells + right row cells.
+fn right_null_row(lschema: &[QCol], r: &QRow) -> QRow {
+    let mut cells = Vec::with_capacity(lschema.len() + r.cells.len());
+    cells.extend(lschema.iter().map(|_| Value::Null));
+    cells.extend(r.cells.iter().cloned());
+    QRow {
+        cells,
+        prov: r.prov.clone(),
+    }
+}
+
 fn build_source(
     q: &mut Q,
     outer: &[Scope],
@@ -7176,8 +7187,21 @@ fn build_source(
     early_limit: Option<usize>,
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     match item {
-        FromItem::Table { name, alias } => {
+        FromItem::Table {
+            name,
+            alias,
+            col_aliases,
+        } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // v0.20: apply column aliases positionally to a schema.
+            let apply_aliases = |mut schema: Vec<QCol>| -> Vec<QCol> {
+                for (i, alias) in col_aliases.iter().enumerate() {
+                    if i < schema.len() {
+                        schema[i].name = alias.clone();
+                    }
+                }
+                schema
+            };
             // v0.10: CTEs shadow everything (like Postgres).
             if let Some(b) = q.ctes.iter().rev().find(|b| b.name == *name) {
                 let schema: Vec<QCol> = b
@@ -7189,7 +7213,7 @@ fn build_source(
                         ty: c.ty.clone(),
                     })
                     .collect();
-                return Ok((schema, b.rows.clone()));
+                return Ok((apply_aliases(schema), b.rows.clone()));
             }
             // v0.9: information_schema virtual tables.
             if name == "information_schema.tables" {
@@ -7201,7 +7225,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             if name == "information_schema.columns" {
                 let (schema, rows) = info_columns_scan(&q.eng.db, q.snap, q.own);
@@ -7212,7 +7236,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             // v0.9: a view name expands to its stored SELECT. Views are
             // checked before tables (a table would have blocked CREATE VIEW).
@@ -7257,7 +7281,7 @@ fn build_source(
                         prov: Vec::new(),
                     })
                     .collect();
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
@@ -7270,7 +7294,7 @@ fn build_source(
                     })
                     .collect();
                 let (_, rows) = pg_stats_scan(&q.eng.db);
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             // v0.11: the role catalogs are virtual too.
             if matches!(
@@ -7286,7 +7310,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             // v0.13: pg_replication_slots is virtual too (cluster-global
             // slot map, not a table).
@@ -7301,7 +7325,7 @@ fn build_source(
                     })
                     .collect();
                 let rows = pg_replication_slots_rows(q.eng);
-                return Ok((schema, rows));
+                return Ok((apply_aliases(schema), rows));
             }
             // v0.11: scanning a real table needs SELECT (and UPDATE when
             // the statement is FOR UPDATE, like PostgreSQL). Existence is
@@ -7424,7 +7448,7 @@ fn build_source(
                 };
                 (schema, rows)
             };
-            Ok((schema, rows))
+            Ok((apply_aliases(schema), rows))
         }
         FromItem::Derived { sub, alias } => {
             // Derived tables are uncorrelated (no LATERAL support): they
@@ -7516,12 +7540,67 @@ fn build_source(
             kind,
             right,
             on,
+            using,
+            natural,
         } => {
-            let (lschema, lrows) = build_source(q, outer, left, where_, need_prov, None, None)?;
-            let (rschema, rrows) = build_source(q, outer, right, where_, need_prov, None, None)?;
-            let mut schema = Vec::with_capacity(lschema.len() + rschema.len());
-            schema.extend(lschema.iter().cloned());
-            schema.extend(rschema.iter().cloned());
+            let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None)?;
+            let (rschema0, rrows0) = build_source(q, outer, right, where_, need_prov, None, None)?;
+            // v0.20: NATURAL JOIN — USING on the common column names.
+            let using_cols: Vec<String> = if *natural {
+                lschema0
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .filter(|n| rschema0.iter().any(|c| c.name == *n))
+                    .collect()
+            } else {
+                using.clone()
+            };
+            // v0.20: RIGHT JOIN runs as LEFT with the sides swapped; the
+            // output schema/rows are un-swapped at the end.
+            let swapped = *kind == JoinKind::Right;
+            let (lschema, lrows, rschema, rrows) = if swapped {
+                (rschema0.clone(), rrows0, lschema0.clone(), lrows0)
+            } else {
+                (lschema0.clone(), lrows0, rschema0.clone(), rrows0)
+            };
+            // v0.20: USING (cols) — build `left.col = right.col AND ...`.
+            let on_expr: Option<Expr> = if !using_cols.is_empty() {
+                let mut cond: Option<Expr> = None;
+                for col in &using_cols {
+                    let lqual = lschema
+                        .iter()
+                        .find(|c| c.name == *col)
+                        .map(|c| c.qual.clone())
+                        .unwrap_or_default();
+                    let rqual = rschema
+                        .iter()
+                        .find(|c| c.name == *col)
+                        .map(|c| c.qual.clone())
+                        .unwrap_or_default();
+                    let eq = Expr::Cmp {
+                        op: CmpOp::Eq,
+                        left: Box::new(Expr::Column {
+                            table: Some(lqual),
+                            name: col.clone(),
+                        }),
+                        right: Box::new(Expr::Column {
+                            table: Some(rqual),
+                            name: col.clone(),
+                        }),
+                    };
+                    cond = Some(match cond {
+                        None => eq,
+                        Some(c) => Expr::And(Box::new(c), Box::new(eq)),
+                    });
+                }
+                cond
+            } else {
+                on.clone()
+            };
+            // Output schema is always in original (left, right) order.
+            let mut schema = Vec::with_capacity(lschema0.len() + rschema0.len());
+            schema.extend(lschema0.iter().cloned());
+            schema.extend(rschema0.iter().cloned());
             // Predicate pushdown, inner joins only below nested joins:
             // each side is filtered here only when it is a leaf source
             // (table or derived table), so a conjunct is never pushed at
@@ -7560,7 +7639,12 @@ fn build_source(
             // pair) — correctness is never at risk.
             let mut rows = Vec::new();
             let is_cross = *kind == JoinKind::Cross;
-            let on_pred: Option<&Expr> = if is_cross { None } else { on.as_ref() };
+            let on_pred: Option<&Expr> = if is_cross { None } else { on_expr.as_ref() };
+            // v0.20: RIGHT runs as LEFT (sides swapped); FULL preserves both.
+            let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
+            let preserve_right = matches!(kind, JoinKind::Full);
+            // v0.20: FULL JOIN tracks which right rows matched.
+            let mut matched_right = vec![false; rrows.len()];
             let fast = is_cross || on_pred.map_or(false, |p| join_fast_path(p, &lschema, &rschema));
             // Pre-resolve the ON predicate's column references once: the
             // scope shape is fixed for the whole loop, so per-pair name
@@ -7593,7 +7677,7 @@ fn build_source(
                         row: &l.cells,
                     };
                     let mut matched = false;
-                    for r in &rrows {
+                    for (ri, r) in rrows.iter().enumerate() {
                         let fr = Scope {
                             schema: &rschema,
                             row: &r.cells,
@@ -7605,10 +7689,13 @@ fn build_source(
                         };
                         if keep {
                             matched = true;
+                            if preserve_right {
+                                matched_right[ri] = true;
+                            }
                             rows.push(combine_rows(l, r));
                         }
                     }
-                    if !matched && *kind == JoinKind::Left {
+                    if !matched && preserve_left {
                         rows.push(left_null_row(l, &rschema));
                     }
                 }
@@ -7616,7 +7703,7 @@ fn build_source(
                 // Correlated join (rare): one small scope Vec per pair.
                 for l in &lrows {
                     let mut matched = false;
-                    for r in &rrows {
+                    for (ri, r) in rrows.iter().enumerate() {
                         let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 2);
                         scopes.extend_from_slice(outer);
                         scopes.push(Scope {
@@ -7633,10 +7720,13 @@ fn build_source(
                         };
                         if keep {
                             matched = true;
+                            if preserve_right {
+                                matched_right[ri] = true;
+                            }
                             rows.push(combine_rows(l, r));
                         }
                     }
-                    if !matched && *kind == JoinKind::Left {
+                    if !matched && preserve_left {
                         rows.push(left_null_row(l, &rschema));
                     }
                 }
@@ -7644,7 +7734,7 @@ fn build_source(
                 // Slow path: original combined-frame evaluation.
                 for l in &lrows {
                     let mut matched = false;
-                    for r in &rrows {
+                    for (ri, r) in rrows.iter().enumerate() {
                         let mut cells = Vec::with_capacity(l.cells.len() + r.cells.len());
                         cells.extend(l.cells.iter().cloned());
                         cells.extend(r.cells.iter().cloned());
@@ -7663,15 +7753,41 @@ fn build_source(
                         };
                         if keep {
                             matched = true;
+                            if preserve_right {
+                                matched_right[ri] = true;
+                            }
                             let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
                             prov.extend(l.prov.iter().cloned());
                             prov.extend(r.prov.iter().cloned());
                             rows.push(QRow { cells, prov });
                         }
                     }
-                    if !matched && *kind == JoinKind::Left {
+                    if !matched && preserve_left {
                         rows.push(left_null_row(l, &rschema));
                     }
+                }
+            }
+            // v0.20: FULL JOIN — add right rows that never matched, with
+            // NULLs for the left columns.
+            if preserve_right {
+                for (ri, r) in rrows.iter().enumerate() {
+                    if !matched_right[ri] {
+                        rows.push(right_null_row(&lschema, r));
+                    }
+                }
+            }
+            // v0.20: RIGHT JOIN ran with swapped sides; un-swap the row
+            // cells back to (left, right) order. The schema is already in
+            // original order.
+            if swapped {
+                let llen = lschema0.len();
+                let rlen = rschema0.len();
+                for row in rows.iter_mut() {
+                    let mut new_cells = Vec::with_capacity(llen + rlen);
+                    // Currently: [R..., L...]; want: [L..., R...]
+                    new_cells.extend(row.cells[rlen..].iter().cloned());
+                    new_cells.extend(row.cells[..rlen].iter().cloned());
+                    row.cells = new_cells;
                 }
             }
             Ok((schema, rows))
@@ -12515,7 +12631,7 @@ fn from_schema_item(
     bindings: &[Rc<CteBinding>],
 ) -> Result<(), ExecError> {
     match item {
-        FromItem::Table { name, alias } => {
+        FromItem::Table { name, alias, .. } => {
             // v0.10: materialized CTE bindings (e.g. the recursive CTE
             // currently being evaluated) shadow everything.
             if let Some(b) = bindings.iter().rev().find(|b| b.name == *name) {
