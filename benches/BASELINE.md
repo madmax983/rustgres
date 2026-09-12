@@ -2,6 +2,23 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## v0.20 baseline — 2026-09-12
+
+No full benchmark re-run for v0.20 (same rationale as v0.14–v0.19 for
+non-hot-path milestones): the milestone is the join type cluster (RIGHT /
+FULL / USING / NATURAL parser + executor support, table column aliases),
+with no new workload and no hot-path rewrite. The join executor's three
+paths (fast two-frame, correlated, slow combined-frame) are unchanged in
+shape; RIGHT JOIN reuses the LEFT machinery with swapped sides and FULL
+JOIN adds an unmatched-right emission pass. (For reference, workload19's
+440 queries ran at 16497 qps on the debug binary during v0.19's
+independent verification.)
+
+- **Valgrind**: NOT RUN — valgrind is not installed in this environment
+  and apt could not install it (dpkg lock held by system processes across
+  VM generations). This is recorded, not hand-waved.
+- **Callgrind/DHAT**: not run (no valgrind).
+
 ## v0.19 baseline — 2026-09-12
 
 The v0.19 workload (`benches/workload19.py`: bytea hex/escape/base64 I/O,

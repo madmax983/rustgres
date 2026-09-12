@@ -1,33 +1,57 @@
-# rustgres v0.19 — "conformance burn-down: strings type cluster"
+# rustgres v0.20 — "conformance burn-down: join type cluster"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 19 of the road to Postgres 19 feature parity. v0.19 burns down
-the strings conformance cluster: `bytea` hex I/O (with whitespace
-tolerance), `reverse`/`position`/`encode`/`decode`/`crc32c` for bytea,
-`sha224`/`sha256`/`sha384`/`sha512` (pure-std FIPS 180-4), a pure-std regex
-engine backing `regexp_like`/`regexp_count`/`regexp_instr`/`regexp_substr`/
-`regexp_replace`, `SIMILAR TO`/`NOT SIMILAR TO`, `LIKE...ESCAPE`, `strpos`,
-`translate`, `unistr`, `OVERLAY`, `E'...'`/`U&'...'` literals, adjacent
-literal concatenation, and POSIX `SUBSTRING(s FROM pattern)` — plus a fixed
-`SUBSTRING(s FROM n FOR m)` integer regression.
-Valgrind memcheck/callgrind/DHAT were not run for v0.19: Valgrind is not
+Milestone 20 of the road to Postgres 19 feature parity. v0.20 burns down
+the join conformance cluster: `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN`,
+`JOIN ... USING (cols)`, `NATURAL [LEFT | RIGHT | FULL] JOIN`, table column
+aliases (`FROM tbl AS x (a, b, c)`), and `USING`/`NATURAL` as reserved
+keywords — the join regression tests that died with `42601` syntax errors
+before now parse.
+Valgrind memcheck/callgrind/DHAT were not run for v0.20: Valgrind is not
 installed in this environment and apt could not install it (dpkg lock held
 by system processes across VM generations); this is recorded, not hand-waved.
-Conformance: **2504 PASS (48.2%)**, 1556 EXPECTED-FAIL, 1133 REAL-FAIL over
-5193 pg_regress statements (+119/−119 vs v0.18).
-1542 cumulative protocol tests pass (27 new in v0.19), plus 73 unit tests
-and 53 isolation checks.
+Conformance: **2507 PASS (48.3%)**, 1557 EXPECTED-FAIL, 1129 REAL-FAIL over
+5193 pg_regress statements (+3/−4 vs v0.19; join cluster 118 → 113).
+1542 cumulative protocol tests pass, plus 73 unit tests and 53 isolation
+checks.
 
-**Repair note.** The v0.19 development pass left four defects that
-independent review caught before publication: 10 of the 80 SHA-512 K
-constants were mistyped (sha512 digests were wrong; sha256 was clean),
-the SHA-384 IV had a typo (`85a` instead of `858`), the new regex VM hung
-forever on patterns like `a(b|c)*d` (a backtracking cycle — now bounded by
-a step budget that degrades to "no match" instead of hanging the backend),
-and the version strings were never bumped from 0.18.0. All four are fixed
-in the published tree.
+**Known limitations.** The v0.20 join executor has three rough edges that
+independent review caught: `RIGHT JOIN` with qualified `ON` conditions can
+fail with `42703` (the executor runs RIGHT as a LEFT with the sides
+swapped, which breaks column resolution on the swapped side); `USING`
+keeps both copies of the merged column, so an unqualified reference to a
+using-column can raise ambiguous-column `42702` (Postgres merges them into
+one); table column aliases parse but are not yet fully applied. All three
+are queued for the next join pass — the parser groundwork in v0.20 is what
+unblocks it.
+
+## What v0.19 adds (conformance burn-down: strings type cluster)
+
+- **bytea hex I/O** (whitespace-tolerant), `reverse`/`encode`/`decode`/
+  `crc32c` for bytea, `sha224`/`sha256`/`sha384`/`sha512` (pure-std FIPS
+  180-4), a pure-std regex engine backing `regexp_like`/`regexp_count`/
+  `regexp_instr`/`regexp_substr`/`regexp_replace`, `SIMILAR TO`/
+  `NOT SIMILAR TO`, `LIKE...ESCAPE`, `strpos`, `translate`, `unistr`,
+  `OVERLAY`, `E'...'`/`U&'...'` literals, adjacent literal concatenation,
+  and POSIX `SUBSTRING(s FROM pattern)` — plus a fixed `SUBSTRING(s FROM
+  n FOR m)` integer regression.
+- Valgrind memcheck/callgrind/DHAT were not run for v0.19: Valgrind is not
+  installed in this environment and apt could not install it (dpkg lock held
+  by system processes across VM generations); recorded, not hand-waved.
+- Conformance: **2504 PASS (48.2%)**, 1556 EXPECTED-FAIL, 1133 REAL-FAIL
+  over 5193 pg_regress statements (+119/−119 vs v0.18). 1542 cumulative
+  protocol tests pass (27 new in v0.19), plus 73 unit tests and 53
+  isolation checks.
+- **Repair note.** The v0.19 development pass left four defects that
+  independent review caught before publication: 10 of the 80 SHA-512 K
+  constants were mistyped (sha512 digests were wrong; sha256 was clean),
+  the SHA-384 IV had a typo (`85a` instead of `858`), the new regex VM hung
+  forever on patterns like `a(b|c)*d` (a backtracking cycle — now bounded by
+  a step budget that degrades to "no match" instead of hanging the backend),
+  and the version strings were never bumped from 0.18.0. All four are fixed
+  in the published tree.
 
 ## What v0.18 adds (conformance burn-down: numeric type cluster)
 
