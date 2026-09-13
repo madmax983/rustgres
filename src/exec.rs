@@ -9109,7 +9109,10 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
         (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
-            Ok(Some(exact_numeric(x).cmp(&exact_numeric(y))))
+            Ok(Some(match (exact_as_i64(x), exact_as_i64(y)) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => exact_numeric(x).cmp(&exact_numeric(y)),
+            }))
         }
         (Value::Float4(x), Value::Float4(y)) => Ok(Some((*x as f64).total_cmp(&(*y as f64)))),
         (Value::Float4(x), Value::Float(y)) => Ok(Some((*x as f64).total_cmp(y))),
@@ -13323,6 +13326,21 @@ fn exact_numeric(v: &Value) -> Numeric {
         Value::BigInt(i) => Numeric::new(*i as i128, 0),
         Value::Numeric(n) => n.clone(),
         _ => Numeric::zero(),
+    }
+}
+
+/// The i64 value of an exact numeric, when it is a plain integer type.
+/// SmallInt/Int/BigInt all fit in i64, so same- and mixed-width integer
+/// comparisons reduce to one integer compare instead of NUMERIC
+/// normalization (which needs i128 checked arithmetic). Mirrors
+/// `index::exact_as_i64`, the same fast path already shipped for B-tree
+/// key comparison.
+fn exact_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::SmallInt(i) => Some(*i as i64),
+        Value::Int(i) => Some(*i as i64),
+        Value::BigInt(i) => Some(*i),
+        _ => None,
     }
 }
 
