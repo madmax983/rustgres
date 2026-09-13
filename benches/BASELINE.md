@@ -2,7 +2,110 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
-## Bolt: `send_data_row` payload buffer reused across a result set — baseline — 2026-09-13
+## Bolt: equi-join comparisons skip NUMERIC normalization — baseline — 2026-09-13
+
+**Workload**: `benches/profile_join.py` (new) — a fixed-iteration-count
+driver for `bench.py`'s `join` workload, scaled down for valgrind
+(200 users, 2000 orders, `WHERE u.id < 20` pushed below the join — 20 x
+2000 = 40,000 row-pair evaluations per query) so a callgrind run finishes
+in minutes instead of the tens of minutes the full 2000/20000/200 shape
+would take under valgrind's ~50-80x slowdown. Same query shape, same
+nested-loop-join and GROUP BY/aggregate code paths as the full-size
+workload; `bench.py --workload join` itself was never profiled under
+valgrind before this entry (every prior `BASELINE.md` Bolt entry profiled
+`expr`/`kw_bench`/`profile_scan`'s parsing and row-output paths — this is
+the first look at join/comparison evaluation).
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+**Profile** (Callgrind, `valgrind --tool=callgrind`, this commit — join
+unchanged): 8,998,951,154 total instructions over 100 iterations. Top
+`rustgres::` sites by self cost:
+
+| site | Ir | % of total |
+|---|---|---|
+| `exec::eval_expr` (both monomorphizations combined) | 1,138,740,000 | 12.65% |
+| `exec::build_source` | 496,496,900 | 5.52% |
+| `exec::eval_cmp_vals` | 487,260,000 | 5.41% |
+| `storage::Value::clone` | 408,689,600 | 4.54% |
+| `storage::Numeric::cmp` (incl. its closure) | 984,467,400 | **10.94%** |
+| `exec::exact_numeric` | 227,360,000 | 2.53% |
+| `exec::cmp_ordering` | 227,360,000 | 2.53% |
+| `exec::coerce_text_numeric` | 207,060,000 | 2.30% |
+| `storage::Numeric::new` | 194,880,000 | 2.17% |
+| `i128::checked_mul` (driven by `Numeric::cmp`) | 164,480,000 | 1.83% |
+| `storage::Numeric::normalize` | 153,835,800 | 1.71% |
+| `storage::Numeric::aligned` | 136,724,000 | 1.52% |
+| `i128::unsigned_abs` (driven by `Numeric::cmp`) | 121,770,000 | 1.35% |
+| `NumericSpecial::eq` | 81,200,000 | 0.90% |
+| `exec::is_exact_numeric` | 73,228,500 | 0.81% |
+| `i128::checked_pow` (driven by `Numeric::normalize`) | 41,120,000 | 0.46% |
+
+**Target**: the `Numeric`-normalization chain reached from
+`exec::cmp_ordering`'s exact-numeric arm — `exact_numeric` +
+`Numeric::{cmp,new,normalize,aligned}` + the `i128` checked-arithmetic it
+uses + `NumericSpecial::eq` — sums to **23.40%** of total instructions
+(2,105,837,200 of 8,998,951,154), well above the 5%-of-profile relevance
+bar. (`build_source` and
+`Value::clone`, the row-copy-out-of-`Table` path, are the same
+architectural item already flagged in the two preceding `send_data_row`
+entries — an ownership-model change to `Value`/`Table`, out of scope
+here, not addressed again in this entry's fix.)
+
+**Mechanism**: `bench_u.id`, `bench_o.uid`, and `bench_o.id` are plain
+`INT` columns (`Value::Int(i64)`), never `NUMERIC`. But
+`exec::cmp_ordering` — the comparison primitive behind every `=`/`<`/`>`
+in `eval_cmp_vals` (used by both the join's `ON u.id = o.uid` and the
+pushed-down `WHERE u.id < 20`) — routes *any* pair of "exact numeric"
+values (`SmallInt`/`Int`/`BigInt`/`Numeric`) through
+`exact_numeric(v) -> Numeric` and then `Numeric::cmp`, unconditionally.
+For two plain integers that means building a full arbitrary-precision
+decimal (`Numeric::new`, which normalizes/aligns scale) on *both* sides
+of *every* comparison, then comparing via `Numeric::cmp`'s scale-aligned
+`i128` arithmetic (`checked_mul`, `checked_pow`, `unsigned_abs`) — for a
+comparison that is just one native integer compare once the `Numeric`
+wrapping is skipped.
+
+This exact bug was already found and fixed once in this codebase: v0.8's
+`index_key_cmp` (`src/index.rs`) got an `exact_as_i64` fast path for
+B-tree key comparison, with a comment explaining precisely this
+(`SmallInt`/`Int`/`BigInt` all fit in `i64`, so same/mixed-width integer
+comparisons reduce to one integer compare instead of NUMERIC
+normalization). That fix was never applied to `exec::cmp_ordering`, the
+general-purpose comparison path used by `WHERE`/`JOIN ON`/every other
+expression-level comparison — so every non-index integer comparison in
+the whole query engine has been paying the NUMERIC tax since v0.7.
+
+**Baseline numbers** (this commit, `cmp_ordering` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 100 iterations x 40,000-pair join) | 8,998,951,154 |
+| Ir in the `Numeric`-normalization chain (see table above) | 2,105,837,200 (23.40%) |
+
+**Fix** (next commit): give `exec::cmp_ordering`'s exact-numeric arm the
+same `exact_as_i64` fast path `index_key_cmp` already has — when both
+operands are plain `SmallInt`/`Int`/`BigInt`, compare as `i64` directly;
+fall back to the existing `Numeric::cmp` path only when either side is
+an actual `Value::Numeric`. `NUMERIC`-involving comparisons (including
+mixed int/`NUMERIC`) are untouched and keep their exact current
+semantics and results.
 
 **Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged) —
 loads a 10,000-row 3-column table (`bench_scan(id INT, name TEXT, active
