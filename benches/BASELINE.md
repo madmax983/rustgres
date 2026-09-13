@@ -107,6 +107,78 @@ an actual `Value::Numeric`. `NUMERIC`-involving comparisons (including
 mixed int/`NUMERIC`) are untouched and keep their exact current
 semantics and results.
 
+**After numbers** (same harness, same workload, same iteration count,
+same machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (100 iterations x 40,000-pair join) | 8,998,951,154 | 6,922,891,660 | **-23.07%** |
+
+More than 4x the >=5% instruction-count floor. `Numeric::cmp`,
+`Numeric::new`, `Numeric::normalize`, `Numeric::aligned`,
+`i128::checked_mul/checked_pow/unsigned_abs`, and `NumericSpecial::eq`
+all disappear from the post-fix Callgrind top-consumers list for this
+workload entirely; the new `exec::exact_as_i64` costs 170,520,000 Ir
+(2.46%) in their place. Reproduced with a second callgrind run on the
+same binary (6,922,947,380, a 0.0008% difference — within this harness's
+established determinism band).
+
+**Correctness**: all 81 `cargo test --all-features` unit tests pass
+unchanged. All 19 `tests/protocol_test*.py` conformance suites pass
+unchanged (the 15 self-managed suites run standalone; the four that
+expect an already-running server — `protocol_test.py`, `2`, `3`, `19` —
+run together against one shared instance) — no test expectations
+touched, since the fast path is exact (`SmallInt`/`Int`/`BigInt` all fit
+in `i64` with no precision loss versus `Numeric::new(v as i128, 0)`, and
+`NUMERIC`-involving comparisons still fall back to the unchanged
+`Numeric::cmp` path). `cargo fmt --all -- --check` clean. `cargo clippy
+--all-targets --all-features` reports the same 235 pre-existing warnings
+before and after (verified via `git stash`/`git stash pop`) — zero new
+warnings from this diff, and the same pre-existing `eq_op` compile error
+at `src/exec.rs:13794` (`cols[1 - 1]`, unrelated to this change) on both
+the pristine tree and this diff.
+
+**Remaining hotspot** (not addressed here, same architectural item
+flagged in the two preceding `send_data_row` entries): `build_source`
+and `<Value as Clone>::clone` — the row-copy-out-of-`Table` path — are
+unaffected by this fix and still need an ownership-model decision on
+`Value`/`Table` to address further.
+
+**Also not addressed here**: `exec::compare_values` (ORDER BY sorting)
+has the exact same `is_exact_numeric`/`exact_numeric` duplication as
+`cmp_ordering` did, but this workload's `ORDER BY u.name` is a text sort
+and never exercises its numeric arm (0.01% of Ir here) — no measured
+justification to touch it in this pass. Likely worth the same fast path
+in a future session profiling a numeric `ORDER BY`/`GROUP BY` workload
+(e.g. `idxscan`'s `ORDER BY id LIMIT 10`).
+
+**Fix applied**: `exec::exact_as_i64(v: &Value) -> Option<i64>` (new,
+mirroring `index::exact_as_i64`) extracts the native `i64` from
+`SmallInt`/`Int`/`BigInt`; `Value::Numeric` returns `None`.
+`cmp_ordering`'s exact-numeric arm tries `exact_as_i64` on both operands
+first and compares as `i64` directly when both succeed; when either side
+is an actual `NUMERIC` value, it falls back to the previous
+`exact_numeric(...).cmp(...)` path, byte-for-byte unchanged. No other
+call site changes; `exact_numeric` itself is untouched and still used by
+the float-mixed comparison arms and the fallback.
+
+**Reproduce**:
+
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before number.
+
 **Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged) —
 loads a 10,000-row 3-column table (`bench_scan(id INT, name TEXT, active
 BOOL)`) once, then sends an exact, fixed count of 30 `SELECT * FROM
