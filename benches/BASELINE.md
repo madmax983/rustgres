@@ -108,12 +108,88 @@ only when either side is an actual `Value::Numeric`. `NUMERIC`-involving
 comparisons (including mixed int/`NUMERIC`) are untouched and keep their
 exact current semantics and results.
 
-**Correctness** (this baseline commit; no source change yet): all 87
-`cargo test --all-features` unit tests pass. `cargo fmt --all -- --check`
-is clean. `cargo clippy --all-targets --all-features` reports the same
-pre-existing `clippy::eq_op` compile error at `exec.rs` (`cols[1 - 1]`,
-unrelated to this entry) and 244 pre-existing warnings on the bin target,
-matching prior entries in this file.
+**Fix applied**: as described above — `compare_values`'s exact-numeric arm
+tries `exact_as_i64` on both operands first and compares as `i64`
+directly when both succeed; when either side is an actual `NUMERIC`
+value, it falls back to the previous `exact_numeric(...).cmp(...)` path,
+byte-for-byte unchanged. No other call site changes.
+
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (30 iterations × 20,000-row sort) | 20,814,946,756 | 11,254,710,504 | **-45.93%** |
+
+More than 9x the ≥5% instruction-count floor. Reproduced with a second
+callgrind run on the same (fixed) binary: 11,254,402,574 (a 307,930-
+instruction, ~0.0027% difference — within this harness's established
+determinism band). The entire `Numeric`-normalization chain — `Numeric::
+cmp`, `Numeric::new`, `Numeric::normalize`, `Numeric::aligned`, the `i128`
+checked-arithmetic it drove, and `NumericSpecial::eq` — disappears from
+the post-fix Callgrind top-consumers list for this workload entirely; the
+new `exec::exact_as_i64` costs 379,971,900 Ir (3.38% of the smaller
+post-fix total) in their place. `compare_values` itself grows in
+*proportion* of the total (7.64% vs. 3.48% before) purely because the
+total shrank so much, not because the function got heavier in absolute
+terms (859,460,250 vs. 723,756,000 Ir — a small, expected increase from
+the added `exact_as_i64`/match dispatch on the common integer path,
+dwarfed by what it replaces).
+
+**Correctness**: all 87 `cargo test --all-features` unit tests pass
+unchanged. `cargo fmt --all -- --check` is clean. `cargo clippy
+--all-targets --all-features` reports the same pre-existing `eq_op`
+compile error and the same 244 bin-target warnings (252 total warning
+lines) as the pristine tree — zero new warnings from this diff.
+
+Conformance (`tests/protocol_test*.py`, run individually against a fresh
+server per README's documented procedure): every ORDER BY-relevant and
+otherwise deterministic suite passes unchanged versus the pristine
+binary — `protocol_test.py`/`2`/`3`/`4`/`6`/`7`/`8`/`9`/`10`/`14`/`16`/
+`17`/`18`/`19`/`21` all fully green, including `protocol_test7.py`'s and
+`protocol_test8.py`'s own `ORDER BY`/index-scan-ordering checks. Two
+suites needed extra scrutiny and both turned out to be pre-existing,
+unrelated to this change:
+
+- `protocol_test5.py` fails identically — the *same* 43-passed/42-failed
+  split, byte-for-byte identical output — on the pristine pre-fix binary
+  and on the fixed binary (diffed directly). Its failures start well
+  before its `ORDER BY` section (`update tag`, `delete effect`, a
+  SAVEPOINT/MVCC group), so this is a pre-existing bug in this branch's
+  `main`, not something this diff touches or worsens; out of scope for a
+  Bolt performance pass.
+- `protocol_test11.py`, `protocol_test12.py`, `protocol_test13.py`
+  (roles/ACLs, concurrency/soak, replication — all timing-sensitive under
+  load) show *different* failure sets across repeated runs on the
+  *pristine* binary alone (e.g. `protocol_test11.py` scored 118/0, then
+  112/1 failing `t_sequence_privs`, on two consecutive pristine runs with
+  no code change between them) — confirmed flaky on this shared-vCPU
+  machine independent of this change, the same phenomenon already
+  documented for `protocol_test12.py` in the "rows are shared, not
+  copied" entry below.
+
+No behavior change for any comparison this fix's fast path applies to:
+`exact_as_i64` is exact for `SmallInt`/`Int`/`BigInt` (no precision loss
+versus `Numeric::new(v as i128, 0)`), and any comparison involving an
+actual `NUMERIC` value still falls back to the unchanged
+`exact_numeric(...).cmp(...)` path.
+
+**Reproduce**:
+
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features   # 87 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_orderby.py --rows 20000 --count 30
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before number.
 
 ## Bolt: WHERE/GROUP BY/aggregate scope chain skips heap allocation for non-correlated queries — baseline — 2026-09-13
 

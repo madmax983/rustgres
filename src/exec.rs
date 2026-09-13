@@ -13642,7 +13642,10 @@ fn compare_values(
             });
         }
         (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
-            exact_numeric(x).cmp(&exact_numeric(y))
+            match (exact_as_i64(x), exact_as_i64(y)) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => exact_numeric(x).cmp(&exact_numeric(y)),
+            }
         }
         (Value::Float4(x), Value::Float4(y)) => (*x as f64).total_cmp(&(*y as f64)),
         (Value::Float4(x), Value::Float(y)) => (*x as f64).total_cmp(y),
