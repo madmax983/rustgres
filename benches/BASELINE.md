@@ -82,6 +82,76 @@ callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
 # 900,000-block entry's stack ends at protocol.rs:199 / server.rs:3009).
 ```
 
+**Fix** (next commit): `MsgBuilder` gains a `with_capacity(typ, cap)`
+constructor (payload `Vec::with_capacity(cap)` instead of `Vec::new()`).
+`send_data_row` uses it with a fixed 64-byte reservation — comfortably
+above the ~27–30 bytes an ordinary short row needs here, chosen as a small
+constant rather than computed per-row (a first attempt precomputed the
+*exact* capacity by collecting every column's `to_text()` result into a
+`Vec<Option<String>>` up front, summing its lengths, then building the
+payload from that; it cleared the allocation-count floor by an even wider
+margin (-22.95%) but *increased* Ir by +7.5% — the extra `Vec<Option<String>>`
+allocation plus three full passes over the row, versus the original's one,
+cost more instructions than the eliminated reallocations saved. Recording
+this here so nobody re-introduces that shape expecting a bigger win: it
+measured worse on the primary counter. The fixed-capacity version has no
+such extra pass or allocation — same field-by-field write loop as before,
+just a bigger initial reservation). Behavior is unchanged: the wire bytes
+written are byte-for-byte identical (same `i16`/`i32`/`bytes` calls, same
+order), just fewer growth reallocations of the same buffer. Same behavior
+for every input (all 81 unit tests, all 19 `tests/protocol_test*.py`
+conformance suites pass unchanged; no test expectations touched).
+
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (30 iterations) | 3,918,050,469 | 3,725,659,427 | **-4.91%** |
+| DHAT total allocations (blocks) | 2,614,698 | 2,014,698 | **-22.95%** |
+| DHAT total bytes allocated | 222,288,431 | 224,688,431 | +1.08% |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+3,725,691,851 (a 32,424-instruction, ~0.00087% difference from the first —
+within this harness's established determinism band).
+
+The allocation-count floor (≥10%) clears with more than 2x margin. The Ir
+delta (-4.91%) is reported honestly as *not* clearing the ≥5% instruction
+floor on its own — it is close, and reproducibly so across two runs on both
+binaries, but the floor is a floor. As with the `tokenize` fix earlier in
+this file, this change is justified on the allocation-count floor, which it
+clears decisively. The small total-bytes increase (+1.08%) comes from the
+fixed 64-byte reservation being modestly larger than the ~27-30 bytes an
+ordinary row here actually needs — an intentional, small, one-time
+over-reservation traded for eliminating per-row regrowth, not a leak (no
+change in peak/live heap shape; every `MsgBuilder` is short-lived and freed
+after `send`).
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tb`/`tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**: same
+pre-existing failure mode as every other Bolt entry in this file — this
+session's toolchain reports 242 repo-wide lint errors unrelated to this
+change (matching the count recorded in the most recent prior entry).
+`cargo clippy --all-targets --all-features` (without `-D warnings`) shows
+the same 242 warnings before and after this diff (verified via `git
+stash`/`git stash pop` on the pristine pre-fix tree) — zero new warnings
+from this change.
+
 ## Bolt: `tokenize` — unsized buffer growth + two-pass identifier folding — baseline — 2026-09-13
 
 **Workload**: same harness, query, and rationale as the three entries below —
