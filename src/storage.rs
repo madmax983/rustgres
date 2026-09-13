@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::fxhash::FxBuildHasher;
 use crate::index::{Index, IndexDef, IndexKey};
 use crate::sql::{CheckDef, DefaultExpr, FkDef, TableDef, UniqueDef};
 
@@ -1569,23 +1570,31 @@ impl Table {
 /// second committer with 40001.
 #[derive(Clone, Debug)]
 pub struct Database {
-    pub tables: HashMap<String, Vec<Table>>,
+    /// Keyed by table name — a short, trusted identifier (whoever is
+    /// connected to this server chose it), looked up several times per
+    /// query (`find_table`). Hashed with `FxHasher` instead of the
+    /// default `SipHash`: SipHash's flooding resistance is wasted on a
+    /// key that isn't attacker-controlled input from an untrusted
+    /// boundary, and its fixed per-call mixing cost showed up at 6.75%
+    /// of Callgrind `Ir` on an ordinary query (see `benches/BASELINE.md`,
+    /// "catalog HashMap hasher"). Same rationale for the five maps below.
+    pub tables: HashMap<String, Vec<Table>, FxBuildHasher>,
     /// Secondary indexes by index name (v0.8). DDL is transactional: each
     /// definition carries creator/deleter xids, and entries for
     /// uncommitted row versions are filtered by visibility at scan time.
-    pub indexes: HashMap<String, Index>,
+    pub indexes: HashMap<String, Index, FxBuildHasher>,
     /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
     /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
-    pub stats: HashMap<String, TableStats>,
+    pub stats: HashMap<String, TableStats, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
-    pub views: HashMap<String, Vec<ViewDef>>,
+    pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
     /// Sequences by name (v0.9). DDL is transactional; the sequence
     /// *value* (`current`) advances non-transactionally, like PostgreSQL.
-    pub sequences: HashMap<String, Vec<Sequence>>,
+    pub sequences: HashMap<String, Vec<Sequence>, FxBuildHasher>,
     /// Roles by name (v0.11). Versioned like tables so CREATE / DROP /
     /// ALTER ROLE are transactional under MVCC.
-    pub roles: HashMap<String, Vec<Role>>,
+    pub roles: HashMap<String, Vec<Role>, FxBuildHasher>,
     /// v0.11: database-level GRANT entries (CONNECT). Empty = default
     /// allow, matching a fresh PostgreSQL install's PUBLIC grant.
     pub db_acl: Vec<AclEntry>,
@@ -1683,12 +1692,12 @@ impl Sequence {
 impl Database {
     pub fn new() -> Self {
         let mut db = Database {
-            tables: HashMap::new(),
-            indexes: HashMap::new(),
-            stats: HashMap::new(),
-            views: HashMap::new(),
-            sequences: HashMap::new(),
-            roles: HashMap::new(),
+            tables: HashMap::default(),
+            indexes: HashMap::default(),
+            stats: HashMap::default(),
+            views: HashMap::default(),
+            sequences: HashMap::default(),
+            roles: HashMap::default(),
             db_acl: Vec::new(),
         };
         // v0.11: the bootstrap superuser always exists.

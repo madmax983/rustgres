@@ -65,6 +65,61 @@ callgrind_annotate --auto=no /tmp/cg.out > /tmp/flat.txt
 grep -E "hash/sip\.rs|hash/mod\.rs.*Hasher|intrinsics/mod\.rs:core::intrinsics::rotate_left" /tmp/flat.txt
 ```
 
+**Fix** (next commit): the six `Database` catalog maps (`tables`,
+`indexes`, `stats`, `views`, `sequences`, `roles`) switch from the
+default `RandomState`/`SipHash13` to a small `FxHasher` (public-domain
+FxHash: rotate-xor-multiply, the same algorithm as the `rustc-hash`
+crate, reimplemented in `src/fxhash.rs` in ~70 lines rather than adding
+a dependency — no `unsafe`, no new crate). No call sites change:
+`HashMap::new()` → `HashMap::default()` at the one construction site
+(`Database::new`) is the only other edit. All 81 tests pass unchanged;
+no test expectations touched.
+
+**After numbers** (same harness, same query, same iteration count,
+same machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 543,682,768 | 509,173,826 | **-6.35%** |
+
+Reproduced with a second `after` run on the same binary: 509,173,639 (a
+187-instruction, ~0.00004% difference from the first — Callgrind's
+normal run-to-run determinism band, not noise threatening the result).
+
+The instruction-count floor (≥5%) is cleared. `SipHash` cost doesn't
+disappear entirely — other `HashMap`/`HashSet`s elsewhere in the
+codebase (GROUP BY, joins, MVCC snapshot sets, session state) are
+untouched by this change and still pay it — but the catalog-lookup
+share of it is gone: post-fix, `sip.rs` + `rotate_left` together are
+down to ~1.7% of `Ir` (was 6.75%), and the new `FxHasher` code
+(`src/fxhash.rs`) accounts for well under 1%.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**:
+same pre-existing failure mode as the `eat_keyword` entry below (this
+environment's clippy reports repo-wide lint errors unrelated to any
+Bolt change). Verified directly: `cargo clippy --all-targets
+--all-features` (without `-D warnings`) reports the exact same 245
+warnings on the pristine pre-fix tree and on this fix — zero new
+warnings from this diff, confirmed by `git stash`/`git stash pop`
+around the clippy run.
+
 ## Bolt: `Parser::eat_keyword` allocation — baseline — 2026-09-12
 
 Every version of this file back to v0.7 has recorded the same finding under
