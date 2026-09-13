@@ -2,6 +2,93 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `send_data_row` payload buffer reused across a result set — baseline — 2026-09-13
+
+**Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged) —
+loads a 10,000-row 3-column table (`bench_scan(id INT, name TEXT, active
+BOOL)`) once, then sends an exact, fixed count of 30 `SELECT * FROM
+bench_scan` queries over the real wire protocol. Same harness as the two
+immediately preceding `send_data_row` entries, run again on top of both
+fixes (already merged, PR #5 and #6) to find the next hotspot on the same
+universal row-output path.
+
+**Profile** (DHAT, `valgrind --tool=dhat`, same harness, this commit — i.e.
+with both prior `send_data_row` fixes already applied):
+
+Total: 1,114,707 allocations, 216,330,355 bytes. Grouping each allocation
+by the innermost `rustgres::` frame in its call stack, the top sites:
+
+| site | blocks | % of total | bytes |
+|---|---|---|---|
+| `<Value as Clone>::clone` (storage.rs:1241, the `Text(String)` arm's heap clone) — reached from `build_source`'s row-copy-out-of-storage, not this workload's target | 350,000 | 31.40% | 2,761,150 |
+| `Vec<Value>` buffer alloc for that same row clone (`with_capacity_in`) | 340,000 | 30.50% | 48,960,000 |
+| `MsgBuilder::with_capacity` payload alloc, one per row (protocol.rs:200, `send_data_row`, server.rs:3012) | **300,000** | **26.91%** | 19,200,000 |
+| SQL tokenizer/parser sites (various, `tokenize`/`Token::clone`/`parse_insert`) | ≤10,184 each | ≤0.91% each | — |
+
+**Target**: `MsgBuilder::with_capacity` in `send_data_row` — 300,000 blocks,
+26.91% of all allocations in the workload, well above the 5%-of-profile
+relevance bar. (The two larger sites above it, `Value::clone` and its
+`Vec<Value>` buffer — together 61.9% of blocks — are the row-copy-out-of-
+`Table` path flagged as a candidate in the immediately preceding entry's
+PR body. Fixing that would mean sharing table storage instead of deep-
+cloning it into query-local rows, an ownership-model change to the `Value`/
+`Table` types and out of scope for a same-behavior, no-new-dependency Bolt
+pass — noted again below as future work for a human decision.)
+
+**Mechanism**: every result row goes through `send_data_row` (server.rs,
+`for row in &rows { send_data_row(stream, row)?; }` at each of `Select`,
+`Explain`, and `Dml`-with-`RETURNING` in `run_statement`'s dispatch, plus
+the extended-protocol `Execute` handler's portal row loop). Each call
+allocates its own fresh `MsgBuilder::with_capacity(b'D', 64)` — a brand-new
+`Vec<u8>` — even though nothing about the message format requires a new
+allocation per row: the buffer is written, sent, and dropped every single
+time, immediately followed by an identically-shaped allocation for the
+next row of the same result set. Reusing one buffer across the whole
+per-statement row loop (clearing it, not deallocating it, between rows)
+turns the growth-and-free cycle from once per row into once per *result
+set* (a handful of growth steps at most, since consecutive rows are
+similar sizes) — without changing the wire bytes, the per-row API used by
+the one-off callers in `repl.rs`, or any data-structure ownership.
+
+**Baseline numbers** (this commit, `send_data_row` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 30 iterations × 10,000-row scan) | 3,311,865,575 |
+| DHAT total allocations (blocks) | 1,114,707 |
+| DHAT total bytes allocated | 216,330,355 |
+| DHAT blocks from `MsgBuilder::with_capacity` via `send_data_row` | 300,000 (26.91% of all allocations) |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+
+# separately, under --tool=dhat --dhat-out-file=/tmp/dh.out with the same
+# harness: sum tbk over pps[] in the JSON output, resolving each
+# allocation's call stack via fs[]-indices into ftbl[] to find the
+# innermost rustgres:: frame (the 300,000-block entry above ends at
+# protocol.rs:200, called from server.rs:3012 (`send_data_row`)).
+```
+
+**Fix** (next commit): add `MsgBuilder::from_payload`, a constructor that
+takes an existing (empty) `Vec<u8>` instead of always allocating a fresh
+one, plus `send_data_row_buf(stream, row, buf: &mut Vec<u8>)`, a sibling to
+`send_data_row` that builds into a caller-supplied scratch buffer and hands
+its (cleared) allocation back afterward. The three hot loops in
+`server.rs` (`Select`/`Explain`/`Dml` row output, plus the portal
+`Execute` handler) declare one `Vec::new()` before their `for row in
+&rows` loop and call `send_data_row_buf` instead of `send_data_row`. The
+existing `send_data_row` and its one-off callers in `repl.rs` (single-row
+replication-command replies) are untouched.
+
 ## Bolt: `send_data_row` per-column text materialization — baseline — 2026-09-13
 
 **Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged from
