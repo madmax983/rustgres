@@ -1271,6 +1271,50 @@ impl Value {
         }
     }
 
+    /// Same encoding as `to_text`, but written straight into `out` instead
+    /// of returned as an owned `String`. Returns `false` for NULL (nothing
+    /// written) or `true` otherwise. Used by `send_data_row`'s per-row wire
+    /// encoding, the hottest caller of the text format: for `Text` this
+    /// avoids `to_text`'s `String::clone()` entirely (the bytes already
+    /// live in `s`), and for the integer/bool arms it skips materializing
+    /// an intermediate `String` just to copy its bytes and drop it. The
+    /// less common variants fall back to `to_text()` — they are not on
+    /// this hot path and formatting them (NUMERIC, dates, bytea, UUID)
+    /// already goes through non-trivial `String`-returning helpers.
+    pub fn write_text_into(&self, out: &mut Vec<u8>) -> bool {
+        use std::io::Write;
+        match self {
+            Value::SmallInt(i) => {
+                let _ = write!(out, "{i}");
+                true
+            }
+            Value::Int(i) => {
+                let _ = write!(out, "{i}");
+                true
+            }
+            Value::BigInt(i) => {
+                let _ = write!(out, "{i}");
+                true
+            }
+            Value::Text(s) => {
+                out.extend_from_slice(s.as_bytes());
+                true
+            }
+            Value::Bool(b) => {
+                out.push(if *b { b't' } else { b'f' });
+                true
+            }
+            Value::Null => false,
+            other => match other.to_text() {
+                Some(s) => {
+                    out.extend_from_slice(s.as_bytes());
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::SmallInt(_) => "smallint",
