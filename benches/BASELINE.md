@@ -79,6 +79,58 @@ behavior (all 81 unit/integration tests plus all 21 protocol conformance
 suites pass unchanged; no test expectations touched), and every keyword or
 punctuation lookahead that used to clone now doesn't.
 
+**After numbers** (same harness, same query, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 509,202,550 | 476,361,041 | **-6.45%** |
+| DHAT total allocations (blocks) | 340,815 | 261,297 | **-23.34%** |
+| DHAT total bytes allocated | 18,450,076 | 18,178,541 | -1.47% |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+476,362,196 (a 1,155-instruction, ~0.0002% difference from the first —
+Callgrind's normal run-to-run determinism band, same as the prior two
+entries, not noise threatening the result).
+
+Both the instruction-count floor (≥5%) and the allocation-count floor
+(≥10%) are cleared, the latter by more than 2x. The byte-count delta is
+small (-1.47%) because most of the removed allocations are short
+keyword/identifier strings (a handful of bytes each) rather than large
+buffers — DHAT's own accounting bears this out (297 KB total across
+87,016 `Token::clone` calls at `sql.rs:70`, ~3.4 bytes/call average) — so
+this fix is an allocation-*count* and instruction-count win, not
+principally a bytes-freed win; it is reported on both counters rather than
+cherry-picked to the more favorable one.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tb`/`tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**:
+same pre-existing failure mode as the two entries below (this
+environment's clippy reports repo-wide lint errors unrelated to any Bolt
+change). Verified directly: `cargo clippy --all-targets --all-features`
+(without `-D warnings`) reports the exact same 245 warnings on the
+pristine pre-fix tree and on this fix — zero new warnings from this diff,
+confirmed by `git stash`/`git stash pop` around the clippy run.
+
 ## Bolt: catalog `HashMap` hasher — baseline — 2026-09-13
 
 **Workload**: same harness and query as the `eat_keyword` entry below —

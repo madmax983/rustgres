@@ -2197,22 +2197,22 @@ struct Parser {
 }
 
 impl Parser {
-    fn peek(&self) -> Token {
-        self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF)
+    fn peek(&self) -> &Token {
+        self.tokens.get(self.pos).unwrap_or(&Token::EOF)
     }
 
     /// Token after the next one (for `qual.*` / `NOT IN` lookahead).
-    fn peek2(&self) -> Token {
-        self.tokens.get(self.pos + 1).cloned().unwrap_or(Token::EOF)
+    fn peek2(&self) -> &Token {
+        self.tokens.get(self.pos + 1).unwrap_or(&Token::EOF)
     }
 
     /// Third token (for `qual.*` vs `qual.col` disambiguation).
-    fn peek3(&self) -> Token {
-        self.tokens.get(self.pos + 2).cloned().unwrap_or(Token::EOF)
+    fn peek3(&self) -> &Token {
+        self.tokens.get(self.pos + 2).unwrap_or(&Token::EOF)
     }
 
     fn next(&mut self) -> Token {
-        let t = self.peek();
+        let t = self.peek().clone();
         if self.pos < self.tokens.len() {
             self.pos += 1;
         }
@@ -2384,9 +2384,9 @@ impl Parser {
             }
             // --- v0.9: ALTER TABLE / ALTER SEQUENCE
             "alter" => match self.peek() {
-                Token::Ident(ref s) if s == "table" => self.parse_alter(),
-                Token::Ident(ref s) if s == "sequence" => self.parse_alter_sequence(),
-                Token::Ident(ref s) if s == "role" || s == "user" || s == "group" => {
+                Token::Ident(s) if s == "table" => self.parse_alter(),
+                Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
+                Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
                 _ => Err(err(
@@ -2463,7 +2463,7 @@ impl Parser {
             }
             "numeric" | "decimal" => {
                 // Optional (p[, s]); parsed and ignored.
-                if self.peek() == Token::LParen {
+                if *self.peek() == Token::LParen {
                     self.next();
                     match self.next() {
                         Token::Number(_) => {}
@@ -2474,7 +2474,7 @@ impl Parser {
                             )));
                         }
                     }
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         match self.next() {
                             Token::Number(_) => {}
@@ -2517,7 +2517,7 @@ impl Parser {
     /// ignoring the values (v0.14: character-type typmods are parsed but
     /// not enforced).
     fn eat_optional_typmod(&mut self) {
-        if self.peek() != Token::LParen {
+        if *self.peek() != Token::LParen {
             return;
         }
         self.next(); // '('
@@ -2570,8 +2570,7 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Stmt, SqlError> {
         // v0.11: CREATE ROLE / USER / GROUP
-        if matches!(self.peek(), Token::Ident(ref s) if s == "role" || s == "user" || s == "group")
-        {
+        if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_create_role();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
@@ -2584,7 +2583,7 @@ impl Parser {
             } else {
                 false
             };
-            let name = if matches!(self.peek(), Token::Ident(ref s) if s == "on") {
+            let name = if matches!(self.peek(), Token::Ident(s) if s == "on") {
                 // v0.14: the index name may be omitted
                 // (`CREATE INDEX ON t (a, b)`); PostgreSQL auto-names it
                 // <table>_<columns>_idx. Filled in after parsing columns.
@@ -2629,7 +2628,7 @@ impl Parser {
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
         // tokenizing so the raw query text survives).
-        if matches!(self.peek(), Token::Ident(ref s) if s == "sequence") {
+        if matches!(self.peek(), Token::Ident(s) if s == "sequence") {
             return self.parse_create_sequence();
         }
         // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
@@ -2672,7 +2671,7 @@ impl Parser {
     /// True when the next tokens start a table-level constraint rather
     /// than a column definition.
     fn is_table_constraint_start(&mut self) -> bool {
-        matches!(self.peek(), Token::Ident(ref s)
+        matches!(self.peek(), Token::Ident(s)
             if s == "constraint" || s == "primary" || s == "unique"
                 || s == "check" || s == "foreign")
     }
@@ -2792,7 +2791,7 @@ impl Parser {
     fn parse_fk_tail(&mut self) -> Result<ParsedFkTail, SqlError> {
         let ref_table = self.expect_ident()?;
         let mut ref_cols = Vec::new();
-        if self.peek() == Token::LParen {
+        if *self.peek() == Token::LParen {
             ref_cols = self.parse_col_name_list()?;
         }
         let mut on_delete = FkAction::Restrict;
@@ -3189,7 +3188,7 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
         let table = self.expect_ident()?;
-        let columns = if self.peek() == Token::LParen {
+        let columns = if *self.peek() == Token::LParen {
             self.next();
             let mut cols = Vec::new();
             loop {
@@ -3233,7 +3232,7 @@ impl Parser {
                     }
                 }
                 rows.push(row);
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -3264,11 +3263,12 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            if self.peek() == Token::Star {
+            if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
             } else if let Token::Ident(q) = self.peek() {
-                if self.peek2() == Token::Dot && self.peek3() == Token::Star {
+                let q = q.clone();
+                if *self.peek2() == Token::Dot && *self.peek3() == Token::Star {
                     self.next();
                     self.next();
                     self.next();
@@ -3283,7 +3283,7 @@ impl Parser {
                 let alias = self.parse_alias_opt()?;
                 items.push(SelectItem::Expr { expr, alias });
             }
-            if self.peek() == Token::Comma {
+            if *self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
@@ -3305,12 +3305,12 @@ impl Parser {
         let arbiter = if self.eat_keyword("on") {
             self.expect_keyword("constraint")?;
             ConflictArbiter::Constraint(self.expect_ident()?)
-        } else if self.peek() == Token::LParen {
+        } else if *self.peek() == Token::LParen {
             self.next();
             let mut cols = Vec::new();
             loop {
                 cols.push(self.expect_ident()?);
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -3346,7 +3346,7 @@ impl Parser {
                     self.expect(Token::Eq, "'='")?;
                     let expr = self.parse_or()?;
                     sets.push((col, expr));
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         continue;
                     }
@@ -3386,12 +3386,12 @@ impl Parser {
         let mut ctes = Vec::new();
         loop {
             let name = self.expect_ident()?;
-            let col_aliases = if self.peek() == Token::LParen {
+            let col_aliases = if *self.peek() == Token::LParen {
                 self.next();
                 let mut aliases = Vec::new();
                 loop {
                     aliases.push(self.expect_ident()?);
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         continue;
                     }
@@ -3415,7 +3415,7 @@ impl Parser {
                 body,
                 recursive,
             });
-            if self.peek() == Token::Comma {
+            if *self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
@@ -3533,12 +3533,12 @@ impl Parser {
     /// v0.10: `COPY table [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`.
     fn parse_copy(&mut self) -> Result<Stmt, SqlError> {
         let table = self.expect_ident()?;
-        let columns = if self.peek() == Token::LParen {
+        let columns = if *self.peek() == Token::LParen {
             self.next();
             let mut cols = Vec::new();
             loop {
                 cols.push(self.expect_ident()?);
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -3636,7 +3636,7 @@ impl Parser {
                         )));
                     }
                 }
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -3708,7 +3708,8 @@ impl Parser {
         // coercion applies the target type's input function, matching
         // PostgreSQL assignment semantics (including 22P02 on bad input).
         if let Token::Ident(name) = self.peek() {
-            if Self::is_type_start(&name) {
+            if Self::is_type_start(name) {
+                let name = name.clone();
                 let save = self.pos;
                 self.next(); // consume the type name
                 if self.parse_type_name_rest(name).is_ok() {
@@ -3721,11 +3722,12 @@ impl Parser {
         }
         let value = match self.peek() {
             Token::Param(n) => {
+                let n = *n;
                 self.next();
                 InsertValue::Param(n)
             }
             Token::Minus | Token::Plus => {
-                let neg = self.peek() == Token::Minus;
+                let neg = *self.peek() == Token::Minus;
                 self.next();
                 let lit = self.parse_literal()?;
                 InsertValue::Lit(match (neg, lit) {
@@ -3748,7 +3750,7 @@ impl Parser {
         // is validated; the literal itself flows through normal column
         // assignment coercion (the casts in the conformance tests are
         // no-ops for their target columns).
-        if self.peek() == Token::ColonColon {
+        if *self.peek() == Token::ColonColon {
             self.next();
             let _ = self.parse_type_name()?;
         }
@@ -3888,7 +3890,7 @@ impl Parser {
                 });
             }
             let mut items = vec![self.parse_or()?];
-            while self.peek() == Token::Comma {
+            while *self.peek() == Token::Comma {
                 self.next();
                 items.push(self.parse_or()?);
             }
@@ -3983,7 +3985,7 @@ impl Parser {
     /// concat := add (`||` add)*
     fn parse_concat(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_add()?;
-        while self.peek() == Token::PipePipe {
+        while *self.peek() == Token::PipePipe {
             self.next();
             let right = self.parse_add()?;
             left = Expr::Concat(Box::new(left), Box::new(right));
@@ -4037,7 +4039,7 @@ impl Parser {
     /// so `-2^2` is `(-2)^2`.
     fn parse_pow(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_cast()?;
-        while self.peek() == Token::Caret {
+        while *self.peek() == Token::Caret {
             self.next();
             let right = self.parse_cast()?;
             left = Expr::Arith {
@@ -4052,7 +4054,7 @@ impl Parser {
     /// cast := unary (`::` type)*
     fn parse_cast(&mut self) -> Result<Expr, SqlError> {
         let mut expr = self.parse_unary()?;
-        while self.peek() == Token::ColonColon {
+        while *self.peek() == Token::ColonColon {
             self.next();
             let to = self.parse_type_name()?;
             // Fold `decimal-literal::numeric` to an exact Numeric literal
@@ -4143,6 +4145,7 @@ impl Parser {
                 }
             }
             Token::Param(n) => {
+                let n = *n;
                 self.next();
                 Ok(Expr::Param(n))
             }
@@ -4168,14 +4171,14 @@ impl Parser {
                 }
                 Ok(Expr::Literal(lit))
             }
-            Token::Ident(ref s) if s == "true" || s == "false" || s == "null" => {
+            Token::Ident(s) if s == "true" || s == "false" || s == "null" => {
                 Ok(Expr::Literal(self.parse_literal()?))
             }
             Token::Ident(_) => {
                 let name = self.expect_ident()?;
                 // `EXISTS (SELECT ...)` — only when followed by `(` so a
                 // column actually named "exists" still works elsewhere.
-                if name == "exists" && self.peek() == Token::LParen {
+                if name == "exists" && *self.peek() == Token::LParen {
                     self.next();
                     let sub = self.parse_subquery()?;
                     self.expect(Token::RParen, "')'")?;
@@ -4185,7 +4188,7 @@ impl Parser {
                     });
                 }
                 // `CAST(x AS type)` — special form, not a function call.
-                if name == "cast" && self.peek() == Token::LParen {
+                if name == "cast" && *self.peek() == Token::LParen {
                     self.next();
                     let expr = self.parse_or()?;
                     self.expect_keyword("as")?;
@@ -4203,6 +4206,7 @@ impl Parser {
                     let save = self.pos;
                     if let Ok(to) = self.parse_type_name_rest(name.clone()) {
                         if let Token::Str(s) = self.peek() {
+                            let s = s.clone();
                             self.next();
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s))),
@@ -4213,7 +4217,7 @@ impl Parser {
                     self.pos = save;
                 }
                 // Aggregate / built-in function call `name(...)`?
-                if self.peek() == Token::LParen {
+                if *self.peek() == Token::LParen {
                     return self.parse_call(name);
                 }
                 // `current_date` / `current_timestamp` without parens.
@@ -4224,7 +4228,7 @@ impl Parser {
                     });
                 }
                 // Qualified ref `table.column`?
-                if self.peek() == Token::Dot {
+                if *self.peek() == Token::Dot {
                     self.next();
                     let col = self.expect_ident()?;
                     return Ok(Expr::Column {
@@ -4254,10 +4258,10 @@ impl Parser {
         if Self::is_type_start(&name) {
             let save = self.pos;
             if let Ok(to) = self.parse_type_name_rest(name.clone()) {
-                if self.peek() == Token::LParen {
+                if *self.peek() == Token::LParen {
                     self.next();
                     if let Ok(expr) = self.parse_or() {
-                        if self.peek() == Token::RParen {
+                        if *self.peek() == Token::RParen {
                             self.next();
                             return Ok(Expr::Cast {
                                 expr: Box::new(expr),
@@ -4289,10 +4293,10 @@ impl Parser {
         if let Some(func) = agg {
             self.expect(Token::LParen, "'('")?;
             let distinct = self.eat_keyword("distinct");
-            if distinct && matches!(func, AggFunc::Count) && self.peek() == Token::Star {
+            if distinct && matches!(func, AggFunc::Count) && *self.peek() == Token::Star {
                 return Err(err("syntax error: DISTINCT is not allowed with count(*)"));
             }
-            let arg = if matches!(func, AggFunc::Count) && self.peek() == Token::Star {
+            let arg = if matches!(func, AggFunc::Count) && *self.peek() == Token::Star {
                 self.next();
                 None
             } else {
@@ -4336,13 +4340,13 @@ impl Parser {
         // Any `name(` is a function call. Unknown names and wrong
         // arities are 42883 (raised here for builtins, in exec for the
         // rest) — like Postgres.
-        if self.peek() == Token::LParen {
+        if *self.peek() == Token::LParen {
             self.next();
             let mut args = Vec::new();
-            if self.peek() != Token::RParen {
+            if *self.peek() != Token::RParen {
                 loop {
                     args.push(self.parse_or()?);
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         continue;
                     }
@@ -4403,7 +4407,7 @@ impl Parser {
             self.expect_keyword("by")?;
             loop {
                 partition_by.push(self.parse_or()?);
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -4440,7 +4444,7 @@ impl Parser {
                     desc,
                     nulls_first,
                 });
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -4561,7 +4565,7 @@ impl Parser {
     fn parse_trim(&mut self) -> Result<Expr, SqlError> {
         self.expect(Token::LParen, "'('")?;
         let mut spec = "both".to_string();
-        if matches!(self.peek(), Token::Ident(ref s) if s == "leading" || s == "trailing" || s == "both")
+        if matches!(self.peek(), Token::Ident(s) if s == "leading" || s == "trailing" || s == "both")
         {
             if let Token::Ident(s) = self.next() {
                 spec = s;
@@ -4638,7 +4642,7 @@ impl Parser {
             let r = self.parse_or()?;
             self.expect(Token::Comma, "','")?;
             let st = self.parse_or()?;
-            let ln = if self.peek() == Token::Comma {
+            let ln = if *self.peek() == Token::Comma {
                 self.next();
                 Some(self.parse_or()?)
             } else {
@@ -4716,7 +4720,7 @@ impl Parser {
         self.expect(Token::Comma, "','")?;
         let start = self.parse_or()?;
         let mut args = vec![s, start];
-        if self.peek() == Token::Comma {
+        if *self.peek() == Token::Comma {
             self.next();
             args.push(self.parse_or()?);
         }
@@ -4734,7 +4738,8 @@ impl Parser {
             return Ok(Some(self.expect_ident()?));
         }
         match self.peek() {
-            Token::Ident(s) if !is_reserved(&s) => {
+            Token::Ident(s) if !is_reserved(s) => {
+                let s = s.clone();
                 self.next();
                 Ok(Some(s))
             }
@@ -4796,7 +4801,7 @@ impl Parser {
                 break;
             }
             // Modes are comma-separated; a missing comma ends the list.
-            if self.peek() == Token::Comma {
+            if *self.peek() == Token::Comma {
                 self.next();
             } else {
                 break;
@@ -4833,7 +4838,7 @@ impl Parser {
         let name = self.expect_ident()?;
         if self.eat_keyword("to") {
             // consumed TO
-        } else if self.peek() == Token::Eq {
+        } else if *self.peek() == Token::Eq {
             self.next();
         } else {
             return Err(err(format!(
@@ -4903,6 +4908,7 @@ impl Parser {
                 self.expect(Token::Eq, "'='")?;
                 let rhs = match self.peek() {
                     Token::Param(n) => {
+                        let n = *n;
                         self.next();
                         WhereRhs::Param(n)
                     }
@@ -4927,7 +4933,7 @@ impl Parser {
             self.expect(Token::Eq, "'='")?;
             let expr = self.parse_or()?;
             sets.push((col, expr));
-            if self.peek() == Token::Comma {
+            if *self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
@@ -4966,7 +4972,7 @@ impl Parser {
         //   [ RESTART IDENTITY | CONTINUE IDENTITY ] [ CASCADE | RESTRICT ]
         let _ = self.eat_keyword("table");
         let mut tables = vec![self.expect_ident()?];
-        while self.peek() == Token::Comma {
+        while *self.peek() == Token::Comma {
             self.next();
             tables.push(self.expect_ident()?);
         }
@@ -5026,7 +5032,7 @@ impl Parser {
 
     /// An optional `-` followed by an integer literal, for FETCH counts.
     fn parse_fetch_count(&mut self) -> Result<i64, SqlError> {
-        let neg = self.peek() == Token::Minus && {
+        let neg = *self.peek() == Token::Minus && {
             self.next();
             true
         };
@@ -5047,7 +5053,7 @@ impl Parser {
     fn try_parse_fetch_count(&mut self) -> Option<i64> {
         // Peek for [Minus] Number without consuming on mismatch.
         let save = self.pos;
-        if self.peek() == Token::Minus {
+        if *self.peek() == Token::Minus {
             self.next();
         }
         let is_num = matches!(self.peek(), Token::Number(_));
@@ -5168,13 +5174,14 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             // `*`
-            if self.peek() == Token::Star {
+            if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
             } else if let Token::Ident(q) = self.peek() {
+                let q = q.clone();
                 // `qual.*` — but only when a `*` really follows the dot;
                 // `qual.col` is a normal expression.
-                if self.peek2() == Token::Dot && self.peek3() == Token::Star {
+                if *self.peek2() == Token::Dot && *self.peek3() == Token::Star {
                     self.next(); // qual
                     self.next(); // dot
                     self.next(); // star
@@ -5189,7 +5196,7 @@ impl Parser {
                 let alias = self.parse_alias_opt()?;
                 items.push(SelectItem::Expr { expr, alias });
             }
-            if self.peek() == Token::Comma {
+            if *self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
@@ -5213,7 +5220,7 @@ impl Parser {
             let mut groups = Vec::new();
             loop {
                 groups.push(self.parse_or()?);
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -5260,7 +5267,7 @@ impl Parser {
                     desc,
                     nulls_first,
                 });
-                if self.peek() == Token::Comma {
+                if *self.peek() == Token::Comma {
                     self.next();
                     continue;
                 }
@@ -5333,7 +5340,7 @@ impl Parser {
     /// bind tighter than commas.
     fn parse_from(&mut self) -> Result<Vec<FromItem>, SqlError> {
         let mut items = vec![self.parse_join_chain()?];
-        while self.peek() == Token::Comma {
+        while *self.peek() == Token::Comma {
             self.next();
             items.push(self.parse_join_chain()?);
         }
@@ -5394,7 +5401,7 @@ impl Parser {
                         let mut cols = Vec::new();
                         loop {
                             cols.push(self.expect_ident()?);
-                            if self.peek() == Token::Comma {
+                            if *self.peek() == Token::Comma {
                                 self.next();
                                 continue;
                             }
@@ -5421,19 +5428,19 @@ impl Parser {
     }
 
     fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
-        if self.peek() == Token::LParen {
+        if *self.peek() == Token::LParen {
             self.next();
             // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
             // Only consume an extra '(' when it opens a subquery or VALUES —
             // never a VALUES row tuple like (1, 2).
             let mut extra = 0;
-            while self.peek() == Token::LParen
-                && matches!(self.peek2(), Token::Ident(ref s) if s == "select" || s == "values")
+            while *self.peek() == Token::LParen
+                && matches!(self.peek2(), Token::Ident(s) if s == "select" || s == "values")
             {
                 self.next();
                 extra += 1;
             }
-            let mut item = if matches!(self.peek(), Token::Ident(ref s) if s == "values") {
+            let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
                 self.next();
                 let mut rows: Vec<Vec<Expr>> = Vec::new();
                 loop {
@@ -5453,7 +5460,7 @@ impl Parser {
                         }
                     }
                     rows.push(row);
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                     } else {
                         break;
@@ -5482,12 +5489,12 @@ impl Parser {
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
             // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
             let alias = self.parse_derived_alias()?;
-            let col_aliases = if self.peek() == Token::LParen {
+            let col_aliases = if *self.peek() == Token::LParen {
                 self.next();
                 let mut cols = Vec::new();
                 loop {
                     cols.push(self.expect_ident()?);
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         continue;
                     }
@@ -5517,7 +5524,7 @@ impl Parser {
             let name = self.expect_ident()?;
             // v0.9: schema-qualified names, so the information_schema
             // catalog views are reachable (`FROM information_schema.tables`).
-            let name = if self.peek() == Token::Dot {
+            let name = if *self.peek() == Token::Dot {
                 self.next();
                 format!("{}.{}", name, self.expect_ident()?)
             } else {
@@ -5525,12 +5532,12 @@ impl Parser {
             };
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
-            let col_aliases = if self.peek() == Token::LParen {
+            let col_aliases = if *self.peek() == Token::LParen {
                 self.next();
                 let mut cols = Vec::new();
                 loop {
                     cols.push(self.expect_ident()?);
-                    if self.peek() == Token::Comma {
+                    if *self.peek() == Token::Comma {
                         self.next();
                         continue;
                     }
@@ -5556,7 +5563,8 @@ impl Parser {
             return self.expect_ident();
         }
         match self.peek() {
-            Token::Ident(s) if !is_reserved(&s) => {
+            Token::Ident(s) if !is_reserved(s) => {
+                let s = s.clone();
                 self.next();
                 Ok(s)
             }
@@ -5574,8 +5582,7 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
         // v0.11: DROP ROLE / USER / GROUP
-        if matches!(self.peek(), Token::Ident(ref s) if s == "role" || s == "user" || s == "group")
-        {
+        if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_drop_role();
         }
         if self.eat_keyword("index") {
