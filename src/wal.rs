@@ -1070,6 +1070,17 @@ impl<'a> Dec<'a> {
             .map_err(|_| self.err("invalid utf-8 in string"))
     }
 
+    /// Read a string straight into an `Arc<str>`. This copies the bytes
+    /// one time. `str()` then `Value::text()` copies them two times.
+    fn str_arc(&mut self) -> Result<std::sync::Arc<str>, String> {
+        let n = self.u32()? as usize;
+        let b = self.take(n)?;
+        match std::str::from_utf8(b) {
+            Ok(s) => Ok(s.into()),
+            Err(_) => Err(self.err("invalid utf-8 in string")),
+        }
+    }
+
     fn col_type(&mut self) -> Result<ColType, String> {
         match self.u8()? {
             0 => Ok(ColType::Int),
@@ -1094,7 +1105,7 @@ impl<'a> Dec<'a> {
             0 => Ok(Value::Null),
             1 => Ok(Value::Int(self.i64()?)),
             2 => Ok(Value::Float(self.f64()?)),
-            3 => Ok(Value::text(self.str()?)),
+            3 => Ok(Value::Text(self.str_arc()?)),
             4 => Ok(Value::Bool(self.u8()? != 0)),
             5 => Ok(Value::SmallInt(self.i16()?)),
             6 => Ok(Value::BigInt(self.i64()?)),

@@ -48,8 +48,6 @@ use crate::server::{
     Session, Writer, lock_engine, lock_wal, send_data_row, send_error, send_ready,
     send_row_description,
 };
-#[cfg(test)]
-use crate::storage::Row;
 use crate::storage::{ColType, Engine, ReplSlot, Value};
 use crate::wal::{Wal, WalRecord};
 
@@ -938,7 +936,7 @@ pub fn check_replication_role(engine: &Arc<Mutex<Engine>>, role: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Table;
+    use crate::storage::{Row, Table};
     use crate::wal::{WalRecord, WalRow};
 
     fn engine_with_t() -> Engine {

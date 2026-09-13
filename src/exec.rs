@@ -1050,7 +1050,7 @@ fn plan_fk_cascade(
                         check_row_lock(eng, &child_table, cid, own)?;
                         if let Some(nk) = &new_key {
                             // ON UPDATE CASCADE: move the child key.
-                            let mut nv = cvalues.as_ref().clone();
+                            let mut nv = cvalues.to_vec();
                             for (&ci, kv) in child_pos.iter().zip(nk.iter()) {
                                 nv[ci] = kv.clone();
                             }
@@ -1126,7 +1126,7 @@ fn plan_fk_cascade(
                     FkAction::SetNull | FkAction::SetDefault => {
                         check_write_conflict(eng, cxmax, level)?;
                         check_row_lock(eng, &child_table, cid, own)?;
-                        let mut nv = cvalues.as_ref().clone();
+                        let mut nv = cvalues.to_vec();
                         for &ci in &child_pos {
                             nv[ci] = match act {
                                 FkAction::SetNull => Value::Null,
@@ -1306,7 +1306,7 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
         },
         // Unknown-type text literal: through the type's input function
         // (so INSERT INTO d VALUES ('2026-01-01') works for dates).
-        Literal::Text(s) => eval_cast(&Value::text(s.as_str()), *col_type).map_err(|e| {
+        Literal::Text(s) => eval_cast(&Value::text(s.clone()), *col_type).map_err(|e| {
             if e.code == "42846" {
                 assign_err(col_name, col_type, lit.type_name())
             } else {
@@ -2048,7 +2048,7 @@ fn exec_insert(
                             continue;
                         }
                     }
-                    let mut new_values = target_values.as_ref().clone();
+                    let mut new_values = target_values.to_vec();
                     for ((_, expr), &ci) in sets.iter().zip(plan.set_cols.iter()) {
                         let v = eval_dml_expr(
                             eng,
@@ -2250,7 +2250,7 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
             Ok(n) => Ok(a == &n),
             Err(_) => Ok(false),
         },
-        (Value::Text(a), Literal::Text(b)) => Ok(&**a == b.as_str()),
+        (Value::Text(a), Literal::Text(b)) => Ok(a == b),
         (Value::Bool(a), Literal::Bool(b)) => Ok(a == b),
         _ => Err(exec_err(
             "42883",
@@ -2423,7 +2423,7 @@ fn exec_update(
             // Only rows we actually write conflict with FOR UPDATE locks —
             // merely scanning a locked row is fine, like Postgres.
             check_row_lock(eng, table, *id, ctx.own)?;
-            let mut new_values = values.as_ref().clone();
+            let mut new_values = values.to_vec();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
                 let v = eval_update_expr(
                     eng,
@@ -5207,9 +5207,10 @@ fn eval_recursive_cte(
             }
         }
         for cells in other.rows {
+            let cells = cells.into_cells();
             let mut coerced = Vec::with_capacity(cells.len());
-            for (v, ty) in cells.iter().zip(seed_types.iter()) {
-                coerced.push(coerce_value(v.clone(), ty, &cte.name)?);
+            for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
+                coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             if all {
                 binding.rows.push(QRow {
@@ -5269,9 +5270,10 @@ fn eval_recursive_cte(
         for cells in delta.rows {
             // Coerce the recursive term's cells to the seed's column
             // types (like UNION's type resolution, simplified).
+            let cells = cells.into_cells();
             let mut coerced = Vec::with_capacity(cells.len());
-            for (v, ty) in cells.iter().zip(seed_types.iter()) {
-                coerced.push(coerce_value(v.clone(), ty, &cte.name)?);
+            for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
+                coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             let row = QRow {
                 cells: Row::new(coerced),
@@ -5806,7 +5808,7 @@ pub fn copy_from_rows(
         .map(|row| {
             row.into_iter()
                 .map(|f| match f {
-                    CopyField::Text(s) => InsertValue::Lit(Literal::Text(s)),
+                    CopyField::Text(s) => InsertValue::Lit(Literal::Text(s.into())),
                     CopyField::Null => InsertValue::Lit(Literal::Null),
                 })
                 .collect()
@@ -7182,7 +7184,7 @@ fn combine_rows(l: &QRow, r: &QRow) -> QRow {
 
 /// LEFT JOIN null-extension for an unmatched left row.
 fn left_null_row(l: &QRow, rschema: &[QCol]) -> QRow {
-    let mut cells = l.cells.as_ref().clone();
+    let mut cells = l.cells.to_vec();
     cells.extend(rschema.iter().map(|_| Value::Null));
     QRow {
         cells: Row::new(cells),
@@ -8764,7 +8766,7 @@ fn apply_order(
                     // Fall back to the full pre-projection row.
                     let frame = Scope {
                         schema,
-                        row: o.full.as_deref().map_or(&[][..], Vec::as_slice),
+                        row: o.full.as_deref().unwrap_or(&[]),
                     };
                     let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                     scopes.extend_from_slice(outer);
@@ -9381,7 +9383,7 @@ fn coerce_text_numeric(a: &Value, b: &Value) -> Result<(Value, Value), ExecError
     };
     match coerced {
         Some((s, t, text_first)) => {
-            let parsed = eval_cast(&Value::Text(s.clone()), t)?;
+            let parsed = eval_cast(&Value::text(s.clone()), t)?;
             Ok(if text_first {
                 (parsed, b.clone())
             } else {
@@ -10031,11 +10033,63 @@ fn cast_to_bool(v: &Value) -> Result<bool, ExecError> {
 
 /// Text rendering for casts and `||`: like the wire format, except
 /// booleans render as `true`/`false` (Postgres cast output).
+/// Text format of one value for a SQL cast, as an owned `String`. Hot
+/// paths use `text_value_of` instead, which does not make a `String`.
 fn value_to_text_cast(v: &Value) -> String {
+    let mut out = String::new();
+    write_text_cast(v, &mut out);
+    out
+}
+
+/// Largest scratch buffer to keep. One very long text must not hold
+/// memory for the life of the connection thread.
+const TEXT_CAST_BUF_MAX: usize = 64 * 1024;
+
+thread_local! {
+    /// Scratch buffer for text casts. It keeps its capacity between
+    /// calls, so a cast that runs for each row allocates only the
+    /// `Arc<str>`.
+    static TEXT_CAST_BUF: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Write one value in its text format into `out`. `Bool` writes
+/// `true`/`false`, like a SQL cast; the wire format writes `t`/`f`.
+fn write_text_cast(v: &Value, out: &mut String) {
+    use std::fmt::Write;
     match v {
-        Value::Bool(b) => b.to_string(),
-        other => other.to_text().unwrap_or_default(),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::SmallInt(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Int(i) | Value::BigInt(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Text(t) => out.push_str(t),
+        other => {
+            if let Some(t) = other.to_text() {
+                out.push_str(&t);
+            }
+        }
     }
+}
+
+/// Build a `Value::Text` from the text format of every value in `parts`.
+/// The scratch buffer keeps one allocation per call, not one per part.
+/// `write_text_cast` never calls this function, so the borrow is safe.
+fn text_value_of(parts: &[&Value]) -> Value {
+    TEXT_CAST_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        for v in parts {
+            write_text_cast(v, &mut buf);
+        }
+        let out = Value::text(buf.as_str());
+        if buf.capacity() > TEXT_CAST_BUF_MAX {
+            *buf = String::new();
+        }
+        out
+    })
 }
 
 fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
@@ -10046,7 +10100,7 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         return Ok(v.clone());
     }
     match to {
-        ColType::Text => Ok(Value::text(value_to_text_cast(v))),
+        ColType::Text => Ok(text_value_of(&[v])),
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
             let i = cast_to_int(v)?;
@@ -10151,11 +10205,7 @@ fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
             r.extend_from_slice(y);
             Ok(Value::Bytea(r))
         }
-        _ => {
-            let mut s = value_to_text_cast(a);
-            s.push_str(&value_to_text_cast(b));
-            Ok(Value::text(s))
-        }
+        _ => Ok(text_value_of(&[a, b])),
     }
 }
 
@@ -14889,7 +14939,7 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         Some(Value::Float4(f)) => Literal::Real(*f),
         Some(Value::Float(f)) => Literal::Float(*f),
         Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
-        Some(Value::Text(s)) => Literal::Text(s.to_string()),
+        Some(Value::Text(s)) => Literal::Text(s.clone()),
         Some(Value::Bool(b)) => Literal::Bool(*b),
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
@@ -15096,8 +15146,8 @@ mod tests {
         }
     }
 
-    /// Issue #8: a sequential scan must hand out the stored row, not a
-    /// copy of it. The copy was 36.8% of the allocations in a table scan.
+    /// A sequential scan must return the stored row. It must not return
+    /// a copy. See issue #8.
     #[test]
     fn seq_scan_shares_table_row_storage() {
         let mut eng = engine();
@@ -15114,7 +15164,32 @@ mod tests {
         );
     }
 
-    /// The text bytes inside a scanned row must come from the table too.
+    /// An index scan must share the stored row, like a sequential scan.
+    #[test]
+    fn index_scan_shares_table_row_storage() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE INDEX users_id_ix ON users(id)").unwrap();
+        let plan = rows_of(run(&mut eng, "EXPLAIN SELECT * FROM users WHERE id = 2").unwrap());
+        let plan = plan.concat().join(" ");
+        assert!(
+            plan.contains("Index"),
+            "query must plan an index scan: {}",
+            plan
+        );
+        let stored = eng.db.tables["users"][0].rows[1].values.as_ptr();
+        let out = run(&mut eng, "SELECT * FROM users WHERE id = 2").unwrap();
+        let ExecResult::Select { rows, .. } = out else {
+            panic!("SELECT returns rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].as_ptr(),
+            stored,
+            "an index scan must share the stored row"
+        );
+    }
+
+    /// A scanned row must share the text bytes of the table row.
     #[test]
     fn seq_scan_shares_table_text_bytes() {
         let mut eng = engine();
@@ -15132,8 +15207,8 @@ mod tests {
         }
     }
 
-    /// Shared rows stay snapshots: a later UPDATE must not change rows a
-    /// previous SELECT returned.
+    /// A shared row does not change. An UPDATE must not change the rows
+    /// that an earlier SELECT returned.
     #[test]
     fn shared_rows_are_immutable_snapshots() {
         let mut eng = engine();
@@ -17646,7 +17721,7 @@ fn alter_drop_column(
     // indexes stay valid.
     let mut new_rows = Vec::with_capacity(old_rows.len());
     for (old_id, values) in old_rows {
-        let mut values = values.as_ref().clone();
+        let mut values = values.to_vec();
         if values.len() > ci {
             values.remove(ci);
         }

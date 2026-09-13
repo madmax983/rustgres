@@ -9,15 +9,31 @@ deep-clone at `exec.rs:7426`, which was 73.63% of the allocations in a
 table scan. Both directions the issue named are taken:
 
 1. `Value::Text` holds `Arc<str>` instead of `String`, so a text clone
-   shares the bytes.
-2. `Row` (`Arc<Vec<Value>>`) replaces `Vec<Value>` for row cells, from
-   `RowVersion` through `QRow`, `OutRow`, `SelectOut` and `ExecResult` to
-   the wire, so a scan hands out the stored row instead of a copy.
+   shares the bytes. `Literal::Text` holds `Arc<str>` for the same
+   reason: a text literal in a query then costs no copy for each row.
+2. `Row` replaces `Vec<Value>` for row cells, from `RowVersion` through
+   `QRow`, `OutRow`, `SelectOut` and `ExecResult` to the wire, so a scan
+   gives out the stored row and does not copy it.
 
-Sharing is safe because rows never change in place: an MVCC write builds
-a new `Vec` and pushes a new `RowVersion`. `Arc` gives no `&mut` access
-to a shared row, so the compiler holds that rule. `Rc` is not usable —
-`Engine` lives in an `Arc<Mutex<Engine>>` and `Value` must stay `Send`.
+`Row` is a newtype around a private `Arc<Vec<Value>>`, not a type alias.
+The private field is what makes the safety rule hold: no code outside
+`storage.rs` can reach `Arc::get_mut` or `Arc::make_mut`, so no code can
+write to a row that it shares, and no code can make a silent deep copy.
+Rows never change in place anyway — an MVCC write builds a new `Vec` and
+adds a new `RowVersion` — but the compiler now holds that rule instead of
+a convention.
+
+`Arc<Vec<Value>>` and not `Arc<[Value]>`: an `Arc<[Value]>` is one heap
+block for each stored row instead of two, but its handle is 16 bytes
+instead of 8. A `Row` goes into large `Vec<QRow>` and `Vec<OutRow>`
+buffers, one entry for each row of a scan, so the larger handle costs
+more than the second block saves. Measured on the scan workload below:
+`Arc<[Value]>` gives the same block count and **adds 15 MB** (85,382,315
+-> 100,077,547 bytes). `Row::default` returns one shared empty row,
+because `Arc::default` allocates for each call.
+
+`Rc` is not usable: `Engine` lives in an `Arc<Mutex<Engine>>`, so `Value`
+must stay `Send`.
 
 **Workload**: `benches/profile_scan.py --rows 10000 --count 30` — the
 same harness and command the issue used.
@@ -39,36 +55,83 @@ python3 benches/profile_scan.py --rows 10000 --count 30
 | change | **-83.46%** | **-56.69%** |
 
 The two `exec.rs:7426` entries — 300,000 blocks for the `Vec<Value>` copy
-and 300,000 for the `String` copies inside it — are gone. No scan site
-remains in the profile; what is left is the one-time 10,000-row load
-(`parse_insert`, `tokenize`, `exec_insert`) plus one `Vec<QRow>` per
-query.
+and 300,000 for the `String` copies inside it — no longer allocate. The
+expression `r.values.clone()` is still there, but it is a count increase
+now, so no scan site is left in the profile. What remains is the
+one-time 10,000-row load (`parse_insert`, `tokenize`, `exec_insert`) plus
+one `Vec<QRow>` for each query.
 
-**Guard workload**: `benches/profile_join.py --count 100`, to catch the
-one risk of the change — projections and joins now build a `Row` where
-they used to build a bare `Vec`.
+The byte win has two causes, not one: 45.6 MB is the removed row copy,
+and the rest is `QRow` and `OutRow` becoming smaller (a `Row` handle is
+8 bytes where a `Vec<Value>` was 24), which shrinks the large per-scan
+buffers.
+
+**Instructions** (Callgrind, the issue's second command, same 30
+iterations):
+
+| | Ir |
+|---|---|
+| before | 3,241,442,943 |
+| after | 2,518,120,790 |
+| change | **-22.31%** |
+
+The before number agrees with the issue's 3,241,697,777 to 0.01%. The
+issue said the `Ir` bulk was "generic allocator/copy overhead — i.e. the
+same root cause as the DHAT finding, not a separate target". That holds:
+no `Ir` work was done, and the allocation fix moved `Ir` by itself.
+
+**Guard workloads.** Two risks come with this change, and each has a
+measurement.
+
+*Risk 1 — joins and projections now build a `Row` where they built a bare
+`Vec`.* `benches/profile_join.py --count 100`:
 
 | | blocks | bytes |
 |---|---|---|
-| before | 578,399 | 87,621,660 |
-| after | 308,699 | 45,834,288 |
-| change | **-46.63%** | **-47.69%** |
+| before | 578,400 | 87,621,664 |
+| after | 306,701 | 45,754,332 |
+| change | **-46.98%** | **-47.78%** |
 
-`combine_rows` adds 20,000 `Arc::new` blocks, far below the 240,000 it
-removes at `build_source`.
+*Risk 2 — `String` -> `Arc<str>` copies, so a path that builds text costs
+one more allocation.* The scan and join workloads never build text, so
+they do not see this. `benches/profile_expr.py` (new) does: an int-only
+table, 2000 rows, 20 queries, five text results for each row.
 
-**Behavior**: unchanged. 86 `cargo test` unit tests pass (81 before, plus
-5 new ownership tests). All 19 `tests/protocol_test*.py` suites pass —
-the self-managed suites standalone, the four that expect a running server
-(`protocol_test.py`, `2`, `3`, `19`) against one shared instance. The
-conformance runner scores identically to `main`: 5193 statements, PASS
-2605 (50.2%), EXPECTED-FAIL 1557, REAL-FAIL 1031.
+```bash
+python3 benches/profile_expr.py --count 20 --mode lit
+python3 benches/profile_expr.py --count 20 --mode cast
+```
 
-**Note on `cargo clippy --all-targets --all-features`**: same pre-existing
-failure as every Bolt entry below — `clippy::eq_op` on `cols[1 - 1]`
-(`exec.rs:13816`), untouched by this change. Warning count drops from 240
-on `main` to 237 here; no new warnings. `cargo fmt --all -- --check` is
-clean.
+| workload | before | after | change |
+|---|---|---|---|
+| 5 text literals for each row | 388,473 blocks | 182,553 | **-53.01%** |
+| 5 `::text` casts for each row | 389,493 blocks | 383,475 | **-1.55%** |
+
+The first is a win because `Literal::Text` is refcounted. The second
+needed `text_value_of`, which formats through a scratch buffer that keeps
+its capacity, so a cast allocates only the `Arc<str>`. Without those two
+fixes both workloads regressed by about 50%.
+
+**Behavior**: unchanged. 87 `cargo test` unit tests pass (81 before, plus
+6 new ownership tests). All 19 `tests/protocol_test*.py` suites pass —
+the 15 self-managed suites standalone, the four that expect a running
+server (`protocol_test.py`, `2`, `3`, `19`) against one shared instance.
+The conformance runner scores the same as `main`: 5193 statements, PASS
+2605 (50.2%), EXPECTED-FAIL 1557, REAL-FAIL 1031. The WAL byte format
+does not change.
+
+**Note on `cargo clippy --all-targets --all-features`**: same
+pre-existing failure as every Bolt entry below — `clippy::eq_op` on
+`cols[1 - 1]` (`exec.rs:13816`), which this change does not touch. The
+warning count goes down from 240 on `main`; no new warnings.
+`cargo fmt --all -- --check` is clean.
+
+**Known follow-ups, not in this change**: `project_row` and `exec_agg`
+build their output cells with `Vec::new()` and no capacity hint, which
+costs two growth reallocations for each output row on both `main` and
+this branch. Catalog scans build the same short literal (`"public"`,
+`"rustgres"`) for each row; a clone is now free, so these can be hoisted
+out of the loop.
 
 ## Bolt: equi-join comparisons skip NUMERIC normalization — baseline — 2026-09-13
 
