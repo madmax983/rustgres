@@ -1,3 +1,61 @@
+# rustgres v0.22 — "conformance burn-down: the five float8 stragglers"
+
+A from-scratch PostgreSQL-compatible database server written in pure Rust —
+**zero external crates**, so it builds offline with plain `cargo build`.
+
+Milestone 22 of the road to Postgres 19 feature parity. v0.22 closes all
+five remaining float8 REAL-FAILs and lands the four features they were
+blocked on:
+
+- **Full UPDATE/DELETE predicates.** `WHERE` on UPDATE/DELETE is now a
+  complete expression (`AND`/`OR`, comparisons, qualified target refs,
+  parameters, subqueries) instead of equality-only.
+- **Session-local TEMP tables.** `CREATE TEMP TABLE` shadows a same-named
+  permanent table for the session; dropping the TEMP reveals the permanent
+  one; disconnect discards the session's TEMP map. TEMP DDL/DML is excluded
+  from WAL/checkpoints. `CREATE INDEX` / `ALTER TABLE` on TEMP return
+  `0A000` (unsupported, honestly).
+- **Signed-scale Numeric.** `Numeric.scale` is now `i32`; negative scales
+  carry huge powers of ten on a bounded `i128` mantissa, so `1e200` parses,
+  computes, and prints exactly. Float text output switches to normalized
+  scientific notation instead of emitting hundreds of digits. `trunc` is
+  overloaded: exact for numeric input, floating for float input.
+- **Bounded CREATE TYPE / DROP TYPE.** Bare `CREATE TYPE name;` makes a
+  shell; parenthesized completion keeps `LIKE = base` (other attributes
+  parse but are ignored); unknown base → `42704`, duplicate shell →
+  `42710`. No UDT columns, casts, I/O functions, enums, composites, or
+  dependency tracking — deliberately bounded.
+
+float8 cluster: **166 PASS / 0 REAL-FAIL** (16 EXPECTED-FAIL, 2 SKIP), up
+from 158/5. numeric: 771 PASS, 241 REAL-FAIL (down 10 from 251). Full
+conformance: **2622 PASS (50.5%)**, 1556 EXPECTED-FAIL, 1015 REAL-FAIL over
+5193 pg_regress statements (+17/−16 vs v0.21). All protocol suites green
+(`protocol_test21.py` grew 53 → 94 checks), 81 unit tests, 53 isolation
+checks. `benches/workload21.py`: ~7500–10600 qps warmed, consistent with
+v0.21's ~9445.
+
+**Recovery performance fix (real v0.22 regression, caught by
+`protocol_test12`'s soak-recovery check).** v0.22's working UPDATE/DELETE
+predicates made the soak generate real row-level WAL; crash recovery then
+replayed each UPDATE/DELETE with a *linear scan* per row, turning replay
+quadratic — 8.5 MB of WAL took **53 s** to replay (the test allows 5 s).
+`apply_record` now resolves rows through the table's existing `row_index`
+(O(1)): the same WAL replays in **~1 s**. 65/65 on protocol_test12.
+
+**Profiling.** Valgrind 3.22.0 (local build): Memcheck still cannot start —
+the stripped `ld-linux-x86-64.so.2` lacks the `strlen` symbol Memcheck needs
+for mandatory function redirection (same as v0.21, recorded not hand-waved).
+Callgrind and DHAT *do* run: a Callgrind profile of the float8 workload
+shows no single hotspot above ~5% — SQL tokenizing/parsing dominates on
+tiny queries, as expected for a query engine at this stage.
+
+**Known limitations (v0.22).** `CREATE TYPE` registrations are not
+WAL-logged or checkpointed — they vanish on restart. Numeric division is
+still bounded to ~10 fractional digits (PostgreSQL's 80-digit division
+checks remain REAL-FAIL). TEMP constraint checks compare `Value`s directly
+while same-statement checks use `IndexKey` (NaN semantics audit pending).
+`CASCADE`/`RESTRICT` on DROP TYPE parse but do nothing.
+
 # rustgres v0.21 — "conformance burn-down: float8 cluster"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —

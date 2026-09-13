@@ -416,6 +416,12 @@ fn run_connection(
     if session.txn.is_some() {
         let _ = txn_rollback(&engine, &mut session, false);
     }
+    // v0.22: session-local temp tables vanish on disconnect (PostgreSQL
+    // semantics), along with their indexes.
+    {
+        let mut guard = lock_engine(&engine);
+        guard.db.drop_session_temps(session.sid);
+    }
     result
 }
 
@@ -1075,6 +1081,7 @@ fn send_copy_out(
 /// shared by the simple and extended protocol paths.
 fn copy_from_ncols(
     engine: &Arc<Mutex<Engine>>,
+    session: u64,
     table: &str,
     columns: &Option<Vec<String>>,
 ) -> Result<usize, exec::ExecError> {
@@ -1082,7 +1089,7 @@ fn copy_from_ncols(
     let snap = guard.take_snapshot();
     // Use a throwaway xid for the snapshot owner (read-only).
     let xid = guard.begin_txn();
-    let r = exec::copy_ncols(&*guard, &snap, xid, table, columns);
+    let r = exec::copy_ncols(&*guard, &snap, xid, session, table, columns);
     retire_txn(&mut guard, xid);
     r
 }
@@ -1157,7 +1164,7 @@ fn copy_from_ingest(
         // success.
         match r {
             Ok(n) => {
-                let records = match wal::records_for_commit(&guard, xid, &writes) {
+                let records = match wal::records_for_commit(&guard, xid, &writes, session.sid) {
                     Ok(r) => r,
                     Err(msg) => {
                         undo_all(&mut guard, xid, &writes);
@@ -1246,7 +1253,7 @@ fn handle_copy_from(
         }
     }
     // Resolve the column count first (validates table/columns).
-    let ncols = match copy_from_ncols(engine, table, columns) {
+    let ncols = match copy_from_ncols(engine, session.sid, table, columns) {
         Ok(n) => n,
         Err(e) => {
             send_error(stream, e.code, &e.message)?;
@@ -1338,7 +1345,7 @@ fn handle_copy_extended(
         Ok(())
     } else {
         // Resolve the column count first (validates table/columns).
-        let ncols = match copy_from_ncols(engine, table, columns) {
+        let ncols = match copy_from_ncols(engine, session.sid, table, columns) {
             Ok(n) => n,
             Err(e) => return protocol_error(stream, session, e.code, &e.message),
         };
@@ -1625,6 +1632,9 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
         Stmt::CreateSequence { .. } => Some("CREATE SEQUENCE"),
         Stmt::AlterSequence { .. } => Some("ALTER SEQUENCE"),
         Stmt::DropSequence { .. } => Some("DROP SEQUENCE"),
+        // v0.22: bounded CREATE TYPE.
+        Stmt::CreateType { .. } => Some("CREATE TYPE"),
+        Stmt::DropType { .. } => Some("DROP TYPE"),
         Stmt::CreateRole { .. } => Some("CREATE ROLE"),
         Stmt::AlterRole { .. } => Some("ALTER ROLE"),
         Stmt::DropRole { .. } => Some("DROP ROLE"),
@@ -2055,7 +2065,7 @@ fn autocommit_execute(
     // A commit-time serialization conflict (e.g. a concurrent CREATE
     // TABLE of the same name won the race) aborts the statement: undo
     // the staged writes and retire the xid.
-    let records = match wal::records_for_commit(&guard, xid, &writes) {
+    let records = match wal::records_for_commit(&guard, xid, &writes, sid) {
         Ok(r) => r,
         Err(msg) => {
             undo_all(&mut guard, xid, &writes);
@@ -2128,7 +2138,13 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::CreateRole { .. }
             | WriteOp::DropRole { .. }
             | WriteOp::AlterRole { .. }
-            | WriteOp::DbAcl { .. } => continue,
+            | WriteOp::DbAcl { .. }
+            // v0.22: temp tables are single-version; their DDL leaves
+            // no dead versions to reap. Shell types likewise.
+            | WriteOp::CreateTempTable { .. }
+            | WriteOp::DropTempTable { .. }
+            | WriteOp::CreateType { .. }
+            | WriteOp::DropType { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);
@@ -2207,7 +2223,7 @@ fn txn_commit(
     // our xid; retiring the xid (below) is what publishes them.
     // A commit-time serialization conflict aborts the transaction, like
     // Postgres: hand it back marked failed so the client can ROLLBACK.
-    let records = match wal::records_for_commit(&guard, t.xid, &t.writes) {
+    let records = match wal::records_for_commit(&guard, t.xid, &t.writes, session.sid) {
         Ok(r) => r,
         Err(msg) => {
             let mut t = t;
@@ -2286,7 +2302,7 @@ fn txn_vacuum(
         next_xid: guard.txns.next_xid,
     };
     let is_owner = |db: &crate::storage::Database, snap: &crate::storage::Snapshot, name: &str| {
-        db.find_table(name, snap, u64::MAX)
+        db.find_table(name, snap, u64::MAX, session.sid)
             .map(|t| {
                 t.owner == session.role
                     || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
@@ -2657,7 +2673,15 @@ fn handle_bind(
                 // Type resolution sees the session's own uncommitted data.
                 let mut guard = lock_engine(engine);
                 let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
-                exec::bind_params(&s, &prep.declared_oids, &raw, &guard, &snap, own)
+                exec::bind_params(
+                    &s,
+                    &prep.declared_oids,
+                    &raw,
+                    &guard,
+                    &snap,
+                    own,
+                    session.sid,
+                )
             };
             let params = match params {
                 Ok(p) => p,
@@ -2759,7 +2783,14 @@ fn handle_describe(
                 let types = {
                     let mut guard = lock_engine(engine);
                     let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
-                    exec::resolve_param_types(stmt, &prep.declared_oids, &guard, &snap, own)
+                    exec::resolve_param_types(
+                        stmt,
+                        &prep.declared_oids,
+                        &guard,
+                        &snap,
+                        own,
+                        session.sid,
+                    )
                 };
                 match types {
                     Ok(types) => types.iter().map(|t| t.oid()).collect(),
@@ -2813,7 +2844,7 @@ fn describe_prepared(
         Some(stmt) => {
             let mut guard = lock_engine(engine);
             let (snap, own, _) = stmt_snapshot(&mut guard, session.txn.as_mut());
-            exec::describe_columns(stmt, &prep.declared_oids, &guard, &snap, own)
+            exec::describe_columns(stmt, &prep.declared_oids, &guard, &snap, own, session.sid)
         }
     }
 }

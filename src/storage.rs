@@ -118,10 +118,18 @@ impl ColType {
 /// `NaN`, `+Infinity`, `-Infinity` from finite values; the `unscaled` /
 /// `scale` fields are always zero for non-finite values so derived
 /// equality stays canonical.
+///
+/// v0.22: `scale` is signed. A negative scale means the value is an
+/// integer multiple of a power of ten (`unscaled * 10^-scale`), which
+/// lets huge magnitudes like `1.2345678901234e200` (from float8
+/// conversion or `1e200`-style literals) be represented without
+/// overflowing the i128 mantissa. Normalization still only strips
+/// trailing zeros while `scale > 0`, so `new(1000, 0)` keeps scale 0
+/// and prints as `1000`, never `1e+3`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Numeric {
     pub unscaled: i128,
-    pub scale: u32,
+    pub scale: i32,
     pub special: NumericSpecial,
 }
 
@@ -138,7 +146,7 @@ pub enum NumericSpecial {
 impl Numeric {
     /// Build without normalizing (v0.18): for fixed-scale internals
     /// like the transcendental series that need exact scale control.
-    fn raw(unscaled: i128, scale: u32) -> Self {
+    fn raw(unscaled: i128, scale: i32) -> Self {
         Numeric {
             unscaled,
             scale,
@@ -147,7 +155,7 @@ impl Numeric {
     }
 
     /// Build and normalize.
-    pub fn new(unscaled: i128, scale: u32) -> Self {
+    pub fn new(unscaled: i128, scale: i32) -> Self {
         let mut n = Numeric {
             unscaled,
             scale,
@@ -316,21 +324,19 @@ impl Numeric {
         if neg {
             unscaled = -unscaled;
         }
-        // scale = frac digits - exponent.
+        // scale = frac digits - exponent. v0.22: a negative scale is
+        // kept as-is (value = unscaled * 10^-scale) instead of erroring,
+        // so huge magnitudes like 1e200 survive in the i128 mantissa.
+        // PostgreSQL allows up to 131072 digits before the decimal point
+        // ("value overflows numeric format" beyond that); the fractional
+        // side is capped symmetrically to keep every scale arithmetic
+        // below in i32 range.
         let scale = frac_part.len() as i32 - exp;
-        if scale < 0 {
-            let extra = (-scale) as u32;
-            unscaled = unscaled
-                .checked_mul(
-                    10i128
-                        .checked_pow(extra)
-                        .ok_or(NumericParseError::Overflow)?,
-                )
-                .ok_or(NumericParseError::Overflow)?;
-            Ok(Numeric::new(unscaled, 0))
-        } else {
-            Ok(Numeric::new(unscaled, scale as u32))
+        let int_digits = (int_part.len() + frac_part.len()) as i64 - scale as i64;
+        if int_digits > 131072 || scale > 200_000 || scale < -200_000 {
+            return Err(NumericParseError::Overflow);
         }
+        Ok(Numeric::new(unscaled, scale))
     }
 
     /// Build from an f64's shortest round-trip representation, so
@@ -355,7 +361,7 @@ impl Numeric {
             NumericSpecial::NaN => f64::NAN,
             NumericSpecial::PosInf => f64::INFINITY,
             NumericSpecial::NegInf => f64::NEG_INFINITY,
-            NumericSpecial::Finite => self.unscaled as f64 * 10f64.powi(-(self.scale as i32)),
+            NumericSpecial::Finite => self.unscaled as f64 * 10f64.powi(-self.scale),
         }
     }
 
@@ -365,11 +371,18 @@ impl Numeric {
         if self.special != NumericSpecial::Finite {
             return None;
         }
-        let half = 10i128.checked_pow(self.scale)? / 2;
+        // v0.22: a non-positive scale means the value is already an
+        // integer multiple of 10^-scale.
+        if self.scale <= 0 {
+            let mul = 10i128.checked_pow((-self.scale) as u32)?;
+            return i64::try_from(self.unscaled.checked_mul(mul)?).ok();
+        }
+        let half = 10i128.checked_pow(self.scale as u32)? / 2;
+        let div = 10i128.checked_pow(self.scale as u32)?;
         let rounded = if self.unscaled >= 0 {
-            self.unscaled.checked_add(half)? / 10i128.checked_pow(self.scale)?
+            self.unscaled.checked_add(half)? / div
         } else {
-            self.unscaled.checked_sub(half)? / 10i128.checked_pow(self.scale)?
+            self.unscaled.checked_sub(half)? / div
         };
         i64::try_from(rounded).ok()
     }
@@ -381,15 +394,25 @@ impl Numeric {
     }
 
     /// Align `other` to our scale; used by add/sub. Overflow -> None.
-    fn aligned(&self, other: &Numeric) -> Option<(i128, i128, u32)> {
+    fn aligned(&self, other: &Numeric) -> Option<(i128, i128, i32)> {
         let scale = self.scale.max(other.scale);
-        let a = self
-            .unscaled
-            .checked_mul(10i128.checked_pow(scale - self.scale)?)?;
-        let b = other
-            .unscaled
-            .checked_mul(10i128.checked_pow(scale - other.scale)?)?;
-        Some((a, b, scale))
+        let up = |n: &Numeric| {
+            n.unscaled
+                .checked_mul(10i128.checked_pow((scale - n.scale) as u32)?)
+        };
+        if let (Some(a), Some(b)) = (up(self), up(other)) {
+            return Some((a, b, scale));
+        }
+        // v0.22: the scales differ by more than i128 can bridge (one
+        // operand is a huge multiple of a power of ten). Align at the
+        // coarser scale instead, rounding the finer operand half away
+        // from zero. The dropped fraction is unrepresentable in i128
+        // anyway; this keeps e.g. `0 - 1e308` = `-1e308` instead of
+        // erroring with 22003.
+        let coarse = self.scale.min(other.scale);
+        let a = self.round_to(coarse)?.unscaled;
+        let b = other.round_to(coarse)?.unscaled;
+        Some((a, b, coarse))
     }
 
     /// Addition with PostgreSQL's non-finite semantics (v0.18): NaN
@@ -471,12 +494,14 @@ impl Numeric {
             }
             (Finite, Finite) => {
                 // a/b = (ua * 10^(sb+10)) / (ub * 10^sa), scale 10.
+                // v0.22: scales are signed; a negative power is out of
+                // range for this fixed-scale path (None -> 22003).
                 let num = self
                     .unscaled
-                    .checked_mul(10i128.checked_pow(other.scale + 10)?)?;
+                    .checked_mul(10i128.checked_pow(u32::try_from(other.scale + 10).ok()?)?)?;
                 let den = other
                     .unscaled
-                    .checked_mul(10i128.checked_pow(self.scale)?)?;
+                    .checked_mul(10i128.checked_pow(u32::try_from(self.scale).ok()?)?)?;
                 Some(Numeric::new(num.checked_div(den)?, 10))
             }
         }
@@ -484,7 +509,8 @@ impl Numeric {
 
     /// v0.18: Divide at a specific output scale, rescaling inputs to avoid
     /// overflow. Returns None on overflow or division by zero.
-    pub fn div_at_scale(&self, other: &Numeric, out_scale: u32) -> Option<Numeric> {
+    /// v0.22: `out_scale` is signed (callers pass non-negative scales).
+    pub fn div_at_scale(&self, other: &Numeric, out_scale: i32) -> Option<Numeric> {
         use NumericSpecial::*;
         match (self.special, other.special) {
             (NaN, _) | (_, NaN) => Some(Numeric::nan()),
@@ -508,7 +534,7 @@ impl Numeric {
                 if !ratio.is_finite() {
                     return None;
                 }
-                let scaled = (ratio * 10f64.powi(out_scale as i32)).round() as i128;
+                let scaled = (ratio * 10f64.powi(out_scale)).round() as i128;
                 Some(Numeric::new(scaled, out_scale))
             }
         }
@@ -547,30 +573,76 @@ impl Numeric {
 
     /// Round to `scale` fractional digits, half away from zero.
     /// v0.18: specials round to themselves (PostgreSQL).
-    pub fn round_to(&self, scale: u32) -> Option<Numeric> {
+    /// v0.22: `scale` is signed. Upscaling that would overflow the i128
+    /// mantissa keeps the numerically-equal narrower representation
+    /// (PostgreSQL would widen the scale; the value is identical, and
+    /// this is what lets `round(1e200)` succeed).
+    /// Digits before the decimal point (<= 0 when |value| < 1).
+    /// Used to enforce the 131072-digit numeric format limit after
+    /// operations that can carry into a new leading digit.
+    fn int_digits(&self) -> i64 {
+        if self.unscaled == 0 {
+            return 0;
+        }
+        let mut v = self.unscaled.unsigned_abs();
+        let mut digits: i64 = 0;
+        while v > 0 {
+            v /= 10;
+            digits += 1;
+        }
+        digits - self.scale as i64
+    }
+
+    pub fn round_to(&self, scale: i32) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
         }
         if scale >= self.scale {
-            let mul = 10i128.checked_pow(scale - self.scale)?;
-            return Some(Numeric::new(self.unscaled.checked_mul(mul)?, scale));
+            if scale == self.scale {
+                return Some(self.clone());
+            }
+            let mul = 10i128.checked_pow((scale - self.scale) as u32);
+            match mul {
+                Some(m) => {
+                    return Some(Numeric::new(self.unscaled.checked_mul(m)?, scale));
+                }
+                None => return Some(self.clone()),
+            }
         }
-        let drop = self.scale - scale;
-        let div = 10i128.checked_pow(drop)?;
+        let drop = (self.scale - scale) as u32;
+        // v0.22: if 10^drop overflows i128, then |unscaled| < 10^39/2 <=
+        // div/2, so the value rounds to zero at any target scale.
+        let div = match 10i128.checked_pow(drop) {
+            Some(d) => d,
+            None => return Some(Numeric::zero()),
+        };
         let half = div / 2;
         let adj = if self.unscaled >= 0 { half } else { -half };
-        Some(Numeric::new(
-            self.unscaled.checked_add(adj)?.checked_div(div)?,
-            scale,
-        ))
+        let r = Numeric::new(self.unscaled.checked_add(adj)?.checked_div(div)?, scale);
+        // v0.22: rounding up can carry past the numeric format limit
+        // (131072 digits before the point), e.g.
+        // round(5.5e131071, -131072) = 1e131072. PostgreSQL raises
+        // "value overflows numeric format"; we return None (-> 22003).
+        if r.int_digits() > 131072 {
+            return None;
+        }
+        Some(r)
     }
 
     /// v0.18: specials are fixed points of floor/ceil.
+    /// v0.22: a non-positive scale is already integral.
     pub fn floor(&self) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
         }
-        let div = 10i128.checked_pow(self.scale)?;
+        if self.scale <= 0 {
+            return Some(self.clone());
+        }
+        // v0.22: if 10^scale overflows i128, |value| < 1.
+        let div = match 10i128.checked_pow(self.scale as u32) {
+            Some(d) => d,
+            None => return Some(Numeric::new(if self.unscaled < 0 { -1 } else { 0 }, 0)),
+        };
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
         let q = if r != 0 && self.unscaled < 0 {
@@ -582,11 +654,19 @@ impl Numeric {
     }
 
     /// v0.18: specials are fixed points of floor/ceil.
+    /// v0.22: a non-positive scale is already integral.
     pub fn ceil(&self) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
         }
-        let div = 10i128.checked_pow(self.scale)?;
+        if self.scale <= 0 {
+            return Some(self.clone());
+        }
+        // v0.22: if 10^scale overflows i128, |value| < 1.
+        let div = match 10i128.checked_pow(self.scale as u32) {
+            Some(d) => d,
+            None => return Some(Numeric::new(if self.unscaled > 0 { 1 } else { 0 }, 0)),
+        };
         let q = self.unscaled.checked_div(div)?;
         let r = self.unscaled.checked_rem(div)?;
         let q = if r != 0 && self.unscaled > 0 {
@@ -735,6 +815,13 @@ impl Numeric {
     /// Canonical decimal text: no trailing fractional zeros.
     /// v0.18: specials render as PostgreSQL does (`NaN`, `Infinity`,
     /// `-Infinity`).
+    /// v0.22: a negative scale (integer multiple of a power of ten)
+    /// prints in plain notation while the integer part stays short,
+    /// and switches to scientific notation for very large magnitudes
+    /// (PostgreSQL prints `round(1.2345678901234e200)` as
+    /// `1.2345678901234e+200`). The plain/scientific cutoff is an
+    /// internal approximation; PostgreSQL's exact threshold is not
+    /// publicly documented.
     pub fn to_text(&self) -> String {
         match self.special {
             NumericSpecial::NaN => return "NaN".to_string(),
@@ -750,6 +837,29 @@ impl Numeric {
         let mut out = String::new();
         if neg {
             out.push('-');
+        }
+        if self.scale < 0 {
+            // Integer multiple of 10^-scale.
+            let int_digits = digits.len() as i64 - self.scale as i64;
+            if int_digits <= 39 {
+                out.push_str(&digits);
+                for _ in 0..-self.scale {
+                    out.push('0');
+                }
+            } else {
+                out.push_str(&digits[..1]);
+                if digits.len() > 1 {
+                    out.push('.');
+                    out.push_str(&digits[1..]);
+                }
+                let exp = digits.len() as i64 - 1 - self.scale as i64;
+                out.push('e');
+                if exp >= 0 {
+                    out.push('+');
+                }
+                out.push_str(&exp.to_string());
+            }
+            return out;
         }
         if self.scale == 0 {
             out.push_str(&digits);
@@ -854,10 +964,10 @@ impl Hp36 {
             return None;
         }
         if n.scale <= 36 {
-            let mul = 10i128.checked_pow(36 - n.scale)?;
+            let mul = 10i128.checked_pow((36 - n.scale) as u32)?;
             Some(Hp36(n.unscaled.checked_mul(mul)?))
         } else {
-            let div = 10i128.checked_pow(n.scale - 36)?;
+            let div = 10i128.checked_pow((n.scale - 36) as u32)?;
             let half = div / 2;
             let q = if n.unscaled >= 0 {
                 (n.unscaled + half) / div
@@ -920,10 +1030,10 @@ impl HpDec {
             return None;
         }
         if n.scale <= 18 {
-            let mul = 10i128.checked_pow(18 - n.scale)?;
+            let mul = 10i128.checked_pow((18 - n.scale) as u32)?;
             Some(HpDec(n.unscaled.checked_mul(mul)?))
         } else {
-            let div = 10i128.checked_pow(n.scale - 18)?;
+            let div = 10i128.checked_pow((n.scale - 18) as u32)?;
             let half = div / 2;
             let adj = if n.unscaled >= 0 { half } else { -half };
             Some(HpDec(n.unscaled.checked_add(adj)?.checked_div(div)?))
@@ -1101,52 +1211,42 @@ impl Numeric {
         Some((Numeric::raw(rm, 18), re10))
     }
 
-    /// v0.18: Rescale to `new_scale`, rounding to nearest. Returns None on overflow.
-    pub fn rescale(&self, new_scale: u32) -> Option<Numeric> {
-        if self.special != NumericSpecial::Finite {
-            return Some(self.clone());
-        }
-        if new_scale == self.scale {
-            return Some(self.clone());
-        }
-        let unscaled = if new_scale > self.scale {
-            let mul = 10i128.checked_pow(new_scale - self.scale)?;
-            self.unscaled.checked_mul(mul)?
-        } else {
-            let div = 10i128.checked_pow(self.scale - new_scale)?;
-            let half = div / 2;
-            if self.unscaled >= 0 {
-                (self.unscaled + half) / div
-            } else {
-                (self.unscaled - half) / div
-            }
-        };
-        Some(Numeric::new(unscaled, new_scale))
+    /// v0.18: Rescale to `new_scale`, rounding half away from zero.
+    /// v0.22: `new_scale` is signed; delegates to `round_to` (upscaling
+    /// past i128 keeps the numerically-equal narrower form).
+    pub fn rescale(&self, new_scale: i32) -> Option<Numeric> {
+        self.round_to(new_scale)
     }
 
     /// v0.18: Truncate toward zero to `new_scale` (no rounding).
-    pub fn trunc_to_scale(&self, new_scale: u32) -> Numeric {
+    /// v0.22: `new_scale` is signed. If the divisor would overflow i128
+    /// the truncated value is necessarily zero (|unscaled| < divisor).
+    pub fn trunc_to_scale(&self, new_scale: i32) -> Numeric {
         if self.special != NumericSpecial::Finite {
             return self.clone();
         }
         if new_scale >= self.scale {
             return self.clone();
         }
-        let div = 10i128.pow(self.scale - new_scale);
+        let div = match 10i128.checked_pow((self.scale - new_scale) as u32) {
+            Some(d) => d,
+            None => return Numeric::new(0, new_scale),
+        };
         Numeric::new(self.unscaled / div, new_scale)
     }
 
     /// v0.18: Convert a (mantissa, e10) scientific value to a Numeric
     /// at `out_scale`, rounding to nearest. Returns None on overflow.
     /// The mantissa is expected at scale 18 (as from exp_sci).
-    pub fn from_sci(mantissa: &Numeric, e10: i32, out_scale: u32) -> Option<Numeric> {
+    /// v0.22: `out_scale` is signed.
+    pub fn from_sci(mantissa: &Numeric, e10: i32, out_scale: i32) -> Option<Numeric> {
         if mantissa.special != NumericSpecial::Finite {
             return Some(mantissa.clone());
         }
         // value = mantissa.unscaled × 10^(e10-18).
         // Want: unscaled_out × 10^-out_scale.
         // unscaled_out = mantissa.unscaled × 10^(e10-18+out_scale).
-        let shift = e10 - 18 + out_scale as i32;
+        let shift = e10 - 18 + out_scale;
         let unscaled = if shift >= 0 {
             mantissa
                 .unscaled
@@ -1174,7 +1274,7 @@ impl Numeric {
         }
         // Scientific split: self = d × 10^e10, d in [1, 10).
         let digits = self.unscaled.unsigned_abs().to_string().len() as i32;
-        let e10 = (digits - 1) - self.scale as i32;
+        let e10 = (digits - 1) - self.scale;
         // d at scale 18: round(unscaled × 10^(18-(digits-1))).
         let shift = 18 - (digits - 1);
         let d_raw: i128 = if shift >= 0 {
@@ -1488,19 +1588,49 @@ fn float_text(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
+    // v0.22: `{}` on f64 never uses scientific notation, so huge
+    // magnitudes explode into hundreds of digits. PostgreSQL's %g
+    // (17 significant digits for float8) switches to scientific when
+    // the decimal exponent is >= 17 or < -4; mirror that so e.g.
+    // trunc('1e200'::numeric) prints "1e+200" like PG.
+    if f != 0.0 {
+        let a = f.abs();
+        if a >= 1e17 || a < 1e-4 {
+            return float_scientific(f);
+        }
+    }
     // `{}` on f64 already prints the shortest string that round-trips.
     format!("{}", f)
 }
 
+/// Scientific notation à la PostgreSQL float8out: shortest
+/// significant digits, `e+NN`/`e-NN` with a sign and at least two
+/// exponent digits (`1e+200`, `1.5e-07`).
+fn float_scientific(f: f64) -> String {
+    let s = format!("{:e}", f);
+    let epos = s.find('e').unwrap_or(s.len());
+    let (mant, exp) = s.split_at(epos);
+    let exp: i32 = exp[1..].parse().unwrap_or(0);
+    format!("{}e{:+03}", mant, exp)
+}
+
 /// Same for f32 (real): Rust's Display already prints the shortest
 /// string that round-trips at f32 precision, so `1.1::real` prints
-/// `1.1` rather than `1.100000023841858`.
+/// `1.1` rather than `1.100000023841858`. v0.22: huge magnitudes get
+/// the same scientific treatment as float8 (threshold at 1e9 for
+/// float4's 9 significant digits).
 fn float4_text(f: f32) -> String {
     if f.is_nan() {
         return "NaN".to_string();
     }
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if f != 0.0 {
+        let a = f.abs();
+        if a >= 1e9 || a < 1e-4 {
+            return float_scientific(f as f64);
+        }
     }
     format!("{}", f)
 }
@@ -1680,6 +1810,24 @@ impl Table {
 /// Multiple live versions of one name can only arise from concurrent
 /// uncommitted CREATEs; the commit-time check in server.rs rejects the
 /// second committer with 40001.
+/// v0.22: session id meaning "no session". Real session ids come from an
+/// incrementing counter starting at 1 (`NEXT_SID` in server.rs), so this
+/// never collides. Pass it to session-aware helpers from paths that only
+/// ever touch permanent tables (WAL replay, vacuum).
+pub const NO_SESSION: u64 = u64::MAX;
+
+/// v0.22: bounded shell-type registry entry. PostgreSQL's
+/// `CREATE TYPE name;` creates an undefined "shell" type that a later
+/// `CREATE TYPE name (... LIKE = base)` completes. rustgres supports
+/// only the shell + LIKE-completion forms (no I/O functions, no
+/// composite/enum/range types): enough for the pg_regress float8
+/// cluster, which builds a float8 alias this way.
+#[derive(Clone, Debug)]
+pub struct ShellType {
+    /// Base type name from LIKE = <base>; None while still a shell.
+    pub like_base: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     /// Keyed by table name — a short, trusted identifier (whoever is
@@ -1691,6 +1839,15 @@ pub struct Database {
     /// of Callgrind `Ir` on an ordinary query (see `benches/BASELINE.md`,
     /// "catalog HashMap hasher"). Same rationale for the five maps below.
     pub tables: HashMap<String, Vec<Table>, FxBuildHasher>,
+    /// v0.22: session-local temporary tables, keyed by session id then
+    /// table name. A temp table shadows any permanent table of the same
+    /// name *only within its owning session* (PostgreSQL semantics); the
+    /// permanent table is never deleted by temp DDL. Temp tables are
+    /// single-version (no MVCC history), never checkpointed, never
+    /// WAL-logged, and are dropped automatically when the session ends.
+    /// DDL on them is still statement-atomic via the txn undo log
+    /// (`WriteOp::CreateTempTable` / `WriteOp::DropTempTable`).
+    pub temp_tables: HashMap<u64, HashMap<String, Table, FxBuildHasher>, FxBuildHasher>,
     /// Secondary indexes by index name (v0.8). DDL is transactional: each
     /// definition carries creator/deleter xids, and entries for
     /// uncommitted row versions are filtered by visibility at scan time.
@@ -1698,6 +1855,14 @@ pub struct Database {
     /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
     /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
     pub stats: HashMap<String, TableStats, FxBuildHasher>,
+    /// Shell types by name (v0.22, bounded — see `ShellType`). Types are
+    /// database-global and transactional via the statement undo log
+    /// (`WriteOp::CreateType` / `WriteOp::DropType`), but are not
+    /// WAL-logged or checkpointed in v0.22: an inter-checkpoint crash or
+    /// a restart loses type definitions. Nothing can reference a shell
+    /// type yet (no column-type or cast support), so recovery stays
+    /// consistent; documented in the README.
+    pub types: HashMap<String, ShellType, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
     pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
@@ -1811,6 +1976,10 @@ impl Database {
             sequences: HashMap::default(),
             roles: HashMap::default(),
             db_acl: Vec::new(),
+            // v0.22: session-local TEMP tables live here, keyed by session id.
+            temp_tables: HashMap::default(),
+            // v0.22: bounded shell-type registry.
+            types: HashMap::default(),
         };
         // v0.11: the bootstrap superuser always exists.
         db.roles
@@ -1866,25 +2035,69 @@ impl Database {
     }
 
     /// First table version with `name` visible to (`snap`, `own`).
-    pub fn find_table(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Table> {
+    pub fn find_table(
+        &self,
+        name: &str,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> Option<&Table> {
+        // v0.22: a session-local temp table shadows the permanent one.
+        if let Some(t) = self.temp_tables.get(&session).and_then(|m| m.get(name)) {
+            return Some(t);
+        }
         self.tables
             .get(name)
             .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, own)))
     }
 
     /// Mutable variant of [`Database::find_table`].
-    pub fn find_table_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Table> {
+    pub fn find_table_mut(
+        &mut self,
+        name: &str,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> Option<&mut Table> {
+        // v0.22: a session-local temp table shadows the permanent one.
+        if let Some(t) = self
+            .temp_tables
+            .get_mut(&session)
+            .and_then(|m| m.get_mut(name))
+        {
+            return Some(t);
+        }
         self.tables
             .get_mut(name)
             .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, own)))
     }
 
+    /// v0.22: drop all of a session's temp tables (disconnect cleanup).
+    /// Temp tables never own entries in the global index map — their
+    /// PRIMARY KEY / UNIQUE constraints are enforced by a session-local
+    /// scan, and CREATE INDEX on a temp table is rejected — so there is
+    /// no index cleanup to do here. There MUST NOT be: an index whose
+    /// `def.table` equals a temp table's name belongs to a same-named
+    /// permanent table, and deleting it would corrupt that table.
+    pub fn drop_session_temps(&mut self, session: u64) {
+        self.temp_tables.remove(&session);
+    }
+
     /// The table version created by `own` (for WAL logging of DDL).
     /// Any row version with this id, wherever it lives (ids are global).
     /// Used by undo and WAL replay; both run with the engine lock held.
+    /// v0.22: also searches session-local temp tables — row ids are
+    /// globally unique, so a match is unambiguous.
     pub fn find_row_version_mut(&mut self, id: u64) -> Option<&mut RowVersion> {
         for vs in self.tables.values_mut() {
             for t in vs {
+                if let Some(pos) = t.row_pos(id) {
+                    return Some(&mut t.rows[pos]);
+                }
+            }
+        }
+        for tmps in self.temp_tables.values_mut() {
+            for t in tmps.values_mut() {
                 if let Some(pos) = t.row_pos(id) {
                     return Some(&mut t.rows[pos]);
                 }
@@ -1894,11 +2107,70 @@ impl Database {
     }
 
     /// Immutable twin, for commit-time WAL record validation.
+    /// v0.22: also searches session-local temp tables (see above).
     pub fn find_row_version(&self, id: u64) -> Option<&RowVersion> {
         for vs in self.tables.values() {
             for t in vs {
                 if let Some(pos) = t.row_pos(id) {
                     return Some(&t.rows[pos]);
+                }
+            }
+        }
+        for tmps in self.temp_tables.values() {
+            for t in tmps.values() {
+                if let Some(pos) = t.row_pos(id) {
+                    return Some(&t.rows[pos]);
+                }
+            }
+        }
+        None
+    }
+
+    /// v0.22: does `session` hold a temp table called `name`?
+    ///
+    /// Pass [`NO_SESSION`] for paths that only ever touch permanent
+    /// tables (WAL replay, vacuum): it is never a real session id.
+    pub fn is_temp_table(&self, session: u64, name: &str) -> bool {
+        self.temp_tables
+            .get(&session)
+            .is_some_and(|m| m.contains_key(name))
+    }
+
+    /// v0.22: is `row_id` held by any session's temp table? Row ids are
+    /// globally unique, so this is unambiguous. Used to keep temp-table
+    /// DML out of the WAL (PostgreSQL never WAL-logs temp-table data).
+    pub fn row_id_in_temp(&self, row_id: u64) -> bool {
+        self.temp_tables
+            .values()
+            .any(|tmps| tmps.values().any(|t| t.row_pos(row_id).is_some()))
+    }
+
+    /// v0.22: remove the row version `row_id` created by `own`, wherever
+    /// it lives (permanent or temp table). Returns the removed values and
+    /// whether the table was a session-local temp table — temp rows have
+    /// no global index entries, so callers skip index cleanup for them.
+    fn remove_own_version(&mut self, row_id: u64, own: u64) -> Option<(Row, bool)> {
+        for vs in self.tables.values_mut() {
+            for t in vs {
+                if let Some(pos) = t.row_pos(row_id) {
+                    if t.rows[pos].xmin == own {
+                        let values = t.rows[pos].values.clone();
+                        t.swap_remove_version(pos);
+                        return Some((values, false));
+                    }
+                    return None;
+                }
+            }
+        }
+        for tmps in self.temp_tables.values_mut() {
+            for t in tmps.values_mut() {
+                if let Some(pos) = t.row_pos(row_id) {
+                    if t.rows[pos].xmin == own {
+                        let values = t.rows[pos].values.clone();
+                        t.swap_remove_version(pos);
+                        return Some((values, true));
+                    }
+                    return None;
                 }
             }
         }
@@ -1923,7 +2195,21 @@ impl Database {
 
     /// All index definitions on `table` visible to (`snap`, `own`),
     /// sorted by name for determinism.
-    pub fn visible_indexes_for(&self, table: &str, snap: &Snapshot, own: u64) -> Vec<&Index> {
+    pub fn visible_indexes_for(
+        &self,
+        table: &str,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> Vec<&Index> {
+        // v0.22: temp tables never have entries in the global index map
+        // (their PRIMARY KEY / UNIQUE constraints are enforced by a
+        // session-local scan instead), so no index is visible for them.
+        // Without this, a temp table would "see" a same-named permanent
+        // table's indexes and read the wrong rows.
+        if self.is_temp_table(session, table) {
+            return Vec::new();
+        }
         let mut out: Vec<&Index> = self
             .indexes
             .values()
@@ -1937,7 +2223,13 @@ impl Database {
     /// index on `table`. Called for INSERT and for the new version of an
     /// UPDATE — including uncommitted versions, whose entries are filtered
     /// by visibility at scan time (PostgreSQL does the same).
-    pub fn index_insert_row(&mut self, table: &str, row_id: u64, values: &[Value]) {
+    /// v0.22: no-op for temp tables (see `visible_indexes_for`); without
+    /// this a temp row would pollute a same-named permanent table's
+    /// indexes with an entry no permanent-table scan could resolve.
+    pub fn index_insert_row(&mut self, table: &str, row_id: u64, values: &[Value], session: u64) {
+        if self.is_temp_table(session, table) {
+            return;
+        }
         let targets: Vec<(String, Vec<usize>)> = self
             .indexes
             .values()
@@ -1986,9 +2278,17 @@ impl Database {
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
         own: u64,
+        session: u64,
     ) -> Option<String> {
-        let t = self.find_table(table, snap, own)?;
-        for ix in self.visible_indexes_for(table, snap, own) {
+        let t = self.find_table(table, snap, own, session)?;
+        // v0.22: temp tables have no backing indexes; enforce their
+        // PRIMARY KEY / UNIQUE constraints with a session-local scan.
+        if self.is_temp_table(session, table) {
+            return self
+                .temp_scan_constraint(t, values, exclude_row_id, snap, own, None)
+                .map(|(name, _)| name);
+        }
+        for ix in self.visible_indexes_for(table, snap, own, session) {
             if !ix.def.unique {
                 continue;
             }
@@ -2022,6 +2322,59 @@ impl Database {
         None
     }
 
+    /// v0.22: scan a temp table's rows for a live row matching `values`
+    /// on a PRIMARY KEY / UNIQUE constraint's columns. `only` restricts
+    /// the scan to the named constraint (for ON CONFLICT arbiters);
+    /// None scans every unique constraint. Returns the conflicting
+    /// constraint's name and row id. NULL key parts never conflict
+    /// (PostgreSQL semantics).
+    fn temp_scan_constraint(
+        &self,
+        t: &Table,
+        values: &[Value],
+        exclude_row_id: Option<u64>,
+        snap: &Snapshot,
+        own: u64,
+        only: Option<&str>,
+    ) -> Option<(String, u64)> {
+        let mut constraints: Vec<&UniqueDef> = t.uniques.iter().collect();
+        if let Some(pk) = &t.pkey {
+            constraints.push(pk);
+        }
+        for c in constraints {
+            if only.is_some_and(|name| name != c.name) {
+                continue;
+            }
+            let cols: Vec<usize> = c.cols.iter().filter_map(|n| t.column_index(n)).collect();
+            if cols.len() != c.cols.len() {
+                continue; // schema changed under us; shouldn't happen
+            }
+            if cols.iter().any(|&p| matches!(values[p], Value::Null)) {
+                continue; // NULLs never conflict
+            }
+            for r in &t.rows {
+                if Some(r.id) == exclude_row_id {
+                    continue;
+                }
+                let alive = if r.xmax == own {
+                    false // deleted by us: not a conflict
+                } else {
+                    r.xmin == own || row_visible(r, snap, own)
+                };
+                if !alive {
+                    continue;
+                }
+                let same = cols
+                    .iter()
+                    .all(|&p| !matches!(r.values[p], Value::Null) && r.values[p] == values[p]);
+                if same {
+                    return Some((c.name.clone(), r.id));
+                }
+            }
+        }
+        None
+    }
+
     /// v0.10: like `unique_violation`, but restricted to the named unique
     /// index and returning the conflicting row version's id instead of the
     /// index name. Used by `INSERT ... ON CONFLICT` to locate the row to
@@ -2034,10 +2387,18 @@ impl Database {
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
         own: u64,
+        session: u64,
     ) -> Option<u64> {
-        let t = self.find_table(table, snap, own)?;
+        let t = self.find_table(table, snap, own, session)?;
+        // v0.22: temp tables have no backing indexes; match the arbiter
+        // against the table's constraint definitions and scan.
+        if self.is_temp_table(session, table) {
+            return self
+                .temp_scan_constraint(t, values, exclude_row_id, snap, own, Some(index_name))
+                .map(|(_, id)| id);
+        }
         let ix = self
-            .visible_indexes_for(table, snap, own)
+            .visible_indexes_for(table, snap, own, session)
             .into_iter()
             .find(|ix| ix.def.name == index_name && ix.def.unique)?;
         let key = ix.key_for(values);
@@ -2082,6 +2443,7 @@ impl Database {
         values: &[Value],
         own_row_id: u64,
         own: u64,
+        session: u64,
     ) -> Option<String> {
         // Fresh snapshot: everything committed as of now is visible.
         // `own` is still in `active`; row_visible would accept our own
@@ -2090,8 +2452,13 @@ impl Database {
             active: txns.active.iter().copied().collect(),
             next_xid: txns.next_xid,
         };
-        let t = self.find_table(table, &fresh, own)?;
-        for ix in self.visible_indexes_for(table, &fresh, own) {
+        // v0.22: temp tables are session-local — no concurrent transaction
+        // can write to them, so the commit-time recheck is vacuous.
+        if self.is_temp_table(session, table) {
+            return None;
+        }
+        let t = self.find_table(table, &fresh, own, session)?;
+        for ix in self.visible_indexes_for(table, &fresh, own, session) {
             if !ix.def.unique {
                 continue;
             }
@@ -2793,6 +3160,30 @@ pub enum WriteOp {
         name: String,
         prev_xmax: u64,
     },
+    // --- v0.22: temp-table DDL. Temp tables live in
+    // `Database::temp_tables[session]` (not the versioned catalog), so
+    // their undo ops carry the whole previous `Table` (or None) and the
+    // owning session id. They are never WAL-logged.
+    CreateTempTable {
+        session: u64,
+        name: String,
+    },
+    DropTempTable {
+        session: u64,
+        name: String,
+        prev: Option<Table>,
+    },
+    // --- v0.22: CREATE/DROP TYPE. Types live in `Database::types` (not
+    // the versioned catalog); the op carries the previous entry (or
+    // None) so undo restores it exactly. Types are never WAL-logged.
+    CreateType {
+        name: String,
+        prev: Option<ShellType>,
+    },
+    DropType {
+        name: String,
+        prev: Option<ShellType>,
+    },
     // --- v0.8: index DDL. DropIndex carries the whole index so undo can
     // restore the definition and its entries exactly.
     CreateIndex {
@@ -2864,28 +3255,13 @@ pub enum WriteOp {
 pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
     match op {
         WriteOp::InsertRow { table, row_id } => {
-            // Two phases: removing the version borrows the table mutably,
-            // and the index cleanup needs `eng.db` mutably too — so the
-            // values are cloned and the table borrow is dropped first.
-            // (DELETE/UPDATE never remove entries, so undoing an insert is
-            // the only DML case that touches the index.)
-            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
-                let mut out = None;
-                for t in versions.iter_mut() {
-                    if let Some(pos) = t.row_pos(*row_id) {
-                        if t.rows[pos].xmin == own {
-                            out = Some(t.rows[pos].values.clone());
-                            t.swap_remove_version(pos);
-                        }
-                        break;
-                    }
+            // v0.22: the row may live in a session-local temp table
+            // (`remove_own_version` searches both). Only permanent-table
+            // rows have global index entries to clean up.
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, own) {
+                if !is_temp {
+                    eng.db.index_remove_row(table, *row_id, &values);
                 }
-                out
-            } else {
-                None
-            };
-            if let Some(values) = removed {
-                eng.db.index_remove_row(table, *row_id, &values);
             }
         }
         WriteOp::DeleteRow {
@@ -2901,7 +3277,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         // v0.13: undo an UPDATE = remove the new version (exactly the
         // InsertRow undo) and restore the old version's xmax (exactly
-        // the DeleteRow undo).
+        // the DeleteRow undo). v0.22: both halves are temp-aware —
+        // `remove_own_version` and `find_row_version_mut` search session
+        // temp tables too, and temp rows have no index entries to clean.
         WriteOp::UpdateRow {
             table,
             old_id,
@@ -2909,23 +3287,10 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
             old_values: _,
         } => {
-            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
-                let mut out = None;
-                for t in versions.iter_mut() {
-                    if let Some(pos) = t.row_pos(*new_id) {
-                        if t.rows[pos].xmin == own {
-                            out = Some(t.rows[pos].values.clone());
-                            t.swap_remove_version(pos);
-                        }
-                        break;
-                    }
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, own) {
+                if !is_temp {
+                    eng.db.index_remove_row(table, *new_id, &values);
                 }
-                out
-            } else {
-                None
-            };
-            if let Some(values) = removed {
-                eng.db.index_remove_row(table, *new_id, &values);
             }
             if let Some(v) = eng.db.find_row_version_mut(*old_id) {
                 if v.xmax == own {
@@ -2950,6 +3315,45 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 }
             }
         }
+        // --- v0.22: temp-table undos. Temp tables are single-version and
+        // session-local; undo simply removes a created temp table or
+        // restores a dropped one.
+        WriteOp::CreateTempTable { session, name } => {
+            if let Some(tmps) = eng.db.temp_tables.get_mut(session) {
+                tmps.remove(name);
+                if tmps.is_empty() {
+                    eng.db.temp_tables.remove(session);
+                }
+            }
+        }
+        WriteOp::DropTempTable {
+            session,
+            name,
+            prev,
+        } => {
+            let tmps = eng.db.temp_tables.entry(*session).or_default();
+            match prev {
+                Some(t) => {
+                    tmps.insert(name.clone(), t.clone());
+                }
+                None => {
+                    tmps.remove(name);
+                }
+            }
+            if tmps.is_empty() {
+                eng.db.temp_tables.remove(session);
+            }
+        }
+        // --- v0.22: type DDL undos. Restore the previous entry, or
+        // remove the type when there was none.
+        WriteOp::CreateType { name, prev } | WriteOp::DropType { name, prev } => match prev {
+            Some(t) => {
+                eng.db.types.insert(name.clone(), t.clone());
+            }
+            None => {
+                eng.db.types.remove(name);
+            }
+        },
         WriteOp::CreateIndex { name } => {
             // Undo a CREATE INDEX: drop the definition (and its entries)
             // iff it is still ours — a concurrent DROP INDEX of the same

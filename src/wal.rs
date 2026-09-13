@@ -1768,7 +1768,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 out
             };
             for (id, values) in &inserted {
-                eng.db.index_insert_row(table, *id, values);
+                eng.db
+                    .index_insert_row(table, *id, values, crate::storage::NO_SESSION);
             }
         }
         WalRecord::DropTable { name, xmax } => match live_table(eng, name) {
@@ -1792,7 +1793,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 return Ok(());
             };
             for id in ids {
-                match t.rows.iter_mut().find(|r| r.id == *id) {
+                // v0.22: O(1) via row_index — the old linear scan made
+                // crash recovery quadratic in version count (a 10 MB WAL
+                // replayed in ~53 s; now ~1 s).
+                match t.row_pos(*id).and_then(|p| t.rows.get_mut(p)) {
                     Some(r) => r.xmax = *xmax,
                     None => eprintln!(
                         "WAL replay: skipping DELETE of missing row id {} in table \"{}\"",
@@ -1819,7 +1823,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 return Ok(());
             };
             for r in old {
-                match t.rows.iter_mut().find(|v| v.id == r.id) {
+                // v0.22: O(1) via row_index — see DeleteRows above.
+                match t.row_pos(r.id).and_then(|p| t.rows.get_mut(p)) {
                     Some(v) => v.xmax = *xmax,
                     None => eprintln!(
                         "WAL replay: skipping UPDATE of missing row id {} in table \"{}\"",
@@ -1841,7 +1846,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             let indexed: Vec<(u64, Row)> = new.iter().map(|r| (r.id, r.values.clone())).collect();
             // `t`'s borrow ends at its last use above; eng.db is free again.
             for (id, values) in indexed {
-                eng.db.index_insert_row(table, id, &values);
+                eng.db
+                    .index_insert_row(table, id, &values, crate::storage::NO_SESSION);
             }
         }
         // v0.13: replication slot metadata is applied by the match
@@ -2053,6 +2059,7 @@ pub fn records_for_commit(
     eng: &Engine,
     own: u64,
     writes: &[WriteOp],
+    session: u64,
 ) -> Result<Vec<WalRecord>, String> {
     let mut out: Vec<WalRecord> = Vec::new();
     let mut i = 0;
@@ -2060,6 +2067,14 @@ pub fn records_for_commit(
         let op = &writes[i];
         match op {
             WriteOp::InsertRow { table, row_id } => {
+                // v0.22: temp-table DML is never WAL-logged (PostgreSQL
+                // doesn't log temp-table data either): it is
+                // session-local and dies with the session. Row ids are
+                // globally unique, so this test is exact.
+                if eng.db.row_id_in_temp(*row_id) {
+                    i += 1;
+                    continue;
+                }
                 let Some((values, table_live)) = own_row(eng, own, *row_id) else {
                     i += 1;
                     continue;
@@ -2075,7 +2090,7 @@ pub fn records_for_commit(
                 // instead of corrupting the unique index.
                 if let Some(cname) = eng
                     .db
-                    .committed_unique_violation(&eng.txns, table, &values, *row_id, own)
+                    .committed_unique_violation(&eng.txns, table, &values, *row_id, own, session)
                 {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\" \
@@ -2097,6 +2112,11 @@ pub fn records_for_commit(
                 }
             }
             WriteOp::DeleteRow { table, row_id, .. } => {
+                // v0.22: temp-table DML is never WAL-logged (see above).
+                if eng.db.row_id_in_temp(*row_id) {
+                    i += 1;
+                    continue;
+                }
                 let Some(v) = eng.db.find_row_version(*row_id) else {
                     i += 1;
                     continue;
@@ -2157,6 +2177,12 @@ pub fn records_for_commit(
                 old_values,
                 ..
             } => {
+                // v0.22: temp-table DML is never WAL-logged (see above).
+                // Both versions live in the same table; one check suffices.
+                if eng.db.row_id_in_temp(*old_id) {
+                    i += 1;
+                    continue;
+                }
                 let Some(v) = eng.db.find_row_version(*old_id) else {
                     i += 1;
                     continue;
@@ -2461,6 +2487,21 @@ pub fn records_for_commit(
                     name: name.clone(),
                     xmax: own,
                 });
+            }
+            // v0.22: temp-table DDL is session-local and never WAL-logged.
+            // The temp table itself is already in `temp_tables`; the op
+            // only exists for statement-atomic undo.
+            WriteOp::CreateTempTable { .. } | WriteOp::DropTempTable { .. } => {
+                i += 1;
+                continue;
+            }
+            // v0.22: bounded shell types are transactional in memory but
+            // not WAL-logged or checkpointed (documented limitation):
+            // they vanish on restart. The op only exists for
+            // statement-atomic undo.
+            WriteOp::CreateType { .. } | WriteOp::DropType { .. } => {
+                i += 1;
+                continue;
             }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
@@ -3475,7 +3516,7 @@ mod tests {
                 row_id: 3,
             },
         ];
-        let recs = records_for_commit(&eng, xid, &writes).unwrap();
+        let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
         assert_eq!(recs.len(), 1);
         match &recs[0] {
             WalRecord::InsertRows { table, rows } => {
@@ -3500,7 +3541,7 @@ mod tests {
             .unwrap()
             .push(Table::new(vec![("a".into(), ColType::Int)], xid));
         let writes = vec![WriteOp::CreateTable { name: "t".into() }];
-        let err = records_for_commit(&eng, xid, &writes).unwrap_err();
+        let err = records_for_commit(&eng, xid, &writes, 0).unwrap_err();
         assert!(err.contains("already exists"), "got: {}", err);
     }
 
@@ -3518,7 +3559,7 @@ mod tests {
             row_id: 1,
             prev_xmax: 0,
         }];
-        let recs = records_for_commit(&eng, xid, &writes).unwrap();
+        let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
         assert!(recs.is_empty());
     }
 
@@ -3550,7 +3591,7 @@ mod tests {
                 row_id: 2,
             },
         ];
-        let err = records_for_commit(&eng, xid, &writes).unwrap_err();
+        let err = records_for_commit(&eng, xid, &writes, 0).unwrap_err();
         assert!(err.contains("concurrent update"), "got: {}", err);
     }
 

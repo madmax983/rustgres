@@ -966,20 +966,9 @@ pub enum CteBody {
     },
 }
 
-/// Right-hand side of a `WHERE col = ...` comparison (UPDATE/DELETE only;
-///
-/// SELECT graduated to full predicates in v0.6).
-#[derive(Clone, Debug)]
-pub enum WhereRhs {
-    Lit(Literal),
-    Param(u32),
-}
-
-#[derive(Clone, Debug)]
-pub struct WhereCond {
-    pub col: String,
-    pub rhs: WhereRhs,
-}
+/// v0.22: UPDATE/DELETE graduated to full predicate expressions (see
+/// `Stmt::Update.where_`); the legacy `WHERE col = ...` condition list
+/// is retired.
 
 /// A value in an INSERT row: a literal, or a `$N` parameter placeholder
 /// (v0.3: substituted with the bound value before execution).
@@ -1602,6 +1591,17 @@ pub enum Stmt {
         names: Vec<String>,
         if_exists: bool,
     },
+    // --- v0.22: CREATE TYPE (bounded shell-type support) ---
+    CreateType {
+        name: String,
+        /// Base type from LIKE = <base> in the parenthesized completion
+        /// form; None for the bare `CREATE TYPE name;` shell form.
+        like_base: Option<String>,
+    },
+    DropType {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     // --- v0.11: roles and privileges ---
     CreateRole {
         name: String,
@@ -1676,7 +1676,10 @@ pub enum Stmt {
         table: String,
         /// (column, expression) assignments.
         sets: Vec<(String, Expr)>,
-        where_: Vec<WhereCond>,
+        /// v0.22: full predicate expression (was `Vec<WhereCond>` limited
+        /// to `col = literal`). Parsed with `parse_or`, like SELECT's
+        /// WHERE and ON CONFLICT DO UPDATE's WHERE.
+        where_: Option<Expr>,
         /// v0.10: `RETURNING ...`.
         returning: Vec<SelectItem>,
         /// v0.10: `WITH ...` CTEs visible to the statement.
@@ -1684,7 +1687,8 @@ pub enum Stmt {
     },
     Delete {
         table: String,
-        where_: Vec<WhereCond>,
+        /// v0.22: full predicate expression (was `Vec<WhereCond>`).
+        where_: Option<Expr>,
         /// v0.10: `RETURNING ...`.
         returning: Vec<SelectItem>,
         /// v0.10: `WITH ...` CTEs visible to the statement.
@@ -1935,10 +1939,8 @@ impl Stmt {
                 for (_, e) in sets {
                     m = m.max(max_param_expr(e));
                 }
-                for w in where_ {
-                    if let WhereRhs::Param(n) = w.rhs {
-                        m = m.max(n as usize);
-                    }
+                if let Some(w) = where_ {
+                    m = m.max(max_param_expr(w));
                 }
                 m = m.max(max_param_returning(returning));
                 m = m.max(max_param_ctes(with));
@@ -1951,10 +1953,8 @@ impl Stmt {
                 ..
             } => {
                 let mut m = 0;
-                for w in where_ {
-                    if let WhereRhs::Param(n) = w.rhs {
-                        m = m.max(n as usize);
-                    }
+                if let Some(w) = where_ {
+                    m = m.max(max_param_expr(w));
                 }
                 m = m.max(max_param_returning(returning));
                 m = m.max(max_param_ctes(with));
@@ -2663,6 +2663,11 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "sequence") {
             return self.parse_create_sequence();
         }
+        // v0.22: CREATE TYPE (bounded): the bare shell form and the
+        // parenthesized completion form with LIKE = <base>.
+        if matches!(self.peek(), Token::Ident(s) if s == "type") {
+            return self.parse_create_type();
+        }
         // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
         // v0.21: TEMP tables drop any existing table with the same name
         // (approximating session-local semantics for pg_regress).
@@ -3073,6 +3078,42 @@ impl Parser {
             if_not_exists,
             opts,
         })
+    }
+
+    /// v0.22: bounded CREATE TYPE. Two forms:
+    /// - `CREATE TYPE name;` — registers a shell type.
+    /// - `CREATE TYPE name (attr = value, ...);` — completes the type;
+    ///   only LIKE = <base> is interpreted, the remaining attributes
+    ///   (input/output functions, etc.) are accepted and ignored.
+    fn parse_create_type(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("type")?;
+        let name = self.expect_ident()?;
+        let like_base = if *self.peek() == Token::LParen {
+            self.next();
+            let mut like_base = None;
+            loop {
+                let key = self.expect_ident()?;
+                self.expect(Token::Eq, "'='")?;
+                let val = self.expect_ident()?;
+                if key == "like" {
+                    like_base = Some(val);
+                }
+                match self.next() {
+                    Token::Comma => {}
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            like_base
+        } else {
+            None
+        };
+        Ok(Stmt::CreateType { name, like_base })
     }
 
     /// ALTER SEQUENCE name [options...] — all options optional.
@@ -4932,28 +4973,15 @@ impl Parser {
 
     /// Shared `WHERE col = lit|$N [AND ...]` tail for UPDATE/DELETE
     /// (kept simple; SELECT uses full predicates since v0.6).
-    fn parse_where_opt(&mut self) -> Result<Vec<WhereCond>, SqlError> {
-        let mut where_ = Vec::new();
+    /// v0.22: UPDATE/DELETE WHERE is a full predicate expression
+    /// (previously only `col = literal` was accepted). Mirrors the
+    /// ON CONFLICT DO UPDATE ... WHERE parsing.
+    fn parse_where_expr_opt(&mut self) -> Result<Option<Expr>, SqlError> {
         if self.eat_keyword("where") {
-            loop {
-                let col = self.expect_ident()?;
-                self.expect(Token::Eq, "'='")?;
-                let rhs = match self.peek() {
-                    Token::Param(n) => {
-                        let n = *n;
-                        self.next();
-                        WhereRhs::Param(n)
-                    }
-                    _ => WhereRhs::Lit(self.parse_literal()?),
-                };
-                where_.push(WhereCond { col, rhs });
-                if self.eat_keyword("and") {
-                    continue;
-                }
-                break;
-            }
+            Ok(Some(self.parse_or()?))
+        } else {
+            Ok(None)
         }
-        Ok(where_)
     }
 
     fn parse_update(&mut self) -> Result<Stmt, SqlError> {
@@ -4974,7 +5002,7 @@ impl Parser {
         if sets.is_empty() {
             return Err(err("syntax error: UPDATE requires at least one assignment"));
         }
-        let where_ = self.parse_where_opt()?;
+        let where_ = self.parse_where_expr_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Update {
             table,
@@ -4988,7 +5016,7 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("from")?;
         let table = self.expect_ident()?;
-        let where_ = self.parse_where_opt()?;
+        let where_ = self.parse_where_expr_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Delete {
             table,
@@ -5670,6 +5698,27 @@ impl Parser {
             // tracked in v0.9 (documented).
             self.parse_cascade_opt()?;
             return Ok(Stmt::DropSequence { names, if_exists });
+        }
+        // v0.22: DROP TYPE [IF EXISTS] name [, ...] [CASCADE | RESTRICT].
+        // CASCADE/RESTRICT are accepted; dependents are not tracked
+        // (bounded shell-type support).
+        if self.eat_keyword("type") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            self.parse_cascade_opt()?;
+            return Ok(Stmt::DropType { names, if_exists });
         }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
@@ -7009,7 +7058,7 @@ impl<'a> SexprParser<'a> {
             "real" => Literal::Real(self.atom()?.parse().map_err(|_| "bad real")?),
             "numeric" => {
                 let unscaled: i128 = self.atom()?.parse().map_err(|_| "bad numeric")?;
-                let scale: u32 = self.atom()?.parse().map_err(|_| "bad numeric")?;
+                let scale: i32 = self.atom()?.parse().map_err(|_| "bad numeric")?;
                 Literal::Numeric(crate::storage::Numeric::new(unscaled, scale))
             }
             "text" => Literal::Text(self.atom()?.into()),
@@ -7054,7 +7103,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn coltype_by_name(name: &str) -> Result<ColType, String> {
+pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
     Ok(match name {
         "integer" | "int" | "int4" => ColType::Int,
         "bigint" | "int8" => ColType::BigInt,
