@@ -253,9 +253,18 @@ fn decode_ustr(s: &str, escape: char) -> Option<String> {
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
-    let chars: Vec<char> = input.chars().collect();
+    // A `str`'s char count can never exceed its byte length, so this is a
+    // safe upper bound that guarantees `chars` never regrows (Chars'
+    // size_hint lower bound is byte_len/4, sized for all-4-byte UTF-8, and
+    // badly undershoots for the ASCII-heavy SQL text this tokenizes).
+    let mut chars: Vec<char> = Vec::with_capacity(input.len());
+    chars.extend(input.chars());
     let mut i = 0;
-    let mut toks = Vec::new();
+    // Every token consumes at least one char (comments consume chars but
+    // push nothing), plus exactly one more for the trailing `Token::EOF`,
+    // so `chars.len() + 1` is a safe upper bound that guarantees `toks`
+    // never regrows either.
+    let mut toks = Vec::with_capacity(chars.len() + 1);
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
@@ -511,8 +520,27 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 {
                     i += 1;
                 }
-                let word: String = chars[start..i].iter().collect();
-                toks.push(Token::Ident(word.to_lowercase()));
+                let span = &chars[start..i];
+                // Fast path: SQL identifiers are ASCII in virtually every
+                // real query (Postgres's own unquoted-identifier folding
+                // is itself ASCII-only), so build the lowercase text
+                // directly in one allocation instead of collecting the
+                // original-case text and then `.to_lowercase()`-ing a
+                // second String. Non-ASCII identifiers keep the original
+                // two-step path exactly, since `to_lowercase()` handles
+                // full-Unicode case folding (e.g. context-sensitive Greek
+                // final sigma) that a per-char map cannot.
+                let word: String = if span.iter().all(|c| c.is_ascii()) {
+                    let mut s = String::with_capacity(span.len());
+                    for c in span {
+                        s.push(c.to_ascii_lowercase());
+                    }
+                    s
+                } else {
+                    let raw: String = span.iter().collect();
+                    raw.to_lowercase()
+                };
+                toks.push(Token::Ident(word));
             }
             _ => return Err(err(format!("unexpected character '{}'", c))),
         }

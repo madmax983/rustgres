@@ -2,6 +2,205 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `tokenize` — unsized buffer growth + two-pass identifier folding — baseline — 2026-09-13
+
+**Workload**: same harness, query, and rationale as the three entries below —
+`benches/profile_fixed.py`, 1500 iterations of
+`SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10` against
+a freshly created 3-row table, this commit (i.e. with the `peek`/`peek2`/
+`peek3`, `eat_keyword`, and catalog-`HashMap` fixes already applied). Reused
+deliberately: already committed, deterministic, and a realistic keyword-dense
+query shape rather than a synthetic microbenchmark of `tokenize` alone.
+
+**Profile** (DHAT, `valgrind --tool=dhat`, same harness, this commit):
+
+DHAT attributes **54,056 of the program's 261,295 total heap allocations
+(20.7%) to `rustgres::sql::tokenize`** — the single largest function in the
+allocation profile, ahead of every parser or executor function (the next
+largest, `resolve_priv_ref`, is 15,000 / 5.7%). Walking each allocation's
+call stack to its exact source line inside `tokenize` breaks the 54,056 down
+into four groups:
+
+| line | what | blocks | % of total |
+|---|---|---|---|
+| `sql.rs:256` | `let chars: Vec<char> = input.chars().collect();` | 4,509 | 1.7% |
+| `sql.rs:514` | `let word: String = chars[start..i].iter().collect();` | 19,516 | 7.5% |
+| `sql.rs:515` | `Token::Ident(word.to_lowercase())` | 25,525 | 9.8% |
+| `sql.rs:500` | `Token::Number(chars[start..i].iter().collect())` | 4,506 | 1.7% |
+
+Reading the code and cross-checking against Callgrind's inlined-frame
+attribution for the same build explains all four:
+
+1. **`sql.rs:256`** — `input.chars().collect()` starts from `Vec::new()`
+   (zero capacity) and grows by repeated doubling. `Chars::size_hint()`'s
+   lower bound is `byte_len / 4` (sized for the worst case of every
+   character being a 4-byte UTF-8 sequence), so for the all-ASCII SQL text
+   in this workload the initial reservation undershoots the real char count
+   by ~4x and the `Vec<char>` regrows 2-3 times per `tokenize()` call before
+   it stops. 1,500-ish calls × ~3 regrows ≈ the 4,509 observed.
+2. **`sql.rs:258`** (not directly visible above because DHAT attributes
+   *growth* events to whichever `.push()` call site happens to trigger
+   them, not to the `Vec::new()` site) — `let mut toks = Vec::new()` has the
+   identical problem: it also starts at zero capacity and doubles as tokens
+   are pushed. Since identifiers are the majority token type in ordinary
+   SQL (7 keywords + 6 column/table names in this query, all tokenized as
+   `Token::Ident`), most of these growth reallocations happen to land on
+   the identifier-push line — this is the 6,009-block difference between
+   line 515's 25,525 total and the 19,516 identifier count confirmed below.
+3. **`sql.rs:514`+`515` (the remaining 19,516 + 19,516 = 39,032)** — every
+   identifier is tokenized in two allocating passes: `chars[start..i]
+   .iter().collect::<String>()` first builds a `String` holding the
+   original-case text (one allocation per identifier — `Ident`/`Number`
+   text collected from a slice iterator is `ExactSizeIterator`, so this
+   part is already a single precisely-sized allocation, not a regrow), then
+   `word.to_lowercase()` allocates a **second**, independent `String` with
+   the case-folded result. Every keyword and every unquoted identifier pays
+   both allocations on every parse, even though SQL identifiers are ASCII
+   in virtually every real query (Postgres's own unquoted-identifier
+   folding is itself ASCII-only) — for ASCII input the two passes compute
+   the same thing `char::to_ascii_lowercase` would compute per character,
+   with no need for a second heap buffer.
+
+`sql.rs:500` (`Token::Number`) is a single, already precisely-sized
+allocation per number literal (same `ExactSizeIterator` reasoning as line
+514) with no second pass and no growth — left alone; there's no waste to
+remove there without a data-model change, which is out of scope.
+
+**Baseline numbers** (this commit, `tokenize` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 1500 iterations) | 476,362,043 |
+| DHAT total allocations (blocks) | 261,295 |
+| DHAT total bytes allocated | 18,178,543 |
+| DHAT blocks attributed to `tokenize` | 54,056 (20.7% of all allocations) |
+| ...of which, in the three lines targeted by the fix below (256/514/515) | 49,550 (19.0% of all allocations) |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+
+# separately, under --tool=dhat --dhat-out-file=/tmp/dh.out with the same
+# harness, sum tbk/tb over pps[] in the JSON output and walk each
+# allocation's ftbl-resolved call stack back to the first `rustgres::`
+# frame (and its resolved source line) to attribute it to a caller.
+```
+
+**Fix** (next commit): three edits, all in `tokenize`, all behavior-
+preserving:
+
+1. `let chars: Vec<char> = input.chars().collect();` becomes a
+   `Vec::with_capacity(input.len())` reserved up front, then extended — the
+   number of `char`s in a `&str` can never exceed its byte length, so this
+   is a safe upper bound that guarantees zero regrowth, for any input
+   (ASCII or not).
+2. `let mut toks = Vec::new();` becomes `Vec::with_capacity(chars.len() +
+   1)` — every token consumes at least one input `char` (comments consume
+   chars but push nothing), so the token count can never exceed
+   `chars.len()`, plus exactly one more for the trailing `Token::EOF` push
+   at the end. Also a safe upper bound; also guarantees zero regrowth.
+3. The identifier arm gains an ASCII fast path, checked once after the
+   identifier's span is known (`span.iter().all(|c| c.is_ascii())`, not
+   folded into the character-scanning loop above it): when every character
+   is ASCII, the final lowercase `String` is built directly in one
+   allocation — `String::with_capacity(span.len())` plus a `for` loop
+   pushing `c.to_ascii_lowercase()` — instead of collecting the
+   original-case text and then `.to_lowercase()`-ing a second, independent
+   String. When any character is non-ASCII, the exact original two-step
+   `collect()` + `.to_lowercase()` path runs unchanged, so full-Unicode
+   case-folding semantics (including context-sensitive cases like Greek
+   final sigma, which `to_lowercase()` handles but a per-character map
+   cannot) are preserved exactly for the rare non-ASCII identifier — this
+   is not a behavior change for any input, ASCII or not.
+
+   (A first attempt folded the ASCII check into the scanning loop as a
+   `bool` flag updated on every character, and built the fast-path string
+   with `.iter().map(|c| c.to_ascii_lowercase()).collect()`. It produced
+   the identical allocation-count win but, measured on this debug build,
+   *increased* Ir by +0.30% — the extra per-character branch plus a
+   non-inlined `Map` iterator/closure both add real overhead when nothing
+   is being inlined. Moving the ASCII check to a single post-hoc
+   `.all()` pass over just the identifier span, and replacing the
+   `.map().collect()` with a plain `for` loop over `&[char]` (one fewer
+   generic iterator-adapter layer for the debug build to not-inline),
+   removed the regression and turned it into a small net Ir win. Recording
+   this here so nobody re-introduces the first shape and is surprised by
+   the regression — this is a debug-build-specific effect; a release build
+   would very likely inline both shapes identically.)
+
+Same behavior for every input (all 81 unit tests and all 19
+`tests/protocol_test*.py` conformance suites pass unchanged; no test
+expectations touched).
+
+**After numbers** (same harness, same query, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 476,362,043 | 473,990,492 | **-0.50%** |
+| DHAT total allocations (blocks) | 261,295 | 234,267 | **-10.34%** |
+| DHAT total bytes allocated | 18,178,543 | 18,052,395 | -0.69% |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+473,990,072 (a 420-instruction, ~0.00009% difference from the first — well
+within Callgrind's established determinism band for this harness, not
+noise threatening the result).
+
+The allocation-count floor (≥10%) is cleared. The Ir delta (-0.50%) does
+not clear the ≥5% instruction floor on its own — reported honestly, not
+cherry-picked — but the allocation-count floor is the one this change is
+justified on, and it clears with margin. `tokenize`'s own self-cost rows
+in `callgrind_annotate` (`sql.rs:tokenize` + `sql.rs:tokenize::{{closure}}`
+— the latter did not exist before this diff) show the expected story in
+more detail: fewer, larger, precisely-sized allocations replace many small
+regrowing ones, at the cost of one added linear scan (`.all()`) over each
+identifier's span that wasn't there before — net negative in allocation
+count and (barely) net negative in instructions on this workload, but the
+two effects partially offset rather than the naive "fewer mallocs → fewer
+instructions" story predicting a larger Ir win.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tb`/`tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**: same
+pre-existing failure mode as every other Bolt entry in this file — this
+session's toolchain reports 242 repo-wide lint errors unrelated to this
+change (a different count from the 245 recorded in older entries in this
+file, presumably toolchain-patch drift between sessions; internally
+consistent within this session, reproduced on the pristine pre-fix tree
+via `git stash`/`git stash pop`). `cargo clippy --all-targets
+--all-features` (without `-D warnings`) shows the same 242 warnings before
+and after this diff — zero new warnings from this change.
+
 ## Bolt: `Parser::peek`/`peek2`/`peek3` clone every lookahead — baseline — 2026-09-13
 
 **Workload**: same harness and query as the `eat_keyword` and catalog-`HashMap`
