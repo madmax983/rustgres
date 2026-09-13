@@ -111,26 +111,95 @@ preserving:
    chars but push nothing), so the token count can never exceed
    `chars.len()`, plus exactly one more for the trailing `Token::EOF` push
    at the end. Also a safe upper bound; also guarantees zero regrowth.
-3. The identifier arm gains an ASCII fast path computed during the same
-   scan that already walks the identifier's characters (no extra pass):
-   when every character is ASCII, the final lowercase `String` is built
-   directly with one `.map(|c| c.to_ascii_lowercase()).collect()`, skipping
-   the intermediate original-case `String` entirely (one allocation instead
-   of two). When any character is non-ASCII, the exact original two-step
+3. The identifier arm gains an ASCII fast path, checked once after the
+   identifier's span is known (`span.iter().all(|c| c.is_ascii())`, not
+   folded into the character-scanning loop above it): when every character
+   is ASCII, the final lowercase `String` is built directly in one
+   allocation — `String::with_capacity(span.len())` plus a `for` loop
+   pushing `c.to_ascii_lowercase()` — instead of collecting the
+   original-case text and then `.to_lowercase()`-ing a second, independent
+   String. When any character is non-ASCII, the exact original two-step
    `collect()` + `.to_lowercase()` path runs unchanged, so full-Unicode
    case-folding semantics (including context-sensitive cases like Greek
    final sigma, which `to_lowercase()` handles but a per-character map
    cannot) are preserved exactly for the rare non-ASCII identifier — this
    is not a behavior change for any input, ASCII or not.
 
-Same behavior for every input (all 81 unit/integration tests and all 21
-protocol conformance suites pass unchanged; no test expectations touched).
+   (A first attempt folded the ASCII check into the scanning loop as a
+   `bool` flag updated on every character, and built the fast-path string
+   with `.iter().map(|c| c.to_ascii_lowercase()).collect()`. It produced
+   the identical allocation-count win but, measured on this debug build,
+   *increased* Ir by +0.30% — the extra per-character branch plus a
+   non-inlined `Map` iterator/closure both add real overhead when nothing
+   is being inlined. Moving the ASCII check to a single post-hoc
+   `.all()` pass over just the identifier span, and replacing the
+   `.map().collect()` with a plain `for` loop over `&[char]` (one fewer
+   generic iterator-adapter layer for the debug build to not-inline),
+   removed the regression and turned it into a small net Ir win. Recording
+   this here so nobody re-introduces the first shape and is surprised by
+   the regression — this is a debug-build-specific effect; a release build
+   would very likely inline both shapes identically.)
+
+Same behavior for every input (all 81 unit tests and all 19
+`tests/protocol_test*.py` conformance suites pass unchanged; no test
+expectations touched).
+
+**After numbers** (same harness, same query, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 476,362,043 | 473,990,492 | **-0.50%** |
+| DHAT total allocations (blocks) | 261,295 | 234,267 | **-10.34%** |
+| DHAT total bytes allocated | 18,178,543 | 18,052,395 | -0.69% |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+473,990,072 (a 420-instruction, ~0.00009% difference from the first — well
+within Callgrind's established determinism band for this harness, not
+noise threatening the result).
+
+The allocation-count floor (≥10%) is cleared. The Ir delta (-0.50%) does
+not clear the ≥5% instruction floor on its own — reported honestly, not
+cherry-picked — but the allocation-count floor is the one this change is
+justified on, and it clears with margin. `tokenize`'s own self-cost rows
+in `callgrind_annotate` (`sql.rs:tokenize` + `sql.rs:tokenize::{{closure}}`
+— the latter did not exist before this diff) show the expected story in
+more detail: fewer, larger, precisely-sized allocations replace many small
+regrowing ones, at the cost of one added linear scan (`.all()`) over each
+identifier's span that wasn't there before — net negative in allocation
+count and (barely) net negative in instructions on this workload, but the
+two effects partially offset rather than the naive "fewer mallocs → fewer
+instructions" story predicting a larger Ir win.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tb`/`tbk` over the `pps` array in the JSON output.
 
 **Note on `cargo clippy --all-targets --all-features -- -D warnings`**: same
-pre-existing failure mode as every other Bolt entry in this file (245
-repo-wide lint errors unrelated to this change, reproduced on the pristine
-pre-fix tree). `cargo clippy --all-targets --all-features` (without `-D
-warnings`) shows the same 245 warnings before and after this diff.
+pre-existing failure mode as every other Bolt entry in this file — this
+session's toolchain reports 242 repo-wide lint errors unrelated to this
+change (a different count from the 245 recorded in older entries in this
+file, presumably toolchain-patch drift between sessions; internally
+consistent within this session, reproduced on the pristine pre-fix tree
+via `git stash`/`git stash pop`). `cargo clippy --all-targets
+--all-features` (without `-D warnings`) shows the same 242 warnings before
+and after this diff — zero new warnings from this change.
 
 ## Bolt: `Parser::peek`/`peek2`/`peek3` clone every lookahead — baseline — 2026-09-13
 
