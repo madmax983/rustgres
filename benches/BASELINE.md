@@ -113,12 +113,18 @@ its capacity, so a cast allocates only the `Arc<str>`. Without those two
 fixes both workloads regressed by about 50%.
 
 **Behavior**: unchanged. 87 `cargo test` unit tests pass (81 before, plus
-6 new ownership tests). All 19 `tests/protocol_test*.py` suites pass —
-the 15 self-managed suites standalone, the four that expect a running
-server (`protocol_test.py`, `2`, `3`, `19`) against one shared instance.
-The conformance runner scores the same as `main`: 5193 statements, PASS
-2605 (50.2%), EXPECTED-FAIL 1557, REAL-FAIL 1031. The WAL byte format
-does not change.
+6 new ownership tests). 18 of the 19 `tests/protocol_test*.py` suites
+pass every time — the self-managed suites standalone, the four that
+expect a running server (`protocol_test.py`, `2`, `3`, `19`) against one
+shared instance. The conformance runner scores the same as `main`: 5193
+statements, PASS 2605 (50.2%), EXPECTED-FAIL 1557, REAL-FAIL 1031. The
+WAL byte format does not change.
+
+`protocol_test12.py` is flaky, and it is flaky on `main` too: its
+connection-timing cases (`t_error_code_pins`, `t_cancel_request_quiet`)
+fail in 2 of 4 runs on `main` and in 2 of 4 runs on this branch, with the
+same case and the same error. This change does not alter the rate. The
+suite passes 65/65 when it does not hit the race.
 
 **Note on `cargo clippy --all-targets --all-features`**: same
 pre-existing failure as every Bolt entry below — `clippy::eq_op` on
