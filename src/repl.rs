@@ -49,6 +49,8 @@ use crate::server::{
     send_row_description,
 };
 use crate::storage::{ColType, Engine, ReplSlot, Value};
+#[cfg(test)]
+use crate::storage::Row;
 use crate::wal::{Wal, WalRecord};
 
 /// Timeline id: rustgres never branches history, so this is always 1.
@@ -998,7 +1000,7 @@ mod tests {
                 rows: vec![WalRow {
                     id: 1,
                     xmin: 2,
-                    values: vec![Value::Int(1), Value::text("o'clock")],
+                    values: Row::new(vec![Value::Int(1), Value::text("o'clock")]),
                 }],
             },
             WalRecord::UpdateRows {
@@ -1006,12 +1008,12 @@ mod tests {
                 old: vec![WalRow {
                     id: 1,
                     xmin: 2,
-                    values: vec![Value::Int(1), Value::text("a")],
+                    values: Row::new(vec![Value::Int(1), Value::text("a")]),
                 }],
                 new: vec![WalRow {
                     id: 2,
                     xmin: 3,
-                    values: vec![Value::Int(1), Value::Null],
+                    values: Row::new(vec![Value::Int(1), Value::Null]),
                 }],
                 xmax: 3,
             },
@@ -1021,7 +1023,7 @@ mod tests {
                 old_rows: vec![WalRow {
                     id: 2,
                     xmin: 3,
-                    values: vec![Value::Int(1), Value::Null],
+                    values: Row::new(vec![Value::Int(1), Value::Null]),
                 }],
                 xmax: 4,
             },
@@ -1065,7 +1067,7 @@ mod tests {
             rows: vec![WalRow {
                 id: 1,
                 xmin: 2,
-                values: vec![Value::Int(7)],
+                values: Row::new(vec![Value::Int(7)]),
             }],
         }];
         assert_eq!(

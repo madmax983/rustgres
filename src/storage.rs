@@ -1501,12 +1501,17 @@ fn float4_text(f: f32) -> String {
 }
 
 /// One version of one row. UPDATE = mark the old version's `xmax` and
+/// Row cells, shared by reference count. A clone bumps the count instead
+/// of copying the cells. Rows never change in place — an MVCC write
+/// pushes a new [`RowVersion`] — so sharing is always safe.
+pub type Row = Arc<Vec<Value>>;
+
 /// append a new version; DELETE = mark `xmax`.
 #[derive(Clone, Debug)]
 pub struct RowVersion {
     /// Globally unique, never reused (survives crashes via the WAL).
     pub id: u64,
-    pub values: Vec<Value>,
+    pub values: Row,
     /// Xid of the creating transaction.
     pub xmin: u64,
     /// Xid of the deleting/updating transaction; 0 = not deleted.
@@ -2281,7 +2286,7 @@ impl Engine {
         let txns = &self.txns;
         // Collect (id, values) of the dead versions first: index cleanup
         // needs each version's key, hence its values.
-        let mut dead: Vec<(u64, Vec<Value>)> = Vec::new();
+        let mut dead: Vec<(u64, Row)> = Vec::new();
         if let Some(versions) = self.db.tables.get_mut(name) {
             for t in versions {
                 for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
@@ -2725,7 +2730,7 @@ pub enum WriteOp {
         old_id: u64,
         new_id: u64,
         prev_xmax: u64,
-        old_values: Vec<Value>,
+        old_values: Row,
     },
     CreateTable {
         name: String,
@@ -2810,7 +2815,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // values are cloned and the table borrow is dropped first.
             // (DELETE/UPDATE never remove entries, so undoing an insert is
             // the only DML case that touches the index.)
-            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
                 let mut out = None;
                 for t in versions.iter_mut() {
                     if let Some(pos) = t.row_pos(*row_id) {
@@ -2850,7 +2855,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
             old_values: _,
         } => {
-            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
                 let mut out = None;
                 for t in versions.iter_mut() {
                     if let Some(pos) = t.row_pos(*new_id) {
@@ -3110,7 +3115,7 @@ mod tests {
                 let mut t = Table::new(vec![("a".to_string(), ColType::Int)], 1);
                 t.push_version(RowVersion {
                     id: 1,
-                    values: vec![Value::Int(1)],
+                    values: Row::new(vec![Value::Int(1)]),
                     xmin: 1,
                     xmax: 0,
                 });
@@ -3192,13 +3197,13 @@ mod tests {
         let t = &mut eng.db.tables.get_mut("t").unwrap()[0];
         t.push_version(RowVersion {
             id: 2,
-            values: vec![Value::Int(2)],
+            values: Row::new(vec![Value::Int(2)]),
             xmin: 1,
             xmax: 8,
         });
         t.push_version(RowVersion {
             id: 3,
-            values: vec![Value::Int(3)],
+            values: Row::new(vec![Value::Int(3)]),
             xmin: 1,
             xmax: 0,
         });
@@ -3212,7 +3217,7 @@ mod tests {
         let mut eng = engine_with_table();
         eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
             id: 9,
-            values: vec![Value::Int(9)],
+            values: Row::new(vec![Value::Int(9)]),
             xmin: 7,
             xmax: 0,
         });
