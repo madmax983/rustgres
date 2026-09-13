@@ -2,6 +2,83 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Parser::peek`/`peek2`/`peek3` clone every lookahead — baseline — 2026-09-13
+
+**Workload**: same harness and query as the `eat_keyword` and catalog-`HashMap`
+entries below — `benches/profile_fixed.py`, 1500 iterations of
+`SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10` against
+a freshly created 3-row table. Reused deliberately, same rationale as those
+two entries: already committed, deterministic, and a realistic query shape
+end-to-end rather than a synthetic microbenchmark of the function being
+changed.
+
+**Profile** (Callgrind, debug build, `valgrind --tool=callgrind
+--cache-sim=yes --branch-sim=yes`, 1500 iterations, this commit — i.e. with
+the `eat_keyword` and catalog-`HashMap` fixes already applied):
+
+DHAT (`valgrind --tool=dhat`, same harness) attributes **97,534 of the
+program's 340,815 total heap allocations (28.6%) to `<Token as
+Clone>::clone` (`sql.rs:70`/`71`)**, and of those, 97,534 (effectively all
+of them — 96,034 via `peek`, 1,500 via `peek2`) are reached through
+`Parser::peek`/`peek2`/`peek3`, confirmed by walking each allocation's
+full DHAT call stack back to its caller. `Token` is `#[derive(Clone)]` over
+an enum whose token-bearing variants (`Ident(String)`, `Number(String)`,
+`Str(String)`, `UStr(String)`) heap-allocate a fresh `String` on every
+clone. `peek`/`peek2`/`peek3` are the parser's whole lookahead surface —
+127 call sites across `sql.rs` (122 `.peek()`, 3 `.peek2()`, 2 `.peek3()`)
+covering essentially every dispatch decision in the recursive-descent
+parser — and every one of them returns an *owned* `Token` by cloning
+`self.tokens[pos]`, even when the caller only compares or matches the
+result and immediately drops it (the overwhelmingly common case: a failed
+`Token::LParen`/`Token::Comma`/keyword-`Ident` probe during dispatch).
+`eat_keyword` (fixed in the entry below) was one such caller, bypassed by
+going straight to `self.tokens.get(self.pos)`; the other 127 call sites
+across the rest of the parser still pay this on every lookahead.
+
+**Baseline numbers** (this commit, `peek`/`peek2`/`peek3` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 1500 iterations) | 509,202,550 |
+| DHAT total allocations (blocks) | 340,815 |
+| DHAT total bytes allocated | 18,450,076 |
+| DHAT blocks attributed to `Token::clone` reached via `peek`/`peek2`/`peek3` | 97,534 (28.6% of all allocations) |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+# and, separately, under --tool=dhat, sum tbk/tb over pps[] in the JSON
+# output and walk each allocation's ftbl-resolved call stack back to the
+# first `rustgres::` frame to attribute it to a caller.
+```
+
+**Fix** (next commit): `peek`/`peek2`/`peek3` return `&Token` (a borrow
+into `self.tokens`) instead of an owned, cloned `Token`. `next()` (which
+legitimately consumes and returns ownership of the current token) clones
+explicitly at its one call to `peek()`, so its behavior is unchanged. Every
+other call site — 127 of them — either already worked unchanged under
+Rust's match ergonomics (`matches!(self.peek(), Token::X)`, `match
+self.peek() { Token::Ident(s) => ... }` with `s` now binding as `&String`),
+needed a `*` deref for a direct equality comparison (`*self.peek() ==
+Token::Comma`), or — the handful of call sites that actually move the
+matched string/number out (a handful of alias/type-name/qualified-`*`
+parses) — an explicit `.clone()` at that one point, no earlier. Same
+behavior (all 81 unit/integration tests plus all 21 protocol conformance
+suites pass unchanged; no test expectations touched), and every keyword or
+punctuation lookahead that used to clone now doesn't.
+
 ## Bolt: catalog `HashMap` hasher — baseline — 2026-09-13
 
 **Workload**: same harness and query as the `eat_keyword` entry below —
