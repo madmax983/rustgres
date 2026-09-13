@@ -2,6 +2,96 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: WHERE/GROUP BY/aggregate scope chain skips heap allocation for non-correlated queries — baseline — 2026-09-13
+
+**Workload**: `benches/profile_join.py --count 100` (unchanged; default 200
+users / 2000 orders / `WHERE u.id < 20`, `GROUP BY`+aggregate+`ORDER BY`),
+the same join-and-aggregate workload the two preceding NUMERIC-normalization
+and row-sharing entries used, run again on top of both (already merged) to
+find the next hotspot in the same join/GROUP BY code paths.
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dh.out ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100
+# SIGTERM the server to flush, then group dhat's pps[] by the innermost
+# rustgres:: frame in each allocation's call stack (fs[] indices into ftbl[]).
+```
+
+**Profile** (DHAT, `valgrind --tool=dhat`, this commit — code unchanged):
+306,690 allocations, 45,745,400 bytes over the 100-iteration run. Grouping
+by the innermost `rustgres::` call-stack frame, the top allocation site is
+`with_capacity_in<rustgres::exec::Scope>` — **120,000 blocks, 39.13% of all
+allocations** — split across four call sites that all build the same
+one-shot value:
+
+| caller | blocks |
+|---|---|
+| `exec::filter_rows` (exec.rs:7009) | 40,000 |
+| `exec::eval_agg_func` (exec.rs:8605) | 40,000 |
+| `exec::apply_where` (exec.rs:7859) | 20,000 |
+| `exec::exec_agg` (exec.rs:8044) | 20,000 |
+
+**Target**: 39.13% of all allocations, well above the 5%-of-profile
+relevance bar.
+
+**Mechanism**: each of these four row-processing loops resolves columns in
+an expression (a `WHERE`/`ON` predicate, a `GROUP BY` key, an aggregate
+argument) against a `Scope` chain — `outer` (the enclosing query's scopes,
+for correlated subqueries) plus one more `Scope` frame for the row being
+processed right now. All four build that chain the same way, **inside the
+per-row loop**: `Vec::with_capacity(outer.len() + 1)` +
+`extend_from_slice(outer)` + `push(frame)` — a fresh heap allocation for
+every row (and, in `filter_rows`, for every `WHERE`-clause conjunct of
+every row, since the allocation sits inside the inner `for c in conjuncts`
+loop too). For the top-level, non-correlated query this workload runs
+(`outer` is `&[]` — every top-level `execute()` call passes `run_select`
+`&[]` for `outer`, and only a correlated-subquery expression ever supplies
+a non-empty one), the resulting `Vec<Scope>` always holds exactly the one
+frame that was just pushed: a heap allocation to hold a value that a
+1-element stack slice would hold for free.
+
+**Baseline numbers** (this commit, all four sites unchanged):
+
+| counter | value |
+|---|---|
+| DHAT total allocations (blocks) | 306,690 |
+| DHAT total bytes allocated | 45,745,400 |
+| DHAT blocks from `with_capacity_in::<Scope>` (the four sites above) | 120,000 (39.13% of all allocations) |
+
+Reproduced with a second DHAT run on the same unchanged binary: 306,692
+blocks, 45,745,376 bytes — within 2 blocks / 24 bytes of the number above,
+i.e. this counter is tight on this workload.
+
+**Note on Callgrind `Ir` for this workload**: two `--tool=callgrind` runs
+of this same unchanged binary/workload, back to back, produced
+10,602,624,702 and 6,628,180,094 total instructions — a 60% swing between
+two runs of identical code with no source change. `profile_join.py`'s
+setup phase does real disk-backed work (2,200 `INSERT`s, each going
+through WAL `fsync`), and on this shared-vCPU machine that I/O work's
+timing — not just wall-clock, but the instruction count itself — is not
+reproducible run to run. `Ir` is therefore not an admissible counter for
+*this* workload on *this* machine; the DHAT allocation count above (tight
+to within 2 blocks across repeats) is used as the sole gating counter for
+this change instead.
+
+**Fix** (next commit): give each of the four sites a fast path — when
+`outer.is_empty()`, evaluate against `std::slice::from_ref(&frame)` (a
+1-element stack slice, no allocation) instead of building a `Vec<Scope>`;
+keep the existing `Vec`-building path, unchanged, for the correlated case
+(`outer` non-empty). `filter_rows` additionally hoists the scope-chain
+construction out of its inner per-conjunct loop (the frame does not depend
+on which conjunct is being evaluated), so it allocates at most once per
+row instead of once per (row, conjunct) pair even on the slow path.
+
 ## Issue #8: rows are shared, not copied, out of table storage — 2026-09-13
 
 **Decision**: issue #8 asked for an ownership-model call on the row
