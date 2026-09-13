@@ -3005,7 +3005,11 @@ pub(crate) fn send_row_description(
 }
 
 pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
-    let mut b = MsgBuilder::new(b'D');
+    // Ordinary rows (a handful of short columns) fit well under this, so
+    // the payload buffer is sized once here instead of growing by
+    // doubling from Vec::new()'s 0 capacity as each field (count, then
+    // per column a length prefix plus text) is appended.
+    let mut b = MsgBuilder::with_capacity(b'D', 64);
     b.i16(row.len() as i16);
     for v in row {
         match v.to_text() {

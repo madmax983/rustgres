@@ -190,6 +190,17 @@ impl MsgBuilder {
         }
     }
 
+    /// Like `new`, but reserves `cap` bytes of payload capacity up front.
+    /// Use when the exact (or a tight upper-bound) payload size is known
+    /// before the first field is written, to avoid the doubling-growth
+    /// reallocations `Vec::new()` would otherwise pay as fields are added.
+    pub fn with_capacity(typ: u8, cap: usize) -> Self {
+        MsgBuilder {
+            typ,
+            payload: Vec::with_capacity(cap),
+        }
+    }
+
     pub fn u8(&mut self, v: u8) -> &mut Self {
         self.payload.push(v);
         self
