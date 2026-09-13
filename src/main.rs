@@ -8,6 +8,7 @@ mod copy;
 mod crypto;
 mod datetime;
 mod exec;
+mod fxhash;
 mod index;
 mod net;
 mod protocol;

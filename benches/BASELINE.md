@@ -2,6 +2,124 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: catalog `HashMap` hasher — baseline — 2026-09-13
+
+**Workload**: same harness and query as the `eat_keyword` entry below —
+`benches/profile_fixed.py`, 1500 iterations of
+`SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10`
+against a freshly created 3-row table. Reused deliberately: it is already
+committed, deterministic, and exercises an ordinary query end-to-end
+(parse, privilege check, plan, execute) rather than a synthetic
+microbenchmark of one function.
+
+**Profile** (Callgrind, debug build, `valgrind --tool=callgrind
+--cache-sim=yes --branch-sim=yes`, 1500 iterations, this commit, i.e.
+with the `eat_keyword` fix already applied):
+
+Total `Ir`: 543,682,768. Summing every `core::hash::sip::*` frame plus
+`core::intrinsics::rotate_left` (confirmed via `callgrind_annotate
+--tree=both` to have no callers other than `Sip13Rounds::c_rounds`/
+`d_rounds` — it is not shared with any other rotate in the program) gives
+**36,720,013 instructions, 6.75% of the total profile** spent computing
+`SipHash` over catalog lookup keys.
+
+`Database`'s six catalog maps (`tables`, `indexes`, `stats`, `views`,
+`sequences`, `roles` — all `HashMap<String, _>`) use Rust's default
+`RandomState`/`SipHash13`. Every one of `find_table`/`find_index`/
+`find_role`/`find_view`/`find_sequence` does a real keyed `.get(name)`
+(not a linear scan — confirmed by reading `storage.rs`), and a single
+ordinary `SELECT` calls into several of them: `check_select_col_privs`
+resolves each referenced column via `find_table` (7,500 calls across
+1500 iterations here — one per column reference), `is_superuser_snap`
+calls `find_role` once per statement (9,002 calls including setup), and
+`plan_access_path` probes `find_index`. Traced via `callgrind_annotate
+--tree=both`: `Hasher::write_str` is called 36,020 times over 1500
+iterations (~24 hashes/query) — all short, trusted keys (table/role/
+column names chosen by whoever is connected to this server), not
+attacker-controlled input from an untrusted network boundary, so the
+DoS-resistance `SipHash` buys has no payoff here, only its fixed
+per-call mixing-round cost.
+
+**Baseline numbers** (this commit, catalog maps still on `RandomState`):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 1500 iterations) | 543,682,768 |
+| Callgrind `Ir` in `SipHash` computation (`sip.rs` + `rotate_left`) | 36,720,013 (6.75%) |
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out > /tmp/flat.txt
+grep -E "hash/sip\.rs|hash/mod\.rs.*Hasher|intrinsics/mod\.rs:core::intrinsics::rotate_left" /tmp/flat.txt
+```
+
+**Fix** (next commit): the six `Database` catalog maps (`tables`,
+`indexes`, `stats`, `views`, `sequences`, `roles`) switch from the
+default `RandomState`/`SipHash13` to a small `FxHasher` (public-domain
+FxHash: rotate-xor-multiply, the same algorithm as the `rustc-hash`
+crate, reimplemented in `src/fxhash.rs` in ~70 lines rather than adding
+a dependency — no `unsafe`, no new crate). No call sites change:
+`HashMap::new()` → `HashMap::default()` at the one construction site
+(`Database::new`) is the only other edit. All 81 tests pass unchanged;
+no test expectations touched.
+
+**After numbers** (same harness, same query, same iteration count,
+same machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (1500 iterations) | 543,682,768 | 509,173,826 | **-6.35%** |
+
+Reproduced with a second `after` run on the same binary: 509,173,639 (a
+187-instruction, ~0.00004% difference from the first — Callgrind's
+normal run-to-run determinism band, not noise threatening the result).
+
+The instruction-count floor (≥5%) is cleared. `SipHash` cost doesn't
+disappear entirely — other `HashMap`/`HashSet`s elsewhere in the
+codebase (GROUP BY, joins, MVCC snapshot sets, session state) are
+untouched by this change and still pay it — but the catalog-lookup
+share of it is gone: post-fix, `sip.rs` + `rotate_left` together are
+down to ~1.7% of `Ir` (was 6.75%), and the new `FxHasher` code
+(`src/fxhash.rs`) accounts for well under 1%.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_fixed.py --count 1500 \
+  --setup "DROP TABLE IF EXISTS kw_bench" \
+  --setup "CREATE TABLE kw_bench(a INT, b INT)" \
+  --setup "INSERT INTO kw_bench VALUES (1,2),(3,4),(5,6)" \
+  --sql "SELECT a, b FROM kw_bench WHERE a = 1 AND b = 2 ORDER BY a LIMIT 10"
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+```
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**:
+same pre-existing failure mode as the `eat_keyword` entry below (this
+environment's clippy reports repo-wide lint errors unrelated to any
+Bolt change). Verified directly: `cargo clippy --all-targets
+--all-features` (without `-D warnings`) reports the exact same 245
+warnings on the pristine pre-fix tree and on this fix — zero new
+warnings from this diff, confirmed by `git stash`/`git stash pop`
+around the clippy run.
+
 ## Bolt: `Parser::eat_keyword` allocation — baseline — 2026-09-12
 
 Every version of this file back to v0.7 has recorded the same finding under
