@@ -1142,7 +1142,11 @@ impl<'a> Dec<'a> {
         for _ in 0..nv {
             values.push(self.value()?);
         }
-        Ok(WalRow { id, xmin, values: Row::new(values) })
+        Ok(WalRow {
+            id,
+            xmin,
+            values: Row::new(values),
+        })
     }
 
     fn record(&mut self) -> Result<WalRecord, String> {
@@ -1178,7 +1182,11 @@ impl<'a> Dec<'a> {
                     for _ in 0..m {
                         values.push(self.value()?);
                     }
-                    rows.push(WalRow { id, xmin, values: Row::new(values) });
+                    rows.push(WalRow {
+                        id,
+                        xmin,
+                        values: Row::new(values),
+                    });
                 }
                 Ok(WalRecord::InsertRows { table, rows })
             }
@@ -1200,7 +1208,11 @@ impl<'a> Dec<'a> {
                         values.push(self.value()?);
                     }
                     ids.push(id);
-                    old_rows.push(WalRow { id, xmin, values: Row::new(values) });
+                    old_rows.push(WalRow {
+                        id,
+                        xmin,
+                        values: Row::new(values),
+                    });
                 }
                 let xmax = self.u64()?;
                 Ok(WalRecord::DeleteRows {
@@ -1815,8 +1827,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // Index the new versions, like live execution's
             // index_insert_row: recovery rebuilds indexes only for the
             // checkpoint image; replayed rows need their entries.
-            let indexed: Vec<(u64, Row)> =
-                new.iter().map(|r| (r.id, r.values.clone())).collect();
+            let indexed: Vec<(u64, Row)> = new.iter().map(|r| (r.id, r.values.clone())).collect();
             // `t`'s borrow ends at its last use above; eng.db is free again.
             for (id, values) in indexed {
                 eng.db.index_insert_row(table, id, &values);

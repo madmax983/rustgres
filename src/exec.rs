@@ -4133,7 +4133,10 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
     render_plan(&plan, 0, &mut lines);
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
-        rows: lines.into_iter().map(|l| Row::new(vec![Value::text(l)])).collect(),
+        rows: lines
+            .into_iter()
+            .map(|l| Row::new(vec![Value::text(l)]))
+            .collect(),
     })
 }
 
@@ -6881,7 +6884,10 @@ fn build_from(
                 let mut prov = Vec::with_capacity(a.prov.len() + b.prov.len());
                 prov.extend(a.prov.iter().cloned());
                 prov.extend(b.prov.iter().cloned());
-                rows.push(QRow { cells: Row::new(cells), prov });
+                rows.push(QRow {
+                    cells: Row::new(cells),
+                    prov,
+                });
             }
         }
         acc_schema = schema;
@@ -7168,7 +7174,10 @@ fn combine_rows(l: &QRow, r: &QRow) -> QRow {
     let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
     prov.extend(l.prov.iter().cloned());
     prov.extend(r.prov.iter().cloned());
-    QRow { cells: Row::new(cells), prov }
+    QRow {
+        cells: Row::new(cells),
+        prov,
+    }
 }
 
 /// LEFT JOIN null-extension for an unmatched left row.
@@ -7802,7 +7811,10 @@ fn build_source(
                             let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
                             prov.extend(l.prov.iter().cloned());
                             prov.extend(r.prov.iter().cloned());
-                            rows.push(QRow { cells: Row::new(cells), prov });
+                            rows.push(QRow {
+                                cells: Row::new(cells),
+                                prov,
+                            });
                         }
                     }
                     if !matched && preserve_left {
@@ -10823,7 +10835,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let len = chars.len() as i64;
             // Negative n drops the last |n| characters (Postgres rule).
             let take = if n >= 0 { n.min(len) } else { (len + n).max(0) };
-            Ok(Value::text(chars[..take as usize].iter().collect::<String>()))
+            Ok(Value::text(
+                chars[..take as usize].iter().collect::<String>(),
+            ))
         }
         "right" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10842,7 +10856,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 (-n).min(len)
             };
-            Ok(Value::text(chars[skip as usize..].iter().collect::<String>()))
+            Ok(Value::text(
+                chars[skip as usize..].iter().collect::<String>(),
+            ))
         }
         "reverse" => Ok(match &vals[0] {
             Value::Null => Value::Null,
@@ -11209,7 +11225,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     // If there's a captured group, return it; else whole match.
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::text(sc[gs..ge].iter().collect::<String>())),
+                            Some((gs, ge)) => {
+                                Ok(Value::text(sc[gs..ge].iter().collect::<String>()))
+                            }
                             None => Ok(Value::Null),
                         }
                     } else {
@@ -11252,7 +11270,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some((ms, me, caps)) => {
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::text(sc[gs..ge].iter().collect::<String>())),
+                            Some((gs, ge)) => {
+                                Ok(Value::text(sc[gs..ge].iter().collect::<String>()))
+                            }
                             None => Ok(Value::Null),
                         }
                     } else {

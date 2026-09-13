@@ -2,6 +2,74 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Issue #8: rows are shared, not copied, out of table storage — 2026-09-13
+
+**Decision**: issue #8 asked for an ownership-model call on the row
+deep-clone at `exec.rs:7426`, which was 73.63% of the allocations in a
+table scan. Both directions the issue named are taken:
+
+1. `Value::Text` holds `Arc<str>` instead of `String`, so a text clone
+   shares the bytes.
+2. `Row` (`Arc<Vec<Value>>`) replaces `Vec<Value>` for row cells, from
+   `RowVersion` through `QRow`, `OutRow`, `SelectOut` and `ExecResult` to
+   the wire, so a scan hands out the stored row instead of a copy.
+
+Sharing is safe because rows never change in place: an MVCC write builds
+a new `Vec` and pushes a new `RowVersion`. `Arc` gives no `&mut` access
+to a shared row, so the compiler holds that rule. `Rc` is not usable —
+`Engine` lives in an `Arc<Mutex<Engine>>` and `Value` must stay `Send`.
+
+**Workload**: `benches/profile_scan.py --rows 10000 --count 30` — the
+same harness and command the issue used.
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dh.out ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# SIGTERM the server to flush, then sum `tbk`/`tb` over `pps` in the JSON.
+```
+
+**Profile** (DHAT):
+
+| | blocks | bytes |
+|---|---|---|
+| before (issue #8 baseline, reproduced) | 814,797 | 197,132,035 |
+| after | 134,768 | 85,382,315 |
+| change | **-83.46%** | **-56.69%** |
+
+The two `exec.rs:7426` entries — 300,000 blocks for the `Vec<Value>` copy
+and 300,000 for the `String` copies inside it — are gone. No scan site
+remains in the profile; what is left is the one-time 10,000-row load
+(`parse_insert`, `tokenize`, `exec_insert`) plus one `Vec<QRow>` per
+query.
+
+**Guard workload**: `benches/profile_join.py --count 100`, to catch the
+one risk of the change — projections and joins now build a `Row` where
+they used to build a bare `Vec`.
+
+| | blocks | bytes |
+|---|---|---|
+| before | 578,399 | 87,621,660 |
+| after | 308,699 | 45,834,288 |
+| change | **-46.63%** | **-47.69%** |
+
+`combine_rows` adds 20,000 `Arc::new` blocks, far below the 240,000 it
+removes at `build_source`.
+
+**Behavior**: unchanged. 86 `cargo test` unit tests pass (81 before, plus
+5 new ownership tests). All 19 `tests/protocol_test*.py` suites pass —
+the self-managed suites standalone, the four that expect a running server
+(`protocol_test.py`, `2`, `3`, `19`) against one shared instance. The
+conformance runner scores identically to `main`: 5193 statements, PASS
+2605 (50.2%), EXPECTED-FAIL 1557, REAL-FAIL 1031.
+
+**Note on `cargo clippy --all-targets --all-features`**: same pre-existing
+failure as every Bolt entry below — `clippy::eq_op` on `cols[1 - 1]`
+(`exec.rs:13816`), untouched by this change. Warning count drops from 240
+on `main` to 237 here; no new warnings. `cargo fmt --all -- --check` is
+clean.
+
 ## Bolt: equi-join comparisons skip NUMERIC normalization — baseline — 2026-09-13
 
 **Workload**: `benches/profile_join.py` (new) — a fixed-iteration-count

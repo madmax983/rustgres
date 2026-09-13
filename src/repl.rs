@@ -48,9 +48,9 @@ use crate::server::{
     Session, Writer, lock_engine, lock_wal, send_data_row, send_error, send_ready,
     send_row_description,
 };
-use crate::storage::{ColType, Engine, ReplSlot, Value};
 #[cfg(test)]
 use crate::storage::Row;
+use crate::storage::{ColType, Engine, ReplSlot, Value};
 use crate::wal::{Wal, WalRecord};
 
 /// Timeline id: rustgres never branches history, so this is always 1.
