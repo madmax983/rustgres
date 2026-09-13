@@ -636,7 +636,7 @@ impl Literal {
             },
             Literal::Real(f) => Value::Float4(f),
             Literal::Numeric(n) => Value::Numeric(n),
-            Literal::Text(s) => Value::Text(s),
+            Literal::Text(s) => Value::text(s),
             Literal::Bool(b) => Value::Bool(b),
             Literal::Date(d) => Value::Date(d),
             Literal::Timestamp(m) => Value::Timestamp(m),

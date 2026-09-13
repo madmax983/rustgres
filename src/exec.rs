@@ -1298,12 +1298,12 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| assign_err(col_name, col_type, lit.type_name())),
-            ColType::Text => Ok(Value::Text(s.clone())),
+            ColType::Text => Ok(Value::text(s.as_str())),
             _ => Err(assign_err(col_name, col_type, lit.type_name())),
         },
         // Unknown-type text literal: through the type's input function
         // (so INSERT INTO d VALUES ('2026-01-01') works for dates).
-        Literal::Text(s) => eval_cast(&Value::Text(s.clone()), *col_type).map_err(|e| {
+        Literal::Text(s) => eval_cast(&Value::text(s.as_str()), *col_type).map_err(|e| {
             if e.code == "42846" {
                 assign_err(col_name, col_type, lit.type_name())
             } else {
@@ -1313,7 +1313,7 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
         // Unknown-type boolean literal.
         Literal::Bool(b) => match col_type {
             ColType::Bool => Ok(Value::Bool(*b)),
-            ColType::Text => Ok(Value::Text(b.to_string())),
+            ColType::Text => Ok(Value::text(if *b { "true" } else { "false" })),
             _ => Err(assign_err(col_name, col_type, lit.type_name())),
         },
         // Typed literals (DATE '...', BYTEA '...', ...): strict.
@@ -1346,7 +1346,7 @@ fn coerce_int_lit(
         ColType::BigInt => i64::try_from(i)
             .map(Value::BigInt)
             .map_err(|_| exec_err("22003", "bigint out of range")),
-        ColType::Text => Ok(Value::Text(i.to_string())),
+        ColType::Text => Ok(Value::text(i.to_string())),
         _ => range(i),
     }
 }
@@ -1369,7 +1369,7 @@ fn coerce_float_lit(
         ColType::Numeric => Numeric::from_f64(f)
             .map(Value::Numeric)
             .map_err(|_| exec_err("22003", "value out of range for type numeric")),
-        ColType::Text => Ok(Value::Text(Value::Float(f).to_text().unwrap_or_default())),
+        ColType::Text => Ok(Value::text(Value::Float(f).to_text().unwrap_or_default())),
         _ => Err(assign_err(col_name, col_type, from)),
     }
 }
@@ -1380,7 +1380,7 @@ fn coerce_numeric_lit(n: &Numeric, col_type: &ColType, col_name: &str) -> Result
         ColType::Numeric => Ok(Value::Numeric(n.clone())),
         ColType::Float4 => Ok(Value::Float4(n.to_f64() as f32)),
         ColType::Float => Ok(Value::Float(n.to_f64())),
-        ColType::Text => Ok(Value::Text(n.to_text())),
+        ColType::Text => Ok(Value::text(n.to_text())),
         _ => Err(assign_err(col_name, col_type, "numeric")),
     }
 }
@@ -2244,7 +2244,7 @@ fn value_matches(value: &Value, lit: &Literal) -> Result<bool, ExecError> {
             Ok(n) => Ok(a == &n),
             Err(_) => Ok(false),
         },
-        (Value::Text(a), Literal::Text(b)) => Ok(a == b),
+        (Value::Text(a), Literal::Text(b)) => Ok(&**a == b.as_str()),
         (Value::Bool(a), Literal::Bool(b)) => Ok(a == b),
         _ => Err(exec_err(
             "42883",
@@ -4127,7 +4127,7 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
     render_plan(&plan, 0, &mut lines);
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
-        rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
+        rows: lines.into_iter().map(|l| vec![Value::text(l)]).collect(),
     })
 }
 
@@ -4337,13 +4337,13 @@ fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
                 .join(",");
             rows.push(QRow {
                 cells: vec![
-                    Value::Text("public".to_string()),
-                    Value::Text(tn.clone()),
-                    Value::Text((*cn).clone()),
+                    Value::text("public"),
+                    Value::text(tn.as_str()),
+                    Value::text(cn.as_str()),
                     Value::Float(cs.null_frac),
                     Value::Float(cs.n_distinct),
-                    Value::Text(format!("{{{}}}", vals)),
-                    Value::Text(format!("{{{}}}", freqs)),
+                    Value::text(format!("{{{}}}", vals)),
+                    Value::text(format!("{{{}}}", freqs)),
                 ],
                 prov: Vec::new(),
             });
@@ -4481,15 +4481,15 @@ fn pg_auth_scan(
             None => Value::Null,
             Some(v) => {
                 if viewer_super {
-                    Value::Text(v.encode())
+                    Value::text(v.encode())
                 } else {
-                    Value::Text("********".to_string())
+                    Value::text("********")
                 }
             }
         };
         let cells = match kind {
             "pg_roles" => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 Value::Bool(r.superuser),
                 Value::Bool(true),
                 Value::Bool(false),
@@ -4499,7 +4499,7 @@ fn pg_auth_scan(
                 valid_until.clone(),
             ],
             "pg_user" => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 // No stable oids in rustgres; hash the name for a
                 // deterministic stand-in.
                 Value::Int(name_oid(&r.name) as i64),
@@ -4511,7 +4511,7 @@ fn pg_auth_scan(
                 Value::Null,
             ],
             _ => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 Value::Bool(r.superuser),
                 Value::Bool(true),
                 Value::Bool(false),
@@ -4584,12 +4584,12 @@ fn pg_replication_slots_rows(eng: &Engine) -> Vec<QRow> {
             let s = &eng.repl_slots[n];
             QRow {
                 cells: vec![
-                    Value::Text(s.name.clone()),
-                    Value::Text(s.plugin.clone()),
-                    Value::Text(s.slot_type.clone()),
+                    Value::text(s.name.as_str()),
+                    Value::text(s.plugin.as_str()),
+                    Value::text(s.slot_type.as_str()),
                     Value::Bool(s.active),
-                    Value::Text(crate::repl::format_lsn(s.restart_lsn)),
-                    Value::Text(crate::repl::format_lsn(s.confirmed_flush_lsn)),
+                    Value::text(crate::repl::format_lsn(s.restart_lsn)),
+                    Value::text(crate::repl::format_lsn(s.confirmed_flush_lsn)),
                 ],
                 prov: Vec::new(),
             }
@@ -8666,7 +8666,7 @@ fn eval_agg_func(
                 }
                 out.push_str(&s);
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
     }
 }
@@ -10032,7 +10032,7 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         return Ok(v.clone());
     }
     match to {
-        ColType::Text => Ok(Value::Text(value_to_text_cast(v))),
+        ColType::Text => Ok(Value::text(value_to_text_cast(v))),
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
             let i = cast_to_int(v)?;
@@ -10140,7 +10140,7 @@ fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
         _ => {
             let mut s = value_to_text_cast(a);
             s.push_str(&value_to_text_cast(b));
-            Ok(Value::Text(s))
+            Ok(Value::text(s))
         }
     }
 }
@@ -10304,7 +10304,7 @@ fn eval_like(
             let (s, p) = if ilike {
                 (s.to_lowercase(), p.to_lowercase())
             } else {
-                (s.clone(), p.clone())
+                (s.to_string(), p.to_string())
             };
             let sc: Vec<char> = s.chars().collect();
             let pc: Vec<char> = p.chars().collect();
@@ -10564,7 +10564,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "transaction_timestamp" => eval_datetime_func(name, vals),
         // v0.17: version() reports our own version, not a PG version we
         // claim to be (see SERVER_VERSION in server.rs).
-        "version" => Ok(Value::Text(format!(
+        "version" => Ok(Value::text(format!(
             "rustgres {} (PostgreSQL-compatible, protocol 3.0)",
             crate::server::SERVER_VERSION
         ))),
@@ -10584,11 +10584,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
-            Some(s) => Value::Text(s.to_uppercase()),
+            Some(s) => Value::text(s.to_uppercase()),
         }),
         "lower" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
-            Some(s) => Value::Text(s.to_lowercase()),
+            Some(s) => Value::text(s.to_lowercase()),
         }),
         "length" | "char_length" | "character_length" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
@@ -10627,7 +10627,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let lo = (from - 1).max(0).min(total) as usize;
             let hi = (upto - 1).max(0).min(total) as usize;
             let (lo, hi) = (lo.min(hi), hi);
-            Ok(Value::Text(chars[lo..hi].iter().collect()))
+            Ok(Value::text(chars[lo..hi].iter().collect::<String>()))
         }
         "trim" => {
             // Parser encodes trim as (spec, chars, str); the 1-arg form
@@ -10638,7 +10638,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(s) => s,
             };
             let spec = match spec {
-                Value::Text(t) => t.as_str(),
+                Value::Text(t) => &**t,
                 _ => return Err(exec_err("22023", "invalid trim specification")),
             };
             if !matches!(spec, "leading" | "trailing" | "both") {
@@ -10655,7 +10655,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 "trailing" => s.trim_end_matches(t).to_string(),
                 _ => s.trim_matches(t).to_string(),
             };
-            Ok(Value::Text(r))
+            Ok(Value::text(r))
         }
         "position" => {
             // bytea position: 1-based byte index, 0 if not found.
@@ -10708,9 +10708,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             };
             // Postgres: empty search string leaves the input unchanged.
             if from.is_empty() {
-                return Ok(Value::Text(s.to_string()));
+                return Ok(Value::text(s));
             }
-            Ok(Value::Text(s.replace(from, to)))
+            Ok(Value::text(s.replace(from, to)))
         }
         "split_part" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10744,7 +10744,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 ""
             };
-            Ok(Value::Text(r.to_string()))
+            Ok(Value::text(r))
         }
         // --- v0.16: missing built-ins (pg_regress 42883 cluster) -----------
         "concat" => {
@@ -10756,7 +10756,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     out.push_str(&t);
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "concat_ws" => {
             // A NULL separator makes the whole result NULL; NULL
@@ -10776,7 +10776,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     first = false;
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "to_hex" | "to_oct" | "to_bin" => {
             // Postgres width rule: int2/int4 render negatives as 32-bit
@@ -10806,7 +10806,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     _ => format!("{:b}", u),
                 }
             };
-            Ok(Value::Text(r))
+            Ok(Value::text(r))
         }
         "left" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10821,7 +10821,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let len = chars.len() as i64;
             // Negative n drops the last |n| characters (Postgres rule).
             let take = if n >= 0 { n.min(len) } else { (len + n).max(0) };
-            Ok(Value::Text(chars[..take as usize].iter().collect()))
+            Ok(Value::text(chars[..take as usize].iter().collect::<String>()))
         }
         "right" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10840,14 +10840,14 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 (-n).min(len)
             };
-            Ok(Value::Text(chars[skip as usize..].iter().collect()))
+            Ok(Value::text(chars[skip as usize..].iter().collect::<String>()))
         }
         "reverse" => Ok(match &vals[0] {
             Value::Null => Value::Null,
             Value::Bytea(b) => Value::Bytea(b.iter().rev().copied().collect()),
             v => match str_arg(name, v)? {
                 None => Value::Null,
-                Some(s) => Value::Text(s.chars().rev().collect()),
+                Some(s) => Value::text(s.chars().rev().collect::<String>()),
             },
         }),
         "encode" => {
@@ -10864,10 +10864,10 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(f) => f.to_lowercase(),
             };
             match fmt.as_str() {
-                "hex" => Ok(Value::Text(hex_encode(data))),
-                "base64" => Ok(Value::Text(base64_encode(data, false))),
-                "base64url" => Ok(Value::Text(base64_encode(data, true))),
-                "escape" => Ok(Value::Text(bytea_escape(data))),
+                "hex" => Ok(Value::text(hex_encode(data))),
+                "base64" => Ok(Value::text(base64_encode(data, false))),
+                "base64url" => Ok(Value::text(base64_encode(data, true))),
+                "escape" => Ok(Value::text(bytea_escape(data))),
                 _ => Err(exec_err("22023", format!("unknown encode format: {}", fmt))),
             }
         }
@@ -10986,7 +10986,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     None => out.push(c),
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "unistr" => {
             // unistr(s): interpret \uXXXX and \UXXXXXXXX escapes.
@@ -10995,7 +10995,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(s) => s,
             };
             match unistr_decode(s) {
-                Some(t) => Ok(Value::Text(t)),
+                Some(t) => Ok(Value::text(t)),
                 None => Err(exec_err("22023", "invalid Unicode escape")),
             }
         }
@@ -11160,7 +11160,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                             None => return Ok(Value::Null),
                         }
                     };
-                    Ok(Value::Text(sc[rs..re_].iter().collect()))
+                    Ok(Value::text(sc[rs..re_].iter().collect::<String>()))
                 }
                 None => Ok(Value::Null),
             }
@@ -11207,11 +11207,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     // If there's a captured group, return it; else whole match.
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            Some((gs, ge)) => Ok(Value::text(sc[gs..ge].iter().collect::<String>())),
                             None => Ok(Value::Null),
                         }
                     } else {
-                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                        Ok(Value::text(sc[ms..me].iter().collect::<String>()))
                     }
                 }
                 _ => Ok(Value::Null),
@@ -11233,7 +11233,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     let total = sc.len() as i64;
                     let from = (*n).max(1);
                     let lo = (from - 1).max(0).min(total) as usize;
-                    return Ok(Value::Text(sc[lo..].iter().collect()));
+                    return Ok(Value::text(sc[lo..].iter().collect::<String>()));
                 }
                 Value::Null => return Ok(Value::Null),
                 Value::Text(_) => {} // Fall through to pattern handling.
@@ -11250,11 +11250,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some((ms, me, caps)) => {
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            Some((gs, ge)) => Ok(Value::text(sc[gs..ge].iter().collect::<String>())),
                             None => Ok(Value::Null),
                         }
                     } else {
-                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                        Ok(Value::text(sc[ms..me].iter().collect::<String>()))
                     }
                 }
                 None => Ok(Value::Null),
@@ -11354,7 +11354,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 }
             }
             out.extend(sc[pos..].iter());
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
@@ -11392,7 +11392,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let mut out: String = sc[..from - 1].iter().collect();
             out.push_str(r);
             out.extend(sc[upto - 1..].iter());
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         _ => Err(exec_err(
             "42883",
@@ -12983,7 +12983,7 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 other => return Err(func_arg_err(name, other)),
             };
             match crate::datetime::format_with_pattern(days, tod, fmt) {
-                Ok(s) => Ok(Value::Text(s)),
+                Ok(s) => Ok(Value::text(s)),
                 Err(e) => Err(fmt_exec_err(e)),
             }
         }
@@ -14601,7 +14601,7 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         ColType::Text => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
-            Ok(Value::Text(s.to_string()))
+            Ok(Value::text(s))
         }
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
@@ -14867,7 +14867,7 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         Some(Value::Float4(f)) => Literal::Real(*f),
         Some(Value::Float(f)) => Literal::Float(*f),
         Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
-        Some(Value::Text(s)) => Literal::Text(s.clone()),
+        Some(Value::Text(s)) => Literal::Text(s.to_string()),
         Some(Value::Bool(b)) => Literal::Bool(*b),
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
@@ -14942,7 +14942,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Float4 => Value::Float4(0.0),
         ColType::Float => Value::Float(0.0),
         ColType::Numeric => Value::Numeric(Numeric::zero()),
-        ColType::Text => Value::Text(String::new()),
+        ColType::Text => Value::text(""),
         ColType::Bool => Value::Bool(false),
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),
@@ -15012,7 +15012,7 @@ mod tests {
         for (i, id, name) in [(1, 1, "ann"), (2, 2, "bob"), (3, 3, "cid")] {
             users.push_version(RowVersion {
                 id: i,
-                values: vec![Value::Int(id), Value::Text(name.into())],
+                values: vec![Value::Int(id), Value::text(name)],
                 xmin: 1,
                 xmax: 0,
             });
@@ -17008,7 +17008,7 @@ fn eval_sequence_func(
 ) -> Result<Value, ExecError> {
     let seq_name = |v: &Value| -> Result<String, ExecError> {
         match v {
-            Value::Text(s) => Ok(s.clone()),
+            Value::Text(s) => Ok(s.to_string()),
             // regclass input: Postgres accepts nextval('seq').
             _ => Err(exec_err(
                 "42883",
@@ -18276,10 +18276,10 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     for tn in names {
         rows.push(QRow {
             cells: vec![
-                Value::Text("rustgres".to_string()),
-                Value::Text("public".to_string()),
-                Value::Text(tn),
-                Value::Text("BASE TABLE".to_string()),
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(tn),
+                Value::text("BASE TABLE"),
             ],
             prov: Vec::new(),
         });
@@ -18297,10 +18297,10 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     for vn in vnames {
         rows.push(QRow {
             cells: vec![
-                Value::Text("rustgres".to_string()),
-                Value::Text("public".to_string()),
-                Value::Text(vn),
-                Value::Text("VIEW".to_string()),
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(vn),
+                Value::text("VIEW"),
             ],
             prov: Vec::new(),
         });
@@ -18351,19 +18351,19 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
     for (tn, t) in tables {
         for (i, (cn, ty)) in t.columns.iter().enumerate() {
             let default = match &t.defaults[i] {
-                Some(d) => Value::Text(format!("{:?}", d)),
+                Some(d) => Value::text(format!("{:?}", d)),
                 None => Value::Null,
             };
             rows.push(QRow {
                 cells: vec![
-                    Value::Text("rustgres".to_string()),
-                    Value::Text("public".to_string()),
-                    Value::Text(tn.clone()),
-                    Value::Text(cn.clone()),
+                    Value::text("rustgres"),
+                    Value::text("public"),
+                    Value::text(tn.as_str()),
+                    Value::text(cn.as_str()),
                     Value::Int((i + 1) as i64),
                     default,
-                    Value::Text(if t.not_null[i] { "NO" } else { "YES" }.to_string()),
-                    Value::Text(format!("{:?}", ty)),
+                    Value::text(if t.not_null[i] { "NO" } else { "YES" }),
+                    Value::text(format!("{:?}", ty)),
                 ],
                 prov: Vec::new(),
             });

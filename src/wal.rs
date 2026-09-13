@@ -1094,7 +1094,7 @@ impl<'a> Dec<'a> {
             0 => Ok(Value::Null),
             1 => Ok(Value::Int(self.i64()?)),
             2 => Ok(Value::Float(self.f64()?)),
-            3 => Ok(Value::Text(self.str()?)),
+            3 => Ok(Value::text(self.str()?)),
             4 => Ok(Value::Bool(self.u8()? != 0)),
             5 => Ok(Value::SmallInt(self.i16()?)),
             6 => Ok(Value::BigInt(self.i64()?)),
@@ -3366,7 +3366,7 @@ mod tests {
                     WalRow {
                         id: 8,
                         xmin: 4,
-                        values: vec![Value::Int(2), Value::Text("x".into())],
+                        values: vec![Value::Int(2), Value::text("x")],
                     },
                 ],
             },
@@ -3402,12 +3402,12 @@ mod tests {
                 old: vec![WalRow {
                     id: 7,
                     xmin: 4,
-                    values: vec![Value::Int(1), Value::Text("a".into())],
+                    values: vec![Value::Int(1), Value::text("a")],
                 }],
                 new: vec![WalRow {
                     id: 10,
                     xmin: 6,
-                    values: vec![Value::Int(1), Value::Text("b".into())],
+                    values: vec![Value::Int(1), Value::text("b")],
                 }],
                 xmax: 6,
             },

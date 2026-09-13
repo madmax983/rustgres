@@ -243,10 +243,10 @@ mod tests {
 
     #[test]
     fn key_ord_is_lexicographic() {
-        let a = IndexKey(vec![Value::Int(1), Value::Text("z".into())]);
-        let b = IndexKey(vec![Value::Int(2), Value::Text("a".into())]);
+        let a = IndexKey(vec![Value::Int(1), Value::text("z")]);
+        let b = IndexKey(vec![Value::Int(2), Value::text("a")]);
         assert!(a < b);
-        let c = IndexKey(vec![Value::Int(1), Value::Text("a".into())]);
+        let c = IndexKey(vec![Value::Int(1), Value::text("a")]);
         assert!(c < a);
     }
 }

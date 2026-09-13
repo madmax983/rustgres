@@ -1752,7 +1752,7 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
     match guc_value(session, name) {
         Some(v) => Ok(ExecResult::Select {
             columns: vec![(name.to_string(), ColType::Text)],
-            rows: vec![vec![Value::Text(v)]],
+            rows: vec![vec![Value::text(v)]],
         }),
         None => Err(ExecError {
             code: "42704",
@@ -2333,20 +2333,20 @@ fn txn_vacuum(
     match table {
         Some(name) => {
             let n = guard.vacuum_table(name);
-            rows.push(vec![Value::Text(format!(
+            rows.push(vec![Value::text(format!(
                 "table \"{}\": removed {} dead row version(s)",
                 name, n
             ))]);
         }
         None => {
             for (name, n) in guard.vacuum_all() {
-                rows.push(vec![Value::Text(format!(
+                rows.push(vec![Value::text(format!(
                     "table \"{}\": removed {} dead row version(s)",
                     name, n
                 ))]);
             }
             if rows.is_empty() {
-                rows.push(vec![Value::Text("vacuum: nothing to remove".to_string())]);
+                rows.push(vec![Value::text("vacuum: nothing to remove")]);
             }
         }
     }

@@ -411,10 +411,10 @@ fn cmd_identify_system(
     send_data_row(
         writer,
         &[
-            Value::Text(system_id.to_string()),
+            Value::text(system_id.to_string()),
             Value::Int(TIMELINE as i64),
-            Value::Text(xlogpos),
-            Value::Text(database.to_string()),
+            Value::text(xlogpos),
+            Value::text(database),
         ],
     )?;
     send_command_complete(writer, session, "IDENTIFY_SYSTEM")
@@ -496,12 +496,12 @@ fn cmd_create_slot(
             send_data_row(
                 writer,
                 &[
-                    Value::Text(name),
-                    Value::Text(format_lsn(consistent_point)),
+                    Value::text(name),
+                    Value::text(format_lsn(consistent_point)),
                     // No exported snapshot in v0.13: the consistent point
                     // is the slot's restart LSN.
                     Value::Null,
-                    Value::Text(if slot_type == "logical" {
+                    Value::text(if slot_type == "logical" {
                         plugin
                     } else {
                         String::new()
@@ -998,7 +998,7 @@ mod tests {
                 rows: vec![WalRow {
                     id: 1,
                     xmin: 2,
-                    values: vec![Value::Int(1), Value::Text("o'clock".into())],
+                    values: vec![Value::Int(1), Value::text("o'clock")],
                 }],
             },
             WalRecord::UpdateRows {
@@ -1006,7 +1006,7 @@ mod tests {
                 old: vec![WalRow {
                     id: 1,
                     xmin: 2,
-                    values: vec![Value::Int(1), Value::Text("a".into())],
+                    values: vec![Value::Int(1), Value::text("a")],
                 }],
                 new: vec![WalRow {
                     id: 2,

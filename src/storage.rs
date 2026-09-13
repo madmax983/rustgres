@@ -22,6 +22,7 @@
 //! by the WAL to name deleted versions and by undo/vacuum to find them.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::fxhash::FxBuildHasher;
 use crate::index::{Index, IndexDef, IndexKey};
@@ -1238,7 +1239,9 @@ pub enum Value {
     Float4(f32),      // v0.7: REAL
     Float(f64),       // FLOAT8
     Numeric(Numeric), // v0.7: NUMERIC
-    Text(String),
+    /// Issue #8: refcounted so a clone shares the bytes. Text cells are
+    /// immutable, so sharing is safe and removes the per-row copy.
+    Text(Arc<str>),
     Bool(bool),
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
@@ -1249,6 +1252,12 @@ pub enum Value {
 }
 
 impl Value {
+    /// Build a text value. Accepts `&str`, `String`, or `Arc<str>`; only
+    /// the `&str` form copies.
+    pub fn text(s: impl Into<Arc<str>>) -> Value {
+        Value::Text(s.into())
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -1260,7 +1269,7 @@ impl Value {
             Value::Float4(f) => Some(float4_text(*f)),
             Value::Float(f) => Some(float_text(*f)),
             Value::Numeric(n) => Some(n.to_text()),
-            Value::Text(s) => Some(s.clone()),
+            Value::Text(s) => Some(s.to_string()),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
@@ -3063,6 +3072,35 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #8: a `Value::Text` clone must share the text bytes. A deep
+    /// copy here is 36.8% of the allocations in a table scan.
+    #[test]
+    fn text_clone_shares_one_buffer() {
+        let a = Value::text("a text long enough to need the heap");
+        let b = a.clone();
+        let (Value::Text(x), Value::Text(y)) = (&a, &b) else {
+            panic!("both values are Text");
+        };
+        assert_eq!(
+            x.as_ptr(),
+            y.as_ptr(),
+            "Value::Text clone must share the buffer, not copy it"
+        );
+        assert_eq!(&**x, "a text long enough to need the heap");
+    }
+
+    /// Sharing must not make two different texts compare equal, and must
+    /// not break ordering.
+    #[test]
+    fn text_equality_and_order_ignore_sharing() {
+        let a = Value::text("abc");
+        let b = Value::text("abc");
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(a, Value::text("abd"));
+    }
 
     fn engine_with_table() -> Engine {
         let mut eng = Engine::new();
