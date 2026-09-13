@@ -195,10 +195,17 @@ impl MsgBuilder {
     /// before the first field is written, to avoid the doubling-growth
     /// reallocations `Vec::new()` would otherwise pay as fields are added.
     pub fn with_capacity(typ: u8, cap: usize) -> Self {
-        MsgBuilder {
-            typ,
-            payload: Vec::with_capacity(cap),
-        }
+        Self::from_payload(typ, Vec::with_capacity(cap))
+    }
+
+    /// Like `new`, but builds into a caller-supplied (expected-empty)
+    /// buffer instead of always allocating a fresh one. Use when sending
+    /// many same-shaped messages back to back (e.g. one per output row of
+    /// a result set): the caller keeps the buffer across calls, so its
+    /// allocation is reused instead of paying one allocate/free cycle per
+    /// message. Retrieve it back afterward with `into_payload`.
+    pub fn from_payload(typ: u8, payload: Vec<u8>) -> Self {
+        MsgBuilder { typ, payload }
     }
 
     pub fn u8(&mut self, v: u8) -> &mut Self {

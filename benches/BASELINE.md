@@ -89,6 +89,64 @@ its (cleared) allocation back afterward. The three hot loops in
 existing `send_data_row` and its one-off callers in `repl.rs` (single-row
 replication-command replies) are untouched.
 
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (30 iterations) | 3,311,865,575 | 3,241,275,220 | -2.13% |
+| DHAT total allocations (blocks) | 1,114,707 | 814,798 | **-26.90%** |
+| DHAT total bytes allocated | 216,330,355 | 197,132,339 | -8.87% |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+3,241,632,054 (a 356,834-instruction, ~0.011% difference from the first —
+within this harness's established determinism band).
+
+The allocation-count floor clears decisively (-26.90%, nearly 3x the ≥10%
+floor); the instruction-count delta (-2.13%) does not clear the ≥5% floor
+on its own, same tradeoff as the prior `send_data_row` capacity-reservation
+entry in this file (Ir -4.91%, allocations -22.95%) — reported honestly
+rather than only citing the more favorable counter. `MsgBuilder::with_
+capacity` (protocol.rs:200) disappears from the DHAT top-allocators list
+entirely for this workload. The two larger sites flagged in the baseline
+above (`Value::clone` + its `Vec<Value>` buffer, together 61.9% of the
+pre-fix blocks) are unchanged, now the top two DHAT sites at 42.96% and
+41.73% of the (smaller) post-fix total — still flagged as future work
+requiring a human decision on the `Value`/`Table` ownership model, not
+addressed here.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**: same
+pre-existing failure mode as every other Bolt entry in this file — this
+session's toolchain reports 242 repo-wide lint errors unrelated to this
+change. `cargo clippy --all-targets --all-features` (without `-D
+warnings`) shows the same 242 warnings before and after this diff
+(verified via `git stash`/`git stash pop` on the pristine pre-fix tree) —
+zero new warnings from this change.
+
+**Conformance**: all 19 `tests/protocol_test*.py` suites pass unchanged
+against the fixed binary (`protocol_test.py` through `protocol_test21.py`
+— the self-managed suites run standalone, each spawning and tearing down
+its own server instance; the four that expect an already-running server
+(`protocol_test.py`, `2`, `3`, `19`) run together against one shared
+instance), in addition to the 81 `cargo test --all-features` unit tests.
+`cargo fmt --all -- --check` is clean.
+
 ## Bolt: `send_data_row` per-column text materialization — baseline — 2026-09-13
 
 **Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged from

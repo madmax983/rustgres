@@ -862,8 +862,9 @@ fn handle_query(
             }
             Ok(ExecResult::Select { columns, rows }) => {
                 send_row_description(stream, &columns)?;
+                let mut row_buf = Vec::new();
                 for row in &rows {
-                    send_data_row(stream, row)?;
+                    send_data_row_buf(stream, row, &mut row_buf)?;
                 }
                 MsgBuilder::new(b'C')
                     .cstr(&format!("SELECT {}", rows.len()))
@@ -871,8 +872,9 @@ fn handle_query(
             }
             Ok(ExecResult::Explain { columns, rows }) => {
                 send_row_description(stream, &columns)?;
+                let mut row_buf = Vec::new();
                 for row in &rows {
-                    send_data_row(stream, row)?;
+                    send_data_row_buf(stream, row, &mut row_buf)?;
                 }
                 MsgBuilder::new(b'C').cstr("EXPLAIN").send(stream)?;
             }
@@ -885,8 +887,9 @@ fn handle_query(
             Ok(ExecResult::Dml { tag, columns, rows }) => {
                 if !columns.is_empty() {
                     send_row_description(stream, &columns)?;
+                    let mut row_buf = Vec::new();
                     for row in &rows {
-                        send_data_row(stream, row)?;
+                        send_data_row_buf(stream, row, &mut row_buf)?;
                     }
                 }
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
@@ -2933,8 +2936,9 @@ fn handle_execute(
     } else {
         std::cmp::min(max_rows as usize, remaining)
     };
+    let mut row_buf = Vec::new();
     for row in pending.rows.iter().skip(pending.pos).take(n) {
-        send_data_row(stream, row)?;
+        send_data_row_buf(stream, row, &mut row_buf)?;
     }
     pending.pos += n;
     if pending.pos < pending.rows.len() {
@@ -3015,6 +3019,28 @@ pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()
         b.value_text(v);
     }
     b.send(stream)
+}
+
+/// Same wire encoding as `send_data_row`, but builds into `buf` (expected
+/// empty on entry) instead of allocating a fresh payload buffer, and hands
+/// `buf`'s allocation back (cleared) afterward. Callers sending many rows
+/// for one result set declare `buf` once outside the row loop, so the
+/// buffer's capacity is reused across rows instead of paying one
+/// allocate/free cycle per row.
+pub(crate) fn send_data_row_buf(
+    stream: &mut Writer,
+    row: &[Value],
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut b = MsgBuilder::from_payload(b'D', std::mem::take(buf));
+    b.i16(row.len() as i16);
+    for v in row {
+        b.value_text(v);
+    }
+    let res = b.send(stream);
+    *buf = b.into_payload();
+    buf.clear();
+    res
 }
 
 #[cfg(test)]
