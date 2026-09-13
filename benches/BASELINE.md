@@ -2279,3 +2279,21 @@ dominated by the sort and per-row frame computation.
 Result: **40.2 qps, p50 22 ms** on the debug build. COPY TO is ~30x faster
 than an equivalent `SELECT *` because it skips the RowDescription/DataRow
 per-row framing overhead and writes the text format directly.
+
+## v0.23: merged USING/NATURAL join workload (2026-09-13)
+
+### New workload
+
+`benches/workload23.py`: 12 join-heavy queries x 10 iterations (120 queries)
+over two 500-row tables — merged USING inner/left/right/full, USING aliases
+(`JOIN ... USING (i) AS x`), whole-join aliases, NATURAL joins, base/derived
+column alias lists, merged keys in WHERE/ORDER BY. Each query scans ~250k
+nested-loop pairs (no hash join by design).
+Result: **36.6 qps** on the release build (~27 ms/query).
+
+Valgrind 3.22.0 on the same workload (debug build, 300-row tables):
+Memcheck **0 errors** (the stripped-`ld.so` blocker from v0.21/v0.22 is gone —
+Memcheck runs again). Callgrind: no Rust function above ~5% self-cost; libc
+`memcpy` leads at 18.45% (row materialization inherent to nested-loop joins),
+so per the measure-first rule no optimization was made. DHAT: 9.6 MB total
+heap, 577 KB peak, 226 KB at exit — no leak growth.

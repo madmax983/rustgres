@@ -810,6 +810,9 @@ fn check_row_constraints(
             qual: String::new(),
             name: n.clone(),
             ty: ty.clone(),
+
+            hidden: false,
+            src_ord: 0,
         })
         .collect();
     for check in &meta.checks {
@@ -1547,6 +1550,9 @@ fn describe_returning(
                 qual: table.to_string(),
                 name: n.clone(),
                 ty: ty.clone(),
+
+                hidden: false,
+                src_ord: 0,
             })
             .collect(),
     ];
@@ -2052,6 +2058,9 @@ fn exec_insert(
                     qual: table.to_string(),
                     name: n.clone(),
                     ty: ty.clone(),
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect();
             let excl: Vec<QCol> = meta_for_upsert
@@ -2061,6 +2070,9 @@ fn exec_insert(
                     qual: "excluded".to_string(),
                     name: n.clone(),
                     ty: ty.clone(),
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect();
             (excl, tgt)
@@ -2305,6 +2317,9 @@ fn exec_insert(
                 qual: table.to_string(),
                 name: n.clone(),
                 ty: ty.clone(),
+
+                hidden: false,
+                src_ord: 0,
             })
             .collect();
         let mut out_rows = Vec::with_capacity(ret_rows.len());
@@ -2445,6 +2460,9 @@ fn exec_update(
                 qual: table.to_string(),
                 name: n.clone(),
                 ty: ty.clone(),
+
+                hidden: false,
+                src_ord: 0,
             })
             .collect();
         // Copy the visible rows' data out; the borrow of `t` ends here so
@@ -2664,6 +2682,9 @@ fn exec_update(
                     qual: table.to_string(),
                     name: n.clone(),
                     ty: ty.clone(),
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect()
         };
@@ -2724,6 +2745,9 @@ fn exec_delete(
                 qual: table.to_string(),
                 name: n.clone(),
                 ty: ty.clone(),
+
+                hidden: false,
+                src_ord: 0,
             })
             .collect();
         let vis: Vec<(u64, u64, Row)> = t
@@ -2818,6 +2842,9 @@ fn exec_delete(
                     qual: table.to_string(),
                     name: n.clone(),
                     ty: ty.clone(),
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect()
         };
@@ -4110,7 +4137,7 @@ fn plan_from_item(
                 }
             }
         }
-        FromItem::Derived { sub, alias } => {
+        FromItem::Derived { sub, alias, .. } => {
             let child = plan_select(eng, sub, snap, own, session)?;
             let rows = child.rows();
             Ok(PlanNode::SubqueryScan {
@@ -4556,6 +4583,9 @@ fn pg_stats_schema() -> Vec<QCol> {
         qual: "pg_stats".to_string(),
         name: n.to_string(),
         ty,
+
+        hidden: false,
+        src_ord: 0,
     })
     .collect()
 }
@@ -4611,6 +4641,8 @@ fn qcol(qual: &str, name: &str, ty: ColType) -> QCol {
         qual: qual.to_string(),
         name: name.to_string(),
         ty,
+        hidden: false,
+        src_ord: 0,
     }
 }
 
@@ -4867,6 +4899,34 @@ pub struct QCol {
     pub qual: String,
     pub name: String,
     pub ty: ColType,
+    /// v0.23: hidden from `*` and unqualified name resolution, but still
+    /// reachable by qualified reference and `qual.*`. Used for the
+    /// preserved originals of merged `JOIN ... USING` / `NATURAL` key
+    /// columns and for `USING (...) AS alias` exposure copies.
+    pub hidden: bool,
+    /// v0.23: position of this column within its source relation's
+    /// schema. `qual.*` expands a qualifier's columns in source order
+    /// (PostgreSQL), which differs from merged-join output order because
+    /// the hidden key originals sort after the pass-through columns.
+    pub src_ord: u32,
+}
+
+/// v0.23: indices of `schema` whose qualifier is `qual`, in the
+/// qualifier's source-column order. PostgreSQL expands `qual.*` in the
+/// table's own column order; for a merged `USING`/`NATURAL` join the
+/// hidden key originals carry their side's source ordinals, so this
+/// sorts them back into side order instead of merged output order.
+fn qual_star_order(schema: &[QCol], qual: &str) -> Vec<usize> {
+    let mut idx: Vec<usize> = schema
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.qual == qual)
+        .map(|(i, _)| i)
+        .collect();
+    // Stable: columns without a meaningful ordinal (plain tables built
+    // before v0.23 call sites, virtual catalogs) keep schema order.
+    idx.sort_by_key(|&i| schema[i].src_ord);
+    idx
 }
 
 /// One working row: cell values parallel to the schema, plus provenance —
@@ -4920,6 +4980,13 @@ fn resolve_col(
             None => {
                 let mut found = None;
                 for (ci, c) in sc.schema.iter().enumerate() {
+                    // v0.23: hidden columns (preserved USING/NATURAL key
+                    // originals, USING-alias copies) are invisible to
+                    // unqualified references and `*`; they resolve only
+                    // through a qualified reference or `qual.*`.
+                    if c.hidden {
+                        continue;
+                    }
                     if c.name == name {
                         if found.is_some() {
                             return Err(exec_err(
@@ -5203,9 +5270,18 @@ fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
             }
             FromItem::Derived { alias, .. } => out.push((alias.clone(), None)),
             FromItem::Values { alias, .. } => out.push((alias.clone(), None)),
-            FromItem::Join { left, right, .. } => {
+            FromItem::Join {
+                left, right, alias, ..
+            } => {
                 walk(q, left, out);
                 walk(q, right, out);
+                // v0.23: `(a JOIN b ...) AS x` requalifies the output to
+                // `x`; the using-alias (if any) is checked at its own
+                // level like a derived table. Underlying tables remain
+                // listed so unqualified refs keep their privilege checks.
+                if let Some(x) = alias {
+                    out.push((x.clone(), None));
+                }
             }
         }
     }
@@ -5372,13 +5448,18 @@ fn eval_cte(q: &mut Q, cte: &CteDef) -> Result<CteBinding, ExecError> {
     match &cte.body {
         CteBody::Simple(sel) => {
             let out = run_select(q, sel, &[])?;
-            Ok(cte_binding(cte, out.columns, out.rows))
+            cte_binding(cte, out.columns, out.rows)
         }
         CteBody::Union { left, right, all } => eval_recursive_cte(q, cte, left, right, *all),
     }
 }
 
-fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Row>) -> CteBinding {
+fn cte_binding(
+    cte: &CteDef,
+    columns: Vec<(String, ColType)>,
+    rows: Vec<Row>,
+) -> Result<CteBinding, ExecError> {
+    check_col_alias_arity(&cte.name, columns.len(), &cte.col_aliases)?;
     let schema: Vec<QCol> = columns
         .into_iter()
         .enumerate()
@@ -5386,6 +5467,9 @@ fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Row>) ->
             qual: cte.name.clone(),
             name: cte.col_aliases.get(i).cloned().unwrap_or(name),
             ty,
+
+            hidden: false,
+            src_ord: 0,
         })
         .collect();
     let rows = rows
@@ -5395,11 +5479,11 @@ fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Row>) ->
             prov: Vec::new(),
         })
         .collect();
-    CteBinding {
+    Ok(CteBinding {
         name: cte.name.clone(),
         schema,
         rows,
-    }
+    })
 }
 
 /// v0.10: `WITH RECURSIVE`: iterative fixpoint. The seed (non-recursive
@@ -5418,7 +5502,7 @@ fn eval_recursive_cte(
 ) -> Result<CteBinding, ExecError> {
     let seed = run_select(q, left, &[])?;
     let width = seed.columns.len();
-    let mut binding = cte_binding(cte, seed.columns, seed.rows);
+    let mut binding = cte_binding(cte, seed.columns, seed.rows)?;
     let seed_types: Vec<ColType> = binding.schema.iter().map(|c| c.ty.clone()).collect();
     // v0.10: non-recursive UNION in WITH RECURSIVE: evaluate the right
     // side once (it doesn't reference the CTE) and union.
@@ -7417,38 +7501,340 @@ fn join_fast_path(on: &Expr, lschema: &[QCol], rschema: &[QCol]) -> bool {
     })
 }
 
-/// Combine a kept join pair: concatenated cells + provenance.
-fn combine_rows(l: &QRow, r: &QRow) -> QRow {
-    let mut cells = Vec::with_capacity(l.cells.len() + r.cells.len());
-    cells.extend(l.cells.iter().cloned());
-    cells.extend(r.cells.iter().cloned());
+/// v0.23: a positional column alias list may be shorter than the column
+/// list (the rest keep their names) but never longer — PostgreSQL raises
+/// 42601 (`table "x" has 3 columns available but 4 specified`).
+fn check_col_alias_arity(
+    table_alias: &str,
+    available: usize,
+    col_aliases: &[String],
+) -> Result<(), ExecError> {
+    if col_aliases.len() > available {
+        return Err(exec_err(
+            "42601",
+            format!(
+                "table \"{table_alias}\" has {available} columns available but {} specified",
+                col_aliases.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v0.23: apply a positional column alias list to a schema
+/// (`FROM tbl AS t(a, b)`), with PostgreSQL's arity rule.
+fn apply_col_aliases(
+    mut schema: Vec<QCol>,
+    table_alias: &str,
+    col_aliases: &[String],
+) -> Result<Vec<QCol>, ExecError> {
+    check_col_alias_arity(table_alias, schema.len(), col_aliases)?;
+    for (i, a) in col_aliases.iter().enumerate() {
+        if i < schema.len() {
+            schema[i].name = a.clone();
+        }
+    }
+    Ok(schema)
+}
+
+/// v0.23: resolved layout of a `JOIN ... USING` / `NATURAL JOIN` output.
+///
+/// PostgreSQL merges each USING/NATURAL key into a single visible column
+/// (merged keys first in USING order, then remaining left columns, then
+/// remaining right columns) while keeping the original side columns
+/// reachable through qualified references. The originals are preserved as
+/// *hidden* columns: invisible to `*` and unqualified lookup, reachable
+/// via `qual.*` and `qual.col`.
+struct JoinLayout {
+    /// `(left_idx, right_idx)` per merged column, in output order; also
+    /// drives the implicit USING/NATURAL equality predicate.
+    keys: Vec<(usize, usize)>,
+    /// Per-output-cell source plan; `row_plan.len() == schema.len()` by
+    /// construction so the combiner and the schema can never disagree
+    /// (e.g. when a whole-join alias drops hidden cells).
+    row_plan: Vec<CellSrc>,
+    /// Final output schema: merged keys, left rest, right rest,
+    /// propagated hidden, new hidden originals, USING-alias copies —
+    /// after whole-join alias rewriting.
+    schema: Vec<QCol>,
+}
+
+/// v0.23: where one output cell of a merged join comes from.
+#[derive(Clone, Copy)]
+enum CellSrc {
+    /// Merged key: (left index, right index) — resolved per join kind.
+    MergedKey(usize, usize),
+    /// Pass-through cell from the left (index) or right row.
+    Left(usize),
+    Right(usize),
+}
+
+/// v0.23: resolve the merged columns of a USING/NATURAL join and plan the
+/// output schema. Shared by the executor and the describe path so both
+/// agree exactly.
+fn plan_join(
+    lschema: &[QCol],
+    rschema: &[QCol],
+    using: &[String],
+    natural: bool,
+    using_alias: Option<&str>,
+    alias: Option<&str>,
+    col_aliases: &[String],
+) -> Result<JoinLayout, ExecError> {
+    // The merged column names: NATURAL merges the common *visible* column
+    // names in left-schema order; USING uses the clause order (deduped).
+    let mut seen = HashSet::new();
+    let names: Vec<String> = if natural {
+        lschema
+            .iter()
+            .filter(|c| !c.hidden && seen.insert(c.name.clone()))
+            .map(|c| c.name.clone())
+            .filter(|n| rschema.iter().any(|c| !c.hidden && c.name == *n))
+            .collect()
+    } else {
+        using
+            .iter()
+            .filter(|n| seen.insert((*n).clone()))
+            .cloned()
+            .collect()
+    };
+    // Each merged column must appear exactly once among its side's
+    // *visible* columns (PostgreSQL 42703 / 42701).
+    let mut keys = Vec::with_capacity(names.len());
+    for col in &names {
+        let find = |schema: &[QCol], side: &str| -> Result<usize, ExecError> {
+            let mut found = None;
+            for (i, c) in schema.iter().enumerate() {
+                if !c.hidden && c.name == *col {
+                    if found.is_some() {
+                        return Err(exec_err(
+                            "42701",
+                            format!(
+                                "common column name \"{col}\" appears more than once in {side} table"
+                            ),
+                        ));
+                    }
+                    found = Some(i);
+                }
+            }
+            found.ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!(
+                        "column \"{col}\" specified in USING clause does not exist in {side} table"
+                    ),
+                )
+            })
+        };
+        let li = find(lschema, "left")?;
+        let ri = find(rschema, "right")?;
+        keys.push((li, ri));
+    }
+    let lkey: HashSet<usize> = keys.iter().map(|(l, _)| *l).collect();
+    let rkey: HashSet<usize> = keys.iter().map(|(_, r)| *r).collect();
+    let mut lpass = Vec::new();
+    let mut lhid = Vec::new();
+    for (i, c) in lschema.iter().enumerate() {
+        if c.hidden {
+            lhid.push(i);
+        } else if !lkey.contains(&i) {
+            lpass.push(i);
+        }
+    }
+    let mut rpass = Vec::new();
+    let mut rhid = Vec::new();
+    for (i, c) in rschema.iter().enumerate() {
+        if c.hidden {
+            rhid.push(i);
+        } else if !rkey.contains(&i) {
+            rpass.push(i);
+        }
+    }
+    // v0.23: `USING (...) AS x` exposes only the merged columns under `x`;
+    // like a table alias, it must not collide with a sibling qualifier.
+    if let Some(x) = using_alias {
+        let clash = lschema
+            .iter()
+            .chain(rschema.iter())
+            .filter(|c| !c.hidden)
+            .any(|c| c.qual == x);
+        if clash {
+            return Err(exec_err(
+                "42712",
+                format!("table name \"{x}\" specified more than once"),
+            ));
+        }
+    }
+    // (QCol, CellSrc) pairs in output order; split into schema/row_plan
+    // at the end so the two can never disagree (a whole-join alias drops
+    // hidden cells from both together).
+    let mut cells: Vec<(QCol, CellSrc)> =
+        Vec::with_capacity(names.len() + lschema.len() + rschema.len() + keys.len());
+    // Merged keys first, in USING/NATURAL order. The merged column belongs
+    // to no single table (empty qualifier), like PostgreSQL's common
+    // column; the originals stay reachable as hidden qualified columns.
+    for (k, ((li, ri), col)) in keys.iter().zip(names.iter()).enumerate() {
+        cells.push((
+            QCol {
+                qual: String::new(),
+                name: col.clone(),
+                ty: lschema[*li].ty.clone(),
+                hidden: false,
+                // Merged keys have no source qualifier; ordinal is the
+                // key position (only USING-alias copies reuse it).
+                src_ord: k as u32,
+            },
+            CellSrc::MergedKey(*li, *ri),
+        ));
+    }
+    let push_visible =
+        |cells: &mut Vec<(QCol, CellSrc)>, side: &[QCol], pass: &[usize], left: bool| {
+            for &i in pass {
+                let c = &side[i];
+                cells.push((
+                    QCol {
+                        qual: c.qual.clone(),
+                        name: c.name.clone(),
+                        ty: c.ty.clone(),
+                        hidden: false,
+                        // Preserve the side's source order so `qual.*`
+                        // expands in the side's own column order.
+                        src_ord: c.src_ord,
+                    },
+                    if left {
+                        CellSrc::Left(i)
+                    } else {
+                        CellSrc::Right(i)
+                    },
+                ));
+            }
+        };
+    push_visible(&mut cells, lschema, &lpass, true);
+    push_visible(&mut cells, rschema, &rpass, false);
+    // Propagated hidden columns (nested joins): keep qualifier + value.
+    for &i in &lhid {
+        cells.push((lschema[i].clone(), CellSrc::Left(i)));
+    }
+    for &i in &rhid {
+        cells.push((rschema[i].clone(), CellSrc::Right(i)));
+    }
+    // Preserved originals of this level's merged keys, for qualified refs
+    // and `qual.*` — hidden from `*` and unqualified lookup. They keep
+    // the side's source ordinal so `qual.*` emits the side's columns in
+    // the side's own order (PostgreSQL), not in merged output order.
+    for (li, _) in &keys {
+        let c = &lschema[*li];
+        cells.push((
+            QCol {
+                qual: c.qual.clone(),
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                hidden: true,
+                src_ord: c.src_ord,
+            },
+            CellSrc::Left(*li),
+        ));
+    }
+    for (_, ri) in &keys {
+        let c = &rschema[*ri];
+        cells.push((
+            QCol {
+                qual: c.qual.clone(),
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                hidden: true,
+                src_ord: c.src_ord,
+            },
+            CellSrc::Right(*ri),
+        ));
+    }
+    // USING-alias exposure copies (merged values, hidden).
+    if let Some(x) = using_alias {
+        for (k, ((li, ri), col)) in keys.iter().zip(names.iter()).enumerate() {
+            cells.push((
+                QCol {
+                    qual: x.to_string(),
+                    name: col.clone(),
+                    ty: lschema[*li].ty.clone(),
+                    hidden: true,
+                    src_ord: k as u32,
+                },
+                CellSrc::MergedKey(*li, *ri),
+            ));
+        }
+    }
+    // v0.23: `(a JOIN b ...) AS x [(cols)]` — the alias hides the inner
+    // table names: visible columns are requalified to `x` and the hidden
+    // originals are dropped (PostgreSQL: the inner names are no longer
+    // referenceable from outside).
+    if let Some(x) = alias {
+        cells.retain(|(c, _)| !c.hidden);
+        // Reassign source ordinals in output order: `x.*` must expand in
+        // the join's output order (PostgreSQL), not the sides' orders.
+        for (i, (c, _)) in cells.iter_mut().enumerate() {
+            c.qual = x.to_string();
+            c.src_ord = i as u32;
+        }
+    }
+    // v0.23: positional renames for a whole-join alias
+    // (`(a JOIN b ...) AS x (cols)`). More aliases than visible output
+    // columns is 42601 in PostgreSQL; fewer is fine.
+    let visible = cells.iter().filter(|(c, _)| !c.hidden).count();
+    check_col_alias_arity(alias.unwrap_or(""), visible, col_aliases)?;
+    let mut vi = 0;
+    for (c, _) in cells.iter_mut() {
+        if c.hidden {
+            continue;
+        }
+        if let Some(a) = col_aliases.get(vi) {
+            c.name = a.clone();
+        }
+        vi += 1;
+    }
+    let mut schema = Vec::with_capacity(cells.len());
+    let mut row_plan = Vec::with_capacity(cells.len());
+    for (c, s) in cells {
+        schema.push(c);
+        row_plan.push(s);
+    }
+    Ok(JoinLayout {
+        keys,
+        row_plan,
+        schema,
+    })
+}
+
+/// v0.23: build one merged join output row from a kept `(l, r)` pair.
+/// `l`/`r` are in side-schema layout (a null-extended side is all-NULL in
+/// its own layout); the merged key value follows the join kind —
+/// `COALESCE(left, right)` for FULL, the preserved side for RIGHT, the
+/// left (equal to the right on a match) otherwise.
+fn combine_join_pair(l: &QRow, r: &QRow, layout: &JoinLayout, kind: JoinKind) -> QRow {
+    let merged = |li: usize, ri: usize| -> Value {
+        let lv = &l.cells[li];
+        match kind {
+            // FULL: the merged key is COALESCE(left, right).
+            JoinKind::Full if matches!(lv, Value::Null) => r.cells[ri].clone(),
+            JoinKind::Right => r.cells[ri].clone(),
+            _ => lv.clone(),
+        }
+    };
+    // v0.23: follow the layout's row_plan so cells always match the
+    // schema exactly (a whole-join alias drops hidden cells from both).
+    let mut cells = Vec::with_capacity(layout.row_plan.len());
+    for src in &layout.row_plan {
+        cells.push(match *src {
+            CellSrc::MergedKey(li, ri) => merged(li, ri),
+            CellSrc::Left(i) => l.cells[i].clone(),
+            CellSrc::Right(i) => r.cells[i].clone(),
+        });
+    }
     let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
     prov.extend(l.prov.iter().cloned());
     prov.extend(r.prov.iter().cloned());
     QRow {
         cells: Row::new(cells),
         prov,
-    }
-}
-
-/// LEFT JOIN null-extension for an unmatched left row.
-fn left_null_row(l: &QRow, rschema: &[QCol]) -> QRow {
-    let mut cells = l.cells.to_vec();
-    cells.extend(rschema.iter().map(|_| Value::Null));
-    QRow {
-        cells: Row::new(cells),
-        prov: l.prov.clone(),
-    }
-}
-
-/// v0.20: for FULL JOIN — NULL left cells + right row cells.
-fn right_null_row(lschema: &[QCol], r: &QRow) -> QRow {
-    let mut cells = Vec::with_capacity(lschema.len() + r.cells.len());
-    cells.extend(lschema.iter().map(|_| Value::Null));
-    cells.extend(r.cells.iter().cloned());
-    QRow {
-        cells: Row::new(cells),
-        prov: r.prov.clone(),
     }
 }
 
@@ -7477,14 +7863,10 @@ fn build_source(
             col_aliases,
         } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
-            // v0.20: apply column aliases positionally to a schema.
-            let apply_aliases = |mut schema: Vec<QCol>| -> Vec<QCol> {
-                for (i, alias) in col_aliases.iter().enumerate() {
-                    if i < schema.len() {
-                        schema[i].name = alias.clone();
-                    }
-                }
-                schema
+            // v0.23: positional column aliases, with PostgreSQL's arity
+            // rule (more aliases than columns is 42601).
+            let apply_aliases = |schema: Vec<QCol>| -> Result<Vec<QCol>, ExecError> {
+                apply_col_aliases(schema, &qual, col_aliases)
             };
             // v0.10: CTEs shadow everything (like Postgres).
             if let Some(b) = q.ctes.iter().rev().find(|b| b.name == *name) {
@@ -7495,9 +7877,12 @@ fn build_source(
                         qual: qual.clone(),
                         name: c.name.clone(),
                         ty: c.ty.clone(),
+
+                        hidden: false,
+                        src_ord: c.src_ord,
                     })
                     .collect();
-                return Ok((apply_aliases(schema), b.rows.clone()));
+                return Ok((apply_aliases(schema)?, b.rows.clone()));
             }
             // v0.9: information_schema virtual tables.
             if name == "information_schema.tables" {
@@ -7509,7 +7894,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             if name == "information_schema.columns" {
                 let (schema, rows) = info_columns_scan(&q.eng.db, q.snap, q.own);
@@ -7520,7 +7905,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             // v0.9: a view name expands to its stored SELECT. Views are
             // checked before tables (a table would have blocked CREATE VIEW).
@@ -7555,6 +7940,9 @@ fn build_source(
                         qual: qual.clone(),
                         name: view.col_aliases.get(i).cloned().unwrap_or(cn),
                         ty,
+
+                        hidden: false,
+                        src_ord: i as u32,
                     })
                     .collect();
                 let rows: Vec<QRow> = out
@@ -7565,7 +7953,7 @@ fn build_source(
                         prov: Vec::new(),
                     })
                     .collect();
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
@@ -7583,7 +7971,7 @@ fn build_source(
                     })
                     .collect();
                 let (_, rows) = pg_stats_scan(&q.eng.db);
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             // v0.11: the role catalogs are virtual too.
             if matches!(
@@ -7603,7 +7991,7 @@ fn build_source(
                         c
                     })
                     .collect();
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             // v0.13: pg_replication_slots is virtual too (cluster-global
             // slot map, not a table).
@@ -7621,7 +8009,7 @@ fn build_source(
                     })
                     .collect();
                 let rows = pg_replication_slots_rows(q.eng);
-                return Ok((apply_aliases(schema), rows));
+                return Ok((apply_aliases(schema)?, rows));
             }
             // v0.11: scanning a real table needs SELECT (and UPDATE when
             // the statement is FOR UPDATE, like PostgreSQL). Existence is
@@ -7674,10 +8062,15 @@ fn build_source(
                 let schema: Vec<QCol> = t
                     .columns
                     .iter()
-                    .map(|(n, ty)| QCol {
+                    .enumerate()
+                    .map(|(i, (n, ty))| QCol {
                         qual: qual.clone(),
                         name: n.clone(),
                         ty: ty.clone(),
+
+                        hidden: false,
+                        // v0.23: source ordinal for `qual.*` ordering.
+                        src_ord: i as u32,
                     })
                     .collect();
                 // v0.8: the planner may replace the sequential scan with
@@ -7748,9 +8141,13 @@ fn build_source(
                 };
                 (schema, rows)
             };
-            Ok((apply_aliases(schema), rows))
+            Ok((apply_aliases(schema)?, rows))
         }
-        FromItem::Derived { sub, alias } => {
+        FromItem::Derived {
+            sub,
+            alias,
+            col_aliases,
+        } => {
             // Derived tables are uncorrelated (no LATERAL support): they
             // never see the outer scope chain.
             let out = {
@@ -7769,13 +8166,20 @@ fn build_source(
                 };
                 run_select(&mut sub_q, sub, &[])?
             };
+            // v0.23: more column aliases than output columns is 42601.
+            check_col_alias_arity(alias, out.columns.len(), col_aliases)?;
             let schema: Vec<QCol> = out
                 .columns
                 .into_iter()
-                .map(|(n, ty)| QCol {
+                .enumerate()
+                .map(|(i, (n, ty))| QCol {
                     qual: alias.clone(),
-                    name: n,
+                    // v0.23: `(SELECT ...) AS s(x, y)` positional renames.
+                    name: col_aliases.get(i).cloned().unwrap_or(n),
                     ty,
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect();
             let rows: Vec<QRow> = out
@@ -7797,6 +8201,8 @@ fn build_source(
             col_aliases,
         } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            // v0.23: more column aliases than VALUES columns is 42601.
+            check_col_alias_arity(alias, ncols, col_aliases)?;
             let mut eval_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
             for row in rows {
                 if row.len() != ncols {
@@ -7835,6 +8241,8 @@ fn build_source(
                             .cloned()
                             .unwrap_or_else(|| format!("column{}", i + 1)),
                         ty,
+                        hidden: false,
+                        src_ord: i as u32,
                     }
                 })
                 .collect();
@@ -7854,19 +8262,23 @@ fn build_source(
             on,
             using,
             natural,
+            using_alias,
+            alias,
+            col_aliases,
         } => {
             let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None)?;
             let (rschema0, rrows0) = build_source(q, outer, right, where_, need_prov, None, None)?;
-            // v0.20: NATURAL JOIN — USING on the common column names.
-            let using_cols: Vec<String> = if *natural {
-                lschema0
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .filter(|n| rschema0.iter().any(|c| c.name == *n))
-                    .collect()
-            } else {
-                using.clone()
-            };
+            // v0.23: resolve merged columns and the output layout (shared
+            // with the describe path so both agree exactly).
+            let layout = plan_join(
+                &lschema0,
+                &rschema0,
+                using,
+                *natural,
+                using_alias.as_deref(),
+                alias.as_deref(),
+                col_aliases,
+            )?;
             // v0.20.1: native RIGHT/FULL support — no side swapping. Each
             // side keeps its original schema/rows/order; preservation is
             // driven directly by the join kind below. (The v0.20 swap
@@ -7874,29 +8286,23 @@ fn build_source(
             // predicate pushdown for RIGHT.)
             let (lschema, lrows) = (lschema0.clone(), lrows0);
             let (rschema, rrows) = (rschema0.clone(), rrows0);
-            // v0.20: USING (cols) — build `left.col = right.col AND ...`.
-            let on_expr: Option<Expr> = if !using_cols.is_empty() {
+            // v0.20: USING (cols) — build `left.col = right.col AND ...`
+            // from the resolved key positions (visible columns only, so a
+            // nested join's hidden originals can never be picked).
+            let on_expr: Option<Expr> = if !layout.keys.is_empty() {
                 let mut cond: Option<Expr> = None;
-                for col in &using_cols {
-                    let lqual = lschema
-                        .iter()
-                        .find(|c| c.name == *col)
-                        .map(|c| c.qual.clone())
-                        .unwrap_or_default();
-                    let rqual = rschema
-                        .iter()
-                        .find(|c| c.name == *col)
-                        .map(|c| c.qual.clone())
-                        .unwrap_or_default();
+                for (li, ri) in &layout.keys {
+                    let lc = &lschema[*li];
+                    let rc = &rschema[*ri];
                     let eq = Expr::Cmp {
                         op: CmpOp::Eq,
                         left: Box::new(Expr::Column {
-                            table: Some(lqual),
-                            name: col.clone(),
+                            table: Some(lc.qual.clone()),
+                            name: lc.name.clone(),
                         }),
                         right: Box::new(Expr::Column {
-                            table: Some(rqual),
-                            name: col.clone(),
+                            table: Some(rc.qual.clone()),
+                            name: rc.name.clone(),
                         }),
                     };
                     cond = Some(match cond {
@@ -7908,10 +8314,11 @@ fn build_source(
             } else {
                 on.clone()
             };
-            // Output schema is always in original (left, right) order.
-            let mut schema = Vec::with_capacity(lschema0.len() + rschema0.len());
-            schema.extend(lschema0.iter().cloned());
-            schema.extend(rschema0.iter().cloned());
+            // v0.23: output schema is the merged join layout (merged keys
+            // first, then remaining left/right columns, then hidden
+            // originals); the predicate scopes below still use the
+            // pre-merge side schemas.
+            let schema = layout.schema.clone();
             // Predicate pushdown, inner joins only below nested joins:
             // each side is filtered here only when it is a leaf source
             // (table or derived table), so a conjunct is never pushed at
@@ -7987,6 +8394,17 @@ fn build_source(
                 _ => None,
             };
             let on_fast: Option<&Expr> = on_resolved.as_ref().or(on_pred);
+            // v0.23: null-extended sides, in side-schema layout; the
+            // combiner projects them into the merged layout (COALESCE for
+            // FULL, preserved side otherwise).
+            let null_l = QRow {
+                cells: Row::new(vec![Value::Null; lschema.len()]),
+                prov: Vec::new(),
+            };
+            let null_r = QRow {
+                cells: Row::new(vec![Value::Null; rschema.len()]),
+                prov: Vec::new(),
+            };
             if fast && outer.is_empty() {
                 // Hot path: zero allocation per row pair. The two frames
                 // live in a stack array; Scope is Copy.
@@ -8011,11 +8429,11 @@ fn build_source(
                             if preserve_right {
                                 matched_right[ri] = true;
                             }
-                            rows.push(combine_rows(l, r));
+                            rows.push(combine_join_pair(l, r, &layout, *kind));
                         }
                     }
                     if !matched && preserve_left {
-                        rows.push(left_null_row(l, &rschema));
+                        rows.push(combine_join_pair(l, &null_r, &layout, *kind));
                     }
                 }
             } else if fast {
@@ -8042,11 +8460,11 @@ fn build_source(
                             if preserve_right {
                                 matched_right[ri] = true;
                             }
-                            rows.push(combine_rows(l, r));
+                            rows.push(combine_join_pair(l, r, &layout, *kind));
                         }
                     }
                     if !matched && preserve_left {
-                        rows.push(left_null_row(l, &rschema));
+                        rows.push(combine_join_pair(l, &null_r, &layout, *kind));
                     }
                 }
             } else {
@@ -8054,15 +8472,15 @@ fn build_source(
                 for l in &lrows {
                     let mut matched = false;
                     for (ri, r) in rrows.iter().enumerate() {
-                        let mut cells = Vec::with_capacity(l.cells.len() + r.cells.len());
-                        cells.extend(l.cells.iter().cloned());
-                        cells.extend(r.cells.iter().cloned());
+                        // v0.23: the pair is built in merged layout up
+                        // front, so the combined frame matches `schema`.
+                        let pair = combine_join_pair(l, r, &layout, *kind);
                         let keep = match on_pred {
                             None => true,
                             Some(p) => {
                                 let frame = Scope {
                                     schema: &schema,
-                                    row: &cells,
+                                    row: &pair.cells,
                                 };
                                 let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                                 scopes.extend_from_slice(outer);
@@ -8075,17 +8493,11 @@ fn build_source(
                             if preserve_right {
                                 matched_right[ri] = true;
                             }
-                            let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
-                            prov.extend(l.prov.iter().cloned());
-                            prov.extend(r.prov.iter().cloned());
-                            rows.push(QRow {
-                                cells: Row::new(cells),
-                                prov,
-                            });
+                            rows.push(pair);
                         }
                     }
                     if !matched && preserve_left {
-                        rows.push(left_null_row(l, &rschema));
+                        rows.push(combine_join_pair(l, &null_r, &layout, *kind));
                     }
                 }
             }
@@ -8095,7 +8507,7 @@ fn build_source(
             if preserve_right {
                 for (ri, r) in rrows.iter().enumerate() {
                     if !matched_right[ri] {
-                        rows.push(right_null_row(&lschema, r));
+                        rows.push(combine_join_pair(&null_l, r, &layout, *kind));
                     }
                 }
             }
@@ -8168,8 +8580,13 @@ fn project_row(
     row: QRow,
 ) -> Result<(Row, Vec<(String, u64)>), ExecError> {
     // Fast path: plain `SELECT *` moves the row through untouched — no
-    // scope chain, no per-row allocation at all.
-    if stmt.items.len() == 1 && matches!(stmt.items[0], SelectItem::All) {
+    // scope chain, no per-row allocation at all. Disabled when the schema
+    // carries hidden columns (v0.23 merged USING/NATURAL keys): the hidden
+    // originals must be filtered out of the visible row.
+    if stmt.items.len() == 1
+        && matches!(stmt.items[0], SelectItem::All)
+        && !schema.iter().any(|c| c.hidden)
+    {
         return Ok((row.cells, row.prov));
     }
     // Only expression items need a scope chain; star-only shapes don't
@@ -8192,20 +8609,26 @@ fn project_row(
     let mut cells = Vec::new();
     for item in &stmt.items {
         match item {
-            SelectItem::All => cells.extend(row.cells.iter().cloned()),
+            // v0.23: hidden columns are skipped by `*` (they stay
+            // reachable via qualified refs and `qual.*`).
+            SelectItem::All => cells.extend(
+                schema
+                    .iter()
+                    .zip(row.cells.iter())
+                    .filter(|(c, _)| !c.hidden)
+                    .map(|(_, v)| v.clone()),
+            ),
             SelectItem::AllOf(qual) => {
-                let mut any = false;
-                for (c, v) in schema.iter().zip(row.cells.iter()) {
-                    if c.qual == *qual {
-                        cells.push(v.clone());
-                        any = true;
-                    }
-                }
-                if !any {
+                // v0.23: expand in the qualifier's source-column order.
+                let idx = qual_star_order(schema, qual);
+                if idx.is_empty() {
                     return Err(exec_err(
                         "42P01",
                         format!("missing FROM-clause entry for table \"{}\"", qual),
                     ));
+                }
+                for i in idx {
+                    cells.push(row.cells[i].clone());
                 }
             }
             SelectItem::Expr { expr, .. } => cells.push(eval_expr(q, &scopes, expr)?),
@@ -8390,6 +8813,9 @@ fn exec_agg(
             qual: String::new(),
             name: n.clone(),
             ty: ty.clone(),
+
+            hidden: false,
+            src_ord: 0,
         })
         .collect();
     let item_pos = select_item_positions(stmt, schema);
@@ -8415,7 +8841,8 @@ fn exec_agg(
         for item in &stmt.items {
             match item {
                 SelectItem::All => {
-                    for c in schema.iter() {
+                    // v0.23: hidden columns are skipped by `*`.
+                    for c in schema.iter().filter(|c| !c.hidden) {
                         cells.push(grouped_col_value(
                             gscope,
                             &stmt.group_by,
@@ -8426,8 +8853,16 @@ fn exec_agg(
                     }
                 }
                 SelectItem::AllOf(qual) => {
-                    let mut any = false;
-                    for c in schema.iter().filter(|c| c.qual == *qual) {
+                    // v0.23: expand in the qualifier's source-column order.
+                    let idx = qual_star_order(schema, qual);
+                    if idx.is_empty() {
+                        return Err(exec_err(
+                            "42P01",
+                            format!("missing FROM-clause entry for table \"{}\"", qual),
+                        ));
+                    }
+                    for i in idx {
+                        let c = &schema[i];
                         cells.push(grouped_col_value(
                             gscope,
                             &stmt.group_by,
@@ -8435,13 +8870,6 @@ fn exec_agg(
                             qual.as_str(),
                             &c.name,
                         )?);
-                        any = true;
-                    }
-                    if !any {
-                        return Err(exec_err(
-                            "42P01",
-                            format!("missing FROM-clause entry for table \"{}\"", qual),
-                        ));
                     }
                 }
                 SelectItem::Expr { expr, .. } => cells.push(eval_grouped(
@@ -8980,7 +9408,8 @@ fn select_item_positions(stmt: &SelectStmt, schema: &[QCol]) -> Vec<Option<usize
     for item in &stmt.items {
         match item {
             SelectItem::All => {
-                pos += schema.len();
+                // v0.23: hidden columns are skipped by `*`.
+                pos += schema.iter().filter(|c| !c.hidden).count();
                 out.push(None);
             }
             SelectItem::AllOf(qual) => {
@@ -9010,6 +9439,9 @@ fn apply_order(
             qual: String::new(),
             name: n.clone(),
             ty: ty.clone(),
+
+            hidden: false,
+            src_ord: 0,
         })
         .collect();
     let item_pos = select_item_positions(stmt, schema);
@@ -13780,21 +14212,37 @@ fn from_schema_item(
     bindings: &[Rc<CteBinding>],
 ) -> Result<(), ExecError> {
     match item {
-        FromItem::Table { name, alias, .. } => {
+        FromItem::Table {
+            name,
+            alias,
+            col_aliases,
+        } => {
+            // v0.23: `FROM tbl [AS] x (a, b, c)` — positional column
+            // renames, applied on every describe sub-path (the executor
+            // already applies them; the describe path ignored them).
+            // More aliases than columns is 42601, like PostgreSQL.
+            // `qual` is defined before each use below.
+            let apply_aliases = |schema: Vec<QCol>| -> Result<Vec<QCol>, ExecError> {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                apply_col_aliases(schema, &qual, col_aliases)
+            };
             // v0.10: materialized CTE bindings (e.g. the recursive CTE
             // currently being evaluated) shadow everything.
             if let Some(b) = bindings.iter().rev().find(|b| b.name == *name) {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
-                out.push(
+                out.push(apply_aliases(
                     b.schema
                         .iter()
                         .map(|c| QCol {
                             qual: qual.clone(),
                             name: c.name.clone(),
                             ty: c.ty.clone(),
+
+                            hidden: false,
+                            src_ord: c.src_ord,
                         })
                         .collect(),
-                );
+                )?);
                 return Ok(());
             }
             // v0.10: CTEs shadow everything (like Postgres). `visible`
@@ -13826,7 +14274,7 @@ fn from_schema_item(
                         c
                     })
                     .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             // v0.13: pg_replication_slots is virtual too.
@@ -13841,7 +14289,7 @@ fn from_schema_item(
                         c
                     })
                     .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             if name == "information_schema.columns" {
@@ -13853,7 +14301,7 @@ fn from_schema_item(
                         c
                     })
                     .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             // v0.9: views describe as their stored SELECT's schema.
@@ -13877,9 +14325,12 @@ fn from_schema_item(
                         qual: qual.clone(),
                         name: view.col_aliases.get(i).cloned().unwrap_or(cn),
                         ty,
+
+                        hidden: false,
+                        src_ord: i as u32,
                     })
                     .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
@@ -13893,7 +14344,7 @@ fn from_schema_item(
                         c
                     })
                     .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             // v0.11: the role catalogs are virtual too.
@@ -13915,33 +14366,49 @@ fn from_schema_item(
                     c
                 })
                 .collect();
-                out.push(schema);
+                out.push(apply_aliases(schema)?);
                 return Ok(());
             }
             let t = eng.db.find_table(name, snap, own, session).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", name))
             })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
-            out.push(
-                t.columns
-                    .iter()
-                    .map(|(n, ty)| QCol {
-                        qual: qual.clone(),
-                        name: n.clone(),
-                        ty: ty.clone(),
-                    })
-                    .collect(),
-            );
+            // v0.23: positional renames apply to plain tables too.
+            let schema: Vec<QCol> = t
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, (n, ty))| QCol {
+                    qual: qual.clone(),
+                    name: n.clone(),
+                    ty: ty.clone(),
+                    hidden: false,
+                    // v0.23: source ordinal for `qual.*` ordering.
+                    src_ord: i as u32,
+                })
+                .collect();
+            out.push(apply_aliases(schema)?);
             Ok(())
         }
-        FromItem::Derived { sub, alias } => {
+        FromItem::Derived {
+            sub,
+            alias,
+            col_aliases,
+        } => {
             let cols = describe_select_outer(eng, snap, own, session, sub, visible, &[])?;
+            // v0.23: more column aliases than output columns is 42601.
+            check_col_alias_arity(alias, cols.len(), col_aliases)?;
             out.push(
                 cols.into_iter()
-                    .map(|(n, ty)| QCol {
+                    .enumerate()
+                    .map(|(i, (n, ty))| QCol {
                         qual: alias.clone(),
-                        name: n,
+                        // v0.23: `(SELECT ...) AS s(x, y)` positional renames.
+                        name: col_aliases.get(i).cloned().unwrap_or(n),
                         ty,
+
+                        hidden: false,
+                        src_ord: i as u32,
                     })
                     .collect(),
             );
@@ -13958,6 +14425,8 @@ fn from_schema_item(
             col_aliases,
         } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            // v0.23: more column aliases than VALUES columns is 42601.
+            check_col_alias_arity(alias, ncols, col_aliases)?;
             out.push(
                 (0..ncols)
                     .map(|i| {
@@ -13974,15 +14443,44 @@ fn from_schema_item(
                                 .cloned()
                                 .unwrap_or_else(|| format!("column{}", i + 1)),
                             ty,
+
+                            hidden: false,
+                            src_ord: i as u32,
                         }
                     })
                     .collect(),
             );
             Ok(())
         }
-        FromItem::Join { left, right, .. } => {
-            from_schema_item(eng, snap, own, session, left, out, visible, bindings)?;
-            from_schema_item(eng, snap, own, session, right, out, visible, bindings)
+        FromItem::Join {
+            left,
+            right,
+            using,
+            natural,
+            using_alias,
+            alias,
+            col_aliases,
+            ..
+        } => {
+            // v0.23: a join contributes a single merged schema (same layout
+            // as the executor builds), not two side-by-side schemas.
+            let mut l: Vec<Vec<QCol>> = Vec::new();
+            from_schema_item(eng, snap, own, session, left, &mut l, visible, bindings)?;
+            let mut r: Vec<Vec<QCol>> = Vec::new();
+            from_schema_item(eng, snap, own, session, right, &mut r, visible, bindings)?;
+            let lflat: Vec<QCol> = l.into_iter().flatten().collect();
+            let rflat: Vec<QCol> = r.into_iter().flatten().collect();
+            let layout = plan_join(
+                &lflat,
+                &rflat,
+                using,
+                *natural,
+                using_alias.as_deref(),
+                alias.as_deref(),
+                col_aliases,
+            )?;
+            out.push(layout.schema);
+            Ok(())
         }
     }
 }
@@ -14003,6 +14501,8 @@ fn describe_cte(
         CteBody::Union { left, .. } => left,
     };
     let cols = describe_select_outer(eng, snap, own, session, body, earlier, &[])?;
+    // v0.23: more column aliases than CTE output columns is 42601.
+    check_col_alias_arity(&cte.name, cols.len(), &cte.col_aliases)?;
     Ok(cols
         .into_iter()
         .enumerate()
@@ -14010,6 +14510,9 @@ fn describe_cte(
             qual: cte.name.clone(),
             name: cte.col_aliases.get(i).cloned().unwrap_or(name),
             ty,
+
+            hidden: false,
+            src_ord: 0,
         })
         .collect())
 }
@@ -14048,19 +14551,20 @@ fn describe_select_outer(
         match item {
             SelectItem::All => {
                 for s in &schemas {
-                    for c in s {
+                    // v0.23: hidden columns are skipped by `*`.
+                    for c in s.iter().filter(|c| !c.hidden) {
                         out.push((c.name.clone(), c.ty.clone()));
                     }
                 }
             }
             SelectItem::AllOf(qual) => {
+                // v0.23: expand in the qualifier's source-column order.
                 let mut any = false;
                 for s in &schemas {
-                    for c in s {
-                        if c.qual == *qual {
-                            out.push((c.name.clone(), c.ty.clone()));
-                            any = true;
-                        }
+                    for i in qual_star_order(s, qual) {
+                        let c = &s[i];
+                        out.push((c.name.clone(), c.ty.clone()));
+                        any = true;
                     }
                 }
                 if !any {
@@ -14745,6 +15249,9 @@ pub fn infer_param_types(
                         qual: String::new(),
                         name: n.clone(),
                         ty: ty.clone(),
+
+                        hidden: false,
+                        src_ord: 0,
                     })
                     .collect(),
             ];
@@ -14791,6 +15298,9 @@ pub fn infer_param_types(
                                 qual: table.clone(),
                                 name: n.clone(),
                                 ty: ty.clone(),
+
+                                hidden: false,
+                                src_ord: 0,
                             })
                             .collect(),
                     ];
@@ -14849,6 +15359,9 @@ fn infer_returning(
                     qual: String::new(),
                     name: n.clone(),
                     ty: ty.clone(),
+
+                    hidden: false,
+                    src_ord: 0,
                 })
                 .collect(),
         ];
@@ -14885,6 +15398,9 @@ fn infer_on_conflict(
                         qual: String::new(),
                         name: n.clone(),
                         ty: ty.clone(),
+
+                        hidden: false,
+                        src_ord: 0,
                     })
                     .collect(),
             ];
@@ -16398,6 +16914,375 @@ mod tests {
             rows_of(run(&mut eng, "SELECT power('inf'::float8, -2)").unwrap())[0][0],
             "0"
         );
+    }
+
+    // ====================================================================
+    // v0.23: JOIN ... USING / NATURAL JOIN merged-column semantics.
+    // ====================================================================
+
+    fn cols_of(r: &ExecResult) -> Vec<String> {
+        match r {
+            ExecResult::Select { columns, .. } | ExecResult::Explain { columns, .. } => {
+                columns.iter().map(|(n, _)| n.clone()).collect()
+            }
+            _ => panic!("expected a row-returning result"),
+        }
+    }
+
+    fn select_cols(eng: &mut Engine, sql: &str) -> Vec<String> {
+        let r = run(eng, sql).unwrap();
+        cols_of(&r)
+    }
+
+    /// `USING` merges each key into one visible column; merged keys come
+    /// first, then the remaining left columns, then the right ones.
+    #[test]
+    fn using_merges_single_visible_key_first() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users JOIN orders USING (id)"),
+            vec!["id", "name", "uid", "amt"]
+        );
+    }
+
+    /// The merged column is addressable unqualified — no 42702.
+    #[test]
+    fn using_unqualified_key_resolves_without_ambiguity() {
+        let mut eng = engine();
+        let rows = rows_of(run(&mut eng, "SELECT id FROM users JOIN orders USING (id)").unwrap());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], "1");
+    }
+
+    /// The original side columns stay reachable through qualifiers, and
+    /// `qual.*` expands in the side's own order.
+    #[test]
+    fn using_keeps_qualified_originals() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT users.id, orders.id FROM users JOIN orders USING (id)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows[0], vec!["1".to_string(), "1".to_string()]);
+        assert_eq!(
+            select_cols(&mut eng, "SELECT users.* FROM users JOIN orders USING (id)"),
+            vec!["id", "name"]
+        );
+        assert_eq!(
+            select_cols(
+                &mut eng,
+                "SELECT orders.* FROM users JOIN orders USING (id)"
+            ),
+            vec!["id", "uid", "amt"]
+        );
+    }
+
+    /// INNER/LEFT/RIGHT/FULL disagree only on the merged key of
+    /// null-extended rows: left value, right value, COALESCE.
+    #[test]
+    fn using_outer_join_merged_values() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int, x text)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, y text)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1,'p'),(2,'q')").unwrap();
+        run(&mut eng, "INSERT INTO b VALUES (1,'u'),(3,'v')").unwrap();
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT * FROM a LEFT JOIN b USING (id) ORDER BY id"
+                )
+                .unwrap()
+            ),
+            vec![vec!["1", "p", "u"], vec!["2", "q", "NULL"]]
+        );
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT * FROM a RIGHT JOIN b USING (id) ORDER BY id"
+                )
+                .unwrap()
+            ),
+            vec![vec!["1", "p", "u"], vec!["3", "NULL", "v"]]
+        );
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT * FROM a FULL JOIN b USING (id) ORDER BY id"
+                )
+                .unwrap()
+            ),
+            vec![
+                vec!["1", "p", "u"],
+                vec!["2", "q", "NULL"],
+                vec!["3", "NULL", "v"]
+            ]
+        );
+    }
+
+    /// Multiple USING keys merge in USING order; a key missing from
+    /// either side is 42703.
+    #[test]
+    fn using_multiple_keys_merge_in_order() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE m1(a int, b int, x text)").unwrap();
+        run(&mut eng, "CREATE TABLE m2(a int, b int, y text)").unwrap();
+        run(&mut eng, "INSERT INTO m1 VALUES (1,2,'p'),(3,4,'q')").unwrap();
+        run(&mut eng, "INSERT INTO m2 VALUES (1,2,'u'),(3,9,'v')").unwrap();
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM m1 JOIN m2 USING (a, b)"),
+            vec!["a", "b", "x", "y"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT * FROM m1 JOIN m2 USING (a, b)").unwrap()),
+            vec![vec!["1", "2", "p", "u"]]
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT * FROM m1 JOIN m2 USING (a, c)"),
+            "42703"
+        );
+    }
+
+    /// NATURAL JOIN merges the shared columns like USING does.
+    #[test]
+    fn natural_join_merges_shared_columns() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users NATURAL JOIN orders"),
+            vec!["id", "name", "uid", "amt"]
+        );
+        let rows = rows_of(run(&mut eng, "SELECT id FROM users NATURAL JOIN orders").unwrap());
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// `JOIN ... USING (i) AS x` exposes only the merged columns as `x`;
+    /// anything else under `x` is 42703.
+    #[test]
+    fn using_alias_exposes_only_merged_columns() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(
+                &mut eng,
+                "SELECT x.* FROM users JOIN orders USING (id) AS x"
+            ),
+            vec!["id"]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT x.id FROM users JOIN orders USING (id) AS x",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "SELECT x.name FROM users JOIN orders USING (id) AS x"
+            ),
+            "42703"
+        );
+    }
+
+    /// `(a JOIN b ...) AS x` requalifies the output to `x` and hides the
+    /// inner table names.
+    #[test]
+    fn whole_join_alias_hides_inner_names() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(
+                &mut eng,
+                "SELECT * FROM (users JOIN orders USING (id)) AS x"
+            ),
+            vec!["id", "name", "uid", "amt"]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT x.id, x.name FROM (users JOIN orders USING (id)) AS x ORDER BY x.id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(
+            run(
+                &mut eng,
+                "SELECT users.id FROM (users JOIN orders USING (id)) AS x"
+            )
+            .is_err(),
+            "inner table names must not leak through a whole-join alias"
+        );
+    }
+
+    /// A column alias list on a parenthesized join renames positionally.
+    #[test]
+    fn whole_join_col_alias_list_renames_positionally() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(
+                &mut eng,
+                "SELECT * FROM (users JOIN orders USING (id)) AS x(p, q, r, s)"
+            ),
+            vec!["p", "q", "r", "s"]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT p FROM (users JOIN orders USING (id)) AS x(p, q) ORDER BY p",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], "1");
+    }
+
+    /// More column aliases than available columns is 42601 in PostgreSQL,
+    /// on every alias-list form (v0.23 arity rule).
+    #[test]
+    fn col_alias_list_arity_is_checked() {
+        let mut eng = engine();
+        for q in [
+            "SELECT * FROM users AS u(a, b, c)",
+            "SELECT * FROM (users JOIN orders USING (id)) AS x(a, b, c, d, e)",
+            "SELECT * FROM (SELECT id FROM users) AS s(a, b)",
+            "SELECT * FROM (VALUES (1, 2)) AS v(a, b, c)",
+            "WITH c(a, b, c) AS (SELECT 1, 2) SELECT * FROM c",
+        ] {
+            let err = run(&mut eng, q).unwrap_err();
+            assert_eq!(err.code, "42601", "query: {q}");
+        }
+        // Exact and short lists still work.
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users AS u(a, b)"),
+            vec!["a", "b"]
+        );
+    }
+
+    /// `FROM tbl AS t(a, b)` renames positionally; fewer aliases than
+    /// columns leave the rest under their original names.
+    #[test]
+    fn table_col_alias_list_renames_base_table() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users AS u(a, b)"),
+            vec!["a", "b"]
+        );
+        let rows =
+            rows_of(run(&mut eng, "SELECT a, u.b FROM users AS u(a, b) ORDER BY a").unwrap());
+        assert_eq!(rows[0], vec!["1".to_string(), "ann".to_string()]);
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users AS u(a)"),
+            vec!["a", "name"]
+        );
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM users AS u"),
+            vec!["id", "name"]
+        );
+    }
+
+    /// `(SELECT ...) AS s(x, y)` renames the derived columns positionally.
+    #[test]
+    fn derived_col_alias_list_renames() {
+        let mut eng = engine();
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM (SELECT 1 AS a, 2 AS b) AS s(x, y)"),
+            vec!["x", "y"]
+        );
+        let rows =
+            rows_of(run(&mut eng, "SELECT x FROM (SELECT 1 AS a, 2 AS b) AS s(x, y)").unwrap());
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+    }
+
+    /// `SELECT *` over a USING join shows exactly one merged key column.
+    #[test]
+    fn star_never_shows_hidden_join_originals() {
+        let mut eng = engine();
+        let cols = select_cols(&mut eng, "SELECT * FROM users JOIN orders USING (id)");
+        assert_eq!(cols.iter().filter(|c| *c == "id").count(), 1);
+    }
+
+    /// The merged key is usable in WHERE, GROUP BY and ORDER BY.
+    #[test]
+    fn merged_key_usable_in_clauses() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT id, count(*) FROM users JOIN orders USING (id) GROUP BY id ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT id FROM users JOIN orders USING (id) WHERE id > 1 ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["2".to_string()], vec!["3".to_string()]]);
+    }
+
+    // ---------------------------------------------------------------
+    // v0.23 parser shapes.
+    // ---------------------------------------------------------------
+
+    fn select_from(sql: &str) -> Vec<FromItem> {
+        let stmt = crate::sql::parse_statement(sql).expect("parses");
+        let crate::sql::Stmt::Select(s) = stmt else {
+            panic!("SELECT");
+        };
+        s.from
+    }
+
+    #[test]
+    fn parse_using_alias_shape() {
+        let from = select_from("SELECT * FROM a JOIN b USING (i) AS x");
+        let crate::sql::FromItem::Join { using_alias, .. } = &from[0] else {
+            panic!("join");
+        };
+        assert_eq!(using_alias.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_paren_join_alias_shape() {
+        let from = select_from("SELECT * FROM (a JOIN b USING (i)) AS x");
+        let crate::sql::FromItem::Join { alias, .. } = &from[0] else {
+            panic!("join");
+        };
+        assert_eq!(alias.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_table_col_alias_list_shape() {
+        let from = select_from("SELECT * FROM tbl AS t(a, b)");
+        let crate::sql::FromItem::Table { col_aliases, .. } = &from[0] else {
+            panic!("table");
+        };
+        assert_eq!(col_aliases, &vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_derived_col_alias_list_retained() {
+        let from = select_from("SELECT * FROM (SELECT 1) AS s(x, y)");
+        let crate::sql::FromItem::Derived { col_aliases, .. } = &from[0] else {
+            panic!("derived");
+        };
+        assert_eq!(col_aliases, &vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn parse_join_col_alias_list_shape() {
+        let from = select_from("SELECT * FROM (a JOIN b USING (i)) AS x(p, q)");
+        let crate::sql::FromItem::Join { col_aliases, .. } = &from[0] else {
+            panic!("join");
+        };
+        assert_eq!(col_aliases, &vec!["p".to_string(), "q".to_string()]);
     }
 }
 
@@ -18827,6 +19712,9 @@ fn info_tables_schema() -> Vec<QCol> {
         qual: "information_schema.tables".to_string(),
         name: n.to_string(),
         ty,
+
+        hidden: false,
+        src_ord: 0,
     })
     .collect()
 }
@@ -18895,6 +19783,9 @@ fn info_columns_schema() -> Vec<QCol> {
         qual: "information_schema.columns".to_string(),
         name: n.to_string(),
         ty,
+
+        hidden: false,
+        src_ord: 0,
     })
     .collect()
 }

@@ -1,3 +1,67 @@
+# rustgres v0.23 — "join merge: USING/NATURAL columns, alias scoping"
+
+A from-scratch PostgreSQL-compatible database server written in pure Rust —
+**zero external crates**, so it builds offline with plain `cargo build`.
+
+Milestone 23 of the road to Postgres 19 feature parity. v0.23 finishes the
+join-semantics work v0.20 started: `JOIN ... USING` / `NATURAL` now merge
+each common column into a single visible output column (merged keys first
+in USING order, then remaining left columns, then remaining right columns),
+like PostgreSQL — the original side columns stay reachable as qualified
+references (`j1.i`, `j2.i`) but no longer leak into `*` or unqualified
+lookup (which used to raise `42702`). The full alias surface around joins
+now works:
+
+- **`JOIN ... USING (cols) AS x`** — a USING-scoped alias exposing only the
+  merged columns (`x.i`, `x.*`); the source tables stay visible. `AS` is
+  required, like PostgreSQL (verified against PG's REL_19 grammar).
+- **Whole-join aliases** — `(a JOIN b ...) [AS] x [(cols)]`: parenthesized
+  joined tables (and bare tables) accept aliases that hide the inner table
+  names and requalify the output; positional column lists rename output
+  columns.
+- **Table column aliases everywhere** — `FROM tbl AS t(a, b, c)` renames
+  positionally (unspecified columns keep their names, like PG); derived
+  tables, CTEs, and VALUES keep their existing alias lists.
+- **Alias-list arity** — more aliases than columns is `42601` on every
+  form (`table "x" has 3 columns available but 4 specified`), like PG; a
+  column list without a table alias on a parenthesized join is a syntax
+  error.
+- **Qualified-star ordering** — `j1.*` expands in the table's own column
+  order even after a merge (a real bug the new unit tests caught: `j1.*`
+  emitted `j,t,i` instead of `i,j,t`).
+- Outer joins coalesce merged keys (RIGHT takes the right value, FULL
+  coalesces); null-extended rows align exactly with the output schema
+  (a schema/row length mismatch the tests caught and `row_plan` repaired).
+- Correct SQLSTATEs: `42703` for unknown USING columns, `42701` for a
+  common name appearing twice on one side, `42702` for genuinely ambiguous
+  unqualified references, `42712` for alias collisions.
+
+Conformance: join.sql **423 PASS / 61 REAL-FAIL** over 974 statements
+(v0.22: 373/111 — **+50 PASS, −50 REAL-FAIL**, no new failures; the
+remaining REAL-FAILs are unsupported features like `DELETE ... USING`,
+temp tables, table functions, and `ROW(...)` constructors, not join bugs).
+Full pg_regress: **2673 PASS (51.5%)**, 1556 EXPECTED-FAIL, 964 REAL-FAIL
+over 5193 statements (v0.22: 2622/1015 — **+51 PASS, −51 REAL-FAIL**, no new
+failures).
+105 wire-protocol checks (`protocol_test23.py`), 106 unit tests (19 new),
+53 isolation checks — all green. New `benches/workload23.py` join-heavy
+workload.
+
+**Profiling.** `benches/workload23.py` (join-heavy: merged USING inner/
+left/right/full, USING aliases, whole-join aliases, NATURAL, column alias
+lists, 500-row tables): **36.6 qps** on the release build (each query scans
+~250k nested-loop pairs — no hash join by design). Valgrind 3.22.0:
+Memcheck **runs again** (the stripped-`ld.so` blocker from v0.21/v0.22 is
+gone) and reports **0 errors** over the join workload with real data.
+Callgrind: no Rust function above ~5% self-cost — libc `memcpy` leads at
+18.45% (row materialization inherent to nested-loop joins), so per the
+measure-first rule no optimization was made. DHAT: 9.6 MB total heap over
+the workload, 577 KB peak, 226 KB at exit — no leak growth.
+
+**Known limitations (v0.23).** Merged keys keep the left column's type
+(no cross-type coercion yet). No hash join — 10k×10k cross products wedge
+the 30 s statement timeout by design (same as v0.22).
+
 # rustgres v0.22 — "conformance burn-down: the five float8 stragglers"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —

@@ -894,7 +894,13 @@ pub enum FromItem {
         col_aliases: Vec<String>,
     },
     /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
-    Derived { sub: Box<SelectStmt>, alias: String },
+    /// v0.23: `[(cols)]` column aliases rename the subquery's output
+    /// columns positionally (previously parsed but discarded).
+    Derived {
+        sub: Box<SelectStmt>,
+        alias: String,
+        col_aliases: Vec<String>,
+    },
     /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
     /// columns `column1`, `column2`, ... when no column aliases are given.
     /// v0.21: `[(col, ...)]` column aliases.
@@ -915,6 +921,15 @@ pub enum FromItem {
         /// v0.20: `NATURAL` — resolved to USING on common columns at
         /// execution time (schemas not known at parse time).
         natural: bool,
+        /// v0.23: `JOIN ... USING (cols) AS alias` — a USING-scoped alias
+        /// exposing only the merged columns (the source tables stay
+        /// visible). The `AS` keyword is required, like PostgreSQL.
+        using_alias: Option<String>,
+        /// v0.23: alias for a parenthesized joined table,
+        /// `(a JOIN b ...) [AS] x [(cols)]` — hides the inner table names.
+        alias: Option<String>,
+        /// v0.23: positional column renames for a parenthesized join.
+        col_aliases: Vec<String>,
     },
 }
 
@@ -5414,6 +5429,9 @@ impl Parser {
                 on: None,
                 using: Vec::new(),
                 natural: false,
+                using_alias: None,
+                alias: None,
+                col_aliases: Vec::new(),
             };
         }
         Ok(vec![acc])
@@ -5475,6 +5493,14 @@ impl Parser {
                     }
                 }
             };
+            // v0.23: `JOIN ... USING (cols) AS alias` — the alias belongs to
+            // the USING clause (exposes only the merged columns); the `AS`
+            // keyword is required, like PostgreSQL.
+            let using_alias = if !using.is_empty() && self.eat_keyword("as") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
             left = FromItem::Join {
                 left: Box::new(left),
                 kind,
@@ -5482,6 +5508,9 @@ impl Parser {
                 on,
                 using,
                 natural,
+                using_alias,
+                alias: None,
+                col_aliases: Vec::new(),
             };
         }
         Ok(left)
@@ -5536,34 +5565,46 @@ impl Parser {
                     alias: String::new(),
                     col_aliases: Vec::new(),
                 }
-            } else {
+            } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
+                // `with` falls through to parse_subquery's clean
+                // "expected SELECT" error, exactly like before v0.23.
                 let sub = self.parse_subquery()?;
                 FromItem::Derived {
                     sub: Box::new(sub),
                     alias: String::new(),
+                    col_aliases: Vec::new(),
                 }
+            } else {
+                // v0.23: parenthesized joined table (or bare table):
+                // `(a JOIN b ...)`, `(tbl)`.
+                self.parse_join_chain()?
             };
             for _ in 0..=extra {
                 self.expect(Token::RParen, "')'")?;
             }
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
             // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
-            let alias = self.parse_derived_alias()?;
-            let col_aliases = if *self.peek() == Token::LParen {
-                self.next();
-                let mut cols = Vec::new();
-                loop {
-                    cols.push(self.expect_ident()?);
-                    if *self.peek() == Token::Comma {
-                        self.next();
-                        continue;
+            // v0.23: `(a JOIN b ...) [AS] x [(cols)]` — the alias is
+            // optional here (unlike derived tables) and never auto-generated:
+            // without one the inner table names stay visible.
+            let (alias, col_aliases) = match &item {
+                FromItem::Join { .. } | FromItem::Table { .. } => {
+                    let a = self.parse_alias_opt()?;
+                    let c = self.parse_col_alias_list()?;
+                    // v0.23: PostgreSQL requires the table alias when a
+                    // column alias list is present.
+                    if a.is_none() && !c.is_empty() {
+                        return Err(err(
+                            "syntax error: column aliases require a table alias".to_string()
+                        ));
                     }
-                    break;
+                    (a, c)
                 }
-                self.expect(Token::RParen, "')'")?;
-                cols
-            } else {
-                Vec::new()
+                _ => {
+                    let a = self.parse_derived_alias()?;
+                    let c = self.parse_col_alias_list()?;
+                    (Some(a), c)
+                }
             };
             match &mut item {
                 FromItem::Values {
@@ -5571,13 +5612,41 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    *a = alias.unwrap_or_default();
+                    *c = col_aliases;
+                }
+                FromItem::Derived {
+                    alias: a,
+                    col_aliases: c,
+                    ..
+                } => {
+                    *a = alias.unwrap_or_default();
+                    *c = col_aliases;
+                }
+                FromItem::Join {
+                    alias: a,
+                    col_aliases: c,
+                    ..
+                } => {
                     *a = alias;
                     *c = col_aliases;
                 }
-                FromItem::Derived { alias: a, .. } => {
-                    *a = alias;
+                FromItem::Table {
+                    alias: a,
+                    col_aliases: c,
+                    ..
+                } => {
+                    if a.is_some() && alias.is_some() {
+                        return Err(err(format!(
+                            "table name \"{}\" specified more than once",
+                            a.as_deref().unwrap_or("")
+                        )));
+                    }
+                    if alias.is_some() {
+                        *a = alias;
+                    }
+                    *c = col_aliases;
                 }
-                _ => unreachable!("parse_from_primary paren branch"),
             }
             Ok(item)
         } else {
@@ -5592,27 +5661,33 @@ impl Parser {
             };
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
-            let col_aliases = if *self.peek() == Token::LParen {
-                self.next();
-                let mut cols = Vec::new();
-                loop {
-                    cols.push(self.expect_ident()?);
-                    if *self.peek() == Token::Comma {
-                        self.next();
-                        continue;
-                    }
-                    break;
-                }
-                self.expect(Token::RParen, "')'")?;
-                cols
-            } else {
-                Vec::new()
-            };
+            let col_aliases = self.parse_col_alias_list()?;
             Ok(FromItem::Table {
                 name,
                 alias,
                 col_aliases,
             })
+        }
+    }
+
+    /// `(a, b, c)` column alias list after a table alias, or empty when
+    /// the next token is not `(`.
+    fn parse_col_alias_list(&mut self) -> Result<Vec<String>, SqlError> {
+        if *self.peek() == Token::LParen {
+            self.next();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+            Ok(cols)
+        } else {
+            Ok(Vec::new())
         }
     }
 
