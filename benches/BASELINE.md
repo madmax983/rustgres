@@ -104,6 +104,62 @@ byte-for-byte identical to today's output; behavior for every input is
 unchanged (same 81 unit tests, same conformance suites, no expectations
 touched).
 
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (30 iterations) | 3,725,524,029 | 3,311,543,182 | **-11.11%** |
+| DHAT total allocations (blocks) | 2,014,707 | 1,114,698 | **-44.68%** |
+| DHAT total bytes allocated | 224,697,027 | 216,321,703 | **-3.73%** |
+
+Reproduced with a second `after` Callgrind run on the same binary:
+3,311,631,519 (an 88,337-instruction, ~0.0027% difference from the first —
+within this harness's established determinism band).
+
+Both floors clear decisively: the instruction-count delta (-11.11%) is
+more than 2x the ≥5% floor, and the allocation-count delta (-44.68%) is
+more than 4x the ≥10% floor. The three targeted `Value::to_text` arms
+disappear from the DHAT profile entirely (0 blocks; the site now shows
+`Value::write_text_into` at 0 allocations of its own — everything it
+writes lands directly in the already-allocated payload buffer). The
+`bytes` delta is smaller than the allocation-count delta because most of
+each freed allocation was small (a handful of digits, or "t"/"f"); the
+untouched `MsgBuilder` payload allocation and the untouched row-clone from
+storage (`Vec<Value>::clone` in `build_source`, exec.rs:7426 — a separate,
+still-unaddressed hotspot now the largest single DHAT site in this
+workload at 26.91% of remaining allocations) account for most of the
+remaining bytes.
+
+**Reproduce** (after building with the fix applied):
+
+```bash
+cargo build && cargo test --all-features   # 81 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Same pattern for DHAT: `valgrind --tool=dhat --dhat-out-file=/tmp/dh.out`,
+then sum `tbk` over the `pps` array in the JSON output.
+
+**Note on `cargo clippy --all-targets --all-features -- -D warnings`**: same
+pre-existing failure mode as every other Bolt entry in this file — this
+session's toolchain reports 242 repo-wide lint errors unrelated to this
+change (matching the count recorded in the most recent prior entry).
+`cargo clippy --all-targets --all-features` (without `-D warnings`) shows
+the same 242 warnings before and after this diff (verified via `git
+stash`/`git stash pop` on the pristine pre-fix tree) — zero new warnings
+from this change.
+
+**Conformance**: all 19 `tests/protocol_test*.py` suites pass unchanged
+against the fixed binary (`protocol_test.py` through `protocol_test21.py`),
+in addition to the 81 `cargo test --all-features` unit tests.
+
 ## Bolt: `send_data_row` payload buffer growth — baseline — 2026-09-13
 
 **Workload**: `benches/profile_scan.py` (new, this commit) — loads a 10,000-row

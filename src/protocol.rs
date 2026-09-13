@@ -233,6 +233,26 @@ impl MsgBuilder {
         self
     }
 
+    /// Writes a column value in the wire protocol's length-prefixed text
+    /// format (a 4-byte length, or `-1` for NULL, followed by the text
+    /// bytes) directly into the payload. Reserves the length prefix,
+    /// writes the value's text straight into the buffer via
+    /// `Value::write_text_into` (no intermediate `String`), then patches
+    /// the prefix with the number of bytes actually written — one pass
+    /// over the payload, same wire bytes as building a `String` via
+    /// `to_text()` and copying it in, minus that extra allocation.
+    pub fn value_text(&mut self, v: &crate::storage::Value) -> &mut Self {
+        let len_pos = self.payload.len();
+        self.payload.extend_from_slice(&[0; 4]); // placeholder, patched below
+        if v.write_text_into(&mut self.payload) {
+            let text_len = (self.payload.len() - len_pos - 4) as i32;
+            self.payload[len_pos..len_pos + 4].copy_from_slice(&text_len.to_be_bytes());
+        } else {
+            self.payload[len_pos..len_pos + 4].copy_from_slice(&(-1i32).to_be_bytes());
+        }
+        self
+    }
+
     /// Message type byte (used when the payload is embedded in another
     /// message, e.g. XLogData inside CopyData).
     pub fn kind(&self) -> u8 {

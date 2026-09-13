@@ -3012,15 +3012,7 @@ pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()
     let mut b = MsgBuilder::with_capacity(b'D', 64);
     b.i16(row.len() as i16);
     for v in row {
-        match v.to_text() {
-            None => {
-                b.i32(-1); // NULL
-            }
-            Some(s) => {
-                b.i32(s.len() as i32);
-                b.bytes(s.as_bytes());
-            }
-        }
+        b.value_text(v);
     }
     b.send(stream)
 }
