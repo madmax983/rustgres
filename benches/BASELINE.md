@@ -2,6 +2,108 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `send_data_row` per-column text materialization — baseline — 2026-09-13
+
+**Workload**: `benches/profile_scan.py --rows 10000 --count 30` (unchanged from
+the prior entry) — loads a 10,000-row 3-column table (`bench_scan(id INT,
+name TEXT, active BOOL)`) once, then sends an exact, fixed count of 30
+`SELECT * FROM bench_scan` queries over the real wire protocol. Same
+workload as the immediately preceding `send_data_row` entry in this file,
+run again on top of that fix (already merged) to find the next hotspot on
+the same universal row-output path.
+
+**Profile** (DHAT, `valgrind --tool=dhat`, same harness, this commit — i.e.
+with the prior `MsgBuilder::with_capacity` fix already applied):
+
+Total: 2,014,707 allocations, 224,697,027 bytes. The top allocation sites,
+all reached from `send_data_row` (server.rs:3015) via `Value::to_text`
+(storage.rs:1255) for this table's three column types, each fire exactly
+once per column per row (300,000 = 30 iterations × 10,000 rows):
+
+| site | blocks | % of total | bytes |
+|---|---|---|---|
+| `MsgBuilder::with_capacity` payload alloc (protocol.rs:200) — the fix from the prior entry, one alloc/row, not a target here | 300,000 | 14.89% | 19,200,000 |
+| `Value::to_text` `Int` arm → `i64::to_string()` (storage.rs:1258) | 300,000 | 14.89% | 5,700,000 |
+| `Value::to_text` `Text` arm → `String::clone()` (storage.rs:1263) | 300,000 | 14.89% | 2,366,700 |
+| `Value::to_text` `Bool` arm → `"t"/"f".to_string()` (storage.rs:1264) | 300,000 | 14.89% | 300,000 |
+
+**The three `Value::to_text` arms together are 900,000 blocks — 44.68% of
+all allocations in the workload** (more than the 34.4% that justified the
+prior entry's fix), every one of them reached from the same call site:
+`send_data_row`'s `match v.to_text() { ... }` loop over the row's columns
+(server.rs:3007-3026).
+
+**Mechanism**: `send_data_row` needs the value's length-prefixed text
+bytes in the wire-format payload buffer. Today it gets them by calling
+`Value::to_text()`, which builds a brand-new heap-allocated `String` for
+every non-NULL value — even for `Text` columns, where the data is already
+a `String` sitting in the table and gets `.clone()`d solely to satisfy
+`to_text`'s `Option<String>`-owning signature — and only afterwards copies
+that `String`'s bytes into the `MsgBuilder`'s payload `Vec<u8>` and drops
+it. Every one of those intermediate `String`s is allocated, written to
+once, copied once, and freed — pure overhead versus formatting straight
+into the payload buffer that is going to hold the bytes anyway. This is
+the same universal path as the prior entry (`send_data_row` runs once per
+output row of every `SELECT`, `RETURNING`, and `FETCH`), so the fix
+compounds with it rather than being a one-off.
+
+**Baseline numbers** (this commit, `send_data_row`/`Value::to_text`
+unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 30 iterations × 10,000-row scan) | 3,725,524,029 |
+| DHAT total allocations (blocks) | 2,014,707 |
+| DHAT total bytes allocated | 224,697,027 |
+| DHAT blocks reached from `send_data_row`'s `to_text()` calls (Int + Text + Bool arms) | 900,000 (44.68% of all allocations) |
+
+Reproduced with a second baseline Callgrind run on the same (pre-fix)
+binary: 3,725,788,122 (a 264,093-instruction, ~0.0071% difference — within
+this harness's established determinism band, not noise threatening the
+result).
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+
+# separately, under --tool=dhat --dhat-out-file=/tmp/dh.out with the same
+# harness: sum tbk over pps[] in the JSON output, and walk each
+# allocation's ftbl-resolved call stack (fs[] indices into ftbl[]) to
+# attribute it to a caller (the three 300,000-block entries above all end
+# at storage.rs:1258/1263/1264, called from server.rs:3015).
+```
+
+**Fix** (next commit): add `Value::write_text_into(&self, out: &mut Vec<u8>)
+-> bool`, a sibling to `to_text()` that writes the same bytes directly into
+a caller-supplied buffer instead of returning an owned `String` — for
+`Text` this is a plain `extend_from_slice` from the existing `&str` (no
+clone at all), for `Int`/`SmallInt`/`BigInt` a `write!` of the integer
+straight into the `Vec<u8>` (still no intermediate `String`; the integer
+formatter's own internals use a small stack buffer, not the heap), and for
+`Bool` a single pushed byte. The remaining variants (`Numeric`, dates,
+`Bytea`, `Uuid`) keep calling `to_text()` internally and copying its bytes
+in — same cost as today for those, since they are not in this workload's
+hot set and a full rewrite of their formatting isn't justified by this
+profile. `MsgBuilder` gains a `value_text(&mut self, v: &Value)` method
+that reserves a 4-byte length placeholder, writes the value via
+`write_text_into`, then patches the placeholder with the actual length (or
+-1 for NULL) — a single pass over the payload buffer, only one allocation
+(the `MsgBuilder`'s own payload `Vec`, already reserved by the prior fix),
+zero for the value text itself. `to_text()` and its other 13 call sites
+(EXPLAIN, WAL text encoding, `repl.rs`, casts, etc.) are untouched — this
+only changes the one hot call site in `send_data_row`. Wire bytes are
+byte-for-byte identical to today's output; behavior for every input is
+unchanged (same 81 unit tests, same conformance suites, no expectations
+touched).
+
 ## Bolt: `send_data_row` payload buffer growth — baseline — 2026-09-13
 
 **Workload**: `benches/profile_scan.py` (new, this commit) — loads a 10,000-row
