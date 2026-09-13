@@ -89,14 +89,18 @@ above the ~27–30 bytes an ordinary short row needs here, chosen as a small
 constant rather than computed per-row (a first attempt precomputed the
 *exact* capacity by collecting every column's `to_text()` result into a
 `Vec<Option<String>>` up front, summing its lengths, then building the
-payload from that; it cleared the allocation-count floor by an even wider
-margin (-22.95%) but *increased* Ir by +7.5% — the extra `Vec<Option<String>>`
-allocation plus three full passes over the row, versus the original's one,
-cost more instructions than the eliminated reallocations saved. Recording
-this here so nobody re-introduces that shape expecting a bigger win: it
-measured worse on the primary counter. The fixed-capacity version has no
-such extra pass or allocation — same field-by-field write loop as before,
-just a bigger initial reservation). Behavior is unchanged: the wire bytes
+payload from that; measured on this same harness, it cleared the
+allocation-count floor too, but by a *smaller* margin than the fixed-64
+version below (-11.47% allocations vs. -22.95%, because the
+`Vec<Option<String>>` is itself an extra per-row allocation), and it
+*increased* Ir by +7.5% instead of reducing it — that extra allocation
+plus three full passes over the row (collect, sum, write), versus the
+original's one pass, cost more instructions than the eliminated
+reallocations saved. Recording this here so nobody re-introduces that
+shape expecting a bigger win: it measured worse on *both* counters than
+the simpler fix below. The fixed-capacity version has no such extra pass
+or allocation — same field-by-field write loop as before, just a bigger
+initial reservation). Behavior is unchanged: the wire bytes
 written are byte-for-byte identical (same `i16`/`i32`/`bytes` calls, same
 order), just fewer growth reallocations of the same buffer. Same behavior
 for every input (all 81 unit tests, all 19 `tests/protocol_test*.py`
