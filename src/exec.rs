@@ -7000,16 +7000,25 @@ fn filter_rows(
     }
     let mut out = Vec::new();
     for row in rows {
+        let frame = Scope {
+            schema,
+            row: &row.cells,
+        };
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            // Common case: no correlated outer query, so the scope chain
+            // is just this row — a 1-element slice needs no heap allocation.
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
         let mut keep = true;
         for c in conjuncts {
-            let frame = Scope {
-                schema,
-                row: &row.cells,
-            };
-            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
-            scopes.extend_from_slice(outer);
-            scopes.push(frame);
-            if !check_bool(eval_expr(q, &scopes, c)?, "WHERE")? {
+            if !check_bool(eval_expr(q, scopes, c)?, "WHERE")? {
                 keep = false;
                 break;
             }
@@ -7851,16 +7860,21 @@ fn apply_where(
     };
     let mut out = Vec::new();
     for row in rows {
-        let keep = {
-            let frame = Scope {
-                schema,
-                row: &row.cells,
-            };
-            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
-            scopes.extend_from_slice(outer);
-            scopes.push(frame);
-            check_bool(eval_expr(q, &scopes, pred)?, "WHERE")?
+        let frame = Scope {
+            schema,
+            row: &row.cells,
         };
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
+        let keep = check_bool(eval_expr(q, scopes, pred)?, "WHERE")?;
         if keep {
             out.push(row);
         }
@@ -8036,24 +8050,28 @@ fn exec_agg(
     let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
-        let (key_vals, key_bytes) = {
-            let frame = Scope {
-                schema,
-                row: &row.cells,
-            };
-            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
-            scopes.extend_from_slice(outer);
-            scopes.push(frame);
-            let mut key_vals = Vec::with_capacity(stmt.group_by.len());
-            let mut key_bytes = Vec::new();
-            for g in &stmt.group_by {
-                // GROUP BY exprs cannot contain aggregates (validated).
-                let v = eval_expr(q, &scopes, g)?;
-                value_key(&v, &mut key_bytes);
-                key_vals.push(v);
-            }
-            (key_vals, key_bytes)
+        let frame = Scope {
+            schema,
+            row: &row.cells,
         };
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
+        let mut key_vals = Vec::with_capacity(stmt.group_by.len());
+        let mut key_bytes = Vec::new();
+        for g in &stmt.group_by {
+            // GROUP BY exprs cannot contain aggregates (validated).
+            let v = eval_expr(q, scopes, g)?;
+            value_key(&v, &mut key_bytes);
+            key_vals.push(v);
+        }
         match group_index.get(&key_bytes) {
             Some(&gi) => groups[gi].1.push(i),
             None => {
@@ -8584,14 +8602,21 @@ fn eval_agg_func(
             schema,
             row: &rows[i].cells,
         };
-        let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
-        scopes.extend_from_slice(outer);
-        scopes.push(frame);
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
         // Aggregate arguments cannot nest aggregates (the parser allows
         // the syntax; fail like Postgres rather than recursing forever).
-        let v = eval_expr(q, &scopes, a)?;
+        let v = eval_expr(q, scopes, a)?;
         if func == AggFunc::StringAgg {
-            let d = eval_expr(q, &scopes, arg2.expect("string_agg takes a delimiter"))?;
+            let d = eval_expr(q, scopes, arg2.expect("string_agg takes a delimiter"))?;
             if v == Value::Null {
                 continue;
             }

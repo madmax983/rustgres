@@ -92,6 +92,67 @@ construction out of its inner per-conjunct loop (the frame does not depend
 on which conjunct is being evaluated), so it allocates at most once per
 row instead of once per (row, conjunct) pair even on the slow path.
 
+**Fix applied**: as described above, using Rust's deferred-initialization
+`let x; let r = if cond { ... } else { x = v; &x };` idiom so the rest of
+each function's row-processing body reads `scopes` once, uniformly,
+whichever path built it — no duplicated per-row logic between the fast and
+slow path.
+
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| DHAT total allocations (blocks) | 306,690 | 186,692 | **-39.13%** |
+| DHAT total bytes allocated | 45,745,400 | 41,905,376 | **-8.39%** |
+
+More than 3x the >=10%-of-allocations impact floor. The
+`with_capacity_in::<Scope>` site is gone entirely from the post-fix DHAT
+top-allocators list for this workload (0 blocks, versus 120,000 before).
+
+**`Ir` for this change**: not used as evidence (see the baseline entry
+above — this workload's `Ir` is not reproducible run-to-run on this
+machine, swinging 60% between two back-to-back runs of *unchanged* code).
+For the record, two before/after pairs measured in this same session:
+before 10,602,624,702 and 6,628,180,094; after 6,533,463,744 and
+6,532,574,015. The two *after* runs agree to within 0.01% (consistent with
+DHAT: removing a fixed-size allocation from a hot loop should have a
+small, not large, effect on instruction count), and the second *before*
+run — the more representative of the two, being close to both after runs
+— gives a Ir delta of about -1.4%, which does not clear the 5% floor. The
+39.13%/-8.39% DHAT deltas above are what this change is gated on, per "at
+least one of" the floor criteria; no instruction-count claim is made.
+
+**Correctness**: all 87 `cargo test --all-features` unit tests pass
+unchanged. All 19 `tests/protocol_test*.py` conformance suites pass
+unchanged (1618+ assertions total across the 15 self-managed suites plus
+the four run against one shared server instance — `protocol_test.py`,
+`2`, `3`, `19`). `cargo fmt --all -- --check` is clean. `cargo clippy
+--all-targets --all-features` reports the same 232 pre-existing warnings
+and the same pre-existing `clippy::eq_op` compile error at `exec.rs:13891`
+(`cols[1 - 1]`, unrelated to this change, unchanged from `main`) before
+and after this diff — zero new warnings.
+
+No behavior change: the fast path evaluates the identical expression
+against the identical (single-frame) scope chain the slow path would have
+built; the slow (correlated, `outer` non-empty) path is byte-for-byte
+unchanged code.
+
+**Reproduce**:
+
+```bash
+cargo build && cargo test --all-features   # 87 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dh.out ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100
+# SIGTERM the server to flush, then sum tbk over pps[] in the JSON — the
+# with_capacity_in::<Scope> site (present in the baseline commit, gone here)
+# no longer appears when grouping by innermost rustgres:: frame.
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before number.
+
 ## Issue #8: rows are shared, not copied, out of table storage — 2026-09-13
 
 **Decision**: issue #8 asked for an ownership-model call on the row
