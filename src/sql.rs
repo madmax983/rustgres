@@ -32,6 +32,8 @@
 //! Keywords are case-insensitive; unquoted identifiers fold to lowercase.
 //! String literals use single quotes with `''` as the escape for a quote.
 
+use std::sync::Arc;
+
 use crate::storage::ColType;
 
 #[derive(Debug)]
@@ -562,7 +564,9 @@ pub enum Literal {
     Decimal(String),
     Real(f32),                        // v0.7: only via typed params/casts, never parsed
     Numeric(crate::storage::Numeric), // v0.7: only via typed params/casts
-    Text(String),
+    /// A reference count controls the text, thus a literal that runs for
+    /// each row makes a `Value::Text` with no copy.
+    Text(Arc<str>),
     Bool(bool),
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
@@ -636,7 +640,7 @@ impl Literal {
             },
             Literal::Real(f) => Value::Float4(f),
             Literal::Numeric(n) => Value::Numeric(n),
-            Literal::Text(s) => Value::Text(s),
+            Literal::Text(s) => Value::text(s),
             Literal::Bool(b) => Value::Bool(b),
             Literal::Date(d) => Value::Date(d),
             Literal::Timestamp(m) => Value::Timestamp(m),
@@ -1183,7 +1187,7 @@ fn classify_default(e: Expr) -> Result<DefaultExpr, SqlError> {
         Expr::Literal(l) => Ok(DefaultExpr::Lit(l)),
         Expr::Func { name, args } if name == "nextval" && args.len() == 1 => {
             match args.into_iter().next() {
-                Some(Expr::Literal(Literal::Text(s))) => Ok(DefaultExpr::Nextval(s)),
+                Some(Expr::Literal(Literal::Text(s))) => Ok(DefaultExpr::Nextval(s.to_string())),
                 _ => Err(err(
                     "nextval() in DEFAULT requires a sequence name string literal".to_string(),
                 )),
@@ -3169,7 +3173,7 @@ impl Parser {
                     )))
                 }
             }
-            Token::Str(s) => Ok(Literal::Text(s)),
+            Token::Str(s) => Ok(Literal::Text(s.into())),
             Token::UStr(raw) => {
                 // v0.19: U&'...' with optional UESCAPE 'c' clause.
                 let escape = if self.eat_keyword("uescape") {
@@ -3196,7 +3200,7 @@ impl Parser {
                     '\\'
                 };
                 match decode_ustr(&raw, escape) {
-                    Some(t) => Ok(Literal::Text(t)),
+                    Some(t) => Ok(Literal::Text(t.into())),
                     None => Err(err("invalid Unicode escape")),
                 }
             }
@@ -3742,7 +3746,7 @@ impl Parser {
                 self.next(); // consume the type name
                 if self.parse_type_name_rest(name).is_ok() {
                     if let Token::Str(s) = self.next() {
-                        return Ok(InsertValue::Lit(Literal::Text(s)));
+                        return Ok(InsertValue::Lit(Literal::Text(s.into())));
                     }
                 }
                 self.pos = save;
@@ -4189,7 +4193,7 @@ impl Parser {
                     // Only concatenate text literals.
                     let next = self.parse_literal()?;
                     match (&mut lit, next) {
-                        (Literal::Text(a), Literal::Text(b)) => a.push_str(&b),
+                        (Literal::Text(a), Literal::Text(b)) => *a = format!("{}{}", a, b).into(),
                         _ => {
                             return Err(err(
                                 "syntax error: adjacent literals must both be strings",
@@ -4237,7 +4241,7 @@ impl Parser {
                             let s = s.clone();
                             self.next();
                             return Ok(Expr::Cast {
-                                expr: Box::new(Expr::Literal(Literal::Text(s))),
+                                expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
                             });
                         }
@@ -4605,8 +4609,8 @@ impl Parser {
             return Ok(Expr::Func {
                 name: "trim".to_string(),
                 args: vec![
-                    Expr::Literal(Literal::Text(spec.to_string())),
-                    Expr::Literal(Literal::Text(" ".to_string())),
+                    Expr::Literal(Literal::Text(spec.into())),
+                    Expr::Literal(Literal::Text(" ".into())),
                     s,
                 ],
             });
@@ -4617,15 +4621,15 @@ impl Parser {
             self.expect(Token::RParen, "')'")?;
             return Ok(Expr::Func {
                 name: "trim".to_string(),
-                args: vec![Expr::Literal(Literal::Text(spec.to_string())), first, s],
+                args: vec![Expr::Literal(Literal::Text(spec.into())), first, s],
             });
         }
         self.expect(Token::RParen, "')'")?;
         Ok(Expr::Func {
             name: "trim".to_string(),
             args: vec![
-                Expr::Literal(Literal::Text("both".to_string())),
-                Expr::Literal(Literal::Text(" ".to_string())),
+                Expr::Literal(Literal::Text("both".into())),
+                Expr::Literal(Literal::Text(" ".into())),
                 first,
             ],
         })
@@ -7008,7 +7012,7 @@ impl<'a> SexprParser<'a> {
                 let scale: u32 = self.atom()?.parse().map_err(|_| "bad numeric")?;
                 Literal::Numeric(crate::storage::Numeric::new(unscaled, scale))
             }
-            "text" => Literal::Text(self.atom()?),
+            "text" => Literal::Text(self.atom()?.into()),
             "bool" => Literal::Bool(self.atom()?.parse().map_err(|_| "bad bool")?),
             "date" => Literal::Date(self.atom()?.parse().map_err(|_| "bad date")?),
             "ts" => Literal::Timestamp(self.atom()?.parse().map_err(|_| "bad ts")?),

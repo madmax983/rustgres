@@ -122,7 +122,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::index::{Index, IndexDef};
-use crate::storage::{ColType, Engine, RowVersion, Table, Value, WriteOp};
+use crate::storage::{ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
 
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
@@ -225,7 +225,7 @@ fn crc32(data: &[u8]) -> u32 {
 pub struct WalRow {
     pub id: u64,
     pub xmin: u64,
-    pub values: Vec<Value>,
+    pub values: Row,
 }
 
 /// One logical change to the committed database.
@@ -716,7 +716,7 @@ impl Enc {
                     self.u64(r.id);
                     self.u64(r.xmin);
                     self.u32(r.values.len() as u32);
-                    for v in &r.values {
+                    for v in r.values.iter() {
                         self.value(v);
                     }
                 }
@@ -740,7 +740,7 @@ impl Enc {
                     self.u64(*id);
                     self.u64(old.xmin);
                     self.u32(old.values.len() as u32);
-                    for v in &old.values {
+                    for v in old.values.iter() {
                         self.value(v);
                     }
                 }
@@ -760,7 +760,7 @@ impl Enc {
                     self.u64(r.id);
                     self.u64(r.xmin);
                     self.u32(r.values.len() as u32);
-                    for v in &r.values {
+                    for v in r.values.iter() {
                         self.value(v);
                     }
                 }
@@ -769,7 +769,7 @@ impl Enc {
                     self.u64(r.id);
                     self.u64(r.xmin);
                     self.u32(r.values.len() as u32);
-                    for v in &r.values {
+                    for v in r.values.iter() {
                         self.value(v);
                     }
                 }
@@ -1070,6 +1070,17 @@ impl<'a> Dec<'a> {
             .map_err(|_| self.err("invalid utf-8 in string"))
     }
 
+    /// Read a string straight into an `Arc<str>`. This copies the bytes
+    /// one time. `str()` then `Value::text()` copies them two times.
+    fn str_arc(&mut self) -> Result<std::sync::Arc<str>, String> {
+        let n = self.u32()? as usize;
+        let b = self.take(n)?;
+        match std::str::from_utf8(b) {
+            Ok(s) => Ok(s.into()),
+            Err(_) => Err(self.err("invalid utf-8 in string")),
+        }
+    }
+
     fn col_type(&mut self) -> Result<ColType, String> {
         match self.u8()? {
             0 => Ok(ColType::Int),
@@ -1094,7 +1105,7 @@ impl<'a> Dec<'a> {
             0 => Ok(Value::Null),
             1 => Ok(Value::Int(self.i64()?)),
             2 => Ok(Value::Float(self.f64()?)),
-            3 => Ok(Value::Text(self.str()?)),
+            3 => Ok(Value::Text(self.str_arc()?)),
             4 => Ok(Value::Bool(self.u8()? != 0)),
             5 => Ok(Value::SmallInt(self.i16()?)),
             6 => Ok(Value::BigInt(self.i64()?)),
@@ -1142,7 +1153,11 @@ impl<'a> Dec<'a> {
         for _ in 0..nv {
             values.push(self.value()?);
         }
-        Ok(WalRow { id, xmin, values })
+        Ok(WalRow {
+            id,
+            xmin,
+            values: Row::new(values),
+        })
     }
 
     fn record(&mut self) -> Result<WalRecord, String> {
@@ -1178,7 +1193,11 @@ impl<'a> Dec<'a> {
                     for _ in 0..m {
                         values.push(self.value()?);
                     }
-                    rows.push(WalRow { id, xmin, values });
+                    rows.push(WalRow {
+                        id,
+                        xmin,
+                        values: Row::new(values),
+                    });
                 }
                 Ok(WalRecord::InsertRows { table, rows })
             }
@@ -1200,7 +1219,11 @@ impl<'a> Dec<'a> {
                         values.push(self.value()?);
                     }
                     ids.push(id);
-                    old_rows.push(WalRow { id, xmin, values });
+                    old_rows.push(WalRow {
+                        id,
+                        xmin,
+                        values: Row::new(values),
+                    });
                 }
                 let xmax = self.u64()?;
                 Ok(WalRecord::DeleteRows {
@@ -1717,7 +1740,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // Collect the actually-inserted (id, values) first: the index
             // maintenance below needs `eng` mutably, which conflicts with
             // the table borrow.
-            let inserted: Vec<(u64, Vec<Value>)> = {
+            let inserted: Vec<(u64, Row)> = {
                 let Some(t) = live_table(eng, table) else {
                     eprintln!(
                         "WAL replay: skipping InsertRows for \"{}\": no live table version",
@@ -1815,8 +1838,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // Index the new versions, like live execution's
             // index_insert_row: recovery rebuilds indexes only for the
             // checkpoint image; replayed rows need their entries.
-            let indexed: Vec<(u64, Vec<Value>)> =
-                new.iter().map(|r| (r.id, r.values.clone())).collect();
+            let indexed: Vec<(u64, Row)> = new.iter().map(|r| (r.id, r.values.clone())).collect();
             // `t`'s borrow ends at its last use above; eng.db is free again.
             for (id, values) in indexed {
                 eng.db.index_insert_row(table, id, &values);
@@ -2493,7 +2515,7 @@ pub fn records_for_commit(
 /// Our uncommitted row version, plus whether its table version is still
 /// live (not dropped by a committed concurrent transaction). `None` when
 /// the row is gone or no longer ours.
-fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Vec<Value>, bool)> {
+fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, bool)> {
     for versions in eng.db.tables.values() {
         for t in versions {
             if let Some(pos) = t.row_pos(row_id) {
@@ -2796,7 +2818,7 @@ impl Wal {
                     body.u64(r.xmin);
                     body.u64(committed_xmax(eng, r.xmax));
                     body.u32(r.values.len() as u32);
-                    for v in &r.values {
+                    for v in r.values.iter() {
                         body.value(v);
                     }
                 }
@@ -3094,7 +3116,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             }
             rows.push(RowVersion {
                 id,
-                values,
+                values: Row::new(values),
                 xmin,
                 xmax,
             });
@@ -3304,7 +3326,7 @@ mod tests {
                 let mut t = Table::new(vec![("a".into(), ColType::Int)], 1);
                 t.push_version(RowVersion {
                     id: 1,
-                    values: vec![Value::Int(10)],
+                    values: Row::new(vec![Value::Int(10)]),
                     xmin: 1,
                     xmax: 0,
                 });
@@ -3361,12 +3383,12 @@ mod tests {
                     WalRow {
                         id: 7,
                         xmin: 4,
-                        values: vec![Value::Int(1), Value::Null],
+                        values: Row::new(vec![Value::Int(1), Value::Null]),
                     },
                     WalRow {
                         id: 8,
                         xmin: 4,
-                        values: vec![Value::Int(2), Value::Text("x".into())],
+                        values: Row::new(vec![Value::Int(2), Value::text("x")]),
                     },
                 ],
             },
@@ -3381,17 +3403,17 @@ mod tests {
                     WalRow {
                         id: 7,
                         xmin: 3,
-                        values: vec![Value::Int(1)],
+                        values: Row::new(vec![Value::Int(1)]),
                     },
                     WalRow {
                         id: 8,
                         xmin: 4,
-                        values: vec![Value::Int(2)],
+                        values: Row::new(vec![Value::Int(2)]),
                     },
                     WalRow {
                         id: 9,
                         xmin: 4,
-                        values: vec![Value::Int(3)],
+                        values: Row::new(vec![Value::Int(3)]),
                     },
                 ],
                 xmax: 6,
@@ -3402,12 +3424,12 @@ mod tests {
                 old: vec![WalRow {
                     id: 7,
                     xmin: 4,
-                    values: vec![Value::Int(1), Value::Text("a".into())],
+                    values: Row::new(vec![Value::Int(1), Value::text("a")]),
                 }],
                 new: vec![WalRow {
                     id: 10,
                     xmin: 6,
-                    values: vec![Value::Int(1), Value::Text("b".into())],
+                    values: Row::new(vec![Value::Int(1), Value::text("b")]),
                 }],
                 xmax: 6,
             },
@@ -3438,7 +3460,7 @@ mod tests {
         for (id, v) in [(2u64, 20i64), (3, 30)] {
             eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
                 id,
-                values: vec![Value::Int(v)],
+                values: Row::new(vec![Value::Int(v)]),
                 xmin: xid,
                 xmax: 0,
             });
@@ -3459,7 +3481,7 @@ mod tests {
             WalRecord::InsertRows { table, rows } => {
                 assert_eq!(table, "t");
                 assert_eq!(rows.len(), 2);
-                assert_eq!(rows[0].values, vec![Value::Int(20)]);
+                assert_eq!(rows[0].values, Row::new(vec![Value::Int(20)]));
             }
             r => panic!("unexpected record: {:?}", r),
         }
@@ -3510,7 +3532,7 @@ mod tests {
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = xid;
         eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
             id: 2,
-            values: vec![Value::Int(99)],
+            values: Row::new(vec![Value::Int(99)]),
             xmin: xid,
             xmax: 0,
         });
@@ -3557,7 +3579,7 @@ mod tests {
                 rows: vec![WalRow {
                     id: 12,
                     xmin: 5,
-                    values: vec![Value::Int(1)],
+                    values: Row::new(vec![Value::Int(1)]),
                 }],
             },
         )
@@ -3570,7 +3592,7 @@ mod tests {
                 old_rows: vec![WalRow {
                     id: 12,
                     xmin: 5,
-                    values: vec![Value::Int(1)],
+                    values: Row::new(vec![Value::Int(1)]),
                 }],
                 xmax: 6,
             },
@@ -3597,7 +3619,7 @@ mod tests {
                 old_rows: vec![WalRow {
                     id: 1,
                     xmin: 2,
-                    values: vec![Value::Int(1)],
+                    values: Row::new(vec![Value::Int(1)]),
                 }],
                 xmax: 9,
             },

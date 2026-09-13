@@ -22,6 +22,7 @@
 //! by the WAL to name deleted versions and by undo/vacuum to find them.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::fxhash::FxBuildHasher;
 use crate::index::{Index, IndexDef, IndexKey};
@@ -1238,7 +1239,10 @@ pub enum Value {
     Float4(f32),      // v0.7: REAL
     Float(f64),       // FLOAT8
     Numeric(Numeric), // v0.7: NUMERIC
-    Text(String),
+    /// A clone of this value shares the text bytes. Text cells do not
+    /// change, so a shared buffer is safe. This removes one copy for
+    /// each row. See issue #8.
+    Text(Arc<str>),
     Bool(bool),
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
@@ -1249,6 +1253,16 @@ pub enum Value {
 }
 
 impl Value {
+    /// Make a text value from `&str`, `String` or `Arc<str>`.
+    /// Only the `Arc<str>` form does not copy the bytes: `String` copies
+    /// too, because `Arc<str>` needs its own buffer. Give an `Arc<str>`
+    /// on a path that runs for each row.
+    /// (`&String` needs `.as_str()`. An `AsRef<str>` bound would accept
+    /// it but would remove the free `Arc<str>` form.)
+    pub fn text(s: impl Into<Arc<str>>) -> Value {
+        Value::Text(s.into())
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -1260,7 +1274,7 @@ impl Value {
             Value::Float4(f) => Some(float4_text(*f)),
             Value::Float(f) => Some(float_text(*f)),
             Value::Numeric(n) => Some(n.to_text()),
-            Value::Text(s) => Some(s.clone()),
+            Value::Text(s) => Some(s.to_string()),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
@@ -1491,13 +1505,67 @@ fn float4_text(f: f32) -> String {
     format!("{}", f)
 }
 
+/// The cells of one row. A reference count controls the memory, thus a
+/// clone increases the count and does not copy the cells.
+///
+/// An MVCC write adds a new [`RowVersion`]. It does not change the cells
+/// of a row that is in the table. Thus a shared row is always safe. The
+/// cells are behind a private `Arc`, so no code can get write access to
+/// a row that it shares. This keeps the rule.
+///
+/// Note: a `Row` holds the cells only. For a row record, see
+/// [`RowVersion`].
+///
+/// `Arc<Vec<Value>>` and not `Arc<[Value]>`: the second is one heap
+/// block and not two, but its handle is 16 bytes and not 8, which makes
+/// the large per-scan row buffers larger. See `benches/BASELINE.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row(Arc<Vec<Value>>);
+
+impl Row {
+    /// Make a row from its cells. Clone the `Row` after this to share
+    /// the cells.
+    pub fn new(cells: Vec<Value>) -> Row {
+        Row(Arc::new(cells))
+    }
+
+    /// Take the cells out. This copies them only if another handle
+    /// shares them.
+    pub fn into_cells(self) -> Vec<Value> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|c| (*c).clone())
+    }
+}
+
+impl Default for Row {
+    /// An empty row. All empty rows share one buffer, thus this function
+    /// does not allocate. `Arc::default()` allocates for each call.
+    fn default() -> Row {
+        static EMPTY: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| Row(Arc::new(Vec::new()))).clone()
+    }
+}
+
+impl std::ops::Deref for Row {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        &self.0
+    }
+}
+
+impl From<Vec<Value>> for Row {
+    fn from(cells: Vec<Value>) -> Row {
+        Row::new(cells)
+    }
+}
+
 /// One version of one row. UPDATE = mark the old version's `xmax` and
 /// append a new version; DELETE = mark `xmax`.
 #[derive(Clone, Debug)]
 pub struct RowVersion {
     /// Globally unique, never reused (survives crashes via the WAL).
     pub id: u64,
-    pub values: Vec<Value>,
+    pub values: Row,
     /// Xid of the creating transaction.
     pub xmin: u64,
     /// Xid of the deleting/updating transaction; 0 = not deleted.
@@ -2272,7 +2340,7 @@ impl Engine {
         let txns = &self.txns;
         // Collect (id, values) of the dead versions first: index cleanup
         // needs each version's key, hence its values.
-        let mut dead: Vec<(u64, Vec<Value>)> = Vec::new();
+        let mut dead: Vec<(u64, Row)> = Vec::new();
         if let Some(versions) = self.db.tables.get_mut(name) {
             for t in versions {
                 for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
@@ -2716,7 +2784,7 @@ pub enum WriteOp {
         old_id: u64,
         new_id: u64,
         prev_xmax: u64,
-        old_values: Vec<Value>,
+        old_values: Row,
     },
     CreateTable {
         name: String,
@@ -2801,7 +2869,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // values are cloned and the table borrow is dropped first.
             // (DELETE/UPDATE never remove entries, so undoing an insert is
             // the only DML case that touches the index.)
-            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
                 let mut out = None;
                 for t in versions.iter_mut() {
                     if let Some(pos) = t.row_pos(*row_id) {
@@ -2841,7 +2909,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
             old_values: _,
         } => {
-            let removed: Option<Vec<Value>> = if let Some(versions) = eng.db.tables.get_mut(table) {
+            let removed: Option<Row> = if let Some(versions) = eng.db.tables.get_mut(table) {
                 let mut out = None;
                 for t in versions.iter_mut() {
                     if let Some(pos) = t.row_pos(*new_id) {
@@ -3064,6 +3132,41 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
 mod tests {
     use super::*;
 
+    /// A clone of a `Value::Text` must share the text bytes. It must not
+    /// copy them. See issue #8.
+    #[test]
+    fn text_clone_shares_one_buffer() {
+        let a = Value::text("a text long enough to need the heap");
+        let b = a.clone();
+        let (Value::Text(x), Value::Text(y)) = (&a, &b) else {
+            panic!("both values are Text");
+        };
+        assert_eq!(
+            x.as_ptr(),
+            y.as_ptr(),
+            "Value::Text clone must share the buffer, not copy it"
+        );
+        assert_eq!(&**x, "a text long enough to need the heap");
+    }
+
+    /// A shared buffer must not change equality or order. Two equal
+    /// texts must compare equal. Two different texts must not.
+    #[test]
+    fn text_equality_and_order_ignore_sharing() {
+        use crate::index::IndexKey;
+        let a = Value::text("abc");
+        let b = Value::text("abc");
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(a, Value::text("abd"));
+        // Order comes from IndexKey; `Value` has no `Ord`.
+        let key = |v: &Value| IndexKey(vec![v.clone()]);
+        assert!(key(&a) < key(&Value::text("abd")));
+        assert!(key(&Value::text("ab")) < key(&a));
+        assert_eq!(key(&a).cmp(&key(&c)), std::cmp::Ordering::Equal);
+    }
+
     fn engine_with_table() -> Engine {
         let mut eng = Engine::new();
         eng.db.tables.insert(
@@ -3072,7 +3175,7 @@ mod tests {
                 let mut t = Table::new(vec![("a".to_string(), ColType::Int)], 1);
                 t.push_version(RowVersion {
                     id: 1,
-                    values: vec![Value::Int(1)],
+                    values: Row::new(vec![Value::Int(1)]),
                     xmin: 1,
                     xmax: 0,
                 });
@@ -3154,13 +3257,13 @@ mod tests {
         let t = &mut eng.db.tables.get_mut("t").unwrap()[0];
         t.push_version(RowVersion {
             id: 2,
-            values: vec![Value::Int(2)],
+            values: Row::new(vec![Value::Int(2)]),
             xmin: 1,
             xmax: 8,
         });
         t.push_version(RowVersion {
             id: 3,
-            values: vec![Value::Int(3)],
+            values: Row::new(vec![Value::Int(3)]),
             xmin: 1,
             xmax: 0,
         });
@@ -3174,7 +3277,7 @@ mod tests {
         let mut eng = engine_with_table();
         eng.db.tables.get_mut("t").unwrap()[0].push_version(RowVersion {
             id: 9,
-            values: vec![Value::Int(9)],
+            values: Row::new(vec![Value::Int(9)]),
             xmin: 7,
             xmax: 0,
         });

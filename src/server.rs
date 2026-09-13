@@ -15,7 +15,7 @@ use crate::exec::{self, ExecError, ExecResult, StmtCtx};
 use crate::protocol::{Cursor, MsgBuilder, read_message, read_startup};
 use crate::repl;
 use crate::sql::{self, CopyFormat, CopyOptions, FetchDir, IsolationLevel, SetValue, Stmt};
-use crate::storage::{ColType, Engine, Snapshot, Value, WriteOp, undo_write_op};
+use crate::storage::{ColType, Engine, Row, Snapshot, Value, WriteOp, undo_write_op};
 use crate::wal::{self, Wal};
 
 /// Buffered sink for server→client traffic. Reads still go through the
@@ -54,7 +54,7 @@ struct Portal {
 }
 
 struct PendingRows {
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Row>,
     pos: usize,
 }
 
@@ -156,7 +156,7 @@ impl Session {
 /// (Named `SqlCursor` — `protocol::Cursor` is the wire-protocol cursor.)
 pub(crate) struct SqlCursor {
     cols: Vec<(String, ColType)>,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Row>,
     /// Current row index: -1 = before the first row, rows.len() = after
     /// the last row (Postgres positions the cursor on the last row
     /// retrieved).
@@ -965,7 +965,7 @@ fn copy_to_fetch(
     session: &mut Session,
     table: &str,
     columns: &Option<Vec<String>>,
-) -> Result<(Vec<(String, ColType)>, Vec<Vec<Value>>), exec::ExecError> {
+) -> Result<(Vec<(String, ColType)>, Vec<Row>), exec::ExecError> {
     if let Some(t) = &session.txn {
         if t.failed {
             return Err(exec::ExecError {
@@ -1023,7 +1023,7 @@ fn copy_to_fetch(
 fn send_copy_out(
     stream: &mut Writer,
     cols: &[(String, ColType)],
-    rows: &[Vec<Value>],
+    rows: &[Row],
     options: &CopyOptions,
 ) -> io::Result<()> {
     // CopyOutResponse: format (0=text, 1=csv), column count, per-column
@@ -1052,7 +1052,7 @@ fn send_copy_out(
         data.clear();
         let mut fields = Vec::with_capacity(row.len());
         let mut nulls = Vec::with_capacity(row.len());
-        for v in row {
+        for v in row.iter() {
             match v.to_text() {
                 None => {
                     fields.push(String::new());
@@ -1539,7 +1539,7 @@ fn cursor_fetch(
         message: format!("cursor \"{}\" does not exist", name),
     })?;
     let (s, e, new_pos) = cursor_window(dir, cur.pos, cur.rows.len());
-    let rows: Vec<Vec<Value>> = cur.rows[s..e].to_vec();
+    let rows: Vec<Row> = cur.rows[s..e].to_vec();
     let cols = cur.cols.clone();
     cur.pos = new_pos;
     let n = rows.len();
@@ -1752,7 +1752,7 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
     match guc_value(session, name) {
         Some(v) => Ok(ExecResult::Select {
             columns: vec![(name.to_string(), ColType::Text)],
-            rows: vec![vec![Value::Text(v)]],
+            rows: vec![Row::new(vec![Value::text(v)])],
         }),
         None => Err(ExecError {
             code: "42704",
@@ -2329,24 +2329,24 @@ fn txn_vacuum(
         }
         return Ok(cmd("VACUUM"));
     }
-    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     match table {
         Some(name) => {
             let n = guard.vacuum_table(name);
-            rows.push(vec![Value::Text(format!(
+            rows.push(Row::new(vec![Value::text(format!(
                 "table \"{}\": removed {} dead row version(s)",
                 name, n
-            ))]);
+            ))]));
         }
         None => {
             for (name, n) in guard.vacuum_all() {
-                rows.push(vec![Value::Text(format!(
+                rows.push(Row::new(vec![Value::text(format!(
                     "table \"{}\": removed {} dead row version(s)",
                     name, n
-                ))]);
+                ))]));
             }
             if rows.is_empty() {
-                rows.push(vec![Value::Text("vacuum: nothing to remove".to_string())]);
+                rows.push(Row::new(vec![Value::text("vacuum: nothing to remove")]));
             }
         }
     }
@@ -3156,7 +3156,7 @@ mod tests {
                 engine.db.tables.get_mut("t").unwrap()[0].push_version(
                     crate::storage::RowVersion {
                         id: *row_id,
-                        values: vec![Value::Int(i as i64)],
+                        values: Row::new(vec![Value::Int(i as i64)]),
                         xmin: xid,
                         xmax: 0,
                     },

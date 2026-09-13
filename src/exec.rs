@@ -45,7 +45,7 @@ use crate::sql::{
     collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ColStats, ColType, Database, Engine, Numeric, RowVersion, Sequence, Snapshot, Table,
+    ColStats, ColType, Database, Engine, Numeric, Row, RowVersion, Sequence, Snapshot, Table,
     TableStats, Value, ViewDef, WriteOp, row_visible,
 };
 use std::cmp::Ordering;
@@ -99,13 +99,13 @@ pub enum ExecResult {
     /// Rows to return: (column name, column type) + row values.
     Select {
         columns: Vec<(String, ColType)>,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Row>,
     },
     /// EXPLAIN output: same shape as Select but completes with the
     /// "EXPLAIN" tag, like Postgres.
     Explain {
         columns: Vec<(String, ColType)>,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Row>,
     },
     /// Tag for CommandComplete, e.g. "INSERT 0 2".
     Command { tag: String },
@@ -115,7 +115,7 @@ pub enum ExecResult {
     Dml {
         tag: String,
         columns: Vec<(String, ColType)>,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Row>,
     },
 }
 
@@ -843,7 +843,7 @@ fn check_fk_child_row(
     child_meta: &TableMeta,
     child_table: &str,
     values: &[Value],
-    self_new: &[Vec<Value>],
+    self_new: &[Row],
     ignore_id: Option<u64>,
 ) -> Result<(), ExecError> {
     for fk in &child_meta.fks {
@@ -926,7 +926,7 @@ struct FkCascade {
     /// (table, row id, prev xmax) to delete.
     deletes: Vec<(String, u64, u64)>,
     /// (table, row id, prev xmax, new values) to update.
-    updates: Vec<(String, u64, u64, Vec<Value>)>,
+    updates: Vec<(String, u64, u64, Row)>,
 }
 
 impl FkCascade {
@@ -953,7 +953,7 @@ fn plan_fk_cascade(
     level: IsolationLevel,
     parent_table: &str,
     parent_meta: &TableMeta,
-    changed: &[(u64, Vec<Value>, Option<Vec<Value>>)],
+    changed: &[(u64, Row, Option<Row>)],
     depth: u8,
     out: &mut FkCascade,
 ) -> Result<(), ExecError> {
@@ -1007,7 +1007,7 @@ fn plan_fk_cascade(
                 fk.on_delete
             };
             // Visible child rows referencing the old key.
-            let refs: Vec<(u64, u64, Vec<Value>)> = {
+            let refs: Vec<(u64, u64, Row)> = {
                 let t = eng
                     .db
                     .find_table(&child_table, snap, own)
@@ -1050,7 +1050,7 @@ fn plan_fk_cascade(
                         check_row_lock(eng, &child_table, cid, own)?;
                         if let Some(nk) = &new_key {
                             // ON UPDATE CASCADE: move the child key.
-                            let mut nv = cvalues.clone();
+                            let mut nv = cvalues.to_vec();
                             for (&ci, kv) in child_pos.iter().zip(nk.iter()) {
                                 nv[ci] = kv.clone();
                             }
@@ -1087,6 +1087,7 @@ fn plan_fk_cascade(
                                 &[],
                                 Some(cid),
                             )?;
+                            let nv = Row::new(nv);
                             out.updates
                                 .push((child_table.clone(), cid, cxmax, nv.clone()));
                             let child_meta2 = child_meta.clone();
@@ -1125,7 +1126,7 @@ fn plan_fk_cascade(
                     FkAction::SetNull | FkAction::SetDefault => {
                         check_write_conflict(eng, cxmax, level)?;
                         check_row_lock(eng, &child_table, cid, own)?;
-                        let mut nv = cvalues.clone();
+                        let mut nv = cvalues.to_vec();
                         for &ci in &child_pos {
                             nv[ci] = match act {
                                 FkAction::SetNull => Value::Null,
@@ -1172,6 +1173,7 @@ fn plan_fk_cascade(
                             &[],
                             Some(cid),
                         )?;
+                        let nv = Row::new(nv);
                         out.updates
                             .push((child_table.clone(), cid, cxmax, nv.clone()));
                         let child_meta2 = child_meta.clone();
@@ -1220,7 +1222,7 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
     for _ in 0..out.updates.len() {
         new_ids.push(eng.alloc_row_id());
     }
-    let mut indexed: Vec<(String, u64, Vec<Value>)> = Vec::with_capacity(out.updates.len());
+    let mut indexed: Vec<(String, u64, Row)> = Vec::with_capacity(out.updates.len());
     for ((table, old_id, prev_xmax, new_values), new_id) in out.updates.iter().zip(new_ids) {
         let t = eng
             .db
@@ -1233,6 +1235,7 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
         // logical decoder needs them); values never change in place.
         let old_values = t.rows[pos].values.clone();
         t.rows[pos].xmax = ctx.own;
+        let new_values = new_values.clone();
         t.push_version(RowVersion {
             id: new_id,
             values: new_values.clone(),
@@ -1246,7 +1249,7 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
             prev_xmax: *prev_xmax,
             old_values,
         });
-        indexed.push((table.clone(), new_id, new_values.clone()));
+        indexed.push((table.clone(), new_id, new_values));
     }
     for (table, new_id, new_values) in &indexed {
         eng.db.index_insert_row(table, *new_id, new_values);
@@ -1298,12 +1301,12 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| assign_err(col_name, col_type, lit.type_name())),
-            ColType::Text => Ok(Value::Text(s.clone())),
+            ColType::Text => Ok(Value::text(s.as_str())),
             _ => Err(assign_err(col_name, col_type, lit.type_name())),
         },
         // Unknown-type text literal: through the type's input function
         // (so INSERT INTO d VALUES ('2026-01-01') works for dates).
-        Literal::Text(s) => eval_cast(&Value::Text(s.clone()), *col_type).map_err(|e| {
+        Literal::Text(s) => eval_cast(&Value::text(s.clone()), *col_type).map_err(|e| {
             if e.code == "42846" {
                 assign_err(col_name, col_type, lit.type_name())
             } else {
@@ -1313,7 +1316,7 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
         // Unknown-type boolean literal.
         Literal::Bool(b) => match col_type {
             ColType::Bool => Ok(Value::Bool(*b)),
-            ColType::Text => Ok(Value::Text(b.to_string())),
+            ColType::Text => Ok(Value::text(if *b { "true" } else { "false" })),
             _ => Err(assign_err(col_name, col_type, lit.type_name())),
         },
         // Typed literals (DATE '...', BYTEA '...', ...): strict.
@@ -1346,7 +1349,7 @@ fn coerce_int_lit(
         ColType::BigInt => i64::try_from(i)
             .map(Value::BigInt)
             .map_err(|_| exec_err("22003", "bigint out of range")),
-        ColType::Text => Ok(Value::Text(i.to_string())),
+        ColType::Text => Ok(Value::text(i.to_string())),
         _ => range(i),
     }
 }
@@ -1369,7 +1372,7 @@ fn coerce_float_lit(
         ColType::Numeric => Numeric::from_f64(f)
             .map(Value::Numeric)
             .map_err(|_| exec_err("22003", "value out of range for type numeric")),
-        ColType::Text => Ok(Value::Text(Value::Float(f).to_text().unwrap_or_default())),
+        ColType::Text => Ok(Value::text(Value::Float(f).to_text().unwrap_or_default())),
         _ => Err(assign_err(col_name, col_type, from)),
     }
 }
@@ -1380,7 +1383,7 @@ fn coerce_numeric_lit(n: &Numeric, col_type: &ColType, col_name: &str) -> Result
         ColType::Numeric => Ok(Value::Numeric(n.clone())),
         ColType::Float4 => Ok(Value::Float4(n.to_f64() as f32)),
         ColType::Float => Ok(Value::Float(n.to_f64())),
-        ColType::Text => Ok(Value::Text(n.to_text())),
+        ColType::Text => Ok(Value::text(n.to_text())),
         _ => Err(assign_err(col_name, col_type, "numeric")),
     }
 }
@@ -1670,7 +1673,7 @@ fn find_upsert_conflict(
 }
 
 /// v0.10: current values of one row version, by id.
-fn row_values_by_id(eng: &Engine, ctx: &StmtCtx, table: &str, id: u64) -> Option<Vec<Value>> {
+fn row_values_by_id(eng: &Engine, ctx: &StmtCtx, table: &str, id: u64) -> Option<Row> {
     let t = eng.db.find_table(table, ctx.snap, ctx.own)?;
     let pos = t.row_pos(id)?;
     Some(t.rows[pos].values.clone())
@@ -1722,7 +1725,7 @@ fn exec_insert(
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // v0.10: INSERT...SELECT: run the SELECT and convert rows to insert
     // values. The CTEs are already materialized above.
-    let select_rows: Option<Vec<Vec<Value>>> = if let Some(sel) = select {
+    let select_rows: Option<Vec<Row>> = if let Some(sel) = select {
         let mut lock_ids = Vec::new();
         let mut q = Q {
             eng,
@@ -1756,7 +1759,7 @@ fn exec_insert(
         Some(oc) => Some(plan_upsert(eng, ctx, table, oc, &meta_for_upsert)?),
     };
     // Validate everything before mutating (statement atomicity).
-    let new_rows: Vec<Vec<Value>> = {
+    let new_rows: Vec<Row> = {
         let meta = {
             let t = eng.db.find_table(table, ctx.snap, ctx.own).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", table))
@@ -1784,7 +1787,7 @@ fn exec_insert(
             None => (0..meta.columns.len()).collect(),
         };
         let ncols = meta.columns.len();
-        let mut built: Vec<Vec<Value>> = Vec::new();
+        let mut built: Vec<Row> = Vec::new();
         // v0.10: INSERT...SELECT: validate column count and use the
         // SELECT's rows directly (already Values).
         if let Some(srows) = select_rows {
@@ -1801,9 +1804,9 @@ fn exec_insert(
                 }
                 let mut values = vec![Value::Null; ncols];
                 let mut explicit = vec![false; ncols];
-                for (j, v) in cells.into_iter().enumerate() {
+                for (j, v) in cells.iter().enumerate() {
                     let ti = targets[j];
-                    values[ti] = v;
+                    values[ti] = v.clone();
                     explicit[ti] = true;
                 }
                 // Fill defaults, check constraints (same as VALUES path).
@@ -1834,7 +1837,7 @@ fn exec_insert(
                     table,
                     &values,
                 )?;
-                built.push(values);
+                built.push(Row::new(values));
             }
         } else {
             built = Vec::with_capacity(rows.len());
@@ -1904,7 +1907,7 @@ fn exec_insert(
                     table,
                     &values,
                 )?;
-                built.push(values);
+                built.push(Row::new(values));
             }
         } // end else (VALUES path)
         // v0.8: statement-atomic UNIQUE enforcement — every row is checked
@@ -1938,14 +1941,14 @@ fn exec_insert(
     //   or updated new values; skipped rows contribute nothing).
     // Same-statement conflicts are detected via `key_map`: (index name,
     // key bytes) -> row id of a planned insert.
-    let mut inserts: Vec<(u64, Vec<Value>)> = Vec::new();
-    let mut updates: Vec<(u64, u64, Vec<Value>)> = Vec::new();
-    let mut ret_rows: Vec<Vec<Value>> = Vec::new();
+    let mut inserts: Vec<(u64, Row)> = Vec::new();
+    let mut updates: Vec<(u64, u64, Row)> = Vec::new();
+    let mut ret_rows: Vec<Row> = Vec::new();
     if let Some(plan) = &upsert {
         let mut key_map: HashMap<(String, Vec<u8>), u64> = HashMap::new();
         // Latest planned values per row id (planned inserts and the new
         // values of planned updates), for chained same-statement conflicts.
-        let mut latest: HashMap<u64, Vec<Value>> = HashMap::new();
+        let mut latest: HashMap<u64, Row> = HashMap::new();
         // Schemas for DO UPDATE evaluation: excluded first, target last
         // (unqualified columns resolve to the target, like Postgres).
         let mk_schemas = || {
@@ -1994,9 +1997,10 @@ fn exec_insert(
                     }
                     key_map.insert((iname.clone(), arbiter_key(values, kcols)), id);
                 }
+                let values = values.clone();
                 latest.insert(id, values.clone());
                 inserts.push((id, values.clone()));
-                ret_rows.push(values.clone());
+                ret_rows.push(values);
                 continue;
             };
             match &plan.action {
@@ -2005,7 +2009,7 @@ fn exec_insert(
                 }
                 ConflictAction::DoUpdate { sets, where_ } => {
                     // Target values: latest planned, else the table row.
-                    let target_values: Vec<Value> = match latest.get(&tid) {
+                    let target_values: Row = match latest.get(&tid) {
                         Some(v) => v.clone(),
                         None => row_values_by_id(eng, ctx, table, tid)
                             .ok_or_else(|| exec_err("XX000", "upsert conflict target vanished"))?,
@@ -2044,7 +2048,7 @@ fn exec_insert(
                             continue;
                         }
                     }
-                    let mut new_values = target_values.clone();
+                    let mut new_values = target_values.to_vec();
                     for ((_, expr), &ci) in sets.iter().zip(plan.set_cols.iter()) {
                         let v = eval_dml_expr(
                             eng,
@@ -2113,6 +2117,7 @@ fn exec_insert(
                             key_map.insert((iname.clone(), arbiter_key(&new_values, kcols)), tid);
                         }
                     }
+                    let new_values = Row::new(new_values);
                     latest.insert(tid, new_values.clone());
                     updates.push((tid, prev_xmax, new_values.clone()));
                     ret_rows.push(new_values);
@@ -2123,8 +2128,9 @@ fn exec_insert(
         // No ON CONFLICT: every candidate is inserted.
         for values in &new_rows {
             let id = eng.alloc_row_id();
+            let values = values.clone();
             inserts.push((id, values.clone()));
-            ret_rows.push(values.clone());
+            ret_rows.push(values);
         }
     }
     let n = inserts.len() + updates.len();
@@ -2156,7 +2162,7 @@ fn exec_insert(
     for _ in 0..updates.len() {
         update_ids.push(eng.alloc_row_id());
     }
-    let mut indexed: Vec<(u64, Vec<Value>)> = Vec::with_capacity(updates.len());
+    let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(updates.len());
     {
         let t = eng
             .db
@@ -2189,7 +2195,7 @@ fn exec_insert(
         eng.db.index_insert_row(table, *new_id, new_values);
     }
     // v0.10: RETURNING.
-    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
@@ -2204,7 +2210,7 @@ fn exec_insert(
             .collect();
         let mut out_rows = Vec::with_capacity(ret_rows.len());
         for values in &ret_rows {
-            out_rows.push(project_returning(
+            out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
                 ctx.own,
@@ -2214,7 +2220,7 @@ fn exec_insert(
                 values,
                 returning,
                 &ctes,
-            )?);
+            )?));
         }
         (cols, out_rows)
     };
@@ -2363,7 +2369,7 @@ fn exec_update(
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first (validate + conflict-check), mutate after: a failed
     // UPDATE leaves no trace (statement atomicity).
-    let plan: Vec<(u64, u64, Vec<Value>)> = {
+    let plan: Vec<(u64, u64, Row)> = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own)
@@ -2394,7 +2400,7 @@ fn exec_update(
             .collect();
         // Copy the visible rows' data out; the borrow of `t` ends here so
         // SET expressions can run against `eng` below.
-        let vis: Vec<(u64, u64, Vec<Value>)> = {
+        let vis: Vec<(u64, u64, Row)> = {
             let t = eng
                 .db
                 .find_table(table, ctx.snap, ctx.own)
@@ -2417,7 +2423,7 @@ fn exec_update(
             // Only rows we actually write conflict with FOR UPDATE locks —
             // merely scanning a locked row is fine, like Postgres.
             check_row_lock(eng, table, *id, ctx.own)?;
-            let mut new_values = values.clone();
+            let mut new_values = values.to_vec();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
                 let v = eval_update_expr(
                     eng,
@@ -2460,13 +2466,13 @@ fn exec_update(
                 &new_values,
             )?;
             old_vals.push(values.clone());
-            plan.push((*id, *xmax, new_values));
+            plan.push((*id, *xmax, Row::new(new_values)));
         }
         // v0.9: child-side FK checks for the new rows. Self-references see
         // the statement's own new versions; each row's old version is
         // excluded from the parent scan.
         {
-            let self_new: Vec<Vec<Value>> = plan.iter().map(|(_, _, nv)| nv.clone()).collect();
+            let self_new: Vec<Row> = plan.iter().map(|(_, _, nv)| nv.clone()).collect();
             for (i, (_, _, nv)) in plan.iter().enumerate() {
                 check_fk_child_row(
                     eng,
@@ -2484,7 +2490,7 @@ fn exec_update(
         // SET DEFAULT), planned before any mutation.
         let mut cascade = FkCascade::default();
         {
-            let changed: Vec<(u64, Vec<Value>, Option<Vec<Value>>)> = plan
+            let changed: Vec<(u64, Row, Option<Row>)> = plan
                 .iter()
                 .zip(old_vals.iter())
                 .map(|((id, _, nv), ov)| (*id, ov.clone(), Some(nv.clone())))
@@ -2507,7 +2513,7 @@ fn exec_update(
         // key in one statement (the index still holds only old entries).
         // v0.9: extended over cascaded updates, grouped by table.
         {
-            let mut by_table: HashMap<&str, Vec<(u64, u64, Vec<Value>)>> = HashMap::new();
+            let mut by_table: HashMap<&str, Vec<(u64, u64, Row)>> = HashMap::new();
             by_table
                 .entry(table)
                 .or_default()
@@ -2534,7 +2540,7 @@ fn exec_update(
     }
     // The table borrow ends before index maintenance (both need `eng.db`
     // mutably); collect the new versions' keys meanwhile.
-    let mut indexed: Vec<(u64, Vec<Value>)> = Vec::with_capacity(n);
+    let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(n);
     {
         let t = eng
             .db
@@ -2569,7 +2575,7 @@ fn exec_update(
         eng.db.index_insert_row(table, *new_id, new_values);
     }
     // v0.10: RETURNING evaluates against the NEW row values.
-    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
@@ -2589,7 +2595,7 @@ fn exec_update(
         };
         let mut out_rows = Vec::with_capacity(indexed.len());
         for (_, new_values) in &indexed {
-            out_rows.push(project_returning(
+            out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
                 ctx.own,
@@ -2599,7 +2605,7 @@ fn exec_update(
                 new_values,
                 returning,
                 &ctes,
-            )?);
+            )?));
         }
         (cols, out_rows)
     };
@@ -2625,7 +2631,7 @@ fn exec_delete(
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first for statement atomicity (WHERE type errors must not
     // leave half the rows deleted).
-    let plan: Vec<(u64, u64, Vec<Value>)> = {
+    let plan: Vec<(u64, u64, Row)> = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own)
@@ -2644,7 +2650,7 @@ fn exec_delete(
         // v0.9: parent-side FK actions for the deleted rows.
         let mut cascade = FkCascade::default();
         {
-            let changed: Vec<(u64, Vec<Value>, Option<Vec<Value>>)> = plan
+            let changed: Vec<(u64, Row, Option<Row>)> = plan
                 .iter()
                 .map(|(id, _, values)| (*id, values.clone(), None))
                 .collect();
@@ -2668,7 +2674,7 @@ fn exec_delete(
     let n = plan.len();
     // v0.10: DELETE RETURNING evaluates against the OLD row values —
     // collect them before the plan is consumed by the apply loop.
-    let ret_vals: Vec<Vec<Value>> = plan.iter().map(|(_, _, v)| v.clone()).collect();
+    let ret_vals: Vec<Row> = plan.iter().map(|(_, _, v)| v.clone()).collect();
     let t = eng
         .db
         .find_table_mut(table, ctx.snap, ctx.own)
@@ -2685,7 +2691,7 @@ fn exec_delete(
         });
     }
     // v0.10: RETURNING.
-    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Vec<Value>>) = if returning.is_empty() {
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let cols = describe_returning(eng, ctx.snap, ctx.own, table, returning)?;
@@ -2705,7 +2711,7 @@ fn exec_delete(
         };
         let mut out_rows = Vec::with_capacity(ret_vals.len());
         for values in &ret_vals {
-            out_rows.push(project_returning(
+            out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
                 ctx.own,
@@ -2715,7 +2721,7 @@ fn exec_delete(
                 values,
                 returning,
                 &ctes,
-            )?);
+            )?));
         }
         (cols, out_rows)
     };
@@ -2963,7 +2969,7 @@ fn unique_violation_err(index: &str) -> ExecError {
 fn check_insert_unique(
     db: &Database,
     table: &str,
-    rows: &[Vec<Value>],
+    rows: &[Row],
     snap: &Snapshot,
     own: u64,
 ) -> Result<(), ExecError> {
@@ -2995,7 +3001,7 @@ fn check_insert_unique(
 fn check_update_unique_pairs(
     db: &Database,
     table: &str,
-    plan: &[(u64, u64, Vec<Value>)],
+    plan: &[(u64, u64, Row)],
     snap: &Snapshot,
     own: u64,
 ) -> Result<(), ExecError> {
@@ -4127,7 +4133,10 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
     render_plan(&plan, 0, &mut lines);
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
-        rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
+        rows: lines
+            .into_iter()
+            .map(|l| Row::new(vec![Value::text(l)]))
+            .collect(),
     })
 }
 
@@ -4336,15 +4345,15 @@ fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
                 .collect::<Vec<_>>()
                 .join(",");
             rows.push(QRow {
-                cells: vec![
-                    Value::Text("public".to_string()),
-                    Value::Text(tn.clone()),
-                    Value::Text((*cn).clone()),
+                cells: Row::new(vec![
+                    Value::text("public"),
+                    Value::text(tn.as_str()),
+                    Value::text(cn.as_str()),
                     Value::Float(cs.null_frac),
                     Value::Float(cs.n_distinct),
-                    Value::Text(format!("{{{}}}", vals)),
-                    Value::Text(format!("{{{}}}", freqs)),
-                ],
+                    Value::text(format!("{{{}}}", vals)),
+                    Value::text(format!("{{{}}}", freqs)),
+                ]),
                 prov: Vec::new(),
             });
         }
@@ -4428,12 +4437,12 @@ fn pg_auth_members_rows(db: &Database, snap: &Snapshot, own: u64) -> Vec<QRow> {
                 continue;
             }
             rows.push(QRow {
-                cells: vec![
+                cells: Row::new(vec![
                     Value::Int(name_oid(&m.role) as i64),
                     Value::Int(name_oid(member_name) as i64),
                     Value::Int(name_oid(&m.grantor) as i64),
                     Value::Bool(false),
-                ],
+                ]),
                 prov: Vec::new(),
             });
         }
@@ -4481,15 +4490,15 @@ fn pg_auth_scan(
             None => Value::Null,
             Some(v) => {
                 if viewer_super {
-                    Value::Text(v.encode())
+                    Value::text(v.encode())
                 } else {
-                    Value::Text("********".to_string())
+                    Value::text("********")
                 }
             }
         };
         let cells = match kind {
             "pg_roles" => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 Value::Bool(r.superuser),
                 Value::Bool(true),
                 Value::Bool(false),
@@ -4499,7 +4508,7 @@ fn pg_auth_scan(
                 valid_until.clone(),
             ],
             "pg_user" => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 // No stable oids in rustgres; hash the name for a
                 // deterministic stand-in.
                 Value::Int(name_oid(&r.name) as i64),
@@ -4511,7 +4520,7 @@ fn pg_auth_scan(
                 Value::Null,
             ],
             _ => vec![
-                Value::Text(r.name.clone()),
+                Value::text(r.name.as_str()),
                 Value::Bool(r.superuser),
                 Value::Bool(true),
                 Value::Bool(false),
@@ -4523,7 +4532,7 @@ fn pg_auth_scan(
             ],
         };
         rows.push(QRow {
-            cells,
+            cells: Row::new(cells),
             prov: Vec::new(),
         });
     }
@@ -4583,14 +4592,14 @@ fn pg_replication_slots_rows(eng: &Engine) -> Vec<QRow> {
         .map(|n| {
             let s = &eng.repl_slots[n];
             QRow {
-                cells: vec![
-                    Value::Text(s.name.clone()),
-                    Value::Text(s.plugin.clone()),
-                    Value::Text(s.slot_type.clone()),
+                cells: Row::new(vec![
+                    Value::text(s.name.as_str()),
+                    Value::text(s.plugin.as_str()),
+                    Value::text(s.slot_type.as_str()),
                     Value::Bool(s.active),
-                    Value::Text(crate::repl::format_lsn(s.restart_lsn)),
-                    Value::Text(crate::repl::format_lsn(s.confirmed_flush_lsn)),
-                ],
+                    Value::text(crate::repl::format_lsn(s.restart_lsn)),
+                    Value::text(crate::repl::format_lsn(s.confirmed_flush_lsn)),
+                ]),
                 prov: Vec::new(),
             }
         })
@@ -4626,7 +4635,7 @@ pub struct QCol {
 /// used by SELECT ... FOR UPDATE.
 #[derive(Clone, Debug, Default)]
 pub struct QRow {
-    pub cells: Vec<Value>,
+    pub cells: Row,
     pub prov: Vec<(String, u64)>,
 }
 
@@ -4890,16 +4899,16 @@ struct WindowCtx {
 
 struct SelectOut {
     columns: Vec<(String, ColType)>,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Row>,
 }
 
 /// One projected output row mid-pipeline: projected cells, provenance for
 /// FOR UPDATE, and (only when an ORDER BY may need it) the full
 /// pre-projection cells.
 struct OutRow {
-    cells: Vec<Value>,
+    cells: Row,
     prov: Vec<(String, u64)>,
-    full: Vec<Value>,
+    full: Option<Row>,
     /// Precomputed ORDER BY keys. Aggregated queries fill this in during
     /// exec_agg, where group-level ORDER BY expressions (aggregates, GROUP
     /// BY columns not in the select list) can still be evaluated; plain
@@ -5130,7 +5139,7 @@ fn eval_cte(q: &mut Q, cte: &CteDef) -> Result<CteBinding, ExecError> {
     }
 }
 
-fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Vec<Value>>) -> CteBinding {
+fn cte_binding(cte: &CteDef, columns: Vec<(String, ColType)>, rows: Vec<Row>) -> CteBinding {
     let schema: Vec<QCol> = columns
         .into_iter()
         .enumerate()
@@ -5191,20 +5200,21 @@ fn eval_recursive_cte(
         if !all {
             for r in &binding.rows {
                 let mut k = Vec::new();
-                for v in &r.cells {
+                for v in r.cells.iter() {
                     value_key(v, &mut k);
                 }
                 seen.insert(k);
             }
         }
         for cells in other.rows {
+            let cells = cells.into_cells();
             let mut coerced = Vec::with_capacity(cells.len());
             for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
                 coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             if all {
                 binding.rows.push(QRow {
-                    cells: coerced,
+                    cells: Row::new(coerced),
                     prov: Vec::new(),
                 });
             } else {
@@ -5214,7 +5224,7 @@ fn eval_recursive_cte(
                 }
                 if seen.insert(k) {
                     binding.rows.push(QRow {
-                        cells: coerced,
+                        cells: Row::new(coerced),
                         prov: Vec::new(),
                     });
                 }
@@ -5226,7 +5236,7 @@ fn eval_recursive_cte(
     if !all {
         for r in &binding.rows {
             let mut k = Vec::new();
-            for v in &r.cells {
+            for v in r.cells.iter() {
                 value_key(v, &mut k);
             }
             seen.insert(k);
@@ -5260,19 +5270,20 @@ fn eval_recursive_cte(
         for cells in delta.rows {
             // Coerce the recursive term's cells to the seed's column
             // types (like UNION's type resolution, simplified).
+            let cells = cells.into_cells();
             let mut coerced = Vec::with_capacity(cells.len());
             for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
                 coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             let row = QRow {
-                cells: coerced,
+                cells: Row::new(coerced),
                 prov: Vec::new(),
             };
             if all {
                 new_rows.push(row);
             } else {
                 let mut k = Vec::new();
-                for v in &row.cells {
+                for v in row.cells.iter() {
                     value_key(v, &mut k);
                 }
                 if seen.insert(k) {
@@ -5417,11 +5428,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
     } else {
         let mut v = Vec::with_capacity(rows.len());
         for (ri, r) in rows.into_iter().enumerate() {
-            let full = if keep_full {
-                r.cells.clone()
-            } else {
-                Vec::new()
-            };
+            let full = keep_full.then(|| r.cells.clone());
             // v0.10: point the window context at this input row before
             // projecting (windows were precomputed above).
             if let Some(wctx) = q.wctx.as_mut() {
@@ -5447,7 +5454,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         orows.retain(|o| {
             let mut k = Vec::new();
-            for v in &o.cells {
+            for v in o.cells.iter() {
                 value_key(v, &mut k);
             }
             seen.insert(k)
@@ -5757,7 +5764,7 @@ pub fn copy_to_rows(
     ctx: &mut StmtCtx,
     table: &str,
     columns: &Option<Vec<String>>,
-) -> Result<(Vec<(String, ColType)>, Vec<Vec<Value>>), ExecError> {
+) -> Result<(Vec<(String, ColType)>, Vec<Row>), ExecError> {
     // Validate the table/columns first (clean 42P01/42703 errors).
     copy_ncols(eng, ctx.snap, ctx.own, table, columns)?;
     let col_list = match columns {
@@ -5801,7 +5808,7 @@ pub fn copy_from_rows(
         .map(|row| {
             row.into_iter()
                 .map(|f| match f {
-                    CopyField::Text(s) => InsertValue::Lit(Literal::Text(s)),
+                    CopyField::Text(s) => InsertValue::Lit(Literal::Text(s.into())),
                     CopyField::Null => InsertValue::Lit(Literal::Null),
                 })
                 .collect()
@@ -6879,7 +6886,10 @@ fn build_from(
                 let mut prov = Vec::with_capacity(a.prov.len() + b.prov.len());
                 prov.extend(a.prov.iter().cloned());
                 prov.extend(b.prov.iter().cloned());
-                rows.push(QRow { cells, prov });
+                rows.push(QRow {
+                    cells: Row::new(cells),
+                    prov,
+                });
             }
         }
         acc_schema = schema;
@@ -7166,15 +7176,18 @@ fn combine_rows(l: &QRow, r: &QRow) -> QRow {
     let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
     prov.extend(l.prov.iter().cloned());
     prov.extend(r.prov.iter().cloned());
-    QRow { cells, prov }
+    QRow {
+        cells: Row::new(cells),
+        prov,
+    }
 }
 
 /// LEFT JOIN null-extension for an unmatched left row.
 fn left_null_row(l: &QRow, rschema: &[QCol]) -> QRow {
-    let mut cells = l.cells.clone();
+    let mut cells = l.cells.to_vec();
     cells.extend(rschema.iter().map(|_| Value::Null));
     QRow {
-        cells,
+        cells: Row::new(cells),
         prov: l.prov.clone(),
     }
 }
@@ -7185,7 +7198,7 @@ fn right_null_row(lschema: &[QCol], r: &QRow) -> QRow {
     cells.extend(lschema.iter().map(|_| Value::Null));
     cells.extend(r.cells.iter().cloned());
     QRow {
-        cells,
+        cells: Row::new(cells),
         prov: r.prov.clone(),
     }
 }
@@ -7563,7 +7576,7 @@ fn build_source(
             let rows = eval_rows
                 .into_iter()
                 .map(|cells| QRow {
-                    cells,
+                    cells: Row::new(cells),
                     prov: Vec::new(),
                 })
                 .collect();
@@ -7800,7 +7813,10 @@ fn build_source(
                             let mut prov = Vec::with_capacity(l.prov.len() + r.prov.len());
                             prov.extend(l.prov.iter().cloned());
                             prov.extend(r.prov.iter().cloned());
-                            rows.push(QRow { cells, prov });
+                            rows.push(QRow {
+                                cells: Row::new(cells),
+                                prov,
+                            });
                         }
                     }
                     if !matched && preserve_left {
@@ -7880,7 +7896,7 @@ fn project_row(
     stmt: &SelectStmt,
     schema: &[QCol],
     row: QRow,
-) -> Result<(Vec<Value>, Vec<(String, u64)>), ExecError> {
+) -> Result<(Row, Vec<(String, u64)>), ExecError> {
     // Fast path: plain `SELECT *` moves the row through untouched — no
     // scope chain, no per-row allocation at all.
     if stmt.items.len() == 1 && matches!(stmt.items[0], SelectItem::All) {
@@ -7925,7 +7941,7 @@ fn project_row(
             SelectItem::Expr { expr, .. } => cells.push(eval_expr(q, &scopes, expr)?),
         }
     }
-    Ok((cells, row.prov))
+    Ok((Row::new(cells), row.prov))
 }
 
 // ---------------------------------------------------------------------------
@@ -8197,9 +8213,9 @@ fn exec_agg(
             Some(keys)
         };
         out_rows.push(OutRow {
-            cells,
+            cells: Row::new(cells),
             prov: Vec::new(),
-            full: Vec::new(),
+            full: None,
             sort_keys,
             // v0.10: ORDER BY terms with windows need the group index.
             win_idx: if windows.is_empty() { None } else { Some(gi) },
@@ -8666,7 +8682,7 @@ fn eval_agg_func(
                 }
                 out.push_str(&s);
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
     }
 }
@@ -8750,7 +8766,7 @@ fn apply_order(
                     // Fall back to the full pre-projection row.
                     let frame = Scope {
                         schema,
-                        row: &o.full,
+                        row: o.full.as_deref().unwrap_or(&[]),
                     };
                     let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                     scopes.extend_from_slice(outer);
@@ -9367,7 +9383,7 @@ fn coerce_text_numeric(a: &Value, b: &Value) -> Result<(Value, Value), ExecError
     };
     match coerced {
         Some((s, t, text_first)) => {
-            let parsed = eval_cast(&Value::Text(s.clone()), t)?;
+            let parsed = eval_cast(&Value::text(s.clone()), t)?;
             Ok(if text_first {
                 (parsed, b.clone())
             } else {
@@ -10017,11 +10033,63 @@ fn cast_to_bool(v: &Value) -> Result<bool, ExecError> {
 
 /// Text rendering for casts and `||`: like the wire format, except
 /// booleans render as `true`/`false` (Postgres cast output).
+/// Text format of one value for a SQL cast, as an owned `String`. Hot
+/// paths use `text_value_of` instead, which does not make a `String`.
 fn value_to_text_cast(v: &Value) -> String {
+    let mut out = String::new();
+    write_text_cast(v, &mut out);
+    out
+}
+
+/// Largest scratch buffer to keep. One very long text must not hold
+/// memory for the life of the connection thread.
+const TEXT_CAST_BUF_MAX: usize = 64 * 1024;
+
+thread_local! {
+    /// Scratch buffer for text casts. It keeps its capacity between
+    /// calls, so a cast that runs for each row allocates only the
+    /// `Arc<str>`.
+    static TEXT_CAST_BUF: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Write one value in its text format into `out`. `Bool` writes
+/// `true`/`false`, like a SQL cast; the wire format writes `t`/`f`.
+fn write_text_cast(v: &Value, out: &mut String) {
+    use std::fmt::Write;
     match v {
-        Value::Bool(b) => b.to_string(),
-        other => other.to_text().unwrap_or_default(),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::SmallInt(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Int(i) | Value::BigInt(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Text(t) => out.push_str(t),
+        other => {
+            if let Some(t) = other.to_text() {
+                out.push_str(&t);
+            }
+        }
     }
+}
+
+/// Build a `Value::Text` from the text format of every value in `parts`.
+/// The scratch buffer keeps one allocation per call, not one per part.
+/// `write_text_cast` never calls this function, so the borrow is safe.
+fn text_value_of(parts: &[&Value]) -> Value {
+    TEXT_CAST_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        for v in parts {
+            write_text_cast(v, &mut buf);
+        }
+        let out = Value::text(buf.as_str());
+        if buf.capacity() > TEXT_CAST_BUF_MAX {
+            *buf = String::new();
+        }
+        out
+    })
 }
 
 fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
@@ -10032,7 +10100,7 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         return Ok(v.clone());
     }
     match to {
-        ColType::Text => Ok(Value::Text(value_to_text_cast(v))),
+        ColType::Text => Ok(text_value_of(&[v])),
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
             let i = cast_to_int(v)?;
@@ -10137,11 +10205,7 @@ fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
             r.extend_from_slice(y);
             Ok(Value::Bytea(r))
         }
-        _ => {
-            let mut s = value_to_text_cast(a);
-            s.push_str(&value_to_text_cast(b));
-            Ok(Value::Text(s))
-        }
+        _ => Ok(text_value_of(&[a, b])),
     }
 }
 
@@ -10304,7 +10368,7 @@ fn eval_like(
             let (s, p) = if ilike {
                 (s.to_lowercase(), p.to_lowercase())
             } else {
-                (s.clone(), p.clone())
+                (s.to_string(), p.to_string())
             };
             let sc: Vec<char> = s.chars().collect();
             let pc: Vec<char> = p.chars().collect();
@@ -10564,7 +10628,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "transaction_timestamp" => eval_datetime_func(name, vals),
         // v0.17: version() reports our own version, not a PG version we
         // claim to be (see SERVER_VERSION in server.rs).
-        "version" => Ok(Value::Text(format!(
+        "version" => Ok(Value::text(format!(
             "rustgres {} (PostgreSQL-compatible, protocol 3.0)",
             crate::server::SERVER_VERSION
         ))),
@@ -10584,11 +10648,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
-            Some(s) => Value::Text(s.to_uppercase()),
+            Some(s) => Value::text(s.to_uppercase()),
         }),
         "lower" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
-            Some(s) => Value::Text(s.to_lowercase()),
+            Some(s) => Value::text(s.to_lowercase()),
         }),
         "length" | "char_length" | "character_length" => Ok(match str_arg(name, &vals[0])? {
             None => Value::Null,
@@ -10627,7 +10691,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let lo = (from - 1).max(0).min(total) as usize;
             let hi = (upto - 1).max(0).min(total) as usize;
             let (lo, hi) = (lo.min(hi), hi);
-            Ok(Value::Text(chars[lo..hi].iter().collect()))
+            Ok(Value::text(chars[lo..hi].iter().collect::<String>()))
         }
         "trim" => {
             // Parser encodes trim as (spec, chars, str); the 1-arg form
@@ -10638,7 +10702,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(s) => s,
             };
             let spec = match spec {
-                Value::Text(t) => t.as_str(),
+                Value::Text(t) => &**t,
                 _ => return Err(exec_err("22023", "invalid trim specification")),
             };
             if !matches!(spec, "leading" | "trailing" | "both") {
@@ -10655,7 +10719,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 "trailing" => s.trim_end_matches(t).to_string(),
                 _ => s.trim_matches(t).to_string(),
             };
-            Ok(Value::Text(r))
+            Ok(Value::text(r))
         }
         "position" => {
             // bytea position: 1-based byte index, 0 if not found.
@@ -10708,9 +10772,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             };
             // Postgres: empty search string leaves the input unchanged.
             if from.is_empty() {
-                return Ok(Value::Text(s.to_string()));
+                return Ok(Value::text(s));
             }
-            Ok(Value::Text(s.replace(from, to)))
+            Ok(Value::text(s.replace(from, to)))
         }
         "split_part" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10744,7 +10808,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 ""
             };
-            Ok(Value::Text(r.to_string()))
+            Ok(Value::text(r))
         }
         // --- v0.16: missing built-ins (pg_regress 42883 cluster) -----------
         "concat" => {
@@ -10756,7 +10820,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     out.push_str(&t);
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "concat_ws" => {
             // A NULL separator makes the whole result NULL; NULL
@@ -10776,7 +10840,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     first = false;
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "to_hex" | "to_oct" | "to_bin" => {
             // Postgres width rule: int2/int4 render negatives as 32-bit
@@ -10806,7 +10870,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     _ => format!("{:b}", u),
                 }
             };
-            Ok(Value::Text(r))
+            Ok(Value::text(r))
         }
         "left" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10821,7 +10885,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let len = chars.len() as i64;
             // Negative n drops the last |n| characters (Postgres rule).
             let take = if n >= 0 { n.min(len) } else { (len + n).max(0) };
-            Ok(Value::Text(chars[..take as usize].iter().collect()))
+            Ok(Value::text(
+                chars[..take as usize].iter().collect::<String>(),
+            ))
         }
         "right" => {
             let s = match str_arg(name, &vals[0])? {
@@ -10840,14 +10906,16 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 (-n).min(len)
             };
-            Ok(Value::Text(chars[skip as usize..].iter().collect()))
+            Ok(Value::text(
+                chars[skip as usize..].iter().collect::<String>(),
+            ))
         }
         "reverse" => Ok(match &vals[0] {
             Value::Null => Value::Null,
             Value::Bytea(b) => Value::Bytea(b.iter().rev().copied().collect()),
             v => match str_arg(name, v)? {
                 None => Value::Null,
-                Some(s) => Value::Text(s.chars().rev().collect()),
+                Some(s) => Value::text(s.chars().rev().collect::<String>()),
             },
         }),
         "encode" => {
@@ -10864,10 +10932,10 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(f) => f.to_lowercase(),
             };
             match fmt.as_str() {
-                "hex" => Ok(Value::Text(hex_encode(data))),
-                "base64" => Ok(Value::Text(base64_encode(data, false))),
-                "base64url" => Ok(Value::Text(base64_encode(data, true))),
-                "escape" => Ok(Value::Text(bytea_escape(data))),
+                "hex" => Ok(Value::text(hex_encode(data))),
+                "base64" => Ok(Value::text(base64_encode(data, false))),
+                "base64url" => Ok(Value::text(base64_encode(data, true))),
+                "escape" => Ok(Value::text(bytea_escape(data))),
                 _ => Err(exec_err("22023", format!("unknown encode format: {}", fmt))),
             }
         }
@@ -10986,7 +11054,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     None => out.push(c),
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "unistr" => {
             // unistr(s): interpret \uXXXX and \UXXXXXXXX escapes.
@@ -10995,7 +11063,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(s) => s,
             };
             match unistr_decode(s) {
-                Some(t) => Ok(Value::Text(t)),
+                Some(t) => Ok(Value::text(t)),
                 None => Err(exec_err("22023", "invalid Unicode escape")),
             }
         }
@@ -11160,7 +11228,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                             None => return Ok(Value::Null),
                         }
                     };
-                    Ok(Value::Text(sc[rs..re_].iter().collect()))
+                    Ok(Value::text(sc[rs..re_].iter().collect::<String>()))
                 }
                 None => Ok(Value::Null),
             }
@@ -11207,11 +11275,13 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     // If there's a captured group, return it; else whole match.
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            Some((gs, ge)) => {
+                                Ok(Value::text(sc[gs..ge].iter().collect::<String>()))
+                            }
                             None => Ok(Value::Null),
                         }
                     } else {
-                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                        Ok(Value::text(sc[ms..me].iter().collect::<String>()))
                     }
                 }
                 _ => Ok(Value::Null),
@@ -11233,7 +11303,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     let total = sc.len() as i64;
                     let from = (*n).max(1);
                     let lo = (from - 1).max(0).min(total) as usize;
-                    return Ok(Value::Text(sc[lo..].iter().collect()));
+                    return Ok(Value::text(sc[lo..].iter().collect::<String>()));
                 }
                 Value::Null => return Ok(Value::Null),
                 Value::Text(_) => {} // Fall through to pattern handling.
@@ -11250,11 +11320,13 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some((ms, me, caps)) => {
                     if re.group_count() >= 1 {
                         match caps.groups.get(1).copied().flatten() {
-                            Some((gs, ge)) => Ok(Value::Text(sc[gs..ge].iter().collect())),
+                            Some((gs, ge)) => {
+                                Ok(Value::text(sc[gs..ge].iter().collect::<String>()))
+                            }
                             None => Ok(Value::Null),
                         }
                     } else {
-                        Ok(Value::Text(sc[ms..me].iter().collect()))
+                        Ok(Value::text(sc[ms..me].iter().collect::<String>()))
                     }
                 }
                 None => Ok(Value::Null),
@@ -11354,7 +11426,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 }
             }
             out.extend(sc[pos..].iter());
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
@@ -11392,7 +11464,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let mut out: String = sc[..from - 1].iter().collect();
             out.push_str(r);
             out.extend(sc[upto - 1..].iter());
-            Ok(Value::Text(out))
+            Ok(Value::text(out))
         }
         _ => Err(exec_err(
             "42883",
@@ -12983,7 +13055,7 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 other => return Err(func_arg_err(name, other)),
             };
             match crate::datetime::format_with_pattern(days, tod, fmt) {
-                Ok(s) => Ok(Value::Text(s)),
+                Ok(s) => Ok(Value::text(s)),
                 Err(e) => Err(fmt_exec_err(e)),
             }
         }
@@ -14601,7 +14673,7 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         ColType::Text => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
-            Ok(Value::Text(s.to_string()))
+            Ok(Value::text(s))
         }
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
@@ -14942,7 +15014,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Float4 => Value::Float4(0.0),
         ColType::Float => Value::Float(0.0),
         ColType::Numeric => Value::Numeric(Numeric::zero()),
-        ColType::Text => Value::Text(String::new()),
+        ColType::Text => Value::text(""),
         ColType::Bool => Value::Bool(false),
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),
@@ -15012,7 +15084,7 @@ mod tests {
         for (i, id, name) in [(1, 1, "ann"), (2, 2, "bob"), (3, 3, "cid")] {
             users.push_version(RowVersion {
                 id: i,
-                values: vec![Value::Int(id), Value::Text(name.into())],
+                values: Row::new(vec![Value::Int(id), Value::text(name)]),
                 xmin: 1,
                 xmax: 0,
             });
@@ -15029,7 +15101,7 @@ mod tests {
         for (i, id, uid, amt) in [(4, 1, 1, 10), (5, 2, 1, 20), (6, 3, 2, 5)] {
             orders.push_version(RowVersion {
                 id: i,
-                values: vec![Value::Int(id), Value::Int(uid), Value::Int(amt)],
+                values: Row::new(vec![Value::Int(id), Value::Int(uid), Value::Int(amt)]),
                 xmin: 1,
                 xmax: 0,
             });
@@ -15064,7 +15136,7 @@ mod tests {
             ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
                 .into_iter()
                 .map(|row| {
-                    row.into_iter()
+                    row.iter()
                         .map(|v| v.to_text().unwrap_or("NULL".to_string()))
                         .collect()
                 })
@@ -15072,6 +15144,82 @@ mod tests {
             ExecResult::Command { tag } => vec![vec![tag]],
             ExecResult::Dml { tag, .. } => vec![vec![tag]],
         }
+    }
+
+    /// A sequential scan must return the stored row. It must not return
+    /// a copy. See issue #8.
+    #[test]
+    fn seq_scan_shares_table_row_storage() {
+        let mut eng = engine();
+        let stored = eng.db.tables["users"][0].rows[0].values.as_ptr();
+        let out = run(&mut eng, "SELECT * FROM users").unwrap();
+        let ExecResult::Select { rows, .. } = out else {
+            panic!("SELECT returns rows");
+        };
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].as_ptr(),
+            stored,
+            "SELECT * must share the stored row, not copy it"
+        );
+    }
+
+    /// An index scan must share the stored row, like a sequential scan.
+    #[test]
+    fn index_scan_shares_table_row_storage() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE INDEX users_id_ix ON users(id)").unwrap();
+        let plan = rows_of(run(&mut eng, "EXPLAIN SELECT * FROM users WHERE id = 2").unwrap());
+        let plan = plan.concat().join(" ");
+        assert!(
+            plan.contains("Index"),
+            "query must plan an index scan: {}",
+            plan
+        );
+        let stored = eng.db.tables["users"][0].rows[1].values.as_ptr();
+        let out = run(&mut eng, "SELECT * FROM users WHERE id = 2").unwrap();
+        let ExecResult::Select { rows, .. } = out else {
+            panic!("SELECT returns rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].as_ptr(),
+            stored,
+            "an index scan must share the stored row"
+        );
+    }
+
+    /// A scanned row must share the text bytes of the table row.
+    #[test]
+    fn seq_scan_shares_table_text_bytes() {
+        let mut eng = engine();
+        let stored = match &eng.db.tables["users"][0].rows[0].values[1] {
+            Value::Text(s) => s.as_ptr(),
+            v => panic!("column 1 is text, got {:?}", v),
+        };
+        let out = run(&mut eng, "SELECT * FROM users").unwrap();
+        let ExecResult::Select { rows, .. } = out else {
+            panic!("SELECT returns rows");
+        };
+        match &rows[0][1] {
+            Value::Text(s) => assert_eq!(s.as_ptr(), stored, "text must be shared"),
+            v => panic!("column 1 is text, got {:?}", v),
+        }
+    }
+
+    /// A shared row does not change. An UPDATE must not change the rows
+    /// that an earlier SELECT returned.
+    #[test]
+    fn shared_rows_are_immutable_snapshots() {
+        let mut eng = engine();
+        let out = run(&mut eng, "SELECT * FROM users WHERE id = 1").unwrap();
+        let ExecResult::Select { rows, .. } = out else {
+            panic!("SELECT returns rows");
+        };
+        run(&mut eng, "UPDATE users SET name = 'zed' WHERE id = 1").unwrap();
+        assert_eq!(rows[0][1].to_text().unwrap(), "ann");
+        let after = rows_of(run(&mut eng, "SELECT name FROM users WHERE id = 1").unwrap());
+        assert_eq!(after, vec![vec!["zed".to_string()]]);
     }
 
     #[test]
@@ -17008,7 +17156,7 @@ fn eval_sequence_func(
 ) -> Result<Value, ExecError> {
     let seq_name = |v: &Value| -> Result<String, ExecError> {
         match v {
-            Value::Text(s) => Ok(s.clone()),
+            Value::Text(s) => Ok(s.to_string()),
             // regclass input: Postgres accepts nextval('seq').
             _ => Err(exec_err(
                 "42883",
@@ -17318,7 +17466,7 @@ fn alter_add_column(
     // replays them as InsertRows. Copy the visible rows out first; the
     // borrow of `t` must end before eval_default.
     let old_cols = t.columns.len();
-    let old_rows: Vec<(u64, Vec<Value>)> = t
+    let old_rows: Vec<(u64, Row)> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
@@ -17359,7 +17507,7 @@ fn alter_add_column(
         )?;
         new_rows.push(RowVersion {
             id: old_id,
-            values: nv,
+            values: Row::new(nv),
             xmin: ctx.own,
             xmax: 0,
         });
@@ -17492,7 +17640,7 @@ fn alter_drop_column(
     // Snapshot the table state and end `t`'s borrow before CASCADE
     // mutations (they need `eng` mutably).
     let mut next = t.clone();
-    let old_rows: Vec<(u64, Vec<Value>)> = t
+    let old_rows: Vec<(u64, Row)> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
@@ -17572,13 +17720,14 @@ fn alter_drop_column(
     // Rewrite rows without the column. Reuse old row ids so surviving
     // indexes stay valid.
     let mut new_rows = Vec::with_capacity(old_rows.len());
-    for (old_id, mut values) in old_rows {
+    for (old_id, values) in old_rows {
+        let mut values = values.to_vec();
         if values.len() > ci {
             values.remove(ci);
         }
         new_rows.push(RowVersion {
             id: old_id,
-            values,
+            values: Row::new(values),
             xmin: ctx.own,
             xmax: 0,
         });
@@ -17686,7 +17835,7 @@ fn alter_add_constraint(
         let mut probe = next.clone();
         probe.checks.push(c.clone());
         let probe_meta = TableMeta::of(&probe);
-        let old_rows: Vec<Vec<Value>> = t
+        let old_rows: Vec<Row> = t
             .rows
             .iter()
             .filter(|r| row_visible(r, ctx.snap, ctx.own))
@@ -18275,12 +18424,12 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     names.sort();
     for tn in names {
         rows.push(QRow {
-            cells: vec![
-                Value::Text("rustgres".to_string()),
-                Value::Text("public".to_string()),
-                Value::Text(tn),
-                Value::Text("BASE TABLE".to_string()),
-            ],
+            cells: Row::new(vec![
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(tn),
+                Value::text("BASE TABLE"),
+            ]),
             prov: Vec::new(),
         });
     }
@@ -18296,12 +18445,12 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     vnames.sort();
     for vn in vnames {
         rows.push(QRow {
-            cells: vec![
-                Value::Text("rustgres".to_string()),
-                Value::Text("public".to_string()),
-                Value::Text(vn),
-                Value::Text("VIEW".to_string()),
-            ],
+            cells: Row::new(vec![
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(vn),
+                Value::text("VIEW"),
+            ]),
             prov: Vec::new(),
         });
     }
@@ -18351,20 +18500,20 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
     for (tn, t) in tables {
         for (i, (cn, ty)) in t.columns.iter().enumerate() {
             let default = match &t.defaults[i] {
-                Some(d) => Value::Text(format!("{:?}", d)),
+                Some(d) => Value::text(format!("{:?}", d)),
                 None => Value::Null,
             };
             rows.push(QRow {
-                cells: vec![
-                    Value::Text("rustgres".to_string()),
-                    Value::Text("public".to_string()),
-                    Value::Text(tn.clone()),
-                    Value::Text(cn.clone()),
+                cells: Row::new(vec![
+                    Value::text("rustgres"),
+                    Value::text("public"),
+                    Value::text(tn.as_str()),
+                    Value::text(cn.as_str()),
                     Value::Int((i + 1) as i64),
                     default,
-                    Value::Text(if t.not_null[i] { "NO" } else { "YES" }.to_string()),
-                    Value::Text(format!("{:?}", ty)),
-                ],
+                    Value::text(if t.not_null[i] { "NO" } else { "YES" }),
+                    Value::text(format!("{:?}", ty)),
+                ]),
                 prov: Vec::new(),
             });
         }
