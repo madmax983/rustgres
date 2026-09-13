@@ -2,6 +2,86 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `send_data_row` payload buffer growth — baseline — 2026-09-13
+
+**Workload**: `benches/profile_scan.py` (new, this commit) — loads a 10,000-row
+3-column table (`bench_scan(id INT, name TEXT, active BOOL)`, same shape as
+`bench.py`'s `scan` workload) once, then sends an exact, fixed count of 30
+`SELECT * FROM bench_scan` queries over the real wire protocol. `bench.py`'s
+`scan` workload is time-boxed (runs for N seconds), so two profiling runs
+under valgrind would execute a different number of queries depending on
+wall-clock jitter, confounding a before/after instruction/allocation
+comparison — the same rationale `profile_fixed.py` already established for
+the keyword-dense query used in the four prior Bolt entries in this file.
+`scan` (not that query) is used here deliberately: the four prior fixes
+(`eat_keyword`, catalog `HashMap`→FxHash, `peek`/`peek2`/`peek3`, `tokenize`)
+already collapsed the parse-heavy cost of a short, repeated statement to the
+point that no remaining named function clears the 5%-of-profile relevance
+bar on that workload (the top *named* rustgres function, `tokenize`, is down
+to 2.14% of Ir; every other function is below 1%) — profiling a real
+row-scan/serialization path instead surfaces a different, still-unaddressed
+hotspot that dominates every `SELECT` returning more than a handful of rows,
+which the keyword workload barely exercises (it returns 3 rows).
+
+**Profile** (DHAT, `valgrind --tool=dhat`, same harness, this commit, i.e.
+with all four prior Bolt fixes already applied):
+
+**`rustgres::protocol::MsgBuilder::i16` (protocol.rs:199), reached from
+`send_data_row` (server.rs:3009), accounts for 900,000 of the workload's
+2,614,698 total heap allocations (34.4%)** — by a wide margin the single
+largest allocation site in the profile, and the only one anywhere near
+34% (the next largest, `Value::clone`, is 13.4%). Walking the full DHAT
+call stack for this allocation point confirms it: `RawVecInner::grow_amortized`
+→ `Vec::append_elements` → `Vec::extend_from_slice` → `MsgBuilder::i16` →
+`send_data_row` → `handle_query`. 900,000 = 3 × 300,000 (30 iterations ×
+10,000 rows), i.e. **3 buffer-growth reallocations per row sent**.
+
+Reading `send_data_row` and `MsgBuilder` explains why: `MsgBuilder::new`
+starts `payload` as `Vec::new()` (0 capacity). `send_data_row` then writes
+the column count (`i16`, 2 bytes) and, per column, a length prefix (`i32`,
+4 bytes) plus the value's text (`bytes`, a handful of bytes for these three
+short columns) — every one of these calls goes through
+`Vec::extend_from_slice`, which reserves via the same amortized-doubling
+`grow_amortized` path regardless of which `MsgBuilder` method invoked it.
+Starting from 0 capacity, a 3-column row (`id INT`, `name TEXT`, `active
+BOOL`, payload ≈ 27–30 bytes total here) blows through 2–3 undersized
+capacities before the buffer is big enough to hold the whole row, exactly
+once per `send_data_row` call — and `send_data_row` is the single most
+universal function in the server: it runs once per output row of every
+`SELECT`, `RETURNING` clause, and `FETCH`, independent of query shape.
+
+**Baseline numbers** (this commit, `send_data_row`/`MsgBuilder` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 30 iterations × 10,000-row scan) | 3,918,050,469 |
+| DHAT total allocations (blocks) | 2,614,698 |
+| DHAT total bytes allocated | 222,288,431 |
+| DHAT blocks attributed to the `send_data_row` payload-growth call stack | 900,000 (34.4% of all allocations) |
+
+Reproduced with a second baseline Callgrind run on the same (pre-fix)
+binary: 3,918,118,517 (a 68,048-instruction, ~0.0017% difference — well
+within this harness's established determinism band, not noise threatening
+the result).
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_scan.py --rows 10000 --count 30
+# terminate the server (SIGTERM) to flush callgrind.out, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -5   # PROGRAM TOTALS Ir
+
+# separately, under --tool=dhat --dhat-out-file=/tmp/dh.out with the same
+# harness: sum tbk/tb over pps[] in the JSON output, and walk each
+# allocation's ftbl-resolved call stack to attribute it to a caller (the
+# 900,000-block entry's stack ends at protocol.rs:199 / server.rs:3009).
+```
+
 ## Bolt: `tokenize` — unsized buffer growth + two-pass identifier folding — baseline — 2026-09-13
 
 **Workload**: same harness, query, and rationale as the three entries below —
