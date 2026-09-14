@@ -2,6 +2,195 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compare_values` (ORDER BY) pays NUMERIC normalization for plain-int sorts — baseline — 2026-09-13
+
+**Workload**: `benches/profile_orderby.py` (new) — a fixed-iteration-count
+driver, same rationale and pattern as `profile_join.py`/`profile_scan.py`
+(bench.py's own `idxscan` workload, which includes an `ORDER BY id LIMIT
+10` op, is time-boxed, so two profiling runs would execute a different
+amount of work and confound a before/after comparison). Loads a 20,000-row
+table with a plain `INT` column in randomly shuffled order (not ascending,
+so the sort does real comparison work rather than a possible
+already-sorted short-circuit), then sends an exact 30 iterations of
+`SELECT * FROM bench_ord ORDER BY val LIMIT 10` over the real wire
+protocol. No index is created — this targets the row-sort comparator
+itself (`exec::compare_values`, called from `apply_order`'s `idx.sort_by`
+closure), not `plan_access_path`'s separate index-scan-for-ordering
+decision. This is the numeric `ORDER BY`/`GROUP BY` workload flagged as
+follow-up work in the "equi-join comparisons skip NUMERIC normalization"
+entry below, which fixed the identical duplication in `exec::cmp_ordering`
+(used by `WHERE`/`JOIN ON`) but left `compare_values` (used by `ORDER BY`)
+untouched because that workload's `ORDER BY u.name` was a text sort and
+never exercised it.
+
+```sql
+CREATE TABLE bench_ord(id INT, val INT)
+SELECT * FROM bench_ord ORDER BY val LIMIT 10
+```
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_orderby.py --rows 20000 --count 30
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+**Profile** (Callgrind, `valgrind --tool=callgrind`, this commit — `compare_values`
+unchanged): 20,814,946,756 total instructions over 30 iterations of a
+20,000-row sort. Top `rustgres::` sites by self cost (`callgrind_annotate
+--auto=no`):
+
+| site | Ir | % of total |
+|---|---|---|
+| `storage::Numeric::cmp` (incl. its closure + main.rs dup frame) | 4,439,549,700 | 21.33% |
+| `exec::apply_order` (incl. its `{{closure}}`, the `idx.sort_by` comparator, + main.rs dup frame) | 1,046,809,530 | 5.03% |
+| `exec::compare_values` | 723,756,000 | 3.48% |
+| `storage::Numeric::aligned` (incl. its closure) | 1,360,372,320 | 6.54% |
+| `exec::exact_numeric` | 506,629,200 | 2.43% |
+| `storage::Numeric::new` | 434,253,600 | 2.09% |
+| `storage::Numeric::normalize` (incl. main.rs dup) | 361,876,830 | 1.74% |
+| `i128::checked_mul` (driven by `Numeric::cmp`) | 1,343,577,600 | 6.45% |
+| `i128::checked_pow` (driven by `Numeric::normalize`, incl. main.rs dup) | 352,689,120 | 1.69% |
+| `i128::unsigned_abs` (driven by `Numeric::cmp`) | 271,408,500 | 1.30% |
+| `NumericSpecial::eq` | 180,939,000 | 0.87% |
+| `exec::is_exact_numeric` | 162,845,100 | 0.78% |
+
+**Target**: the `Numeric`-normalization chain reached from
+`compare_values`'s exact-numeric arm — `exact_numeric` +
+`Numeric::{cmp,new,normalize,aligned}` + the `i128` checked-arithmetic it
+uses + `NumericSpecial::eq` — sums to **9,251,295,870 instructions, 44.45%
+of total instructions**, far above the 5%-of-profile relevance bar (and
+proportionally much larger than the 23.40% found for the same chain in the
+`cmp_ordering`/join workload below, because a sort does O(n log n)
+comparisons over the whole table instead of one comparison per join pair,
+so the per-comparison NUMERIC tax dominates even more of the total here).
+
+**Mechanism**: `bench_ord.val` is a plain `INT` column
+(`Value::Int(i64)`), never `NUMERIC`. `exec::compare_values` — the
+comparison primitive behind every `ORDER BY` term, called once per pair
+per sort-comparator invocation from `apply_order`'s `idx.sort_by` closure
+— routes any pair of "exact numeric" values (`SmallInt`/`Int`/`BigInt`/
+`Numeric`) through `exact_numeric(v) -> Numeric` and then `Numeric::cmp`,
+unconditionally, exactly the same duplication already found and fixed in
+`exec::cmp_ordering` (the `WHERE`/`JOIN ON` comparison primitive) in the
+entry below — but that fix was never applied to `compare_values`, the
+separate comparison primitive `ORDER BY`/window `ORDER BY` use, because
+the join workload's `ORDER BY u.name` never exercised it (a text sort, not
+numeric). `exec::exact_as_i64` (extracting a native `i64` from
+`SmallInt`/`Int`/`BigInt`) already exists in this file from that fix,
+unused by `compare_values` today.
+
+**Baseline numbers** (this commit, `compare_values` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total instructions, 30 iterations × 20,000-row sort) | 20,814,946,756 |
+| Ir in the `Numeric`-normalization chain (see table above) | 9,251,295,870 (44.45%) |
+
+Reproduced with a second baseline Callgrind run on the same (unchanged)
+binary: 20,814,886,474 (a 60,282-instruction, ~0.00029% difference from
+the first — tight, well within this harness's established determinism
+band; unlike the join workload's setup phase, this workload's INSERT
+volume — 20,000 rows in 20 chunked statements — is a small fraction of
+the 30×20,000-comparison sort workload it precedes, so it does not show
+the join workload's WAL-fsync-driven run-to-run jitter).
+
+**Fix** (next commit): give `exec::compare_values`'s exact-numeric arm the
+same `exact_as_i64` fast path already applied to `exec::cmp_ordering` —
+when both operands are plain `SmallInt`/`Int`/`BigInt`, compare as `i64`
+directly; fall back to the existing `exact_numeric(...).cmp(...)` path
+only when either side is an actual `Value::Numeric`. `NUMERIC`-involving
+comparisons (including mixed int/`NUMERIC`) are untouched and keep their
+exact current semantics and results.
+
+**Fix applied**: as described above — `compare_values`'s exact-numeric arm
+tries `exact_as_i64` on both operands first and compares as `i64`
+directly when both succeed; when either side is an actual `NUMERIC`
+value, it falls back to the previous `exact_numeric(...).cmp(...)` path,
+byte-for-byte unchanged. No other call site changes.
+
+**After numbers** (same harness, same workload, same iteration count, same
+machine, this session):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (30 iterations × 20,000-row sort) | 20,814,946,756 | 11,254,710,504 | **-45.93%** |
+
+More than 9x the ≥5% instruction-count floor. Reproduced with a second
+callgrind run on the same (fixed) binary: 11,254,402,574 (a 307,930-
+instruction, ~0.0027% difference — within this harness's established
+determinism band). The entire `Numeric`-normalization chain — `Numeric::
+cmp`, `Numeric::new`, `Numeric::normalize`, `Numeric::aligned`, the `i128`
+checked-arithmetic it drove, and `NumericSpecial::eq` — disappears from
+the post-fix Callgrind top-consumers list for this workload entirely; the
+new `exec::exact_as_i64` costs 379,971,900 Ir (3.38% of the smaller
+post-fix total) in their place. `compare_values` itself grows in
+*proportion* of the total (7.64% vs. 3.48% before) purely because the
+total shrank so much, not because the function got heavier in absolute
+terms (859,460,250 vs. 723,756,000 Ir — a small, expected increase from
+the added `exact_as_i64`/match dispatch on the common integer path,
+dwarfed by what it replaces).
+
+**Correctness**: all 87 `cargo test --all-features` unit tests pass
+unchanged. `cargo fmt --all -- --check` is clean. `cargo clippy
+--all-targets --all-features` reports the same pre-existing `eq_op`
+compile error and the same 244 bin-target warnings (252 total warning
+lines) as the pristine tree — zero new warnings from this diff.
+
+Conformance (`tests/protocol_test*.py`, run individually against a fresh
+server per README's documented procedure): every ORDER BY-relevant and
+otherwise deterministic suite passes unchanged versus the pristine
+binary — `protocol_test.py`/`2`/`3`/`4`/`6`/`7`/`8`/`9`/`10`/`14`/`16`/
+`17`/`18`/`19`/`21` all fully green, including `protocol_test7.py`'s and
+`protocol_test8.py`'s own `ORDER BY`/index-scan-ordering checks. Two
+suites needed extra scrutiny and both turned out to be pre-existing,
+unrelated to this change:
+
+- `protocol_test5.py` fails identically — the *same* 43-passed/42-failed
+  split, byte-for-byte identical output — on the pristine pre-fix binary
+  and on the fixed binary (diffed directly). Its failures start well
+  before its `ORDER BY` section (`update tag`, `delete effect`, a
+  SAVEPOINT/MVCC group), so this is a pre-existing bug in this branch's
+  `main`, not something this diff touches or worsens; out of scope for a
+  Bolt performance pass.
+- `protocol_test11.py`, `protocol_test12.py`, `protocol_test13.py`
+  (roles/ACLs, concurrency/soak, replication — all timing-sensitive under
+  load) show *different* failure sets across repeated runs on the
+  *pristine* binary alone (e.g. `protocol_test11.py` scored 118/0, then
+  112/1 failing `t_sequence_privs`, on two consecutive pristine runs with
+  no code change between them) — confirmed flaky on this shared-vCPU
+  machine independent of this change, the same phenomenon already
+  documented for `protocol_test12.py` in the "rows are shared, not
+  copied" entry below.
+
+No behavior change for any comparison this fix's fast path applies to:
+`exact_as_i64` is exact for `SmallInt`/`Int`/`BigInt` (no precision loss
+versus `Numeric::new(v as i128, 0)`), and any comparison involving an
+actual `NUMERIC` value still falls back to the unchanged
+`exact_numeric(...).cmp(...)` path.
+
+**Reproduce**:
+
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features   # 87 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes --branch-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_orderby.py --rows 20000 --count 30
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before number.
+
 ## Bolt: WHERE/GROUP BY/aggregate scope chain skips heap allocation for non-correlated queries — baseline — 2026-09-13
 
 **Workload**: `benches/profile_join.py --count 100` (unchanged; default 200
