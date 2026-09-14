@@ -1938,6 +1938,22 @@ fn exec_insert(
                 built.push(Row::new(values));
             }
         } else {
+            // v0.24: expression VALUES (`INSERT ... VALUES (repeat(...))`)
+            // need an evaluation context; build it once for all rows.
+            let mut lock_ids = Vec::new();
+            let mut q = Q {
+                eng,
+                snap: ctx.snap,
+                own: ctx.own,
+                session: ctx.session,
+                role: ctx.role,
+                read_only: ctx.read_only,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+                ctes: ctes.clone(),
+                wctx: None,
+                priv_scopes: Vec::new(),
+            };
             built = Vec::with_capacity(rows.len());
             for row in rows {
                 if row.len() != targets.len() {
@@ -1959,10 +1975,17 @@ fn exec_insert(
                         InsertValue::Param(n) => {
                             return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
                         }
+                        // v0.24: general expressions in VALUES — evaluate,
+                        // then coerce to the column type like PG's
+                        // assignment cast.
+                        InsertValue::Expr(e) => {
+                            let val = eval_expr(&mut q, &[], e)?;
+                            coerce_value(val, ctype, cname)?
+                        }
                         // v0.9: DEFAULT in VALUES applies the column default.
                         InsertValue::Default => match &meta.defaults[ci] {
                             Some(d) => eval_default(
-                                eng,
+                                q.eng,
                                 ctx.snap,
                                 ctx.own,
                                 ctx.session,
@@ -1982,7 +2005,7 @@ fn exec_insert(
                         if let Some(d) = d {
                             let (cname, ctype) = &meta.columns[i];
                             values[i] = eval_default(
-                                eng,
+                                q.eng,
                                 ctx.snap,
                                 ctx.own,
                                 ctx.session,
@@ -1996,7 +2019,7 @@ fn exec_insert(
                 }
                 // v0.9: NOT NULL + CHECK.
                 check_row_constraints(
-                    eng,
+                    q.eng,
                     ctx.snap,
                     ctx.own,
                     ctx.session,
@@ -11261,10 +11284,16 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
+        "substring_from_for" => n == 3,
         // v0.16: new string/math built-ins.
         "concat" => true, // concat() with no args is '' (Postgres).
         "concat_ws" => n >= 1,
         "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
+        // v0.24: missing string built-ins (pg_regress 42883 cluster).
+        "repeat" => n == 2,
+        "lpad" | "rpad" => n == 2 || n == 3,
+        "ascii" | "chr" | "initcap" => n == 1,
+        "ltrim" | "rtrim" => n == 1 || n == 2,
         "left" | "right" => n == 2,
         "now" | "current_date" | "current_timestamp" => n == 0,
         // v0.17: transaction/clock timestamps.
@@ -11311,10 +11340,10 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "trim" | "position" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
         | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "decode" | "crc32c"
         | "sha224" | "sha256" | "sha384" | "sha512" | "strpos" | "translate" | "unistr"
-        | "overlay" | "regexp_like" | "regexp_count" | "regexp_instr" | "regexp_substr"
-        | "regexp_replace" | "similar_to" | "substring_similar" | "substring_from" => {
-            eval_str_func(name, vals)
-        }
+        | "overlay" | "repeat" | "lpad" | "rpad" | "ascii" | "chr" | "initcap" | "ltrim"
+        | "rtrim" | "regexp_like" | "regexp_count" | "regexp_instr" | "regexp_substr"
+        | "regexp_replace" | "similar_to" | "substring_similar" | "substring_from"
+        | "substring_from_for" => eval_str_func(name, vals),
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -11361,6 +11390,112 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     }
 }
 
+/// v0.24: output-size guards for string-building built-ins. Postgres
+/// caps a single text value at ~1GB (MaxAllocSize -> 54000); the char
+/// bound is the corresponding worst case for 4-byte UTF-8.
+const MAX_STR_RESULT_BYTES: u64 = 1_000_000_000;
+const MAX_STR_RESULT_CHARS: u64 = 250_000_000;
+
+/// v0.24: parse PostgreSQL regexp flags (`i`, `n`/`m`, `s`, `x`, `g`).
+/// Returns `(options, global)`. Anything else is 2201B, like PG's
+/// `invalid regular expression option`. The `g` flag is only meaningful
+/// for `regexp_replace`; the other regexp_* functions reject it with
+/// PG's exact `does not support the "global" option` error.
+fn parse_regexp_flags(
+    flags: &str,
+    func: &str,
+    allow_global: bool,
+) -> Result<(crate::regex::RegexOptions, bool), ExecError> {
+    let mut opts = crate::regex::RegexOptions::default();
+    let mut global = false;
+    for c in flags.chars() {
+        match c {
+            'i' => opts.case_insensitive = true,
+            'n' | 'm' => opts.newline_sensitive = true,
+            's' => opts.newline_sensitive = false,
+            'x' => opts.expanded = true,
+            'g' => {
+                if !allow_global {
+                    return Err(exec_err(
+                        "2201B",
+                        format!("{func}() does not support the \"global\" option"),
+                    ));
+                }
+                global = true;
+            }
+            _ => {
+                return Err(exec_err(
+                    "2201B",
+                    format!("invalid regular expression option: \"{c}\""),
+                ));
+            }
+        }
+    }
+    Ok((opts, global))
+}
+
+/// v0.24: integer `substring(s, start [, len])` — 1-based; start < 1
+/// shifts the window (Postgres rule).
+fn substring_int(s: &str, start: i64, len: Option<i64>) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let total = chars.len() as i64;
+    let from = start.max(1);
+    let upto = match len {
+        Some(n) => start + n,
+        None => total + 1,
+    };
+    let lo = (from - 1).max(0).min(total) as usize;
+    let hi = (upto - 1).max(0).min(total) as usize;
+    let (lo, hi) = (lo.min(hi), hi);
+    chars[lo..hi].iter().collect::<String>()
+}
+
+/// v0.24: SIMILAR TO substring match — the pattern must match the
+/// entire string; if it has a group, return the first group.
+fn substring_similar_match(s: &str, pat: &str, escape: char) -> Result<Value, ExecError> {
+    let regex_pat = similar_to_regex(pat, escape)
+        .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+    let re = crate::regex::compile(&regex_pat, false)
+        .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
+    let sc: Vec<char> = s.chars().collect();
+    match re.find_at(&sc, 0) {
+        Some((ms, me, caps)) if ms == 0 && me == sc.len() => {
+            if re.group_count() >= 1 {
+                match caps.groups.get(1).copied().flatten() {
+                    Some((gs, ge)) => Ok(Value::text(sc[gs..ge].iter().collect::<String>())),
+                    None => Ok(Value::Null),
+                }
+            } else {
+                Ok(Value::text(sc[ms..me].iter().collect::<String>()))
+            }
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// v0.24: validate a regexp `start` parameter — must be >= 1, like PG's
+/// `invalid value for parameter "start": N`.
+fn check_regexp_start(start: i64) -> Result<usize, ExecError> {
+    if start < 1 {
+        return Err(exec_err(
+            "22023",
+            format!("invalid value for parameter \"start\": {start}"),
+        ));
+    }
+    Ok((start as u64).min(usize::MAX as u64) as usize - 1)
+}
+
+/// v0.24: validate a regexp occurrence/`n` parameter — must be >= 1.
+fn check_regexp_n(n: i64, what: &str) -> Result<(), ExecError> {
+    if n < 1 {
+        return Err(exec_err(
+            "22023",
+            format!("invalid value for parameter \"{what}\": {n}"),
+        ));
+    }
+    Ok(())
+}
+
 fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" => Ok(match str_arg(name, &vals[0])? {
@@ -11398,17 +11533,47 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None
             };
             // 1-based; start < 1 shifts the window (Postgres rule).
-            let chars: Vec<char> = s.chars().collect();
-            let total = chars.len() as i64;
-            let from = start.max(1);
-            let upto = match len {
-                Some(n) => start + n,
-                None => total + 1,
+            Ok(Value::text(substring_int(s, start, len)))
+        }
+        "substring_from_for" => {
+            // v0.24: `SUBSTRING(s FROM x FOR y)` — runtime dispatch.
+            // Integer (start, len) vs SIMILAR (pattern, escape); PG
+            // decides by type, so `-1`, `1+1`, etc. work as integers.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
             };
-            let lo = (from - 1).max(0).min(total) as usize;
-            let hi = (upto - 1).max(0).min(total) as usize;
-            let (lo, hi) = (lo.min(hi), hi);
-            Ok(Value::text(chars[lo..hi].iter().collect::<String>()))
+            match (&vals[1], &vals[2]) {
+                (Value::Int(start), Value::Int(len)) => {
+                    if *len < 0 {
+                        return Err(exec_err("22011", "negative substring length not allowed"));
+                    }
+                    Ok(Value::text(substring_int(s, *start, Some(*len))))
+                }
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                _ => {
+                    // SIMILAR form: pattern + escape char.
+                    let pat = match str_arg(name, &vals[1])? {
+                        None => return Ok(Value::Null),
+                        Some(p) => p,
+                    };
+                    let esc_s = match str_arg(name, &vals[2])? {
+                        None => return Ok(Value::Null),
+                        Some(e) => e,
+                    };
+                    let mut ch = esc_s.chars();
+                    let escape = match (ch.next(), ch.next()) {
+                        (Some(c), None) => c,
+                        _ => {
+                            return Err(exec_err(
+                                "22023",
+                                "ESCAPE string must be empty or one character",
+                            ));
+                        }
+                    };
+                    Ok(substring_similar_match(s, pat, escape)?)
+                }
+            }
         }
         "trim" => {
             // Parser encodes trim as (spec, chars, str); the 1-arg form
@@ -11635,25 +11800,193 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Some(s) => Value::text(s.chars().rev().collect::<String>()),
             },
         }),
+        // --- v0.24: missing string built-ins (pg_regress strings cluster) --
+        "repeat" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            // Postgres: repeat(s, n <= 0) is '' (no error; PG 19
+            // regression output confirms `repeat('Pg', -4)` -> '').
+            if n <= 0 || s.is_empty() {
+                return Ok(Value::text(String::new()));
+            }
+            let total = (n as u64).checked_mul(s.len() as u64);
+            if !matches!(total, Some(t) if t <= MAX_STR_RESULT_BYTES) {
+                return Err(exec_err("54000", "requested length too large"));
+            }
+            Ok(Value::text(s.repeat(n as usize)))
+        }
+        "lpad" | "rpad" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let fill = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(f) => f,
+                }
+            } else {
+                " "
+            };
+            // Postgres: negative length -> ''.
+            if n < 0 {
+                return Ok(Value::text(String::new()));
+            }
+            if n as u64 > MAX_STR_RESULT_CHARS {
+                return Err(exec_err("54000", "requested length too large"));
+            }
+            let n = n as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() >= n {
+                return Ok(Value::text(chars[..n].iter().collect::<String>()));
+            }
+            let fill_chars: Vec<char> = fill.chars().collect();
+            if fill_chars.is_empty() {
+                // Postgres: empty fill -> no padding (truncation above
+                // still applies).
+                return Ok(Value::text(chars.iter().collect::<String>()));
+            }
+            let need = n - chars.len();
+            // Cycle the fill to exactly `need` chars.
+            let reps = need / fill_chars.len() + 1;
+            let fill_s: String = fill_chars.iter().collect();
+            let pad: String = fill_s.repeat(reps).chars().take(need).collect();
+            let body: String = chars.iter().collect();
+            Ok(Value::text(if name == "lpad" {
+                format!("{pad}{body}")
+            } else {
+                format!("{body}{pad}")
+            }))
+        }
+        "ascii" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            // Postgres: ascii('') is 0; otherwise the code point of the
+            // first character (full astral code point in UTF-8).
+            match s.chars().next() {
+                None => Ok(Value::Int(0)),
+                Some(c) => Ok(Value::Int(c as u32 as i64)),
+            }
+        }
+        "chr" => {
+            let n = match int_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            // Postgres' exact error split: negative -> 22023, zero or
+            // out-of-range -> 54000.
+            if n < 0 {
+                return Err(exec_err("22023", "character number must be positive"));
+            }
+            if n == 0 {
+                return Err(exec_err("54000", "null character not permitted"));
+            }
+            if n > 0x10FFFF {
+                return Err(exec_err(
+                    "54000",
+                    "requested character too large for encoding",
+                ));
+            }
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::text(c.to_string())),
+                None => Err(exec_err(
+                    "54000",
+                    "requested character not valid for encoding",
+                )),
+            }
+        }
+        "initcap" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            // First alphabetic char after a non-alphanumeric -> upper;
+            // other alphabetics -> lower; the rest pass through.
+            let mut out = String::with_capacity(s.len());
+            let mut prev_alnum = false;
+            for c in s.chars() {
+                if c.is_alphabetic() {
+                    if prev_alnum {
+                        out.extend(c.to_lowercase());
+                    } else {
+                        out.extend(c.to_uppercase());
+                    }
+                } else {
+                    out.push(c);
+                }
+                prev_alnum = c.is_alphanumeric();
+            }
+            Ok(Value::text(out))
+        }
+        "ltrim" | "rtrim" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let set: Vec<char> = if vals.len() > 1 {
+                match str_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(c) => c.chars().collect(),
+                }
+            } else {
+                vec![' ']
+            };
+            let t = if name == "ltrim" {
+                s.trim_start_matches(|c| set.contains(&c))
+            } else {
+                s.trim_end_matches(|c| set.contains(&c))
+            };
+            Ok(Value::text(t.to_string()))
+        }
         "encode" => {
-            let data: &[u8] = match &vals[0] {
+            let data: Vec<u8> = match &vals[0] {
                 Value::Null => return Ok(Value::Null),
-                Value::Bytea(b) => b,
+                Value::Bytea(b) => b.clone(),
                 v => match str_arg(name, v)? {
                     None => return Ok(Value::Null),
-                    Some(s) => s.as_bytes(),
+                    // v0.24: unknown literals coerce to bytea via the
+                    // bytea input function (`\x` hex or escape format),
+                    // like PG.
+                    Some(s) => match text_to_bytea(s) {
+                        Some(b) => b,
+                        None => {
+                            return Err(exec_err(
+                                "22P02",
+                                format!("invalid input syntax for type bytea: {:?}", s),
+                            ));
+                        }
+                    },
                 },
             };
-            let fmt = match str_arg(name, &vals[1])? {
+            let data: &[u8] = &data;
+            let fmt_raw = match str_arg(name, &vals[1])? {
                 None => return Ok(Value::Null),
-                Some(f) => f.to_lowercase(),
+                Some(f) => f,
             };
+            let fmt = fmt_raw.to_lowercase();
             match fmt.as_str() {
                 "hex" => Ok(Value::text(hex_encode(data))),
                 "base64" => Ok(Value::text(base64_encode(data, false))),
                 "base64url" => Ok(Value::text(base64_encode(data, true))),
+                "base32hex" => Ok(Value::text(base32hex_encode(data))),
                 "escape" => Ok(Value::text(bytea_escape(data))),
-                _ => Err(exec_err("22023", format!("unknown encode format: {}", fmt))),
+                // v0.24: PG 19's exact message (original case).
+                _ => Err(exec_err(
+                    "22023",
+                    format!("unrecognized encoding: \"{}\"", fmt_raw),
+                )),
             }
         }
         "decode" => {
@@ -11661,10 +11994,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
-            let fmt = match str_arg(name, &vals[1])? {
+            let fmt_raw = match str_arg(name, &vals[1])? {
                 None => return Ok(Value::Null),
-                Some(f) => f.to_lowercase(),
+                Some(f) => f,
             };
+            let fmt = fmt_raw.to_lowercase();
             match fmt.as_str() {
                 "hex" => match hex_decode(s) {
                     Some(b) => Ok(Value::Bytea(b)),
@@ -11678,11 +12012,19 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     Some(b) => Ok(Value::Bytea(b)),
                     None => Err(exec_err("22023", "invalid base64url string")),
                 },
+                "base32hex" => match base32hex_decode(s) {
+                    Some(b) => Ok(Value::Bytea(b)),
+                    None => Err(exec_err("22023", "invalid base32hex string")),
+                },
                 "escape" => match bytea_unescape(s) {
                     Some(b) => Ok(Value::Bytea(b)),
                     None => Err(exec_err("22023", "invalid escape string")),
                 },
-                _ => Err(exec_err("22023", format!("unknown decode format: {}", fmt))),
+                // v0.24: PG 19's exact message (original case).
+                _ => Err(exec_err(
+                    "22023",
+                    format!("unrecognized encoding: \"{}\"", fmt_raw),
+                )),
             }
         }
         "crc32c" => {
@@ -11802,8 +12144,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 ""
             };
-            let ci = flags.contains('i');
-            let re = crate::regex::compile(pat, ci)
+            // v0.24: strict flag validation; `g` is rejected like PG.
+            let (opts, _) = parse_regexp_flags(flags, name, false)?;
+            let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
             Ok(Value::Bool(re.is_match(&sc)))
@@ -11833,13 +12176,15 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             } else {
                 ""
             };
-            let ci = flags.contains('i');
-            let re = crate::regex::compile(pat, ci)
+            let (opts, _) = parse_regexp_flags(flags, name, false)?;
+            let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
-            let start_idx = (start.max(1) - 1) as usize;
+            // v0.24: start < 1 is an error, not a clamp (PG: `invalid
+            // value for parameter "start"`).
+            let start_idx = check_regexp_start(start)?.min(sc.len());
             let mut count = 0i64;
-            let mut pos = start_idx.min(sc.len());
+            let mut pos = start_idx;
             while pos <= sc.len() {
                 match re.find_at(&sc, pos) {
                     Some((ms, me, _)) => {
@@ -11866,15 +12211,29 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let occurrence = get_int_arg(name, vals, 3, 1)?;
             let end_option = get_int_arg(name, vals, 4, 0)?;
             let flags = get_str_arg(name, vals, 5, "")?;
-            let subexpr = get_int_arg(name, vals, 6, 0)? as usize;
-            if occurrence < 1 {
-                return Err(exec_err("22023", "occurrence must be positive"));
+            let subexpr = get_int_arg(name, vals, 6, 0)?;
+            // v0.24: strict PG validation (was: clamps and silent
+            // acceptance).
+            let start_idx = check_regexp_start(start)?;
+            check_regexp_n(occurrence, "n")?;
+            if end_option != 0 && end_option != 1 {
+                return Err(exec_err(
+                    "22023",
+                    format!("invalid value for parameter \"endoption\": {end_option}"),
+                ));
             }
-            let ci = flags.contains('i');
-            let re = crate::regex::compile(pat, ci)
+            if subexpr < 0 {
+                return Err(exec_err(
+                    "22023",
+                    format!("invalid value for parameter \"subexpr\": {subexpr}"),
+                ));
+            }
+            let subexpr = subexpr as usize;
+            let (opts, _) = parse_regexp_flags(flags, name, false)?;
+            let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
-            let mut pos = ((start.max(1) - 1) as usize).min(sc.len());
+            let mut pos = start_idx.min(sc.len());
             let mut found = None;
             for _ in 0..occurrence {
                 match re.find_at(&sc, pos) {
@@ -11916,15 +12275,22 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let start = get_int_arg(name, vals, 2, 1)?;
             let occurrence = get_int_arg(name, vals, 3, 1)?;
             let flags = get_str_arg(name, vals, 4, "")?;
-            let subexpr = get_int_arg(name, vals, 5, 0)? as usize;
-            if occurrence < 1 {
-                return Err(exec_err("22023", "occurrence must be positive"));
+            let subexpr = get_int_arg(name, vals, 5, 0)?;
+            // v0.24: strict PG validation (was: clamps).
+            let start_idx = check_regexp_start(start)?;
+            check_regexp_n(occurrence, "n")?;
+            if subexpr < 0 {
+                return Err(exec_err(
+                    "22023",
+                    format!("invalid value for parameter \"subexpr\": {subexpr}"),
+                ));
             }
-            let ci = flags.contains('i');
-            let re = crate::regex::compile(pat, ci)
+            let subexpr = subexpr as usize;
+            let (opts, _) = parse_regexp_flags(flags, name, false)?;
+            let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
-            let mut pos = ((start.max(1) - 1) as usize).min(sc.len());
+            let mut pos = start_idx.min(sc.len());
             let mut found = None;
             for _ in 0..occurrence {
                 match re.find_at(&sc, pos) {
@@ -12091,7 +12457,13 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::Bool(matched))
         }
         "regexp_replace" => {
-            // regexp_replace(s, pat, repl [, start [, count [, flags]]])
+            // v0.24: two PG forms.
+            // Legacy: regexp_replace(s, pat, repl, flags) — 4th arg is
+            // text (PG overload resolution); replaces the first match, or
+            // all with 'g'.
+            // Extended: regexp_replace(s, pat, repl [, start [, n [, flags]]])
+            // — n=0 replaces all from start, n>0 replaces only the nth
+            // match; an explicitly given n makes 'g' irrelevant.
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -12104,37 +12476,79 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
+            // Legacy 4-text-arg form?
+            if vals.len() == 4 && matches!(&vals[3], Value::Text(_)) {
+                let flags = match str_arg(name, &vals[3])? {
+                    None => return Ok(Value::Null),
+                    Some(f) => f,
+                };
+                let (opts, global) = parse_regexp_flags(flags, name, true)?;
+                let re = crate::regex::compile_opts(pat, opts)
+                    .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+                let sc: Vec<char> = s.chars().collect();
+                let mut out = String::new();
+                let mut pos = 0usize;
+                while pos <= sc.len() {
+                    match re.find_at(&sc, pos) {
+                        Some((ms, me, caps)) => {
+                            out.extend(sc[pos..ms].iter());
+                            out.push_str(&expand_replacement(repl, &sc, &caps));
+                            pos = if me > ms { me } else { ms + 1 };
+                            if !global {
+                                break;
+                            }
+                            if ms == sc.len() && me == ms {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                out.extend(sc[pos.min(sc.len())..].iter());
+                return Ok(Value::text(out));
+            }
+            // Extended form.
             let start = get_int_arg(name, vals, 3, 1)?;
-            let count = get_int_arg(name, vals, 4, 0)?; // 0 = all (if 'g' flag)
+            let n = get_int_arg(name, vals, 4, 0)?;
             let flags = get_str_arg(name, vals, 5, "")?;
-            let ci = flags.contains('i');
-            let global = flags.contains('g');
-            let re = crate::regex::compile(pat, ci)
+            // v0.24: strict PG validation (was: clamps).
+            let start_idx = check_regexp_start(start)?;
+            if n < 0 {
+                return Err(exec_err(
+                    "22023",
+                    format!("invalid value for parameter \"n\": {n}"),
+                ));
+            }
+            let (opts, _) = parse_regexp_flags(flags, name, true)?;
+            let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
-            let start_idx = ((start.max(1) - 1) as usize).min(sc.len());
+            let start_idx = start_idx.min(sc.len());
             let mut out = String::new();
             out.extend(sc[..start_idx].iter());
             let mut pos = start_idx;
-            let mut replaced = 0i64;
-            // count: 0 means "all" only if global flag; otherwise 1.
-            let max_replace = if count > 0 {
-                count
-            } else if global {
-                i64::MAX
-            } else {
-                1
-            };
-            while pos <= sc.len() && replaced < max_replace {
+            // n = 0: replace all; n > 0: replace only the nth match.
+            // (An explicitly given n makes 'g' irrelevant, like PG.)
+            let target = if n == 0 { u64::MAX } else { n as u64 };
+            let mut seen = 0u64;
+            while pos <= sc.len() {
                 match re.find_at(&sc, pos) {
                     Some((ms, me, caps)) => {
-                        // Copy text before match.
-                        out.extend(sc[pos..ms].iter());
-                        // Expand replacement.
-                        out.push_str(&expand_replacement(repl, &sc, &caps));
-                        replaced += 1;
+                        seen += 1;
+                        if seen == target || n == 0 {
+                            out.extend(sc[pos..ms].iter());
+                            out.push_str(&expand_replacement(repl, &sc, &caps));
+                        } else {
+                            // Not the target occurrence: copy through.
+                            // (We still need to advance past it.)
+                            out.extend(sc[pos..me.max(ms + 1)].iter());
+                        }
                         pos = if me > ms { me } else { ms + 1 };
-                        // If empty match at end, avoid infinite loop.
+                        if n > 0 && seen >= target {
+                            // Copy the rest and finish.
+                            out.extend(sc[pos..].iter());
+                            return Ok(Value::text(out));
+                        }
                         if ms == sc.len() && me == ms {
                             break;
                         }
@@ -12142,7 +12556,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     None => break,
                 }
             }
-            out.extend(sc[pos..].iter());
+            out.extend(sc[pos.min(sc.len())..].iter());
             Ok(Value::text(out))
         }
         "overlay" => {
@@ -12307,6 +12721,108 @@ fn base64_decode(s: &str, url_safe: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// v0.24: base32hex encode (RFC 4648 base32hex alphabet
+/// `0-9A-V`, PG 19's `encode(x, 'base32hex')`).
+fn base32hex_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let mut out = String::with_capacity((data.len() + 4) / 5 * 8);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        let b3 = if i + 3 < data.len() { data[i + 3] } else { 0 };
+        let b4 = if i + 4 < data.len() { data[i + 4] } else { 0 };
+        // 5 bytes -> eight 5-bit groups.
+        let g = [
+            b0 >> 3,
+            ((b0 & 7) << 2) | (b1 >> 6),
+            (b1 >> 1) & 31,
+            ((b1 & 1) << 4) | (b2 >> 4),
+            ((b2 & 15) << 1) | (b3 >> 7),
+            (b3 >> 2) & 31,
+            ((b3 & 3) << 3) | (b4 >> 5),
+            b4 & 31,
+        ];
+        // How many output chars are real (rest are '=').
+        let nchars = match data.len() - i {
+            1 => 2,
+            2 => 4,
+            3 => 5,
+            4 => 7,
+            _ => 8,
+        };
+        for k in 0..8 {
+            if k < nchars {
+                out.push(ALPHA[g[k] as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        i += 5;
+    }
+    out
+}
+
+/// v0.24: base32hex decode. PG 19 is lenient: case-insensitive, `=`
+/// padding optional, trailing partial quanta emit
+/// `floor(bits/8)` bytes, non-zero pad bits accepted. Errors on invalid
+/// characters, `=` outside the trailing pad, or a padded quantum whose
+/// data length isn't 2/4/5/7.
+fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'A'..=b'V' => Some(c - b'A' + 10),
+            b'a'..=b'v' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    // '=' may only appear as a trailing pad.
+    let pad_start = bytes.iter().position(|&b| b == b'=').unwrap_or(bytes.len());
+    if bytes[pad_start..].iter().any(|&b| b != b'=') {
+        return None;
+    }
+    let data = &bytes[..pad_start];
+    let npad = bytes.len() - pad_start;
+    for &b in data {
+        if val(b).is_none() {
+            return None;
+        }
+    }
+    if npad > 0 {
+        // Padded: the data length mod 8 must be a valid partial quantum.
+        // (data == 0 with padding, e.g. "=", is an error.)
+        match data.len() % 8 {
+            2 | 4 | 5 | 7 => {}
+            _ => return None,
+        }
+    }
+    // Decode 5-bit groups into bytes, MSB first.
+    let mut out = Vec::with_capacity(data.len() * 5 / 8);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &b in data {
+        acc = (acc << 5) | val(b).unwrap() as u32;
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    // Leftover bits (< 8) are dropped — PG emits nothing for them
+    // (e.g. decode('2') -> empty) and accepts non-zero pad bits.
+    let _ = acc;
+    Some(out)
+}
+
+/// v0.24: interpret a text value as bytea input (PG's unknown-literal ->
+/// bytea coercion): `\x...` hex, otherwise escape format.
+fn text_to_bytea(s: &str) -> Option<Vec<u8>> {
+    crate::storage::parse_bytea(s).ok()
+}
+
 /// PG bytea `escape` output format: printable ASCII as-is, backslash as
 /// `\\`, others as `\ooo` octal.
 fn bytea_escape(data: &[u8]) -> String {
@@ -12445,9 +12961,12 @@ fn expand_replacement(repl: &str, s: &[char], caps: &crate::regex::Captures) -> 
                 i += 1;
             }
             _ => {
-                // Unknown escape: treat as literal char (PG behavior).
-                out.push(b[i] as char);
-                i += 1;
+                // v0.24: unknown escape keeps the backslash (PG:
+                // `X\Y\1Z\` -> `X\YoZ\`).
+                out.push('\\');
+                let c = repl[i..].chars().next().unwrap();
+                out.push(c);
+                i += c.len_utf8();
             }
         }
     }
@@ -13933,17 +14452,19 @@ fn func_result_type(
     match name {
         "upper" | "lower" | "substring" | "substr" | "trim" | "replace" | "split_part"
         | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin" | "left" | "right"
-        | "reverse" | "encode" => Ok(ColType::Text),
+        | "reverse" | "encode" | "repeat" | "lpad" | "rpad" | "chr" | "initcap" | "ltrim"
+        | "rtrim" => Ok(ColType::Text),
         "decode" => Ok(ColType::Bytea),
         "crc32c" => Ok(ColType::BigInt),
         "sha224" | "sha256" | "sha384" | "sha512" => Ok(ColType::Bytea),
         "strpos" => Ok(ColType::Int),
+        "ascii" => Ok(ColType::Int),
         "translate" | "unistr" | "overlay" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         "regexp_substr" | "regexp_replace" => Ok(ColType::Text),
         "similar_to" => Ok(ColType::Bool),
-        "substring_similar" | "substring_from" => Ok(ColType::Text),
+        "substring_similar" | "substring_from" | "substring_from_for" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
         "abs" | "sign" => arg0(),
         "round" | "mod" => Ok(ColType::Numeric),
@@ -15614,8 +16135,14 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
             subst_ctes(with, params)?;
             for row in rows {
                 for v in row {
-                    if let InsertValue::Param(p) = v {
-                        *v = InsertValue::Lit(param_literal(*p, params)?);
+                    match v {
+                        InsertValue::Param(p) => {
+                            *v = InsertValue::Lit(param_literal(*p, params)?);
+                        }
+                        // v0.24: substitute parameters inside VALUES
+                        // expressions.
+                        InsertValue::Expr(e) => subst_expr(e, params)?,
+                        _ => {}
                     }
                 }
             }

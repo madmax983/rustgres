@@ -72,8 +72,9 @@ enum Token {
     Ident(String), // folded to lowercase unless double-quoted
     Number(String),
     Str(String),
-    UStr(String), // v0.19: U&'...' raw content (UESCAPE handled by parser)
-    Param(u32),   // $N parameter placeholder, 1-based
+    UStr(String),   // v0.19: U&'...' raw content (UESCAPE handled by parser)
+    UIdent(String), // v0.24: U&"..." raw identifier content (UESCAPE handled by parser)
+    Param(u32),     // $N parameter placeholder, 1-based
     LParen,
     RParen,
     Comma,
@@ -212,6 +213,13 @@ fn unescape_e_string(s: &str) -> Result<String, SqlError> {
 /// `\\` followed by 4 hex digits = 16-bit code unit, `\\+` followed by 6
 /// hex digits = 32-bit code point. `\\` followed by the escape char itself
 /// is a literal escape char. Returns None on invalid escapes.
+/// v0.24: PG prohibits certain UESCAPE characters: hex digits, '+',
+/// quotes, and whitespace are all invalid ("invalid Unicode escape
+/// character").
+fn is_valid_uescape(c: char) -> bool {
+    !(c.is_ascii_hexdigit() || c == '+' || c == '\'' || c == '"' || c.is_whitespace())
+}
+
 fn decode_ustr(s: &str, escape: char) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -343,6 +351,35 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             toks.push(Token::UStr(s));
             continue;
         }
+        // v0.24: `U&"..."` Unicode escape quoted identifier.
+        if (c == 'u' || c == 'U')
+            && i + 2 < chars.len()
+            && chars[i + 1] == '&'
+            && chars[i + 2] == '"'
+        {
+            i += 2; // consume `U&`, now at the quote
+            i += 1; // consume opening `"`
+            let mut s = String::new();
+            loop {
+                if i >= chars.len() {
+                    return Err(err("unterminated quoted identifier"));
+                }
+                if chars[i] == '"' {
+                    if i + 1 < chars.len() && chars[i + 1] == '"' {
+                        s.push('"');
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    s.push(chars[i]);
+                    i += 1;
+                }
+            }
+            toks.push(Token::UIdent(s));
+            continue;
+        }
         // v0.19: `E'...'` escape string prefix.
         if (c == 'e' || c == 'E') && i + 1 < chars.len() && chars[i + 1] == '\'' {
             i += 1; // consume `E`, now at the quote
@@ -466,22 +503,66 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 }
                 toks.push(Token::Ident(s));
             }
-            // `$N` parameter placeholder (only when `$` starts the token;
-            // `$` inside an identifier, e.g. `a$1`, keeps the old behavior).
-            '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
-                i += 1;
-                let start = i;
-                while i < chars.len() && chars[i].is_ascii_digit() {
+            // v0.24: `$tag$...$tag$` dollar-quoted string, or `$N`
+            // parameter placeholder. A `$` that opens neither falls to
+            // the syntax error below.
+            '$' => {
+                // Try a dollar-quote opening delimiter `$tag$`: the tag
+                // follows identifier rules (or is empty for `$$`) and may
+                // not start with a digit (that would be `$N`).
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let tag: String = chars[i + 1..j].iter().collect();
+                // A digit-start tag (e.g. `$1`) is a parameter, never a
+                // dollar-quote delimiter.
+                let is_open = j < chars.len()
+                    && chars[j] == '$'
+                    && (tag.is_empty() || !tag.chars().next().unwrap().is_ascii_digit());
+                if is_open {
+                    let delim: Vec<char> = format!("${}$", tag).chars().collect();
+                    let mut k = j + 1;
+                    let mut close = None;
+                    while k + delim.len() <= chars.len() {
+                        if chars[k..k + delim.len()] == delim[..] {
+                            close = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    match close {
+                        Some(c) => {
+                            let content: String = chars[j + 1..c].iter().collect();
+                            toks.push(Token::Str(content));
+                            i = c + delim.len();
+                            continue;
+                        }
+                        None => {
+                            return Err(err("unterminated dollar-quoted string"));
+                        }
+                    }
+                }
+                // `$N` parameter placeholder (only when `$` starts the
+                // token; `$` inside an identifier, e.g. `a$1`, keeps the
+                // old behavior).
+                if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
                     i += 1;
+                    let start = i;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let raw: String = chars[start..i].iter().collect();
+                    let n: u32 = raw
+                        .parse()
+                        .map_err(|_| err(format!("bad parameter number \"${}\"", raw)))?;
+                    if n == 0 {
+                        return Err(err("parameter number must be >= 1"));
+                    }
+                    toks.push(Token::Param(n));
+                } else {
+                    return Err(err("unexpected character '$'"));
                 }
-                let raw: String = chars[start..i].iter().collect();
-                let n: u32 = raw
-                    .parse()
-                    .map_err(|_| err(format!("bad parameter number \"${}\"", raw)))?;
-                if n == 0 {
-                    return Err(err("parameter number must be >= 1"));
-                }
-                toks.push(Token::Param(n));
             }
             _ if c.is_ascii_digit()
                 || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
@@ -993,6 +1074,9 @@ pub enum InsertValue {
     Param(u32),
     /// v0.9: the DEFAULT keyword in INSERT VALUES.
     Default,
+    /// v0.24: a general expression in INSERT VALUES
+    /// (e.g. `VALUES (repeat('x', 3))`).
+    Expr(Expr),
 }
 
 /// One `ORDER BY` sort key: expression + direction + explicit NULL
@@ -2288,9 +2372,41 @@ impl Parser {
         }
     }
 
+    /// v0.24: parse the optional `UESCAPE 'c'` clause after a `U&...`
+    /// literal/identifier. Returns the escape char (default `\`).
+    /// PG rejects hex digits, '+', quotes, and whitespace as the
+    /// escape character.
+    fn parse_uescape(&mut self) -> Result<char, SqlError> {
+        if !self.eat_keyword("uescape") {
+            return Ok('\\');
+        }
+        match self.next() {
+            Token::Str(e) => {
+                let mut ch = e.chars();
+                match (ch.next(), ch.next()) {
+                    (Some(c), None) if is_valid_uescape(c) => Ok(c),
+                    (Some(_), None) => Err(err("invalid Unicode escape character")),
+                    _ => Err(err("UESCAPE string must be empty or one character")),
+                }
+            }
+            other => Err(err(format!(
+                "syntax error: expected string literal for UESCAPE, found {:?}",
+                other
+            ))),
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Ident(s) => Ok(s),
+            Token::UIdent(raw) => {
+                // v0.24: U&"..." with optional UESCAPE 'c' clause.
+                let escape = self.parse_uescape()?;
+                match decode_ustr(&raw, escape) {
+                    Some(t) => Ok(t),
+                    None => Err(err("invalid Unicode escape")),
+                }
+            }
             other => Err(err(format!(
                 "syntax error: expected identifier, found {:?}",
                 other
@@ -3232,29 +3348,7 @@ impl Parser {
             Token::Str(s) => Ok(Literal::Text(s.into())),
             Token::UStr(raw) => {
                 // v0.19: U&'...' with optional UESCAPE 'c' clause.
-                let escape = if self.eat_keyword("uescape") {
-                    match self.next() {
-                        Token::Str(e) => {
-                            let mut ch = e.chars();
-                            match (ch.next(), ch.next()) {
-                                (Some(c), None) => c,
-                                _ => {
-                                    return Err(err(
-                                        "UESCAPE string must be empty or one character",
-                                    ));
-                                }
-                            }
-                        }
-                        other => {
-                            return Err(err(format!(
-                                "syntax error: expected string literal for UESCAPE, found {:?}",
-                                other
-                            )));
-                        }
-                    }
-                } else {
-                    '\\'
-                };
+                let escape = self.parse_uescape()?;
                 match decode_ustr(&raw, escape) {
                     Some(t) => Ok(Literal::Text(t.into())),
                     None => Err(err("invalid Unicode escape")),
@@ -3791,6 +3885,30 @@ impl Parser {
         if self.eat_keyword("default") {
             return Ok(InsertValue::Default);
         }
+        // v0.24: general expressions in VALUES. First try the legacy
+        // simple-value path (literals, params, typed literals); if the
+        // value continues with an operator, rewind and parse a full
+        // expression instead.
+        let save = self.pos;
+        match self.parse_insert_simple() {
+            Ok(value) => {
+                if matches!(self.peek(), Token::Comma | Token::RParen) {
+                    return Ok(value);
+                }
+            }
+            Err(_) => {}
+        }
+        self.pos = save;
+        let expr = self.parse_or()?;
+        // Recursively collect parameters (they are substituted before
+        // execution, like everywhere else).
+        Ok(InsertValue::Expr(expr))
+    }
+
+    /// v0.24: the pre-v0.24 simple VALUES parser (literals, params,
+    /// typed literals, `::type` suffixes), factored out of
+    /// `parse_insert_value`.
+    fn parse_insert_simple(&mut self) -> Result<InsertValue, SqlError> {
         // v0.14: typed literals in VALUES, e.g. `bool 't'`, `date '2026-01-01'`
         // (pg_regress conformance). The text is stored as-is; the column
         // coercion applies the target type's input function, matching
@@ -4778,21 +4896,13 @@ impl Parser {
             if self.eat_keyword("for") {
                 let for_arg = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
-                // Distinguish integer (start, len) from text (pattern, escape).
-                // If both are integer literals, it's substring(s, start, len).
-                // Otherwise, it's the SQL99 SIMILAR form.
-                let is_int = |e: &Expr| matches!(e, Expr::Literal(crate::sql::Literal::Int(_)));
-                if is_int(&pat_or_start) && is_int(&for_arg) {
-                    return Ok(Expr::Func {
-                        name: "substring".to_string(),
-                        args: vec![s, pat_or_start, for_arg],
-                    });
-                } else {
-                    return Ok(Expr::Func {
-                        name: "substring_similar".to_string(),
-                        args: vec![s, pat_or_start, for_arg],
-                    });
-                }
+                // v0.24: `SUBSTRING(s FROM x FOR y)` — integer
+                // (start, len) vs SIMILAR (pattern, escape) is decided
+                // at runtime by type (PG), so `-1`, `1+1`, etc. work.
+                return Ok(Expr::Func {
+                    name: "substring_from_for".to_string(),
+                    args: vec![s, pat_or_start, for_arg],
+                });
             }
             self.expect(Token::RParen, "')'")?;
             // SUBSTRING(s FROM pat): could be POSIX regex or (start) integer.
@@ -4831,6 +4941,8 @@ impl Parser {
                 self.next();
                 Ok(Some(s))
             }
+            // v0.24: bare U&"..." alias; expect_ident handles UESCAPE.
+            Token::UIdent(_) => Ok(Some(self.expect_ident()?)),
             _ => Ok(None),
         }
     }

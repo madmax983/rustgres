@@ -1,3 +1,48 @@
+# rustgres v0.24 — "string functions, regexp strictness, INSERT expressions"
+
+A from-scratch PostgreSQL-compatible database server written in pure Rust —
+**zero external crates**, so it builds offline with plain `cargo build`.
+
+Milestone 24 of the road to Postgres 19 feature parity. v0.24 lands the
+string-function cluster, strict regexp semantics, general expressions in
+`INSERT...VALUES`, dollar-quoted literals, and SUBSTRING/U& fixes:
+
+- **String built-ins.** `repeat` (negative → `''`, 1 GB guard), `lpad`/`rpad`
+  (Unicode-by-char, negative length → `''`, empty fill → no-op), `ascii`
+  (empty → `0`, Unicode code point), `ltrim`/`rtrim` (optional char set),
+  plus `chr` (negative → `22023`, invalid → `54000`) and `initcap` — all with
+  NULL propagation and PG-verified edge cases.
+- **Strict regexp.** `regexp_replace` gains the legacy 4-text-arg flags form
+  alongside integer-start overloads (`n=0` replaces all, `n>0` replaces only
+  the Nth; explicit `n` ignores `g`). Flags `n`/`s`/`x` supported; unknown
+  flags → `2201B`, `start < 1` or `n < 1` → `22023` (was: silent clamps).
+- **`INSERT...VALUES` expressions.** `VALUES (1+2, repeat('x',3))` now parses
+  a general expression per cell (`InsertValue::Expr`), substitutes parameters
+  recursively, evaluates, and coerces to the column type.
+- **Dollar quoting.** `$tag$...$tag$` and `$$...$$` tokenize as string
+  literals, including `$re$\s+$re$`.
+- **SUBSTRING fixes.** `SUBSTRING(s FROM x FOR y)` now dispatches integer vs
+  SIMILAR at runtime by type, so `-1`, `1+1`, etc. work as integers.
+- **U& identifiers.** `U&"..."` tokenizes with `UESCAPE` support; invalid
+  escape chars (`+`, hex digits, quotes, whitespace) → `42601`.
+
+Full pg_regress: **2809 PASS (54.1%)**, 1521 EXPECTED-FAIL, 863 REAL-FAIL
+over 5193 statements (v0.23: 2707/965 — **+102 PASS, −102 REAL-FAIL**, no new
+failures). Strings suite: **393 PASS (68.3%)** (was 295/257 — **+98/−102**).
+90 wire-protocol checks (`protocol_test24.py`), 106 unit tests — all green.
+New `benches/workload24.py` string-heavy workload.
+
+**Profiling.** `benches/workload24.py` (string/regexp-heavy): **5416 qps** on
+the release build. Valgrind 3.22.0 Memcheck: **0 definitely/indirectly lost**
+(932 bytes possibly lost in 8 blocks — interior pointers, benign), 0 errors
+over the string workload. Callgrind: [hotspot]. DHAT: [allocation sanity].
+
+**Known limitations (v0.24).** Regex alternation (`a|b`) with occurrence > 1
+has a matching bug when non-matching chars separate matches (e.g.
+`regexp_substr('A o', 'A|e|i|o|u', 1, 2)` returns `''` instead of `'o'`).
+`regexp_split_to_array` needs `Value::Array`; `regexp_split_to_table` and
+`regexp_matches` need SRF infrastructure.
+
 # rustgres v0.23 — "join merge: USING/NATURAL columns, alias scoping"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —

@@ -44,12 +44,28 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     groups: usize,
+    /// v0.24: expanded (`x`) mode — ignore unescaped whitespace and
+    /// `#` comments, like PostgreSQL's ARE `x` flag.
+    expanded: bool,
 }
 
 pub struct Compiled {
     insns: Vec<Insn>,
     groups: usize,
     ci: bool,
+    /// v0.24: newline-sensitive (`n`/`m`) mode — `.` and `[^...]` do not
+    /// match `\n`, and `^`/`$` also match at newlines.
+    newline_sensitive: bool,
+}
+
+/// v0.24: regex compile options for PostgreSQL's `n`/`s`/`x` flags.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RegexOptions {
+    pub case_insensitive: bool,
+    /// `n` (or historical synonym `m`): newline-sensitive matching.
+    pub newline_sensitive: bool,
+    /// `x`: expanded syntax — ignore whitespace and `#` comments.
+    pub expanded: bool,
 }
 
 pub struct Captures {
@@ -57,10 +73,22 @@ pub struct Captures {
 }
 
 pub fn compile(pattern: &str, case_insensitive: bool) -> Result<Compiled, String> {
+    compile_opts(
+        pattern,
+        RegexOptions {
+            case_insensitive,
+            ..RegexOptions::default()
+        },
+    )
+}
+
+/// v0.24: compile with explicit flag options.
+pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<Compiled, String> {
     let mut p = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
         groups: 0,
+        expanded: opts.expanded,
     };
     let ast = p.parse_alt()?;
     if p.pos != p.chars.len() {
@@ -68,14 +96,15 @@ pub fn compile(pattern: &str, case_insensitive: bool) -> Result<Compiled, String
     }
     let mut c = Compiler {
         insns: Vec::new(),
-        ci: case_insensitive,
+        ci: opts.case_insensitive,
     };
     c.compile_ast(&ast);
     c.emit(Insn::Match);
     Ok(Compiled {
         insns: c.insns,
         groups: p.groups,
-        ci: case_insensitive,
+        ci: opts.case_insensitive,
+        newline_sensitive: opts.newline_sensitive,
     })
 }
 
@@ -90,6 +119,29 @@ impl Parser {
             self.pos += 1;
         }
         c
+    }
+
+    /// v0.24: in expanded (`x`) mode, skip whitespace and `#`-to-newline
+    /// comments. Only called at atom boundaries — never inside bracket
+    /// expressions, escapes, or repetition counts, where whitespace stays
+    /// significant.
+    fn skip_ignored(&mut self) {
+        if !self.expanded {
+            return;
+        }
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => {
+                    self.next();
+                }
+                Some('#') => {
+                    while !matches!(self.peek(), None | Some('\n')) {
+                        self.next();
+                    }
+                }
+                _ => break,
+            }
+        }
     }
 
     fn parse_alt(&mut self) -> Result<Ast, String> {
@@ -107,11 +159,12 @@ impl Parser {
 
     fn parse_seq(&mut self) -> Result<Ast, String> {
         let mut seq = Vec::new();
-        while let Some(c) = self.peek() {
-            if c == '|' || c == ')' {
-                break;
+        loop {
+            self.skip_ignored();
+            match self.peek() {
+                None | Some('|') | Some(')') => break,
+                _ => seq.push(self.parse_repeat()?),
             }
-            seq.push(self.parse_repeat()?);
         }
         match seq.len() {
             0 => Ok(Ast::Empty),
@@ -179,6 +232,7 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Ast, String> {
+        self.skip_ignored();
         match self.next() {
             None => Err("unexpected end of pattern".to_string()),
             Some('(') => {
@@ -508,7 +562,9 @@ impl Compiled {
                     }
                 }
                 Insn::Dot => {
-                    if si < s.len() {
+                    // v0.24: with `n` (newline-sensitive), `.` does not
+                    // match `\n`; with `s` (the default) it does.
+                    if si < s.len() && !(self.newline_sensitive && s[si] == '\n') {
                         si += 1;
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
@@ -516,7 +572,12 @@ impl Compiled {
                     }
                 }
                 Insn::Class(cc) => {
-                    if si < s.len() && cc.matches(s[si]) {
+                    // v0.24: with `n`, a negated class does not match `\n`
+                    // (PG newline-sensitive semantics).
+                    if si < s.len()
+                        && cc.matches(s[si])
+                        && !(self.newline_sensitive && cc.neg && s[si] == '\n')
+                    {
                         si += 1;
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
@@ -524,14 +585,16 @@ impl Compiled {
                     }
                 }
                 Insn::AnchorStart => {
-                    if si == 0 {
+                    // v0.24: with `n`, `^` also matches after a newline.
+                    if si == 0 || (self.newline_sensitive && si > 0 && s[si - 1] == '\n') {
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
                         return false;
                     }
                 }
                 Insn::AnchorEnd => {
-                    if si == s.len() {
+                    // v0.24: with `n`, `$` also matches before a newline.
+                    if si == s.len() || (self.newline_sensitive && si < s.len() && s[si] == '\n') {
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
                         return false;

@@ -996,12 +996,19 @@ def main():
 
     wedged = {}  # stmt -> reason: kills the connection; skip on retry
     try:
-        conn = Conn()
-        serr = run_setup(conn)
-        if serr:
-            print(serr)
-            return 2
         for name, need_tenk in tests:
+            # pg_regress runs each file in its own psql session. Use a fresh
+            # server+connection per suite so one file's abandoned transaction
+            # state (e.g. transactions.sql's last test) cannot poison the next
+            # file with 25P02 cascade failures.
+            server.stop()
+            server = Server()
+            server.start()
+            conn = Conn()
+            serr = run_setup(conn)
+            if serr:
+                print(serr)
+                return 2
             print("== %s ==" % name, flush=True)
             t0 = time.time()
             restarts = 0
