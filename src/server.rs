@@ -83,6 +83,9 @@ pub(crate) struct Session {
     next_txn_level: Option<IsolationLevel>,
     next_txn_read_only: Option<bool>,
     next_txn_deferrable: Option<bool>,
+    /// v0.29: `bytea_output` GUC (hex|escape). Controls bytea wire output
+    /// format, like PG. Default is hex.
+    bytea_output: crate::storage::ByteaOutput,
 }
 
 /// v0.17: honest version identity. rustgres reports its OWN version, not
@@ -147,6 +150,7 @@ impl Session {
             next_txn_level: None,
             next_txn_read_only: None,
             next_txn_deferrable: None,
+            bytea_output: crate::storage::ByteaOutput::default(),
         }
     }
 }
@@ -870,7 +874,7 @@ fn handle_query(
                 send_row_description(stream, &columns)?;
                 let mut row_buf = Vec::new();
                 for row in &rows {
-                    send_data_row_buf(stream, row, &mut row_buf)?;
+                    send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
                 MsgBuilder::new(b'C')
                     .cstr(&format!("SELECT {}", rows.len()))
@@ -880,7 +884,7 @@ fn handle_query(
                 send_row_description(stream, &columns)?;
                 let mut row_buf = Vec::new();
                 for row in &rows {
-                    send_data_row_buf(stream, row, &mut row_buf)?;
+                    send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
                 MsgBuilder::new(b'C').cstr("EXPLAIN").send(stream)?;
             }
@@ -895,7 +899,7 @@ fn handle_query(
                     send_row_description(stream, &columns)?;
                     let mut row_buf = Vec::new();
                     for row in &rows {
-                        send_data_row_buf(stream, row, &mut row_buf)?;
+                        send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                     }
                 }
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
@@ -1648,6 +1652,7 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
 
 /// v0.17: GUC metadata for the tiny supported set. Only
 /// `default_transaction_read_only` is honored; anything else is 42704.
+/// v0.29: `bytea_output` added.
 fn guc_value(session: &Session, name: &str) -> Option<String> {
     match name {
         "default_transaction_read_only" => Some(
@@ -1655,6 +1660,13 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
                 "on"
             } else {
                 "off"
+            }
+            .to_string(),
+        ),
+        "bytea_output" => Some(
+            match session.bytea_output {
+                crate::storage::ByteaOutput::Hex => "hex",
+                crate::storage::ByteaOutput::Escape => "escape",
             }
             .to_string(),
         ),
@@ -1730,6 +1742,7 @@ fn parse_bool_guc(s: &str) -> Option<bool> {
 
 /// v0.17: `SET name = value`. Only `default_transaction_read_only` is
 /// honored; unknown parameters are 42704 (undefined_object), like PG.
+/// v0.29: `bytea_output` (hex|escape) added.
 fn stmt_set_guc(
     session: &mut Session,
     name: &str,
@@ -1745,6 +1758,25 @@ fn stmt_set_guc(
                 })?,
             };
             session.default_txn_read_only = Some(ro);
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
+        "bytea_output" => {
+            let v = match value {
+                SetValue::Default => crate::storage::ByteaOutput::Hex,
+                SetValue::Str(s) => match s.to_ascii_lowercase().as_str() {
+                    "hex" => crate::storage::ByteaOutput::Hex,
+                    "escape" => crate::storage::ByteaOutput::Escape,
+                    _ => {
+                        return Err(ExecError {
+                            code: "22023",
+                            message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                        });
+                    }
+                },
+            };
+            session.bytea_output = v;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
@@ -1773,10 +1805,24 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 
 /// v0.17: `RESET name` / `RESET ALL` (tag "RESET", like PG). Session
 /// transaction characteristics are not GUCs and survive RESET ALL.
+/// v0.29: `bytea_output` resets to hex.
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
-        "all" | "default_transaction_read_only" => {
+        "all" => {
             session.default_txn_read_only = None;
+            session.bytea_output = crate::storage::ByteaOutput::Hex;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        "default_transaction_read_only" => {
+            session.default_txn_read_only = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        "bytea_output" => {
+            session.bytea_output = crate::storage::ByteaOutput::Hex;
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -2969,7 +3015,7 @@ fn handle_execute(
     };
     let mut row_buf = Vec::new();
     for row in pending.rows.iter().skip(pending.pos).take(n) {
-        send_data_row_buf(stream, row, &mut row_buf)?;
+        send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
     }
     pending.pos += n;
     if pending.pos < pending.rows.len() {
@@ -3039,7 +3085,11 @@ pub(crate) fn send_row_description(
     b.send(stream)
 }
 
-pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()> {
+pub(crate) fn send_data_row(
+    stream: &mut Writer,
+    row: &[Value],
+    bytea_output: crate::storage::ByteaOutput,
+) -> io::Result<()> {
     // Ordinary rows (a handful of short columns) fit well under this, so
     // the payload buffer is sized once here instead of growing by
     // doubling from Vec::new()'s 0 capacity as each field (count, then
@@ -3047,7 +3097,7 @@ pub(crate) fn send_data_row(stream: &mut Writer, row: &[Value]) -> io::Result<()
     let mut b = MsgBuilder::with_capacity(b'D', 64);
     b.i16(row.len() as i16);
     for v in row {
-        b.value_text(v);
+        b.value_text(v, bytea_output);
     }
     b.send(stream)
 }
@@ -3062,11 +3112,12 @@ pub(crate) fn send_data_row_buf(
     stream: &mut Writer,
     row: &[Value],
     buf: &mut Vec<u8>,
+    bytea_output: crate::storage::ByteaOutput,
 ) -> io::Result<()> {
     let mut b = MsgBuilder::from_payload(b'D', std::mem::take(buf));
     b.i16(row.len() as i16);
     for v in row {
-        b.value_text(v);
+        b.value_text(v, bytea_output);
     }
     let res = b.send(stream);
     *buf = b.into_payload();
@@ -3095,6 +3146,7 @@ mod tests {
             next_txn_level: None,
             next_txn_read_only: None,
             next_txn_deferrable: None,
+            bytea_output: crate::storage::ByteaOutput::default(),
             txn: Some(Txn {
                 xid,
                 level,

@@ -248,10 +248,14 @@ impl MsgBuilder {
     /// the prefix with the number of bytes actually written — one pass
     /// over the payload, same wire bytes as building a `String` via
     /// `to_text()` and copying it in, minus that extra allocation.
-    pub fn value_text(&mut self, v: &crate::storage::Value) -> &mut Self {
+    pub fn value_text(
+        &mut self,
+        v: &crate::storage::Value,
+        bytea_output: crate::storage::ByteaOutput,
+    ) -> &mut Self {
         let len_pos = self.payload.len();
         self.payload.extend_from_slice(&[0; 4]); // placeholder, patched below
-        if v.write_text_into(&mut self.payload) {
+        if v.write_text_into(&mut self.payload, bytea_output) {
             let text_len = (self.payload.len() - len_pos - 4) as i32;
             self.payload[len_pos..len_pos + 4].copy_from_slice(&text_len.to_be_bytes());
         } else {

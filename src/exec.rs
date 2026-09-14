@@ -11151,11 +11151,21 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::Bytea => match v {
             Value::Text(s) => crate::storage::parse_bytea(s)
                 .map(Value::Bytea)
-                .map_err(|_| {
-                    exec_err(
-                        "22P02",
-                        format!("invalid input syntax for type bytea: {:?}", s),
-                    )
+                .map_err(|e| {
+                    // v0.29: PG's exact hex-format errors (22023); escape
+                    // format stays 22P02 like PG.
+                    use crate::storage::ByteaParseError;
+                    match e {
+                        ByteaParseError::OddHexDigits => {
+                            exec_err("22023", "invalid hexadecimal data: odd number of digits")
+                        }
+                        ByteaParseError::BadHexDigit(c) => {
+                            exec_err("22023", format!("invalid hexadecimal digit: \"{}\"", c))
+                        }
+                        ByteaParseError::Invalid => {
+                            exec_err("22P02", "invalid input syntax for type bytea")
+                        }
+                    }
                 }),
             // v0.28: integer -> bytea is big-endian binary.
             Value::SmallInt(i) => Ok(Value::Bytea(i.to_be_bytes().to_vec())),
@@ -11494,8 +11504,8 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
 fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
     let n = vals.len();
     let ok = match name {
-        "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
-        | "ceil" | "ceiling" | "sqrt" => n == 1,
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "octet_length"
+        | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
         "exp" | "ln" => n == 1,
         "log" => n == 1 || n == 2,
         "cbrt" | "factorial" => n == 1,
@@ -11529,6 +11539,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_substr" => (2..=6).contains(&n),
         "regexp_replace" => (3..=6).contains(&n),
         "regexp_split_to_array" => (2..=3).contains(&n),
+        // v0.29: pg_input_is_valid(input, type).
+        "pg_input_is_valid" => n == 2,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -11595,6 +11607,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "length"
         | "char_length"
         | "character_length"
+        | "octet_length"
         | "substring"
         | "trim"
         | "position"
@@ -11641,7 +11654,8 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "set_bit"
         | "get_byte"
         | "set_byte"
-        | "bit_count" => eval_str_func(name, vals),
+        | "bit_count"
+        | "pg_input_is_valid" => eval_str_func(name, vals),
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -11824,9 +11838,23 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             None => Value::Null,
             Some(s) => Value::text(s.to_lowercase()),
         }),
-        "length" | "char_length" | "character_length" => Ok(match str_arg(name, &vals[0])? {
-            None => Value::Null,
-            Some(s) => Value::Int(s.chars().count() as i64),
+        "length" | "char_length" | "character_length" => {
+            // v0.29: length(bytea) returns the byte count (PG).
+            if let Value::Bytea(b) = &vals[0] {
+                return Ok(Value::Int(b.len() as i64));
+            }
+            Ok(match str_arg(name, &vals[0])? {
+                None => Value::Null,
+                Some(s) => Value::Int(s.chars().count() as i64),
+            })
+        }
+        // v0.29: octet_length returns the byte count. For bytea it's the
+        // byte length; for text it's the UTF-8 byte length (PG).
+        "octet_length" => Ok(match &vals[0] {
+            Value::Null => Value::Null,
+            Value::Bytea(b) => Value::Int(b.len() as i64),
+            Value::Text(s) => Value::Int(s.len() as i64),
+            other => return Err(func_arg_err(name, other)),
         }),
         "substring" => {
             let s = match str_arg(name, &vals[0])? {
@@ -12472,6 +12500,30 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 other => return Err(func_arg_err(name, other)),
             };
             Ok(Value::BigInt(b.iter().map(|x| x.count_ones() as i64).sum()))
+        }
+        // v0.29: pg_input_is_valid(input text, type text) -> bool.
+        // Probes whether the input parses as the named type without
+        // raising. Currently supports 'bytea' (the strings.sql coverage);
+        // other types are 42883, like an undefined function.
+        "pg_input_is_valid" => {
+            let input = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let typ = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            match typ.to_ascii_lowercase().as_str() {
+                "bytea" => Ok(Value::Bool(crate::storage::parse_bytea(input).is_ok())),
+                _ => Err(exec_err(
+                    "42883",
+                    format!(
+                        "function pg_input_is_valid(unknown, {}) does not exist",
+                        typ
+                    ),
+                )),
+            }
         }
         "crc32c" => {
             let data: &[u8] = match &vals[0] {
@@ -13344,19 +13396,10 @@ fn text_to_bytea(s: &str) -> Option<Vec<u8>> {
 }
 
 /// PG bytea `escape` output format: printable ASCII as-is, backslash as
-/// `\\`, others as `\ooo` octal.
+/// `\\`, others as `\ooo` octal. (v0.29: moved to storage.rs as
+/// `bytea_escape`; this is now a thin alias.)
 fn bytea_escape(data: &[u8]) -> String {
-    let mut out = String::new();
-    for &b in data {
-        if b == b'\\' {
-            out.push_str("\\\\");
-        } else if b >= 32 && b < 127 {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("\\{:03o}", b));
-        }
-    }
-    out
+    crate::storage::bytea_escape(data)
 }
 
 /// Translate a SQL SIMILAR TO pattern to a regex pattern.
@@ -15096,11 +15139,14 @@ fn func_result_type(
         "ascii" => Ok(ColType::Int),
         "translate" | "unistr" | "overlay" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
+        "pg_input_is_valid" => Ok(ColType::Bool),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         "regexp_substr" | "regexp_replace" | "regexp_split_to_array" => Ok(ColType::Text),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" | "substring_from" | "substring_from_for" => Ok(ColType::Text),
-        "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
+        "length" | "char_length" | "character_length" | "octet_length" | "position" => {
+            Ok(ColType::Int)
+        }
         "abs" | "sign" => arg0(),
         "round" | "mod" => Ok(ColType::Numeric),
         "floor" | "ceil" | "ceiling" => match arg0()? {

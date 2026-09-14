@@ -416,6 +416,7 @@ fn cmd_identify_system(
             Value::text(xlogpos),
             Value::text(database),
         ],
+        crate::storage::ByteaOutput::default(),
     )?;
     send_command_complete(writer, session, "IDENTIFY_SYSTEM")
 }
@@ -507,6 +508,7 @@ fn cmd_create_slot(
                         String::new()
                     }),
                 ],
+                crate::storage::ByteaOutput::default(),
             )?;
             send_command_complete(writer, session, "CREATE_REPLICATION_SLOT")
         }

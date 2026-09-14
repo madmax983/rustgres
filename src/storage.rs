@@ -1525,7 +1525,7 @@ impl Value {
     /// less common variants fall back to `to_text()` — they are not on
     /// this hot path and formatting them (NUMERIC, dates, bytea, UUID)
     /// already goes through non-trivial `String`-returning helpers.
-    pub fn write_text_into(&self, out: &mut Vec<u8>) -> bool {
+    pub fn write_text_into(&self, out: &mut Vec<u8>, bytea_output: ByteaOutput) -> bool {
         use std::io::Write;
         match self {
             Value::SmallInt(i) => {
@@ -1549,6 +1549,15 @@ impl Value {
                 true
             }
             Value::Null => false,
+            // v0.29: bytea rendering honors the bytea_output GUC.
+            Value::Bytea(b) => {
+                let s = match bytea_output {
+                    ByteaOutput::Hex => bytea_text(b),
+                    ByteaOutput::Escape => bytea_escape(b),
+                };
+                out.extend_from_slice(s.as_bytes());
+                true
+            }
             other => match other.to_text() {
                 Some(s) => {
                     out.extend_from_slice(s.as_bytes());
@@ -1599,6 +1608,16 @@ impl Value {
     }
 }
 
+/// v0.29: `bytea_output` GUC values. `Hex` (`\xdeadbeef`) is the default;
+/// `Escape` renders per PG docs Table 8.8 (printables literal, backslash
+/// doubled, others as `\ooo` octal).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ByteaOutput {
+    #[default]
+    Hex,
+    Escape,
+}
+
 /// `\x` + lowercase hex, like Postgres' hex-format bytea output.
 fn bytea_text(b: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1607,6 +1626,22 @@ fn bytea_text(b: &[u8]) -> String {
     for &byte in b {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// v0.29: PG bytea `escape` output format (docs Table 8.8): printable ASCII
+/// as-is, backslash doubled, others as `\ooo` octal.
+pub(crate) fn bytea_escape(data: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in data {
+        if b == b'\\' {
+            out.push_str("\\\\");
+        } else if b >= 32 && b < 127 {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\{:03o}", b));
+        }
     }
     out
 }
@@ -1627,19 +1662,36 @@ fn uuid_text(u: &[u8; 16]) -> String {
 
 /// Parse `\xdeadbeef` (or a bare even-length hex string) into bytes.
 /// `Err(())` = malformed (caller maps to 22P02).
-pub fn parse_bytea(s: &str) -> Result<Vec<u8>, ()> {
+/// v0.29: rich bytea parse errors so callers can emit PG's exact messages.
+/// Hex-format failures are 22023 with PG's specific texts; anything else
+/// is the generic 22P02 `invalid input syntax for type bytea`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ByteaParseError {
+    /// `\x` hex with an odd number of digits.
+    OddHexDigits,
+    /// `\x` hex with a non-hex digit (the offending char).
+    BadHexDigit(char),
+    /// Escape format or otherwise malformed.
+    Invalid,
+}
+
+pub fn parse_bytea(s: &str) -> Result<Vec<u8>, ByteaParseError> {
     // Hex format: `\x` followed by hex digits. PG ignores whitespace
     // between the hex digits (e.g. '\x De Ad Be Ef ').
     if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
         let digits: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         if digits.len() % 2 != 0 {
-            return Err(());
+            return Err(ByteaParseError::OddHexDigits);
         }
         let mut out = Vec::with_capacity(digits.len() / 2);
         let mut i = 0;
         while i < digits.len() {
-            let hi = (digits[i] as char).to_digit(16).ok_or(())?;
-            let lo = (digits[i + 1] as char).to_digit(16).ok_or(())?;
+            let hi = (digits[i] as char)
+                .to_digit(16)
+                .ok_or(ByteaParseError::BadHexDigit(digits[i] as char))?;
+            let lo = (digits[i + 1] as char)
+                .to_digit(16)
+                .ok_or(ByteaParseError::BadHexDigit(digits[i + 1] as char))?;
             out.push((hi * 16 + lo) as u8);
             i += 2;
         }
@@ -1665,12 +1717,12 @@ pub fn parse_bytea(s: &str) -> Result<Vec<u8>, ()> {
                     + (bytes[i + 1] - b'0') as u16 * 8
                     + (bytes[i + 2] - b'0') as u16;
                 if v > 255 {
-                    return Err(());
+                    return Err(ByteaParseError::Invalid);
                 }
                 out.push(v as u8);
                 i += 3;
             } else {
-                return Err(());
+                return Err(ByteaParseError::Invalid);
             }
         } else {
             out.push(bytes[i]);
