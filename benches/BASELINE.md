@@ -83,6 +83,69 @@ the coercion behavior itself.
 | `<Value as Clone>::clone` self `Ir` | 1,924,939,255 (6.46%) |
 | `drop_in_place<Value>` self `Ir` | 1,404,189,420 (4.71%) |
 
+**Fix**: `coerce_text_numeric` now returns `Result<Option<(Value, Value)>,
+ExecError>` — `Some` only when an actual `Text`-vs-numeric coercion
+happened, `None` for every other pairing. `eval_cmp_vals` and `eval_arith`
+match on that: `Some((ac, bc)) => (&ac, &bc)`, `None => (a, b)` — the
+original borrowed references, unchanged. No behavior changes; the coercion
+itself (the `Some` arm) is byte-for-byte the same code it was before.
+
+**Instructions** (Callgrind, same harness, same machine, same session as
+the baseline commit — `profile_join.py --count 5 --users 2000 --orders
+20000 --filter 200`):
+
+| | Ir |
+|---|---|
+| before | 29,812,962,260 |
+| after | 27,749,919,526 |
+| change | **-6.92%** |
+
+Reproduced with a second callgrind run of the post-fix binary: 27,749,925,976
+(0.0000232% different from the first — well within this workload's established
+determinism for a single-connection, single-threaded run).
+
+Per-function self-cost, before -> after:
+
+| function | before | after | change |
+|---|---|---|---|
+| `coerce_text_numeric` | 1,021,530,000 | 681,020,000 | -33.33% |
+| `<Value as Clone>::clone` | 1,924,939,255 | 963,499,255 | -49.95% |
+| `drop_in_place<Value>` | 1,404,189,420 | 843,349,420 | -39.94% |
+
+`eval_cmp_vals` itself moved from 2,403,630,000 to 2,503,780,000 (+4.2%) —
+the `Option` match adds a small amount of its own branching — but the
+combined `eval_cmp_vals` + `coerce_text_numeric` cost still drops from
+3,425,160,000 to 3,184,800,000 (-7.02%), and the net effect across the
+whole workload (every join-condition and `sum()` call site, not just
+these two functions) is the -6.92% total shown above.
+
+**Behavior**: unchanged. All 107 `cargo test --all-features` unit tests
+pass, byte-for-byte the same as before this change. `tests/protocol_test.py`,
+`6`, `7`, `8`, `9`, `21`, and `23` (the suites covering joins, aggregates,
+comparisons, and numeric/text coercion) pass in full. `protocol_test12.py`'s
+`t_giant_length_lie` failed once under system load during this session and
+passed in isolation immediately after; it is a protocol-layer
+oversized-message test unrelated to comparisons or arithmetic and is
+reproducible as a flake on the pre-change binary too (confirmed via `git
+stash`), not a regression from this change. `cargo fmt --all` is clean.
+`cargo clippy --all-targets --all-features -- -D warnings` fails to compile
+with the same 252 pre-existing errors (an unrelated `collapsible_if`
+lint-vs-toolchain mismatch in `main.rs`, nothing this change touches) on
+both the pre-change and post-change tree, confirmed via `git stash`; no new
+clippy findings on `coerce_text_numeric`, `eval_cmp_vals`, or `eval_arith`.
+
+**Reproduce** (after this commit):
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 5 --users 2000 --orders 20000 \
+  --filter 200 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | grep "PROGRAM TOTALS"
+```
+
 ## Bolt: `project_row`'s output-cell `Vec` grows unsized — baseline — 2026-09-14
 
 **Workload**: `benches/profile_project.py` (new) — a fixed-iteration-count
