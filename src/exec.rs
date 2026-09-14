@@ -10697,6 +10697,18 @@ fn cast_to_int(v: &Value) -> Result<i128, ExecError> {
         Value::Float(f) => float_to_int(*f),
         Value::Text(s) => parse_int_text(s),
         Value::Bool(b) => Ok(*b as i128),
+        // v0.28: bytea -> integer is big-endian binary (empty -> 0).
+        Value::Bytea(b) => {
+            let mut v: i128 = 0;
+            for &byte in b.iter() {
+                v = (v << 8) | (byte as i128);
+            }
+            // Interpret as signed based on the top bit of the first byte.
+            if !b.is_empty() && b[0] & 0x80 != 0 {
+                v -= 1i128 << (b.len() * 8);
+            }
+            Ok(v)
+        }
         other => Err(cast_err(other, "integer")),
     }
 }
@@ -11124,6 +11136,10 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                         format!("invalid input syntax for type bytea: {:?}", s),
                     )
                 }),
+            // v0.28: integer -> bytea is big-endian binary.
+            Value::SmallInt(i) => Ok(Value::Bytea(i.to_be_bytes().to_vec())),
+            Value::Int(i) => Ok(Value::Bytea((*i as i32).to_be_bytes().to_vec())),
+            Value::BigInt(i) => Ok(Value::Bytea(i.to_be_bytes().to_vec())),
             other => Err(cast_err(other, "bytea")),
         },
         ColType::Uuid => match v {
@@ -11496,6 +11512,12 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
         "substring_from_for" => n == 3,
+        // v0.28: bytea bit/byte functions.
+        "get_bit" => n == 2,
+        "set_bit" => n == 3,
+        "get_byte" => n == 2,
+        "set_byte" => n == 3,
+        "bit_count" => n == 1,
         // v0.16: new string/math built-ins.
         "concat" => true, // concat() with no args is '' (Postgres).
         "concat_ws" => n >= 1,
@@ -11593,7 +11615,12 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "similar_to"
         | "substring_similar"
         | "substring_from"
-        | "substring_from_for" => eval_str_func(name, vals),
+        | "substring_from_for"
+        | "get_bit"
+        | "set_bit"
+        | "get_byte"
+        | "set_byte"
+        | "bit_count" => eval_str_func(name, vals),
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -12296,6 +12323,103 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     format!("unrecognized encoding: \"{}\"", fmt_raw),
                 )),
             }
+        }
+        // v0.28: bytea bit/byte accessors (PG semantics: bit 0 is MSB of byte 0).
+        "get_bit" => {
+            let b = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                other => return Err(func_arg_err(name, other)),
+            };
+            let bit = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if bit < 0 || (bit as usize) >= b.len() * 8 {
+                return Err(exec_err("22000", "bit index out of range"));
+            }
+            let bit = bit as usize;
+            let byte_idx = bit / 8;
+            let bit_idx = 7 - (bit % 8);
+            Ok(Value::Int(((b[byte_idx] >> bit_idx) & 1) as i64))
+        }
+        "set_bit" => {
+            let b = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b.clone(),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let bit = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let val = match int_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if bit < 0 || (bit as usize) >= b.len() * 8 {
+                return Err(exec_err("22000", "bit index out of range"));
+            }
+            if val != 0 && val != 1 {
+                return Err(exec_err("22000", "new bit must be 0 or 1"));
+            }
+            let bit = bit as usize;
+            let byte_idx = bit / 8;
+            let bit_idx = 7 - (bit % 8);
+            let mut out = b;
+            if val == 1 {
+                out[byte_idx] |= 1 << bit_idx;
+            } else {
+                out[byte_idx] &= !(1 << bit_idx);
+            }
+            Ok(Value::Bytea(out))
+        }
+        "get_byte" => {
+            let b = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                other => return Err(func_arg_err(name, other)),
+            };
+            let idx = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if idx < 0 || (idx as usize) >= b.len() {
+                return Err(exec_err("22000", "byte index out of range"));
+            }
+            Ok(Value::Int(b[idx as usize] as i64))
+        }
+        "set_byte" => {
+            let b = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b.clone(),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let idx = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let val = match int_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if idx < 0 || (idx as usize) >= b.len() {
+                return Err(exec_err("22000", "byte index out of range"));
+            }
+            if val < 0 || val > 255 {
+                return Err(exec_err("22000", "new byte must be 0..255"));
+            }
+            let mut out = b;
+            out[idx as usize] = val as u8;
+            Ok(Value::Bytea(out))
+        }
+        "bit_count" => {
+            let b = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                other => return Err(func_arg_err(name, other)),
+            };
+            Ok(Value::BigInt(b.iter().map(|x| x.count_ones() as i64).sum()))
         }
         "crc32c" => {
             let data: &[u8] = match &vals[0] {
@@ -14911,6 +15035,10 @@ fn func_result_type(
         | "rtrim" => Ok(ColType::Text),
         "decode" => Ok(ColType::Bytea),
         "crc32c" => Ok(ColType::BigInt),
+        // v0.28: bytea bit/byte functions.
+        "get_bit" | "get_byte" => Ok(ColType::Int),
+        "set_bit" | "set_byte" => Ok(ColType::Bytea),
+        "bit_count" => Ok(ColType::BigInt),
         "sha224" | "sha256" | "sha384" | "sha512" => Ok(ColType::Bytea),
         "strpos" => Ok(ColType::Int),
         "ascii" => Ok(ColType::Int),
