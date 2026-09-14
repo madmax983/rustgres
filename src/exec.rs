@@ -5126,6 +5126,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::And(a, b) => Ok(Expr::And(Box::new(r(a)?), Box::new(r(b)?))),
         Expr::Or(a, b) => Ok(Expr::Or(Box::new(r(a)?), Box::new(r(b)?))),
         Expr::Not(x) => Ok(Expr::Not(Box::new(r(x)?))),
+        Expr::BitNot(x) => Ok(Expr::BitNot(Box::new(r(x)?))),
         Expr::IsNull { expr, neg } => Ok(Expr::IsNull {
             expr: Box::new(r(expr)?),
             neg: *neg,
@@ -5972,9 +5973,10 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             validate_expr(low)?;
             validate_expr(high)
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-            validate_expr(x)
-        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. } => validate_expr(x),
         Expr::Cast { expr, .. } => validate_expr(expr),
         Expr::Func { args, .. } => {
             for a in args {
@@ -6011,9 +6013,10 @@ fn contains_agg(e: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-            contains_agg(x)
-        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. } => contains_agg(x),
         Expr::Cast { expr, .. } => contains_agg(expr),
         Expr::Func { args, .. } => args.iter().any(contains_agg),
         Expr::Extract { from, .. } => contains_agg(from),
@@ -6050,9 +6053,10 @@ fn contains_window(e: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => contains_window(expr) || contains_window(low) || contains_window(high),
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-            contains_window(x)
-        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. } => contains_window(x),
         Expr::Cast { expr, .. } => contains_window(expr),
         Expr::Func { args, .. } => args.iter().any(contains_window),
         Expr::Agg { arg, arg2, .. } => {
@@ -6290,9 +6294,10 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             validate_window_expr(low, in_agg)?;
             validate_window_expr(high, in_agg)
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-            validate_window_expr(x, in_agg)
-        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. } => validate_window_expr(x, in_agg),
         Expr::Cast { expr, .. } => validate_window_expr(expr, in_agg),
         Expr::Func { args, .. } => {
             for a in args {
@@ -6418,9 +6423,10 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
                 walk(low, visit);
                 walk(high, visit);
             }
-            Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-                walk(x, visit)
-            }
+            Expr::Not(x)
+            | Expr::BitNot(x)
+            | Expr::IsNull { expr: x, .. }
+            | Expr::IsBool { expr: x, .. } => walk(x, visit),
             Expr::Cast { expr, .. } => walk(expr, visit),
             Expr::Func { args, .. } => {
                 for a in args {
@@ -6496,9 +6502,10 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 stamp(low, windows);
                 stamp(high, windows);
             }
-            Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-                stamp(x, windows)
-            }
+            Expr::Not(x)
+            | Expr::BitNot(x)
+            | Expr::IsNull { expr: x, .. }
+            | Expr::IsBool { expr: x, .. } => stamp(x, windows),
             Expr::Cast { expr, .. } => stamp(expr, windows),
             Expr::Func { args, .. } => {
                 for a in args {
@@ -7295,6 +7302,7 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
         }
         Expr::And(a, b) | Expr::Or(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
         Expr::Not(x) => pushable_columns(x, cols),
+        Expr::BitNot(x) => pushable_columns(x, cols),
         Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => pushable_columns(x, cols),
         _ => false,
     }
@@ -7423,6 +7431,7 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_column_refs(b, out);
         }
         Expr::Not(x) => collect_column_refs(x, out),
+        Expr::BitNot(x) => collect_column_refs(x, out),
         Expr::IsNull { expr: x, .. } => collect_column_refs(x, out),
         Expr::Agg { arg, arg2, .. } => {
             if let Some(x) = arg {
@@ -9172,6 +9181,10 @@ fn eval_grouped(
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             eval_not_val(&v)
         }
+        Expr::BitNot(x) => {
+            let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
+            eval_bitnot_val(&v)
+        }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
@@ -9713,6 +9726,10 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let v = eval_expr(q, scopes, x)?;
             eval_not_val(&v)
         }
+        Expr::BitNot(x) => {
+            let v = eval_expr(q, scopes, x)?;
+            eval_bitnot_val(&v)
+        }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_expr(q, scopes, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
@@ -10178,6 +10195,9 @@ fn to_numeric_opt(v: &Value) -> Option<Numeric> {
         Value::Numeric(n) => Some(n.clone()),
         Value::Float4(f) => Numeric::from_f64(*f as f64).ok(),
         Value::Float(f) => Numeric::from_f64(*f).ok(),
+        // v0.25: untyped literals in a numeric function position (e.g.
+        // `power('inf', '2')`) coerce through numeric's input function.
+        Value::Text(s) => Numeric::parse(s).ok(),
         _ => None,
     }
 }
@@ -10240,6 +10260,10 @@ fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, Ex
             Value::Numeric(n) => Ok(n.to_f64()),
             Value::Float4(f) => Ok(*f as f64),
             Value::Float(f) => Ok(*f),
+            // v0.25: untyped literals coerce through numeric's input.
+            Value::Text(s) => crate::storage::Numeric::parse(s)
+                .map(|n| n.to_f64())
+                .map_err(|_| func_arg_err(name, v)),
             _ => Err(func_arg_err(name, v)),
         }
     };
@@ -10258,7 +10282,11 @@ fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, Ex
         if count <= 0 {
             return Err(exec_err("2201F", "count must be greater than zero"));
         }
-        let bucket = if operand < b1.min(b2) {
+        // v0.25: PG treats NaN as larger than any bound (NaN operand or
+        // NaN bound yields count+1 for ascending, 0 for descending).
+        let bucket = if operand.is_nan() || b1.is_nan() || b2.is_nan() {
+            count + 1
+        } else if operand < b1.min(b2) {
             0
         } else if operand >= b1.max(b2) {
             count + 1
@@ -10331,6 +10359,13 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     // before anything else, so '1.5' + 1 works like Postgres.
     let (ac, bc) = coerce_text_numeric(a, b)?;
     let (a, b) = (&ac, &bc);
+    // v0.25: bitwise operators only accept the integer kinds.
+    if matches!(
+        op,
+        ArithOp::BitAnd | ArithOp::BitOr | ArithOp::BitXor | ArithOp::Shl | ArithOp::Shr
+    ) {
+        return eval_bitwise(op, a, b);
+    }
     if let Some(v) = eval_datetime_arith(op, a, b)? {
         return Ok(v);
     }
@@ -10349,8 +10384,10 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
         // (smallint/int/bigint/numeric), not for real/double.
         return Err(op_err(op, a, b));
     }
-    // Postgres resolves smallint <op> smallint to integer.
-    let icat = if ca == NumCat::Small && cb == NumCat::Small {
+    // Postgres promotes smallint <op> smallint to integer (int4):
+    // e.g. 30000::smallint + 30000::smallint = 60000 :: integer, and
+    // (-32768)::int2 * (-1)::int2 = 32768 :: integer (no overflow).
+    let icat = if cat == NumCat::Small {
         NumCat::Int
     } else {
         cat
@@ -10361,6 +10398,14 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                 .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
             let y = to_numeric_opt(b)
                 .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
+            // v0.25: NaN propagates through div/mod even with a zero
+            // divisor ('nan' % '0' = NaN, not division by zero).
+            use crate::storage::NumericSpecial;
+            if matches!(op, ArithOp::Div | ArithOp::Mod)
+                && (x.special == NumericSpecial::NaN || y.special == NumericSpecial::NaN)
+            {
+                return Ok(Value::Numeric(crate::storage::Numeric::nan()));
+            }
             if matches!(op, ArithOp::Div | ArithOp::Mod) && y.is_zero() {
                 return Err(exec_err("22012", "division by zero"));
             }
@@ -10371,6 +10416,13 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                 ArithOp::Div => x.checked_div(&y),
                 ArithOp::Mod => x.checked_rem(&y),
                 ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                ArithOp::BitAnd
+                | ArithOp::BitOr
+                | ArithOp::BitXor
+                | ArithOp::Shl
+                | ArithOp::Shr => {
+                    unreachable!("bitwise ops return early via eval_bitwise")
+                }
             };
             r.map(Value::Numeric)
                 .ok_or_else(|| exec_err("22003", "numeric field overflow"))
@@ -10403,6 +10455,13 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                     ArithOp::Div => xf / yf,
                     ArithOp::Mod => unreachable!("rejected above"),
                     ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                    ArithOp::BitAnd
+                    | ArithOp::BitOr
+                    | ArithOp::BitXor
+                    | ArithOp::Shl
+                    | ArithOp::Shr => {
+                        unreachable!("bitwise ops return early via eval_bitwise")
+                    }
                 };
                 check_float_arith(f64::from(r), f64::from(xf), f64::from(yf), "real")?;
                 Ok(Value::Float4(r))
@@ -10414,6 +10473,13 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                     ArithOp::Div => x / y,
                     ArithOp::Mod => unreachable!("rejected above"),
                     ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                    ArithOp::BitAnd
+                    | ArithOp::BitOr
+                    | ArithOp::BitXor
+                    | ArithOp::Shl
+                    | ArithOp::Shr => {
+                        unreachable!("bitwise ops return early via eval_bitwise")
+                    }
                 };
                 check_float_arith(r, x, y, "double precision")?;
                 Ok(Value::Float(r))
@@ -10433,10 +10499,81 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                 ArithOp::Div => x.checked_div(y),
                 ArithOp::Mod => x.checked_rem(y),
                 ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
+                ArithOp::BitAnd
+                | ArithOp::BitOr
+                | ArithOp::BitXor
+                | ArithOp::Shl
+                | ArithOp::Shr => {
+                    unreachable!("bitwise ops return early via eval_bitwise")
+                }
             };
             let r = r.ok_or_else(|| exec_err("22003", "integer out of range"))?;
             fit_int_result(icat, r)
         }
+    }
+}
+
+/// v0.25: `& | # << >>` on smallint/integer/bigint. Postgres promotes
+/// smallint pairs to integer (like arithmetic); shifts use C/x86
+/// semantics (the count is masked to the width, int2/int4 shift in 32
+/// bits then truncate). Anything non-integer is 42883.
+fn eval_bitwise(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    let (ca, cb) = match (num_cat(a), num_cat(b)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return Err(op_err(op, a, b)),
+    };
+    let int_kind = |c: NumCat| matches!(c, NumCat::Small | NumCat::Int | NumCat::Big);
+    if !int_kind(ca) || !int_kind(cb) {
+        return Err(op_err(op, a, b));
+    }
+    // Postgres resolves smallint <op> smallint to integer.
+    let icat = if ca == NumCat::Small && cb == NumCat::Small {
+        NumCat::Int
+    } else {
+        ca.max(cb)
+    };
+    let x = to_i128(a);
+    let y = to_i128(b);
+    let r: i128 = match op {
+        ArithOp::BitAnd => x & y,
+        ArithOp::BitOr => x | y,
+        ArithOp::BitXor => x ^ y,
+        ArithOp::Shl => {
+            if matches!(icat, NumCat::Big) {
+                (x as i64).wrapping_shl(y as u32) as i128
+            } else {
+                // int2/int4: C promotes to 32 bits before shifting.
+                (x as i32).wrapping_shl(y as u32) as i128
+            }
+        }
+        ArithOp::Shr => {
+            if matches!(icat, NumCat::Big) {
+                (x as i64).wrapping_shr(y as u32) as i128
+            } else {
+                (x as i32).wrapping_shr(y as u32) as i128
+            }
+        }
+        _ => unreachable!("non-bitwise op in eval_bitwise"),
+    };
+    fit_int_result(icat, r)
+}
+
+/// v0.25: `~x` bitwise NOT. NULL propagates; smallint promotes to
+/// integer (like PG, which has no int2not); non-integers are 42883.
+fn eval_bitnot_val(v: &Value) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    match num_cat(v) {
+        Some(NumCat::Small) | Some(NumCat::Int) => {
+            let x = to_i128(v) as i32;
+            Ok(Value::Int((!x) as i64))
+        }
+        Some(NumCat::Big) => Ok(Value::BigInt(!(to_i128(v) as i64))),
+        _ => Err(exec_err(
+            "42883",
+            format!("operator does not exist: ~ {}", v.type_name()),
+        )),
     }
 }
 
@@ -10558,38 +10695,101 @@ fn float_to_int(f: f64) -> Result<i128, ExecError> {
     if !f.is_finite() {
         return Err(exec_err("22003", "integer out of range"));
     }
-    // Half away from zero.
-    let r = (f.abs() + 0.5).floor().copysign(f);
+    // v0.25: PG rounds half to even (banker's rounding): 2.5 -> 2, 3.5 -> 4.
+    let r = f.round_ties_even();
     if r < i128::MIN as f64 || r > i128::MAX as f64 {
         return Err(exec_err("22003", "integer out of range"));
     }
     Ok(r as i128)
 }
 
-/// Postgres integer input: optional sign, digits, surrounding
-/// whitespace. Anything else (decimal points, exponents) is 22P02.
+/// Postgres integer input (v0.25): optional sign, optional `0b`/`0o`/`0x`
+/// base prefix (PG 16+), digits with `_` separators between digits
+/// (PG 16+), surrounding whitespace. Anything else (decimal points,
+/// exponents, bad prefixes) is 22P02; overflow of i128 is 22003 (the
+/// caller narrows to int2/int4/int8 with its own range error).
 fn parse_int_text(s: &str) -> Result<i128, ExecError> {
     let t = s.trim();
-    let digits = t.strip_prefix('+').unwrap_or(t);
-    let digits = digits.strip_prefix('-').map(|d| d).unwrap_or(digits);
-    let neg = t.starts_with('-');
-    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(exec_err(
-            "22P02",
-            format!("invalid input syntax for type integer: {:?}", s),
-        ));
+    let after_sign = t.strip_prefix('+').unwrap_or(t);
+    let (neg, digits) = match after_sign.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, after_sign),
+    };
+    // v0.25: base prefix. Underscores may appear between digits; PG
+    // also allows one right after the prefix (`0b_101`). A bare prefix
+    // or a stray/doubled/trailing underscore is 22P02.
+    let (base, mut digits) = if let Some(d) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2u32, d)
+    } else if let Some(d) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        (8u32, d)
+    } else if let Some(d) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16u32, d)
+    } else {
+        (10u32, digits)
+    };
+    let had_prefix = base != 10;
+    // PG allows a single underscore immediately after the base prefix.
+    if had_prefix && digits.starts_with('_') {
+        digits = &digits[1..];
+    }
+    let digit_ok = |c: u8| match base {
+        2 => c == b'0' || c == b'1',
+        8 => c.is_ascii_digit() && c < b'8',
+        16 => c.is_ascii_hexdigit(),
+        _ => c.is_ascii_digit(),
+    };
+    // Validate: at least one digit; underscores only between digits
+    // (no leading, trailing, or doubled underscores).
+    let mut saw_digit = false;
+    let mut need_digit = true; // leading underscore rejected
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            if need_digit {
+                return Err(int_syntax_err(s));
+            }
+            need_digit = true;
+        } else if digit_ok(c) {
+            saw_digit = true;
+            need_digit = false;
+        } else {
+            return Err(int_syntax_err(s));
+        }
+    }
+    if !saw_digit || need_digit {
+        return Err(int_syntax_err(s));
     }
     let mut r: i128 = 0;
-    for c in digits.bytes() {
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        let d = (c as char).to_digit(base).unwrap() as i128;
         r = r
-            .checked_mul(10)
-            .and_then(|r| r.checked_add((c - b'0') as i128))
+            .checked_mul(base as i128)
+            .and_then(|r| r.checked_add(d))
             .ok_or_else(|| exec_err("22003", "value overflows integer"))?;
     }
     if neg {
         r = -r;
     }
     Ok(r)
+}
+
+/// 22P02 for a bad integer literal, PG-style message.
+fn int_syntax_err(s: &str) -> ExecError {
+    exec_err(
+        "22P02",
+        format!("invalid input syntax for type integer: {:?}", s),
+    )
 }
 
 /// v0.21: does the (trimmed, non-special) float literal's mantissa
@@ -13971,10 +14171,64 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::Numeric(Numeric::new(result, 0)))
         }
         "gcd" | "lcm" => {
+            // v0.25: PG has int4/int8 overloads that return the same type
+            // and raise 22003 on overflow (e.g. gcd(-2^31, 0) overflows
+            // int4). Numeric args use the numeric path.
+            let int_gcd_lcm = |a: i64, b: i64, bits: u32| -> Result<i64, ExecError> {
+                let mut x = (a as i128).unsigned_abs();
+                let mut y = (b as i128).unsigned_abs();
+                while y != 0 {
+                    let t = x % y;
+                    x = y;
+                    y = t;
+                }
+                let g = x;
+                let result = if name == "gcd" {
+                    g
+                } else {
+                    if g == 0 {
+                        0
+                    } else {
+                        (a as i128).unsigned_abs() / g * (b as i128).unsigned_abs()
+                    }
+                };
+                // v0.25: gcd/lcm results are non-negative; check against
+                // the type's max (min is irrelevant for unsigned result).
+                let max = match bits {
+                    16 => i16::MAX as u128,
+                    32 => i32::MAX as u128,
+                    _ => i64::MAX as u128,
+                };
+                if result > max {
+                    return Err(exec_err("22003", "integer out of range"));
+                }
+                Ok(result as i64)
+            };
+            // Check for int2/int4/int8 args (both must be integer types).
+            let int_args = match (v, &vals[1]) {
+                (Value::SmallInt(a), Value::SmallInt(b)) => Some((*a as i64, *b as i64, 16)),
+                (Value::Int(a), Value::Int(b)) => Some((*a, *b, 32)),
+                (Value::BigInt(a), Value::BigInt(b)) => Some((*a, *b, 64)),
+                _ => None,
+            };
+            if let Some((a, b, bits)) = int_args {
+                let r = int_gcd_lcm(a, b, bits)?;
+                return Ok(match bits {
+                    16 => Value::SmallInt(r as i16),
+                    32 => Value::Int(r),
+                    _ => Value::BigInt(r),
+                });
+            }
             let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
-            let ai = a.to_i64().ok_or_else(|| func_arg_err(name, v))?;
-            let bi = b.to_i64().ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            // v0.25: values that don't fit in i64 are a numeric overflow
+            // (22003), not a type error — e.g. lcm(10^131068, 2).
+            let ai = a
+                .to_i64()
+                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+            let bi = b
+                .to_i64()
+                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
             // Euclidean algorithm in u128: ai.abs() would panic on i64::MIN
             // (negation overflow); unsigned_abs is exact for all i64 inputs.
             let mut x = (ai as i128).unsigned_abs();
@@ -14091,6 +14345,12 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             // div(numeric, numeric): truncating division.
             let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
+            // v0.25: PG returns NaN if either operand is NaN, even when
+            // dividing by zero (div('nan', '0') = NaN).
+            use crate::storage::NumericSpecial;
+            if a.special == NumericSpecial::NaN || b.special == NumericSpecial::NaN {
+                return Ok(Value::Numeric(crate::storage::Numeric::nan()));
+            }
             if b.is_zero() {
                 return Err(exec_err("22012", "division by zero"));
             }
@@ -15161,6 +15421,18 @@ fn expr_type(
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
+        Expr::BitNot(x) => {
+            // v0.25: `~smallint`/`~int` -> int, `~bigint` -> bigint (PG
+            // promotes smallint, having no int2not).
+            match expr_type(eng, snap, own, session, schemas, ctes, x)? {
+                ColType::BigInt => Ok(ColType::BigInt),
+                ColType::SmallInt | ColType::Int => Ok(ColType::Int),
+                t => Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: ~ {}", t.sql_name()),
+                )),
+            }
+        }
         Expr::Concat(..) => Ok(ColType::Text),
         Expr::Cmp { .. }
         | Expr::And(_, _)
@@ -15275,6 +15547,9 @@ fn arith_operand_type(
         }
         Expr::Cast { to, .. } => Ok(Some(*to)),
         Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        Expr::Concat(..) => Ok(Some(ColType::Text)),
+        // v0.25: `~x` result type via the shared expr_type rule.
+        Expr::BitNot(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
         // Boolean / predicate expressions can't be arithmetic operands.
         _ => Err(exec_err(
             "42883",
@@ -15358,6 +15633,29 @@ fn combine_arith_types(
                 // the runtime parses the text in coerce_text_numeric.
                 (x, ColType::Text) if numeric_rank(x).is_some() => Ok(*x),
                 (ColType::Text, y) if numeric_rank(y).is_some() => Ok(*y),
+                (x, y)
+                    if matches!(
+                        op,
+                        ArithOp::BitAnd
+                            | ArithOp::BitOr
+                            | ArithOp::BitXor
+                            | ArithOp::Shl
+                            | ArithOp::Shr
+                    ) =>
+                {
+                    // v0.25: bitwise operators only accept the integer
+                    // kinds; smallint pairs promote to integer, like PG.
+                    match (numeric_rank(x), numeric_rank(y)) {
+                        (Some(rx), Some(ry)) if rx <= 2 && ry <= 2 => {
+                            if rx == 0 && ry == 0 {
+                                Ok(ColType::Int)
+                            } else {
+                                Ok(rank_type(rx.max(ry)))
+                            }
+                        }
+                        _ => Err(op_err(x, y)),
+                    }
+                }
                 (x, y) => match (numeric_rank(x), numeric_rank(y)) {
                     (Some(rx), Some(ry)) => {
                         if op == ArithOp::Pow {
@@ -15606,7 +15904,7 @@ fn infer_expr(
             infer_expr(a, eng, snap, own, session, schemas, out)?;
             infer_expr(b, eng, snap, own, session, schemas, out)
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } => {
+        Expr::Not(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
             infer_expr(x, eng, snap, own, session, schemas, out)
         }
         Expr::Agg { arg, .. } => {
@@ -16334,9 +16632,10 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             subst_expr(low, params)?;
             subst_expr(high, params)?;
         }
-        Expr::Not(x) | Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => {
-            subst_expr(x, params)?
-        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. } => subst_expr(x, params)?,
         Expr::Cast { expr, .. } => subst_expr(expr, params)?,
         Expr::Func { args, .. } => {
             for a in args {
@@ -19147,6 +19446,7 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(b, old, new);
         }
         Expr::Not(a) => rename_col_in_expr(a, old, new),
+        Expr::BitNot(a) => rename_col_in_expr(a, old, new),
         Expr::Like { expr, pattern, .. } => {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(pattern, old, new);

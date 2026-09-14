@@ -268,6 +268,48 @@ impl Numeric {
     /// `Err(())` = not a number (caller maps to 22P02).
     /// `Err` with overflow is impossible here only if digits fit; too
     /// many digits yield `None` via the overflow flag (caller: 22003).
+    /// v0.25: parse a non-decimal integer literal (`0b`/`0o`/`0x`, PG 16+)
+    /// into a Numeric. `digits` is the part after the prefix; PG allows a
+    /// single `_` right after the prefix, then underscores only between
+    /// digits.
+    fn parse_based(digits: &str, base: u32, neg: bool) -> Result<Self, NumericParseError> {
+        let digits = digits.strip_prefix('_').unwrap_or(digits);
+        let digit_ok = |c: u8| match base {
+            2 => c == b'0' || c == b'1',
+            8 => c.is_ascii_digit() && c < b'8',
+            16 => c.is_ascii_hexdigit(),
+            _ => false,
+        };
+        let mut saw_digit = false;
+        let mut need_digit = true;
+        let mut unscaled: i128 = 0;
+        for &c in digits.as_bytes() {
+            if c == b'_' {
+                if need_digit {
+                    return Err(NumericParseError::Syntax);
+                }
+                need_digit = true;
+            } else if digit_ok(c) {
+                saw_digit = true;
+                need_digit = false;
+                let d = (c as char).to_digit(base).unwrap() as i128;
+                unscaled = unscaled
+                    .checked_mul(base as i128)
+                    .and_then(|v| v.checked_add(d))
+                    .ok_or(NumericParseError::Overflow)?;
+            } else {
+                return Err(NumericParseError::Syntax);
+            }
+        }
+        if !saw_digit || need_digit {
+            return Err(NumericParseError::Syntax);
+        }
+        if neg {
+            unscaled = -unscaled;
+        }
+        Ok(Numeric::new(unscaled, 0))
+    }
+
     pub fn parse(s: &str) -> Result<Self, NumericParseError> {
         let s = s.trim();
         if s.is_empty() {
@@ -278,9 +320,13 @@ impl Numeric {
             None => (false, s.strip_prefix('+').unwrap_or(s)),
         };
         // v0.18: PostgreSQL's non-finite numerics, case-insensitive.
-        // A leading sign is accepted; `-NaN` is still NaN.
+        // v0.25: a sign before NaN is rejected (PG 16: `'+NaN'` is
+        // 22P02); signed infinities are fine.
         let lower: String = rest.to_lowercase();
         if lower == "nan" {
+            if neg || s.starts_with('+') {
+                return Err(NumericParseError::Syntax);
+            }
             return Ok(Numeric::nan());
         }
         if lower == "inf" || lower == "infinity" {
@@ -290,20 +336,46 @@ impl Numeric {
                 Numeric::infinity()
             });
         }
-        // Split off an exponent.
-        let (mant, exp): (&str, i32) = match rest.find(['e', 'E']) {
-            Some(i) => {
-                let e: i32 = rest[i + 1..]
-                    .parse()
-                    .map_err(|_| NumericParseError::Syntax)?;
-                (&rest[..i], e)
-            }
-            None => (rest, 0),
+        // v0.25: PG 16 non-decimal integer syntax and `_` digit
+        // separators. A base prefix means the whole literal is an
+        // integer (no fraction/exponent); underscores are stripped
+        // after validating placement.
+        let (base, rest) =
+            if let Some(d) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+                (2u32, d)
+            } else if let Some(d) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+                (8u32, d)
+            } else if let Some(d) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+                (16u32, d)
+            } else {
+                (10u32, rest)
+            };
+        if base != 10 {
+            return Self::parse_based(rest, base, neg);
+        }
+        // Split off an exponent before underscore stripping (the
+        // exponent carries its own optional sign, e.g. `1e-1_0`).
+        let (mant_raw, exp_raw) = match rest.find(['e', 'E']) {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
         };
-        let (int_part, frac_part) = match mant.find('.') {
-            Some(i) => (&mant[..i], &mant[i + 1..]),
-            None => (mant, ""),
+        let exp: i32 = if exp_raw.is_empty() {
+            0
+        } else {
+            strip_underscores(exp_raw)
+                .ok_or(NumericParseError::Syntax)?
+                .parse()
+                .map_err(|_| NumericParseError::Syntax)?
         };
+        // Split the mantissa on '.', then strip underscores from each
+        // part (empty parts are fine: `.5`, `5.`).
+        let (int_raw, frac_raw) = match mant_raw.find('.') {
+            Some(i) => (&mant_raw[..i], &mant_raw[i + 1..]),
+            None => (mant_raw, ""),
+        };
+        let int_part = strip_underscores_opt(int_raw).ok_or(NumericParseError::Syntax)?;
+        let frac_part = strip_underscores_opt(frac_raw).ok_or(NumericParseError::Syntax)?;
+        let (int_part, frac_part) = (int_part.as_str(), frac_part.as_str());
         if int_part.is_empty() && frac_part.is_empty() {
             return Err(NumericParseError::Syntax);
         }
@@ -343,8 +415,17 @@ impl Numeric {
     /// `Numeric::from_f64(0.1)` is exactly 0.1. Non-finite and extreme
     /// magnitudes fail.
     pub fn from_f64(f: f64) -> Result<Self, NumericParseError> {
-        if !f.is_finite() {
-            return Err(NumericParseError::Syntax);
+        // v0.25: PG's float->numeric cast maps non-finite floats to the
+        // corresponding numeric special values (not an error).
+        if f.is_nan() {
+            return Ok(Numeric::nan());
+        }
+        if f.is_infinite() {
+            return Ok(if f.is_sign_positive() {
+                Numeric::infinity()
+            } else {
+                Numeric::neg_infinity()
+            });
         }
         // Shortest round-trip text, then decimal parse. Rust's Display
         // for f64 already gives the shortest such string.
@@ -883,6 +964,55 @@ impl Numeric {
 pub enum NumericParseError {
     Syntax,
     Overflow,
+}
+
+/// v0.25: like `strip_underscores`, but an empty part (as in `.5` or
+/// `5.`) is allowed.
+fn strip_underscores_opt(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return Some(String::new());
+    }
+    strip_underscores(s)
+}
+
+/// v0.25: validate and remove `_` digit separators (PG 16+). Underscores
+/// must sit between digits; a single leading underscore is allowed (the
+/// caller strips a base prefix first, so it means the underscore followed
+/// the prefix). Returns the cleaned string, preserving a leading sign.
+fn strip_underscores(s: &str) -> Option<String> {
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => match s.strip_prefix('+') {
+            Some(d) => (false, d),
+            None => (false, s),
+        },
+    };
+    // PG allows one underscore right after a stripped base prefix.
+    let digits = digits.strip_prefix('_').unwrap_or(digits);
+    let mut out = String::with_capacity(digits.len());
+    let mut saw_digit = false;
+    let mut need_digit = true; // leading underscore rejected
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            if need_digit {
+                return None;
+            }
+            need_digit = true;
+        } else if c.is_ascii_digit() {
+            saw_digit = true;
+            need_digit = false;
+            out.push(c as char);
+        } else {
+            return None;
+        }
+    }
+    if !saw_digit || need_digit {
+        return None;
+    }
+    if neg {
+        out.insert(0, '-');
+    }
+    Some(out)
 }
 
 /// v0.18: fixed scale-18 decimal for transcendental series evaluation.
@@ -3716,13 +3846,13 @@ mod tests {
     }
 
     // v0.18: numeric special values (NaN, Infinity, -Infinity).
+    // v0.25: PG rejects a sign before NaN (`'+NaN'`/`'-NaN'` are 22P02).
     #[test]
     fn numeric_special_parse_case_insensitive() {
         for (s, expect) in [
             ("NaN", NumericSpecial::NaN),
             ("nan", NumericSpecial::NaN),
             ("NAN", NumericSpecial::NaN),
-            ("-NaN", NumericSpecial::NaN),
             ("Inf", NumericSpecial::PosInf),
             ("inf", NumericSpecial::PosInf),
             ("INF", NumericSpecial::PosInf),
@@ -3735,6 +3865,25 @@ mod tests {
             let n = Numeric::parse(s).expect(s);
             assert_eq!(n.special, expect, "parse {}", s);
         }
+    }
+
+    // v0.25: signed NaN is a syntax error (PG 16).
+    #[test]
+    fn numeric_signed_nan_rejected() {
+        for s in ["+NaN", "-NaN", "+nan", "-nan", " +NaN ", " -NAN "] {
+            assert_eq!(
+                Numeric::parse(s),
+                Err(NumericParseError::Syntax),
+                "parse {}",
+                s
+            );
+        }
+        // Unsigned NaN still parses.
+        assert_eq!(Numeric::parse("NaN").unwrap().special, NumericSpecial::NaN);
+        assert_eq!(
+            Numeric::parse(" nan ").unwrap().special,
+            NumericSpecial::NaN
+        );
     }
 
     #[test]

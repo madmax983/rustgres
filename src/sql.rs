@@ -93,6 +93,12 @@ enum Token {
     Neq,           // v0.6: <> and !=
     ColonColon,    // v0.7: `::` cast
     PipePipe,      // v0.7: `||` concat
+    Pipe,          // v0.25: `|` bitwise OR
+    Amp,           // v0.25: `&` bitwise AND
+    Hash,          // v0.25: `#` bitwise XOR
+    Tilde,         // v0.25: `~` bitwise NOT (unary)
+    Shl,           // v0.25: `<<` shift left
+    Shr,           // v0.25: `>>` shift right
     At,            // v0.21: `@` prefix abs operator
     PipeSlash,     // v0.21: `|/` prefix sqrt operator
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
@@ -304,8 +310,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             }
             continue;
         }
-        // `||/` prefix cbrt, `|/` prefix sqrt, `||` concatenation
-        // (a lone `|` is a syntax error). Longest match first.
+        // `||/` prefix cbrt, `|/` prefix sqrt, `||` concatenation,
+        // `|` bitwise OR. Longest match first.
         if c == '|' {
             if i + 2 < chars.len() && chars[i + 1] == '|' && chars[i + 2] == '/' {
                 toks.push(Token::PipePipeSlash);
@@ -317,8 +323,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 toks.push(Token::PipePipe);
                 i += 2;
             } else {
-                return Err(err("unexpected character '|'"));
+                toks.push(Token::Pipe);
+                i += 1;
             }
+            continue;
+        }
+        // v0.25: `&` bitwise AND, `#` bitwise XOR, `~` bitwise NOT.
+        if c == '&' {
+            toks.push(Token::Amp);
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            toks.push(Token::Hash);
+            i += 1;
+            continue;
+        }
+        if c == '~' {
+            toks.push(Token::Tilde);
+            i += 1;
             continue;
         }
         // v0.21: `@` prefix absolute-value operator.
@@ -429,7 +452,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 i += 1;
             }
             '<' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 1 < chars.len() && chars[i + 1] == '<' {
+                    toks.push(Token::Shl);
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Token::LtEq);
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '>' {
@@ -441,7 +467,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 }
             }
             '>' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    toks.push(Token::Shr);
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Token::GtEq);
                     i += 2;
                 } else {
@@ -789,7 +818,12 @@ pub enum ArithOp {
     Mul,
     Div,
     Mod,
-    Pow, // v0.7: `^` exponentiation
+    Pow,    // v0.7: `^` exponentiation
+    BitAnd, // v0.25: `&`
+    BitOr,  // v0.25: `|`
+    BitXor, // v0.25: `#`
+    Shl,    // v0.25: `<<`
+    Shr,    // v0.25: `>>`
 }
 
 impl ArithOp {
@@ -801,6 +835,11 @@ impl ArithOp {
             ArithOp::Div => "/",
             ArithOp::Mod => "%",
             ArithOp::Pow => "^",
+            ArithOp::BitAnd => "&",
+            ArithOp::BitOr => "|",
+            ArithOp::BitXor => "#",
+            ArithOp::Shl => "<<",
+            ArithOp::Shr => ">>",
         }
     }
 }
@@ -876,6 +915,7 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
+    BitNot(Box<Expr>), // v0.25: `~` bitwise NOT
     IsNull {
         expr: Box<Expr>,
         neg: bool,
@@ -1530,6 +1570,7 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
             collect_col_refs(b, out);
         }
         Expr::Not(a) => collect_col_refs(a, out),
+        Expr::BitNot(a) => collect_col_refs(a, out),
         Expr::Like { expr, pattern, .. } => {
             collect_col_refs(expr, out);
             collect_col_refs(pattern, out);
@@ -2169,9 +2210,10 @@ fn max_param_expr(e: &Expr) -> usize {
         } => max_param_expr(expr)
             .max(max_param_expr(low))
             .max(max_param_expr(high)),
-        Expr::Cast { expr, .. } | Expr::Not(expr) | Expr::IsNull { expr, .. } => {
-            max_param_expr(expr)
-        }
+        Expr::Cast { expr, .. }
+        | Expr::Not(expr)
+        | Expr::BitNot(expr)
+        | Expr::IsNull { expr, .. } => max_param_expr(expr),
         Expr::IsBool { expr, .. } => max_param_expr(expr),
         Expr::Func { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
         Expr::Extract { from, .. } => max_param_expr(from),
@@ -4001,14 +4043,14 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, SqlError> {
-        let left = self.parse_concat()?;
+        let left = self.parse_bitor()?;
         // `[NOT] BETWEEN low AND high`, `[NOT] LIKE pat`,
         // `[NOT] ILIKE pat`, `[NOT] IN (subquery)`.
         let neg = self.eat_keyword("not");
         if self.eat_keyword("between") {
-            let low = self.parse_concat()?;
+            let low = self.parse_bitor()?;
             self.expect_keyword("and")?;
-            let high = self.parse_concat()?;
+            let high = self.parse_bitor()?;
             return Ok(Expr::Between {
                 expr: Box::new(left),
                 low: Box::new(low),
@@ -4017,9 +4059,9 @@ impl Parser {
             });
         }
         if self.eat_keyword("like") {
-            let pattern = self.parse_concat()?;
+            let pattern = self.parse_bitor()?;
             let escape = if self.eat_keyword("escape") {
-                Some(Box::new(self.parse_concat()?))
+                Some(Box::new(self.parse_bitor()?))
             } else {
                 None
             };
@@ -4035,10 +4077,10 @@ impl Parser {
         // Desugars to similar_to(expr, pattern [, escape]).
         if self.eat_keyword("similar") {
             self.expect_keyword("to")?;
-            let pattern = self.parse_concat()?;
+            let pattern = self.parse_bitor()?;
             let mut args = vec![left, pattern];
             if self.eat_keyword("escape") {
-                args.push(self.parse_concat()?);
+                args.push(self.parse_bitor()?);
             }
             let e = Expr::Func {
                 name: "similar_to".to_string(),
@@ -4051,9 +4093,9 @@ impl Parser {
             }
         }
         if self.eat_keyword("ilike") {
-            let pattern = self.parse_concat()?;
+            let pattern = self.parse_bitor()?;
             let escape = if self.eat_keyword("escape") {
-                Some(Box::new(self.parse_concat()?))
+                Some(Box::new(self.parse_bitor()?))
             } else {
                 None
             };
@@ -4133,7 +4175,7 @@ impl Parser {
         let mut expr = match op {
             Some(op) => {
                 self.next();
-                let right = self.parse_concat()?;
+                let right = self.parse_bitor()?;
                 Expr::Cmp {
                     op,
                     left: Box::new(left),
@@ -4186,6 +4228,75 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    /// v0.25: bitwise OR — the loosest bitwise operator (PG binds `|`
+    /// looser than `#`, `&`, `<<`/`>>`, and all of those looser than
+    /// `||`). Operands are the next-tighter level.
+    fn parse_bitor(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_bitxor()?;
+        while *self.peek() == Token::Pipe {
+            self.next();
+            let right = self.parse_bitxor()?;
+            left = Expr::Arith {
+                op: ArithOp::BitOr,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// v0.25: bitwise XOR (`#`), binds tighter than `|` but looser than `&`.
+    fn parse_bitxor(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_bitand()?;
+        while *self.peek() == Token::Hash {
+            self.next();
+            let right = self.parse_bitand()?;
+            left = Expr::Arith {
+                op: ArithOp::BitXor,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// v0.25: bitwise AND (`&`), binds tighter than `#` but looser than shifts.
+    fn parse_bitand(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_shift()?;
+        while *self.peek() == Token::Amp {
+            self.next();
+            let right = self.parse_shift()?;
+            left = Expr::Arith {
+                op: ArithOp::BitAnd,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// v0.25: shifts (`<<`, `>>`), bind looser than `||` (PG ranks `||`
+    /// above shifts, so `a || b << 2` is `(a || b) << 2`) but tighter
+    /// than `&`.
+    fn parse_shift(&mut self) -> Result<Expr, SqlError> {
+        let mut left = self.parse_concat()?;
+        loop {
+            let op = match self.peek() {
+                Token::Shl => ArithOp::Shl,
+                Token::Shr => ArithOp::Shr,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_concat()?;
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     /// concat := add (`||` add)*
@@ -4283,11 +4394,11 @@ impl Parser {
         Ok(expr)
     }
 
-    /// unary := (`-` | `+` | `@` | `|/` | `||/`) unary | primary.
+    /// unary := (`-` | `+` | `~` | `@` | `|/` | `||/`) unary | primary.
     /// `-x` desugars to `0 - x` (so `-NULL` is NULL and `-'2026-01-01'`
     /// fails at evaluation, like Postgres). The prefix operators desugar
     /// to function calls, like Postgres' parser does: `@x` -> `abs(x)`,
-    /// `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`.
+    /// `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`. v0.25: `~x` is bitwise NOT.
     fn parse_unary(&mut self) -> Result<Expr, SqlError> {
         match self.peek() {
             Token::Minus => {
@@ -4326,6 +4437,11 @@ impl Parser {
                     name: "cbrt".to_string(),
                     args: vec![inner],
                 })
+            }
+            Token::Tilde => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::BitNot(Box::new(inner)))
             }
             _ => self.parse_primary(),
         }
@@ -4814,7 +4930,7 @@ impl Parser {
         self.expect(Token::LParen, "'('")?;
         // Parse below `IN` (parse_cmp) so a trailing `in` is left for the
         // `position(x in y)` form instead of becoming an IN-subquery.
-        let a = self.parse_concat()?;
+        let a = self.parse_bitor()?;
         let b = if self.eat_keyword("in") {
             self.parse_or()?
         } else {
@@ -6743,6 +6859,7 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(b, what)
         }
         Expr::Not(a) => validate_constraint_expr(a, what),
+        Expr::BitNot(a) => validate_constraint_expr(a, what),
         Expr::Like { expr, pattern, .. } => {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(pattern, what)
@@ -6862,6 +6979,11 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
                 ArithOp::Div => "div",
                 ArithOp::Mod => "mod",
                 ArithOp::Pow => "pow",
+                ArithOp::BitAnd => "bitand",
+                ArithOp::BitOr => "bitor",
+                ArithOp::BitXor => "bitxor",
+                ArithOp::Shl => "shl",
+                ArithOp::Shr => "shr",
             };
             out.push_str(&format!("(arith {} ", o));
             encode_expr_inner(left, out);
@@ -6974,6 +7096,11 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         }
         Expr::Not(a) => {
             out.push_str("(not ");
+            encode_expr_inner(a, out);
+            out.push(')');
+        }
+        Expr::BitNot(a) => {
+            out.push_str("(bitnot ");
             encode_expr_inner(a, out);
             out.push(')');
         }
@@ -7102,6 +7229,11 @@ impl<'a> SexprParser<'a> {
                     "div" => ArithOp::Div,
                     "mod" => ArithOp::Mod,
                     "pow" => ArithOp::Pow,
+                    "bitand" => ArithOp::BitAnd,
+                    "bitor" => ArithOp::BitOr,
+                    "bitxor" => ArithOp::BitXor,
+                    "shl" => ArithOp::Shl,
+                    "shr" => ArithOp::Shr,
                     o => return Err(format!("bad arith op {}", o)),
                 };
                 let l = self.expr()?;
@@ -7220,6 +7352,10 @@ impl<'a> SexprParser<'a> {
             "not" => {
                 let a = self.expr()?;
                 Expr::Not(Box::new(a))
+            }
+            "bitnot" => {
+                let a = self.expr()?;
+                Expr::BitNot(Box::new(a))
             }
             "isnull" => {
                 let neg = self.atom()? == "1";

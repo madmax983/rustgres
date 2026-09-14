@@ -144,17 +144,23 @@ def main():
         c = Conn()
 
         # ---- A. NaN/Infinity parsing (case-insensitive) ----
-        for lit, expect in [
-            ("'NaN'", "NaN"), ("'nan'", "NaN"), ("'NAN'", "NaN"), ("'nAn'", "NaN"),
-            ("'-NaN'", "NaN"), ("'+NaN'", "NaN"),
-            ("'Inf'", "Infinity"), ("'inf'", "Infinity"), ("'INF'", "Infinity"),
-            ("'Infinity'", "Infinity"), ("'infinity'", "Infinity"), ("'INFINITY'", "Infinity"),
-            ("'-Infinity'", "-Infinity"), ("'-inf'", "-Infinity"), ("'-Infinity'", "-Infinity"),
-            ("'+Inf'", "Infinity"), ("'+Infinity'", "Infinity"),
+        # v0.25: PG's numeric input rejects a sign before NaN ("NaN mustn't
+        # have a sign" — numeric.c), so signed NaNs are 22P02; signed
+        # infinities are fine.
+        for lit, expect, expect_err in [
+            ("'NaN'", "NaN", None), ("'nan'", "NaN", None), ("'NAN'", "NaN", None), ("'nAn'", "NaN", None),
+            ("'-NaN'", None, "22P02"), ("'+NaN'", None, "22P02"),
+            ("'Inf'", "Infinity", None), ("'inf'", "Infinity", None), ("'INF'", "Infinity", None),
+            ("'Infinity'", "Infinity", None), ("'infinity'", "Infinity", None), ("'INFINITY'", "Infinity", None),
+            ("'-Infinity'", "-Infinity", None), ("'-inf'", "-Infinity", None), ("'-Infinity'", "-Infinity", None),
+            ("'+Inf'", "Infinity", None), ("'+Infinity'", "Infinity", None),
         ]:
             rows, _, err = c.sql(f"SELECT {lit}::numeric")
-            check(f"parse {lit}", err is None and rows and rows[0][0] == expect,
-                  f"got {rows} err={err}")
+            if expect_err:
+                check(f"parse {lit}", err == expect_err, f"got {rows} err={err}")
+            else:
+                check(f"parse {lit}", err is None and rows and rows[0][0] == expect,
+                      f"got {rows} err={err}")
 
         # The v0.17 cascade: INSERT with NaN in explicit txn must not abort.
         c.sql("CREATE TABLE num_exp_div(a numeric, b numeric, c numeric)")
