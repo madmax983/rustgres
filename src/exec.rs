@@ -9930,8 +9930,11 @@ fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     // v0.21: text-vs-numeric coercion (unknown-literal resolution) runs
     // before the NaN special-case, so 'nan' = x behaves like NaN = x
     // and 1.5 = '1.5' is true.
-    let (ac, bc) = coerce_text_numeric(a, b)?;
-    let (a, b) = (&ac, &bc);
+    let coerced = coerce_text_numeric(a, b)?;
+    let (a, b): (&Value, &Value) = match &coerced {
+        Some((ac, bc)) => (ac, bc),
+        None => (a, b),
+    };
     // v0.18: PG semantics: NaN != NaN (NaN is not equal to itself).
     // This applies to = and <>; ORDER BY still sorts NaN last via cmp().
     let a_is_nan = matches!(a, Value::Numeric(n) if n.is_nan());
@@ -10132,7 +10135,11 @@ fn num_col_type(v: &Value) -> Option<ColType> {
 /// other side's type — Postgres resolves unknown-type literals this
 /// way (`1.5 = '1.5'` is true). Unparseable text is 22P02; anything
 /// else passes through untouched.
-fn coerce_text_numeric(a: &Value, b: &Value) -> Result<(Value, Value), ExecError> {
+/// `None` means neither operand needed coercion; the caller keeps
+/// borrowing its original `&Value`s instead of paying for a clone of
+/// both sides on every call (the common case: typed columns, no `Text`
+/// operand at all).
+fn coerce_text_numeric(a: &Value, b: &Value) -> Result<Option<(Value, Value)>, ExecError> {
     let coerced = match (a, b) {
         (Value::Text(s), o) => num_col_type(o).map(|t| (s, t, true)),
         (o, Value::Text(s)) => num_col_type(o).map(|t| (s, t, false)),
@@ -10141,13 +10148,13 @@ fn coerce_text_numeric(a: &Value, b: &Value) -> Result<(Value, Value), ExecError
     match coerced {
         Some((s, t, text_first)) => {
             let parsed = eval_cast(&Value::text(s.clone()), t)?;
-            Ok(if text_first {
+            Ok(Some(if text_first {
                 (parsed, b.clone())
             } else {
                 (a.clone(), parsed)
-            })
+            }))
         }
-        None => Ok((a.clone(), b.clone())),
+        None => Ok(None),
     }
 }
 
@@ -10357,8 +10364,11 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     }
     // v0.21: text-vs-numeric coercion (unknown-literal resolution)
     // before anything else, so '1.5' + 1 works like Postgres.
-    let (ac, bc) = coerce_text_numeric(a, b)?;
-    let (a, b) = (&ac, &bc);
+    let coerced = coerce_text_numeric(a, b)?;
+    let (a, b): (&Value, &Value) = match &coerced {
+        Some((ac, bc)) => (ac, bc),
+        None => (a, b),
+    };
     // v0.25: bitwise operators only accept the integer kinds.
     if matches!(
         op,
