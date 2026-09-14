@@ -11491,6 +11491,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_instr" => (2..=7).contains(&n),
         "regexp_substr" => (2..=6).contains(&n),
         "regexp_replace" => (3..=6).contains(&n),
+        "regexp_split_to_array" => (2..=3).contains(&n),
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -11546,13 +11547,52 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     // v0.16: `substr` is a true alias of `substring` (same semantics).
     let name = if name == "substr" { "substring" } else { name };
     match name {
-        "upper" | "lower" | "length" | "char_length" | "character_length" | "substring"
-        | "trim" | "position" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
-        | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "decode" | "crc32c"
-        | "sha224" | "sha256" | "sha384" | "sha512" | "strpos" | "translate" | "unistr"
-        | "overlay" | "repeat" | "lpad" | "rpad" | "ascii" | "chr" | "initcap" | "ltrim"
-        | "rtrim" | "regexp_like" | "regexp_count" | "regexp_instr" | "regexp_substr"
-        | "regexp_replace" | "similar_to" | "substring_similar" | "substring_from"
+        "upper"
+        | "lower"
+        | "length"
+        | "char_length"
+        | "character_length"
+        | "substring"
+        | "trim"
+        | "position"
+        | "replace"
+        | "split_part"
+        | "concat"
+        | "concat_ws"
+        | "to_hex"
+        | "to_oct"
+        | "to_bin"
+        | "left"
+        | "right"
+        | "reverse"
+        | "encode"
+        | "decode"
+        | "crc32c"
+        | "sha224"
+        | "sha256"
+        | "sha384"
+        | "sha512"
+        | "strpos"
+        | "translate"
+        | "unistr"
+        | "overlay"
+        | "repeat"
+        | "lpad"
+        | "rpad"
+        | "ascii"
+        | "chr"
+        | "initcap"
+        | "ltrim"
+        | "rtrim"
+        | "regexp_like"
+        | "regexp_count"
+        | "regexp_instr"
+        | "regexp_substr"
+        | "regexp_replace"
+        | "regexp_split_to_array"
+        | "similar_to"
+        | "substring_similar"
+        | "substring_from"
         | "substring_from_for" => eval_str_func(name, vals),
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
@@ -12465,14 +12505,20 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let sc: Vec<char> = s.chars().collect();
             let mut pos = start_idx.min(sc.len());
             let mut found = None;
+            let mut matched = 0;
             for _ in 0..occurrence {
                 match re.find_at(&sc, pos) {
                     Some((ms, me, caps)) => {
                         found = Some((ms, me, caps));
+                        matched += 1;
                         pos = if me > ms { me } else { ms + 1 };
                     }
                     None => break,
                 }
+            }
+            // Only return a result if we found the requested occurrence.
+            if matched < occurrence {
+                found = None;
             }
             match found {
                 Some((ms, me, caps)) => {
@@ -12522,14 +12568,20 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let sc: Vec<char> = s.chars().collect();
             let mut pos = start_idx.min(sc.len());
             let mut found = None;
+            let mut matched = 0;
             for _ in 0..occurrence {
                 match re.find_at(&sc, pos) {
                     Some((ms, me, caps)) => {
                         found = Some((ms, me, caps));
+                        matched += 1;
                         pos = if me > ms { me } else { ms + 1 };
                     }
                     None => break,
                 }
+            }
+            // Only return a result if we found the requested occurrence.
+            if matched < occurrence {
+                found = None;
             }
             match found {
                 Some((ms, me, caps)) => {
@@ -12787,6 +12839,68 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 }
             }
             out.extend(sc[pos.min(sc.len())..].iter());
+            Ok(Value::text(out))
+        }
+        "regexp_split_to_array" => {
+            // regexp_split_to_array(s, pat [, flags]): split string on
+            // regexp matches, return text[] as PG array literal.
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let flags = get_str_arg(name, vals, 2, "")?;
+            let (opts, _) = parse_regexp_flags(flags, name, false)?;
+            let re = crate::regex::compile_opts(pat, opts)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let mut parts: Vec<String> = Vec::new();
+            let mut pos = 0usize;
+            // Empty pattern: split between each character.
+            if pat.is_empty() {
+                for c in sc.iter() {
+                    parts.push(c.to_string());
+                }
+            } else {
+                while pos <= sc.len() {
+                    match re.find_at(&sc, pos) {
+                        Some((ms, me, _)) => {
+                            parts.push(sc[pos..ms].iter().collect());
+                            // Avoid infinite loop on empty match.
+                            pos = if me > ms { me } else { ms + 1 };
+                            if ms == sc.len() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                parts.push(sc[pos.min(sc.len())..].iter().collect());
+            }
+            // Format as PG array literal: {"",23456}
+            let mut out = String::from("{");
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // Quote if empty or contains special chars.
+                if p.is_empty() || p.contains(&[',', '"', '\\', '{', '}'][..]) {
+                    out.push('"');
+                    for c in p.chars() {
+                        if c == '"' || c == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(p);
+                }
+            }
+            out.push('}');
             Ok(Value::text(out))
         }
         "overlay" => {
@@ -14803,7 +14917,7 @@ fn func_result_type(
         "translate" | "unistr" | "overlay" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
-        "regexp_substr" | "regexp_replace" => Ok(ColType::Text),
+        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" => Ok(ColType::Text),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" | "substring_from" | "substring_from_for" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "position" => Ok(ColType::Int),
