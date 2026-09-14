@@ -2,6 +2,108 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `project_row`'s output-cell `Vec` grows unsized — baseline — 2026-09-14
+
+**Workload**: `benches/profile_project.py` (new) — a fixed-iteration-count
+driver, same rationale as `profile_scan.py`/`profile_orderby.py`. Loads a
+20,000-row, 8-`INT`-column table, then sends an exact 30 iterations of an
+**explicit** column-list `SELECT c0,c1,c2,c3,c4,c5,c6,c7 FROM bench_proj`
+over the real wire protocol. This deliberately avoids `SELECT *`: v0.6
+already gave `project_row` a zero-allocation fast path for that shape (see
+the fast-path check at the top of `project_row`, `src/exec.rs`), so every
+prior profiling session in this file that used `SELECT *` (`profile_scan.py`
+et al.) never exercised the explicit-item path at all. An explicit column
+list is extremely common in real client SQL (ORMs, hand-written queries
+selecting named columns), so this is real, not a synthetic microbenchmark
+of the function alone — it drives the same `run_statement`/`project_row`
+call path as every other SELECT, through the real wire protocol, at a row
+count large enough to amortize connection/parse overhead.
+
+This is the "`project_row` and `exec_agg` build their output cells with
+`Vec::new()` and no capacity hint" item flagged as a known-but-unmeasured
+follow-up in the `compare_values`/tokenizer entry earlier in this file.
+
+```sql
+CREATE TABLE bench_proj(c0 INT, c1 INT, ..., c7 INT)
+SELECT c0,c1,c2,c3,c4,c5,c6,c7 FROM bench_proj
+```
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_project.py --rows 20000 --count 30
+# SIGTERM the server to flush, then inspect /tmp/dhat.out (dhatFileVersion 2
+# JSON: sum `tbk`/`tb` over all `pps` entries for the total; filter by
+# entries whose `fs` frame list resolves to `rustgres::exec::project_row`
+# via `ftbl` for the target's share).
+```
+
+**Profile** (DHAT, `valgrind --tool=dhat`, this commit — `project_row`
+unchanged): 2,870,108 total allocation blocks, 598,967,285 total bytes,
+over 30 iterations of the 20,000-row / 8-column workload. Reproduced twice
+on the pristine tree: both runs report exactly 2,870,108 blocks and
+598,967,285 bytes (this workload is single-connection, single-threaded —
+fully deterministic, no run-to-run variance at all). Top allocation sites
+by innermost `rustgres::` frame:
+
+| site | blocks | % of total blocks | bytes | % of total bytes |
+|---|---|---|---|---|
+| `exec::project_row` (exec.rs:8634, the `cells.push(eval_expr(...))` arm) | 1,200,000 | **41.81%** | 345,600,000 | **57.70%** |
+| `Arc<Vec<Value>>` alloc (row-storage sharing, unrelated) | 620,000 | 21.60% | 24,800,000 | 4.14% |
+| `Vec<Scope>` alloc (`project_row`'s scope-chain build, unrelated to the cells buffer) | 600,000 | 20.90% | 19,200,000 | 3.21% |
+| SQL tokenizer/parser sites (`tokenize`, `Token::clone`, `parse_insert`, fixture setup) | ≤160,000 each | ≤5.57% each | — | — |
+
+**Target**: `exec::project_row`'s `cells` buffer — 1,200,000 blocks,
+**41.81%** of all allocations in the workload, far above the 5%-of-profile
+relevance bar. 1,200,000 blocks / (30 iterations x 20,000 rows) = exactly
+**2.0 allocations per output row** — consistent with `Vec<Value>`'s growth
+policy starting a `Vec::new()` at capacity 0, jumping to capacity 4 on the
+first push (the implementation's minimum non-zero capacity for a
+non-tiny element), then doubling to capacity 8 to fit the 8th column: two
+reallocations to reach a known-in-advance final size of 8.
+
+**Mechanism**: `project_row`'s explicit-item loop (`SelectItem::Expr` /
+`AllOf` / non-fast-path `All`) starts `cells` at `Vec::new()` and grows it
+one `push` at a time, even though the exact final width is already known
+before the loop starts: `describe_select` computed it earlier in the same
+call chain (`run_select`, `src/exec.rs`) into `out_cols`, which is also
+passed into `exec_agg` for the identical reason on the aggregated path.
+Passing that already-computed count into `project_row` and calling
+`Vec::with_capacity` instead of `Vec::new()` removes both reallocations
+with no new computation — `out_cols.len()` is a field read, not a scan.
+
+**Baseline numbers** (this commit, `project_row` unchanged):
+
+| counter | value |
+|---|---|
+| DHAT total allocation blocks (30 iterations x 20,000-row x 8-col explicit SELECT) | 2,870,108 |
+| Blocks in `project_row`'s `cells` buffer (see table above) | 1,200,000 (41.81%) |
+| DHAT total bytes | 598,967,285 |
+| Bytes in `project_row`'s `cells` buffer | 345,600,000 (57.70%) |
+
+For context, not as the gating counter: Callgrind `Ir` (total instructions,
+same workload) is 22,729,866,638; `exec::project_row`'s own self-cost is
+428,400,000 (1.88%) — most of the workload's instructions are in per-cell
+column-reference resolution (`resolve_col` 6.59%) and value formatting
+(`Value::write_text_into`, `fmt`), not allocation bookkeeping, so this
+fix is evaluated against the allocation-count floor (DHAT), not the
+instruction-count floor — the 41.81%/57.70% allocation share clears the
+5%-of-profile relevance bar and the eventual delta is checked against the
+"≥10% reduction in allocation count or bytes" floor, not the 5%
+instruction floor.
+
+**Fix** (next commit): give `project_row` an `out_ncols: usize` parameter
+(the caller's already-computed `out_cols.len()`) and change
+`Vec::new()` to `Vec::with_capacity(out_ncols)` for the `cells` buffer.
+`exec_agg`'s analogous `let mut cells = Vec::new();` in its per-group
+output loop has the identical mechanism and already has `out_cols` in
+scope as a parameter — fixed in the same commit, though this workload
+(no `GROUP BY`) does not exercise or measure it; see the after-numbers
+note below.
+
 ## Bolt: `compare_values` (ORDER BY) pays NUMERIC normalization for plain-int sorts — baseline — 2026-09-13
 
 **Workload**: `benches/profile_orderby.py` (new) — a fixed-iteration-count
