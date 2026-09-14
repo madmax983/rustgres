@@ -2,6 +2,87 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `coerce_text_numeric` clones both comparison/arithmetic operands unconditionally — baseline — 2026-09-14
+
+**Workload**: `benches/profile_join.py` (existing, from the equi-join-comparison
+Bolt round) at bench.py's own full-size shape — `--users 2000 --orders 20000
+--filter 200`, an exact **5** iterations of
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 200
+GROUP BY u.name ORDER BY u.name
+```
+
+over the real wire protocol — the same nested-loop-join query `bench.py`'s
+`join` workload uses (200 x 20,000 pairs after the WHERE is pushed below the
+join), so every equi-join comparison, WHERE filter, and `sum()`/`count()`
+aggregate update in the whole workload is exercised for real, not against a
+synthetic slice of `coerce_text_numeric` alone.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 5 --users 2000 --orders 20000 \
+  --filter 200 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | head -40
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged): 29,812,962,260
+total instructions over the 5-iteration run. Top `rustgres::exec` self-costs:
+
+| function | Ir | % of total |
+|---|---|---|
+| `eval_expr` (both monomorphizations) | 5,591,370,000 | 18.75% |
+| `build_source` | 2,500,239,200 | 8.39% |
+| `eval_cmp_vals` | 2,403,630,000 | **8.06%** |
+| `<Value as Clone>::clone` | 1,924,939,255 | **6.46%** |
+| `drop_in_place<Value>` | 1,404,189,420 | 4.71% |
+| `cmp_ordering` | 1,442,160,000 | 4.84% |
+| `coerce_text_numeric` | 1,021,530,000 | **3.43%** |
+| `exact_as_i64` | 841,260,000 | 2.82% |
+
+**Target**: `exec::coerce_text_numeric` (`src/exec.rs`), called from both
+`eval_cmp_vals` (every `=`/`<`/`>`/... comparison — the join's `ON`
+condition and its `WHERE u.id < 200` filter) and `eval_arith` (every
+`+ - * / %`/bitwise op — `sum(o.amt)`'s running total). Its job is to
+resolve an unknown-typed text literal against the other side's numeric
+type (`'1.5' = 1`), but it runs on **every single call**, including the
+overwhelming common case where neither operand is `Text` at all (an
+`Int`/`Int` join-key comparison, an `Int`/`Int` sum accumulation) — and in
+that fast-path branch it still returns owned values by unconditionally
+cloning both operands: `_ => Ok((a.clone(), b.clone()))`. Own self-cost
+(3.43%) plus the `Value::clone`/`drop_in_place<Value>` it triggers on every
+one of those calls (a combined 11.17% of the profile, not otherwise
+plausibly attributable given this workload's join condition alone runs
+`coerce_text_numeric` 200 x 20,000 x 5 = 20,000,000 times) puts this target
+far above the 5%-of-profile relevance bar.
+
+**Mechanism**: `Value::clone`'s match arms are cheap per call (no heap
+alloc for `Int`/`Numeric`/etc.; `Text` is an `Arc` bump), but the join's
+inner loop calls `coerce_text_numeric` once per candidate row pair for the
+`ON` condition alone (4,000,000 comparisons/query x 5 queries), each
+paying two `Value::clone` + two `drop_in_place<Value>` calls purely to
+hand back the same bits the caller already owns references to. Changing
+`coerce_text_numeric` to return `Option<(Value, Value)>` — `None` when
+neither operand is `Text` — lets both call sites keep borrowing the
+original `&Value`s in that branch instead of cloning, with zero change to
+the coercion behavior itself.
+
+**Baseline numbers** (this commit, `coerce_text_numeric` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind total instructions (`Ir`), 5-iteration 200x20,000 join | 29,812,962,260 |
+| `eval_cmp_vals` self `Ir` | 2,403,630,000 (8.06%) |
+| `coerce_text_numeric` self `Ir` | 1,021,530,000 (3.43%) |
+| `<Value as Clone>::clone` self `Ir` | 1,924,939,255 (6.46%) |
+| `drop_in_place<Value>` self `Ir` | 1,404,189,420 (4.71%) |
+
 ## Bolt: `project_row`'s output-cell `Vec` grows unsized — baseline — 2026-09-14
 
 **Workload**: `benches/profile_project.py` (new) — a fixed-iteration-count
