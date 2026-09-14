@@ -11511,7 +11511,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.17: version() takes no arguments.
         "version" => n == 0,
         // v0.17: date/time built-in batch.
-        "date_part" | "to_char" | "timezone" => n == 2,
+        "date_part" | "to_char" | "timezone" | "to_number" => n == 2,
         "to_date" => n == 2,
         "to_timestamp" => n == 1 || n == 2, // (float8) or (text, text)
         "make_date" => n == 3,
@@ -11567,6 +11567,26 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "asinh" | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd"
         | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" | "trunc" | "log10"
         | "float8send" => eval_math_func(name, vals),
+        // v0.26: to_number(text, text) -> numeric. Parses text with a
+        // numeric format picture (PG's numeric_to_number).
+        "to_number" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let fmt = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(f) => f,
+            };
+            let desc = match crate::numfmt::parse_numfmt(fmt) {
+                Ok(d) => d,
+                Err(e) => return Err(numfmt_exec_err(e)),
+            };
+            match crate::numfmt_fromchar::to_number(s, &desc) {
+                Ok(n) => Ok(Value::Numeric(n)),
+                Err(e) => Err(numfmt_exec_err(e)),
+            }
+        }
         "random" | "setseed" => eval_math_func(name, vals),
         "now"
         | "current_date"
@@ -14451,6 +14471,42 @@ fn fmt_exec_err(e: crate::datetime::FmtErr) -> ExecError {
     }
 }
 
+/// v0.26: `to_char` for numeric values (PG's `numeric_to_char`).
+fn num_to_char(n: &crate::storage::Numeric, fmt: &str, _name: &str) -> Result<Value, ExecError> {
+    let desc = match crate::numfmt::parse_numfmt(fmt) {
+        Ok(d) => d,
+        Err(e) => return Err(numfmt_exec_err(e)),
+    };
+    match crate::numfmt_tochar::numeric_to_char(n, &desc) {
+        Ok(s) => Ok(Value::text(s)),
+        Err(e) => Err(numfmt_exec_err(e)),
+    }
+}
+
+/// v0.26: `to_char` for float values (PG's `float8_to_char`).
+fn float_to_char(v: f64, fmt: &str, _name: &str) -> Result<Value, ExecError> {
+    let desc = match crate::numfmt::parse_numfmt(fmt) {
+        Ok(d) => d,
+        Err(e) => return Err(numfmt_exec_err(e)),
+    };
+    match crate::numfmt_tochar::float8_to_char(v, &desc) {
+        Ok(s) => Ok(Value::text(s)),
+        Err(e) => Err(numfmt_exec_err(e)),
+    }
+}
+
+/// v0.26: map numeric-format errors to PG's codes: 42601
+/// (syntax_error) for bad pictures, 22P02
+/// (invalid_text_representation) for bad input, 0A000
+/// for the unsupported EEEE input path.
+fn numfmt_exec_err(e: crate::numfmt::NumFmtError) -> ExecError {
+    match e {
+        crate::numfmt::NumFmtError::Syntax(msg) => exec_err("42601", msg),
+        crate::numfmt::NumFmtError::InvalidInput(msg) => exec_err("22P02", msg),
+        crate::numfmt::NumFmtError::Unsupported(msg) => exec_err("0A000", msg),
+    }
+}
+
 fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "now" | "current_timestamp" => Ok(Value::Timestamptz(crate::datetime::now_micros())),
@@ -14560,6 +14616,21 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let (days, tod) = match v {
                 Value::Date(d) => (i64::from(*d), 0),
                 Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::split_micros(*m),
+                // v0.26: numeric to_char overloads (PG's numeric_to_char /
+                // float8_to_char); integers widen through numeric.
+                Value::SmallInt(i) => {
+                    let n = crate::storage::Numeric::new(i128::from(*i), 0);
+                    return num_to_char(&n, fmt, name);
+                }
+                Value::Int(i) | Value::BigInt(i) => {
+                    let n = crate::storage::Numeric::new(i128::from(*i), 0);
+                    return num_to_char(&n, fmt, name);
+                }
+                Value::Numeric(n) => return num_to_char(n, fmt, name),
+                Value::Float4(f) => {
+                    return float_to_char(f64::from(*f), fmt, name);
+                }
+                Value::Float(f) => return float_to_char(*f, fmt, name),
                 other => return Err(func_arg_err(name, other)),
             };
             match crate::datetime::format_with_pattern(days, tod, fmt) {
@@ -14815,6 +14886,8 @@ fn func_result_type(
         "to_date" | "make_date" => Ok(ColType::Date),
         "to_timestamp" => Ok(ColType::Timestamptz),
         "to_char" => Ok(ColType::Text),
+        // v0.26: to_number(text, text) returns numeric.
+        "to_number" => Ok(ColType::Numeric),
         // v0.17: version() returns text.
         "version" => Ok(ColType::Text),
         "make_timestamp" => Ok(ColType::Timestamp),

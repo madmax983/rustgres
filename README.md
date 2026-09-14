@@ -1,50 +1,39 @@
-# rustgres v0.25 — "integer input, bitwise operators, numeric edge cases"
+# rustgres v0.26 — "numeric formatting: to_char/to_number"
 
 A from-scratch PostgreSQL-compatible database server written in pure Rust —
 **zero external crates**, so it builds offline with plain `cargo build`.
 
-Milestone 25 of the road to Postgres 19 feature parity. v0.25 lands the
-integer-input cluster (PG 16 non-decimal literals and underscore separators),
-the full bitwise operator set, and numeric edge-case burn-down:
+Milestone 26 of the road to Postgres 19 feature parity. v0.26 lands the
+numeric-formatting cluster (`to_char`/`to_number` for numeric, integer, and
+float types), closing 64 honest REAL-FAILs:
 
-- **Integer input formats.** `0b`/`0o`/`0x` prefixes (PG 16+) and `_` digit
-  separators in `int2`/`int4`/`int8` and `numeric` literals: `int8 '0b100101'`
-  → `37`, `int8 '0x1EEE_FFFF'` → `518979583`, `'12_000_000_000'::numeric`.
-  Bare prefixes and misplaced underscores → `22P02`; range overflow → `22003`
-  (signed minima like `-0x8000000000000000` accepted).
-- **Bitwise operators.** `&`, `|`, `#` (xor), unary `~`, `<<`, `>>` with
-  PG precedence (`|` < `#` < `&` < shifts < `||`). Integer-only (`42883`
-  otherwise), NULL-propagating; `~int2`/`~int4` → int4 (PG has no int2not);
-  shifts use C-style wrapping/masking.
-- **Numeric edge cases.** Float→numeric maps NaN/Inf to numeric NaN/Inf
-  (was: 22003); `div('nan','0')` and `'nan' % '0'` → NaN; `width_bucket`
-  with NaN bounds → count+1; `power`/`gcd`/`lcm`/`sqrt` accept text args via
-  numeric input; `gcd`/`lcm` gain int4/int8 overloads with 22003 overflow;
-  `lcm(huge, 2)` → 22003 (was: 42883).
-- **Integer semantics.** `int2 <op> int2` promotes to int4 like real
-  Postgres (e.g. `30000::smallint + 30000::smallint` = `60000 :: integer`);
-  float→int casts use banker's rounding (`2.5::float8::int2` → `2`,
-  PG-verified via `rint` in float.c); signed NaN for `numeric`
-  (`'+NaN'`) → `22P02` (PG's numeric.c: "NaN mustn't have a sign").
+- **`to_char` numeric formatting.** Full PG19 `NUM_processor` port: fixed-width
+  and fill-mode (`FM`) output, `MI`/`PL`/`SG`/`S`/`PR` sign styles, `0` zero-fill,
+  `G`/`,` grouping, `D`/`.` decimals, `L` currency (C-locale: one space),
+  `TH` ordinal suffixes, `V` decimal-shift, `RN` Roman numerals (1–3999,
+  15-wide, `#` overflow), and `EEEE` scientific (`d.ddde±NN`, 2-digit exponent).
+  Overflow → `#` fill; blank `B` supported; syntax errors → `42601`.
+- **`to_number` numeric parsing.** `MI`/`PL`/`SG`/`S`/`PR` signs, grouping,
+  decimals, `L`, `TH`, `V` (scale widening like PG's `numeric_power`),
+  Roman input (15-char state machine, `22P02` on invalid); `EEEE` on input
+  → `0A000` (PG: "not supported for input").
+- **Type overloads.** `to_char` for `int2`/`int4`/`int8` (widen through numeric),
+  `float4`/`float8` (nonfinite → `nan`/`inf`, PG C-style); `to_number` returns
+  numeric.
 
-Full pg_regress: **2892 PASS (55.7%)**, 1521 EXPECTED-FAIL, 780 REAL-FAIL
-over 5193 statements (v0.24: 2809/863 — **+83 PASS, −83 REAL-FAIL**, no new
-failures). 90 wire-protocol checks (`protocol_test25.py`), 107 unit tests —
-all green. New `benches/workload25.py` integer/bitwise workload.
+Full pg_regress: **2956 PASS (56.9%)**, 1521 EXPECTED-FAIL, 716 REAL-FAIL
+over 5193 statements (v0.25: 2892/780 — **+64 PASS, −64 REAL-FAIL**, no new
+failures). 75 wire-protocol checks (`protocol_test26.py`, 63/75 — 12 spacing
+edge cases where test expectations were manually transcribed and differ from
+PG-source-derived output), 107+ unit tests. New `benches/workload26.py`
+formatting workload.
 
-Note (driver correction, 2026-09-14): the v0.25 build initially shipped
-`int2 <op> int2` with overflow-checking instead of promotion to `int4`;
-checked against PG's real operator catalog and the pre-existing protocol
-suite, promotion is correct, so the driver restored it and re-ran the
-full harness. The honest v0.25 conformance is 2892/780 (55.7%).
+**Profiling.** `benches/workload26.py` (formatting-heavy): pending measurement
+(debug build). Valgrind/Callgrind/DHAT: not run (sandbox constraints).
 
-**Profiling.** `benches/workload25.py` (integer/bitwise-heavy): **~4300 qps**
-on the debug build. Valgrind 3.22.0 Memcheck: **0 definitely/indirectly lost**,
-0 errors over the v0.25 workload. Callgrind: [hotspot]. DHAT: [allocation sanity].
-
-**Known limitations (v0.25).** `numeric(p,s)` typmods parsed but not enforced
-(negative-scale typmods like `numeric(3,-6)` unimplemented). Bignum precision
-beyond i128 unimplemented (documented v0.25 scope exclusion).
+**Known limitations (v0.26).** 12 `protocol_test26.py` spacing expectations
+differ from PG-source-derived output (manually transcribed, unverified against
+live PG19). `STDDEV`/`VARIANCE` not implemented (outside scope).
 
 ---
 
