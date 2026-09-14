@@ -5760,7 +5760,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             // project_row takes the row by value: plain `SELECT *` moves
             // it through with zero copies, and provenance moves rather
             // than cloning.
-            let (cells, prov) = project_row(q, outer, stmt, &schema, r)?;
+            let (cells, prov) = project_row(q, outer, stmt, &schema, r, out_cols.len())?;
             v.push(OutRow {
                 cells,
                 prov,
@@ -8571,13 +8571,17 @@ fn check_bool(v: Value, what: &str) -> Result<bool, ExecError> {
 // Projection (non-aggregated queries)
 // ---------------------------------------------------------------------------
 
-/// Project one joined row to output cells + provenance.
+/// Project one joined row to output cells + provenance. `out_ncols` is the
+/// query's exact output column count (already computed by the caller via
+/// `describe_select`, one per `RowDescription` field), used to size the
+/// cell buffer up front for the explicit-item path below.
 fn project_row(
     q: &mut Q,
     outer: &[Scope],
     stmt: &SelectStmt,
     schema: &[QCol],
     row: QRow,
+    out_ncols: usize,
 ) -> Result<(Row, Vec<(String, u64)>), ExecError> {
     // Fast path: plain `SELECT *` moves the row through untouched — no
     // scope chain, no per-row allocation at all. Disabled when the schema
@@ -8606,7 +8610,7 @@ fn project_row(
     } else {
         Vec::new()
     };
-    let mut cells = Vec::new();
+    let mut cells = Vec::with_capacity(out_ncols);
     for item in &stmt.items {
         match item {
             // v0.23: hidden columns are skipped by `*` (they stay

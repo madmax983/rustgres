@@ -95,14 +95,79 @@ instruction-count floor — the 41.81%/57.70% allocation share clears the
 "≥10% reduction in allocation count or bytes" floor, not the 5%
 instruction floor.
 
-**Fix** (next commit): give `project_row` an `out_ncols: usize` parameter
-(the caller's already-computed `out_cols.len()`) and change
-`Vec::new()` to `Vec::with_capacity(out_ncols)` for the `cells` buffer.
-`exec_agg`'s analogous `let mut cells = Vec::new();` in its per-group
-output loop has the identical mechanism and already has `out_cols` in
-scope as a parameter — fixed in the same commit, though this workload
-(no `GROUP BY`) does not exercise or measure it; see the after-numbers
-note below.
+**Fix**: give `project_row` an `out_ncols: usize` parameter (the caller's
+already-computed `out_cols.len()`) and change `Vec::new()` to
+`Vec::with_capacity(out_ncols)` for the `cells` buffer. `exec_agg`'s
+analogous `let mut cells = Vec::new();` in its per-group output loop has
+the identical mechanism and already has `out_cols` in scope as a
+parameter, but this workload (no `GROUP BY`) doesn't exercise or measure
+it — left untouched, still an unmeasured known follow-up (same status as
+before this entry), not bundled into an unmeasured claim in this pass.
+
+**After numbers** (same harness, same workload, same iteration count,
+same machine, this session; reproduced twice, byte-identical both times):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| DHAT total allocation blocks | 2,870,108 | 2,270,108 | **-20.90%** |
+| DHAT total bytes | 598,967,285 | 483,767,285 | **-19.23%** |
+| Blocks in `project_row`'s `cells` buffer (site-specific) | 1,200,000 | 600,000 | **-50.00%** |
+| Bytes in `project_row`'s `cells` buffer (site-specific) | 345,600,000 | 230,400,000 | **-33.30%** |
+| Callgrind `Ir` (total instructions, context only) | 22,729,866,638 | 22,504,677,284 | -0.99% |
+
+The `Ir` delta is under 1% — expected and non-gating: as noted in the
+baseline profile, `project_row`'s own self-cost is only 1.88% of
+instructions, and most of that workload's instruction count is per-cell
+column-reference resolution and value formatting, not allocator
+bookkeeping (Callgrind's simulated malloc/free cost for two `Vec` growth
+reallocations is small next to 22.7B total instructions even though it
+is 41.81%/57.70% of *allocations*). This change is judged against the
+allocation-count/bytes floor, which it clears by 2-5x.
+
+Both the whole-workload total and the target site clear the "≥10%
+reduction in allocation count or bytes" impact floor by a wide margin.
+The post-fix DHAT top-10 no longer lists `exec::project_row` as an
+allocation site at all: the `cells` buffer now shows up as a single
+`with_capacity_in<rustgres::storage::Value, _>` allocation (600,000
+blocks, one per output row — exactly the predicted single up-front
+allocation to capacity 8, replacing the pre-fix capacity-4-then-8 pair).
+
+**Correctness**: 106 `cargo test --all-features` unit tests pass
+unchanged (same 106 on the pristine tree). `cargo fmt --all -- --check`
+clean. `cargo clippy --all-targets --all-features` shows the same
+pre-existing `eq_op` compile error and 249 warnings as the pristine tree
+(verified via `git stash`/`git stash pop`) — zero new warnings.
+`tests/protocol_test{4,5,6,7,8,9,10,17,18,21,23}.py` (self-managed
+suites covering SELECT/JOIN/GROUP BY/aggregate/window/COPY/numeric/
+merged-USING-join behavior — all exercise `project_row`'s explicit-item
+path extensively) pass unchanged. `protocol_test14.py`/`protocol_test16.py`
+hit a pre-existing, change-independent environment issue when run back
+to back with the rest of the suite in the same shell session: their
+`Server.__init__` does a plain `socket.bind` (no `SO_REUSEADDR`) as an
+"is the port free" probe, which fails against a lingering `TIME_WAIT`
+entry left by the preceding tests' rapid connect/close cycles (`rustgres`
+itself binds fine — `src/net.rs` sets `SO_REUSEADDR` — this only affects
+the test harness's own pre-flight probe). Reproduces identically on the
+pristine tree (same `/proc/net/tcp` `TIME_WAIT` state on port 5433),
+confirming it is pre-existing and unrelated to this change; both suites
+pass once run in isolation after the port clears (verified below).
+
+**Reproduce**:
+
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features   # 106 passed
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_project.py --rows 20000 --count 30
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`
+# for the total, and filter by frames resolving through
+# `rustgres::exec::project_row` (via `ftbl`) for the site-specific share.
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers.
 
 ## Bolt: `compare_values` (ORDER BY) pays NUMERIC normalization for plain-int sorts — baseline — 2026-09-13
 
