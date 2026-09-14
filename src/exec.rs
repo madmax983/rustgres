@@ -10697,20 +10697,32 @@ fn cast_to_int(v: &Value) -> Result<i128, ExecError> {
         Value::Float(f) => float_to_int(*f),
         Value::Text(s) => parse_int_text(s),
         Value::Bool(b) => Ok(*b as i128),
-        // v0.28: bytea -> integer is big-endian binary (empty -> 0).
-        Value::Bytea(b) => {
-            let mut v: i128 = 0;
-            for &byte in b.iter() {
-                v = (v << 8) | (byte as i128);
-            }
-            // Interpret as signed based on the top bit of the first byte.
-            if !b.is_empty() && b[0] & 0x80 != 0 {
-                v -= 1i128 << (b.len() * 8);
-            }
-            Ok(v)
-        }
+        // v0.28: bytea -> integer is width-sensitive (PG's bytea_int2/int4/
+        // int8 reinterpret the bytes at the target width), so it is handled
+        // per-target in eval_cast via cast_bytea_to_int, not here.
         other => Err(cast_err(other, "integer")),
     }
+}
+
+/// v0.28: bytea -> integer cast, following PG 18+ (present in PG 19).
+/// The bytes are the two's complement representation of the integer, most
+/// significant byte first. Fewer bytes than the target width are fine
+/// (empty -> 0); more bytes than the width is 22003 "<type> out of range".
+/// The accumulated bits are reinterpreted as signed *at the target width*,
+/// so e.g. '\xFF'::bytea::int2 is 255 while '\x8000'::bytea::int2 is -32768.
+fn cast_bytea_to_int(b: &[u8], width: usize, type_name: &str) -> Result<i128, ExecError> {
+    if b.len() > width {
+        return Err(exec_err("22003", format!("{} out of range", type_name)));
+    }
+    let mut v: u64 = 0;
+    for &byte in b {
+        v = (v << 8) | u64::from(byte);
+    }
+    Ok(match width {
+        2 => i128::from((v as u16) as i16),
+        4 => i128::from((v as u32) as i32),
+        _ => i128::from(v as i64),
+    })
 }
 
 fn float_to_int(f: f64) -> Result<i128, ExecError> {
@@ -11065,19 +11077,28 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::Text => Ok(text_value_of(&[v])),
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
-            let i = cast_to_int(v)?;
+            let i = match v {
+                Value::Bytea(b) => cast_bytea_to_int(b, 2, "smallint")?,
+                _ => cast_to_int(v)?,
+            };
             i16::try_from(i)
                 .map(Value::SmallInt)
                 .map_err(|_| exec_err("22003", "smallint out of range"))
         }
         ColType::Int => {
-            let i = cast_to_int(v)?;
+            let i = match v {
+                Value::Bytea(b) => cast_bytea_to_int(b, 4, "integer")?,
+                _ => cast_to_int(v)?,
+            };
             i32::try_from(i)
                 .map(|w| Value::Int(w as i64))
                 .map_err(|_| exec_err("22003", "integer out of range"))
         }
         ColType::BigInt => {
-            let i = cast_to_int(v)?;
+            let i = match v {
+                Value::Bytea(b) => cast_bytea_to_int(b, 8, "bigint")?,
+                _ => cast_to_int(v)?,
+            };
             i64::try_from(i)
                 .map(Value::BigInt)
                 .map_err(|_| exec_err("22003", "bigint out of range"))
@@ -12324,7 +12345,10 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 )),
             }
         }
-        // v0.28: bytea bit/byte accessors (PG semantics: bit 0 is MSB of byte 0).
+        // v0.28: bytea bit/byte accessors. PG numbers bits from the right
+        // within each byte: bit 0 is the least significant bit of byte 0
+        // ("bit 0 is the least significant bit of the first byte, and
+        // bit 15 is the most significant bit of the second byte").
         "get_bit" => {
             let b = match &vals[0] {
                 Value::Null => return Ok(Value::Null),
@@ -12335,12 +12359,19 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(n) => n,
             };
-            if bit < 0 || (bit as usize) >= b.len() * 8 {
-                return Err(exec_err("22000", "bit index out of range"));
+            if bit < 0 || bit >= b.len() as i64 * 8 {
+                return Err(exec_err(
+                    "22000",
+                    format!(
+                        "index {} out of valid range, 0..{}",
+                        bit,
+                        b.len() as i64 * 8 - 1
+                    ),
+                ));
             }
             let bit = bit as usize;
             let byte_idx = bit / 8;
-            let bit_idx = 7 - (bit % 8);
+            let bit_idx = bit % 8;
             Ok(Value::Int(((b[byte_idx] >> bit_idx) & 1) as i64))
         }
         "set_bit" => {
@@ -12357,15 +12388,22 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(n) => n,
             };
-            if bit < 0 || (bit as usize) >= b.len() * 8 {
-                return Err(exec_err("22000", "bit index out of range"));
+            if bit < 0 || bit >= b.len() as i64 * 8 {
+                return Err(exec_err(
+                    "22000",
+                    format!(
+                        "index {} out of valid range, 0..{}",
+                        bit,
+                        b.len() as i64 * 8 - 1
+                    ),
+                ));
             }
             if val != 0 && val != 1 {
                 return Err(exec_err("22000", "new bit must be 0 or 1"));
             }
             let bit = bit as usize;
             let byte_idx = bit / 8;
-            let bit_idx = 7 - (bit % 8);
+            let bit_idx = bit % 8;
             let mut out = b;
             if val == 1 {
                 out[byte_idx] |= 1 << bit_idx;
@@ -12384,8 +12422,15 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(n) => n,
             };
-            if idx < 0 || (idx as usize) >= b.len() {
-                return Err(exec_err("22000", "byte index out of range"));
+            if idx < 0 || idx >= b.len() as i64 {
+                return Err(exec_err(
+                    "22000",
+                    format!(
+                        "index {} out of valid range, 0..{}",
+                        idx,
+                        b.len() as i64 - 1
+                    ),
+                ));
             }
             Ok(Value::Int(b[idx as usize] as i64))
         }
@@ -12403,8 +12448,15 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(n) => n,
             };
-            if idx < 0 || (idx as usize) >= b.len() {
-                return Err(exec_err("22000", "byte index out of range"));
+            if idx < 0 || idx >= b.len() as i64 {
+                return Err(exec_err(
+                    "22000",
+                    format!(
+                        "index {} out of valid range, 0..{}",
+                        idx,
+                        b.len() as i64 - 1
+                    ),
+                ));
             }
             if val < 0 || val > 255 {
                 return Err(exec_err("22000", "new byte must be 0..255"));

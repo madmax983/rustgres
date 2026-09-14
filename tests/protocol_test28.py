@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""rustgres v0.28 protocol tests: bytea functions, casts, and bytea_output.
+"""rustgres v0.28 protocol tests: bytea functions, casts, and 0x literals.
 
-RED/GREEN: these tests were written against PostgreSQL 19's
-bytea semantics. They require a running rustgres server on
-port 5433.
+RED/GREEN: expectations are taken from PostgreSQL's own semantics:
+- PG docs: get_bit/set_bit "number bits from the right within each byte;
+  bit 0 is the least significant bit of the first byte, and bit 15 is the
+  most significant bit of the second byte."
+- PG 18+ commit 6da469ba ("Allow casting between bytea and integer types",
+  in PG 19): int<->bytea casts are two's complement, most significant byte
+  first; bytea->int reinterprets at the target width and raises 22003
+  "<type> out of range" only when the bytea is longer than the width.
+- PG 19 strings.sql/strings.out regression expectations for the exact
+  get_bit/get_byte/set_byte/set_bit examples and error messages.
+
+They require a running rustgres server on port 5433.
 
 Run: python3 tests/protocol_test28.py
 """
@@ -107,29 +116,71 @@ def check(name, rows, code, expect_rows=None, expect_code=None):
 def main():
     s, rd = connect()
 
-    # get_byte / set_byte
+    # get_byte / set_byte (PG 19 strings.out expectations)
     # '\x1234567890abcdef00' = [0x12,0x34,0x56,0x78,0x90,0xab,0xcd,0xef,0x00]
     check("get_byte", *sql(s, rd, r"SELECT get_byte('\x1234567890abcdef00'::bytea, 3)"),
           expect_rows=[["120"]])  # 0x78
     check("set_byte", *sql(s, rd, r"SELECT set_byte('\x1234567890abcdef00'::bytea, 7, 11)"),
           expect_rows=[["\\x1234567890abcd0b00"]])  # byte 7 (0xef) -> 0x0b
+    check("get_byte oob", *sql(s, rd, r"SELECT get_byte('\x1234567890abcdef00'::bytea, 99)"),
+          expect_code="22000")
+    check("set_byte oob", *sql(s, rd, r"SELECT set_byte('\x1234567890abcdef00'::bytea, 99, 11)"),
+          expect_code="22000")
 
-    # get_bit / set_bit (bit 0 = MSB of byte 0)
-    # byte 5 = 0xab = 10101011; bit 43 -> byte 5, bit_idx 4 -> (0xab>>4)&1 = 0
+    # get_bit / set_bit: PG numbers bits from the right within each byte
+    # (bit 0 = LSB of byte 0). PG 19 strings.out:
+    #   get_bit('\x1234567890abcdef00'::bytea, 43) -> 1
+    #   set_bit('\x1234567890abcdef00'::bytea, 43, 0) -> \x1234567890a3cdef00
+    # (byte 5 = 0xab = 10101011; bit 43 is bit 3 of byte 5, LSB-first)
     check("get_bit", *sql(s, rd, r"SELECT get_bit('\x1234567890abcdef00'::bytea, 43)"),
+          expect_rows=[["1"]])
+    check("set_bit 0", *sql(s, rd, r"SELECT set_bit('\x1234567890abcdef00'::bytea, 43, 0)"),
+          expect_rows=[["\\x1234567890a3cdef00"]])
+    check("get_bit oob", *sql(s, rd, r"SELECT get_bit('\x1234567890abcdef00'::bytea, 99)"),
+          expect_code="22000")
+    check("set_bit oob", *sql(s, rd, r"SELECT set_bit('\x1234567890abcdef00'::bytea, 99, 0)"),
+          expect_code="22000")
+    check("set_bit bad value", *sql(s, rd, r"SELECT set_bit('\x00'::bytea, 0, 2)"),
+          expect_code="22000")
+    # Asymmetric bytes pin the LSB-first numbering down:
+    # bit 0 of 0x01 is 1; bit 0 of 0x80 is 0; bit 7 of 0x80 is 1.
+    check("get_bit lsb", *sql(s, rd, r"SELECT get_bit('\x01'::bytea, 0)"),
+          expect_rows=[["1"]])
+    check("get_bit msb", *sql(s, rd, r"SELECT get_bit('\x80'::bytea, 0)"),
           expect_rows=[["0"]])
-    # set bit 43 to 1: 0xab (10101011) | 0x10 = 0xbb (10111011)
-    check("set_bit 1", *sql(s, rd, r"SELECT set_bit('\x1234567890abcdef00'::bytea, 43, 1)"),
-          expect_rows=[["\\x1234567890bbcdef00"]])
+    check("get_bit msb7", *sql(s, rd, r"SELECT get_bit('\x80'::bytea, 7)"),
+          expect_rows=[["1"]])
+    # set_bit('\x00', 0, 1) sets the least significant bit -> \x01
+    check("set_bit lsb", *sql(s, rd, r"SELECT set_bit('\x00'::bytea, 0, 1)"),
+          expect_rows=[["\\x01"]])
 
     # bit_count
     check("bit_count", *sql(s, rd, r"SELECT bit_count('\x1234567890'::bytea)"),
           expect_rows=[["15"]])
 
-    # int2 <-> bytea (big-endian binary)
-    check("int2 to bytea", *sql(s, rd, r"SELECT 4660::int2::bytea"),
+    # PG 16+ non-decimal integer literals
+    check("hex literal", *sql(s, rd, r"SELECT 0x1234"), expect_rows=[["4660"]])
+    check("hex literal neg", *sql(s, rd, r"SELECT -0x1234"), expect_rows=[["-4660"]])
+    check("oct literal", *sql(s, rd, r"SELECT 0o17"), expect_rows=[["15"]])
+    check("bin literal", *sql(s, rd, r"SELECT 0b101"), expect_rows=[["5"]])
+    check("hex literal big", *sql(s, rd, r"SELECT 0x1122334455667788"),
+          expect_rows=[["1234605616436508552"]])
+    check("bare 0x", *sql(s, rd, r"SELECT 0x"), expect_code="42601")
+    # PG16+: underscores only between digits; identifier chars glued to a
+    # non-decimal literal are "trailing junk" (42601), never an alias.
+    check("hex underscore", *sql(s, rd, r"SELECT 0x1_FF"), expect_rows=[["511"]])
+    check("hex doubled underscore", *sql(s, rd, r"SELECT 0x1__2"), expect_code="42601")
+    check("hex trailing underscore", *sql(s, rd, r"SELECT 0x1_"), expect_code="42601")
+    check("hex leading underscore", *sql(s, rd, r"SELECT 0x_12"), expect_code="42601")
+    check("hex trailing junk", *sql(s, rd, r"SELECT 0x1G"), expect_code="42601")
+    check("bin bad digit", *sql(s, rd, r"SELECT 0b12"), expect_code="42601")
+    check("oct bad digit", *sql(s, rd, r"SELECT 0o89"), expect_code="42601")
+
+    # int2 <-> bytea (PG 19 strings.out expectations, two's complement,
+    # most significant byte first)
+    check("int2 to bytea", *sql(s, rd, r"SELECT 0x1234::int2::bytea"),
           expect_rows=[["\\x1234"]])
-    check("int2 to bytea neg", *sql(s, rd, r"SELECT (-4660)::int2::bytea"),
+    check("int2 to bytea neg", *sql(s, rd, r"SELECT (-0x1234)::int2::bytea"),
           expect_rows=[["\\xedcc"]])
     check("bytea to int2", *sql(s, rd, r"SELECT '\x12'::bytea::int2"),
           expect_rows=[["18"]])
@@ -137,20 +188,40 @@ def main():
           expect_rows=[["-32768"]])
     check("bytea empty to int2", *sql(s, rd, r"SELECT ''::bytea::int2"),
           expect_rows=[["0"]])
+    # Short bytea reinterprets at the target width: '\xFF' -> 255, not -1
+    check("bytea to int2 ff", *sql(s, rd, r"SELECT '\xFF'::bytea::int2"),
+          expect_rows=[["255"]])
+    check("bytea too long int2", *sql(s, rd, r"SELECT '\x123456'::bytea::int2"),
+          expect_code="22003")
 
     # int4 <-> bytea
-    check("int4 to bytea", *sql(s, rd, r"SELECT 305419896::int4::bytea"),
+    check("int4 to bytea", *sql(s, rd, r"SELECT 0x12345678::int4::bytea"),
           expect_rows=[["\\x12345678"]])
+    check("int4 to bytea neg", *sql(s, rd, r"SELECT (-0x12345678)::int4::bytea"),
+          expect_rows=[["\\xedcba988"]])
     check("bytea to int4", *sql(s, rd, r"SELECT '\x12345678'::bytea::int4"),
           expect_rows=[["305419896"]])
     check("bytea to int4 neg", *sql(s, rd, r"SELECT '\x80000000'::bytea::int4"),
           expect_rows=[["-2147483648"]])
+    # '\x8000' as int4 is positive: sign comes from the target width
+    check("bytea to int4 8000", *sql(s, rd, r"SELECT '\x8000'::bytea::int4"),
+          expect_rows=[["32768"]])
+    check("bytea too long int4", *sql(s, rd, r"SELECT '\x123456789A'::bytea::int4"),
+          expect_code="22003")
 
     # int8 <-> bytea
-    check("int8 to bytea", *sql(s, rd, r"SELECT 1234605616436508552::int8::bytea"),
+    check("int8 to bytea", *sql(s, rd, r"SELECT 0x1122334455667788::int8::bytea"),
           expect_rows=[["\\x1122334455667788"]])
+    check("int8 to bytea neg", *sql(s, rd, r"SELECT (-0x1122334455667788)::int8::bytea"),
+          expect_rows=[["\\xeeddccbbaa998878"]])
     check("bytea to int8", *sql(s, rd, r"SELECT '\x1122334455667788'::bytea::int8"),
           expect_rows=[["1234605616436508552"]])
+    check("bytea to int8 min", *sql(s, rd, r"SELECT '\x8000000000000000'::bytea::int8"),
+          expect_rows=[["-9223372036854775808"]])
+    check("bytea to int8 max", *sql(s, rd, r"SELECT '\x7FFFFFFFFFFFFFFF'::bytea::int8"),
+          expect_rows=[["9223372036854775807"]])
+    check("bytea too long int8", *sql(s, rd, r"SELECT '\x112233445566778899'::bytea::int8"),
+          expect_code="22003")
 
     s.close()
     print(f"{PASSED}/{CHECKS} passed")

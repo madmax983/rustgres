@@ -67,6 +67,18 @@ fn err_duplicate(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v0.28: parse the digits of a PG 16+ non-decimal integer literal (the
+/// `0x`/`0o`/`0b` prefix is already stripped). Underscores between digits
+/// are ignored, like Postgres. Returns None when there are no digits or
+/// the value overflows i64.
+fn parse_int_radix(digits: &str, radix: u32) -> Option<i64> {
+    let clean: String = digits.chars().filter(|&c| c != '_').collect();
+    if clean.is_empty() {
+        return None;
+    }
+    i64::from_str_radix(&clean, radix).ok()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Ident(String), // folded to lowercase unless double-quoted
@@ -597,24 +609,64 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
             {
                 let start = i;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i < chars.len() && chars[i] == '.' {
-                    i += 1;
+                // v0.28: PG 16+ non-decimal integer literals: 0x/0X hex,
+                // 0o/0O octal, 0b/0B binary. Underscores may separate digits.
+                let radix = if c == '0' && i + 1 < chars.len() {
+                    match chars[i + 1] {
+                        'x' | 'X' => Some(16u32),
+                        'o' | 'O' => Some(8u32),
+                        'b' | 'B' => Some(2u32),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(r) = radix {
+                    i += 2;
+                    // PG: underscores may only appear *between* digits, so
+                    // only consume one when a digit follows it.
+                    let mut prev_was_digit = false;
+                    while i < chars.len() {
+                        let ch = chars[i];
+                        if ch.is_digit(r) {
+                            prev_was_digit = true;
+                            i += 1;
+                        } else if ch == '_'
+                            && prev_was_digit
+                            && i + 1 < chars.len()
+                            && chars[i + 1].is_digit(r)
+                        {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // v0.28: PG 16+ rejects an identifier char immediately
+                    // after a numeric literal ("trailing junk after numeric
+                    // literal", 42601) instead of reading it as an alias.
+                    if i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
+                        return Err(err("trailing junk after numeric literal"));
+                    }
+                } else {
                     while i < chars.len() && chars[i].is_ascii_digit() {
                         i += 1;
                     }
-                }
-                if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
-                    let mut j = i + 1;
-                    if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
-                        j += 1;
-                    }
-                    if j < chars.len() && chars[j].is_ascii_digit() {
-                        i = j;
+                    if i < chars.len() && chars[i] == '.' {
+                        i += 1;
                         while i < chars.len() && chars[i].is_ascii_digit() {
                             i += 1;
+                        }
+                    }
+                    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                        let mut j = i + 1;
+                        if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                            j += 1;
+                        }
+                        if j < chars.len() && chars[j].is_ascii_digit() {
+                            i = j;
+                            while i < chars.len() && chars[i].is_ascii_digit() {
+                                i += 1;
+                            }
                         }
                     }
                 }
@@ -3370,7 +3422,18 @@ impl Parser {
             Token::Number(raw) => {
                 // v0.7: integer literals outside the int4 range become
                 // bigint, like Postgres.
-                if let Ok(i) = raw.parse::<i64>() {
+                // v0.28: PG 16+ 0x/0o/0b integer literals (lexed above).
+                let ival: Option<i64> = if raw.len() > 2 && raw.as_bytes()[0] == b'0' {
+                    match raw.as_bytes()[1] {
+                        b'x' | b'X' => parse_int_radix(&raw[2..], 16),
+                        b'o' | b'O' => parse_int_radix(&raw[2..], 8),
+                        b'b' | b'B' => parse_int_radix(&raw[2..], 2),
+                        _ => raw.parse().ok(),
+                    }
+                } else {
+                    raw.parse().ok()
+                };
+                if let Some(i) = ival {
                     if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                         Ok(Literal::Int(i))
                     } else {
