@@ -91,6 +91,10 @@ fn parse_int_radix(digits: &str, radix: u32) -> Option<i64> {
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Ident(String), // folded to lowercase unless double-quoted
+    /// v0.36: double-quoted identifier, kept verbatim (no case folding).
+    /// Quoted identifiers are never keywords, and quoted `"char"` is
+    /// PG's one-byte "char" type (OID 18), not `character(1)`.
+    QIdent(String),
     Number(String),
     Str(String),
     UStr(String),   // v0.19: U&'...' raw content (UESCAPE handled by parser)
@@ -532,6 +536,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             }
             '"' => {
                 // double-quoted identifier: kept verbatim (no case folding)
+                // v0.36: distinct QIdent token so the parser can tell
+                // quoted `"char"` (PG's 1-byte type) from unquoted `char`
+                // (character(1)); quoted identifiers are never keywords.
                 i += 1;
                 let mut s = String::new();
                 loop {
@@ -551,7 +558,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                         i += 1;
                     }
                 }
-                toks.push(Token::Ident(s));
+                toks.push(Token::QIdent(s));
             }
             // v0.24: `$tag$...$tag$` dollar-quoted string, or `$N`
             // parameter placeholder. A `$` that opens neither falls to
@@ -2461,6 +2468,16 @@ impl Parser {
         self.tokens.get(self.pos + 2).unwrap_or(&Token::EOF)
     }
 
+    /// v0.36: the text of a peeked identifier, whether bare (folded) or
+    /// double-quoted (verbatim). Used at identifier positions where both
+    /// forms are legal names; keyword checks keep matching `Ident` only.
+    fn peek_ident(&self) -> Option<&str> {
+        match self.peek() {
+            Token::Ident(s) | Token::QIdent(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     fn next(&mut self) -> Token {
         let t = self.peek().clone();
         if self.pos < self.tokens.len() {
@@ -2518,6 +2535,9 @@ impl Parser {
     fn expect_ident(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Ident(s) => Ok(s),
+            // v0.36: double-quoted identifiers are valid anywhere a name
+            // is expected; the verbatim text is the name.
+            Token::QIdent(s) => Ok(s),
             Token::UIdent(raw) => {
                 // v0.24: U&"..." with optional UESCAPE 'c' clause.
                 let escape = self.parse_uescape()?;
@@ -2657,7 +2677,7 @@ impl Parser {
                 // ANALYZE [table]
                 let table = match self.peek() {
                     Token::EOF => None,
-                    Token::Ident(_) => Some(self.expect_ident()?),
+                    Token::Ident(_) | Token::QIdent(_) => Some(self.expect_ident()?),
                     other => {
                         return Err(err(format!("syntax error: unexpected {:?}", other)));
                     }
@@ -2701,7 +2721,30 @@ impl Parser {
     /// `timestamp with time zone` are accepted; `numeric(p[,s])`
     /// precision/scale are parsed but not enforced (documented).
     fn parse_type_name(&mut self) -> Result<ColType, SqlError> {
+        // v0.36: a double-quoted name resolves case-sensitively; quoted
+        // `"char"` is PG's one-byte "char" type (OID 18), not character(1).
+        if let Token::QIdent(name) = self.peek() {
+            let name = name.clone();
+            self.next();
+            return self.parse_quoted_type_name(name);
+        }
         let name = self.expect_ident()?;
+        self.parse_type_name_rest(name)
+    }
+
+    /// v0.36: resolve a double-quoted type name. Quoted `"char"` is PG's
+    /// one-byte "char" type (OID 18), which takes no typmod; every other
+    /// name resolves exactly like its unquoted spelling (so `"text"`,
+    /// `"bpchar"` keep working, while `"CHAR"` stays unknown, like PG).
+    fn parse_quoted_type_name(&mut self, name: String) -> Result<ColType, SqlError> {
+        if name == "char" {
+            if *self.peek() == Token::LParen {
+                return Err(err(
+                    "syntax error: type modifier is not allowed for type \"char\"".to_string(),
+                ));
+            }
+            return Ok(ColType::SingleChar);
+        }
         self.parse_type_name_rest(name)
     }
 
@@ -3595,8 +3638,9 @@ impl Parser {
             if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
-            } else if let Token::Ident(q) = self.peek() {
-                let q = q.clone();
+            } else if let Some(q) = self.peek_ident() {
+                // v0.36: `qual.*` with a double-quoted qualifier.
+                let q = q.to_string();
                 if *self.peek2() == Token::Dot && *self.peek3() == Token::Star {
                     self.next();
                     self.next();
@@ -4060,12 +4104,22 @@ impl Parser {
         // (pg_regress conformance). The text is stored as-is; the column
         // coercion applies the target type's input function, matching
         // PostgreSQL assignment semantics (including 22P02 on bad input).
-        if let Token::Ident(name) = self.peek() {
+        // v0.36: a double-quoted type name (`"char" 'c'`) works too.
+        if let Some(name) = self.peek_ident() {
+            let quoted = matches!(self.peek(), Token::QIdent(_));
+            // v0.36: quoted type names resolve case-sensitively, so only
+            // exact lowercase spellings pass `is_type_start` (`"char"` is
+            // the 1-byte type; `"CHAR"` is not a type at all).
             if Self::is_type_start(name) {
-                let name = name.clone();
+                let name = name.to_string();
                 let save = self.pos;
                 self.next(); // consume the type name
-                if self.parse_type_name_rest(name).is_ok() {
+                let ty = if quoted {
+                    self.parse_quoted_type_name(name)
+                } else {
+                    self.parse_type_name_rest(name)
+                };
+                if ty.is_ok() {
                     if let Token::Str(s) = self.next() {
                         return Ok(InsertValue::Lit(Literal::Text(s.into())));
                     }
@@ -4674,6 +4728,56 @@ impl Parser {
                 }
                 Ok(Expr::Column { table: None, name })
             }
+            // v0.36: double-quoted identifier in expression position. Like
+            // PG, quoted names are never keywords: no EXISTS/CAST/typed-
+            // literal special forms (except `"char" 'c'`), but quoted
+            // function names, qualified refs, and (function-style) casts
+            // work.
+            Token::QIdent(name) => {
+                let name = name.clone();
+                self.next();
+                // Typed literal `"char" 'c'` (and `"date" '...'`, etc.):
+                // backtrack when no string literal follows, like unquoted.
+                if Self::is_type_start(&name) {
+                    let save = self.pos;
+                    if let Ok(to) = self.parse_quoted_type_name(name.clone()) {
+                        if let Token::Str(s) = self.peek() {
+                            let s = s.clone();
+                            self.next();
+                            return Ok(Expr::Cast {
+                                expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
+                                to,
+                            });
+                        }
+                    }
+                    self.pos = save;
+                }
+                // Function-style cast `"char"(expr)`: parse_call would
+                // resolve the name to character(1), so handle it here.
+                if name == "char" && *self.peek() == Token::LParen {
+                    self.next();
+                    let expr = self.parse_or()?;
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(Expr::Cast {
+                        expr: Box::new(expr),
+                        to: ColType::SingleChar,
+                    });
+                }
+                // Quoted function call `"name"(...)`?
+                if *self.peek() == Token::LParen {
+                    return self.parse_call(name);
+                }
+                // Qualified ref `"table".column`?
+                if *self.peek() == Token::Dot {
+                    self.next();
+                    let col = self.expect_ident()?;
+                    return Ok(Expr::Column {
+                        table: Some(name),
+                        name: col,
+                    });
+                }
+                Ok(Expr::Column { table: None, name })
+            }
             other => Err(err(format!(
                 "syntax error: expected expression, found {:?}",
                 other
@@ -5183,6 +5287,13 @@ impl Parser {
                 self.next();
                 Ok(Some(s))
             }
+            // v0.36: a double-quoted alias may be any word, even a
+            // reserved one (like PG).
+            Token::QIdent(s) => {
+                let s = s.clone();
+                self.next();
+                Ok(Some(s))
+            }
             // v0.24: bare U&"..." alias; expect_ident handles UESCAPE.
             Token::UIdent(_) => Ok(Some(self.expect_ident()?)),
             _ => Ok(None),
@@ -5581,7 +5692,7 @@ impl Parser {
         // v0.14: `VACUUM ANALYZE` (pg_regress conformance).
         let analyze = self.eat_keyword("analyze");
         let table = match self.peek() {
-            Token::Ident(_) => Some(self.expect_ident()?),
+            Token::Ident(_) | Token::QIdent(_) => Some(self.expect_ident()?),
             _ => None,
         };
         Ok(Stmt::Vacuum {
@@ -5606,8 +5717,9 @@ impl Parser {
             if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
-            } else if let Token::Ident(q) = self.peek() {
-                let q = q.clone();
+            } else if let Some(q) = self.peek_ident() {
+                // v0.36: `qual.*` with a double-quoted qualifier.
+                let q = q.to_string();
                 // `qual.*` — but only when a `*` really follows the dot;
                 // `qual.col` is a normal expression.
                 if *self.peek2() == Token::Dot && *self.peek3() == Token::Star {
@@ -6084,6 +6196,13 @@ impl Parser {
                 self.next();
                 Ok(s)
             }
+            // v0.36: a double-quoted derived-table alias may be any word
+            // (like PG).
+            Token::QIdent(s) => {
+                let s = s.clone();
+                self.next();
+                Ok(s)
+            }
             _ => {
                 let n = self.unnamed_seq;
                 self.unnamed_seq += 1;
@@ -6445,7 +6564,8 @@ impl Parser {
                 self.next(); // (
                 loop {
                     match self.next() {
-                        Token::Ident(n) => columns.push(n),
+                        // v0.36: double-quoted column names.
+                        Token::Ident(n) | Token::QIdent(n) => columns.push(n),
                         other => {
                             return Err(err(format!(
                                 "syntax error: expected column name, found {:?}",

@@ -4464,7 +4464,8 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Float(_) => ColType::Float,
         Value::Numeric(_) => ColType::Numeric,
         Value::Text(_) => ColType::Text,
-        Value::BpChar(_) => ColType::Char(None), // v0.35
+        Value::BpChar(_) => ColType::Char(None),     // v0.35
+        Value::SingleChar(_) => ColType::SingleChar, // v0.36
         Value::Bool(_) => ColType::Bool,
         Value::Date(_) => ColType::Date,
         Value::Timestamp(_) => ColType::Timestamp,
@@ -8949,6 +8950,11 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.push(13);
             out.extend_from_slice(u);
         }
+        // v0.36: the one-byte "char" value groups by its byte.
+        Value::SingleChar(b) => {
+            out.push(14);
+            out.push(*b);
+        }
     }
 }
 
@@ -10132,6 +10138,9 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
         (Value::Timestamptz(z), Value::Timestamp(t)) => Ok(Some(z.cmp(t))),
         (Value::Bytea(x), Value::Bytea(y)) => Ok(Some(x.cmp(y))),
         (Value::Uuid(x), Value::Uuid(y)) => Ok(Some(x.cmp(y))),
+        // v0.36: PG's "char" comparison is a plain byte comparison
+        // (chareq/charlt compare the single byte).
+        (Value::SingleChar(x), Value::SingleChar(y)) => Ok(Some(x.cmp(y))),
         _ => Err(exec_err(
             "42883",
             format!(
@@ -11477,6 +11486,28 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 }
             }
         },
+        // v0.36: casts to PG's one-byte `"char"` type go through charin
+        // (char.c): `\ooo` is a bytea-style octal escape, otherwise the
+        // FIRST byte wins (empty is NUL); charin is total, never errors.
+        // int4 -> "char" is i4tochar (explicit): -128..=127 else 22003
+        // `"char" out of range`. Like PG, text/bpchar/int4 are the only
+        // sources with a cast to "char".
+        ColType::SingleChar => match v {
+            Value::Text(s) => Ok(Value::SingleChar(crate::storage::char_in(s))),
+            // A bpchar source goes through text(bpchar) first (rtrim),
+            // like PG's cast chain.
+            Value::BpChar(s) => Ok(Value::SingleChar(crate::storage::char_in(
+                crate::storage::rtrim_spaces(s),
+            ))),
+            Value::Int(i) => {
+                if !(-128..=127).contains(i) {
+                    Err(exec_err("22003", "\"char\" out of range"))
+                } else {
+                    Ok(Value::SingleChar(*i as u8))
+                }
+            }
+            other => Err(cast_err(other, "\"char\"")),
+        },
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
             let i = match v {
@@ -11490,6 +11521,8 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::Int => {
             let i = match v {
                 Value::Bytea(b) => cast_bytea_to_int(b, 4, "integer")?,
+                // v0.36: "char" -> int4 is chartoi4: the byte as SIGNED int8.
+                Value::SingleChar(b) => i128::from(*b as i8),
                 _ => cast_to_int(v)?,
             };
             i32::try_from(i)
@@ -12049,6 +12082,23 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     check_builtin_arity(name, vals)?;
     // v0.16: `substr` is a true alias of `substring` (same semantics).
     let name = if name == "substr" { "substring" } else { name };
+    // v0.36: PG's "char"->text cast is IMPLICIT, so a "char" argument
+    // coerces to text for any function (e.g. length('\377'::"char") = 4).
+    // Coerce up front; non-text functions will still reject the text
+    // value with their usual type error, like PG.
+    let coerced: Vec<Value>;
+    let vals: &[Value] = if vals.iter().any(|v| matches!(v, Value::SingleChar(_))) {
+        coerced = vals
+            .iter()
+            .map(|v| match v {
+                Value::SingleChar(b) => Value::text(crate::storage::char_out(*b)),
+                v => v.clone(),
+            })
+            .collect();
+        &coerced
+    } else {
+        vals
+    };
     match name {
         "upper"
         | "lower"
@@ -13364,6 +13414,13 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
+            // v0.36: PG's one-byte `"char"` type (the quotes are part of
+            // the name; like PG it never folds case, so this check runs
+            // on the un-lowercased spelling). charin is total: every
+            // input is valid.
+            if typ.trim() == "\"char\"" {
+                return Ok(Value::Bool(true));
+            }
             match typ.to_ascii_lowercase().as_str() {
                 "bytea" => Ok(Value::Bool(crate::storage::parse_bytea(input).is_ok())),
                 // v0.35: character types with typmod, via the same
@@ -16404,6 +16461,8 @@ fn compare_values(
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        // v0.36: PG's "char" ordering is a plain byte comparison.
+        (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),
         _ => {
             return Err(exec_err(
                 "42804",
@@ -16479,7 +16538,8 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Float(_) => "float",
         Value::Numeric(_) => "numeric",
         Value::Text(_) => "text",
-        Value::BpChar(_) => "character", // v0.35
+        Value::BpChar(_) => "character",    // v0.35
+        Value::SingleChar(_) => "\"char\"", // v0.36
         Value::Bool(_) => "boolean",
         Value::Date(_) => "date",
         Value::Timestamp(_) => "timestamp",
@@ -17906,6 +17966,13 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             eval_char_assign(s, *n, false)
         }
+        // v0.36: parameter input for "char" goes through charin (total:
+        // first byte wins, empty is NUL; never errors).
+        ColType::SingleChar => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            Ok(Value::SingleChar(crate::storage::char_in(s)))
+        }
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
@@ -18182,6 +18249,10 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
+        // v0.36: a "char" parameter substitutes as its charout text;
+        // downstream charin re-applies the input function (round-trips,
+        // since charout is charin's fixed point for single bytes).
+        Some(Value::SingleChar(b)) => Literal::Text(crate::storage::char_out(*b).into()),
         Some(Value::Bool(b)) => Literal::Bool(*b),
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
@@ -18258,8 +18329,9 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Float => Value::Float(0.0),
         ColType::Numeric => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::text(""),
-        ColType::Char(_) => Value::bpchar(""),  // v0.35
-        ColType::Varchar(_) => Value::text(""), // v0.35
+        ColType::Char(_) => Value::bpchar(""),       // v0.35
+        ColType::Varchar(_) => Value::text(""),      // v0.35
+        ColType::SingleChar => Value::SingleChar(0), // v0.36
         ColType::Bool => Value::Bool(false),
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),

@@ -45,12 +45,16 @@ pub enum ColType {
     // unlimited `character varying`.
     Char(Option<i32>),    // OID 1042
     Varchar(Option<i32>), // OID 1043
-    Bool,                 // OID 16
-    Date,                 // OID 1082 (v0.7)
-    Timestamp,            // OID 1114 (v0.7)
-    Timestamptz,          // OID 1184 (v0.7)
-    Bytea,                // OID 17 (v0.7)
-    Uuid,                 // OID 2950 (v0.7)
+    // v0.36: PG's one-byte `"char"` type (OID 18), written double-quoted
+    // to distinguish it from `character(1)`. A single byte, not a
+    // character: multibyte UTF-8 input is rejected by charin.
+    SingleChar,  // OID 18 ("char")
+    Bool,        // OID 16
+    Date,        // OID 1082 (v0.7)
+    Timestamp,   // OID 1114 (v0.7)
+    Timestamptz, // OID 1184 (v0.7)
+    Bytea,       // OID 17 (v0.7)
+    Uuid,        // OID 2950 (v0.7)
 }
 
 impl ColType {
@@ -63,6 +67,7 @@ impl ColType {
             ColType::Text => 25,          // TEXT
             ColType::Char(_) => 1042,     // BPCHAR (v0.35)
             ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
+            ColType::SingleChar => 18,    // "char" (v0.36)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -88,6 +93,8 @@ impl ColType {
             // wire column names only need the base name.
             ColType::Char(_) => "character",
             ColType::Varchar(_) => "character varying",
+            // v0.36: PG's typname for OID 18 is `"char"` (with quotes).
+            ColType::SingleChar => "\"char\"",
             ColType::Bool => "boolean",
             ColType::Date => "date",
             ColType::Timestamp => "timestamp without time zone",
@@ -112,6 +119,9 @@ impl ColType {
             // and `CAST(x AS varchar(n))` ones `varchar`.
             ColType::Char(_) => "bpchar",
             ColType::Varchar(_) => "varchar",
+            // v0.36: PG labels `SELECT 'a'::"char"` columns bare `char`
+            // (char.out), even though the catalog typname is `"char"`.
+            ColType::SingleChar => "char",
             ColType::Bool => "bool",
             ColType::Date => "date",
             ColType::Timestamp => "timestamp",
@@ -1507,6 +1517,9 @@ pub enum Value {
     // distinct from Text so comparisons, octet_length, and output typing
     // can apply PG's trailing-space rules.
     BpChar(Arc<str>),
+    // v0.36: PG's one-byte `"char"` value (OID 18): a raw byte 0-255.
+    // A u8 (not char) so high-bit bytes and NUL round-trip exactly.
+    SingleChar(u8),
     Bool(bool),
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
@@ -1548,6 +1561,9 @@ impl Value {
             // v0.35: bpchar is stored blank-padded; the wire shows the
             // padded bytes, like Postgres.
             Value::BpChar(s) => Some(s.to_string()),
+            // v0.36: PG's charout: NUL renders empty, high-bit bytes as
+            // `\ooo` octal escapes, other bytes as themselves.
+            Value::SingleChar(b) => Some(char_out(*b)),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
@@ -1593,6 +1609,12 @@ impl Value {
                 out.extend_from_slice(s.as_bytes());
                 true
             }
+            // v0.36: PG's charout, written directly (usually 1 byte, or
+            // 4 for a `\ooo` octal escape, or 0 for NUL).
+            Value::SingleChar(b) => {
+                char_out_into(*b, out);
+                true
+            }
             Value::Bool(b) => {
                 out.push(if *b { b't' } else { b'f' });
                 true
@@ -1627,6 +1649,8 @@ impl Value {
             Value::Numeric(_) => "numeric",
             Value::Text(_) => "text",
             Value::BpChar(_) => "character", // v0.35
+            // v0.36: PG's format_type(18) renders `"char"` (quoted).
+            Value::SingleChar(_) => "\"char\"",
             Value::Bool(_) => "boolean",
             Value::Date(_) => "date",
             Value::Timestamp(_) => "timestamp without time zone",
@@ -1650,6 +1674,7 @@ impl Value {
             // v0.35: the value alone doesn't record the typmod; Char(None)
             // is the honest fallback (bare `character`).
             Value::BpChar(_) => ColType::Char(None),
+            Value::SingleChar(_) => ColType::SingleChar, // v0.36
             Value::Bool(_) => ColType::Bool,
             Value::Date(_) => ColType::Date,
             Value::Timestamp(_) => ColType::Timestamp,
@@ -1681,6 +1706,58 @@ fn bytea_text(b: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// v0.36: PG's `charout` for the one-byte `"char"` type: byte 0 renders
+/// as the empty string (a C string can't hold NUL), bytes with the high
+/// bit set render as `\ooo` octal escapes, every other byte renders as
+/// itself. (char.out: `'\377'::"char"` -> `\377`, `'\000'` -> empty.)
+pub(crate) fn char_out(b: u8) -> String {
+    if b == 0 {
+        String::new()
+    } else if b >= 0x80 {
+        format!("\\{:03o}", b)
+    } else {
+        (b as char).to_string()
+    }
+}
+
+/// v0.36: `charout` writing UTF-8 bytes straight into `out` (the `\ooo`
+/// escape is pure ASCII, so this is byte-exact).
+pub(crate) fn char_out_into(b: u8, out: &mut Vec<u8>) {
+    if b == 0 {
+        // NUL renders as the empty string.
+    } else if b >= 0x80 {
+        const OCT: &[u8; 8] = b"01234567";
+        out.push(b'\\');
+        out.push(OCT[(b >> 6) as usize]);
+        out.push(OCT[((b >> 3) & 7) as usize]);
+        out.push(OCT[(b & 7) as usize]);
+    } else {
+        out.push(b);
+    }
+}
+
+/// v0.36: PG's `charin` for the one-byte `"char"` type (char.c, PG19).
+/// Exact rules:
+/// - exactly 4 bytes `\ooo` (backslash + 3 octal digits) -> the byte value
+/// - otherwise the FIRST byte, silently discarding the rest (a
+///   backwards-compatibility provision, per the char.c comment); the empty
+///   string is NUL (ch[0] of "" is '\0')
+/// `charin` is total: it never errors.
+pub(crate) fn char_in(s: &str) -> u8 {
+    let b = s.as_bytes();
+    if b.len() == 4
+        && b[0] == b'\\'
+        && (b'0'..=b'7').contains(&b[1])
+        && (b'0'..=b'7').contains(&b[2])
+        && (b'0'..=b'7').contains(&b[3])
+    {
+        ((b[1] - b'0') << 6) | ((b[2] - b'0') << 3) | (b[3] - b'0')
+    } else {
+        // First byte; empty input -> NUL.
+        b.first().copied().unwrap_or(0)
+    }
 }
 
 /// v0.29: PG bytea `escape` output format (docs Table 8.8): printable ASCII

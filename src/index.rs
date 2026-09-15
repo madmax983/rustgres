@@ -66,6 +66,8 @@ pub fn index_key_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        // v0.36: PG's "char" btree opclass compares the single byte.
+        (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),
         // Total fallback: values of different types can never share one
         // indexed column, but the B-tree still needs a total order.
         _ => type_tag(a).cmp(&type_tag(b)),
@@ -138,6 +140,8 @@ fn type_tag(v: &Value) -> u8 {
         Value::Timestamptz(_) => 11,
         Value::Bytea(_) => 12,
         Value::Uuid(_) => 13,
+        // v0.36: "char" gets its own tag after v0.35's (append-only).
+        Value::SingleChar(_) => 14,
     }
 }
 

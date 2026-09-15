@@ -629,6 +629,11 @@ impl Enc {
                 self.i32(n.unwrap_or(-1));
                 return;
             }
+            // v0.36: the one-byte "char" type; tag appends after v0.35's.
+            ColType::SingleChar => {
+                self.u8(15);
+                return;
+            }
         });
     }
 
@@ -693,6 +698,11 @@ impl Enc {
             Value::BpChar(s) => {
                 self.u8(14);
                 self.str(s);
+            }
+            // v0.36: one-byte "char" values; tag appends after v0.35's.
+            Value::SingleChar(b) => {
+                self.u8(15);
+                self.u8(*b);
             }
         }
     }
@@ -1122,6 +1132,8 @@ impl<'a> Dec<'a> {
                 let n = self.i32()?;
                 Ok(ColType::Varchar(if n < 0 { None } else { Some(n) }))
             }
+            // v0.36: the one-byte "char" type.
+            15 => Ok(ColType::SingleChar),
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }
@@ -1157,6 +1169,8 @@ impl<'a> Dec<'a> {
             }
             // v0.35: blank-padded char values.
             14 => Ok(Value::BpChar(self.str()?.into())),
+            // v0.36: one-byte "char" values.
+            15 => Ok(Value::SingleChar(self.u8()?)),
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
     }
