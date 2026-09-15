@@ -11706,7 +11706,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "round" => n == 1 || n == 2,
         "substring" | "substr" => n == 2 || n == 3,
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
-        "replace" | "split_part" | "trim" => n == 3,
+        "replace" | "split_part" => n == 3,
         "encode" | "decode" => n == 2,
         "crc32" | "crc32c" => n == 1,
         "sha224" | "sha256" | "sha384" | "sha512" => n == 1,
@@ -11744,6 +11744,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "lpad" | "rpad" => n == 2 || n == 3,
         "ascii" | "chr" | "initcap" => n == 1,
         "ltrim" | "rtrim" => n == 1 || n == 2,
+        // v0.33: btrim(text [, text]); btrim(bytea, bytea).
+        "btrim" => n == 1 || n == 2,
         "left" | "right" => n == 2,
         "now" | "current_date" | "current_timestamp" => n == 0,
         // v0.17: transaction/clock timestamps.
@@ -11793,7 +11795,6 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "character_length"
         | "octet_length"
         | "substring"
-        | "trim"
         | "position"
         | "replace"
         | "split_part"
@@ -11825,6 +11826,8 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "initcap"
         | "ltrim"
         | "rtrim"
+        // v0.33: btrim(bytea, bytea).
+        | "btrim"
         | "regexp_like"
         | "regexp_count"
         | "regexp_instr"
@@ -11968,6 +11971,97 @@ fn substring_int(s: &str, start: i64, len: Option<i64>) -> String {
     let hi = (upto - 1).max(0).min(total) as usize;
     let (lo, hi) = (lo.min(hi), hi);
     chars[lo..hi].iter().collect::<String>()
+}
+
+/// v0.33: `substring(bytea from S [for L])` — PG 19 `bytea_substring`
+/// (src/backend/utils/adt/bytea.c). Byte-based (not char-based), 1-based.
+/// S1 = max(S, 1); no length means to end; L < 0 is error 22011; S+L
+/// overflowing int32 means to end; E = S+L < 1 means empty.
+fn bytea_substring(data: &[u8], start: i64, len: Option<i64>) -> Result<Vec<u8>, ExecError> {
+    // PG takes int4; clamp i64 inputs to int32 range first.
+    let s = start.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let s1 = s.max(1);
+    let l1: i64 = match len {
+        None => -1, // to end
+        Some(l) => {
+            if l < 0 {
+                return Err(exec_err("22011", "negative substring length not allowed"));
+            }
+            if l > i32::MAX as i64 {
+                -1 // S + L would overflow int32 -> to end
+            } else {
+                let l = l as i32;
+                match s.checked_add(l) {
+                    None => -1, // overflow -> to end
+                    Some(e) => {
+                        if e < 1 {
+                            return Ok(Vec::new());
+                        }
+                        (e - s1) as i64
+                    }
+                }
+            }
+        }
+    };
+    let start_idx = (s1 - 1) as usize;
+    if start_idx >= data.len() {
+        return Ok(Vec::new());
+    }
+    let end_idx = if l1 < 0 {
+        data.len()
+    } else {
+        start_idx.saturating_add(l1 as usize).min(data.len())
+    };
+    Ok(data[start_idx..end_idx].to_vec())
+}
+
+/// v0.33: `overlay(bytea placing bytea from SP [for SL])` — PG 19
+/// `bytea_overlay` (src/backend/utils/adt/bytea.c). SP <= 0 is error
+/// 22011 (unlike text overlay which clamps); SP+SL overflowing int32
+/// is error 22003; omitted SL defaults to len(replacement).
+fn bytea_overlay(t1: &[u8], t2: &[u8], sp: i64, sl: i64) -> Result<Vec<u8>, ExecError> {
+    if sp <= 0 {
+        return Err(exec_err("22011", "negative substring length not allowed"));
+    }
+    if sl < 0 {
+        return Err(exec_err("22011", "negative substring length not allowed"));
+    }
+    // PG takes int4; out-of-range inputs are "integer out of range".
+    if sp > i32::MAX as i64 || sl > i32::MAX as i64 {
+        return Err(exec_err("22003", "integer out of range"));
+    }
+    let sp = sp as i32;
+    let sl = sl as i32;
+    let sp_pl_sl = sp
+        .checked_add(sl)
+        .ok_or_else(|| exec_err("22003", "integer out of range"))?;
+    let mut out = bytea_substring(t1, 1, Some((sp - 1) as i64))?;
+    out.extend_from_slice(t2);
+    out.extend_from_slice(&bytea_substring(t1, sp_pl_sl as i64, None)?);
+    Ok(out)
+}
+
+/// v0.33: bytea `btrim`/`ltrim`/`rtrim` — PG 19 `dobyteatrim`
+/// (src/backend/utils/adt/oracle_compat.c). If the string or the set is
+/// empty, the string is returned unchanged; otherwise bytes in the set
+/// are stripped from the left and/or right.
+fn bytea_trim(data: &[u8], set: &[u8], doltrim: bool, dortrim: bool) -> Vec<u8> {
+    if data.is_empty() || set.is_empty() {
+        return data.to_vec();
+    }
+    let mut start = 0;
+    let mut end = data.len();
+    if doltrim {
+        while start < end && set.contains(&data[start]) {
+            start += 1;
+        }
+    }
+    if dortrim {
+        while end > start && set.contains(&data[end - 1]) {
+            end -= 1;
+        }
+    }
+    data[start..end].to_vec()
 }
 
 /// v0.31: validate a SIMILAR TO ESCAPE string per PostgreSQL 19
@@ -12293,6 +12387,32 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             other => return Err(func_arg_err(name, other)),
         }),
         "substring" => {
+            // v0.33: bytea form (PG bytea_substr) dispatches before str_arg.
+            if let Value::Bytea(b) = &vals[0] {
+                let start = match int_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                let len = if vals.len() > 2 {
+                    match int_arg(name, &vals[2])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => Some(n),
+                    }
+                } else {
+                    None
+                };
+                // bytea_substring raises 22011 for negative length.
+                return Ok(Value::Bytea(bytea_substring(b, start, len)?));
+            }
+            if matches!(&vals[0], Value::Null) {
+                // NULL subject: still validate other args for type errors?
+                // PG is strict: NULL in -> NULL out.
+                let _ = int_arg(name, &vals[1])?;
+                if vals.len() > 2 {
+                    let _ = int_arg(name, &vals[2])?;
+                }
+                return Ok(Value::Null);
+            }
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -12321,6 +12441,16 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             // v0.24: `SUBSTRING(s FROM x FOR y)` — runtime dispatch.
             // Integer (start, len) vs SIMILAR (pattern, escape); PG
             // decides by type, so `-1`, `1+1`, etc. work as integers.
+            // v0.33: bytea subject (PG bytea_substr) dispatches first.
+            if let Value::Bytea(b) = &vals[0] {
+                match (&vals[1], &vals[2]) {
+                    (Value::Int(start), Value::Int(len)) => {
+                        return Ok(Value::Bytea(bytea_substring(b, *start, Some(*len))?));
+                    }
+                    (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+                    _ => return Err(func_arg_err(name, &vals[1])),
+                }
+            }
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -12348,34 +12478,6 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     Ok(substring_similar_match(s, pat, escape)?)
                 }
             }
-        }
-        "trim" => {
-            // Parser encodes trim as (spec, chars, str); the 1-arg form
-            // arrives as ("both", " ", str).
-            let (spec, ch, s) = (&vals[0], &vals[1], &vals[2]);
-            let s = match str_arg(name, s)? {
-                None => return Ok(Value::Null),
-                Some(s) => s,
-            };
-            let spec = match spec {
-                Value::Text(t) => &**t,
-                _ => return Err(exec_err("22023", "invalid trim specification")),
-            };
-            if !matches!(spec, "leading" | "trailing" | "both") {
-                return Err(exec_err("22023", "invalid trim specification"));
-            }
-            let ch = match str_arg(name, ch)? {
-                None => " ",
-                Some(c) => c,
-            };
-            let set: Vec<char> = ch.chars().collect();
-            let t = |c: char| set.contains(&c);
-            let r = match spec {
-                "leading" => s.trim_start_matches(t).to_string(),
-                "trailing" => s.trim_end_matches(t).to_string(),
-                _ => s.trim_matches(t).to_string(),
-            };
-            Ok(Value::text(r))
         }
         "position" => {
             // bytea position: 1-based byte index, 0 if not found.
@@ -12705,6 +12807,26 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::text(out))
         }
         "ltrim" | "rtrim" => {
+            // v0.33: bytea form (PG bytealtrim/byteartrim).
+            if let Value::Bytea(b) = &vals[0] {
+                let set: &[u8] = if vals.len() > 1 {
+                    match &vals[1] {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Bytea(sb) => sb,
+                        other => return Err(func_arg_err(name, other)),
+                    }
+                } else {
+                    // PG has no 1-arg bytea ltrim/rtrim; treat as no-op set.
+                    // (Unreachable via arity check for bytea, but be safe.)
+                    &[]
+                };
+                let (doltrim, dortrim) = if name == "ltrim" {
+                    (true, false)
+                } else {
+                    (false, true)
+                };
+                return Ok(Value::Bytea(bytea_trim(b, set, doltrim, dortrim)));
+            }
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -12723,6 +12845,42 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 s.trim_end_matches(|c| set.contains(&c))
             };
             Ok(Value::text(t.to_string()))
+        }
+        // v0.33: btrim(text [, text]) -> text; btrim(bytea, bytea) -> bytea
+        // (PG btrim/btrim1/byteatrim). SQL trim syntax desugars to this.
+        "btrim" => {
+            // Bytea form.
+            if let Value::Bytea(b) = &vals[0] {
+                let set: &[u8] = if vals.len() > 1 {
+                    match &vals[1] {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Bytea(sb) => sb,
+                        other => return Err(func_arg_err(name, other)),
+                    }
+                } else {
+                    // No 1-arg bytea btrim in PG; arity check prevents this.
+                    return Err(func_arg_err(name, &vals[0]));
+                };
+                return Ok(Value::Bytea(bytea_trim(b, set, true, true)));
+            }
+            if matches!(&vals[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let set: Vec<char> = if vals.len() > 1 {
+                match str_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(c) => c.chars().collect(),
+                }
+            } else {
+                vec![' ']
+            };
+            Ok(Value::text(
+                s.trim_matches(|c| set.contains(&c)).to_string(),
+            ))
         }
         "encode" => {
             let data: Vec<u8> = match &vals[0] {
@@ -12755,7 +12913,7 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 "base64" => Ok(Value::text(base64_encode(data, false))),
                 "base64url" => Ok(Value::text(base64_encode(data, true))),
                 "base32hex" => Ok(Value::text(base32hex_encode(data))),
-                "escape" => Ok(Value::text(bytea_escape(data))),
+                "escape" => Ok(Value::text(bytea_encode_escape(data))),
                 // v0.24: PG 19's exact message (original case).
                 _ => Err(exec_err(
                     "22023",
@@ -13315,6 +13473,16 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "substring_from" => {
             // SUBSTRING(s FROM pat): POSIX regex substring. If the pattern
             // contains a group, return the first group; else the whole match.
+            // v0.33: bytea subject with integer start (PG bytea_substr_no_len).
+            if let Value::Bytea(b) = &vals[0] {
+                match &vals[1] {
+                    Value::Int(n) => {
+                        return Ok(Value::Bytea(bytea_substring(b, *n, None)?));
+                    }
+                    Value::Null => return Ok(Value::Null),
+                    _ => return Err(func_arg_err(name, &vals[1])),
+                }
+            }
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -13531,6 +13699,33 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
             // to length(replacement). 1-based start; start < 1 is clamped.
+            // v0.33: bytea form (PG byteaoverlay/byteaoverlay_no_len).
+            // Unlike text, bytea errors on start <= 0 (22011).
+            if let Value::Bytea(b) = &vals[0] {
+                let r: &[u8] = match &vals[1] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bytea(rb) => rb,
+                    other => return Err(func_arg_err(name, other)),
+                };
+                let start = match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                let len = if vals.len() > 3 {
+                    match int_arg(name, &vals[3])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => n,
+                    }
+                } else {
+                    r.len() as i64
+                };
+                // bytea_overlay raises 22011/22003 as appropriate.
+                return Ok(Value::Bytea(bytea_overlay(b, r, start, len)?));
+            }
+            if matches!(&vals[0], Value::Null) {
+                // PG is strict: NULL subject -> NULL (no arg validation).
+                return Ok(Value::Null);
+            }
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
@@ -13643,25 +13838,49 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
     let alpha: &[u8; 64] = if url_safe { URL } else { STD };
     // v0.30: PG's base64url output is unpadded; standard base64 pads with '='.
     let pad = !url_safe;
+    // v0.33: PG inserts '\n' after every 76 chars for standard base64
+    // (not base64url), per pg_base64_encode_internal. Only full 3-byte
+    // groups trigger the newline; the final partial group does not.
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     let mut i = 0;
-    while i < data.len() {
+    let mut col = 0;
+    // Full groups.
+    while i + 3 <= data.len() {
         let b0 = data[i];
-        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
-        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        let b1 = data[i + 1];
+        let b2 = data[i + 2];
         out.push(alpha[(b0 >> 2) as usize] as char);
         out.push(alpha[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < data.len() {
-            out.push(alpha[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
-        } else if pad {
-            out.push('=');
-        }
-        if i + 2 < data.len() {
-            out.push(alpha[(b2 & 63) as usize] as char);
-        } else if pad {
-            out.push('=');
-        }
+        out.push(alpha[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(alpha[(b2 & 63) as usize] as char);
         i += 3;
+        if !url_safe {
+            col += 4;
+            if col >= 76 {
+                out.push('\n');
+                col = 0;
+            }
+        }
+    }
+    // Partial group (1-2 bytes): no newline check (PG behavior).
+    let rem = data.len() - i;
+    if rem == 1 {
+        let b0 = data[i];
+        out.push(alpha[(b0 >> 2) as usize] as char);
+        out.push(alpha[((b0 & 3) << 4) as usize] as char);
+        if pad {
+            out.push('=');
+            out.push('=');
+        }
+    } else if rem == 2 {
+        let b0 = data[i];
+        let b1 = data[i + 1];
+        out.push(alpha[(b0 >> 2) as usize] as char);
+        out.push(alpha[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(alpha[((b1 & 15) << 2) as usize] as char);
+        if pad {
+            out.push('=');
+        }
     }
     out
 }
@@ -13890,11 +14109,27 @@ fn text_to_bytea(s: &str) -> Option<Vec<u8>> {
     crate::storage::parse_bytea(s).ok()
 }
 
-/// PG bytea `escape` output format: printable ASCII as-is, backslash as
-/// `\\`, others as `\ooo` octal. (v0.29: moved to storage.rs as
-/// `bytea_escape`; this is now a thin alias.)
-fn bytea_escape(data: &[u8]) -> String {
-    crate::storage::bytea_escape(data)
+/// v0.33: `encode(bytea, 'escape')` — PG's observed output format from
+/// CI-validated regression expected files (strings.out, PG 15/16/17/19):
+/// 0x00 as `\000` octal, 0x01-0x1F as `\xNN`, 0x80-0xFF as octal,
+/// backslash as `\\`, other printable ASCII as-is.
+/// (Note: this differs from PG's `byteaout` display function, which uses
+/// octal for all non-printables; `encode()` is a separate code path.)
+fn bytea_encode_escape(data: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in data {
+        if b == b'\\' {
+            out.push_str("\\\\");
+        } else if b >= 0x20 && b < 0x7f {
+            out.push(b as char);
+        } else if b >= 0x01 && b < 0x20 {
+            out.push_str(&format!("\\x{:02x}", b));
+        } else {
+            // 0x00 and 0x80-0xFF: octal
+            out.push_str(&format!("\\{:03o}", b));
+        }
+    }
+    out
 }
 
 /// v0.31: Port of PostgreSQL 19's `similar_escape_internal()` (from
@@ -14116,6 +14351,16 @@ fn bytea_unescape(s: &str) -> Option<Vec<u8>> {
             if b[i] == b'\\' {
                 out.push(b'\\');
                 i += 1;
+            } else if b[i] == b'x'
+                && i + 2 < b.len()
+                && (b[i + 1] as char).is_digit(16)
+                && (b[i + 2] as char).is_digit(16)
+            {
+                // v0.33: \xNN hex escape (emitted by bytea_encode_escape).
+                let hi = (b[i + 1] as char).to_digit(16).unwrap();
+                let lo = (b[i + 2] as char).to_digit(16).unwrap();
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
             } else if i + 2 < b.len()
                 && (b[i] as char).is_digit(8)
                 && (b[i + 1] as char).is_digit(8)
@@ -15651,11 +15896,19 @@ fn func_result_type(
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
     let arg0 = || expr_type(eng, snap, own, session, schemas, ctes, &args[0]);
+    // v0.33: bytea-returning string functions dispatch on input type.
+    let bytea_if_arg0_bytea = || match arg0() {
+        Ok(ColType::Bytea) => Ok(ColType::Bytea),
+        Ok(_) => Ok(ColType::Text),
+        Err(e) => Err(e),
+    };
     match name {
-        "upper" | "lower" | "substring" | "substr" | "trim" | "replace" | "split_part"
-        | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin" | "left" | "right"
-        | "reverse" | "encode" | "repeat" | "lpad" | "rpad" | "chr" | "initcap" | "ltrim"
-        | "rtrim" => Ok(ColType::Text),
+        "upper" | "lower" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
+        | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "repeat" | "lpad"
+        | "rpad" | "chr" | "initcap" => Ok(ColType::Text),
+        // v0.33: substring/overlay/ltrim/rtrim/btrim return bytea for bytea input.
+        "substring" | "substr" | "substring_from" | "substring_from_for" | "overlay" | "ltrim"
+        | "rtrim" | "btrim" => bytea_if_arg0_bytea(),
         "decode" => Ok(ColType::Bytea),
         "crc32" | "crc32c" => Ok(ColType::BigInt),
         // v0.28: bytea bit/byte functions.
@@ -15665,7 +15918,7 @@ fn func_result_type(
         "sha224" | "sha256" | "sha384" | "sha512" => Ok(ColType::Bytea),
         "strpos" => Ok(ColType::Int),
         "ascii" => Ok(ColType::Int),
-        "translate" | "unistr" | "overlay" => Ok(ColType::Text),
+        "translate" | "unistr" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
@@ -15673,7 +15926,7 @@ fn func_result_type(
             Ok(ColType::Text)
         }
         "similar_to" => Ok(ColType::Bool),
-        "substring_similar" | "substring_from" | "substring_from_for" => Ok(ColType::Text),
+        "substring_similar" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
             Ok(ColType::Int)
         }

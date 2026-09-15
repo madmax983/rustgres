@@ -4973,6 +4973,8 @@ impl Parser {
     /// Encoded as Func "trim" with args [spec, chars, str] where spec is
     /// a Text literal "leading"/"trailing"/"both" and chars defaults to " ".
     fn parse_trim(&mut self) -> Result<Expr, SqlError> {
+        // v0.33: PG resolves SQL trim syntax to btrim/ltrim/rtrim
+        // (the column name is the function name).
         self.expect(Token::LParen, "'('")?;
         let mut spec = "both".to_string();
         if matches!(self.peek(), Token::Ident(s) if s == "leading" || s == "trailing" || s == "both")
@@ -4981,35 +4983,36 @@ impl Parser {
                 spec = s;
             }
         }
+        let func_name = match spec.as_str() {
+            "leading" => "ltrim",
+            "trailing" => "rtrim",
+            _ => "btrim",
+        }
+        .to_string();
         if self.eat_keyword("from") {
             let s = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
+            // trim([spec] from str) -> btrim/ltrim/rtrim(str)
             return Ok(Expr::Func {
-                name: "trim".to_string(),
-                args: vec![
-                    Expr::Literal(Literal::Text(spec.into())),
-                    Expr::Literal(Literal::Text(" ".into())),
-                    s,
-                ],
+                name: func_name,
+                args: vec![s],
             });
         }
         let first = self.parse_or()?;
         if self.eat_keyword("from") {
             let s = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
+            // trim([spec] chars from str) -> btrim/ltrim/rtrim(str, chars)
             return Ok(Expr::Func {
-                name: "trim".to_string(),
-                args: vec![Expr::Literal(Literal::Text(spec.into())), first, s],
+                name: func_name,
+                args: vec![s, first],
             });
         }
         self.expect(Token::RParen, "')'")?;
+        // trim(str) -> btrim(str)
         Ok(Expr::Func {
-            name: "trim".to_string(),
-            args: vec![
-                Expr::Literal(Literal::Text("both".into())),
-                Expr::Literal(Literal::Text(" ".into())),
-                first,
-            ],
+            name: "btrim".to_string(),
+            args: vec![first],
         })
     }
 
