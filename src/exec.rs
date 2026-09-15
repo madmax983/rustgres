@@ -11527,7 +11527,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
         "replace" | "split_part" | "trim" => n == 3,
         "encode" | "decode" => n == 2,
-        "crc32c" => n == 1,
+        "crc32" | "crc32c" => n == 1,
         "sha224" | "sha256" | "sha384" | "sha512" => n == 1,
         "strpos" => n == 2,
         "translate" => n == 3,
@@ -11623,6 +11623,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "reverse"
         | "encode"
         | "decode"
+        | "crc32"
         | "crc32c"
         | "sha224"
         | "sha256"
@@ -12354,9 +12355,9 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     Some(b) => Ok(Value::Bytea(b)),
                     None => Err(exec_err("22023", "invalid base64 string")),
                 },
-                "base64url" => match base64_decode(s, true) {
-                    Some(b) => Ok(Value::Bytea(b)),
-                    None => Err(exec_err("22023", "invalid base64url string")),
+                "base64url" => match base64url_decode(s) {
+                    Ok(b) => Ok(Value::Bytea(b)),
+                    Err(msg) => Err(exec_err("22023", msg)),
                 },
                 "base32hex" => match base32hex_decode(s) {
                     Some(b) => Ok(Value::Bytea(b)),
@@ -12524,6 +12525,20 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     ),
                 )),
             }
+        }
+        "crc32" => {
+            let data: &[u8] = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Bytea(b) => b,
+                Value::Text(s) => s.as_bytes(),
+                other => {
+                    return Err(exec_err(
+                        "42883",
+                        format!("crc32({}) not supported", other.type_name()),
+                    ));
+                }
+            };
+            Ok(Value::BigInt(crc32(data) as i64))
         }
         "crc32c" => {
             let data: &[u8] = match &vals[0] {
@@ -13193,6 +13208,23 @@ fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+/// v0.30: CRC-32 (IEEE, as in PG 18+'s crc32() function).
+fn crc32(data: &[u8]) -> u32 {
+    // Bit-by-bit implementation (no table); adequate for test-size inputs.
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 /// Lowercase hex encode.
 fn hex_encode(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -13227,6 +13259,8 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
     const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let alpha: &[u8; 64] = if url_safe { URL } else { STD };
+    // v0.30: PG's base64url output is unpadded; standard base64 pads with '='.
+    let pad = !url_safe;
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     let mut i = 0;
     while i < data.len() {
@@ -13237,17 +13271,96 @@ fn base64_encode(data: &[u8], url_safe: bool) -> String {
         out.push(alpha[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
         if i + 1 < data.len() {
             out.push(alpha[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
+        } else if pad {
             out.push('=');
         }
         if i + 2 < data.len() {
             out.push(alpha[(b2 & 63) as usize] as char);
-        } else {
+        } else if pad {
             out.push('=');
         }
         i += 3;
     }
     out
+}
+
+/// v0.30: PG 19's base64url decoder. Accepts unpadded input (length % 4 may be
+/// 0, 2, or 3) and optional '=' padding. Returns PG's exact error messages.
+fn base64url_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut vals: Vec<u8> = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // Find where padding starts (if any); '=' must only appear at the end.
+    while i < bytes.len() {
+        let c = bytes[i];
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => {
+                // '=' must be at the end; check remaining are all '='
+                let mut j = i;
+                while j < bytes.len() && bytes[j] == b'=' {
+                    j += 1;
+                }
+                if j < bytes.len() {
+                    return Err("unexpected \"=\" while decoding base64url sequence".to_string());
+                }
+                let pad_len = j - i;
+                if pad_len > 2 {
+                    return Err("invalid base64url end sequence".to_string());
+                }
+                // Padding is valid; stop processing (pad_len 1 or 2)
+                break;
+            }
+            _ => {
+                return Err(format!(
+                    "invalid symbol \"{}\" found while decoding base64url sequence",
+                    c as char
+                ));
+            }
+        };
+        vals.push(v);
+        i += 1;
+    }
+    // Length % 4 == 1 is impossible (a single base64 char can't encode a byte)
+    match vals.len() % 4 {
+        1 => Err("invalid base64url end sequence".to_string()),
+        _ => {
+            // Decode, handling the final partial group
+            let mut out = Vec::with_capacity(vals.len() / 4 * 3 + 3);
+            let mut j = 0;
+            while j + 4 <= vals.len() {
+                let a = vals[j];
+                let b = vals[j + 1];
+                let c = vals[j + 2];
+                let d = vals[j + 3];
+                out.push((a << 2) | (b >> 4));
+                out.push(((b & 15) << 4) | (c >> 2));
+                out.push(((c & 3) << 6) | d);
+                j += 4;
+            }
+            // Handle remainder (2 or 3 chars -> 1 or 2 bytes)
+            match vals.len() - j {
+                2 => {
+                    let a = vals[j];
+                    let b = vals[j + 1];
+                    out.push((a << 2) | (b >> 4));
+                }
+                3 => {
+                    let a = vals[j];
+                    let b = vals[j + 1];
+                    let c = vals[j + 2];
+                    out.push((a << 2) | (b >> 4));
+                    out.push(((b & 15) << 4) | (c >> 2));
+                }
+                _ => {}
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Base64 decode; None on invalid input.
@@ -15129,7 +15242,7 @@ fn func_result_type(
         | "reverse" | "encode" | "repeat" | "lpad" | "rpad" | "chr" | "initcap" | "ltrim"
         | "rtrim" => Ok(ColType::Text),
         "decode" => Ok(ColType::Bytea),
-        "crc32c" => Ok(ColType::BigInt),
+        "crc32" | "crc32c" => Ok(ColType::BigInt),
         // v0.28: bytea bit/byte functions.
         "get_bit" | "get_byte" => Ok(ColType::Int),
         "set_bit" | "set_byte" => Ok(ColType::Bytea),
