@@ -13586,29 +13586,15 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 let re = crate::regex::compile_opts(pat, opts)
                     .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
                 let sc: Vec<char> = s.chars().collect();
-                let mut out = String::new();
-                let mut pos = 0usize;
-                while pos <= sc.len() {
-                    match re.find_at(&sc, pos) {
-                        Some((ms, me, caps)) => {
-                            out.extend(sc[pos..ms].iter());
-                            out.push_str(&expand_replacement(repl, &sc, &caps));
-                            pos = if me > ms { me } else { ms + 1 };
-                            if !global {
-                                break;
-                            }
-                            if ms == sc.len() && me == ms {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                out.extend(sc[pos.min(sc.len())..].iter());
+                // v0.34: PG 19 legacy form — n defaults to 1 (first match
+                // only) unless the 'g' flag requests all (n=0).
+                let n = if global { 0 } else { 1 };
+                let out = pg_replace_text_regexp(&sc, &re, repl, 0, n);
                 return Ok(Value::text(out));
             }
             // Extended form.
             let start = get_int_arg(name, vals, 3, 1)?;
+            let n_given = vals.len() > 4;
             let n = get_int_arg(name, vals, 4, 0)?;
             let flags = get_str_arg(name, vals, 5, "")?;
             // v0.24: strict PG validation (was: clamps).
@@ -13619,44 +13605,22 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                     format!("invalid value for parameter \"n\": {n}"),
                 ));
             }
-            let (opts, _) = parse_regexp_flags(flags, name, true)?;
+            let (opts, has_g) = parse_regexp_flags(flags, name, true)?;
             let re = crate::regex::compile_opts(pat, opts)
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
             let sc: Vec<char> = s.chars().collect();
             let start_idx = start_idx.min(sc.len());
-            let mut out = String::new();
-            out.extend(sc[..start_idx].iter());
-            let mut pos = start_idx;
-            // n = 0: replace all; n > 0: replace only the nth match.
-            // (An explicitly given n makes 'g' irrelevant, like PG.)
-            let target = if n == 0 { u64::MAX } else { n as u64 };
-            let mut seen = 0u64;
-            while pos <= sc.len() {
-                match re.find_at(&sc, pos) {
-                    Some((ms, me, caps)) => {
-                        seen += 1;
-                        if seen == target || n == 0 {
-                            out.extend(sc[pos..ms].iter());
-                            out.push_str(&expand_replacement(repl, &sc, &caps));
-                        } else {
-                            // Not the target occurrence: copy through.
-                            // (We still need to advance past it.)
-                            out.extend(sc[pos..me.max(ms + 1)].iter());
-                        }
-                        pos = if me > ms { me } else { ms + 1 };
-                        if n > 0 && seen >= target {
-                            // Copy the rest and finish.
-                            out.extend(sc[pos..].iter());
-                            return Ok(Value::text(out));
-                        }
-                        if ms == sc.len() && me == ms {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            out.extend(sc[pos.min(sc.len())..].iter());
+            // v0.34: PG 19 n default — if N was not specified, n=0 (all)
+            // only when the 'g' flag is present, else n=1 (first match).
+            // An explicitly given n makes 'g' irrelevant.
+            let n = if n_given {
+                n
+            } else if has_g {
+                0
+            } else {
+                1
+            };
+            let out = pg_replace_text_regexp(&sc, &re, repl, start_idx, n);
             Ok(Value::text(out))
         }
         "regexp_split_to_array" => {
@@ -14299,6 +14263,51 @@ fn expand_replacement(repl: &str, s: &[char], caps: &crate::regex::Captures) -> 
     out
 }
 
+/// Port of PostgreSQL 19 `replace_text_regexp`
+/// (src/backend/utils/adt/varlena.c, REL_19_STABLE).
+///
+/// `search_start0` is the 0-based char offset where matching begins (text
+/// before it is copied verbatim). `n == 0` replaces all matches from there;
+/// `n > 0` replaces only the n'th match. The copy cursor (`data_pos`) only
+/// advances over replaced/copied text, while the search cursor
+/// (`search_start`) advances past every match -- a zero-width match advances
+/// the search by one char without discarding source text.
+fn pg_replace_text_regexp(
+    sc: &[char],
+    re: &crate::regex::Compiled,
+    repl: &str,
+    search_start0: usize,
+    n: i64,
+) -> String {
+    let mut out = String::new();
+    out.extend(sc[..search_start0].iter());
+    let mut data_pos = search_start0;
+    let mut search_start = search_start0;
+    let mut match_no: i64 = 0;
+    let replace_all = n == 0;
+    while search_start <= sc.len() {
+        match re.find_at(sc, search_start) {
+            Some((ms, me, caps)) => {
+                match_no += 1;
+                if replace_all || match_no == n {
+                    out.extend(sc[data_pos..ms].iter());
+                    out.push_str(&expand_replacement(repl, sc, &caps));
+                    data_pos = me;
+                }
+                // Advance the search past this match; a zero-width match
+                // consumes one char of search space but no source text.
+                search_start = if me > ms { me } else { ms + 1 };
+                if !replace_all && match_no >= n {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    out.extend(sc[data_pos.min(sc.len())..].iter());
+    out
+}
+
 /// Decode `\uXXXX` and `\UXXXXXXXX` escapes (unistr and U&'' literals).
 /// `\\` produces a literal backslash. Returns None on invalid escapes.
 fn unistr_decode(s: &str) -> Option<String> {
@@ -14324,6 +14333,25 @@ fn unistr_decode(s: &str) -> Option<String> {
                 let cp = u32::from_str_radix(hex, 16).ok()?;
                 out.push(char::from_u32(cp)?);
                 i += digits;
+            } else if b[i] == b'+' {
+                // v0.34: PG unistr \+XXXXXX (6 hex digits).
+                i += 1;
+                if i + 6 > b.len() {
+                    return None;
+                }
+                let hex = &s[i..i + 6];
+                let cp = u32::from_str_radix(hex, 16).ok()?;
+                out.push(char::from_u32(cp)?);
+                i += 6;
+            } else if (b[i] as char).is_ascii_hexdigit() {
+                // v0.34: PG unistr \XXXX (4 hex digits, no 'u').
+                if i + 4 > b.len() {
+                    return None;
+                }
+                let hex = &s[i..i + 4];
+                let cp = u32::from_str_radix(hex, 16).ok()?;
+                out.push(char::from_u32(cp)?);
+                i += 4;
             } else {
                 return None;
             }

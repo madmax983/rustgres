@@ -386,6 +386,40 @@ class Expected:
         self.__dict__.update(kw)
 
 
+def resolve_physical_rows(physical, count, cells, ncols):
+    """Turn raw psql physical lines into logical result rows.
+
+    physical: list of raw lines between the dashes and "(N rows)".
+    count: the N from "(N rows)", or None if the marker was absent.
+    cells: function mapping one physical line to a list of cell strings.
+    ncols: number of columns.
+
+    v0.34: psql renders an empty-string value as a blank physical line and
+    a value containing newlines as several physical lines. The old code
+    skipped every blank line, turning one-row empty-string results into
+    zero rows and splitting multi-line values into phantom rows.
+    """
+    nonblank = [ln for ln in physical if ln.strip() != ""]
+    n_phys = len(physical)
+    n_nonblank = len(nonblank)
+    if count is None:
+        # No count marker: keep the old separator-skipping behavior.
+        return [cells(ln) for ln in nonblank]
+    if n_phys == count:
+        # Every physical line is a row; blank lines are empty-string rows.
+        return [cells(ln) for ln in physical]
+    if n_nonblank == count:
+        # Blank lines were separators between the count's rows.
+        return [cells(ln) for ln in nonblank]
+    # More physical lines than the count: possibly embedded newlines.
+    # Only disambiguable for a single-column single-row value: the value
+    # is the newline-joined stripped physical lines (e.g. wrapped base64).
+    if ncols == 1 and count == 1 and n_phys > 1:
+        return [["\n".join(cells(ln)[0] for ln in physical)]]
+    # Otherwise fall back to separator-skipping (may still mismatch).
+    return [cells(ln) for ln in nonblank]
+
+
 def parse_expected_block(lines, pos, null_display):
     """Parse one result block starting at lines[pos] (after blank skipping).
 
@@ -445,7 +479,8 @@ def parse_expected_block(lines, pos, null_display):
 
         colnames = cells(line)
         pos += 2
-        rows = []
+        # Collect physical lines until "(N rows)" or end of block.
+        physical = []
         count = None
         while pos < n:
             ln = lines[pos]
@@ -454,11 +489,9 @@ def parse_expected_block(lines, pos, null_display):
                 count = int(m.group(1))
                 pos += 1
                 break
-            if ln.strip() == "":
-                pos += 1
-                continue
-            rows.append(cells(ln))
+            physical.append(ln)
             pos += 1
+        rows = resolve_physical_rows(physical, count, cells, len(widths))
         return Expected("table", colnames=colnames, rows=rows, count=count), pos
 
     # Otherwise: utility statement with no output block (pg_regress omits
@@ -502,7 +535,12 @@ def canon(oid, text):
             return Decimal(t)
         except InvalidOperation:
             return t
-    return text  # text/date/timestamp/unknown: raw string compare
+    # v0.34: strip text/date/timestamp like every other type. The expected
+    # side is always psql-padding-stripped by cells(), so comparing the raw
+    # wire value made correct trailing-space results (lpad/rpad) fail.
+    # (Known limitation: this also masks missing char(n) blank-padding
+    # enforcement on CAST, which is a separate future milestone.)
+    return t  # text/date/timestamp/unknown: stripped string compare
 
 
 def values_equal(oid, a, b):
