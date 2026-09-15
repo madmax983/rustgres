@@ -2419,6 +2419,11 @@ struct Parser {
     /// v0.14: counter for auto-generated `unnamed_subquery[_N]` aliases,
     /// matching what PostgreSQL reports for alias-less FROM subqueries.
     unnamed_seq: usize,
+    /// v0.31: when false, `parse_cmp` does not consume `SIMILAR` as the
+    /// SIMILAR TO operator. Used while parsing the subject of
+    /// `SUBSTRING(s SIMILAR pat ...)`, where a bare SIMILAR introduces the
+    /// SQL substring form instead of a boolean SIMILAR TO test.
+    allow_similar_to: bool,
 }
 
 impl Parser {
@@ -4138,7 +4143,9 @@ impl Parser {
         }
         // v0.19: [NOT] SIMILAR TO pattern [ESCAPE 'c'].
         // Desugars to similar_to(expr, pattern [, escape]).
-        if self.eat_keyword("similar") {
+        // v0.31: suppressed while parsing a SUBSTRING subject, where a bare
+        // SIMILAR introduces the SQL substring form (handled by the caller).
+        if self.allow_similar_to && self.eat_keyword("similar") {
             self.expect_keyword("to")?;
             let pattern = self.parse_bitor()?;
             let mut args = vec![left, pattern];
@@ -4523,7 +4530,14 @@ impl Parser {
                         Ok(Expr::ScalarSub(Box::new(sub)))
                     }
                     _ => {
-                        let e = self.parse_or()?;
+                        // v0.31: a parenthesized expression is a fresh
+                        // context; re-enable SIMILAR TO inside it (it may
+                        // have been disabled by an enclosing SUBSTRING).
+                        let save_similar = self.allow_similar_to;
+                        self.allow_similar_to = true;
+                        let e = self.parse_or();
+                        self.allow_similar_to = save_similar;
+                        let e = e?;
                         self.expect(Token::RParen, "')'")?;
                         Ok(e)
                     }
@@ -5056,7 +5070,16 @@ impl Parser {
     /// [escape 'c'])` (SIMILAR).
     fn parse_substring(&mut self) -> Result<Expr, SqlError> {
         self.expect(Token::LParen, "'('")?;
-        let s = self.parse_or()?;
+        // v0.31: parse the subject with SIMILAR TO disabled, so that a bare
+        // SIMILAR after the subject introduces the SQL substring form
+        // (`SUBSTRING(s SIMILAR pat [ESCAPE c])`) instead of erroring on a
+        // missing TO. Parenthesized sub-expressions re-enable it (see
+        // parse_primary).
+        let save_similar = self.allow_similar_to;
+        self.allow_similar_to = false;
+        let s = self.parse_or();
+        self.allow_similar_to = save_similar;
+        let s = s?;
         // v0.19: SUBSTRING(s SIMILAR pat [ESCAPE 'c']).
         if self.eat_keyword("similar") {
             let pat = self.parse_or()?;
@@ -6891,6 +6914,7 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
         tokens,
         pos: 0,
         unnamed_seq: 0,
+        allow_similar_to: true,
     };
     let stmt = p.parse_top()?;
     match p.next() {

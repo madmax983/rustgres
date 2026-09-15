@@ -11783,9 +11783,27 @@ fn substring_int(s: &str, start: i64, len: Option<i64>) -> String {
     chars[lo..hi].iter().collect::<String>()
 }
 
+/// v0.31: validate a SIMILAR TO ESCAPE string per PostgreSQL 19
+/// (`similar_escape_internal`): empty means "no escape character", a single
+/// character is the escape, anything longer is error 22025.
+fn similar_escape_opt(esc_s: &str) -> Result<Option<char>, ExecError> {
+    let mut ch = esc_s.chars();
+    match (ch.next(), ch.next()) {
+        (None, None) => Ok(None),
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(exec_err(
+            "22025",
+            "invalid escape string: Escape string must be empty or one character.",
+        )),
+    }
+}
+
 /// v0.24: SIMILAR TO substring match — the pattern must match the
 /// entire string; if it has a group, return the first group.
-fn substring_similar_match(s: &str, pat: &str, escape: char) -> Result<Value, ExecError> {
+/// v0.31: uses the PG 19 `similar_escape_internal` translation, so the
+/// escape-double-quoted part becomes capture group 1 (or, with no
+/// escape-double-quotes, there are no groups and the whole match returns).
+fn substring_similar_match(s: &str, pat: &str, escape: Option<char>) -> Result<Value, ExecError> {
     let regex_pat = similar_to_regex(pat, escape)
         .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
     let re = crate::regex::compile(&regex_pat, false)
@@ -11908,16 +11926,8 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                         None => return Ok(Value::Null),
                         Some(e) => e,
                     };
-                    let mut ch = esc_s.chars();
-                    let escape = match (ch.next(), ch.next()) {
-                        (Some(c), None) => c,
-                        _ => {
-                            return Err(exec_err(
-                                "22023",
-                                "ESCAPE string must be empty or one character",
-                            ));
-                        }
-                    };
+                    // v0.31: empty escape means "no escape character" (PG 19).
+                    let escape = similar_escape_opt(&esc_s)?;
                     Ok(substring_similar_match(s, pat, escape)?)
                 }
             }
@@ -12856,21 +12866,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let escape = if vals.len() > 2 {
                 match str_arg(name, &vals[2])? {
                     None => return Ok(Value::Null),
-                    Some(e) => {
-                        let mut ch = e.chars();
-                        match (ch.next(), ch.next()) {
-                            (Some(c), None) => c,
-                            _ => {
-                                return Err(exec_err(
-                                    "22023",
-                                    "ESCAPE string must be empty or one character",
-                                ));
-                            }
-                        }
-                    }
+                    Some(e) => similar_escape_opt(&e)?,
                 }
             } else {
-                '\\'
+                // v0.31: omitted ESCAPE defaults to backslash (PG 19).
+                Some('\\')
             };
             let regex_pat = similar_to_regex(pat, escape)
                 .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
@@ -12953,21 +12953,11 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let escape = if vals.len() > 2 {
                 match str_arg(name, &vals[2])? {
                     None => return Ok(Value::Null),
-                    Some(e) => {
-                        let mut ch = e.chars();
-                        match (ch.next(), ch.next()) {
-                            (Some(c), None) => c,
-                            _ => {
-                                return Err(exec_err(
-                                    "22023",
-                                    "ESCAPE string must be empty or one character",
-                                ));
-                            }
-                        }
-                    }
+                    Some(e) => similar_escape_opt(&e)?,
                 }
             } else {
-                '\\'
+                // v0.31: omitted ESCAPE defaults to backslash (PG 19).
+                Some('\\')
             };
             let regex_pat = similar_to_regex(pat, escape)
                 .map_err(|e| exec_err("2201B", format!("invalid SIMILAR TO pattern: {}", e)))?;
@@ -13515,60 +13505,93 @@ fn bytea_escape(data: &[u8]) -> String {
     crate::storage::bytea_escape(data)
 }
 
-/// Translate a SQL SIMILAR TO pattern to a regex pattern.
-/// SIMILAR TO: `%` = any sequence, `_` = any char, `|` = alternation,
-/// `*`/`+`/`?`/`{m,n}` = repetition, `(...)` = group, `[...]` = class.
-fn similar_to_regex(pat: &str, escape: char) -> Result<String, String> {
-    let mut out = String::with_capacity(pat.len() * 2);
+/// v0.31: Port of PostgreSQL 19's `similar_escape_internal()` (from
+/// `src/backend/utils/adt/regexp.c`, REL_19_STABLE).
+///
+/// Convert a SQL SIMILAR TO pattern to a POSIX-style regular expression.
+/// `escape` is the ESCAPE character, or `None` for "no escape character"
+/// (i.e. `ESCAPE ''`, which PG allows).
+///
+/// Returns the translated pattern including PG's `^(?:...)$` wrapper (and,
+/// for SUBSTRING, the escape-double-quote part separators, yielding
+/// `^(?:part1){1,1}?(part2){1,1}(?:part3)$`). Errors only when the pattern
+/// contains more than two escape-double-quote separators.
+fn similar_to_regex(pat: &str, escape: Option<char>) -> Result<String, String> {
+    let mut out = String::with_capacity(pat.len() * 3 + 24);
+    out.push_str("^(?:");
+
     let chars: Vec<char> = pat.chars().collect();
     let mut i = 0;
+    let mut afterescape = false;
+    let mut nquotes = 0;
+    let mut bracket_depth: i32 = 0; // square bracket nesting level
+    let mut charclass_pos: i32 = 0; // position inside a character class
+
     while i < chars.len() {
-        let c = chars[i];
-        if c == escape {
-            i += 1;
-            if i >= chars.len() {
-                return Err("trailing escape".to_string());
-            }
-            // Escaped char is literal; escape regex metachars.
-            let e = chars[i];
-            if ".^$*+?{}[]\\|()".contains(e) {
-                out.push('\\');
-            }
-            out.push(e);
-            i += 1;
-        } else if c == '%' {
-            out.push_str(".*");
-            i += 1;
-        } else if c == '_' {
-            out.push('.');
-            i += 1;
-        } else if ".^$*+?{}[]\\|()".contains(c) {
-            // Regex metachars that are literal in SIMILAR TO (except those
-            // with special meaning: | * + ? { } ( ) [ ]).
-            // Actually in SIMILAR TO: | * + ? { } ( ) [ ] are special.
-            // . ^ $ \\ are literal but need escaping for regex.
-            if c == '|'
-                || c == '*'
-                || c == '+'
-                || c == '?'
-                || c == '{'
-                || c == '}'
-                || c == '('
-                || c == ')'
-                || c == '['
-                || c == ']'
-            {
-                out.push(c);
+        let pchar = chars[i];
+
+        if afterescape {
+            if pchar == '"' && bracket_depth < 1 {
+                // escape-double-quote: emit the part separator for SUBSTRING.
+                if nquotes == 0 {
+                    out.push_str("){1,1}?(");
+                } else if nquotes == 1 {
+                    out.push_str("){1,1}(?:");
+                } else {
+                    return Err("SQL regular expression may not contain more than two escape-double-quote separators".to_string());
+                }
+                nquotes += 1;
             } else {
+                // PG allows any character at all to be escaped; this also
+                // gives access to POSIX class escapes such as `\d`.
                 out.push('\\');
-                out.push(c);
+                out.push(pchar);
+                // An escaped character inside a class ends the "beginning".
+                charclass_pos = 3;
             }
-            i += 1;
+            afterescape = false;
+        } else if escape == Some(pchar) {
+            // SQL escape character; do not send to output.
+            afterescape = true;
+        } else if bracket_depth > 0 {
+            // Inside a character class: copy as-is (so `%`, `_`, `(`, `)`,
+            // etc. stay literal), doubling backslashes.
+            if pchar == '\\' {
+                out.push('\\');
+            }
+            out.push(pchar);
+            // Parse just enough to find the real end of the class.
+            if pchar == ']' && charclass_pos > 2 {
+                bracket_depth -= 1;
+            } else if pchar == '[' {
+                bracket_depth += 1;
+                charclass_pos = 3;
+            } else if pchar == '^' {
+                charclass_pos += 1;
+            } else {
+                charclass_pos = 3;
+            }
+        } else if pchar == '[' {
+            out.push(pchar);
+            bracket_depth = 1;
+            charclass_pos = 1;
+        } else if pchar == '%' {
+            out.push_str(".*");
+        } else if pchar == '_' {
+            out.push('.');
+        } else if pchar == '(' {
+            // Convert to non-capturing parenthesis.
+            out.push_str("(?:");
+        } else if pchar == '\\' || pchar == '.' || pchar == '^' || pchar == '$' {
+            out.push('\\');
+            out.push(pchar);
         } else {
-            out.push(c);
-            i += 1;
+            out.push(pchar);
         }
+        i += 1;
     }
+
+    out.push_str(")$");
     Ok(out)
 }
 

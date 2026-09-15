@@ -20,7 +20,10 @@ enum Ast {
     AnchorEnd,
     Seq(Vec<Ast>),
     Alt(Vec<Ast>),
-    Repeat(Box<Ast>, u32, Option<u32>),
+    // v0.31: `lazy` selects non-greedy (lazy) repetition, e.g. `*?`, `+?`,
+    // `??`, `{m,n}?` (PostgreSQL ARE semantics; used by SIMILAR TO's
+    // SUBSTRING translation).
+    Repeat(Box<Ast>, u32, Option<u32>, bool),
     Group(Box<Ast>, usize),
     BackRef(usize),
 }
@@ -97,6 +100,7 @@ pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<Compiled, Strin
     let mut c = Compiler {
         insns: Vec::new(),
         ci: opts.case_insensitive,
+        lazy_ctx: false,
     };
     c.compile_ast(&ast);
     c.emit(Insn::Match);
@@ -178,15 +182,15 @@ impl Parser {
         match self.peek() {
             Some('*') => {
                 self.next();
-                Ok(Ast::Repeat(Box::new(atom), 0, None))
+                Ok(Ast::Repeat(Box::new(atom), 0, None, self.eat_lazy()))
             }
             Some('+') => {
                 self.next();
-                Ok(Ast::Repeat(Box::new(atom), 1, None))
+                Ok(Ast::Repeat(Box::new(atom), 1, None, self.eat_lazy()))
             }
             Some('?') => {
                 self.next();
-                Ok(Ast::Repeat(Box::new(atom), 0, Some(1)))
+                Ok(Ast::Repeat(Box::new(atom), 0, Some(1), self.eat_lazy()))
             }
             Some('{') => {
                 self.next();
@@ -210,9 +214,19 @@ impl Parser {
                         return Err("invalid repetition range".to_string());
                     }
                 }
-                Ok(Ast::Repeat(Box::new(atom), min, max))
+                Ok(Ast::Repeat(Box::new(atom), min, max, self.eat_lazy()))
             }
             _ => Ok(atom),
+        }
+    }
+
+    /// v0.31: consume a trailing '?' that makes a quantifier lazy.
+    fn eat_lazy(&mut self) -> bool {
+        if self.peek() == Some('?') {
+            self.next();
+            true
+        } else {
+            false
         }
     }
 
@@ -409,6 +423,11 @@ enum Insn {
 struct Compiler {
     insns: Vec<Insn>,
     ci: bool,
+    /// v0.31: when true, all nested quantifiers compile as lazy
+    /// (non-greedy). Set while compiling the body of a lazy `Repeat`,
+    /// matching PostgreSQL's semantics where `{1,1}?` on a group makes the
+    /// whole group (including inner quantifiers) non-greedy.
+    lazy_ctx: bool,
 }
 
 impl Compiler {
@@ -446,15 +465,27 @@ impl Compiler {
                 }
             }
             Ast::Alt(v) => {
+                // v0.31: fix — the last alternative must NOT be wrapped in a
+                // Split whose "else" branch falls through to `end`; if the
+                // last branch fails, the whole alternation must fail (and
+                // backtrack), not succeed with an empty match.
                 let mut jumps = Vec::new();
-                for a in v {
-                    let split = self.emit(Insn::Split(0, 0));
-                    self.compile_ast(a);
-                    jumps.push(self.emit(Insn::Jump(0)));
-                    let here = self.insns.len();
-                    if let Insn::Split(ref mut x, ref mut y) = self.insns[split] {
-                        *x = split + 1;
-                        *y = here;
+                let n = v.len();
+                for (idx, a) in v.iter().enumerate() {
+                    if idx + 1 < n {
+                        let split = self.emit(Insn::Split(0, 0));
+                        self.compile_ast(a);
+                        jumps.push(self.emit(Insn::Jump(0)));
+                        let here = self.insns.len();
+                        if let Insn::Split(ref mut x, ref mut y) = self.insns[split] {
+                            *x = split + 1;
+                            *y = here;
+                        }
+                    } else {
+                        // Last alternative: compile directly; failure
+                        // backtracks naturally.
+                        self.compile_ast(a);
+                        jumps.push(self.emit(Insn::Jump(0)));
                     }
                 }
                 let here = self.insns.len();
@@ -464,10 +495,18 @@ impl Compiler {
                     }
                 }
             }
-            Ast::Repeat(inner, min, max) => {
+            Ast::Repeat(inner, min, max, lazy) => {
+                // v0.31: a lazy quantifier makes its entire body non-greedy,
+                // including nested quantifiers (PostgreSQL `{1,1}?` semantics
+                // for SIMILAR TO's SUBSTRING part1).
+                let eff_lazy = *lazy || self.lazy_ctx;
+                let save_lazy = self.lazy_ctx;
+                self.lazy_ctx = eff_lazy;
                 for _ in 0..*min {
                     self.compile_ast(inner);
                 }
+                // v0.31: lazy repetition swaps the Split targets so the
+                // "skip the body" branch is preferred (non-greedy).
                 match max {
                     Some(mx) => {
                         for _ in 0..(mx - min) {
@@ -475,8 +514,13 @@ impl Compiler {
                             self.compile_ast(inner);
                             let here = self.insns.len();
                             if let Insn::Split(ref mut x, ref mut y) = self.insns[split] {
-                                *x = split + 1;
-                                *y = here;
+                                if eff_lazy {
+                                    *x = here;
+                                    *y = split + 1;
+                                } else {
+                                    *x = split + 1;
+                                    *y = here;
+                                }
                             }
                         }
                     }
@@ -486,11 +530,17 @@ impl Compiler {
                         self.emit(Insn::Jump(split));
                         let here = self.insns.len();
                         if let Insn::Split(ref mut x, ref mut y) = self.insns[split] {
-                            *x = split + 1;
-                            *y = here;
+                            if eff_lazy {
+                                *x = here;
+                                *y = split + 1;
+                            } else {
+                                *x = split + 1;
+                                *y = here;
+                            }
                         }
                     }
                 }
+                self.lazy_ctx = save_lazy;
             }
             Ast::Group(inner, idx) => {
                 self.emit(Insn::SaveStart(*idx));
