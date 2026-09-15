@@ -293,7 +293,9 @@ def t_casts():
         check("bad int text -> 22P02", errcode(c, "SELECT 'abc'::int") == "22P02")
         check("bad date text -> 22P02", errcode(c, "SELECT '2026-13-45'::date") == "22P02")
         check("bad uuid text -> 22P02", errcode(c, "SELECT 'nope'::uuid") == "22P02")
-        check("bad bytea text -> 22P02", errcode(c, "SELECT '\\xzz'::bytea") == "22P02")
+        # v0.29 bytea I/O fidelity: bad hex digits are PG's 22023
+        # ("invalid hexadecimal digit"), not generic 22P02.
+        check("bad bytea hex -> 22023", errcode(c, "SELECT '\\xzz'::bytea") == "22023")
         check("bad bool text -> 22P02", errcode(c, "SELECT 'maybe'::bool") == "22P02")
         check("div by zero -> 22012", errcode(c, "SELECT 1/0") == "22012")
         check("numeric div by zero -> 22012",

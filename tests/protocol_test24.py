@@ -211,8 +211,8 @@ def main():
         # --- E. Regexp strictness ---
         check("E1 bad flag 2201B",
               val(c, "SELECT regexp_like('a', 'a', 'z')") == ("ERR", "2201B"))
-        check("E2 g flag unsupported 2201B",
-              val(c, "SELECT regexp_like('a', 'a', 'g')") == ("ERR", "2201B"))
+        check("E2 g flag rejected 22023",
+              val(c, "SELECT regexp_like('a', 'a', 'g')") == ("ERR", "22023"))
         check("E3 n flag newline dot",
               val(c, "SELECT regexp_like('a' || chr(10) || 'b', 'a.b', 'n')") == "f")
         check("E4 s flag dotall",
