@@ -1331,7 +1331,8 @@ fn assign_err(col_name: &str, col_type: &ColType, from: &str) -> ExecError {
         format!(
             "column \"{}\" is of type {} but expression is of type {}",
             col_name,
-            col_type.sql_name(),
+            // v0.35: show the typmod for character columns.
+            col_type.typmod_display(),
             from
         ),
     )
@@ -1374,13 +1375,22 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
         },
         // Unknown-type text literal: through the type's input function
         // (so INSERT INTO d VALUES ('2026-01-01') works for dates).
-        Literal::Text(s) => eval_cast(&Value::text(s.clone()), *col_type).map_err(|e| {
-            if e.code == "42846" {
-                assign_err(col_name, col_type, lit.type_name())
-            } else {
-                e
-            }
-        }),
+        // v0.35: character targets use assignment (input-function)
+        // semantics: blank-tolerant truncation, 22001 on non-blank excess.
+        Literal::Text(s) => {
+            let v = Value::text(s.clone());
+            let r = match col_type {
+                ColType::Char(_) | ColType::Varchar(_) => eval_assign_cast(&v, col_type),
+                _ => eval_cast(&v, *col_type),
+            };
+            r.map_err(|e| {
+                if e.code == "42846" {
+                    assign_err(col_name, col_type, lit.type_name())
+                } else {
+                    e
+                }
+            })
+        }
         // Unknown-type boolean literal.
         Literal::Bool(b) => match col_type {
             ColType::Bool => Ok(Value::Bool(*b)),
@@ -1490,8 +1500,12 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
         return Ok(w);
     }
     // Text goes through the type's input function (assignment cast).
-    if matches!(v, Value::Text(_)) {
-        return eval_cast(&v, *col_type).map_err(|e| {
+    // v0.35: character targets use assignment semantics; bpchar values
+    // coerce like text.
+    if matches!(v, Value::Text(_) | Value::BpChar(_))
+        || matches!(col_type, ColType::Char(_) | ColType::Varchar(_))
+    {
+        return eval_assign_cast(&v, col_type).map_err(|e| {
             if e.code == "42846" {
                 assign_err(col_name, col_type, v.type_name())
             } else {
@@ -4450,6 +4464,7 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Float(_) => ColType::Float,
         Value::Numeric(_) => ColType::Numeric,
         Value::Text(_) => ColType::Text,
+        Value::BpChar(_) => ColType::Char(None), // v0.35
         Value::Bool(_) => ColType::Bool,
         Value::Date(_) => ColType::Date,
         Value::Timestamp(_) => ColType::Timestamp,
@@ -8900,6 +8915,15 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&(s.len() as u64).to_be_bytes());
             out.extend_from_slice(s.as_bytes());
         }
+        // v0.35: bpchar groups by its significant (rtrimmed) content, so
+        // 'ab'::char(3) and 'ab'::text group together, like PG's
+        // trailing-space-insensitive bpchar equality.
+        Value::BpChar(s) => {
+            out.push(3);
+            let t = crate::storage::rtrim_spaces(s);
+            out.extend_from_slice(&(t.len() as u64).to_be_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
         Value::Bool(b) => {
             out.push(4);
             out.push(*b as u8);
@@ -9308,9 +9332,8 @@ fn eval_grouped(
         Expr::Func { name, args } => {
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
-                vals.push(eval_grouped(
-                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
-                )?);
+                let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
+                vals.push(normalize_func_arg(name, v));
             }
             // v0.9: sequence functions need engine access; they cannot
             // go through the pure eval_func_vals path.
@@ -9587,6 +9610,8 @@ fn eval_agg_func(
             for (i, v) in vals.iter().enumerate() {
                 let s = match v {
                     Value::Text(t) => t.clone(),
+                    // v0.35: PG coerces bpchar string_agg inputs to text.
+                    Value::BpChar(t) => crate::storage::rtrim_spaces(t).into(),
                     other => {
                         return Err(exec_err(
                             "42883",
@@ -10079,6 +10104,18 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
             Ok(Some(float_val(x).total_cmp(&exact_to_f64(y))))
         }
         (Value::Text(x), Value::Text(y)) => Ok(Some(x.cmp(y))),
+        // v0.35: PG's bpcharcmp ignores trailing spaces (bcTruelen):
+        // when either side is a blank-padded char, compare the
+        // significant (rtrimmed) contents.
+        (Value::BpChar(x), Value::BpChar(y)) => Ok(Some(
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y)),
+        )),
+        (Value::BpChar(x), Value::Text(y)) => Ok(Some(
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y)),
+        )),
+        (Value::Text(x), Value::BpChar(y)) => Ok(Some(
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y)),
+        )),
         (Value::Bool(x), Value::Bool(y)) => Ok(Some(x.cmp(y))),
         (Value::Date(x), Value::Date(y)) => Ok(Some(x.cmp(y))),
         (Value::Timestamp(x), Value::Timestamp(y)) => Ok(Some(x.cmp(y))),
@@ -11221,6 +11258,8 @@ fn write_text_cast(v: &Value, out: &mut String) {
             let _ = write!(out, "{i}");
         }
         Value::Text(t) => out.push_str(t),
+        // v0.35: PG's text(bpchar) strips trailing spaces (rtrim1).
+        Value::BpChar(s) => out.push_str(crate::storage::rtrim_spaces(s)),
         other => {
             if let Some(t) = other.to_text() {
                 out.push_str(&t);
@@ -11247,6 +11286,161 @@ fn text_value_of(parts: &[&Value]) -> Value {
     })
 }
 
+/// v0.35: parse a `pg_input_is_valid` type argument naming a character
+/// type, returning `(is_char, typmod)`. `None` = not a character type.
+/// A malformed typmod is 22023, like PG's type parser. Bare `char`
+/// means `char(1)`; bare `bpchar`/`varchar` carry no typmod.
+fn parse_char_type_arg(t: &str) -> Result<Option<(bool, Option<i32>)>, ExecError> {
+    let t = t.trim();
+    let (base, n) = match t.find('(') {
+        None => (t, None),
+        Some(i) => {
+            let base = t[..i].trim();
+            let rest = &t[i + 1..];
+            let bad = || exec_err("22023", "invalid type modifier");
+            let end = rest.find(')').ok_or_else(bad)?;
+            if !rest[end + 1..].trim().is_empty() {
+                return Err(bad());
+            }
+            let num: i64 = rest[..end].trim().parse().map_err(|_| bad())?;
+            if !(1..=10_485_760).contains(&num) {
+                return Err(bad());
+            }
+            (base, Some(num as i32))
+        }
+    };
+    let base_lc = base.to_ascii_lowercase();
+    let is_char = match base_lc.as_str() {
+        "char" | "character" | "bpchar" => true,
+        "varchar" | "character varying" => false,
+        _ => return Ok(None),
+    };
+    let n = match (base_lc.as_str(), n) {
+        ("char" | "character", None) => Some(1),
+        _ => n,
+    };
+    Ok(Some((is_char, n)))
+}
+
+/// v0.35: PG19 varchar.c length coercion (`bpchar()` / `varchar()`).
+///
+/// `s` is the source string (already rtrimmed when the source is bpchar
+/// and the target is varchar/text, per PG's `text(bpchar)` = rtrim1).
+/// `n` is the typmod (None = unlimited); `is_explicit` selects CAST
+/// semantics (silent truncation of any excess) vs assignment/input
+/// semantics (excess must be all spaces, else 22001); `pad` blank-pads to
+/// `n` (bpchar only). Lengths count Unicode characters, like PG.
+///
+/// Returns the coerced string (unpadded for varchar).
+fn coerce_char_len(
+    s: &str,
+    n: Option<i32>,
+    is_explicit: bool,
+    pad: bool,
+    type_label: &str,
+) -> Result<String, ExecError> {
+    let Some(n) = n else {
+        return Ok(s.to_string());
+    };
+    let n = n as usize;
+    let char_count = s.chars().count();
+    if char_count <= n {
+        if pad && char_count < n {
+            let mut out = String::with_capacity(s.len() + (n - char_count));
+            out.push_str(s);
+            for _ in char_count..n {
+                out.push(' ');
+            }
+            return Ok(out);
+        }
+        return Ok(s.to_string());
+    }
+    // Overlength: find the byte offset of the n-th character boundary.
+    let cut = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+    let (keep, rest) = s.split_at(cut);
+    if !is_explicit && !rest.bytes().all(|b| b == b' ') {
+        return Err(exec_err(
+            "22001",
+            format!("value too long for type {}({})", type_label, n),
+        ));
+    }
+    Ok(keep.to_string())
+}
+
+/// v0.35: assignment/input coercion to `character(n)` / `character
+/// varying(n)`: blank-tolerant truncation (22001 on non-blank excess),
+/// blank-padding for char. `n` = None means no typmod (unlimited).
+/// Returns `Value::BpChar` for char (padded) and `Value::Text` for
+/// varchar.
+fn eval_char_assign(s: &str, n: Option<i32>, is_char: bool) -> Result<Value, ExecError> {
+    let label = if is_char {
+        "character"
+    } else {
+        "character varying"
+    };
+    let out = coerce_char_len(s, n, false, is_char, label)?;
+    Ok(if is_char {
+        Value::bpchar(out)
+    } else {
+        Value::text(out)
+    })
+}
+
+/// v0.35: explicit-cast coercion to `character(n)` / `character
+/// varying(n)`: silent truncation of any excess, blank-padding for char.
+/// The caller rtrims bpchar sources targeting varchar (PG's
+/// `varchar(bpchar)` goes through `text(bpchar)` = rtrim1); bpchar
+/// sources targeting char keep their padding (PG's `bpchar()` works on
+/// the padded datum).
+fn eval_char_cast(s: &str, n: Option<i32>, is_char: bool) -> Result<Value, ExecError> {
+    let label = if is_char {
+        "character"
+    } else {
+        "character varying"
+    };
+    let out = coerce_char_len(s, n, true, is_char, label)?;
+    Ok(if is_char {
+        Value::bpchar(out)
+    } else {
+        Value::text(out)
+    })
+}
+
+/// v0.35: assignment/input coercion to a column type. For
+/// `character(n)` / `character varying(n)` targets this is PG's
+/// assignment cast (blank-tolerant truncation, 22001 on non-blank
+/// excess, blank-padding for char); every other target goes through
+/// the explicit `eval_cast` (unchanged behavior).
+fn eval_assign_cast(v: &Value, to: &ColType) -> Result<Value, ExecError> {
+    match to {
+        ColType::Char(n) => match v {
+            // A bpchar source keeps its padding: PG's bpchar() works on
+            // the padded datum.
+            Value::Text(s) | Value::BpChar(s) => eval_char_assign(s, *n, true),
+            _ => {
+                let t = text_value_of(&[v]);
+                match &t {
+                    Value::Text(s) => eval_char_assign(s, *n, true),
+                    _ => Ok(t),
+                }
+            }
+        },
+        ColType::Varchar(n) => match v {
+            // PG's bpchar->varchar cast goes through text(bpchar).
+            Value::BpChar(s) => eval_char_assign(crate::storage::rtrim_spaces(s), *n, false),
+            Value::Text(s) => eval_char_assign(s, *n, false),
+            _ => {
+                let t = text_value_of(&[v]);
+                match &t {
+                    Value::Text(s) => eval_char_assign(s, *n, false),
+                    _ => Ok(t),
+                }
+            }
+        },
+        _ => eval_cast(v, *to),
+    }
+}
+
 fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     if v == &Value::Null {
         return Ok(Value::Null);
@@ -11256,6 +11450,33 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v0.35: explicit casts to character(n) / varchar(n): silent
+        // truncation of any excess, blank-padding for char. A bpchar
+        // source keeps its padding for char targets (PG's bpchar()
+        // works on the padded datum); for varchar targets it is first
+        // rtrimmed (PG's varchar(bpchar) goes through text(bpchar)).
+        // Non-text sources go through their text form.
+        ColType::Char(n) => match v {
+            Value::Text(s) | Value::BpChar(s) => eval_char_cast(s, n, true),
+            _ => {
+                let t = text_value_of(&[v]);
+                match &t {
+                    Value::Text(s) => eval_char_cast(s, n, true),
+                    _ => Ok(t),
+                }
+            }
+        },
+        ColType::Varchar(n) => match v {
+            Value::BpChar(s) => eval_char_cast(crate::storage::rtrim_spaces(s), n, false),
+            Value::Text(s) => eval_char_cast(s, n, false),
+            _ => {
+                let t = text_value_of(&[v]);
+                match &t {
+                    Value::Text(s) => eval_char_cast(s, n, false),
+                    _ => Ok(t),
+                }
+            }
+        },
         ColType::Bool => cast_to_bool(v).map(Value::Bool),
         ColType::SmallInt => {
             let i = match v {
@@ -11498,6 +11719,24 @@ fn eval_like(
     not: bool,
     ilike: bool,
 ) -> Result<Value, ExecError> {
+    // v0.35: PG coerces bpchar LIKE operands to text (rtrim1). Normalize
+    // here since LIKE is an operator, not a function call.
+    let a_norm;
+    let a = match a {
+        Value::BpChar(s) => {
+            a_norm = Value::text(crate::storage::rtrim_spaces(s));
+            &a_norm
+        }
+        _ => a,
+    };
+    let p_norm;
+    let pattern = match pattern {
+        Value::BpChar(s) => {
+            p_norm = Value::text(crate::storage::rtrim_spaces(s));
+            &p_norm
+        }
+        _ => pattern,
+    };
     // No ESCAPE clause -> PG default escape is backslash.
     // ESCAPE NULL -> NULL result. ESCAPE must be a single character/byte.
     // Returns (text_escape, bytea_escape); only one is used per branch.
@@ -11646,6 +11885,9 @@ fn str_arg<'a>(fname: &str, v: &'a Value) -> Result<Option<&'a str>, ExecError> 
     match v {
         Value::Null => Ok(None),
         Value::Text(s) => Ok(Some(s)),
+        // v0.35: bpchar text arguments are rtrimmed (PG's text(bpchar)).
+        // The trimmed slice borrows from the padded value, so no copy.
+        Value::BpChar(s) => Ok(Some(crate::storage::rtrim_spaces(s))),
         other => Err(func_arg_err(fname, other)),
     }
 }
@@ -11658,6 +11900,25 @@ fn int_arg(fname: &str, v: &Value) -> Result<Option<i64>, ExecError> {
         Value::Int(i) => Ok(Some(*i)),
         Value::BigInt(i) => Ok(Some(*i)),
         other => Err(func_arg_err(fname, other)),
+    }
+}
+
+/// v0.35: model PG's parse-time coercion of bpchar function arguments
+/// to text (`text(bpchar)` = rtrim1). A blank-padded char value becomes
+/// rtrimmed text before scalar dispatch, except for the builtins where
+/// PG keeps the padding (`octet_length`, `bit_length`) or the value's
+/// own type (`coalesce`, `nullif`, `greatest`, `least`).
+fn normalize_func_arg(name: &str, v: Value) -> Value {
+    match v {
+        Value::BpChar(s)
+            if !matches!(
+                name,
+                "octet_length" | "bit_length" | "coalesce" | "nullif" | "greatest" | "least"
+            ) =>
+        {
+            Value::text(crate::storage::rtrim_spaces(&s))
+        }
+        _ => v,
     }
 }
 
@@ -11675,7 +11936,8 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
-        vals.push(eval_expr(q, scopes, a)?);
+        let v = eval_expr(q, scopes, a)?;
+        vals.push(normalize_func_arg(name, v));
     }
     eval_func_vals(name, &vals)
 }
@@ -12384,6 +12646,8 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Value::Null => Value::Null,
             Value::Bytea(b) => Value::Int(b.len() as i64),
             Value::Text(s) => Value::Int(s.len() as i64),
+            // v0.35: PG's octet_length(bpchar) counts the padded bytes.
+            Value::BpChar(s) => Value::Int(s.len() as i64),
             other => return Err(func_arg_err(name, other)),
         }),
         "substring" => {
@@ -13102,13 +13366,27 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             };
             match typ.to_ascii_lowercase().as_str() {
                 "bytea" => Ok(Value::Bool(crate::storage::parse_bytea(input).is_ok())),
-                _ => Err(exec_err(
-                    "42883",
-                    format!(
-                        "function pg_input_is_valid(unknown, {}) does not exist",
-                        typ
-                    ),
-                )),
+                // v0.35: character types with typmod, via the same
+                // blank-tolerant input coercion as INSERT.
+                t => match parse_char_type_arg(t)? {
+                    Some((is_char, n)) => {
+                        let label = if is_char {
+                            "character"
+                        } else {
+                            "character varying"
+                        };
+                        Ok(Value::Bool(
+                            coerce_char_len(input, n, false, is_char, label).is_ok(),
+                        ))
+                    }
+                    None => Err(exec_err(
+                        "42883",
+                        format!(
+                            "function pg_input_is_valid(unknown, {}) does not exist",
+                            typ
+                        ),
+                    )),
+                },
             }
         }
         "crc32" => {
@@ -16109,6 +16387,17 @@ fn compare_values(
             float_val(x).total_cmp(&exact_to_f64(y))
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v0.35: bpchar ordering ignores trailing spaces (like
+        // cmp_ordering above).
+        (Value::BpChar(x), Value::BpChar(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
+        (Value::BpChar(x), Value::Text(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
+        (Value::Text(x), Value::BpChar(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
@@ -16190,6 +16479,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Float(_) => "float",
         Value::Numeric(_) => "numeric",
         Value::Text(_) => "text",
+        Value::BpChar(_) => "character", // v0.35
         Value::Bool(_) => "boolean",
         Value::Date(_) => "date",
         Value::Timestamp(_) => "timestamp",
@@ -17604,6 +17894,18 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::text(s))
         }
+        // v0.35: parameter input goes through the type's input function,
+        // i.e. assignment semantics (blank-tolerant, 22001 on excess).
+        ColType::Char(n) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            eval_char_assign(s, *n, true)
+        }
+        ColType::Varchar(n) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            eval_char_assign(s, *n, false)
+        }
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
@@ -17877,6 +18179,9 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         Some(Value::Float(f)) => Literal::Float(*f),
         Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
         Some(Value::Text(s)) => Literal::Text(s.clone()),
+        // v0.35: a bpchar parameter substitutes as its (padded) text;
+        // downstream coercion re-applies any target typmod.
+        Some(Value::BpChar(s)) => Literal::Text(s.clone()),
         Some(Value::Bool(b)) => Literal::Bool(*b),
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
@@ -17953,6 +18258,8 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Float => Value::Float(0.0),
         ColType::Numeric => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::text(""),
+        ColType::Char(_) => Value::bpchar(""),  // v0.35
+        ColType::Varchar(_) => Value::text(""), // v0.35
         ColType::Bool => Value::Bool(false),
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),

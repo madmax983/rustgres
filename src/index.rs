@@ -49,6 +49,17 @@ pub fn index_key_cmp(a: &Value, b: &Value) -> Ordering {
             float_val(x).total_cmp(&exact_to_f64(y))
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v0.35: bpchar keys compare trailing-space-insensitively, like
+        // PG's bpchar btree opclass.
+        (Value::BpChar(x), Value::BpChar(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
+        (Value::BpChar(x), Value::Text(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
+        (Value::Text(x), Value::BpChar(y)) => {
+            crate::storage::rtrim_spaces(x).cmp(crate::storage::rtrim_spaces(y))
+        }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
@@ -120,6 +131,7 @@ fn type_tag(v: &Value) -> u8 {
         Value::Float(_) => 5,
         Value::Numeric(_) => 6,
         Value::Text(_) => 7,
+        Value::BpChar(_) => 7, // v0.35: sorts with text in the fallback
         Value::Bool(_) => 8,
         Value::Date(_) => 9,
         Value::Timestamp(_) => 10,

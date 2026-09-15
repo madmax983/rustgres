@@ -31,19 +31,26 @@ use crate::sql::{CheckDef, DefaultExpr, FkDef, TableDef, UniqueDef};
 /// Column data types supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
-    Int,         // INT4, OID 23
-    BigInt,      // INT8, OID 20 (v0.7)
-    SmallInt,    // INT2, OID 21 (v0.7)
-    Float,       // FLOAT8, OID 701
-    Float4,      // FLOAT4, OID 700 (v0.7)
-    Numeric,     // NUMERIC, OID 1700 (v0.7)
-    Text,        // OID 25
-    Bool,        // OID 16
-    Date,        // OID 1082 (v0.7)
-    Timestamp,   // OID 1114 (v0.7)
-    Timestamptz, // OID 1184 (v0.7)
-    Bytea,       // OID 17 (v0.7)
-    Uuid,        // OID 2950 (v0.7)
+    Int,      // INT4, OID 23
+    BigInt,   // INT8, OID 20 (v0.7)
+    SmallInt, // INT2, OID 21 (v0.7)
+    Float,    // FLOAT8, OID 701
+    Float4,   // FLOAT4, OID 700 (v0.7)
+    Numeric,  // NUMERIC, OID 1700 (v0.7)
+    Text,     // OID 25
+    // v0.35: SQL character types with typmod (PG19 bpchar/varchar).
+    // Char(Some(n)) is blank-padded `character(n)`; Char(None) is
+    // `character`/`bpchar` with typmod -1 (no padding, no limit).
+    // Varchar(Some(n)) is `character varying(n)`; Varchar(None) is
+    // unlimited `character varying`.
+    Char(Option<i32>),    // OID 1042
+    Varchar(Option<i32>), // OID 1043
+    Bool,                 // OID 16
+    Date,                 // OID 1082 (v0.7)
+    Timestamp,            // OID 1114 (v0.7)
+    Timestamptz,          // OID 1184 (v0.7)
+    Bytea,                // OID 17 (v0.7)
+    Uuid,                 // OID 2950 (v0.7)
 }
 
 impl ColType {
@@ -54,6 +61,8 @@ impl ColType {
             ColType::BigInt => 20,        // INT8
             ColType::SmallInt => 21,      // INT2
             ColType::Text => 25,          // TEXT
+            ColType::Char(_) => 1042,     // BPCHAR (v0.35)
+            ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -75,6 +84,10 @@ impl ColType {
             ColType::Float4 => "real",
             ColType::Numeric => "numeric",
             ColType::Text => "text",
+            // v0.35: PG's format_type() shows the typmod; the harness and
+            // wire column names only need the base name.
+            ColType::Char(_) => "character",
+            ColType::Varchar(_) => "character varying",
             ColType::Bool => "boolean",
             ColType::Date => "date",
             ColType::Timestamp => "timestamp without time zone",
@@ -95,12 +108,28 @@ impl ColType {
             ColType::Float4 => "float4",
             ColType::Numeric => "numeric",
             ColType::Text => "text",
+            // v0.35: PG names `CAST(x AS char(n))` output columns `bpchar`
+            // and `CAST(x AS varchar(n))` ones `varchar`.
+            ColType::Char(_) => "bpchar",
+            ColType::Varchar(_) => "varchar",
             ColType::Bool => "bool",
             ColType::Date => "date",
             ColType::Timestamp => "timestamp",
             ColType::Timestamptz => "timestamptz",
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
+        }
+    }
+
+    /// v0.35: human-readable type with typmod, e.g. `character(4)` or
+    /// `character varying`; used in error messages and display contexts.
+    pub fn typmod_display(&self) -> String {
+        match self {
+            ColType::Char(Some(n)) => format!("character({})", n),
+            ColType::Char(None) => "character".to_string(),
+            ColType::Varchar(Some(n)) => format!("character varying({})", n),
+            ColType::Varchar(None) => "character varying".to_string(),
+            other => other.sql_name().to_string(),
         }
     }
 }
@@ -1473,6 +1502,11 @@ pub enum Value {
     /// change, so a shared buffer is safe. This removes one copy for
     /// each row. See issue #8.
     Text(Arc<str>),
+    // v0.35: a blank-padded `character(n)` value, stored exactly as PG
+    // stores bpchar (padded to n characters with ASCII spaces). Kept
+    // distinct from Text so comparisons, octet_length, and output typing
+    // can apply PG's trailing-space rules.
+    BpChar(Arc<str>),
     Bool(bool),
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
@@ -1493,6 +1527,12 @@ impl Value {
         Value::Text(s.into())
     }
 
+    /// Make a blank-padded `character(n)` value (v0.35). `s` must already
+    /// be padded to exactly `n` characters.
+    pub fn bpchar(s: impl Into<Arc<str>>) -> Value {
+        Value::BpChar(s.into())
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -1505,6 +1545,9 @@ impl Value {
             Value::Float(f) => Some(float_text(*f)),
             Value::Numeric(n) => Some(n.to_text()),
             Value::Text(s) => Some(s.to_string()),
+            // v0.35: bpchar is stored blank-padded; the wire shows the
+            // padded bytes, like Postgres.
+            Value::BpChar(s) => Some(s.to_string()),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
@@ -1544,6 +1587,12 @@ impl Value {
                 out.extend_from_slice(s.as_bytes());
                 true
             }
+            // v0.35: BpChar shares Text's zero-copy fast path (already
+            // padded; the wire shows the padded bytes).
+            Value::BpChar(s) => {
+                out.extend_from_slice(s.as_bytes());
+                true
+            }
             Value::Bool(b) => {
                 out.push(if *b { b't' } else { b'f' });
                 true
@@ -1577,6 +1626,7 @@ impl Value {
             Value::Float(_) => "double precision",
             Value::Numeric(_) => "numeric",
             Value::Text(_) => "text",
+            Value::BpChar(_) => "character", // v0.35
             Value::Bool(_) => "boolean",
             Value::Date(_) => "date",
             Value::Timestamp(_) => "timestamp without time zone",
@@ -1597,6 +1647,9 @@ impl Value {
             Value::Float(_) => ColType::Float,
             Value::Numeric(_) => ColType::Numeric,
             Value::Text(_) => ColType::Text,
+            // v0.35: the value alone doesn't record the typmod; Char(None)
+            // is the honest fallback (bare `character`).
+            Value::BpChar(_) => ColType::Char(None),
             Value::Bool(_) => ColType::Bool,
             Value::Date(_) => ColType::Date,
             Value::Timestamp(_) => ColType::Timestamp,
@@ -1815,6 +1868,13 @@ fn float4_text(f: f32) -> String {
         }
     }
     format!("{}", f)
+}
+
+/// v0.35: strip trailing ASCII spaces, like PG19's `rtrim1` /
+/// `bcTruelen` in varchar.c. bpchar blank-padding is always ASCII space
+/// (0x20); only that byte is significant, never other whitespace.
+pub fn rtrim_spaces(s: &str) -> &str {
+    s.trim_end_matches(' ')
 }
 
 /// The cells of one row. A reference count controls the memory, thus a

@@ -67,6 +67,15 @@ fn err_duplicate(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// A parse-time 22023 (invalid_parameter_value), like PG's
+/// anychar_typmodin for bad character-type length modifiers.
+fn err_typmod(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "22023",
+    }
+}
+
 /// v0.28: parse the digits of a PG 16+ non-decimal integer literal (the
 /// `0x`/`0o`/`0b` prefix is already stripped). Underscores between digits
 /// are ignored, like Postgres. Returns None when there are no digits or
@@ -2707,22 +2716,33 @@ impl Parser {
             // column definitions. Unlike PostgreSQL we do not auto-create a
             // backing sequence or DEFAULT nextval(); documented in README.
             "serial" => Ok(ColType::Int),
-            // v0.14: character type aliases. Length modifiers are parsed and
-            // ignored; values are stored as text (no blank-padding or
-            // truncation enforcement), documented in README.
+            // v0.35: character types carry their typmod, like PG19
+            // (anychar_typmodin): a single positive length; anything else
+            // is 22023. `varchar` without a length is unlimited (None);
+            // bare `char` means `char(1)`.
             "varchar" => {
-                self.eat_optional_typmod();
-                Ok(ColType::Text)
+                let n = self.parse_opt_typmod()?;
+                Ok(ColType::Varchar(n))
             }
-            "char" | "bpchar" => {
-                self.eat_optional_typmod();
-                Ok(ColType::Text)
+            "char" => {
+                let n = self.parse_opt_typmod()?;
+                Ok(ColType::Char(n.or(Some(1))))
+            }
+            // v0.35: internal `bpchar` name; bare means typmod -1 (no
+            // padding, no limit), like PG.
+            "bpchar" => {
+                let n = self.parse_opt_typmod()?;
+                Ok(ColType::Char(n))
             }
             "character" => {
                 // `character varying(n)` or plain `character(n)`.
-                self.eat_keyword("varying");
-                self.eat_optional_typmod();
-                Ok(ColType::Text)
+                let varying = self.eat_keyword("varying");
+                let n = self.parse_opt_typmod()?;
+                if varying {
+                    Ok(ColType::Varchar(n))
+                } else {
+                    Ok(ColType::Char(n.or(Some(1))))
+                }
             }
             // v0.14: `name` (PostgreSQL internal identifier type) behaves
             // like text here; the 63-byte truncation is not enforced.
@@ -2786,23 +2806,29 @@ impl Parser {
         }
     }
 
-    /// Consume an optional `(n)` or `(n, m)` length/precision modifier,
-    /// ignoring the values (v0.14: character-type typmods are parsed but
-    /// not enforced).
-    fn eat_optional_typmod(&mut self) {
+    /// v0.35: parse an optional character-type length modifier `(n)`,
+    /// returning `None` when absent. Mirrors PG19's `anychar_typmodin`:
+    /// exactly one positive length is required; anything else (missing
+    /// digits, a second modifier, zero, negative, or over 10,485,760) is
+    /// SQLSTATE 22023.
+    fn parse_opt_typmod(&mut self) -> Result<Option<i32>, SqlError> {
         if *self.peek() != Token::LParen {
-            return;
+            return Ok(None);
         }
         self.next(); // '('
-        let mut depth = 1usize;
-        while depth > 0 {
-            match self.next() {
-                Token::LParen => depth += 1,
-                Token::RParen => depth -= 1,
-                Token::EOF => break,
-                _ => {}
-            }
+        let bad = || err_typmod("invalid type modifier".to_string());
+        let n: i64 = match self.next() {
+            Token::Number(s) => s.parse().map_err(|_| bad())?,
+            _ => return Err(bad()),
+        };
+        match self.next() {
+            Token::RParen => {}
+            _ => return Err(bad()),
         }
+        if !(1..=10_485_760).contains(&n) {
+            return Err(bad());
+        }
+        Ok(Some(n as i32))
     }
 
     /// First word of a type name (for typed-literal lookahead like

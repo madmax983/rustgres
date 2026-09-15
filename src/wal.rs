@@ -617,6 +617,18 @@ impl Enc {
             ColType::Timestamptz => 10,
             ColType::Bytea => 11,
             ColType::Uuid => 12,
+            // v0.35: new tags append after (v0.7 layout); the typmod is
+            // stored as i32, -1 for "no typmod".
+            ColType::Char(n) => {
+                self.u8(13);
+                self.i32(n.unwrap_or(-1));
+                return;
+            }
+            ColType::Varchar(n) => {
+                self.u8(14);
+                self.i32(n.unwrap_or(-1));
+                return;
+            }
         });
     }
 
@@ -676,6 +688,11 @@ impl Enc {
             Value::Uuid(u) => {
                 self.u8(13);
                 self.bytes(u);
+            }
+            // v0.35: blank-padded char values; tag appends after v0.7's.
+            Value::BpChar(s) => {
+                self.u8(14);
+                self.str(s);
             }
         }
     }
@@ -1096,6 +1113,15 @@ impl<'a> Dec<'a> {
             10 => Ok(ColType::Timestamptz),
             11 => Ok(ColType::Bytea),
             12 => Ok(ColType::Uuid),
+            // v0.35: typmod stored as i32, -1 = no typmod.
+            13 => {
+                let n = self.i32()?;
+                Ok(ColType::Char(if n < 0 { None } else { Some(n) }))
+            }
+            14 => {
+                let n = self.i32()?;
+                Ok(ColType::Varchar(if n < 0 { None } else { Some(n) }))
+            }
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }
@@ -1129,6 +1155,8 @@ impl<'a> Dec<'a> {
                 u.copy_from_slice(b);
                 Ok(Value::Uuid(u))
             }
+            // v0.35: blank-padded char values.
+            14 => Ok(Value::BpChar(self.str()?.into())),
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
     }
