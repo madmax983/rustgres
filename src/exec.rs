@@ -3764,7 +3764,10 @@ fn plan_order_scan(
         FromItem::Table { name, alias, .. } => {
             (name.as_str(), alias.clone().unwrap_or_else(|| name.clone()))
         }
-        FromItem::Derived { .. } | FromItem::Join { .. } | FromItem::Values { .. } => return None,
+        FromItem::Derived { .. }
+        | FromItem::Join { .. }
+        | FromItem::Values { .. }
+        | FromItem::Function { .. } => return None,
     };
     let t = eng.db.find_table(table_name, snap, own, session)?;
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a
@@ -4169,6 +4172,9 @@ fn plan_from_item(
                 child: Box::new(child),
             })
         }
+        // v0.32: table function — cardinality is unknown at plan time
+        // (args need evaluation), so plan it as a single-row VALUES.
+        FromItem::Function { .. } => Ok(PlanNode::Values { rows: 1 }),
         // v0.14: VALUES rows are uncorrelated constants.
         FromItem::Values { rows, .. } => Ok(PlanNode::Values {
             rows: rows.len() as u64,
@@ -5294,6 +5300,11 @@ fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
             }
             FromItem::Derived { alias, .. } => out.push((alias.clone(), None)),
             FromItem::Values { alias, .. } => out.push((alias.clone(), None)),
+            // v0.32: table function — no underlying table; privilege is
+            // checked at the function's own level (none needed).
+            FromItem::Function { name, alias, .. } => {
+                out.push((alias.clone().unwrap_or_else(|| name.clone()), None))
+            }
             FromItem::Join {
                 left, right, alias, ..
             } => {
@@ -5696,6 +5707,9 @@ fn from_refs_table(f: &FromItem, name: &str) -> bool {
         FromItem::Table { name: n, .. } => n == name,
         FromItem::Derived { sub, .. } => stmt_refs_table(sub, name),
         FromItem::Values { .. } => false,
+        // v0.32: table functions reference no tables (args are
+        // uncorrelated).
+        FromItem::Function { .. } => false,
         FromItem::Join { left, right, .. } => {
             from_refs_table(left, name) || from_refs_table(right, name)
         }
@@ -5774,12 +5788,41 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         exec_agg(q, outer, stmt, &schema, &rows, &out_cols, &windows)?
     } else {
         let mut v = Vec::with_capacity(rows.len());
+        // v0.32: SRF-in-targetlist expansion (PG 19). A top-level
+        // set-returning function call in the SELECT list fans each input
+        // row out to one row per returned element. Only on the plain
+        // projection path: aggregates and windowed queries keep the
+        // scalar (first-row-or-NULL) reading.
+        let expand_srf = windows.is_empty()
+            && stmt.items.iter().any(|it| {
+                matches!(
+                    it,
+                    SelectItem::Expr {
+                        expr: Expr::Func { name, .. },
+                        ..
+                    } if is_srf(name)
+                )
+            });
         for (ri, r) in rows.into_iter().enumerate() {
             let full = keep_full.then(|| r.cells.clone());
             // v0.10: point the window context at this input row before
             // projecting (windows were precomputed above).
             if let Some(wctx) = q.wctx.as_mut() {
                 wctx.row = ri;
+            }
+            if expand_srf {
+                for (cells, prov) in
+                    project_row_expanded(q, outer, stmt, &schema, r, out_cols.len())?
+                {
+                    v.push(OutRow {
+                        cells,
+                        prov,
+                        full: full.clone(),
+                        sort_keys: None,
+                        win_idx: None,
+                    });
+                }
+                continue;
             }
             // project_row takes the row by value: plain `SELECT *` moves
             // it through with zero copies, and provenance moves rather
@@ -5915,6 +5958,13 @@ fn validate_from(f: &FromItem) -> Result<(), ExecError> {
     match f {
         FromItem::Table { .. } => Ok(()),
         FromItem::Derived { sub, .. } => validate_select(sub),
+        // v0.32: validate table-function args.
+        FromItem::Function { args, .. } => {
+            for a in args {
+                validate_expr(a)?;
+            }
+            Ok(())
+        }
         FromItem::Values { rows, .. } => {
             for row in rows {
                 for e in row {
@@ -7510,6 +7560,12 @@ fn collect_from_refs(f: &FromItem, out: &mut Vec<(Option<String>, String)>) {
             }
         }
         FromItem::Table { .. } => {}
+        // v0.32: table-function args are uncorrelated expressions.
+        FromItem::Function { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
     }
 }
 
@@ -8175,6 +8231,49 @@ fn build_source(
             };
             Ok((apply_aliases(schema)?, rows))
         }
+        // v0.32: set-returning table function (`regexp_split_to_table`).
+        // Uncorrelated (no LATERAL): args evaluate against the outer
+        // scope chain only, once per query.
+        FromItem::Function {
+            name,
+            args,
+            alias,
+            col_aliases,
+        } => {
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(eval_expr(q, outer, a)?);
+            }
+            let row_vals = eval_table_function(name, &arg_vals)?;
+            let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // PG 19 arity rule for column aliases (more aliases than
+            // columns is 42601), via check_col_alias_arity.
+            check_col_alias_arity(&qual, 1, col_aliases)?;
+            // v0.32: a single-column function scan's column takes the
+            // table alias when one is present (PG: `SELECT * FROM
+            // generate_series(1,3) AS g` shows header `g`), else the
+            // function name; explicit column aliases win.
+            let col_name = col_aliases
+                .first()
+                .cloned()
+                .or(alias.clone())
+                .unwrap_or_else(|| name.clone());
+            let schema = vec![QCol {
+                qual,
+                name: col_name,
+                ty: ColType::Text,
+                hidden: false,
+                src_ord: 0,
+            }];
+            let rows = row_vals
+                .into_iter()
+                .map(|v| QRow {
+                    cells: Row::new(vec![v]),
+                    prov: Vec::new(),
+                })
+                .collect();
+            Ok((schema, rows))
+        }
         FromItem::Derived {
             sub,
             alias,
@@ -8627,7 +8726,22 @@ fn project_row(
     }
     // Only expression items need a scope chain; star-only shapes don't
     // pay for one. `row` is owned, so provenance moves without cloning.
-    let scopes: Vec<Scope> = if stmt
+    let scopes = projection_scopes(outer, stmt, schema, &row);
+    let mut cells = Vec::with_capacity(out_ncols);
+    for item in &stmt.items {
+        cells.extend(project_item_values(q, &scopes, schema, &row, item, false)?);
+    }
+    Ok((Row::new(cells), row.prov))
+}
+
+/// v0.32: build the SELECT-list scope chain for one input row.
+fn projection_scopes<'a>(
+    outer: &'a [Scope<'a>],
+    stmt: &SelectStmt,
+    schema: &'a [QCol],
+    row: &'a QRow,
+) -> Vec<Scope<'a>> {
+    if stmt
         .items
         .iter()
         .any(|i| matches!(i, SelectItem::Expr { .. }))
@@ -8641,36 +8755,103 @@ fn project_row(
         s
     } else {
         Vec::new()
-    };
-    let mut cells = Vec::with_capacity(out_ncols);
-    for item in &stmt.items {
-        match item {
-            // v0.23: hidden columns are skipped by `*` (they stay
-            // reachable via qualified refs and `qual.*`).
-            SelectItem::All => cells.extend(
-                schema
-                    .iter()
-                    .zip(row.cells.iter())
-                    .filter(|(c, _)| !c.hidden)
-                    .map(|(_, v)| v.clone()),
-            ),
-            SelectItem::AllOf(qual) => {
-                // v0.23: expand in the qualifier's source-column order.
-                let idx = qual_star_order(schema, qual);
-                if idx.is_empty() {
-                    return Err(exec_err(
-                        "42P01",
-                        format!("missing FROM-clause entry for table \"{}\"", qual),
-                    ));
-                }
-                for i in idx {
-                    cells.push(row.cells[i].clone());
+    }
+}
+
+/// v0.32: evaluate one SELECT-list item to its column values. With
+/// `expand_srf`, a top-level set-returning function call produces one value
+/// per output row instead of a single scalar (PG 19 SRF-in-targetlist).
+fn project_item_values(
+    q: &mut Q,
+    scopes: &[Scope],
+    schema: &[QCol],
+    row: &QRow,
+    item: &SelectItem,
+    expand_srf: bool,
+) -> Result<Vec<Value>, ExecError> {
+    match item {
+        // v0.23: hidden columns are skipped by `*` (they stay
+        // reachable via qualified refs and `qual.*`).
+        SelectItem::All => Ok(schema
+            .iter()
+            .zip(row.cells.iter())
+            .filter(|(c, _)| !c.hidden)
+            .map(|(_, v)| v.clone())
+            .collect()),
+        SelectItem::AllOf(qual) => {
+            // v0.23: expand in the qualifier's source-column order.
+            let idx = qual_star_order(schema, qual);
+            if idx.is_empty() {
+                return Err(exec_err(
+                    "42P01",
+                    format!("missing FROM-clause entry for table \"{qual}\""),
+                ));
+            }
+            Ok(idx.into_iter().map(|i| row.cells[i].clone()).collect())
+        }
+        SelectItem::Expr { expr, .. } => {
+            if expand_srf {
+                if let Expr::Func { name, args } = expr {
+                    if is_srf(name) {
+                        let mut vals = Vec::with_capacity(args.len());
+                        for a in args {
+                            vals.push(eval_expr(q, scopes, a)?);
+                        }
+                        return eval_srf_vals(name, &vals);
+                    }
                 }
             }
-            SelectItem::Expr { expr, .. } => cells.push(eval_expr(q, &scopes, expr)?),
+            Ok(vec![eval_expr(q, scopes, expr)?])
         }
     }
-    Ok((Row::new(cells), row.prov))
+}
+
+/// v0.32: project one input row with SRF-in-targetlist expansion (PG 19).
+/// The row fans out to max(SRF widths) output rows; SRFs narrower than the
+/// max pad with NULL; an all-empty SRF set yields zero rows. Plain columns
+/// repeat their value on every fanned-out row.
+fn project_row_expanded(
+    q: &mut Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    schema: &[QCol],
+    row: QRow,
+    out_ncols: usize,
+) -> Result<Vec<(Row, Vec<(String, u64)>)>, ExecError> {
+    let scopes = projection_scopes(outer, stmt, schema, &row);
+    // (values, pad_with_null): SRF columns pad, plain columns repeat.
+    let mut cols: Vec<(Vec<Value>, bool)> = Vec::with_capacity(out_ncols);
+    for item in &stmt.items {
+        let vals = project_item_values(q, &scopes, schema, &row, item, true)?;
+        let srf_col = matches!(
+            item,
+            SelectItem::Expr {
+                expr: Expr::Func { name, .. },
+                ..
+            } if is_srf(name)
+        );
+        if srf_col {
+            cols.push((vals, true));
+        } else {
+            for v in vals {
+                cols.push((vec![v], false));
+            }
+        }
+    }
+    let width = cols.iter().map(|(v, _)| v.len()).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(width);
+    for k in 0..width {
+        let mut cells = Vec::with_capacity(cols.len());
+        for (vals, pad) in &cols {
+            if *pad {
+                cells.push(vals.get(k).cloned().unwrap_or(Value::Null));
+            } else {
+                cells.push(vals[0].clone());
+            }
+        }
+        out.push((Row::new(cells), row.prov.clone()));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -11539,6 +11720,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_substr" => (2..=6).contains(&n),
         "regexp_replace" => (3..=6).contains(&n),
         "regexp_split_to_array" => (2..=3).contains(&n),
+        // v0.32: regexp set-returning functions (PG 19).
+        "regexp_matches" => (2..=3).contains(&n),
+        "regexp_split_to_table" => (2..=3).contains(&n),
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
         "similar_to" => (2..=3).contains(&n),
@@ -11647,6 +11831,8 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "regexp_substr"
         | "regexp_replace"
         | "regexp_split_to_array"
+        // v0.32: regexp_matches (scalar context = first match row).
+        | "regexp_matches"
         | "similar_to"
         | "substring_similar"
         | "substring_from"
@@ -11749,8 +11935,9 @@ fn parse_regexp_flags(
             'x' => opts.expanded = true,
             'g' => {
                 if !allow_global {
+                    // v0.32: PG uses 22023 for this rejection.
                     return Err(exec_err(
-                        "2201B",
+                        "22023",
                         format!("{func}() does not support the \"global\" option"),
                     ));
                 }
@@ -11845,6 +12032,236 @@ fn check_regexp_n(n: i64, what: &str) -> Result<(), ExecError> {
         ));
     }
     Ok(())
+}
+
+/// v0.32: shared PG-19 match loop, port of `setup_regexp_matches` in
+/// `src/backend/utils/adt/regexp.c`.
+///
+/// Finds successive non-overlapping matches starting at or after each
+/// previous match end. After a zero-length match the next search starts one
+/// character later (PG's `start_search = end_search; if (start_search ==
+/// end_search) start_search++`).
+///
+/// When `ignore_degenerate` is set (the split functions), zero-length
+/// matches at the end of the string or immediately after the previous match
+/// end are ignored entirely (PG: `if (so == eo && !(so < n && eo >
+/// prev_match_end)) continue;`).
+fn regexp_find_all(
+    re: &crate::regex::Compiled,
+    sc: &[char],
+    global: bool,
+    ignore_degenerate: bool,
+) -> Vec<(usize, usize, crate::regex::Captures)> {
+    let mut out = Vec::new();
+    let mut prev_match_end = 0usize;
+    let mut ss = 0usize;
+    loop {
+        let (ms, me, caps) = match re.find_at(sc, ss) {
+            None => break,
+            Some(m) => m,
+        };
+        let degenerate = ms == me && !(ms < sc.len() && me > prev_match_end);
+        if !(ignore_degenerate && degenerate) {
+            out.push((ms, me, caps));
+        }
+        prev_match_end = me;
+        if !global {
+            break;
+        }
+        ss = me;
+        if ms == me {
+            ss += 1;
+        }
+        if ss > sc.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// v0.32: PG `array_out` quoting for text elements — quote when empty,
+/// when containing whitespace or any of `,"\{}` (which would corrupt
+/// parsing), or when equal to NULL in any case. Escapes `"` and `\`.
+fn pg_quote_array_elem(p: &str) -> String {
+    let needs = p.is_empty()
+        || p.chars().any(|c| {
+            c == ',' || c == '"' || c == '\\' || c == '{' || c == '}' || c.is_whitespace()
+        })
+        || p.eq_ignore_ascii_case("null");
+    if !needs {
+        return p.to_string();
+    }
+    let mut out = String::with_capacity(p.len() + 2);
+    out.push('"');
+    for c in p.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// v0.32: build a PG text[] literal; `None` renders as bare NULL.
+fn pg_text_array_literal(elems: &[Option<String>]) -> String {
+    let mut out = String::from("{");
+    for (i, e) in elems.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match e {
+            None => out.push_str("NULL"),
+            Some(s) => out.push_str(&pg_quote_array_elem(s)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// v0.32: port of PG 19 `build_regexp_split_result` in `regexp.c`.
+/// Splits `sc` on the recorded delimiter matches; the pieces are the
+/// unmatched segments before, between, and after the delimiters.
+fn regexp_split_result(
+    sc: &[char],
+    matches: &[(usize, usize, crate::regex::Captures)],
+) -> Vec<String> {
+    let mut pieces = Vec::with_capacity(matches.len() + 1);
+    let mut pos = 0usize;
+    for (ms, me, _) in matches {
+        pieces.push(sc[pos..*ms].iter().collect::<String>());
+        pos = *me;
+    }
+    pieces.push(sc[pos..].iter().collect::<String>());
+    pieces
+}
+
+/// v0.32: port of PG 19 `build_regexp_match_result` in `regexp.c`.
+/// One `text[]` literal per match; element `i` is group `i`'s text, NULL
+/// when the group did not participate. With no capture groups the literal
+/// holds the whole match.
+fn regexp_match_result(
+    sc: &[char],
+    re: &crate::regex::Compiled,
+    ms: usize,
+    me: usize,
+    caps: &crate::regex::Captures,
+) -> String {
+    let ngroups = re.group_count();
+    let elems: Vec<Option<String>> = if ngroups == 0 {
+        vec![Some(sc[ms..me].iter().collect::<String>())]
+    } else {
+        (1..=ngroups)
+            .map(|g| {
+                caps.groups
+                    .get(g)
+                    .and_then(|slot| slot.as_ref())
+                    .map(|&(gs, ge)| sc[gs..ge].iter().collect::<String>())
+            })
+            .collect()
+    };
+    pg_text_array_literal(&elems)
+}
+
+/// v0.32: `regexp_matches(string, pattern [, flags])` as a set-returning
+/// function — one row per match (PG 19 `regexp_matches`). Flags are parsed
+/// with 'g' allowed (global = all matches, else just the first).
+/// NULL input yields zero rows.
+fn regexp_matches_rows(vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    let name = "regexp_matches";
+    let s = match str_arg(name, &vals[0])? {
+        None => return Ok(Vec::new()),
+        Some(s) => s.to_string(),
+    };
+    let pat = match str_arg(name, &vals[1])? {
+        None => return Ok(Vec::new()),
+        Some(p) => p.to_string(),
+    };
+    let flags = if vals.len() > 2 {
+        match str_arg(name, &vals[2])? {
+            None => return Ok(Vec::new()),
+            Some(f) => f.to_string(),
+        }
+    } else {
+        String::new()
+    };
+    let (opts, global) = parse_regexp_flags(&flags, name, true)?;
+    let re = crate::regex::compile_opts(&pat, opts)
+        .map_err(|e| exec_err("2201B", format!("invalid regular expression: {e}")))?;
+    let sc: Vec<char> = s.chars().collect();
+    Ok(regexp_find_all(&re, &sc, global, false)
+        .into_iter()
+        .map(|(ms, me, caps)| Value::text(regexp_match_result(&sc, &re, ms, me, &caps)))
+        .collect())
+}
+
+/// v0.32: table functions usable in FROM — currently
+/// `regexp_split_to_table(string, pattern [, flags])` (PG 19). Returns one
+/// value per split piece. NULL input yields zero rows; the 'g' flag is
+/// rejected (the split is internally global, like PG).
+fn eval_table_function(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    // v0.32: arity is validated like scalar builtins (42883, as PG's
+    // "function ... does not exist" for a bad signature).
+    check_builtin_arity(name, vals)?;
+    match name {
+        "regexp_split_to_table" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Vec::new()),
+                Some(s) => s.to_string(),
+            };
+            let pat = match str_arg(name, &vals[1])? {
+                None => return Ok(Vec::new()),
+                Some(p) => p.to_string(),
+            };
+            let flags = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Vec::new()),
+                    Some(f) => f.to_string(),
+                }
+            } else {
+                String::new()
+            };
+            let (opts, _) = parse_regexp_flags(&flags, name, false)?;
+            let re = crate::regex::compile_opts(&pat, opts)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {e}")))?;
+            let sc: Vec<char> = s.chars().collect();
+            let matches = regexp_find_all(&re, &sc, true, true);
+            Ok(regexp_split_result(&sc, &matches)
+                .into_iter()
+                .map(Value::text)
+                .collect())
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!(
+                "function {}({}) does not exist",
+                name,
+                vals.iter()
+                    .map(|v| v.type_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// v0.32: set-returning functions that expand in the SELECT list (PG 19
+/// SRF-in-targetlist semantics). Unknown names are not SRFs.
+fn is_srf(name: &str) -> bool {
+    matches!(name, "regexp_matches")
+}
+
+/// v0.32: evaluate a set-returning function to its output rows (one Value
+/// per row). Used by the SRF targetlist expansion.
+fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    check_builtin_arity(name, vals)?;
+    match name {
+        "regexp_matches" => regexp_matches_rows(vals),
+        _ => Err(exec_err(
+            "42883",
+            format!("function {name} is not a set-returning function"),
+        )),
+    }
 }
 
 fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
@@ -13075,66 +13492,41 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::text(out))
         }
         "regexp_split_to_array" => {
-            // regexp_split_to_array(s, pat [, flags]): split string on
-            // regexp matches, return text[] as PG array literal.
+            // v0.32: port of PG 19 regexp_split_to_array — the split is
+            // internally global, degenerate zero-length delimiter matches
+            // are ignored (see regexp_find_all), and the result follows
+            // build_regexp_split_result with PG array_out quoting.
+            let name = "regexp_split_to_array";
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
-                Some(s) => s,
+                Some(s) => s.to_string(),
             };
             let pat = match str_arg(name, &vals[1])? {
                 None => return Ok(Value::Null),
-                Some(s) => s,
+                Some(p) => p.to_string(),
             };
-            let flags = get_str_arg(name, vals, 2, "")?;
-            let (opts, _) = parse_regexp_flags(flags, name, false)?;
-            let re = crate::regex::compile_opts(pat, opts)
-                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
-            let sc: Vec<char> = s.chars().collect();
-            let mut parts: Vec<String> = Vec::new();
-            let mut pos = 0usize;
-            // Empty pattern: split between each character.
-            if pat.is_empty() {
-                for c in sc.iter() {
-                    parts.push(c.to_string());
+            let flags = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(f) => f.to_string(),
                 }
             } else {
-                while pos <= sc.len() {
-                    match re.find_at(&sc, pos) {
-                        Some((ms, me, _)) => {
-                            parts.push(sc[pos..ms].iter().collect());
-                            // Avoid infinite loop on empty match.
-                            pos = if me > ms { me } else { ms + 1 };
-                            if ms == sc.len() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                parts.push(sc[pos.min(sc.len())..].iter().collect());
-            }
-            // Format as PG array literal: {"",23456}
-            let mut out = String::from("{");
-            for (i, p) in parts.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                // Quote if empty or contains special chars.
-                if p.is_empty() || p.contains(&[',', '"', '\\', '{', '}'][..]) {
-                    out.push('"');
-                    for c in p.chars() {
-                        if c == '"' || c == '\\' {
-                            out.push('\\');
-                        }
-                        out.push(c);
-                    }
-                    out.push('"');
-                } else {
-                    out.push_str(p);
-                }
-            }
-            out.push('}');
-            Ok(Value::text(out))
+                String::new()
+            };
+            let (opts, _) = parse_regexp_flags(&flags, name, false)?;
+            let re = crate::regex::compile_opts(&pat, opts)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {e}")))?;
+            let sc: Vec<char> = s.chars().collect();
+            let matches = regexp_find_all(&re, &sc, true, true);
+            let parts = regexp_split_result(&sc, &matches);
+            let lit = pg_text_array_literal(&parts.into_iter().map(Some).collect::<Vec<_>>());
+            Ok(Value::text(lit))
+        }
+        "regexp_matches" => {
+            // v0.32: scalar context — first match row, or NULL when there
+            // is no match. Set semantics live in eval_srf_vals.
+            let rows = regexp_matches_rows(vals)?;
+            Ok(rows.into_iter().next().unwrap_or(Value::Null))
         }
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
@@ -15277,7 +15669,9 @@ fn func_result_type(
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
-        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" => Ok(ColType::Text),
+        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches" => {
+            Ok(ColType::Text)
+        }
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" | "substring_from" | "substring_from_for" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
@@ -15759,6 +16153,40 @@ fn from_schema_item(
                     })
                     .collect(),
             );
+            Ok(())
+        }
+        // v0.32: table functions describe as their single output column
+        // (currently always text); unknown functions are 42883.
+        FromItem::Function {
+            name,
+            alias,
+            col_aliases,
+            ..
+        } => {
+            if !matches!(name.as_str(), "regexp_split_to_table") {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {name}() does not exist"),
+                ));
+            }
+            let qual = alias.clone().unwrap_or_else(|| name.clone());
+            check_col_alias_arity(&qual, 1, col_aliases)?;
+            // v0.32: single-column function scan — the column takes the
+            // table alias when present (see build_source), else the
+            // function name; explicit column aliases win.
+            let col_name = col_aliases
+                .first()
+                .cloned()
+                .or(alias.clone())
+                .unwrap_or_else(|| name.clone());
+            out.push(vec![QCol {
+                qual,
+                name: col_name,
+                ty: ColType::Text,
+
+                hidden: false,
+                src_ord: 0,
+            }]);
             Ok(())
         }
         // v0.14: VALUES columns are `column1`, ... typed from the first
@@ -16526,6 +16954,13 @@ fn infer_from(
             }
             Ok(())
         }
+        // v0.32: table-function args are uncorrelated (no LATERAL).
+        FromItem::Function { args, .. } => {
+            for a in args {
+                infer_expr(a, eng, snap, own, session, &[], out)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -17125,6 +17560,13 @@ fn subst_from(f: &mut FromItem, params: &[Option<Value>]) -> Result<(), ExecErro
                 for e in row {
                     subst_expr(e, params)?;
                 }
+            }
+            Ok(())
+        }
+        // v0.32: table-function args may hold $n parameters.
+        FromItem::Function { args, .. } => {
+            for a in args {
+                subst_expr(a, params)?;
             }
             Ok(())
         }

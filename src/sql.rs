@@ -1082,6 +1082,15 @@ pub enum FromItem {
         alias: String,
         col_aliases: Vec<String>,
     },
+    /// v0.32: `func(args) [AS] alias [(cols)]` — set-returning table
+    /// function (currently `regexp_split_to_table`). Correlated (LATERAL)
+    /// references are not supported: args see the outer scope only.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+        col_aliases: Vec<String>,
+    },
     Join {
         left: Box<FromItem>,
         kind: JoinKind,
@@ -2229,6 +2238,8 @@ fn max_param_from(f: &FromItem) -> usize {
     match f {
         FromItem::Table { .. } => 0,
         FromItem::Derived { sub, .. } => max_param_select(sub),
+        // v0.32: table-function args may hold $n parameters.
+        FromItem::Function { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
         FromItem::Values { rows, .. } => rows
             .iter()
             .flat_map(|r| r.iter())
@@ -5961,6 +5972,9 @@ impl Parser {
                     }
                     *c = col_aliases;
                 }
+                // v0.32: unreachable here (functions parse in the
+                // non-parenthesized branch with alias already set).
+                FromItem::Function { .. } => {}
             }
             Ok(item)
         } else {
@@ -5973,6 +5987,30 @@ impl Parser {
             } else {
                 name
             };
+            // v0.32: `FROM func(args)` — set-returning table function.
+            if *self.peek() == Token::LParen {
+                self.next();
+                let mut args = Vec::new();
+                if *self.peek() != Token::RParen {
+                    loop {
+                        args.push(self.parse_or()?);
+                        if *self.peek() == Token::Comma {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RParen, "')'")?;
+                let alias = self.parse_alias_opt()?;
+                let col_aliases = self.parse_col_alias_list()?;
+                return Ok(FromItem::Function {
+                    name,
+                    args,
+                    alias,
+                    col_aliases,
+                });
+            }
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
             let col_aliases = self.parse_col_alias_list()?;
@@ -6896,6 +6934,9 @@ pub fn collect_table_refs(sel: &SelectStmt, out: &mut Vec<String>) {
             FromItem::Table { name, .. } => out.push(name.clone()),
             FromItem::Derived { sub, .. } => collect_table_refs(sub, out),
             FromItem::Values { .. } => {}
+            // v0.32: a table function is not a relation for dependency
+            // tracking.
+            FromItem::Function { .. } => {}
             FromItem::Join { left, right, .. } => {
                 from_item(left, out);
                 from_item(right, out);
