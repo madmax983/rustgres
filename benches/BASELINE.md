@@ -2,6 +2,84 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `exec_insert`'s per-row `WriteOp` log grows unsized — fix — 2026-09-15
+
+Fixes the target identified in the baseline entry immediately below this
+one. `src/exec.rs`'s `exec_insert` adds one line, `ctx.writes.reserve(n);`,
+right after `n` (the exact total of inserted + updated rows) is computed
+and before either the insert loop or the `ON CONFLICT DO UPDATE` loop
+that each push one `WriteOp` per row into `ctx.writes`. No other line
+changes; `WriteOp` construction is byte-for-byte identical to before.
+
+**After numbers** (same harness, same workload — `benches/profile_insert.py
+--count 20 --rows 1000`, same machine, this session; both DHAT runs
+below are exact repeats, byte-for-byte identical to each other):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| DHAT total bytes (20 iterations x 1000-row INSERT) | 63,914,972 | 55,396,236 | **-13.33%** |
+| DHAT total blocks | 262,249 | 262,090 | -0.06% |
+| Bytes in the `ctx.writes` push site | 16,679,040 (26.10% of total) | 8,160,000 (14.73% of total) | **-51.06%** |
+| Blocks in the `ctx.writes` push site | 180 | 20 | **-88.89%** |
+
+Well above the ≥10%-reduction-in-allocation-bytes impact floor, on both
+the whole-workload total and the target site specifically. Blocks
+dropped too (the doubling-growth path's ~9 reallocations per statement
+collapsed to the 1 allocation `reserve(n)` performs), just not by 10% of
+the *workload's* total block count — most of this workload's block count
+is small, one-per-row allocations elsewhere (tokenizer/parser Vecs,
+`Value` Vecs, WAL encoding) that this change doesn't touch, so the
+byte-count floor is the one this change is judged against, matching how
+it was found (a byte-share profile, not a block-share one).
+
+Reproduced twice post-fix: 55,396,236 bytes / 262,090 blocks both times
+(this workload is single-connection, single-threaded — fully
+deterministic under DHAT, unlike Callgrind's instruction counts which
+carry a tiny amount of run-to-run jitter elsewhere in this file). The
+post-fix DHAT top site for this call path is now a single
+`Vec<WriteOp>::reserve` allocation (8,160,000 bytes, 20 blocks — one
+per statement, sized to fit the whole batch in one shot) in place of the
+pre-fix `finish_grow`/`grow_amortized` chain.
+
+For context, not as the gating counter: Callgrind `Ir` (total
+instructions) moved from 1,225,598,180 to 1,223,815,158 (**-0.145%**) —
+expected and non-gating, since `WriteOp` growth reallocation is a small
+fraction of this workload's instruction count even though it is over a
+quarter of its allocated bytes (most of the workload's instructions are
+in parsing the 1000-row VALUES text and per-row constraint checking, not
+allocator bookkeeping).
+
+**Correctness**: 123 of 124 `cargo test --all-features` unit tests pass,
+unchanged from the pristine tree — the one failure
+(`exec::tests::v17_datetime_functions`) is pre-existing and
+change-independent (reproduces identically via `git stash`; a `to_char`
+`"YYYY"`-format assertion unrelated to INSERT/WriteOp). `cargo fmt --all
+-- --check` is clean. `cargo clippy --all-targets --all-features -- -D
+warnings` fails to compile with the same 273 pre-existing errors (the
+`collapsible_if`/toolchain-mismatch issue noted in earlier entries in
+this file) on both the pre-change and post-change tree, confirmed via
+`git stash`; no new clippy findings on `exec_insert`.
+`tests/protocol_test.py`, `8`, `9`, `10`, `12`, `13`, `21` (durability,
+unique-index enforcement, COPY, `ON CONFLICT`/upsert, replication,
+mini-soak-and-recovery, numeric edge cases — the suites that exercise
+`exec_insert`'s `WriteOp::InsertRow`/`WriteOp::UpdateRow` push sites,
+including the `ON CONFLICT DO UPDATE` path this fix also covers) all
+pass in full.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_insert.py --count 20 --rows 1000 --timeout 600
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`.
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
 ## Bolt: `exec_insert`'s per-row `WriteOp` log grows unsized — baseline — 2026-09-15
 
 **Workload**: `benches/profile_insert.py` (new) — a fixed-iteration-count
