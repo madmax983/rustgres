@@ -2,6 +2,107 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `exec_insert`'s per-row `WriteOp` log grows unsized — baseline — 2026-09-15
+
+**Workload**: `benches/profile_insert.py` (new) — a fixed-iteration-count
+driver, same rationale as `profile_join.py`/`profile_scan.py`: `bench.py`'s
+`insert` workload is time-boxed, so two profiling runs would execute a
+different amount of work whenever wall-clock speed jitters under valgrind.
+This driver sends an exact 20 iterations of the same 1000-row multi-VALUES
+`INSERT` `bench.py`'s `insert` workload uses, over the real wire protocol,
+against a fresh table:
+
+```sql
+CREATE TABLE bench_ins(id INT, name TEXT, active BOOL)
+INSERT INTO bench_ins VALUES (0,'name0',true),(1,'name1',false),...  -- 1000 rows
+```
+
+The `INSERT` path (`exec::exec_insert`) had no prior Bolt round in this
+file — every previous round profiled `SELECT`/`JOIN`/`ORDER BY` read
+paths. A 1000-row batched insert is a realistic shape for real client
+code (ORM bulk-insert, ETL/bulk-load, `COPY`-adjacent workflows that
+fall back to multi-VALUES `INSERT` for portability), not a synthetic
+microbenchmark of one function.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_insert.py --count 20 --rows 1000 --timeout 600
+# SIGTERM the server to flush, then inspect /tmp/dhat.out (dhatFileVersion 2
+# JSON: sum `tbk`/`tb` over all `pps` entries for the total; each entry's
+# `fs` frame list resolves through `ftbl` to the allocating call site).
+```
+
+**Profile** (DHAT, `valgrind --tool=dhat`, this commit — `exec_insert`
+unchanged): 63,914,972 total bytes allocated, 262,249 total allocation
+blocks, over 20 iterations of the 1000-row multi-VALUES `INSERT`
+workload. Reproduced twice on the pristine tree: 63,914,972 / 63,915,276
+bytes (0.0005% apart — negligible run-to-run noise, not signal) and
+262,249 / 262,250 blocks. Top allocation sites by bytes, innermost
+`rustgres::` frame:
+
+| site | blocks | % of blocks | bytes | % of bytes |
+|---|---|---|---|---|
+| `exec::exec_insert` (exec.rs:2297, `ctx.writes.push(WriteOp::InsertRow{..})`) | 180 | 0.07% | 16,679,040 | **26.10%** |
+| `sql::tokenize`'s token buffer (`Vec::with_capacity` for the whole statement) | 22 | 0.01% | 13,640,512 | 21.34% |
+| `sql::Parser::parse_insert` (sql.rs:3551, per-row `InsertValue` Vec) | 20,000 | 7.63% | 10,240,000 | 16.02% |
+| `sql::split_statements` | 66 | 0.03% | 2,984,352 | 4.67% |
+| `exec::exec_insert`'s row-values `Vec<Value>` (`vec![Value::Null; ncols]`) | 20,000 | 7.63% | 2,880,000 | 4.51% |
+| `wal::Enc::u64`/`wal::Enc::u32` (WAL record encoding) | 349 | 0.13% | 5,197,950 | 8.13% |
+| `storage::Table::push_version` (row-version Vec growth) | 28 | 0.01% | 3,211,292 | 5.02% |
+
+**Target**: `exec::exec_insert`'s `ctx.writes` push loop (`src/exec.rs`,
+around line 2297 pre-fix) — **26.10%** of all bytes allocated in this
+workload, far above the 5%-of-profile relevance bar, and the single
+largest allocation site by bytes.
+
+**Mechanism**: after building and validating every row, `exec_insert`
+already computes `let n = inserts.len() + updates.len();` — the exact
+number of `WriteOp`s about to be pushed onto `ctx.writes` (one
+`WriteOp::InsertRow` per inserted row, one `WriteOp::UpdateRow` per
+`ON CONFLICT DO UPDATE` row) — but never uses `n` to size the push. Both
+loops call `ctx.writes.push(..)` one row at a time starting from
+whatever spare capacity `ctx.writes` (a `&mut Vec<WriteOp>` borrowed from
+the enclosing transaction/statement context) already has, so a
+1000-row `INSERT` walks `Vec::push`'s amortized-doubling growth path
+from there up to capacity ≥1000 — repeated `grow_amortized`/`finish_grow`
+reallocate-and-copy cycles — even though the exact final count was
+already sitting in a local variable one line above the loop.
+`Vec::reserve(n)` before the loop turns that into a single up-front
+allocation sized for the known total.
+
+**Baseline numbers** (this commit, `exec_insert` unchanged):
+
+| counter | value |
+|---|---|
+| DHAT total bytes (20 iterations x 1000-row multi-VALUES INSERT) | 63,914,972 |
+| DHAT total blocks | 262,249 |
+| Bytes in the `ctx.writes` push site (see table above) | 16,679,040 (26.10%) |
+| Blocks in the `ctx.writes` push site | 180 |
+
+For context, not as the gating counter: Callgrind `Ir` (total
+instructions, same workload) is 1,225,598,180; this is evaluated against
+the DHAT allocation-bytes floor, not the instruction floor, since the
+target was found via a byte-share, not an instruction-share, profile.
+
+**Fix**: add `ctx.writes.reserve(n);` immediately after `n` is computed,
+before either the insert loop or the `ON CONFLICT DO UPDATE` loop that
+push into it. No other change — `WriteOp` construction and the values
+pushed are byte-for-byte identical to before.
+
+**Reproduce** (before this fix, on the parent commit):
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_insert.py --count 20 --rows 1000 --timeout 600
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`.
+```
+
 ## Bolt: `coerce_text_numeric` clones both comparison/arithmetic operands unconditionally — baseline — 2026-09-14
 
 **Workload**: `benches/profile_join.py` (existing, from the equi-join-comparison
