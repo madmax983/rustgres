@@ -2281,6 +2281,12 @@ fn exec_insert(
         }
     }
     let n = inserts.len() + updates.len();
+    // Every row inserted/updated below pushes exactly one WriteOp onto
+    // ctx.writes; reserving for the known total up front avoids the
+    // repeated grow-and-copy of pushing into it unsized (measured via
+    // dhat on benches/profile_insert.py: this was the single largest
+    // allocation site in the workload, ~26% of bytes allocated).
+    ctx.writes.reserve(n);
     // Apply inserts.
     {
         let t = eng
