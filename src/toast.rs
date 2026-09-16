@@ -14,10 +14,15 @@
 //! - The toast table (`pg_toast.pg_toast_<oid>`) holds derived chunks
 //!   of the compressed/relocated bytes, so `pg_class.reltoastrelid`
 //!   and chunk counts are real, not constants.
-//! - The compressor is LZ77 with PGLZ-style parameters (12-bit
-//!   window, short matches), but its byte format is NOT bit-compatible
-//!   with PG's PGLZ — only rustgres reads it back, and
+//! - The compressor is a faithful port of PG19's `pglz_compress()` with
+//!   the default strategy: for a given input the payload bytes are
+//!   identical to PostgreSQL 19's, and compression is refused under
+//!   exactly PG's conditions (input < 32 bytes, payload must beat 75%
+//!   of the input, give up if no match by 1024 output bytes).
 //!   `pg_column_compression` reports the conventional `'pglz'` name.
+//!   Framing differs: PG carries the original length in the compressed
+//!   varlena header, while rustgres prepends a 4-byte little-endian
+//!   length (read back by the test-only decompressor).
 //! - `default_toast_compression = lz4` is accepted but maps to pglz:
 //!   rustgres has no LZ4 implementation (documented in server.rs).
 
@@ -34,105 +39,330 @@ const TOAST_POINTER_SIZE: usize = 20;
 const MAXALIGN_TOAST_POINTER: usize = 24;
 
 // ---------------------------------------------------------------------------
-// PGLZ-inspired LZ77 compressor
+// PGLZ compressor — byte-compatible with PostgreSQL 19
 // ---------------------------------------------------------------------------
+//
+// Faithful port of `pglz_compress()` from PG19's `src/common/pg_lzcompress.c`
+// (REL_19_STABLE) using the default strategy (`PGLZ_strategy_default`).
+// For a given input the emitted payload is byte-identical to PG19's
+// `pglz_compress(source, slen, dest, NULL)` output, and compression is
+// refused under exactly PG's conditions: input shorter than 32 bytes, or
+// the strategy's gates trip (payload must beat 75% of the input; give up
+// if no match was found by 1024 output bytes).
+//
+// Framing: PG carries the original length in the compressed varlena
+// header, outside the payload. rustgres has no varlena headers, so it
+// prepends a 4-byte little-endian original length (read back by
+// [`decompress_pglz`]); the bytes after it are the stock PGLZ stream.
+//
+// One deliberate structural difference from the C: PG's history lists
+// are process-global `static` arrays of pointers. Here they are
+// index-based (`0` = null) inside a thread-local scratch struct reused
+// across calls — only the `hashsz` active hash heads are cleared per
+// call, exactly like PG's `memset(hist_start, 0, hashsz * ...)`.
 
-/// Minimum input size worth attempting to compress (PG's
-/// `PGLZ_min_comp_size` is 64 in recent versions; smaller inputs never
-/// win against the header overhead).
-const MIN_COMPRESS_SIZE: usize = 64;
-/// Sliding window: 12 bits of offset, like PGLZ.
-const WINDOW_SIZE: usize = 4096;
-/// Minimum match length.
-const MIN_MATCH: usize = 3;
-/// Maximum match length encoded in one token.
-const MAX_MATCH: usize = 130;
+/// PG19 `PGLZ_MAX_HISTORY_LISTS`.
+const PGLZ_HISTORY_LISTS: usize = 8192;
+/// PG19 `PGLZ_HISTORY_SIZE`.
+const PGLZ_HISTORY_SIZE: usize = 4096;
+/// PG19 `PGLZ_MAX_MATCH`.
+const PGLZ_MAX_MATCH: usize = 273;
+/// Default strategy's `min_input_size`.
+const PGLZ_MIN_INPUT: usize = 32;
+/// Default strategy's `min_comp_rate`: payload must beat this % of input.
+const PGLZ_RESULT_PCT: usize = 75;
+/// Default strategy's `first_success_by`.
+const PGLZ_FIRST_SUCCESS_BY: usize = 1024;
+/// Default strategy's `match_size_good` (PG clamps it into `[17, 273]`).
+const PGLZ_MATCH_GOOD: i32 = 128;
+/// Default strategy's `match_size_drop`.
+const PGLZ_MATCH_DROP: i32 = 10;
+/// Match offsets must be `< 0x0fff` (the tag layout's 12-bit window).
+const PGLZ_MAX_OFFSET: usize = 0x0fff;
+
+/// Index-based mirror of PG19's `Pglz_HistEntry` history lists. PG uses
+/// pointers with `NULL` for "none"; index `0` plays that role here
+/// (`hist_next` starts at 1, so entry 0 is never allocated).
+struct PglzHist {
+    start: [u16; PGLZ_HISTORY_LISTS],
+    next: [u16; PGLZ_HISTORY_SIZE + 1],
+    prev: [u16; PGLZ_HISTORY_SIZE + 1],
+    hindex: [u16; PGLZ_HISTORY_SIZE + 1],
+    pos: [u32; PGLZ_HISTORY_SIZE + 1],
+    hist_next: u16,
+    recycle: bool,
+}
+
+impl PglzHist {
+    const fn new() -> Self {
+        Self {
+            start: [0; PGLZ_HISTORY_LISTS],
+            next: [0; PGLZ_HISTORY_SIZE + 1],
+            prev: [0; PGLZ_HISTORY_SIZE + 1],
+            hindex: [0; PGLZ_HISTORY_SIZE + 1],
+            pos: [0; PGLZ_HISTORY_SIZE + 1],
+            hist_next: 1,
+            recycle: false,
+        }
+    }
+}
 
 thread_local! {
-    /// Scratch hash table for [`compress_pglz`]'s 3-byte-sequence index.
-    /// Reused across calls on the same connection thread instead of a
-    /// fresh 64K-entry (512 KiB) `Vec` per call — every call still
-    /// clears it in full before use, so behavior is unchanged.
-    static HASH_TAB: RefCell<Vec<usize>> = RefCell::new(vec![usize::MAX; 1 << 16]);
+    /// Scratch history lists for [`compress_pglz`], reused across calls
+    /// on the same thread (PG keeps these as process-global statics).
+    static PGLZ_HIST: RefCell<PglzHist> = const { RefCell::new(PglzHist::new()) };
 }
 
-/// Compress `input` with a simple LZ77. Returns `None` when the input
-/// is too small or the compressed form would not be smaller (PG only
-/// keeps the compressed form on a real win).
-pub fn compress_pglz(input: &[u8]) -> Option<Vec<u8>> {
-    if input.len() < MIN_COMPRESS_SIZE {
-        return None;
-    }
-    HASH_TAB.with(|cell| {
-        let mut tab = cell.borrow_mut();
-        tab.fill(usize::MAX);
-        compress_pglz_with(input, &mut tab)
-    })
+/// PG19's `pglz_hist_idx`: hash the 4 bytes at `pos` (fewer at the tail)
+/// into `[0, mask]`. The C hashes over `const char *`, which is signed
+/// on x86-64 Linux, so bytes `>= 0x80` are sign-extended before the
+/// shifts — replicated here so the hash (and hence match choice) is
+/// identical to PG's.
+fn pglz_hist_idx(input: &[u8], pos: usize, end: usize, mask: i32) -> usize {
+    let sb = |b: u8| b as i8 as i32;
+    let h = if end - pos < 4 {
+        sb(input[pos])
+    } else {
+        (sb(input[pos]) << 6)
+            ^ (sb(input[pos + 1]) << 4)
+            ^ (sb(input[pos + 2]) << 2)
+            ^ sb(input[pos + 3])
+    };
+    // `mask` is `2^k - 1`, so this lands in `[0, mask]` even for
+    // negative `h` (two's-complement AND), exactly like the C.
+    (h & mask) as usize
 }
 
-/// Hash 3-byte sequences to candidate positions (open addressing, keeps
-/// the last position per hash) using a caller-supplied, already-cleared
-/// table.
-fn compress_pglz_with(input: &[u8], tab: &mut [usize]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len());
-    // Header: original length, so the decompressor knows when to stop
-    // and can pre-size the output.
-    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
-
-    let mut i = 0usize;
-    let mut lit_start = 0usize;
-    while i < input.len() {
-        let mut best_len = 0usize;
-        let mut best_off = 0usize;
-        if i + MIN_MATCH <= input.len() {
-            let h = hash3(&input[i..i + 3.min(input.len() - i)]);
-            let cand = tab[h];
-            if cand != usize::MAX && i - cand <= WINDOW_SIZE && cand < i {
-                // Extend the match.
-                let max_len = (input.len() - i).min(MAX_MATCH);
-                let mut len = 0;
-                while len < max_len && input[cand + len] == input[i + len] {
-                    len += 1;
-                }
-                if len >= MIN_MATCH {
-                    best_len = len;
-                    best_off = i - cand;
-                }
-            }
-            tab[h] = i;
-        }
-        if best_len >= MIN_MATCH {
-            flush_literals(&mut out, &input[lit_start..i]);
-            // Match token: 1LLLLLLL, u16 LE offset; length = L+3.
-            out.push(0x80 | ((best_len - MIN_MATCH) as u8));
-            out.extend_from_slice(&(best_off as u16).to_le_bytes());
-            // Feed the skipped bytes into the table so later matches
-            // can reference them.
-            for j in (i + 1)..(i + best_len) {
-                if j + MIN_MATCH <= input.len() {
-                    let h = hash3(&input[j..j + 3.min(input.len() - j)]);
-                    tab[h] = j;
-                }
-            }
-            i += best_len;
-            lit_start = i;
+/// PG19's `pglz_hist_add`: record position `pos` in the history lists,
+/// recycling the oldest entry once the 4096-entry ring fills.
+fn pglz_hist_add(hist: &mut PglzHist, input: &[u8], pos: usize, end: usize, mask: i32) {
+    let hindex = pglz_hist_idx(input, pos, end, mask);
+    let hn = hist.hist_next as usize;
+    if hist.recycle {
+        // Delink the recycled entry from its old list.
+        let prev = hist.prev[hn] as usize;
+        if prev == 0 {
+            hist.start[hist.hindex[hn] as usize] = hist.next[hn];
         } else {
-            i += 1;
+            hist.next[prev] = hist.next[hn];
+        }
+        let nxt = hist.next[hn] as usize;
+        if nxt != 0 {
+            hist.prev[nxt] = hist.prev[hn];
         }
     }
-    flush_literals(&mut out, &input[lit_start..]);
+    // Push to the head of the new list.
+    let head = hist.start[hindex] as usize;
+    hist.next[hn] = head as u16;
+    hist.prev[hn] = 0;
+    hist.hindex[hn] = hindex as u16;
+    hist.pos[hn] = pos as u32;
+    // When the list was empty `head` is 0: scribbling `prev[0]` is
+    // harmless scratch, exactly like the C writing through a NULL link.
+    hist.prev[head] = hn as u16;
+    hist.start[hindex] = hn as u16;
+    let mut next = hn + 1;
+    if next > PGLZ_HISTORY_SIZE {
+        next = 1;
+        hist.recycle = true;
+    }
+    hist.hist_next = next as u16;
+}
 
-    if out.len() < input.len() {
-        Some(out)
+/// PG19's `pglz_find_match`: the longest match at `dp` in the history
+/// lists. Returns `(length, offset)` for matches longer than 2 bytes.
+fn pglz_find_match(
+    hist: &PglzHist,
+    input: &[u8],
+    dp: usize,
+    end: usize,
+    mask: i32,
+    good_match_init: i32,
+    good_drop: i32,
+) -> Option<(usize, usize)> {
+    let mut hent = hist.start[pglz_hist_idx(input, dp, end, mask)] as usize;
+    let mut len: i32 = 0;
+    let mut off: usize = 0;
+    let mut good_match = good_match_init;
+    while hent != 0 {
+        let hp = hist.pos[hent] as usize;
+        // Every entry records a position processed before `dp`.
+        let thisoff = dp - hp;
+        if thisoff >= PGLZ_MAX_OFFSET {
+            break;
+        }
+        let mut thislen: i32 = 0;
+        if len >= 16 {
+            // Fast path: the candidate must at least repeat the best
+            // match found so far at this same `dp`; `memcmp` that first.
+            // `hp + n < dp + n <= end`, so both slices are in bounds.
+            let n = len as usize;
+            if input[dp..dp + n] == input[hp..hp + n] {
+                thislen = len;
+                let mut ip = dp + n;
+                let mut hpp = hp + n;
+                while ip < end && input[ip] == input[hpp] && thislen < PGLZ_MAX_MATCH as i32 {
+                    thislen += 1;
+                    ip += 1;
+                    hpp += 1;
+                }
+            }
+        } else {
+            let mut ip = dp;
+            let mut hpp = hp;
+            while ip < end && input[ip] == input[hpp] && thislen < PGLZ_MAX_MATCH as i32 {
+                thislen += 1;
+                ip += 1;
+                hpp += 1;
+            }
+        }
+        if thislen > len {
+            len = thislen;
+            off = thisoff;
+        }
+        hent = hist.next[hent] as usize;
+        if hent != 0 {
+            if len >= good_match {
+                break;
+            }
+            good_match -= (good_match * good_drop) / 100;
+        }
+    }
+    if len > 2 {
+        Some((len as usize, off))
     } else {
         None
     }
+}
+
+/// Emit one pending-control-byte step: PG's `pglz_out_ctrl`, which opens
+/// a fresh control byte when the current one is full and patches the
+/// finished byte into the output after the fact.
+fn pglz_out_ctrl(out: &mut Vec<u8>, ctrlp: &mut Option<usize>, ctrlb: &mut u8, ctrl: &mut u16) {
+    if *ctrl & 0xff == 0 {
+        if let Some(p) = *ctrlp {
+            out[p] = *ctrlb;
+        }
+        *ctrlp = Some(out.len());
+        out.push(0);
+        *ctrlb = 0;
+        *ctrl = 1;
+    }
+}
+
+/// Compress `input` with PG19's PGLZ (default strategy) and return the
+/// framed bytes: 4-byte little-endian original length followed by the
+/// raw PGLZ payload, which is byte-identical to PG19's
+/// `pglz_compress()` output. Returns `None` exactly when PG19 refuses:
+/// input shorter than 32 bytes, or the strategy's gates trip (payload
+/// must beat 75% of the input; give up if no match by 1024 output
+/// bytes).
+pub fn compress_pglz(input: &[u8]) -> Option<Vec<u8>> {
+    let payload = pglz_compress_payload(input)?;
+    let mut out = Vec::with_capacity(payload.len() + 4);
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+fn pglz_compress_payload(input: &[u8]) -> Option<Vec<u8>> {
+    let slen = input.len();
+    if slen < PGLZ_MIN_INPUT {
+        return None;
+    }
+    // Default strategy: the payload must beat 75% of the input.
+    let result_max = slen * PGLZ_RESULT_PCT / 100;
+    // PG sizes the active hash table from the input length.
+    let hashsz = if slen < 128 {
+        512
+    } else if slen < 256 {
+        1024
+    } else if slen < 512 {
+        2048
+    } else if slen < 1024 {
+        4096
+    } else {
+        8192
+    };
+    let mask = (hashsz - 1) as i32;
+    let good_match_init = PGLZ_MATCH_GOOD.clamp(17, PGLZ_MAX_MATCH as i32);
+    PGLZ_HIST.with(|cell| {
+        let hist = &mut *cell.borrow_mut();
+        // PG clears only the active heads (`hashsz` of them); higher
+        // slots are never read because every index is `< hashsz`.
+        hist.start[..hashsz].fill(0);
+        hist.hist_next = 1;
+        hist.recycle = false;
+
+        let mut out: Vec<u8> = Vec::with_capacity(slen);
+        let mut ctrlp: Option<usize> = None;
+        let mut ctrlb: u8 = 0;
+        // `u16` so the `<<= 1` past bit 7 stays observable for the
+        // `& 0xff` fullness test, like PG's `unsigned char` wraparound.
+        let mut ctrl: u16 = 0;
+        let mut dp = 0usize;
+        let end = slen;
+        let mut found_match = false;
+        while dp < end {
+            // PG's give-up gates, checked before every item.
+            if out.len() >= result_max {
+                return None;
+            }
+            if !found_match && out.len() >= PGLZ_FIRST_SUCCESS_BY {
+                return None;
+            }
+            match pglz_find_match(hist, input, dp, end, mask, good_match_init, PGLZ_MATCH_DROP) {
+                Some((mlen, moff)) => {
+                    pglz_out_ctrl(&mut out, &mut ctrlp, &mut ctrlb, &mut ctrl);
+                    // Match item: set this item's control bit...
+                    ctrlb |= ctrl as u8;
+                    ctrl <<= 1;
+                    // ...then PG's `pglz_out_tag`.
+                    if mlen > 17 {
+                        out.push((((moff & 0xf00) >> 4) | 0x0f) as u8);
+                        out.push((moff & 0xff) as u8);
+                        out.push((mlen - 18) as u8);
+                    } else {
+                        out.push((((moff & 0xf00) >> 4) | (mlen - 3)) as u8);
+                        out.push((moff & 0xff) as u8);
+                    }
+                    // Every consumed byte joins the history, like PG.
+                    for _ in 0..mlen {
+                        pglz_hist_add(hist, input, dp, end, mask);
+                        dp += 1;
+                    }
+                    found_match = true;
+                }
+                None => {
+                    pglz_out_ctrl(&mut out, &mut ctrlp, &mut ctrlb, &mut ctrl);
+                    // Literal item: the control bit stays clear.
+                    out.push(input[dp]);
+                    ctrl <<= 1;
+                    pglz_hist_add(hist, input, dp, end, mask);
+                    dp += 1;
+                }
+            }
+        }
+        // Patch in the final control byte (PG: `*ctrlp = ctrlb`).
+        // A non-empty input always emits at least one item, so `ctrlp`
+        // is set: the give-up gates cannot fire before the first item
+        // (`out` starts empty and both thresholds are positive).
+        out[ctrlp.expect("non-empty input emits at least one item")] = ctrlb;
+        if out.len() >= result_max {
+            return None;
+        }
+        Some(out)
+    })
 }
 
 /// Decompress data produced by [`compress_pglz`]. Returns `None` on
 /// corrupt input. Test-only: the engine keeps values detoasted inline,
 /// so no production path ever decompresses; the unit tests use it to
 /// verify compression round-trips.
+///
+/// This is PG19's `pglz_decompress()` with `check_complete = true`: the
+/// payload must decode to exactly the framed original length and consume
+/// the entire input, otherwise the data is rejected.
 #[cfg(test)]
 pub fn decompress_pglz(input: &[u8]) -> Option<Vec<u8>> {
     if input.len() < 4 {
@@ -143,63 +373,55 @@ pub fn decompress_pglz(input: &[u8]) -> Option<Vec<u8>> {
     if orig_len > 1_000_000_000 {
         return None;
     }
-    let mut out = Vec::with_capacity(orig_len);
-    let mut i = 4usize;
-    while i < input.len() {
-        let tag = input[i];
-        i += 1;
-        if tag & 0x80 == 0 {
-            // Literal run: (tag & 0x7F) + 1 bytes follow.
-            let n = (tag & 0x7F) as usize + 1;
-            if i + n > input.len() {
-                return None;
+    let src = &input[4..];
+    let mut out: Vec<u8> = Vec::with_capacity(orig_len);
+    let mut sp = 0usize;
+    // PG reads one control byte per group of up to eight items, least
+    // significant bit first: clear = literal byte, set = match tag.
+    while sp < src.len() && out.len() < orig_len {
+        let mut ctrl = src[sp];
+        sp += 1;
+        for _ in 0..8 {
+            if sp >= src.len() || out.len() >= orig_len {
+                break;
             }
-            out.extend_from_slice(&input[i..i + n]);
-            i += n;
-        } else {
-            // Match: length (tag & 0x7F) + 3, u16 LE offset.
-            let len = (tag & 0x7F) as usize + MIN_MATCH;
-            if i + 2 > input.len() {
-                return None;
+            if ctrl & 1 != 0 {
+                if sp + 2 > src.len() {
+                    return None;
+                }
+                let mut mlen = (src[sp] & 0x0f) as usize + 3;
+                let moff = (((src[sp] & 0xf0) as usize) << 4) | src[sp + 1] as usize;
+                sp += 2;
+                if mlen == 18 {
+                    // Long form: low nibble 0x0f, extension byte is len-18.
+                    if sp >= src.len() {
+                        return None;
+                    }
+                    mlen += src[sp] as usize;
+                    sp += 1;
+                }
+                if moff == 0 || moff > out.len() {
+                    return None;
+                }
+                // PG clamps the final match to the remaining output.
+                let mlen = mlen.min(orig_len - out.len());
+                for _ in 0..mlen {
+                    let b = out[out.len() - moff];
+                    out.push(b);
+                }
+            } else {
+                out.push(src[sp]);
+                sp += 1;
             }
-            let off = u16::from_le_bytes([input[i], input[i + 1]]) as usize;
-            i += 2;
-            if off == 0 || off > out.len() {
-                return None;
-            }
-            for _ in 0..len {
-                let b = out[out.len() - off];
-                out.push(b);
-            }
+            ctrl >>= 1;
         }
     }
-    if out.len() == orig_len {
+    if out.len() == orig_len && sp == src.len() {
         Some(out)
     } else {
         None
     }
 }
-
-fn hash3(b: &[u8]) -> usize {
-    // b has at least 1 byte; use up to 3.
-    let mut h = 0usize;
-    for (i, &byte) in b.iter().take(3).enumerate() {
-        h |= (byte as usize) << (8 * i);
-    }
-    h & 0xFFFF
-}
-
-fn flush_literals(out: &mut Vec<u8>, lit: &[u8]) {
-    let mut rest = lit;
-    while !rest.is_empty() {
-        // Literal token holds up to 128 bytes (0x00..=0x7F => 1..=128).
-        let n = rest.len().min(128);
-        out.push((n - 1) as u8);
-        out.extend_from_slice(&rest[..n]);
-        rest = &rest[n..];
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Toast decision logic (heaptoast.c strategy)
 // ---------------------------------------------------------------------------
@@ -300,7 +522,7 @@ pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<Toa
     // when any column is NULL, 8-byte aligned.
     let has_null = values.iter().any(|v| matches!(v, Value::Null));
     let hoff = if has_null {
-        (23 + (n + 7) / 8 + 7) & !7
+        (23 + n.div_ceil(8) + 7) & !7
     } else {
         (23 + 7) & !7
     };
@@ -601,9 +823,78 @@ mod tests {
     fn pglz_all_same_byte() {
         let data = vec![0xABu8; 5000];
         let c = compress_pglz(&data).expect("should compress");
-        // 5000 identical bytes should compress well (format uses
-        // 3-byte match tokens with max 130-byte matches).
+        // 5000 identical bytes should compress well (PG's long-form
+        // match tags encode up to 273 bytes per match).
         assert!(c.len() < 200);
         assert_eq!(decompress_pglz(&c).unwrap(), data);
+    }
+
+    /// Golden vectors: the payloads below are the verbatim output of
+    /// PG19's `pglz_compress()` (REL_19_STABLE `src/common/pg_lzcompress.c`,
+    /// compiled with gcc and run with `PGLZ_strategy_default`), framed
+    /// with rustgres's 4-byte little-endian original length.
+    #[test]
+    fn pglz_golden_vectors_match_pg19() {
+        // "ab" * 32: two literals, then one long-form match (len 62, off 2).
+        let c = compress_pglz(&b"ab".repeat(32)).expect("should compress");
+        assert_eq!(
+            c,
+            [
+                64, 0, 0, 0, // framed original length
+                0x04, 0x61, 0x62, 0x0f, 0x02, 0x2c,
+            ]
+            .as_slice()
+        );
+        // "X" * 100: one literal, then one long-form match (len 99, off 1).
+        let c = compress_pglz(&vec![b'X'; 100]).expect("should compress");
+        assert_eq!(c, [100, 0, 0, 0, 0x02, 0x58, 0x0f, 0x01, 0x51].as_slice());
+        // 200 bytes of repeated English: 45 literals (a fresh control
+        // byte every 8), then a long-form match (len 155, off 45).
+        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(5)[..200].to_vec();
+        let c = compress_pglz(&data).expect("should compress");
+        let mut expected = vec![200, 0, 0, 0];
+        for chunk in data[..40].chunks(8) {
+            expected.push(0x00);
+            expected.extend_from_slice(chunk);
+        }
+        expected.push(0x20); // 5 literals, then a match
+        expected.extend_from_slice(&data[40..45]);
+        expected.extend_from_slice(&[0x0f, 0x2d, 0x89]);
+        assert_eq!(c, expected.as_slice());
+        assert_eq!(decompress_pglz(&c).unwrap(), data);
+    }
+
+    #[test]
+    fn pglz_pg19_refusal_rules() {
+        // PG's default strategy needs at least 32 input bytes...
+        assert!(compress_pglz(&vec![b'A'; 31]).is_none());
+        // ...and now attempts inputs the old 64-byte minimum skipped.
+        assert!(compress_pglz(&vec![b'A'; 32]).is_some());
+        // ...and refuses unless the payload beats 75% of the input
+        // (result_max = 30 here): PG19's C oracle returns -1 for this
+        // 40-byte input, so rustgres must too.
+        let data = [
+            0x67, 0x61, 0x33, 0x99, 0x2d, 0xb3, 0x89, 0x16, 0xc2, 0x16, //
+            0x40, 0xba, 0x62, 0x87, 0xaf, 0xb3, 0x89, 0x16, 0xf0, 0x9f, //
+            0x7d, 0xd2, 0x63, 0xdc, 0x9c, 0x96, 0x37, 0xca, 0xe6, 0xc9, //
+            0x5f, 0xd2, 0x63, 0xdc, 0x9c, 0x96, 0x26, 0x76, 0xa9, 0x2d,
+        ];
+        assert!(compress_pglz(&data).is_none());
+    }
+
+    #[test]
+    fn pglz_decompress_rejects_truncated_tags() {
+        let data = vec![0xABu8; 500];
+        let c = compress_pglz(&data).expect("should compress");
+        // Truncated payload.
+        assert!(decompress_pglz(&c[..c.len() - 1]).is_none());
+        // Trailing garbage after a complete payload.
+        let mut d = c.clone();
+        d.push(0x00);
+        assert!(decompress_pglz(&d).is_none());
+        // Wrong framed length.
+        let mut d = c.clone();
+        d[0] = 0x01;
+        assert!(decompress_pglz(&d).is_none());
     }
 }

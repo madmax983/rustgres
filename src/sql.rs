@@ -293,6 +293,29 @@ fn decode_ustr(s: &str, escape: char) -> Option<String> {
     Some(out)
 }
 
+/// Consume PG19's `{decinteger}` (`{decdigit}(_?{decdigit})*` in
+/// `scan.l`): digits with single underscores allowed only *between*
+/// digits, so `1_000` lexes as 1000 but `1__2` and `1_` stop at the
+/// underscore.
+fn consume_dec_digits(chars: &[char], i: &mut usize) {
+    let mut prev_was_digit = false;
+    while *i < chars.len() {
+        let ch = chars[*i];
+        if ch.is_ascii_digit() {
+            prev_was_digit = true;
+            *i += 1;
+        } else if ch == '_'
+            && prev_was_digit
+            && *i + 1 < chars.len()
+            && chars[*i + 1].is_ascii_digit()
+        {
+            *i += 1;
+        } else {
+            break;
+        }
+    }
+}
+
 fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
     // A `str`'s char count can never exceed its byte length, so this is a
     // safe upper bound that guarantees `chars` never regrows (Chars'
@@ -664,14 +687,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                         return Err(err("trailing junk after numeric literal"));
                     }
                 } else {
-                    while i < chars.len() && chars[i].is_ascii_digit() {
-                        i += 1;
-                    }
+                    // v0.40: PG's `{decinteger}` allows single underscores
+                    // between digits (`1_000` = 1000), like the radix
+                    // branch above.
+                    consume_dec_digits(&chars, &mut i);
                     if i < chars.len() && chars[i] == '.' {
                         i += 1;
-                        while i < chars.len() && chars[i].is_ascii_digit() {
-                            i += 1;
-                        }
+                        consume_dec_digits(&chars, &mut i);
                     }
                     if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
                         let mut j = i + 1;
@@ -680,10 +702,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                         }
                         if j < chars.len() && chars[j].is_ascii_digit() {
                             i = j;
-                            while i < chars.len() && chars[i].is_ascii_digit() {
-                                i += 1;
-                            }
+                            consume_dec_digits(&chars, &mut i);
                         }
+                    }
+                    // v0.40: PG 16+ rejects an identifier char immediately
+                    // after a decimal numeric literal ("trailing junk after
+                    // numeric literal", 42601) instead of reading it as an
+                    // alias — the decimal half of the v0.28 check above.
+                    if i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
+                        return Err(err("trailing junk after numeric literal"));
                     }
                 }
                 toks.push(Token::Number(chars[start..i].iter().collect()));
@@ -3567,10 +3594,12 @@ impl Parser {
                         b'x' | b'X' => parse_int_radix(&raw[2..], 16),
                         b'o' | b'O' => parse_int_radix(&raw[2..], 8),
                         b'b' | b'B' => parse_int_radix(&raw[2..], 2),
-                        _ => raw.parse().ok(),
+                        // v0.40: PG's `{decinteger}` allows `_` between
+                        // digits; strip them like `parse_int_radix` does.
+                        _ => raw.replace('_', "").parse().ok(),
                     }
                 } else {
-                    raw.parse().ok()
+                    raw.replace('_', "").parse().ok()
                 };
                 if let Some(i) = ival {
                     if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
