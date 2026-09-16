@@ -22,6 +22,7 @@
 //!   rustgres has no LZ4 implementation (documented in server.rs).
 
 use crate::storage::{Table, ToastInfo, Value, toast_consts, toast_storage};
+use std::cell::RefCell;
 
 /// PG's `TOAST_POINTER_SIZE` (`detoast.h`): `VARHDRSZ_EXTERNAL` (4) +
 /// `sizeof(varatt_external)` (16) — the on-disk footprint of a toasted
@@ -47,6 +48,14 @@ const MIN_MATCH: usize = 3;
 /// Maximum match length encoded in one token.
 const MAX_MATCH: usize = 130;
 
+thread_local! {
+    /// Scratch hash table for [`compress_pglz`]'s 3-byte-sequence index.
+    /// Reused across calls on the same connection thread instead of a
+    /// fresh 64K-entry (512 KiB) `Vec` per call — every call still
+    /// clears it in full before use, so behavior is unchanged.
+    static HASH_TAB: RefCell<Vec<usize>> = RefCell::new(vec![usize::MAX; 1 << 16]);
+}
+
 /// Compress `input` with a simple LZ77. Returns `None` when the input
 /// is too small or the compressed form would not be smaller (PG only
 /// keeps the compressed form on a real win).
@@ -54,9 +63,17 @@ pub fn compress_pglz(input: &[u8]) -> Option<Vec<u8>> {
     if input.len() < MIN_COMPRESS_SIZE {
         return None;
     }
-    // Hash 3-byte sequences to candidate positions (open addressing,
-    // keeps the last position per hash).
-    let mut tab = vec![usize::MAX; 1 << 16];
+    HASH_TAB.with(|cell| {
+        let mut tab = cell.borrow_mut();
+        tab.fill(usize::MAX);
+        compress_pglz_with(input, &mut tab)
+    })
+}
+
+/// Hash 3-byte sequences to candidate positions (open addressing, keeps
+/// the last position per hash) using a caller-supplied, already-cleared
+/// table.
+fn compress_pglz_with(input: &[u8], tab: &mut [usize]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len());
     // Header: original length, so the decompressor knows when to stop
     // and can pre-size the output.
