@@ -8,9 +8,9 @@ as a plain identifier, so `'\101'::"char"` went through `char(1)` assignment
 
 GREEN (this milestone):
 - `"char"` is a distinct type (OID 18), not `character(1)` (OID 1042).
-- Input (charin): "" -> NUL, `\ooo` -> bytea-style octal escape, any other
-  single byte -> itself; longer input -> 22001 "value too long for type
-  character(1)".
+- Input (charin): `""` -> NUL, `\ooo` -> bytea-style octal escape, any other
+  single byte -> itself; longer input keeps the first byte (PG's charin
+  semantics), it does NOT raise 22001.
 - Output (charout): NUL -> empty, bytes >= 0x80 -> `\ooo` octal, else the byte.
 - `"char"` <-> text casts work; comparison is a byte comparison.
 - Double-quoted identifiers keep working everywhere (never keywords).
@@ -150,7 +150,11 @@ do_sql("DROP TABLE IF EXISTS t36_o")
 do_sql('CREATE TABLE t36_o (c "char")')
 do_sql("INSERT INTO t36_o VALUES ('b'::\"char\"), ('\\377'::\"char\"), ('a'::\"char\")")
 rows, _, _, _, _ = do_sql("SELECT c::text FROM t36_o ORDER BY c")
-check("E5 order by byte", [r[0] for r in rows] == ["a", "b", "\\377"])
+# v0.37: PG19 FigureColname names c::text as "c" (not "text"), so ORDER BY c
+# resolves to the text output column per PG's "output column wins" rule.
+# Text sort: "\\377" (backslash=92) < "a" < "b". The v0.36 expectation
+# ["a","b","\\377"] matched the old incorrect "text" naming.
+check("E5 order by byte", [r[0] for r in rows] == ["\\377", "a", "b"])
 
 # F. Cast matrix (int4<->"char" are explicit per pg_cast.dat).
 check("F1 int to char works", val("SELECT 65::\"char\"") == "A")

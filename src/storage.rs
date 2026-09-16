@@ -55,6 +55,9 @@ pub enum ColType {
     Timestamptz, // OID 1184 (v0.7)
     Bytea,       // OID 17 (v0.7)
     Uuid,        // OID 2950 (v0.7)
+    // v0.37: PG's regclass type (OID 2205) — an OID that displays as
+    // the relation name. Used for pg_class.reltoastrelid::regclass.
+    Regclass, // OID 2205
 }
 
 impl ColType {
@@ -77,6 +80,7 @@ impl ColType {
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
             ColType::Bytea => 17,         // BYTEA
             ColType::Uuid => 2950,        // UUID
+            ColType::Regclass => 2205,    // REGCLASS (v0.37)
         }
     }
 
@@ -101,6 +105,7 @@ impl ColType {
             ColType::Timestamptz => "timestamp with time zone",
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
+            ColType::Regclass => "regclass",
         }
     }
 
@@ -128,6 +133,7 @@ impl ColType {
             ColType::Timestamptz => "timestamptz",
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
+            ColType::Regclass => "regclass",
         }
     }
 
@@ -142,6 +148,90 @@ impl ColType {
             other => other.sql_name().to_string(),
         }
     }
+
+    /// v0.37: whether this type is TOAST-able (PG's `typlen == -1`,
+    /// varlena types). Only these columns get non-PLAIN storage and a
+    /// toast table.
+    pub fn is_toastable(&self) -> bool {
+        matches!(
+            self,
+            ColType::Text
+                | ColType::Char(_)
+                | ColType::Varchar(_)
+                | ColType::Bytea
+                | ColType::Numeric
+        )
+    }
+
+    /// v0.37: the type's default TOAST storage strategy (PG's
+    /// `pg_type.typstorage`): `x` (extended) for most varlena types,
+    /// `m` (main) for numeric, `p` (plain) for the rest.
+    pub fn default_toast_storage(&self) -> u8 {
+        if !self.is_toastable() {
+            return toast_storage::PLAIN;
+        }
+        match self {
+            ColType::Numeric => toast_storage::MAIN,
+            _ => toast_storage::EXTENDED,
+        }
+    }
+}
+
+/// v0.37: TOAST storage strategies — PG's `pg_attribute.attstorage`
+/// single-character codes (`p`/`e`/`x`/`m`).
+pub mod toast_storage {
+    /// PLAIN: no compression, no out-of-line storage.
+    pub const PLAIN: u8 = b'p';
+    /// EXTERNAL: out-of-line storage, no compression.
+    pub const EXTERNAL: u8 = b'e';
+    /// EXTENDED: compression first, then out-of-line storage (default
+    /// for most toastable types).
+    pub const EXTENDED: u8 = b'x';
+    /// MAIN: compression, out-of-line only as a last resort.
+    pub const MAIN: u8 = b'm';
+
+    /// Parse a `SET STORAGE` mode name (case-insensitive), like PG's
+    /// `GetAttributeStorage`. Returns the `default` storage for
+    /// `"default"`, or `None` for an invalid name (caller reports 22023).
+    pub fn parse(name: &str, default: u8) -> Option<u8> {
+        match name.to_ascii_lowercase().as_str() {
+            "plain" => Some(PLAIN),
+            "external" => Some(EXTERNAL),
+            "extended" => Some(EXTENDED),
+            "main" => Some(MAIN),
+            "default" => Some(default),
+            _ => None,
+        }
+    }
+}
+
+/// v0.37: per-value TOAST state for one toasted/compressed cell,
+/// keyed by value id in `Table::toast_info`.
+#[derive(Clone, Debug, Default)]
+pub struct ToastInfo {
+    /// The stored form is compressed (always `pglz` in v0.37).
+    pub compressed: bool,
+}
+
+/// v0.37: TOAST constants adapted from PG19 `access/heaptoast.h`.
+/// PG's are page-derived (`MaximumBytesPerTuple(4)` with 8 KiB pages =
+/// 2037); rustgres has no pages, so the numeric defaults are used
+/// directly and documented here.
+pub mod toast_consts {
+    /// Row width (bytes of toastable data) above which the toaster runs.
+    pub const TOAST_TUPLE_THRESHOLD: u32 = 2037;
+    /// Default `toast_tuple_target`: row width the toaster aims for.
+    pub const TOAST_TUPLE_TARGET: u32 = 2037;
+    /// Minimum allowed `toast_tuple_target` (PG's reloption bound).
+    pub const TOAST_TUPLE_TARGET_MIN: u32 = 128;
+    /// Last-resort target for MAIN columns (PG's `TOAST_TUPLE_TARGET_MAIN`
+    /// = `MaximumBytesPerTuple(1)` with 8 KiB pages = 8160).
+    pub const TOAST_TUPLE_TARGET_MAIN: u32 = 8160;
+    /// Maximum bytes per toast-table chunk (`TOAST_MAX_CHUNK_SIZE`,
+    /// ~2 KiB so four chunk rows fit a page).
+    pub const TOAST_MAX_CHUNK_SIZE: usize = 2001;
+    /// First user-table OID, matching PG's `FirstNormalObjectId`.
+    pub const FIRST_USER_OID: u32 = 16384;
 }
 
 /// Fixed-precision decimal (v0.7): value = `unscaled * 10^-scale`.
@@ -1485,6 +1575,27 @@ impl Numeric {
         let result = ln_d.add(hp_const(HP_LN10).mul_int(e10 as i128)?)?;
         Some(result.to_numeric())
     }
+
+    /// v0.37: byte size of this numeric for TOAST accounting. Uses the
+    /// binary encoding size (unscaled i128 + scale i32 + discriminant).
+    pub fn toast_len(&self) -> usize {
+        16 + 4 + 1
+    }
+
+    /// v0.37: raw bytes of this numeric for TOAST compression/chunking:
+    /// big-endian unscaled + scale + special discriminant.
+    pub fn toast_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(21);
+        b.extend_from_slice(&self.unscaled.to_be_bytes());
+        b.extend_from_slice(&self.scale.to_be_bytes());
+        b.push(match self.special {
+            NumericSpecial::Finite => 0,
+            NumericSpecial::NaN => 1,
+            NumericSpecial::PosInf => 2,
+            NumericSpecial::NegInf => 3,
+        });
+        b
+    }
 }
 
 impl PartialOrd for Numeric {
@@ -2019,6 +2130,26 @@ pub struct RowVersion {
     pub xmin: u64,
     /// Xid of the deleting/updating transaction; 0 = not deleted.
     pub xmax: u64,
+    /// v0.37: per-cell toast value id, parallel to `values.values`;
+    /// 0 = stored plain inline, otherwise a key into the owning
+    /// table's `toast_info` (and, for out-of-line values, the
+    /// `chunk_id` in the toast table).
+    pub toast: Vec<u32>,
+}
+
+impl RowVersion {
+    /// v0.37: build a row version with no toasted cells (`toast` all
+    /// zero, parallel to `values`).
+    pub fn plain(id: u64, values: Row, xmin: u64) -> Self {
+        let n = values.len();
+        RowVersion {
+            id,
+            values,
+            xmin,
+            xmax: 0,
+            toast: vec![0; n],
+        }
+    }
 }
 
 /// One table version. Tables themselves are versioned so that
@@ -2049,11 +2180,33 @@ pub struct Table {
     pub acl: Vec<AclEntry>,
     /// v0.11: column-level GRANT entries (empty = none granted).
     pub col_acl: Vec<ColAclEntry>,
+    // --- v0.37: TOAST ---
+    /// Table OID (`pg_class.oid`), assigned from `Database::next_oid`.
+    pub oid: u32,
+    /// OID of this table's toast table (`pg_class.reltoastrelid`);
+    /// 0 = no toast table (no toastable columns).
+    pub toast_relid: u32,
+    /// `toast_tuple_target` reloption (default `TOAST_TUPLE_TARGET`).
+    pub toast_target: u32,
+    /// Per-column TOAST storage strategy (`toast_storage::*`), parallel
+    /// to `columns`.
+    pub col_storage: Vec<u8>,
+    /// Toast value id -> storage state, for cells recorded in
+    /// `RowVersion::toast`.
+    pub toast_info: HashMap<u32, ToastInfo>,
+    /// Next toast value id to assign in this table (starts at 1; 0
+    /// means "not toasted" in `RowVersion::toast`).
+    pub next_value_id: u32,
 }
 
 impl Table {
     pub fn new(columns: Vec<(String, ColType)>, created_xmin: u64) -> Self {
         let n = columns.len();
+        // v0.37: compute storage strategies before `columns` moves.
+        let col_storage: Vec<u8> = columns
+            .iter()
+            .map(|(_, t)| t.default_toast_storage())
+            .collect();
         Table {
             columns,
             rows: Vec::new(),
@@ -2069,6 +2222,14 @@ impl Table {
             owner: "postgres".to_string(),
             acl: Vec::new(),
             col_acl: Vec::new(),
+            // --- v0.37: TOAST (oid assigned by the caller via
+            // `Database::alloc_oid`; toast table created on demand). ---
+            oid: 0,
+            toast_relid: 0,
+            toast_target: toast_consts::TOAST_TUPLE_TARGET,
+            col_storage,
+            toast_info: HashMap::new(),
+            next_value_id: 1,
         }
     }
 
@@ -2194,6 +2355,9 @@ pub struct Database {
     /// v0.11: database-level GRANT entries (CONNECT). Empty = default
     /// allow, matching a fresh PostgreSQL install's PUBLIC grant.
     pub db_acl: Vec<AclEntry>,
+    /// v0.37: next table OID to assign (`pg_class.oid`). Starts at
+    /// `FIRST_USER_OID` (16384), like PG's `FirstNormalObjectId`.
+    pub next_oid: u32,
 }
 
 /// v0.13: a replication slot. Cluster-global (not per-database), and
@@ -2299,11 +2463,20 @@ impl Database {
             temp_tables: HashMap::default(),
             // v0.22: bounded shell-type registry.
             types: HashMap::default(),
+            // v0.37: table OIDs for pg_class.
+            next_oid: toast_consts::FIRST_USER_OID,
         };
         // v0.11: the bootstrap superuser always exists.
         db.roles
             .insert("postgres".to_string(), vec![Role::bootstrap_postgres()]);
         db
+    }
+
+    /// v0.37: hand out the next table OID (`pg_class.oid`).
+    pub fn alloc_oid(&mut self) -> u32 {
+        let oid = self.next_oid;
+        self.next_oid = oid.wrapping_add(1).max(toast_consts::FIRST_USER_OID);
+        oid
     }
 
     /// First role version with `name` visible to (`snap`, `own`).
@@ -3901,6 +4074,7 @@ mod tests {
                     values: Row::new(vec![Value::Int(1)]),
                     xmin: 1,
                     xmax: 0,
+                    toast: Vec::new(),
                 });
                 t
             }],
@@ -3983,12 +4157,14 @@ mod tests {
             values: Row::new(vec![Value::Int(2)]),
             xmin: 1,
             xmax: 8,
+            toast: Vec::new(),
         });
         t.push_version(RowVersion {
             id: 3,
             values: Row::new(vec![Value::Int(3)]),
             xmin: 1,
             xmax: 0,
+            toast: Vec::new(),
         });
         assert_eq!(eng.vacuum_table("t"), 1);
         let ids: Vec<u64> = eng.db.tables["t"][0].rows.iter().map(|r| r.id).collect();
@@ -4003,6 +4179,7 @@ mod tests {
             values: Row::new(vec![Value::Int(9)]),
             xmin: 7,
             xmax: 0,
+            toast: Vec::new(),
         });
         undo_write_op(
             &mut eng,

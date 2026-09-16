@@ -994,6 +994,8 @@ mod tests {
                 acl: vec![],
                 col_acl: vec![],
                 xmin: 1,
+                oid: 0,
+                toast_relid: 0,
             },
             WalRecord::InsertRows {
                 table: "t".into(),

@@ -1670,6 +1670,11 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
             }
             .to_string(),
         ),
+        // v0.37: `default_toast_compression` is always "pglz" (like a PG
+        // built without LZ4): rustgres has no LZ4 implementation, so
+        // `lz4` is rejected with 22023 instead of being silently
+        // accepted.
+        "default_toast_compression" => Some("pglz".to_string()),
         "server_version" => Some(SERVER_VERSION.to_string()),
         "server_version_num" => Some(SERVER_VERSION_NUM.to_string()),
         "transaction_isolation" => {
@@ -1781,6 +1786,27 @@ fn stmt_set_guc(
                 tag: "SET".to_string(),
             })
         }
+        // v0.37: `default_toast_compression`. PG19 lists pglz and (when
+        // built with it) lz4. rustgres has no LZ4 implementation, so only
+        // pglz (and DEFAULT) is accepted; lz4 is rejected with 22023, like
+        // a PG built without LZ4 support.
+        "default_toast_compression" => {
+            match value {
+                SetValue::Default => {}
+                SetValue::Str(s) => match s.to_ascii_lowercase().as_str() {
+                    "pglz" => {}
+                    _ => {
+                        return Err(ExecError {
+                            code: "22023",
+                            message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                        });
+                    }
+                },
+            };
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
@@ -1806,6 +1832,7 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 /// v0.17: `RESET name` / `RESET ALL` (tag "RESET", like PG). Session
 /// transaction characteristics are not GUCs and survive RESET ALL.
 /// v0.29: `bytea_output` resets to hex.
+/// v0.37: `default_toast_compression` resets to pglz.
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
         "all" => {
@@ -1827,6 +1854,11 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
                 tag: "RESET".to_string(),
             })
         }
+        // v0.37: `default_toast_compression` is a constant "pglz";
+        // RESET is a no-op that still reports the tag, like PG.
+        "default_toast_compression" => Ok(ExecResult::Command {
+            tag: "RESET".to_string(),
+        }),
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
@@ -3237,12 +3269,11 @@ mod tests {
         for (i, op) in writes.iter().enumerate() {
             if let WriteOp::InsertRow { row_id, .. } = op {
                 engine.db.tables.get_mut("t").unwrap()[0].push_version(
-                    crate::storage::RowVersion {
-                        id: *row_id,
-                        values: Row::new(vec![Value::Int(i as i64)]),
-                        xmin: xid,
-                        xmax: 0,
-                    },
+                    crate::storage::RowVersion::plain(
+                        *row_id,
+                        Row::new(vec![Value::Int(i as i64)]),
+                        xid,
+                    ),
                 );
             }
         }

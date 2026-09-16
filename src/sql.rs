@@ -1312,6 +1312,18 @@ pub enum AlterAction {
     OwnerTo {
         new_owner: String,
     },
+    /// v0.37: ALTER TABLE name ALTER COLUMN col SET STORAGE mode.
+    /// `mode` is the raw mode name (`plain`/`external`/`extended`/
+    /// `main`/`default`); validated in exec against PG's rules.
+    SetStorage {
+        column: String,
+        mode: String,
+    },
+    /// v0.37: ALTER TABLE name SET (opt = val, ...). Only
+    /// `toast_tuple_target` is supported; anything else is 0A000.
+    SetRelOptions {
+        options: Vec<(String, String)>,
+    },
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -2565,6 +2577,18 @@ impl Parser {
         }
     }
 
+    /// v0.37: read a reloption value (`SET (opt = val, ...)`). Accepts an
+    /// identifier, number, or string literal; returns the raw text.
+    fn expect_reloption_value(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Ident(s) | Token::QIdent(s) | Token::Number(s) | Token::Str(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected option value, found {:?}",
+                other
+            ))),
+        }
+    }
+
     fn parse_top(&mut self) -> Result<Stmt, SqlError> {
         let kw = match self.next() {
             Token::Ident(s) => s,
@@ -2845,6 +2869,7 @@ impl Parser {
             }
             "bytea" => Ok(ColType::Bytea),
             "uuid" => Ok(ColType::Uuid),
+            "regclass" => Ok(ColType::Regclass),
             _ => Err(err(format!("syntax error: unknown type \"{}\"", name))),
         }
     }
@@ -2907,6 +2932,7 @@ impl Parser {
                 | "timestamptz"
                 | "bytea"
                 | "uuid"
+                | "regclass"
         )
     }
 
@@ -3208,6 +3234,26 @@ impl Parser {
                 new_owner: self.expect_ident()?,
             });
         }
+        // v0.37: ALTER TABLE name SET (opt = val, ...) — reloptions.
+        if self.eat_keyword("set") {
+            self.expect(Token::LParen, "'('")?;
+            let mut options = Vec::new();
+            loop {
+                let opt_name = self.expect_ident()?;
+                self.expect(Token::Eq, "'='")?;
+                // Option values are simple: identifiers, numbers, or
+                // string literals. Read the raw token text.
+                let opt_val = self.expect_reloption_value()?;
+                options.push((opt_name, opt_val));
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+            return Ok(AlterAction::SetRelOptions { options });
+        }
         if self.eat_keyword("add") {
             if self.is_table_constraint_start() {
                 return self.parse_alter_add_constraint();
@@ -3282,6 +3328,14 @@ impl Parser {
             self.eat_keyword("column");
             let cname = self.expect_ident()?;
             if self.eat_keyword("set") {
+                // v0.37: ALTER COLUMN c SET STORAGE mode
+                if self.eat_keyword("storage") {
+                    let mode = self.expect_ident()?;
+                    return Ok(AlterAction::SetStorage {
+                        column: cname,
+                        mode,
+                    });
+                }
                 self.expect_keyword("default")?;
                 let e = self.parse_or()?;
                 validate_constraint_expr(&e, "DEFAULT")?;

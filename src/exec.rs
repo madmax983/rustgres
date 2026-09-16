@@ -46,7 +46,7 @@ use crate::sql::{
 };
 use crate::storage::{
     ColStats, ColType, Database, Engine, Numeric, Row, RowVersion, Sequence, ShellType, Snapshot,
-    Table, TableStats, Value, ViewDef, WriteOp, row_visible,
+    Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -515,6 +515,12 @@ fn exec_create(
     let mut t = Table::with_def(def, ctx.own);
     // v0.11: the creating role owns the table.
     t.owner = ctx.role.to_string();
+    // v0.37: assign the table OID (pg_class.oid).
+    t.oid = eng.db.alloc_oid();
+    // v0.37: PG creates the toast table at CREATE TABLE when the table
+    // has toastable columns, so pg_class.reltoastrelid is set from the
+    // start (not lazily on first toast).
+    ensure_toast_table_eager(eng, ctx, name, &mut t);
     eng.db.tables.entry(name.to_string()).or_default().push(t);
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
@@ -835,6 +841,7 @@ fn check_row_constraints(
         let frame = Scope {
             schema: &schema,
             row: values,
+            prov: None,
         };
         let v = eval_expr(&mut q, &[frame], &check.expr)?;
         // Postgres CHECK passes on TRUE or NULL; only FALSE fails it.
@@ -1303,12 +1310,7 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
         let old_values = t.rows[pos].values.clone();
         t.rows[pos].xmax = ctx.own;
         let new_values = new_values.clone();
-        t.push_version(RowVersion {
-            id: new_id,
-            values: new_values.clone(),
-            xmin: ctx.own,
-            xmax: 0,
-        });
+        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
         ctx.writes.push(WriteOp::UpdateRow {
             table: table.clone(),
             old_id: *old_id,
@@ -1796,6 +1798,269 @@ fn arbiter_key(values: &[Value], key_cols: &[usize]) -> Vec<u8> {
         out.push(0xff);
     }
     out
+}
+
+/// v0.37: name of the toast table for a main-table OID, as PG names it
+/// (`pg_toast.pg_toast_<oid>`).
+fn toast_table_name(oid: u32) -> String {
+    format!("pg_toast.pg_toast_{}", oid)
+}
+
+/// v0.37: find the visible toast table's name by its OID.
+fn toast_table_name_by_oid(
+    eng: &Engine,
+    oid: u32,
+    snap: &crate::storage::Snapshot,
+    own: u64,
+) -> Option<String> {
+    eng.db
+        .tables
+        .iter()
+        .filter_map(|(n, vs)| {
+            vs.iter()
+                .find(|v| v.oid == oid && crate::storage::table_visible(v, snap, own))
+                .map(|_| n.clone())
+        })
+        .next()
+}
+
+/// v0.37: ensure the toast table exists for `table_name`, creating it
+/// (with its own OID) on first use, like PG's `toast_save_datum`
+/// creating the toast relation lazily. Returns the toast table name.
+/// v0.37: build the toast table value for a main-table OID. PG names it
+/// `pg_toast.pg_toast_<oid>` and creates it at CREATE TABLE; toast
+/// tables are never themselves toasted (all-PLAIN storage).
+fn new_toast_table(toast_oid: u32, owner: &str, xmin: u64) -> Table {
+    let mut tt = Table::new(
+        vec![
+            ("chunk_id".to_string(), ColType::Int),
+            ("chunk_seq".to_string(), ColType::Int),
+            ("chunk_data".to_string(), ColType::Bytea),
+        ],
+        xmin,
+    );
+    tt.oid = toast_oid;
+    tt.owner = owner.to_string();
+    // Toast tables are never themselves toasted.
+    tt.col_storage = vec![
+        toast_storage::PLAIN,
+        toast_storage::PLAIN,
+        toast_storage::PLAIN,
+    ];
+    tt
+}
+
+/// v0.37: create the toast table for a main table that has toastable
+/// columns but no toast table yet, and link it via `toast_relid`. PG
+/// creates the toast table at CREATE TABLE; for ALTER ADD COLUMN we
+/// create it when the first toastable column appears. The toast
+/// table's own CREATE is staged as a write op (like the main table's),
+/// so ROLLBACK and WAL replay both see it. No-op when the table
+/// already has one, has no toastable columns, or is a temp table
+/// (temp tables are session-local and skip TOAST; values stay inline).
+fn ensure_toast_table_eager(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+    main_table: &mut Table,
+) {
+    if main_table.toast_relid != 0 {
+        return;
+    }
+    if !main_table.columns.iter().any(|(_, ty)| ty.is_toastable()) {
+        return;
+    }
+    if eng
+        .db
+        .temp_tables
+        .get(&ctx.session)
+        .is_some_and(|m| m.contains_key(table_name))
+    {
+        return;
+    }
+    let toast_oid = eng.db.alloc_oid();
+    let toast_name = toast_table_name(main_table.oid);
+    let tt = new_toast_table(toast_oid, &ctx.role, ctx.own);
+    eng.db
+        .tables
+        .entry(toast_name.clone())
+        .or_default()
+        .push(tt);
+    main_table.toast_relid = toast_oid;
+    ctx.writes.push(WriteOp::CreateTable { name: toast_name });
+}
+
+fn ensure_toast_table(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+) -> Result<String, ExecError> {
+    let (oid, toast_relid) = {
+        let t = eng
+            .db
+            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .ok_or_else(|| {
+                exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", table_name),
+                )
+            })?;
+        (t.oid, t.toast_relid)
+    };
+    if toast_relid != 0 {
+        // Toast table already exists; find its name by OID.
+        if let Some(name) = toast_table_name_by_oid(eng, toast_relid, ctx.snap, ctx.own) {
+            return Ok(name);
+        }
+        // Fell through: toast_relid points nowhere (shouldn't happen).
+    }
+    // Create the toast table: (chunk_id oid, chunk_seq int4, chunk_data bytea).
+    let toast_name = toast_table_name(oid);
+    let toast_oid = eng.db.alloc_oid();
+    let tt = new_toast_table(toast_oid, &ctx.role, ctx.own);
+    eng.db
+        .tables
+        .entry(toast_name.clone())
+        .or_default()
+        .push(tt);
+    // Record the toast table OID on the main table.
+    {
+        let t = eng
+            .db
+            .find_table_mut(table_name, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible");
+        t.toast_relid = toast_oid;
+    }
+    ctx.writes.push(WriteOp::CreateTable {
+        name: toast_name.clone(),
+    });
+    Ok(toast_name)
+}
+
+/// v0.37: apply TOAST to a freshly inserted/updated row. Plans storage
+/// via `toast::plan_toast`, allocates value ids, records `toast_info`,
+/// writes out-of-line chunks to the toast table, and stamps the row's
+/// `toast` flags. Values stay detoasted in the main row (the flags are
+/// metadata); chunks are derived data for `pg_class.reltoastrelid`.
+fn toast_new_row(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+    row_id: u64,
+    values: &Row,
+) -> Result<(), ExecError> {
+    // v0.37: temp tables are session-local and skip TOAST (values stay
+    // inline, always correct); they never get a toast table, so there
+    // is nothing to spill to.
+    if eng
+        .db
+        .temp_tables
+        .get(&ctx.session)
+        .is_some_and(|m| m.contains_key(table_name))
+    {
+        return Ok(());
+    }
+    // v0.37: compression uses the pglz-named custom LZ77 (see toast.rs).
+    const COMPRESS_OK: bool = true;
+    // Phase 1: plan with a shared borrow.
+    let plan = {
+        let t = eng
+            .db
+            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .ok_or_else(|| {
+                exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", table_name),
+                )
+            })?;
+        crate::toast::plan_toast(t, values, COMPRESS_OK)
+    };
+    if plan.iter().all(|p| *p == crate::toast::ToastPlan::Plain) {
+        return Ok(());
+    }
+    // Phase 2: allocate value ids, record toast_info, collect chunks,
+    // and stamp the row's flags (mutable table borrow).
+    let chunks: Vec<(u32, Vec<u8>)> = {
+        let t = eng
+            .db
+            .find_table_mut(table_name, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible");
+        let mut flags = vec![0u32; values.len()];
+        let mut chunks = Vec::new();
+        for (i, p) in plan.iter().enumerate() {
+            if *p == crate::toast::ToastPlan::Plain {
+                continue;
+            }
+            let vid = t.next_value_id;
+            t.next_value_id += 1;
+            let compressed = matches!(
+                p,
+                crate::toast::ToastPlan::Compressed | crate::toast::ToastPlan::CompressedExternal
+            );
+            crate::toast::record_toast_info(t, vid, compressed);
+            flags[i] = vid;
+            if let Some(bytes) = crate::toast::out_of_line_bytes(values, i, *p, COMPRESS_OK) {
+                chunks.push((vid, bytes));
+            }
+        }
+        if let Some(pos) = t.row_pos(row_id) {
+            if let Some(r) = t.rows.get_mut(pos) {
+                r.toast = flags;
+            }
+        }
+        chunks
+    };
+    // Phase 3: write chunks to the toast table.
+    // Pre-allocate chunk row ids (the table borrow below conflicts).
+    let n_chunks: usize = chunks
+        .iter()
+        .map(|(_, b)| crate::toast::chunk_bytes(b).len())
+        .sum();
+    let mut chunk_ids = Vec::with_capacity(n_chunks);
+    for _ in 0..n_chunks {
+        chunk_ids.push(eng.alloc_row_id());
+    }
+    // v0.37: ensure the toast table exists if the table has any
+    // toastable columns (like PG, which creates it at CREATE TABLE).
+    // This sets reltoastrelid even when no chunks are needed yet.
+    let has_toastable = {
+        let t = eng
+            .db
+            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible");
+        t.columns.iter().any(|(_, ty)| ty.is_toastable())
+    };
+    if has_toastable {
+        let toast_name = ensure_toast_table(eng, ctx, table_name)?;
+        if !chunks.is_empty() {
+            let tt = eng
+                .db
+                .find_table_mut(&toast_name, ctx.snap, ctx.own, ctx.session)
+                .expect("toast table just created");
+            let mut id_iter = chunk_ids.into_iter();
+            for (vid, bytes) in chunks {
+                for (seq, chunk) in crate::toast::chunk_bytes(&bytes).iter().enumerate() {
+                    let cid = id_iter.next().expect("pre-allocated");
+                    tt.push_version(RowVersion::plain(
+                        cid,
+                        Row::new(vec![
+                            Value::Int(vid as i64),
+                            Value::Int(seq as i64),
+                            Value::Bytea(chunk.to_vec()),
+                        ]),
+                        ctx.own,
+                    ));
+                    // v0.37: chunks are real rows — stage the write op so
+                    // ROLLBACK removes them and the WAL replays them.
+                    ctx.writes.push(WriteOp::InsertRow {
+                        table: toast_name.clone(),
+                        row_id: cid,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn exec_insert(
@@ -2294,17 +2559,16 @@ fn exec_insert(
             .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
             .expect("table still visible; engine lock held throughout");
         for (id, values) in &inserts {
-            t.push_version(RowVersion {
-                id: *id,
-                values: values.clone(),
-                xmin: ctx.own,
-                xmax: 0,
-            });
+            t.push_version(RowVersion::plain(*id, values.clone(), ctx.own));
             ctx.writes.push(WriteOp::InsertRow {
                 table: table.to_string(),
                 row_id: *id,
             });
         }
+    }
+    // v0.37: TOAST the new rows (separate borrows inside).
+    for (id, values) in &inserts {
+        toast_new_row(eng, ctx, table, *id, values)?;
     }
     for (id, values) in &inserts {
         eng.db.index_insert_row(table, *id, values, ctx.session);
@@ -2328,12 +2592,7 @@ fn exec_insert(
             // v0.13: UpdateRow carries the old values for logical decoding.
             let old_values = t.rows[pos].values.clone();
             t.rows[pos].xmax = ctx.own;
-            t.push_version(RowVersion {
-                id: new_id,
-                values: new_values.clone(),
-                xmin: ctx.own,
-                xmax: 0,
-            });
+            t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
             ctx.writes.push(WriteOp::UpdateRow {
                 table: table.to_string(),
                 old_id: *old_id,
@@ -2343,6 +2602,10 @@ fn exec_insert(
             });
             indexed.push((new_id, new_values.clone()));
         }
+    }
+    // v0.37: TOAST the updated rows.
+    for (new_id, new_values) in &indexed {
+        toast_new_row(eng, ctx, table, *new_id, new_values)?;
     }
     for (new_id, new_values) in &indexed {
         eng.db
@@ -2687,12 +2950,7 @@ fn exec_update(
             // v0.13: UpdateRow carries the old values for logical decoding.
             let old_values = t.rows[pos].values.clone();
             t.rows[pos].xmax = ctx.own;
-            t.push_version(RowVersion {
-                id: new_id,
-                values: new_values.clone(),
-                xmin: ctx.own,
-                xmax: 0,
-            });
+            t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
             ctx.writes.push(WriteOp::UpdateRow {
                 table: table.to_string(),
                 old_id,
@@ -2702,6 +2960,11 @@ fn exec_update(
             });
             indexed.push((new_id, new_values));
         }
+    }
+    // v0.37: TOAST the updated rows, like INSERT does (the new versions
+    // may hold large values even when the old ones did not).
+    for (new_id, new_values) in &indexed {
+        toast_new_row(eng, ctx, table, *new_id, new_values)?;
     }
     // v0.8: index the new versions (old versions' entries stay; the
     // version chain's xmax makes them invisible).
@@ -2975,7 +3238,21 @@ fn exec_truncate(
     }
     // Delete every visible row, staging the same WriteOps as DELETE so
     // ROLLBACK / ROLLBACK TO SAVEPOINT restore the table exactly.
-    for table in &targets {
+    // v0.37: TRUNCATE also clears each table's toast data, like PG.
+    let mut delete_targets: Vec<String> = targets.clone();
+    for t in &targets {
+        let tr = eng
+            .db
+            .find_table(t, ctx.snap, ctx.own, ctx.session)
+            .map(|tt| tt.toast_relid)
+            .unwrap_or(0);
+        if tr != 0 {
+            if let Some(tn) = toast_table_name_by_oid(eng, tr, ctx.snap, ctx.own) {
+                delete_targets.push(tn);
+            }
+        }
+    }
+    for table in &delete_targets {
         let plan: Vec<(u64, u64)> = {
             let t = eng
                 .db
@@ -3151,11 +3428,30 @@ fn drop_one_table(
         .db
         .find_table_mut(name, ctx.snap, ctx.own, ctx.session)
         .expect("table still visible; engine lock held throughout");
+    // v0.37: dropping a table drops its toast table too (like PG).
+    let toast_relid = t.toast_relid;
     t.dropped_xmax = ctx.own;
     ctx.writes.push(WriteOp::DropTable {
         name: name.to_string(),
         prev_xmax,
     });
+    if toast_relid != 0 {
+        // Find the toast table's name by OID (visible version).
+        if let Some(tn) = toast_table_name_by_oid(eng, toast_relid, ctx.snap, ctx.own) {
+            let tt_prev_xmax = eng
+                .db
+                .find_table(&tn, ctx.snap, ctx.own, ctx.session)
+                .map(|tt| tt.dropped_xmax)
+                .unwrap_or(0);
+            if let Some(tt) = eng.db.find_table_mut(&tn, ctx.snap, ctx.own, ctx.session) {
+                tt.dropped_xmax = ctx.own;
+                ctx.writes.push(WriteOp::DropTable {
+                    name: tn,
+                    prev_xmax: tt_prev_xmax,
+                });
+            }
+        }
+    }
     // v0.8: dropping a table drops its indexes with it. Each index drop
     // is its own write op (snapshotting the definition) so ROLLBACK
     // restores them and the WAL replays them.
@@ -4115,6 +4411,14 @@ fn plan_from_item(
                     rows,
                 });
             }
+            // v0.37: pg_class is virtual (TOAST introspection).
+            if name == "pg_class" && eng.db.find_table(name, snap, own, session).is_none() {
+                return Ok(PlanNode::SeqScan {
+                    table: "pg_class".to_string(),
+                    filter: None,
+                    rows: eng.db.tables.len() as u64,
+                });
+            }
             // v0.11: role catalogs are virtual.
             if matches!(
                 name.as_str(),
@@ -4682,6 +4986,56 @@ fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.37: pg_class (virtual). A real table by the same name takes
+// precedence, like pg_stats. Exposes oid, relname, and reltoastrelid
+// for TOAST introspection. OIDs are Int (rustgres has no separate OID
+// type); reltoastrelid is 0 when the table has no toast table.
+// ---------------------------------------------------------------------------
+
+fn pg_class_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("relname", ColType::Text),
+        ("reltoastrelid", ColType::Int),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_class".to_string(),
+        name: n.to_string(),
+        ty,
+
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_class_schema();
+    let mut rows = Vec::new();
+    // Sort by name for deterministic output.
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    for name in names {
+        // Only the live version is visible in pg_class.
+        let Some(t) = db.find_table(name, snap, own, session) else {
+            continue;
+        };
+        // Skip the toast tables themselves? No — PG lists them in
+        // pg_class too. Include everything.
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(t.oid as i64),
+                Value::text(name.as_str()),
+                Value::Int(t.toast_relid as i64),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
 // v0.11: role catalogs (virtual). A real table by the same name takes
 // precedence, like pg_stats. `pg_authid` masks password verifiers from
 // non-superusers, like PostgreSQL.
@@ -4989,6 +5343,79 @@ pub struct QRow {
     pub prov: Vec<(String, u64)>,
 }
 
+/// v0.37: does this statement (or anything nested inside it, including
+/// subqueries and CTE bodies) call `pg_column_compression`? Used to
+/// decide `need_prov` for the FROM scan. Descending into subqueries is a
+/// safe over-approximation for the outer level (it only populates
+/// provenance that may go unused) and it is *required* for correlated
+/// subqueries, whose `pg_column_compression(t.c)` needs the outer
+/// query's rows to carry provenance; each nested level also computes
+/// its own `need_prov` from its own statement.
+fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
+    fn expr_uses(e: &Expr) -> bool {
+        match e {
+            Expr::Func { name, args } => {
+                if name == "pg_column_compression" {
+                    return true;
+                }
+                args.iter().any(expr_uses)
+            }
+            Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => {
+                false
+            }
+            Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Cast { expr, .. } => expr_uses(expr),
+            Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => expr_uses(expr) || expr_uses(pattern) || escape.as_deref().is_some_and(expr_uses),
+            Expr::Between {
+                expr, low, high, ..
+            } => expr_uses(expr) || expr_uses(low) || expr_uses(high),
+            Expr::IsBool { expr, .. } => expr_uses(expr),
+            Expr::Extract { from, .. } => expr_uses(from),
+            Expr::Cmp { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Not(e) | Expr::BitNot(e) => expr_uses(e),
+            Expr::IsNull { expr, .. } => expr_uses(expr),
+            Expr::Agg { arg, arg2, .. } => {
+                arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
+            }
+            Expr::ScalarSub(s) => stmt_uses_pg_column_compression(s),
+            Expr::InSub { expr, sub, .. } => {
+                expr_uses(expr) || stmt_uses_pg_column_compression(sub)
+            }
+            Expr::Exists { sub, .. } => stmt_uses_pg_column_compression(sub),
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(expr_uses)
+                    || partition_by.iter().any(expr_uses)
+                    || order_by.iter().any(|o| expr_uses(&o.expr))
+            }
+        }
+    }
+    stmt.items.iter().any(|it| match it {
+        SelectItem::Expr { expr, .. } => expr_uses(expr),
+        _ => false,
+    }) || stmt.where_.as_ref().is_some_and(expr_uses)
+        || stmt.group_by.iter().any(expr_uses)
+        || stmt.having.as_ref().is_some_and(expr_uses)
+        || stmt.order_by.iter().any(|o| expr_uses(&o.expr))
+        || stmt.with.iter().any(|c| match &c.body {
+            CteBody::Simple(s) => stmt_uses_pg_column_compression(s),
+            CteBody::Union { left, right, .. } => {
+                stmt_uses_pg_column_compression(left) || stmt_uses_pg_column_compression(right)
+            }
+        })
+}
+
 /// One scope in the column-resolution chain: a FROM source's schema+row,
 /// or an outer query's row for correlated subqueries. Scopes are searched
 /// innermost-first, like Postgres.
@@ -4996,6 +5423,10 @@ pub struct QRow {
 struct Scope<'a> {
     schema: &'a [QCol],
     row: &'a [Value],
+    /// v0.37: (table name, row-version id) provenance, from QRow.prov.
+    /// Used by `pg_column_compression` to find the row's toast flags.
+    /// None for derived/computed scopes.
+    prov: Option<&'a [(String, u64)]>,
 }
 
 /// Resolve `qual.name` / `name` across the scope chain (innermost first).
@@ -5083,6 +5514,7 @@ fn resolve_predicate_columns(pred: &Expr, schemas: &[&[QCol]]) -> Result<Expr, E
         .map(|s| Scope {
             schema: s,
             row: &[],
+            prov: None,
         })
         .collect();
     resolve_predicate_columns_in(pred, &scopes)
@@ -5779,7 +6211,9 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         outer,
         &stmt.from,
         stmt.where_.as_ref(),
-        stmt.for_update,
+        // v0.37: pg_column_compression needs row provenance too (anywhere
+        // in the statement, including correlated subqueries).
+        stmt.for_update || stmt_uses_pg_column_compression(stmt),
         order_hint.as_ref(),
         early_limit,
     )?;
@@ -6874,6 +7308,7 @@ fn gather_window_inputs_plain(
             let frame = Scope {
                 schema,
                 row: &r.cells,
+                prov: None,
             };
             let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
             scopes.extend_from_slice(outer);
@@ -6931,7 +7366,11 @@ fn gather_window_inputs_grouped(
                 Some(&i) => &rows[i].cells,
                 None => &[],
             };
-            let gscope = Scope { schema, row: first };
+            let gscope = Scope {
+                schema,
+                row: first,
+                prov: None,
+            };
             let mut pk = Vec::with_capacity(spec.partition_by.len());
             for p in &spec.partition_by {
                 pk.push(eval_grouped(
@@ -7430,6 +7869,7 @@ fn filter_rows(
         let frame = Scope {
             schema,
             row: &row.cells,
+            prov: None,
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {
@@ -8083,6 +8523,23 @@ fn build_source(
                 let (_, rows) = pg_stats_scan(&q.eng.db);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v0.37: pg_class is virtual too (TOAST introspection).
+            if name == "pg_class"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, q.own, q.session)
+                    .is_none()
+            {
+                let schema: Vec<QCol> = pg_class_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_class_scan(&q.eng.db, q.snap, q.own, q.session);
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -8565,12 +9022,14 @@ fn build_source(
                     let fl = Scope {
                         schema: &lschema,
                         row: &l.cells,
+                        prov: None,
                     };
                     let mut matched = false;
                     for (ri, r) in rrows.iter().enumerate() {
                         let fr = Scope {
                             schema: &rschema,
                             row: &r.cells,
+                            prov: None,
                         };
                         let scopes = [fl, fr];
                         let keep = match on_fast {
@@ -8599,10 +9058,12 @@ fn build_source(
                         scopes.push(Scope {
                             schema: &lschema,
                             row: &l.cells,
+                            prov: None,
                         });
                         scopes.push(Scope {
                             schema: &rschema,
                             row: &r.cells,
+                            prov: None,
                         });
                         let keep = match on_fast {
                             None => true,
@@ -8634,6 +9095,7 @@ fn build_source(
                                 let frame = Scope {
                                     schema: &schema,
                                     row: &pair.cells,
+                                    prov: None,
                                 };
                                 let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                                 scopes.extend_from_slice(outer);
@@ -8684,6 +9146,7 @@ fn apply_where(
         let frame = Scope {
             schema,
             row: &row.cells,
+            prov: Some(&row.prov),
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {
@@ -8773,6 +9236,7 @@ fn projection_scopes<'a>(
         s.push(Scope {
             schema,
             row: &row.cells,
+            prov: Some(&row.prov),
         });
         s
     } else {
@@ -8985,6 +9449,7 @@ fn exec_agg(
         let frame = Scope {
             schema,
             row: &row.cells,
+            prov: None,
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {
@@ -9023,7 +9488,11 @@ fn exec_agg(
             Some(&i) => &rows[i].cells,
             None => &[],
         };
-        let gscope = Scope { schema, row: first };
+        let gscope = Scope {
+            schema,
+            row: first,
+            prov: None,
+        };
         let keep = match &stmt.having {
             None => true,
             Some(h) => eval_grouped_bool(
@@ -9085,11 +9554,15 @@ fn exec_agg(
         // Correlated subqueries inside the select list see the first row
         // of the group. Any correlated column must be group-bound for the
         // query to be valid, so every row in the group agrees on it.
-        let first: &[Value] = match idxs.first() {
-            Some(&i) => &rows[i].cells,
-            None => &[],
+        let (first, first_prov): (&[Value], Option<&[(String, u64)]>) = match idxs.first() {
+            Some(&i) => (&rows[i].cells, Some(&rows[i].prov)),
+            None => (&[], None),
         };
-        let gscope = Scope { schema, row: first };
+        let gscope = Scope {
+            schema,
+            row: first,
+            prov: first_prov,
+        };
         let mut cells = Vec::new();
         for item in &stmt.items {
             match item {
@@ -9342,6 +9815,37 @@ fn eval_grouped(
             eval_is_bool(&v, *neg, *val)
         }
         Expr::Func { name, args } => {
+            // v0.37: pg_column_compression and pg_relation_size need
+            // engine/provenance access; they cannot go through the pure
+            // eval_func_vals path.
+            if name == "pg_column_compression" {
+                if args.len() != 1 {
+                    return Err(exec_err(
+                        "42883",
+                        "function pg_column_compression() does not exist".to_string(),
+                    ));
+                }
+                // Build scopes from gscope + outer for the type lookup.
+                // Grouped values are always computed inline, so there is
+                // no base row to attribute (use_prov = false).
+                let mut scopes = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(gscope);
+                let v = eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0],
+                )?;
+                return pg_column_compression_value(q, &scopes, &args[0], &v, false);
+            }
+            if name == "pg_relation_size" {
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v =
+                        eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
+                    vals.push(v);
+                }
+                check_builtin_arity(name, &vals)?;
+                return eval_pg_relation_size(q, &vals);
+            }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
@@ -9541,6 +10045,7 @@ fn eval_agg_func(
         let frame = Scope {
             schema,
             row: &rows[i].cells,
+            prov: None,
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {
@@ -9738,6 +10243,7 @@ fn apply_order(
                     let frame = Scope {
                         schema,
                         row: o.full.as_deref().unwrap_or(&[]),
+                        prov: None,
                     };
                     let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                     scopes.extend_from_slice(outer);
@@ -9883,6 +10389,10 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         }
         Expr::Cast { expr, to } => {
             let v = eval_expr(q, scopes, expr)?;
+            // v0.37: regclass cast needs catalog lookup (OID -> name).
+            if *to == ColType::Regclass {
+                return eval_regclass_cast(q, &v);
+            }
             eval_cast(&v, *to)
         }
         Expr::Concat(a, b) => {
@@ -10304,7 +10814,11 @@ fn eval_dml_expr(
     };
     let scopes: Vec<Scope> = frames
         .iter()
-        .map(|(schema, row)| Scope { schema, row })
+        .map(|(schema, row)| Scope {
+            schema,
+            row,
+            prov: None,
+        })
         .collect();
     let v = eval_expr(&mut q, &scopes, e)?;
     // FOR UPDATE inside an UPDATE's SET subquery locks nothing: UPDATE is
@@ -11456,6 +11970,64 @@ fn eval_assign_cast(v: &Value, to: &ColType) -> Result<Value, ExecError> {
     }
 }
 
+/// v0.37: regclass output — an OID rendered as text, like PG19's
+/// `regclassout`: OID 0 renders as `"-"`, a known visible relation
+/// renders as its name, and any other OID renders as its decimal
+/// string (never an error).
+fn regclass_display(q: &Q, oid: u32) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    for (name, versions) in &q.eng.db.tables {
+        if versions
+            .iter()
+            .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, q.own))
+        {
+            return name.clone();
+        }
+    }
+    oid.to_string()
+}
+
+/// v0.37: `CAST(x AS regclass)`, like PG19's `regclassin`: `"-"`
+/// signifies OID 0 and an all-digit string is taken as the OID
+/// directly (no existence check); anything else must name a visible
+/// relation (42P01 otherwise). A regclass value is represented by its
+/// display text (see [`regclass_display`]).
+fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
+    let oid: u32 = match v {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(i) => *i as u32,
+        Value::BigInt(i) => *i as u32,
+        Value::SmallInt(i) => *i as u32,
+        Value::Text(s) => {
+            if s.as_ref() == "-" {
+                0
+            } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                // PG's parseNumericOid: overflow fails soft to InvalidOid.
+                s.parse::<u32>().unwrap_or(0)
+            } else {
+                // A relation name: must resolve, like PG (42P01).
+                let t = q
+                    .eng
+                    .db
+                    .find_table(s, q.snap, q.own, q.session)
+                    .ok_or_else(|| {
+                        exec_err("42P01", format!("relation \"{}\" does not exist", s))
+                    })?;
+                t.oid
+            }
+        }
+        other => {
+            return Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to regclass", other.type_name()),
+            ));
+        }
+    };
+    Ok(Value::text(regclass_display(q, oid)))
+}
+
 fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     if v == &Value::Null {
         return Ok(Value::Null);
@@ -11623,6 +12195,9 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             }),
             other => Err(cast_err(other, "uuid")),
         },
+        // v0.37: regclass is handled in eval_expr (needs catalog access).
+        // This arm is unreachable but required for exhaustiveness.
+        ColType::Regclass => Err(cast_err(v, "regclass")),
     }
 }
 
@@ -11973,12 +12548,246 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
         return eval_sequence_func(eng, snap, own, session, q.role, q.read_only, name, &vals);
     }
+    // v0.37: pg_column_compression needs row provenance (not just the
+    // value), so it cannot go through the pure eval_func_vals path.
+    if name == "pg_column_compression" {
+        if args.len() != 1 {
+            return Err(exec_err(
+                "42883",
+                "function pg_column_compression() does not exist".to_string(),
+            ));
+        }
+        let v = eval_expr(q, scopes, &args[0])?;
+        return pg_column_compression_value(q, scopes, &args[0], &v, true);
+    }
+    // v0.37: pg_relation_size needs engine access.
+    if name == "pg_relation_size" {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        check_builtin_arity(name, &vals)?;
+        return eval_pg_relation_size(q, &vals);
+    }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
         let v = eval_expr(q, scopes, a)?;
         vals.push(normalize_func_arg(name, v));
     }
     eval_func_vals(name, &vals)
+}
+
+/// v0.37: `pg_column_compression(any)` — like PG19's implementation in
+/// `varlena.c`: NULL for a NULL argument and for fixed-width types;
+/// for a varlena value, the stored compression method name when the
+/// value is compressed in its row, else NULL. Our compressor is a
+/// custom LZ77 that reports under the `pglz` name (it is not
+/// PGLZ byte-compatible).
+///
+/// The argument may be any expression (PG's function is not restricted
+/// to simple column references): only a plain column reference on a
+/// base table can carry provenance, and only in the row-wise path
+/// (`use_prov`). Everywhere else the value at hand is necessarily
+/// inline, so a non-null varlena yields NULL.
+fn pg_column_compression_value(
+    q: &mut Q,
+    scopes: &[Scope],
+    arg: &Expr,
+    value: &Value,
+    use_prov: bool,
+) -> Result<Value, ExecError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // Resolve a plain column reference to its schema position, for the
+    // type check and (row-wise) the provenance lookup. Columns usually
+    // arrive as ResolvedCol after the resolver pass; handle the
+    // unresolved shape too.
+    let resolved: Option<(usize, usize)> = match arg {
+        Expr::ResolvedCol { frame, idx } => Some((*frame, *idx)),
+        Expr::Column { table, name } => Some(resolve_col(scopes, table.as_deref(), name)?),
+        _ => None,
+    };
+    let is_varlena = match resolved {
+        Some((si, ci)) => scopes
+            .get(si)
+            .and_then(|s| s.schema.get(ci))
+            .map(|c| c.ty.is_toastable())
+            .unwrap_or(false),
+        // A computed value: varlena-ness from the value itself (PG
+        // checks the argument's type the same way).
+        None => matches!(
+            value,
+            Value::Text(_) | Value::BpChar(_) | Value::Bytea(_) | Value::Numeric(_)
+        ),
+    };
+    if !is_varlena {
+        return Ok(Value::Null);
+    }
+    let (Some((si, ci)), true) = (resolved, use_prov) else {
+        // No base row to attribute (an expression, or grouped
+        // evaluation): the value at hand is inline by construction.
+        return Ok(Value::Null);
+    };
+    let scope = &scopes[si];
+    let (Some(prov), Some(qcol)) = (scope.prov, scope.schema.get(ci)) else {
+        return Ok(Value::Null);
+    };
+    if qcol.qual.is_empty() {
+        // A merged USING/NATURAL key belongs to no single table.
+        return Ok(Value::Null);
+    }
+    // Provenance entries run in FROM-item order, one per leaf item,
+    // matching the schema's distinct non-empty qualifiers in
+    // first-appearance order.
+    let mut quals: Vec<&str> = Vec::new();
+    for c in scope.schema {
+        if !c.qual.is_empty() && !quals.contains(&c.qual.as_str()) {
+            quals.push(c.qual.as_str());
+        }
+    }
+    let (table_name, row_id) = match quals
+        .iter()
+        .position(|qq| *qq == qcol.qual.as_str())
+        .and_then(|pi| prov.get(pi))
+    {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let t = match q.eng.db.find_table(table_name, q.snap, q.own, q.session) {
+        Some(t) => t,
+        None => return Ok(Value::Null),
+    };
+    // The exact row version by id (it is the row under evaluation, so
+    // no duplicate-value confusion is possible).
+    let rv = match t.rows.iter().find(|r| r.id == *row_id) {
+        Some(rv) => rv,
+        None => return Ok(Value::Null),
+    };
+    // `src_ord` is the column's index in its source table, preserved
+    // through joins and (positional) column aliases.
+    let flag = rv.toast.get(qcol.src_ord as usize).copied().unwrap_or(0);
+    if flag == 0 {
+        return Ok(Value::Null);
+    }
+    match t.toast_info.get(&flag) {
+        Some(info) if info.compressed => Ok(Value::text("pglz")),
+        _ => Ok(Value::Null),
+    }
+}
+
+/// v0.37: `pg_relation_size(regclass)` / `pg_relation_size(regclass,
+/// text)` — an APPROXIMATE size in bytes of the table's stored rows,
+/// summed from the in-memory row data (value bytes plus per-tuple
+/// overhead). This is NOT PostgreSQL's disk-page accounting: it is an
+/// in-memory estimate, and only the `main` fork is tracked.
+///
+/// Accepts a relation name, a regclass display value (text), or an OID
+/// integer — like PG's `regclass` input, an all-digit string is read as
+/// an OID. Unknown relations are 42P01; a non-`main` fork is 0A000.
+fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> {
+    let fork: Option<String> = match vals.get(1) {
+        None => None,
+        Some(Value::Text(s)) => Some(s.to_string()),
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(other) => {
+            return Err(exec_err(
+                "42883",
+                format!(
+                    "function pg_relation_size({}) does not exist",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    if let Some(f) = &fork {
+        if f != "main" {
+            return Err(exec_err(
+                "0A000",
+                format!("fork \"{}\" is not supported", f),
+            ));
+        }
+    }
+    // Resolve the relation: OID integer, all-digit text (an OID), or a
+    // relation name — mirroring regclass input.
+    let oid: Option<u32> = match &vals[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(i) => Some(*i as u32),
+        Value::BigInt(i) => Some(*i as u32),
+        Value::SmallInt(i) => Some(*i as u32),
+        Value::Text(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(s.parse::<u32>().unwrap_or(0))
+        }
+        Value::Text(_) => None,
+        other => {
+            return Err(exec_err(
+                "42883",
+                format!(
+                    "function pg_relation_size({}) does not exist",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let t = match oid {
+        Some(oid) => {
+            let mut found = None;
+            // Session temp tables shadow permanent ones, like find_table
+            // (temp tables are session-local; find_table skips the
+            // visibility check for them too).
+            if let Some(tmps) = q.eng.db.temp_tables.get(&q.session) {
+                found = tmps.values().find(|t| t.oid == oid);
+            }
+            if found.is_none() {
+                found = q.eng.db.tables.values().find_map(|vs| {
+                    vs.iter()
+                        .find(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, q.own))
+                });
+            }
+            found.ok_or_else(|| {
+                exec_err("42P01", format!("relation with OID {} does not exist", oid))
+            })?
+        }
+        None => {
+            let Value::Text(s) = &vals[0] else {
+                return Err(exec_err("XX000", "internal error: relation name"));
+            };
+            q.eng
+                .db
+                .find_table(s, q.snap, q.own, q.session)
+                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", s)))?
+        }
+    };
+    // Sum the estimated stored size of all visible row versions.
+    let mut size: i64 = 0;
+    for rv in &t.rows {
+        if !crate::storage::row_visible(rv, q.snap, q.own) {
+            continue;
+        }
+        // Rough estimate: sum of value sizes + per-row overhead.
+        for v in rv.values.iter() {
+            size += match v {
+                Value::Null => 1,
+                Value::Bool(_) => 1,
+                Value::SmallInt(_) => 2,
+                Value::Int(_) => 4,
+                Value::BigInt(_) => 8,
+                Value::Float(_) => 8,
+                Value::Float4(_) => 4,
+                Value::Numeric(_) => 16, // approximate
+                Value::Text(s) => s.len() as i64,
+                Value::BpChar(s) => s.len() as i64,
+                Value::Bytea(b) => b.len() as i64,
+                Value::SingleChar(_) => 1,
+                Value::Date(_) => 4,
+                Value::Timestamp(_) => 8,
+                Value::Timestamptz(_) => 8,
+                Value::Uuid(_) => 16,
+            };
+        }
+        size += 24; // per-tuple overhead (approximate)
+    }
+    Ok(Value::BigInt(size))
 }
 
 /// Validate argument counts for scalar built-ins. A wrong count is
@@ -12026,6 +12835,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_split_to_table" => (2..=3).contains(&n),
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
+        // v0.37: TOAST introspection functions.
+        "pg_column_compression" => n == 1,
+        "pg_relation_size" => n == 1 || n == 2,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -16290,6 +17102,9 @@ fn func_result_type(
         "translate" | "unistr" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
+        // v0.37: TOAST introspection functions.
+        "pg_column_compression" => Ok(ColType::Text),
+        "pg_relation_size" => Ok(ColType::BigInt),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches" => {
             Ok(ColType::Text)
@@ -16725,6 +17540,19 @@ fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v0.37: pg_class is virtual too (TOAST introspection).
+            if name == "pg_class" && eng.db.find_table(name, snap, own, session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_class_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -16999,15 +17827,32 @@ fn describe_select_outer(
 /// Default output column name when there is no alias: the column name for
 /// bare refs, the function name for aggregates, the type name for casts
 /// (v0.14, like Postgres), `?column?` otherwise.
-fn expr_col_name(e: &Expr) -> String {
+/// v0.37: PG19's `FigureColnameInternal` (parse_target.c) with its
+/// confidence strength: 2 = good name (column, function), 1 =
+/// second-best (a cast falling back to the type name), 0 = no
+/// information (`?column?`). A cast keeps its argument's name only at
+/// strength 2; otherwise the type name wins (`'x'::text` -> `text`,
+/// `'x'::text::varchar` -> `varchar`).
+fn expr_col_name_strength(e: &Expr) -> (String, u8) {
     match e {
-        Expr::Column { name, .. } => name.clone(),
-        Expr::Agg { func, .. } => func.name().to_string(),
-        Expr::Cast { to, .. } => to.pg_typname().to_string(),
+        Expr::Column { name, .. } => (name.clone(), 2),
+        Expr::Agg { func, .. } => (func.name().to_string(), 2),
+        Expr::Cast { expr, to } => {
+            let (inner, s) = expr_col_name_strength(expr);
+            if s <= 1 {
+                (to.pg_typname().to_string(), 1)
+            } else {
+                (inner, s)
+            }
+        }
         // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
-        Expr::Func { name, .. } => name.clone(),
-        _ => "?column?".to_string(),
+        Expr::Func { name, .. } => (name.clone(), 2),
+        _ => ("?column?".to_string(), 0),
     }
+}
+
+fn expr_col_name(e: &Expr) -> String {
+    expr_col_name_strength(e).0
 }
 
 fn expr_type(
@@ -17026,6 +17871,7 @@ fn expr_type(
                 .map(|s| Scope {
                     schema: s,
                     row: &[],
+                    prov: None,
                 })
                 .collect();
             let (si, ci) = resolve_col(&scopes, table.as_deref(), name)?;
@@ -17093,7 +17939,7 @@ fn expr_type(
             if cols.len() != 1 {
                 return Err(exec_err("42601", "subquery must return only one column"));
             }
-            Ok(cols[1 - 1].clone().1)
+            Ok(cols[0].clone().1)
         }
         // v0.10: window function result types.
         Expr::Window { func, args, .. } => {
@@ -17417,6 +18263,7 @@ fn hint_type(
                 .map(|s| Scope {
                     schema: s,
                     row: &[],
+                    prov: None,
                 })
                 .collect();
             let (si, ci) = match e {
@@ -18058,6 +18905,8 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::Uuid)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v0.37: regclass input not supported via binary protocol.
+        ColType::Regclass => Err(bad("invalid input syntax for type regclass".into())),
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -18344,6 +19193,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Timestamptz => Value::Timestamptz(0),
         ColType::Bytea => Value::Bytea(Vec::new()),
         ColType::Uuid => Value::Uuid([0; 16]),
+        ColType::Regclass => Value::Text("".into()),
     }
 }
 
@@ -18408,12 +19258,11 @@ mod tests {
             1,
         );
         for (i, id, name) in [(1, 1, "ann"), (2, 2, "bob"), (3, 3, "cid")] {
-            users.push_version(RowVersion {
-                id: i,
-                values: Row::new(vec![Value::Int(id), Value::text(name)]),
-                xmin: 1,
-                xmax: 0,
-            });
+            users.push_version(RowVersion::plain(
+                i,
+                Row::new(vec![Value::Int(id), Value::text(name)]),
+                1,
+            ));
         }
         // orders(id int, uid int, amt int): (1,1,10), (2,1,20), (3,2,5)
         let mut orders = Table::new(
@@ -18425,12 +19274,11 @@ mod tests {
             1,
         );
         for (i, id, uid, amt) in [(4, 1, 1, 10), (5, 2, 1, 20), (6, 3, 2, 5)] {
-            orders.push_version(RowVersion {
-                id: i,
-                values: Row::new(vec![Value::Int(id), Value::Int(uid), Value::Int(amt)]),
-                xmin: 1,
-                xmax: 0,
-            });
+            orders.push_version(RowVersion::plain(
+                i,
+                Row::new(vec![Value::Int(id), Value::Int(uid), Value::Int(amt)]),
+                1,
+            ));
         }
         eng.db.tables.insert("users".to_string(), vec![users]);
         eng.db.tables.insert("orders".to_string(), vec![orders]);
@@ -20932,6 +21780,110 @@ fn alter_owner_to(
     })
 }
 
+/// v0.37: ALTER TABLE name ALTER COLUMN col SET STORAGE mode.
+/// Follows PG's `ATExecSetStorage`: the mode name is case-insensitive;
+/// invalid names are 22023; non-toastable types may only use PLAIN
+/// (anything else is 0A000); `default` restores the type default.
+fn alter_set_storage(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    column: &str,
+    mode: &str,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let col_idx = t
+        .columns
+        .iter()
+        .position(|(n, _)| n == column)
+        .ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column, name
+                ),
+            )
+        })?;
+    let col_type = t.columns[col_idx].1.clone();
+    let storage = toast_storage::parse(mode, col_type.default_toast_storage())
+        .ok_or_else(|| exec_err("22023", format!("invalid storage type \"{}\"", mode)))?;
+    if storage != toast_storage::PLAIN && !col_type.is_toastable() {
+        return Err(exec_err(
+            "0A000",
+            // PG19 tablecmds.c GetAttributeStorage: "column data type %s
+            // can only have storage PLAIN".
+            format!(
+                "column data type {} can only have storage PLAIN",
+                col_type.sql_name(),
+            ),
+        ));
+    }
+    let mut next = t;
+    next.col_storage[col_idx] = storage;
+    // v0.37: creating the toast table itself is lazy (on first toast);
+    // SET STORAGE only records the strategy, like PG.
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v0.37: ALTER TABLE name SET (opt = val, ...). Only
+/// `toast_tuple_target` is supported (range 128..=8160, like PG's
+/// reloption); anything else is 22023 ("unrecognized parameter").
+fn alter_set_reloptions(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    options: &[(String, String)],
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let mut next = t;
+    for (opt, val) in options {
+        if opt.eq_ignore_ascii_case("toast_tuple_target") {
+            let n: i64 = val.parse().map_err(|_| {
+                exec_err(
+                    "22023",
+                    format!("invalid value for \"toast_tuple_target\": \"{}\"", val),
+                )
+            })?;
+            if n < toast_consts::TOAST_TUPLE_TARGET_MIN as i64
+                || n > toast_consts::TOAST_TUPLE_TARGET_MAIN as i64
+            {
+                return Err(exec_err(
+                    "22023",
+                    format!(
+                        "value {} out of bounds for \"toast_tuple_target\" (128..={})",
+                        n,
+                        toast_consts::TOAST_TUPLE_TARGET_MAIN,
+                    ),
+                ));
+            }
+            next.toast_target = n as u32;
+        } else {
+            // PG19 reloptions.c parseRelOptionsInternal: unrecognized
+            // parameters are 22023, not 0A000.
+            return Err(exec_err(
+                "22023",
+                format!("unrecognized parameter \"{}\"", opt),
+            ));
+        }
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
 fn eval_sequence_func(
     eng: &mut Engine,
     snap: &Snapshot,
@@ -21031,6 +21983,14 @@ fn alter_swap(
         .find_table(name, ctx.snap, ctx.own, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
+    // v0.37: the per-column TOAST storage must stay parallel to
+    // `columns` across every ALTER shape change.
+    debug_assert_eq!(
+        next.col_storage.len(),
+        next.columns.len(),
+        "col_storage out of sync with columns in ALTER TABLE {}",
+        name
+    );
     next.created_xmin = ctx.own;
     next.dropped_xmax = 0;
     let rewrite = new_rows.is_some();
@@ -21195,6 +22155,9 @@ fn exec_alter(
         AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
         // v0.11
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
+        // v0.37
+        AlterAction::SetStorage { column, mode } => alter_set_storage(eng, ctx, name, column, mode),
+        AlterAction::SetRelOptions { options } => alter_set_reloptions(eng, ctx, name, options),
     }
 }
 
@@ -21240,6 +22203,8 @@ fn alter_add_column(
     }
     let mut next = t.clone();
     next.columns.push((col.to_string(), col_type.clone()));
+    // v0.37: keep the per-column TOAST storage parallel to `columns`.
+    next.col_storage.push(col_type.default_toast_storage());
     next.not_null.push(not_null);
     next.defaults.push(default.clone());
     next.checks.extend(checks.iter().cloned());
@@ -21303,12 +22268,7 @@ fn alter_add_column(
             name,
             &nv,
         )?;
-        new_rows.push(RowVersion {
-            id: old_id,
-            values: Row::new(nv),
-            xmin: ctx.own,
-            xmax: 0,
-        });
+        new_rows.push(RowVersion::plain(old_id, Row::new(nv), ctx.own));
     }
     // Backing indexes for new unique/pkey constraints.
     let mut new_indexes: Vec<(String, Vec<String>)> = Vec::new();
@@ -21318,6 +22278,12 @@ fn alter_add_column(
     if let Some(pk) = pkey {
         new_indexes.push((pk.name.clone(), pk.cols.clone()));
     }
+    // v0.37: adding the first toastable column earns the table a toast
+    // table (like PG), so reltoastrelid is set even before any row is
+    // toasted. The toast table's CREATE is its own write op, so
+    // ROLLBACK removes it while alter_swap's AlterTable op restores the
+    // old version (whose toast_relid is still 0).
+    ensure_toast_table_eager(eng, ctx, name, &mut next);
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
     for (ix_name, cols) in new_indexes {
         create_constraint_index(eng, ctx, name, &ix_name, &cols, true)?;
@@ -21514,6 +22480,8 @@ fn alter_drop_column(
     next.columns.remove(ci);
     next.not_null.remove(ci);
     next.defaults.remove(ci);
+    // v0.37: keep the per-column TOAST storage parallel to `columns`.
+    next.col_storage.remove(ci);
     // CHECK expressions reference columns by name; nothing to shift.
     // Rewrite rows without the column. Reuse old row ids so surviving
     // indexes stay valid.
@@ -21523,12 +22491,7 @@ fn alter_drop_column(
         if values.len() > ci {
             values.remove(ci);
         }
-        new_rows.push(RowVersion {
-            id: old_id,
-            values: Row::new(values),
-            xmin: ctx.own,
-            xmax: 0,
-        });
+        new_rows.push(RowVersion::plain(old_id, Row::new(values), ctx.own));
     }
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
     // Shift index positions: drop and re-create each surviving index with

@@ -23,12 +23,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 7 (`RGSWAL07` / `RGSCHK07`) is NOT compatible with v0.12
-//! or earlier: v0.13 adds old row values to DeleteRows, first-class
-//! UpdateRows, replication slot records (CREATE/DROP/FLUSH), and
-//! replication slots in the checkpoint image. Like every format bump,
-//! old data directories are refused with a clear error instead of
-//! being misread. v0.12 was `RGSWAL06` / `RGSCHK06`.
+//! Format version 8 (`RGSWAL08` / `RGSCHK07`) is NOT compatible with v0.36
+//! or earlier: v0.37 adds table OIDs and TOAST metadata to the WAL and
+//! checkpoint. Like every format bump, old data directories are refused
+//! with a clear error instead of being misread. v0.36 was `RGSWAL07` /
+//! `RGSCHK06`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -128,13 +127,19 @@ const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
 const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK07";
-const CHKPT_VERSION: u32 = 6;
+/// v0.37: version 7 adds TOAST metadata (table OIDs, storage strategies,
+/// toast tables, per-cell toast flags). v6 checkpoints are refused; remove
+/// the data directory to start fresh (same policy as prior bumps).
+const CHKPT_VERSION: u32 = 7;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
 /// UpdateRows / ReplSlot* records. Old `RGSWAL06` files are refused loudly
 /// (see read_wal_header); remove the data directory to start fresh.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL07";
+/// v0.37: `RGSWAL08` — CreateTable carries the table OID and its
+/// toast-table OID (reltoastrelid), AlterTable carries TOAST metadata.
+/// Old `RGSWAL07` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL08";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -242,6 +247,10 @@ pub enum WalRecord {
         acl: Vec<WalAcl>,
         /// v0.11: column-level GRANT entries.
         col_acl: Vec<WalColAcl>,
+        /// v0.37: table OID (pg_class.oid).
+        oid: u32,
+        /// v0.37: toast table OID (pg_class.reltoastrelid).
+        toast_relid: u32,
         xmin: u64,
     },
     InsertRows {
@@ -303,6 +312,14 @@ pub enum WalRecord {
         acl: Vec<WalAcl>,
         /// v0.11: column-level GRANT entries.
         col_acl: Vec<WalColAcl>,
+        /// v0.37: TOAST metadata (SET STORAGE / SET (...) alters).
+        oid: u32,
+        toast_relid: u32,
+        toast_target: u32,
+        col_storage: Vec<u8>,
+        next_value_id: u32,
+        /// (value_id, compressed) pairs.
+        toast_info: Vec<(u32, u8)>,
         xmin: u64,
     },
     CreateView {
@@ -634,6 +651,11 @@ impl Enc {
                 self.u8(15);
                 return;
             }
+            // v0.37: regclass; tag appends after v0.36's.
+            ColType::Regclass => {
+                self.u8(16);
+                return;
+            }
         });
     }
 
@@ -724,6 +746,8 @@ impl Enc {
                 owner,
                 acl,
                 col_acl,
+                oid,
+                toast_relid,
                 xmin,
             } => {
                 self.u8(1);
@@ -733,6 +757,8 @@ impl Enc {
                 self.str(owner);
                 self.acl_list(acl);
                 self.col_acl_list(col_acl);
+                self.u32(*oid);
+                self.u32(*toast_relid);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -834,6 +860,12 @@ impl Enc {
                 owner,
                 acl,
                 col_acl,
+                oid,
+                toast_relid,
+                toast_target,
+                col_storage,
+                next_value_id,
+                toast_info,
                 xmin,
             } => {
                 self.u8(7);
@@ -844,6 +876,20 @@ impl Enc {
                 self.str(owner);
                 self.acl_list(acl);
                 self.col_acl_list(col_acl);
+                // v0.37: TOAST metadata.
+                self.u32(*oid);
+                self.u32(*toast_relid);
+                self.u32(*toast_target);
+                self.u32(col_storage.len() as u32);
+                for s in col_storage {
+                    self.u8(*s);
+                }
+                self.u32(*next_value_id);
+                self.u32(toast_info.len() as u32);
+                for (k, c) in toast_info {
+                    self.u32(*k);
+                    self.u8(*c);
+                }
                 self.u64(*xmin);
             }
             WalRecord::CreateView {
@@ -1134,6 +1180,8 @@ impl<'a> Dec<'a> {
             }
             // v0.36: the one-byte "char" type.
             15 => Ok(ColType::SingleChar),
+            // v0.37: regclass.
+            16 => Ok(ColType::Regclass),
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }
@@ -1212,6 +1260,9 @@ impl<'a> Dec<'a> {
                 let owner = self.str()?;
                 let acl = self.acl_list()?;
                 let col_acl = self.col_acl_list()?;
+                // v0.37: oid, toast_relid precede xmin, matching encode order.
+                let oid = self.u32()?;
+                let toast_relid = self.u32()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -1220,6 +1271,8 @@ impl<'a> Dec<'a> {
                     owner,
                     acl,
                     col_acl,
+                    oid,
+                    toast_relid,
                     xmin,
                 })
             }
@@ -1309,6 +1362,21 @@ impl<'a> Dec<'a> {
                 let owner = self.str()?;
                 let acl = self.acl_list()?;
                 let col_acl = self.col_acl_list()?;
+                // v0.37: TOAST metadata.
+                let oid = self.u32()?;
+                let toast_relid = self.u32()?;
+                let toast_target = self.u32()?;
+                let n_storage = self.u32()? as usize;
+                let mut col_storage = Vec::with_capacity(n_storage);
+                for _ in 0..n_storage {
+                    col_storage.push(self.u8()?);
+                }
+                let next_value_id = self.u32()?;
+                let n_ti = self.u32()? as usize;
+                let mut toast_info = Vec::with_capacity(n_ti);
+                for _ in 0..n_ti {
+                    toast_info.push((self.u32()?, self.u8()?));
+                }
                 let xmin = self.u64()?;
                 Ok(WalRecord::AlterTable {
                     name,
@@ -1318,6 +1386,12 @@ impl<'a> Dec<'a> {
                     owner,
                     acl,
                     col_acl,
+                    oid,
+                    toast_relid,
+                    toast_target,
+                    col_storage,
+                    next_value_id,
+                    toast_info,
                     xmin,
                 })
             }
@@ -1753,6 +1827,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             owner,
             acl,
             col_acl,
+            oid,
+            toast_relid,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
@@ -1760,6 +1836,16 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             t.owner = owner.clone();
             t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
             t.col_acl = col_acl.iter().cloned().map(WalColAcl::into_entry).collect();
+            // v0.37: restore the table OID and its toast table link.
+            t.oid = *oid;
+            t.toast_relid = *toast_relid;
+            // v0.37: advance the OID counter past every restored OID, or
+            // the next CREATE after replay would hand out a colliding OID.
+            eng.db.next_oid = eng
+                .db
+                .next_oid
+                .max(oid.wrapping_add(1))
+                .max(toast_relid.wrapping_add(1));
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
@@ -1799,12 +1885,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         );
                         continue;
                     }
-                    t.push_version(RowVersion {
-                        id: row.id,
-                        values: row.values.clone(),
-                        xmin: row.xmin,
-                        xmax: 0,
-                    });
+                    t.push_version(RowVersion::plain(row.id, row.values.clone(), row.xmin));
                     out.push((row.id, row.values.clone()));
                 }
                 out
@@ -1875,12 +1956,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 }
             }
             for r in new {
-                t.push_version(RowVersion {
-                    id: r.id,
-                    values: r.values.clone(),
-                    xmin: *xmax,
-                    xmax: 0,
-                });
+                t.push_version(RowVersion::plain(r.id, r.values.clone(), *xmax));
             }
             // Index the new versions, like live execution's
             // index_insert_row: recovery rebuilds indexes only for the
@@ -1950,6 +2026,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             owner,
             acl,
             col_acl,
+            oid,
+            toast_relid,
+            toast_target,
+            col_storage,
+            next_value_id,
+            toast_info,
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
@@ -1985,6 +2067,30 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             t.owner = owner.clone();
             t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
             t.col_acl = col_acl.iter().cloned().map(WalColAcl::into_entry).collect();
+            // v0.37: TOAST metadata.
+            t.oid = *oid;
+            t.toast_relid = *toast_relid;
+            // v0.37: keep the OID counter ahead of restored OIDs (see
+            // the CreateTable replay above).
+            eng.db.next_oid = eng
+                .db
+                .next_oid
+                .max(oid.wrapping_add(1))
+                .max(toast_relid.wrapping_add(1));
+            t.toast_target = *toast_target;
+            t.col_storage = col_storage.clone();
+            t.next_value_id = (*next_value_id).max(1);
+            t.toast_info = toast_info
+                .iter()
+                .map(|(k, c)| {
+                    (
+                        *k,
+                        crate::storage::ToastInfo {
+                            compressed: *c != 0,
+                        },
+                    )
+                })
+                .collect();
             versions.push(t);
         }
         WalRecord::CreateView {
@@ -2297,6 +2403,8 @@ pub fn records_for_commit(
                     owner: ours.owner.clone(),
                     acl: ours.acl.iter().map(WalAcl::of).collect(),
                     col_acl: ours.col_acl.iter().map(WalColAcl::of).collect(),
+                    oid: ours.oid,
+                    toast_relid: ours.toast_relid,
                     xmin: own,
                 });
             }
@@ -2322,6 +2430,17 @@ pub fn records_for_commit(
                     owner: ours.owner.clone(),
                     acl: ours.acl.iter().map(WalAcl::of).collect(),
                     col_acl: ours.col_acl.iter().map(WalColAcl::of).collect(),
+                    // v0.37: TOAST metadata.
+                    oid: ours.oid,
+                    toast_relid: ours.toast_relid,
+                    toast_target: ours.toast_target,
+                    col_storage: ours.col_storage.clone(),
+                    next_value_id: ours.next_value_id,
+                    toast_info: ours
+                        .toast_info
+                        .iter()
+                        .map(|(k, v)| (*k, v.compressed as u8))
+                        .collect(),
                     xmin: own,
                 });
             }
@@ -2869,6 +2988,8 @@ impl Wal {
         img.u64(wal_end);
         img.u64(eng.txns.next_xid);
         img.u64(eng.txns.next_row_id);
+        // v0.37: table OID counter.
+        img.u32(eng.db.next_oid);
         // Sort table names for a deterministic image (HashMap order is not).
         let mut names: Vec<&String> = eng.db.tables.keys().collect();
         names.sort();
@@ -2890,6 +3011,22 @@ impl Wal {
                 body.str(&t.owner);
                 body.acl_list(&t.acl.iter().map(WalAcl::of).collect::<Vec<_>>());
                 body.col_acl_list(&t.col_acl.iter().map(WalColAcl::of).collect::<Vec<_>>());
+                // v0.37: TOAST metadata.
+                body.u32(t.oid);
+                body.u32(t.toast_relid);
+                body.u32(t.toast_target);
+                body.u32(t.col_storage.len() as u32);
+                for s in &t.col_storage {
+                    body.u8(*s);
+                }
+                let mut toast_keys: Vec<u32> = t.toast_info.keys().copied().collect();
+                toast_keys.sort_unstable();
+                body.u32(toast_keys.len() as u32);
+                for k in &toast_keys {
+                    body.u32(*k);
+                    body.u8(t.toast_info[k].compressed as u8);
+                }
+                body.u32(t.next_value_id);
                 let live_rows: Vec<&RowVersion> = t
                     .rows
                     .iter()
@@ -2903,6 +3040,10 @@ impl Wal {
                     body.u32(r.values.len() as u32);
                     for v in r.values.iter() {
                         body.value(v);
+                    }
+                    // v0.37: per-cell toast flags (parallel to values).
+                    for f in r.toast.iter() {
+                        body.u32(*f);
                     }
                 }
                 n_versions += 1;
@@ -3158,6 +3299,11 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
     let mut eng = Engine::new();
     eng.txns.next_xid = d.u64().map_err(|e| bad(&e))?.max(1);
     eng.txns.next_row_id = d.u64().map_err(|e| bad(&e))?.max(1);
+    // v0.37: table OID counter.
+    eng.db.next_oid = d
+        .u32()
+        .map_err(|e| bad(&e))?
+        .max(crate::storage::toast_consts::FIRST_USER_OID);
     let n_versions = d.u32().map_err(|e| bad(&e))? as usize;
     for _ in 0..n_versions {
         let name = d.str().map_err(|e| bad(&e))?;
@@ -3180,6 +3326,23 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             .into_iter()
             .map(WalColAcl::into_entry)
             .collect();
+        // v0.37: TOAST metadata.
+        let oid = d.u32().map_err(|e| bad(&e))?;
+        let toast_relid = d.u32().map_err(|e| bad(&e))?;
+        let toast_target = d.u32().map_err(|e| bad(&e))?;
+        let n_storage = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut col_storage = Vec::with_capacity(n_storage);
+        for _ in 0..n_storage {
+            col_storage.push(d.u8().map_err(|e| bad(&e))?);
+        }
+        let n_toast_info = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut toast_info = std::collections::HashMap::new();
+        for _ in 0..n_toast_info {
+            let k = d.u32().map_err(|e| bad(&e))?;
+            let compressed = d.u8().map_err(|e| bad(&e))? != 0;
+            toast_info.insert(k, crate::storage::ToastInfo { compressed });
+        }
+        let next_value_id = d.u32().map_err(|e| bad(&e))?.max(1);
         let n_rows = d.u32().map_err(|e| bad(&e))? as usize;
         let mut rows = Vec::with_capacity(n_rows);
         for _ in 0..n_rows {
@@ -3194,15 +3357,18 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             if values.len() != columns.len() {
                 return Err(bad("row/column count mismatch"));
             }
+            // v0.37: per-cell toast flags.
+            let mut toast = Vec::with_capacity(n_vals);
+            for _ in 0..n_vals {
+                toast.push(d.u32().map_err(|e| bad(&e))?);
+            }
             if id >= eng.txns.next_row_id {
                 eng.txns.next_row_id = id + 1;
             }
-            rows.push(RowVersion {
-                id,
-                values: Row::new(values),
-                xmin,
-                xmax,
-            });
+            let mut __rv = RowVersion::plain(id, Row::new(values), xmin);
+            __rv.xmax = xmax;
+            __rv.toast = toast;
+            rows.push(__rv);
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
@@ -3210,6 +3376,13 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         __t.owner = owner;
         __t.acl = acl;
         __t.col_acl = col_acl;
+        // v0.37
+        __t.oid = oid;
+        __t.toast_relid = toast_relid;
+        __t.toast_target = toast_target;
+        __t.col_storage = col_storage;
+        __t.toast_info = toast_info;
+        __t.next_value_id = next_value_id;
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;
@@ -3407,12 +3580,7 @@ mod tests {
             "t".into(),
             vec![{
                 let mut t = Table::new(vec![("a".into(), ColType::Int)], 1);
-                t.push_version(RowVersion {
-                    id: 1,
-                    values: Row::new(vec![Value::Int(10)]),
-                    xmin: 1,
-                    xmax: 0,
-                });
+                t.push_version(RowVersion::plain(1, Row::new(vec![Value::Int(10)]), 1));
                 t
             }],
         );
@@ -3458,6 +3626,8 @@ mod tests {
                 owner: "postgres".into(),
                 acl: vec![],
                 col_acl: vec![],
+                oid: 16384,
+                toast_relid: 16385,
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -3546,6 +3716,7 @@ mod tests {
                 values: Row::new(vec![Value::Int(v)]),
                 xmin: xid,
                 xmax: 0,
+                toast: Vec::new(),
             });
         }
         let writes = vec![
@@ -3618,6 +3789,7 @@ mod tests {
             values: Row::new(vec![Value::Int(99)]),
             xmin: xid,
             xmax: 0,
+            toast: Vec::new(),
         });
         // Concurrent txn overwrites our delete-half.
         let other = eng.begin_txn();
@@ -3651,6 +3823,8 @@ mod tests {
                 owner: "postgres".into(),
                 acl: vec![],
                 col_acl: vec![],
+                oid: 16384,
+                toast_relid: 0,
                 xmin: 4,
             },
         )

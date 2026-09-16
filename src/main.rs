@@ -20,6 +20,7 @@ mod repl;
 mod server;
 mod sql;
 mod storage;
+mod toast;
 mod wal;
 
 use std::path::PathBuf;
