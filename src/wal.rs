@@ -23,11 +23,12 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 8 (`RGSWAL08` / `RGSCHK07`) is NOT compatible with v0.36
-//! or earlier: v0.37 adds table OIDs and TOAST metadata to the WAL and
-//! checkpoint. Like every format bump, old data directories are refused
-//! with a clear error instead of being misread. v0.36 was `RGSWAL07` /
-//! `RGSCHK06`.
+//! Format version 9 (`RGSWAL09` / `RGSCHK07`) is NOT compatible with v0.38
+//! or earlier: v0.39 adds per-row toast flags and toast provenance
+//! (value-id compression metadata) to InsertRows/UpdateRows/DeleteRows
+//! records so TOAST metadata survives WAL replay. Like every format
+//! bump, old data directories are refused with a clear error instead of
+//! being misread. v0.37 was `RGSWAL08` / `RGSCHK07`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -139,7 +140,11 @@ const CHKPT_VERSION: u32 = 7;
 /// v0.37: `RGSWAL08` — CreateTable carries the table OID and its
 /// toast-table OID (reltoastrelid), AlterTable carries TOAST metadata.
 /// Old `RGSWAL07` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL08";
+/// v0.39: `RGSWAL09` — row versions carry their per-cell toast flags and
+/// the (value id, compressed) provenance for value ids introduced by the
+/// row, so TOAST metadata survives crash recovery via WAL replay (not
+/// just checkpoints). Old `RGSWAL08` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL09";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -226,11 +231,19 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// One row version for the WAL: stable id, creator xid, values.
 /// (xmax is always 0 at insert time; deletes are separate records.)
+///
+/// v0.39: `toast` carries the per-cell toast value ids, parallel to
+/// `values` (`RowVersion::toast`); `toast_meta` carries the
+/// (value id, compressed) provenance for value ids *introduced* by
+/// this row, so replay can rebuild `Table::toast_info`. Both are empty
+/// for rows that never touched TOAST.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalRow {
     pub id: u64,
     pub xmin: u64,
     pub values: Row,
+    pub toast: Vec<u32>,
+    pub toast_meta: Vec<(u32, u8)>,
 }
 
 /// One logical change to the committed database.
@@ -618,6 +631,27 @@ impl Enc {
         self.bytes(s.as_bytes());
     }
 
+    /// v0.39: encode one row version, including its per-cell toast flags
+    /// (parallel to the values) and the (value id, compressed) provenance
+    /// for value ids introduced by this row. Used by every record that
+    /// carries row versions (InsertRows, DeleteRows, UpdateRows).
+    fn wal_row(&mut self, r: &WalRow) {
+        self.u64(r.id);
+        self.u64(r.xmin);
+        self.u32(r.values.len() as u32);
+        for v in r.values.iter() {
+            self.value(v);
+        }
+        for i in 0..r.values.len() {
+            self.u32(r.toast.get(i).copied().unwrap_or(0));
+        }
+        self.u32(r.toast_meta.len() as u32);
+        for (k, c) in &r.toast_meta {
+            self.u32(*k);
+            self.u8(*c);
+        }
+    }
+
     fn col_type(&mut self, t: &ColType) {
         // Tags 0-3 are the v0.6 layout; new v0.7 types append after.
         self.u8(match t {
@@ -766,12 +800,7 @@ impl Enc {
                 self.str(table);
                 self.u32(rows.len() as u32);
                 for r in rows {
-                    self.u64(r.id);
-                    self.u64(r.xmin);
-                    self.u32(r.values.len() as u32);
-                    for v in r.values.iter() {
-                        self.value(v);
-                    }
+                    self.wal_row(r);
                 }
             }
             WalRecord::DropTable { name, xmax } => {
@@ -796,6 +825,16 @@ impl Enc {
                     for v in old.values.iter() {
                         self.value(v);
                     }
+                    // v0.39: per-cell toast flags, parallel to the values.
+                    for i in 0..old.values.len() {
+                        self.u32(old.toast.get(i).copied().unwrap_or(0));
+                    }
+                    // v0.39: (value id, compressed) provenance.
+                    self.u32(old.toast_meta.len() as u32);
+                    for (k, c) in &old.toast_meta {
+                        self.u32(*k);
+                        self.u8(*c);
+                    }
                 }
                 self.u64(*xmax);
             }
@@ -810,21 +849,11 @@ impl Enc {
                 self.str(table);
                 self.u32(old.len() as u32);
                 for r in old {
-                    self.u64(r.id);
-                    self.u64(r.xmin);
-                    self.u32(r.values.len() as u32);
-                    for v in r.values.iter() {
-                        self.value(v);
-                    }
+                    self.wal_row(r);
                 }
                 self.u32(new.len() as u32);
                 for r in new {
-                    self.u64(r.id);
-                    self.u64(r.xmin);
-                    self.u32(r.values.len() as u32);
-                    for v in r.values.iter() {
-                        self.value(v);
-                    }
+                    self.wal_row(r);
                 }
                 self.u64(*xmax);
             }
@@ -1243,10 +1272,24 @@ impl<'a> Dec<'a> {
         for _ in 0..nv {
             values.push(self.value()?);
         }
+        // v0.39: per-cell toast flags, parallel to the values.
+        let mut toast = Vec::with_capacity(nv);
+        for _ in 0..nv {
+            toast.push(self.u32()?);
+        }
+        // v0.39: (value id, compressed) provenance for value ids
+        // introduced by this row.
+        let nm = self.u32()? as usize;
+        let mut toast_meta = Vec::with_capacity(nm);
+        for _ in 0..nm {
+            toast_meta.push((self.u32()?, self.u8()?));
+        }
         Ok(WalRow {
             id,
             xmin,
             values: Row::new(values),
+            toast,
+            toast_meta,
         })
     }
 
@@ -1281,18 +1324,7 @@ impl<'a> Dec<'a> {
                 let n = self.u32()? as usize;
                 let mut rows = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let id = self.u64()?;
-                    let xmin = self.u64()?;
-                    let m = self.u32()? as usize;
-                    let mut values = Vec::with_capacity(m);
-                    for _ in 0..m {
-                        values.push(self.value()?);
-                    }
-                    rows.push(WalRow {
-                        id,
-                        xmin,
-                        values: Row::new(values),
-                    });
+                    rows.push(self.wal_row()?);
                 }
                 Ok(WalRecord::InsertRows { table, rows })
             }
@@ -1313,11 +1345,24 @@ impl<'a> Dec<'a> {
                     for _ in 0..nv {
                         values.push(self.value()?);
                     }
+                    // v0.39: per-cell toast flags, parallel to the values.
+                    let mut toast = Vec::with_capacity(nv);
+                    for _ in 0..nv {
+                        toast.push(self.u32()?);
+                    }
+                    // v0.39: (value id, compressed) provenance.
+                    let nm = self.u32()? as usize;
+                    let mut toast_meta = Vec::with_capacity(nm);
+                    for _ in 0..nm {
+                        toast_meta.push((self.u32()?, self.u8()?));
+                    }
                     ids.push(id);
                     old_rows.push(WalRow {
                         id,
                         xmin,
                         values: Row::new(values),
+                        toast,
+                        toast_meta,
                     });
                 }
                 let xmax = self.u64()?;
@@ -1885,7 +1930,25 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         );
                         continue;
                     }
-                    t.push_version(RowVersion::plain(row.id, row.values.clone(), row.xmin));
+                    // v0.39: restore the per-cell toast flags (they were
+                    // WAL-logged per row) and rebuild the table's
+                    // toast_info provenance from the record's metadata.
+                    let mut rv = RowVersion::plain(row.id, row.values.clone(), row.xmin);
+                    if row.toast.len() == row.values.len() {
+                        rv.toast = row.toast.clone();
+                    }
+                    for (vid, compressed) in &row.toast_meta {
+                        t.toast_info.insert(
+                            *vid,
+                            crate::storage::ToastInfo {
+                                compressed: *compressed != 0,
+                            },
+                        );
+                        if t.next_value_id <= *vid {
+                            t.next_value_id = vid + 1;
+                        }
+                    }
+                    t.push_version(rv);
                     out.push((row.id, row.values.clone()));
                 }
                 out
@@ -1956,7 +2019,23 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 }
             }
             for r in new {
-                t.push_version(RowVersion::plain(r.id, r.values.clone(), *xmax));
+                // v0.39: restore toast flags and metadata, like InsertRows.
+                let mut rv = RowVersion::plain(r.id, r.values.clone(), *xmax);
+                if r.toast.len() == r.values.len() {
+                    rv.toast = r.toast.clone();
+                }
+                for (vid, compressed) in &r.toast_meta {
+                    t.toast_info.insert(
+                        *vid,
+                        crate::storage::ToastInfo {
+                            compressed: *compressed != 0,
+                        },
+                    );
+                    if t.next_value_id <= *vid {
+                        t.next_value_id = vid + 1;
+                    }
+                }
+                t.push_version(rv);
             }
             // Index the new versions, like live execution's
             // index_insert_row: recovery rebuilds indexes only for the
@@ -2223,7 +2302,7 @@ pub fn records_for_commit(
                     i += 1;
                     continue;
                 }
-                let Some((values, table_live)) = own_row(eng, own, *row_id) else {
+                let Some((values, toast, table_live)) = own_row(eng, own, *row_id) else {
                     i += 1;
                     continue;
                 };
@@ -2246,10 +2325,15 @@ pub fn records_for_commit(
                         cname
                     ));
                 }
+                // v0.39: the row's toast flags and value-id provenance
+                // ride along so replay restores TOAST metadata.
+                let toast_meta = toast_meta_for(eng, table, &toast);
                 let row = WalRow {
                     id: *row_id,
                     xmin: own,
                     values,
+                    toast,
+                    toast_meta,
                 };
                 match out.last_mut() {
                     Some(WalRecord::InsertRows { table: t, rows }) if t == table => rows.push(row),
@@ -2291,11 +2375,15 @@ pub fn records_for_commit(
                 }
                 // v0.13: the old values travel with the delete so the
                 // logical decoder can report them without consulting
-                // live (possibly vacuumed) storage.
+                // live (possibly vacuumed) storage. v0.39: the old
+                // toast flags ride along too (no new provenance: the
+                // value ids were introduced by an earlier record).
                 let old = WalRow {
                     id: *row_id,
                     xmin: v.xmin,
                     values: v.values.clone(),
+                    toast: v.toast.clone(),
+                    toast_meta: Vec::new(),
                 };
                 match out.last_mut() {
                     Some(WalRecord::DeleteRows {
@@ -2341,7 +2429,7 @@ pub fn records_for_commit(
                         old_id, table
                     ));
                 }
-                let Some((new_values, table_live)) = own_row(eng, own, *new_id) else {
+                let Some((new_values, new_toast, table_live)) = own_row(eng, own, *new_id) else {
                     i += 1;
                     continue;
                 };
@@ -2349,15 +2437,23 @@ pub fn records_for_commit(
                     i += 1;
                     continue; // table dropped by a committed concurrent txn
                 }
+                // v0.39: old rows carry their toast flags (provenance was
+                // logged when the value ids were introduced); the new row
+                // carries its flags plus fresh provenance.
                 let old = WalRow {
                     id: *old_id,
                     xmin: v.xmin,
                     values: old_values.clone(),
+                    toast: v.toast.clone(),
+                    toast_meta: Vec::new(),
                 };
+                let new_toast_meta = toast_meta_for(eng, table, &new_toast);
                 let new = WalRow {
                     id: *new_id,
                     xmin: own,
                     values: new_values,
+                    toast: new_toast,
+                    toast_meta: new_toast_meta,
                 };
                 match out.last_mut() {
                     Some(WalRecord::UpdateRows {
@@ -2717,7 +2813,9 @@ pub fn records_for_commit(
 /// Our uncommitted row version, plus whether its table version is still
 /// live (not dropped by a committed concurrent transaction). `None` when
 /// the row is gone or no longer ours.
-fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, bool)> {
+/// v0.39: also returns the row version's per-cell toast flags, so the
+/// commit path can WAL-log them (and the value-id provenance).
+fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, Vec<u32>, bool)> {
     for versions in eng.db.tables.values() {
         for t in versions {
             if let Some(pos) = t.row_pos(row_id) {
@@ -2730,11 +2828,36 @@ fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, bool)> {
                 let dropped = t.dropped_xmax != 0
                     && t.dropped_xmax != own
                     && eng.xid_committed(t.dropped_xmax);
-                return Some((v.values.clone(), !dropped));
+                return Some((v.values.clone(), v.toast.clone(), !dropped));
             }
         }
     }
     None
+}
+
+/// v0.39: collect the (value id, compressed) provenance for the nonzero
+/// toast flags of one row, from the live table's `toast_info`. Returns an
+/// empty vec when the row carries no toasted cells.
+fn toast_meta_for(eng: &Engine, table: &str, flags: &[u32]) -> Vec<(u32, u8)> {
+    if flags.iter().all(|f| *f == 0) {
+        return Vec::new();
+    }
+    let Some(t) = eng.db.tables.get(table).and_then(|v| v.last()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u32, u8)> = Vec::new();
+    for &vid in flags {
+        if vid == 0 || out.iter().any(|(k, _)| *k == vid) {
+            continue;
+        }
+        let compressed = t
+            .toast_info
+            .get(&vid)
+            .map(|i| i.compressed)
+            .unwrap_or(false);
+        out.push((vid, u8::from(compressed)));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3637,11 +3760,15 @@ mod tests {
                         id: 7,
                         xmin: 4,
                         values: Row::new(vec![Value::Int(1), Value::Null]),
+                        toast: vec![0; 2],
+                        toast_meta: vec![],
                     },
                     WalRow {
                         id: 8,
                         xmin: 4,
                         values: Row::new(vec![Value::Int(2), Value::text("x")]),
+                        toast: vec![0; 2],
+                        toast_meta: vec![],
                     },
                 ],
             },
@@ -3657,16 +3784,22 @@ mod tests {
                         id: 7,
                         xmin: 3,
                         values: Row::new(vec![Value::Int(1)]),
+                        toast: vec![0; 1],
+                        toast_meta: vec![],
                     },
                     WalRow {
                         id: 8,
                         xmin: 4,
                         values: Row::new(vec![Value::Int(2)]),
+                        toast: vec![0; 1],
+                        toast_meta: vec![],
                     },
                     WalRow {
                         id: 9,
                         xmin: 4,
                         values: Row::new(vec![Value::Int(3)]),
+                        toast: vec![0; 1],
+                        toast_meta: vec![],
                     },
                 ],
                 xmax: 6,
@@ -3678,11 +3811,15 @@ mod tests {
                     id: 7,
                     xmin: 4,
                     values: Row::new(vec![Value::Int(1), Value::text("a")]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
                 new: vec![WalRow {
                     id: 10,
                     xmin: 6,
                     values: Row::new(vec![Value::Int(1), Value::text("b")]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
                 xmax: 6,
             },
@@ -3837,6 +3974,8 @@ mod tests {
                     id: 12,
                     xmin: 5,
                     values: Row::new(vec![Value::Int(1)]),
+                    toast: vec![0; 1],
+                    toast_meta: vec![],
                 }],
             },
         )
@@ -3850,6 +3989,8 @@ mod tests {
                     id: 12,
                     xmin: 5,
                     values: Row::new(vec![Value::Int(1)]),
+                    toast: vec![0; 1],
+                    toast_meta: vec![],
                 }],
                 xmax: 6,
             },
@@ -3877,6 +4018,8 @@ mod tests {
                     id: 1,
                     xmin: 2,
                     values: Row::new(vec![Value::Int(1)]),
+                    toast: vec![0; 1],
+                    toast_meta: vec![],
                 }],
                 xmax: 9,
             },

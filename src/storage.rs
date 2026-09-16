@@ -2450,6 +2450,16 @@ impl Sequence {
 }
 
 impl Database {
+    /// v0.39: find a table's name by its OID (any live version), for
+    /// resolving a main table's `toast_relid` to its toast table during
+    /// vacuum. Returns the first match; OIDs are unique across live
+    /// versions.
+    pub fn table_name_by_oid(&self, oid: u32) -> Option<String> {
+        self.tables
+            .iter()
+            .find_map(|(n, vs)| vs.iter().any(|v| v.oid == oid).then(|| n.clone()))
+    }
+
     pub fn new() -> Self {
         let mut db = Database {
             tables: HashMap::default(),
@@ -3197,13 +3207,14 @@ impl Engine {
         // Borrow the manager immutably for the dead-to-all test while the
         // table versions are borrowed mutably: the two are disjoint.
         let txns = &self.txns;
-        // Collect (id, values) of the dead versions first: index cleanup
-        // needs each version's key, hence its values.
-        let mut dead: Vec<(u64, Row)> = Vec::new();
+        // Collect (id, values, toast flags) of the dead versions first:
+        // index cleanup needs each version's key (hence its values), and
+        // the toast flags drive out-of-line chunk cleanup below.
+        let mut dead: Vec<(u64, Row, Vec<u32>)> = Vec::new();
         if let Some(versions) = self.db.tables.get_mut(name) {
             for t in versions {
                 for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
-                    dead.push((v.id, v.values.clone()));
+                    dead.push((v.id, v.values.clone(), v.toast.clone()));
                 }
                 let before = t.rows.len();
                 t.rows.retain(|v| !version_dead_to_all(txns, v));
@@ -3214,10 +3225,74 @@ impl Engine {
                 removed += gone;
             }
         }
-        for (id, values) in &dead {
+        for (id, values, _) in &dead {
             self.db.index_remove_row(name, *id, values);
         }
+        // v0.39: remove the dead versions' out-of-line toast chunks. A
+        // dead main-table version can no longer be seen by any snapshot,
+        // so its chunks are unreachable; leaving them would leak toast
+        // rows (and their index entries) forever. Like the rest of
+        // vacuum this is non-transactional surgery — but chunk rows are
+        // only ever read through the flags of a live main version, so
+        // removing a dead version's chunks cannot orphan live data.
+        self.vacuum_toast_chunks(name, &dead);
         removed
+    }
+
+    /// v0.39: remove toast-table chunk rows for the value ids referenced
+    /// by the given dead main-table versions' toast flags. No-op when the
+    /// table has no toast table or no dead version was toasted.
+    fn vacuum_toast_chunks(&mut self, name: &str, dead: &[(u64, Row, Vec<u32>)]) {
+        let vids: Vec<u32> = dead
+            .iter()
+            .flat_map(|(_, _, toast)| toast.iter().copied())
+            .filter(|v| *v != 0)
+            .collect();
+        if vids.is_empty() {
+            return;
+        }
+        // Resolve the toast table name from the main table's relid. The
+        // borrow ends before the mutable work below.
+        let toast_name: Option<String> = self
+            .db
+            .tables
+            .get(name)
+            .and_then(|versions| versions.last())
+            .and_then(|t| {
+                if t.toast_relid == 0 {
+                    None
+                } else {
+                    self.db.table_name_by_oid(t.toast_relid)
+                }
+            });
+        let Some(toast_name) = toast_name else {
+            return;
+        };
+        let Some(versions) = self.db.tables.get_mut(&toast_name) else {
+            return;
+        };
+        let mut gone: Vec<(u64, Row)> = Vec::new();
+        for t in versions {
+            t.rows.retain(|r| {
+                let chunked = match r.values.first() {
+                    Some(Value::Int(vid)) => vids.contains(&(*vid as u32)),
+                    _ => false,
+                };
+                if chunked {
+                    gone.push((r.id, r.values.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            if !gone.is_empty() {
+                t.rebuild_row_index();
+            }
+        }
+        // The tables borrow ends here; index cleanup needs `&mut self`.
+        for (id, values) in &gone {
+            self.db.index_remove_row(&toast_name, *id, values);
+        }
     }
 
     /// Vacuum every table. Returns (table, removed) per table touched.

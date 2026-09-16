@@ -1003,6 +1003,8 @@ mod tests {
                     id: 1,
                     xmin: 2,
                     values: Row::new(vec![Value::Int(1), Value::text("o'clock")]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
             },
             WalRecord::UpdateRows {
@@ -1011,11 +1013,15 @@ mod tests {
                     id: 1,
                     xmin: 2,
                     values: Row::new(vec![Value::Int(1), Value::text("a")]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
                 new: vec![WalRow {
                     id: 2,
                     xmin: 3,
                     values: Row::new(vec![Value::Int(1), Value::Null]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
                 xmax: 3,
             },
@@ -1026,6 +1032,8 @@ mod tests {
                     id: 2,
                     xmin: 3,
                     values: Row::new(vec![Value::Int(1), Value::Null]),
+                    toast: vec![0; 2],
+                    toast_meta: vec![],
                 }],
                 xmax: 4,
             },
@@ -1070,6 +1078,8 @@ mod tests {
                 id: 1,
                 xmin: 2,
                 values: Row::new(vec![Value::Int(7)]),
+                toast: vec![0; 1],
+                toast_meta: vec![],
             }],
         }];
         assert_eq!(

@@ -2063,6 +2063,76 @@ fn toast_new_row(
     Ok(())
 }
 
+/// v0.39: delete the out-of-line toast chunks for the given value ids.
+/// PostgreSQL's `heap_delete` calls `heap_toast_delete` immediately when
+/// the deleted tuple has external attributes (heapam.c); the chunk rows
+/// are staged as `WriteOp::DeleteRow` so the deletions are transactional
+/// (WAL-logged, restored on ROLLBACK by the DeleteRow undo). A no-op when
+/// the table has no toast table or none of the value ids is toasted.
+fn toast_delete_chunks(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+    vids: &[u32],
+) -> Result<(), ExecError> {
+    if vids.is_empty() {
+        return Ok(());
+    }
+    let toast_name = {
+        let t = match eng
+            .db
+            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+        {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        if t.toast_relid == 0 {
+            return Ok(());
+        }
+        match toast_table_name_by_oid(eng, t.toast_relid, ctx.snap, ctx.own) {
+            Some(n) => n,
+            None => return Ok(()),
+        }
+    };
+    // Collect the live chunk rows first; the mutation below needs the
+    // table mutably.
+    let chunk_rows: Vec<(u64, u64)> =
+        match eng
+            .db
+            .find_table(&toast_name, ctx.snap, ctx.own, ctx.session)
+        {
+            Some(tt) => tt
+                .rows
+                .iter()
+                .filter(|r| r.xmax == 0)
+                .filter_map(|r| match r.values.first() {
+                    Some(Value::Int(vid)) if vids.contains(&(*vid as u32)) => Some((r.id, r.xmax)),
+                    _ => None,
+                })
+                .collect(),
+            None => return Ok(()),
+        };
+    if chunk_rows.is_empty() {
+        return Ok(());
+    }
+    let tt = eng
+        .db
+        .find_table_mut(&toast_name, ctx.snap, ctx.own, ctx.session)
+        .expect("toast table still visible; engine lock held throughout");
+    for (cid, prev_xmax) in chunk_rows {
+        let Some(pos) = tt.row_pos(cid) else {
+            continue;
+        };
+        tt.rows[pos].xmax = ctx.own;
+        ctx.writes.push(WriteOp::DeleteRow {
+            table: toast_name.clone(),
+            row_id: cid,
+            prev_xmax,
+        });
+    }
+    Ok(())
+}
+
 fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -3032,7 +3102,7 @@ fn exec_delete(
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first for statement atomicity (WHERE type errors must not
     // leave half the rows deleted).
-    let plan: Vec<(u64, u64, Row)> = {
+    let plan: Vec<(u64, u64, Row, Vec<u32>)> = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
@@ -3056,14 +3126,14 @@ fn exec_delete(
                 src_ord: 0,
             })
             .collect();
-        let vis: Vec<(u64, u64, Row)> = t
+        let vis: Vec<(u64, u64, Row, Vec<u32>)> = t
             .rows
             .iter()
             .filter(|r| row_visible(r, ctx.snap, ctx.own))
-            .map(|r| (r.id, r.xmax, r.values.clone()))
+            .map(|r| (r.id, r.xmax, r.values.clone(), r.toast.clone()))
             .collect();
         let mut plan = Vec::new();
-        for (id, xmax, values) in &vis {
+        for (id, xmax, values, _toast) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
             let row_matches = match where_ {
                 None => true,
@@ -3086,7 +3156,7 @@ fn exec_delete(
                 // Only rows we actually delete conflict with FOR UPDATE
                 // locks — merely scanning a locked row is fine.
                 check_row_lock(eng, table, *id, ctx.own)?;
-                plan.push((*id, *xmax, values.clone()));
+                plan.push((*id, *xmax, values.clone(), _toast.clone()));
             }
         }
         // v0.9: parent-side FK actions for the deleted rows.
@@ -3094,7 +3164,7 @@ fn exec_delete(
         {
             let changed: Vec<(u64, Row, Option<Row>)> = plan
                 .iter()
-                .map(|(id, _, values)| (*id, values.clone(), None))
+                .map(|(id, _, values, _)| (*id, values.clone(), None))
                 .collect();
             plan_fk_cascade(
                 eng,
@@ -3116,12 +3186,18 @@ fn exec_delete(
     let n = plan.len();
     // v0.10: DELETE RETURNING evaluates against the OLD row values —
     // collect them before the plan is consumed by the apply loop.
-    let ret_vals: Vec<Row> = plan.iter().map(|(_, _, v)| v.clone()).collect();
+    let ret_vals: Vec<Row> = plan.iter().map(|(_, _, v, _)| v.clone()).collect();
+    // v0.39: the deleted versions' toast value ids, for chunk cleanup below.
+    let deleted_vids: Vec<u32> = plan
+        .iter()
+        .flat_map(|(_, _, _, toast)| toast.iter().copied())
+        .filter(|v| *v != 0)
+        .collect();
     let t = eng
         .db
         .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
         .expect("table still visible; engine lock held throughout");
-    for (id, prev_xmax, _) in plan {
+    for (id, prev_xmax, _, _) in plan {
         let pos = t
             .row_pos(id)
             .expect("row version still present; engine lock held throughout");
@@ -3132,6 +3208,11 @@ fn exec_delete(
             prev_xmax,
         });
     }
+    // v0.39: deleting a row version deletes its out-of-line toast chunks
+    // too (PG19 heap_delete calls heap_toast_delete immediately). Staged
+    // as WriteOps so the chunk deletions are transactional and WAL-logged;
+    // ROLLBACK restores them via the DeleteRow undo.
+    toast_delete_chunks(eng, ctx, table, &deleted_vids)?;
     // v0.10: RETURNING.
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
