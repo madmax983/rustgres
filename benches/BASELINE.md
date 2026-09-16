@@ -2,6 +2,106 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compress_pglz` reallocates its 64K-entry match table every call — baseline — 2026-09-16
+
+**Workload**: `benches/profile_toast.py` (new) — a fixed-iteration-count
+driver, same rationale as `profile_insert.py`/`profile_join.py`/
+`profile_scan.py`: two profiling runs must do identical work for a
+before/after counter comparison to mean anything. This driver sends an
+exact COUNT of single-row `INSERT`s of a wide `TEXT` column (a
+document/log-line/JSON-blob shape — one write, one wide column, prose
+with real word/sentence redundancy, not a repeated single byte) over the
+real wire protocol, against a fresh table:
+
+```sql
+CREATE TABLE bench_toast(id INT, body TEXT)
+INSERT INTO bench_toast VALUES (0, '<~4096-byte prose body>')
+-- repeated, one row per statement
+```
+
+No prior Bolt round in this file has profiled the TOAST path (`src/
+toast.rs`, added in v0.37) — every previous round targeted the
+tokenizer/parser, row send/project, or join/order-by comparisons. A
+single-row `INSERT` of a document-sized `TEXT` value is a realistic
+shape (CMS article body, log line, serialized JSON) that pushes the row
+past `TOAST_TUPLE_THRESHOLD` (2037 bytes) and so drives the PGLZ
+compressor that plans/writes wide rows; `TEXT` columns default to
+`EXTENDED` storage, so no schema tuning is needed to trigger it.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_toast.py --count 300 --body-bytes 4096 --timeout 600
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`.
+```
+
+**Profile** (DHAT, `valgrind --tool=dhat`, this commit — `toast.rs`
+unchanged): 231,494,505 total bytes allocated, 25,123 total allocation
+blocks, over 300 iterations of the single-row ~4096-byte `TEXT` `INSERT`
+workload. Top allocation sites by bytes:
+
+| site | blocks | % of bytes | bytes |
+|---|---|---|---|
+| `toast::compress_pglz` (toast.rs:59, `vec![usize::MAX; 1 << 16]` match table) | 300 | **67.94%** | 157,286,400 |
+| `sql::tokenize`'s per-statement `Token` buffer (`Vec::with_capacity`) | 302 | 17.29% | 40,034,784 |
+| `sql::tokenize`'s char collection (`chars().collect()`) | 906 | 3.79% | 8,764,364 |
+| `sql::tokenize` (sql.rs:301) | 302 | 2.16% | 5,003,140 |
+| `sql::tokenize` (sql.rs:531, `String` growth) | 3,300 | 2.12% | 4,912,800 |
+| `wal::Enc::u32` (WAL record encoding) | 903 | 1.63% | 3,782,954 |
+
+**Target**: `toast::compress_pglz`'s match-table allocation
+(`src/toast.rs:59` pre-fix) — **67.94%** of all bytes allocated in this
+workload, far above the 5%-of-profile relevance bar, and the single
+largest allocation site by a wide margin (nearly 4x the second-place
+site).
+
+**Mechanism**: `compress_pglz` opens with
+`let mut tab = vec![usize::MAX; 1 << 16];` — a fresh 65,536-entry
+(524,288-byte) `usize` hash table, allocated and filled from scratch on
+*every call*, even though the table's only job is to index 3-byte
+sequences within the current input and get thrown away at the end of
+the function. Every TOAST-eligible column on every wide-row `INSERT`
+(or `UPDATE`) pays this 512 KiB allocate-and-fill again. Reusing one
+scratch buffer across calls on the same connection thread — clearing it
+in full before each use, so the compressor sees the exact same "empty
+table" state it does today — turns N allocations into (at most) one per
+connection.
+
+**Baseline numbers** (this commit, `compress_pglz` unchanged):
+
+| counter | value |
+|---|---|
+| DHAT total bytes (300 x single-row ~4096-byte TEXT INSERT) | 231,494,505 |
+| DHAT total blocks | 25,123 |
+| Bytes in the `compress_pglz` match-table site | 157,286,400 (67.94%) |
+| Blocks in the `compress_pglz` match-table site | 300 |
+
+For context, not as the gating counter: Callgrind `Ir` (total
+instructions, same query shape, 60 iterations to keep the run tractable
+under valgrind) is 591,758,634. This was found via a byte-share DHAT
+profile, so the DHAT allocation-bytes floor is the primary gate; see the
+fix entry below for the instruction-count delta this fix also produced.
+
+**Fix**: reuse a `thread_local!` `RefCell<Vec<usize>>` scratch table
+across calls instead of allocating a fresh one every time, clearing it
+(`fill(usize::MAX)`) at the top of every call so behavior is identical
+to today — the compressor still starts from an all-empty table on every
+call, it just doesn't `malloc`/`free` that table's backing memory every
+time.
+
+**Reproduce** (before this fix, on this commit):
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_toast.py --count 300 --body-bytes 4096 --timeout 600
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`.
+```
+
 ## Bolt: `exec_insert`'s per-row `WriteOp` log grows unsized — fix — 2026-09-15
 
 Fixes the target identified in the baseline entry immediately below this
