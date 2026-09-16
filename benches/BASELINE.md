@@ -2,6 +2,83 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compress_pglz` reallocates its 64K-entry match table every call — fix — 2026-09-16
+
+Fixes the target identified in the baseline entry immediately below this
+one. `src/toast.rs`'s `compress_pglz` no longer opens with
+`let mut tab = vec![usize::MAX; 1 << 16];`; instead a
+`thread_local! { static HASH_TAB: RefCell<Vec<usize>> = ...; }` holds
+one 65,536-entry table per connection thread, and `compress_pglz`
+borrows it, `fill(usize::MAX)`s it (the same all-empty starting state
+the fresh `vec!` gave it before), and hands it to the unchanged
+compression loop (moved into a new private `compress_pglz_with` taking
+`tab: &mut [usize]`). No line of the actual LZ77 logic changes — same
+hashing, same matching, same output bytes for the same input.
+
+**After numbers** (same harness, same workload —
+`benches/profile_toast.py --count 300 --body-bytes 4096`, same machine,
+this session; both DHAT runs below are exact repeats, byte-for-byte
+identical to each other):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| DHAT total bytes (300 x single-row ~4096-byte TEXT INSERT) | 231,494,505 | 74,732,729 | **-67.72%** |
+| DHAT total blocks | 25,123 | 24,826 | -1.18% |
+| Bytes in the `compress_pglz` match-table site | 157,286,400 (67.94% of total) | 524,288 (0.70% of total) | **-99.67%** |
+| Blocks in the `compress_pglz` match-table site | 300 | 1 | **-99.67%** |
+
+Far above the ≥10%-reduction-in-allocation-bytes impact floor, on both
+the whole-workload total and the target site specifically. The post-fix
+match-table site is a single 512 KiB allocation for the entire
+300-iteration run (the `thread_local`'s one-time initialization on the
+harness's single connection) instead of 300 of them.
+
+Reproduced twice post-fix: 74,732,729 bytes / 24,826 blocks both times,
+byte-identical (DHAT is fully deterministic for this single-connection,
+single-threaded workload).
+
+For context, not required to clear the floor (the gate was already met
+on DHAT bytes above): Callgrind `Ir` (total instructions, same query
+shape, 60 iterations) moved from 591,758,634 to 483,444,909
+(**-18.30%**), reproduced to within 2,130 instructions (0.0004%) on a
+second run — the usual tiny Callgrind jitter, not signal. This is a
+larger instruction win than the earlier `exec_insert` WriteOp fix saw,
+because a 512 KiB allocation crosses glibc's `mmap` threshold: each
+pre-fix call's `malloc`/`free` pair for the match table did a real
+`mmap`/`munmap` round trip, not just heap bookkeeping, and the
+`thread_local` reuse removes 299 of those 300 round trips.
+
+**Correctness**: 128 of 129 `cargo test --all-features` unit tests
+pass, unchanged from the pristine tree — the one failure
+(`exec::tests::v17_datetime_functions`) is pre-existing and
+change-independent (reproduces identically via `git stash`; a `to_char`
+`"YYYY"`-format assertion unrelated to TOAST/compression), same failure
+noted in the `exec_insert` fix entry below. All 5
+`toast::tests::pglz_*` unit tests pass unchanged, including the two
+roundtrip tests (`pglz_roundtrip_repetitive`, `pglz_roundtrip_random_no_win`)
+that exercise `compress_pglz` + `decompress_pglz` together — output
+bytes are unaffected by the buffer-reuse change, as expected since the
+table's contents at the start of compression are identical either way.
+`cargo fmt --all -- --check` is clean. `cargo clippy --all-targets
+--all-features -- -D warnings` fails to compile with the same 282
+pre-existing errors (the `collapsible_if`/toolchain-mismatch issue noted
+in earlier entries in this file) on both the pre-change and post-change
+tree, confirmed via `git stash`; no new clippy findings.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_toast.py --count 300 --body-bytes 4096 --timeout 600
+# SIGTERM the server to flush, then sum tbk/tb over /tmp/dhat.out's `pps`.
+```
+
+Compare against the baseline commit (`src/toast.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
 ## Bolt: `compress_pglz` reallocates its 64K-entry match table every call — baseline — 2026-09-16
 
 **Workload**: `benches/profile_toast.py` (new) — a fixed-iteration-count
