@@ -280,6 +280,20 @@ def split_statements(text):
                 i = n if j == -1 else j + 1
                 line_start = True
                 continue
+            if c == "\\" and re.match(r"\\gset\b", text[i:]):
+                # v0.38: trailing \gset [prefix] executes the pending
+                # statement (psql query-buffer suffix). Terminate the
+                # statement here like ';', keeping the marker (with any
+                # prefix) attached for run_test to honor.
+                m = re.match(r"\\gset[^\n]*", text[i:])
+                # buf already ends with the pre-\gset whitespace, so keep
+                # the marker tight: the echo lookup needs byte-exact text.
+                buf.append(m.group(0).strip())
+                j = text.find("\n", i)
+                i = n if j == -1 else j + 1
+                flush()
+                line_start = True
+                continue
             if c == "-" and nxt == "-":
                 state = "linecomment"
                 i += 2
@@ -414,8 +428,20 @@ def resolve_physical_rows(physical, count, cells, ncols):
     # More physical lines than the count: possibly embedded newlines.
     # Only disambiguable for a single-column single-row value: the value
     # is the newline-joined stripped physical lines (e.g. wrapped base64).
+    # v0.38: psql marks an embedded-newline continuation with a trailing
+    # '+' (its nl_right marker, see print.c pg_asciiformat) and pads the
+    # segment to the column width. Strip one marker per non-final line;
+    # a value segment that itself ends in '+' still survives because the
+    # marker is an ADDITIONAL '+'.
     if ncols == 1 and count == 1 and n_phys > 1:
-        return [["\n".join(cells(ln)[0] for ln in physical)]]
+        parts = []
+        for ln in physical[:-1]:
+            cell = cells(ln)[0]
+            if cell.endswith("+"):
+                cell = cell[:-1].rstrip()
+            parts.append(cell)
+        parts.append(cells(physical[-1])[0])
+        return [["\n".join(parts)]]
     # Otherwise fall back to separator-skipping (may still mismatch).
     return [cells(ln) for ln in nonblank]
 
@@ -817,9 +843,12 @@ def compare(stmt, expected, actual, null_display):
                 "column count: expected %d got %d"
                 % (len(expected.colnames), len(oids)),
             )
-        # column names (stripped) must match
+        # column names (stripped) must match. v0.38: the expected side is
+        # stripped by the aligned-format parser, so strip the wire side
+        # too — psql's padding makes trailing spaces in an alias
+        # unrepresentable in the .out header.
         for ec, ac in zip(expected.colnames, actual["colnames"]):
-            if ec != ac:
+            if ec != ac.strip():
                 reason = classify_expected_fail(stmt)
                 if reason:
                     return Verdict("EXPECTED-FAIL", reason)
@@ -909,6 +938,10 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
     null_display = ""
     pos = 0
     failed_objects = set()  # tables whose CREATE failed (cascade guard)
+    # v0.38: psql variables set by \gset (name -> text value). psql
+    # interpolates :name in later statements; unknown :names are left
+    # untouched so a literal colon never silently vanishes.
+    psql_vars = {}
     if skip_stmts is None:
         skip_stmts = {}
 
@@ -965,12 +998,40 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
             results.append((stmt, Verdict("EXPECTED-FAIL", slow_reason)))
             continue
 
+        # v0.38: psql variable interpolation (see \gset below). A colon
+        # preceded by another colon is a cast (`::`), not a variable.
+        exec_stmt = re.sub(
+            r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)",
+            lambda m: psql_vars.get(m.group(1), m.group(0)),
+            stmt,
+        )
+        # v0.38: trailing \gset [prefix] — run the query, store the first
+        # row's columns as psql variables (like psql). The expected file
+        # shows no output block for \gset, which parse_expected_block
+        # already models as noresult.
+        gset = None
+        m = re.search(r"\\gset(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;?\s*$", exec_stmt)
+        if m:
+            gset = m.group(1) or ""
+            exec_stmt = exec_stmt[: m.start()].rstrip()
+            if not exec_stmt.endswith(";"):
+                exec_stmt += ";"
+
         try:
-            actual = conn.q(stmt)
+            actual = conn.q(exec_stmt)
         except socket.timeout as e:
             raise ServerWedged(stmt, "ran past %ds timeout" % STMT_TIMEOUT)
         except (WireError, OSError) as e:
             raise ServerWedged(stmt, "connection died during execution: %r" % e)
+
+        if gset is not None and not actual["err_codes"] and actual["rows"]:
+            # psql \gset: first row only; NULL unsets the variable.
+            for cname, cval in zip(actual["colnames"], actual["rows"][0]):
+                vname = gset + cname
+                if cval is None:
+                    psql_vars.pop(vname, None)
+                else:
+                    psql_vars[vname] = cval
 
         if casc and (actual["err_codes"] or expected.kind == "error"):
             results.append(

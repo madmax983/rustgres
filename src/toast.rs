@@ -23,6 +23,15 @@
 
 use crate::storage::{Table, ToastInfo, Value, toast_consts, toast_storage};
 
+/// PG's `TOAST_POINTER_SIZE` (`detoast.h`): `VARHDRSZ_EXTERNAL` (4) +
+/// `sizeof(varatt_external)` (16) — the on-disk footprint of a toasted
+/// value's pointer datum once it moves out-of-line.
+const TOAST_POINTER_SIZE: usize = 20;
+/// `MAXALIGN(TOAST_POINTER_SIZE)`: PG's
+/// `toast_tuple_find_biggest_attribute` only considers columns larger
+/// than this worth moving or compressing.
+const MAXALIGN_TOAST_POINTER: usize = 24;
+
 // ---------------------------------------------------------------------------
 // PGLZ-inspired LZ77 compressor
 // ---------------------------------------------------------------------------
@@ -215,17 +224,38 @@ fn toastable_bytes(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-/// Decide the storage plan for every cell of a row, following PG's
-/// `toast_insert_or_update` order:
-/// 1. try to compress EXTENDED columns;
-/// 2. move the biggest EXTENDED/EXTERNAL values out-of-line until the
-///    row fits `target` (or nothing toastable remains);
-/// 3. try to compress MAIN columns;
-/// 4. move MAIN values out-of-line as a last resort (bigger target).
+/// Decide the storage plan for every cell of a row, following PG19's
+/// `heap_toast_insert_or_update` (`toast_helper.c`, REL_19_STABLE):
+/// 1. biggest-first over EXTENDED/EXTERNAL columns: try compression on
+///    EXTENDED (mark EXTERNAL incompressible); externalize the column
+///    immediately when it alone still exceeds the target;
+/// 2. externalize the biggest EXTENDED/EXTERNAL column until the row
+///    fits `target` (or nothing movable remains);
+/// 3. biggest-first compression over MAIN columns;
+/// 4. as a last resort, externalize MAIN columns against the bigger
+///    `TOAST_TUPLE_TARGET_MAIN`.
+///
+/// Fit accounting mirrors PG: the limit is `target - hoff` where `hoff`
+/// is the tuple header (23 bytes plus a null bitmap when any column is
+/// NULL, 8-byte aligned); an externalized column counts
+/// `TOAST_POINTER_SIZE` (20) bytes, not zero; and a column is only
+/// worth moving when it exceeds `MAXALIGN(TOAST_POINTER_SIZE)` (24).
+/// Compression is only kept on a savings of more than 2 bytes (PG's
+/// `toast_compress_datum` rule).
 ///
 /// `compress_ok` mirrors `default_toast_compression`: when false,
 /// compression is skipped entirely (PG still externalizes).
 /// Returns the per-column plan and the value ids to allocate.
+///
+/// Honest deviation: PG measures the whole tuple (all columns plus
+/// header/alignment); here only toastable payloads are summed, so rows
+/// mixing wide fixed-width columns with varlenas may toast slightly
+/// earlier or later than PG.
+///
+/// v0.38: rounds 1-4 restructured to PG's per-iteration biggest-first
+/// order (was: compress-all then externalize-biggest), externalized
+/// columns now count the 20-byte toast pointer (was: zero), and the
+/// limit is `target - hoff` (was: `target`).
 pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<ToastPlan> {
     let n = values.len();
     let mut plan = vec![ToastPlan::Plain; n];
@@ -249,110 +279,236 @@ pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<Toa
     if width <= toast_consts::TOAST_TUPLE_THRESHOLD as usize {
         return plan;
     }
-    let target = table.toast_target as usize;
+    // PG's tuple header: SizeofHeapTupleHeader (23) plus a null bitmap
+    // when any column is NULL, 8-byte aligned.
+    let has_null = values.iter().any(|v| matches!(v, Value::Null));
+    let hoff = if has_null {
+        (23 + (n + 7) / 8 + 7) & !7
+    } else {
+        (23 + 7) & !7
+    };
+    let target = (table.toast_target as usize).saturating_sub(hoff);
+    let main_target = (toast_consts::TOAST_TUPLE_TARGET_MAIN as usize).saturating_sub(hoff);
 
-    // Sizes as currently planned (compressed sizes once compressed).
+    // Sizes as currently planned (compressed sizes once compressed,
+    // TOAST_POINTER_SIZE once externalized).
     let mut sizes: Vec<usize> = (0..n).map(|i| toastable_size(&values[i])).collect();
     // Compressed payloads, filled in by the compression rounds.
     let mut compressed: Vec<Option<Vec<u8>>> = vec![None; n];
+    // Columns proven incompressible (PG's TOASTCOL_INCOMPRESSIBLE):
+    // skipped by later compression passes, still movable out-of-line.
+    let mut incompressible = vec![false; n];
 
-    // Round 1: compress EXTENDED columns.
-    if compress_ok {
-        for &i in &eligible {
-            if table.col_storage[i] != toast_storage::EXTENDED {
-                continue;
-            }
-            if let Some(raw) = toastable_bytes(&values[i]) {
-                if let Some(c) = compress_pglz(&raw) {
-                    sizes[i] = c.len();
-                    compressed[i] = Some(c);
-                    plan[i] = ToastPlan::Compressed;
-                }
-            }
-        }
-    }
-
-    // Round 2: externalize biggest EXTENDED/EXTERNAL until under target.
-    // PG picks the largest eligible attribute each iteration.
-    loop {
-        let cur: usize = eligible
+    // Current row width: externalized columns count the toast pointer.
+    let cur_width = |plan: &[ToastPlan], sizes: &[usize]| -> usize {
+        eligible
             .iter()
-            .filter(|&&i| !matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal))
-            .map(|&i| sizes[i])
-            .sum();
-        if cur <= target {
+            .map(|&i| {
+                if matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal) {
+                    TOAST_POINTER_SIZE
+                } else {
+                    sizes[i]
+                }
+            })
+            .sum()
+    };
+
+    // Round 1 (PG's first loop): biggest-first over EXTENDED/EXTERNAL;
+    // compress EXTENDED (mark EXTERNAL incompressible); a column that
+    // alone still exceeds the target moves out-of-line immediately.
+    loop {
+        if cur_width(&plan, &sizes) <= target {
             break;
         }
-        let mut best: Option<usize> = None;
-        for &i in &eligible {
-            if !matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal)
-                && matches!(
-                    table.col_storage[i],
-                    toast_storage::EXTENDED | toast_storage::EXTERNAL
-                )
-            {
-                if best.map_or(true, |b| sizes[i] > sizes[b]) {
-                    best = Some(i);
-                }
-            }
-        }
-        let Some(b) = best else { break };
-        plan[b] = if compressed[b].is_some() {
-            ToastPlan::CompressedExternal
-        } else {
-            ToastPlan::External
+        let Some(b) = biggest_attr(
+            table,
+            &eligible,
+            &plan,
+            &sizes,
+            &compressed,
+            &incompressible,
+            true,
+            false,
+        ) else {
+            break;
         };
-    }
-
-    // Round 3: compress MAIN columns.
-    if compress_ok {
-        for &i in &eligible {
-            if table.col_storage[i] != toast_storage::MAIN {
-                continue;
-            }
-            if plan[i] != ToastPlan::Plain {
-                continue;
-            }
-            if let Some(raw) = toastable_bytes(&values[i]) {
-                if let Some(c) = compress_pglz(&raw) {
-                    sizes[i] = c.len();
-                    compressed[i] = Some(c);
-                    plan[i] = ToastPlan::Compressed;
-                }
-            }
+        if table.col_storage[b] == toast_storage::EXTENDED {
+            try_compress_attr(
+                b,
+                values,
+                compress_ok,
+                &mut plan,
+                &mut sizes,
+                &mut compressed,
+                &mut incompressible,
+            );
+        } else {
+            incompressible[b] = true;
+        }
+        if sizes[b] > target {
+            externalize_attr(b, &mut plan, &compressed);
         }
     }
 
-    // Round 4: externalize MAIN as a last resort (bigger target).
-    let main_target = toast_consts::TOAST_TUPLE_TARGET_MAIN as usize;
+    // Round 2 (PG's second loop): externalize the biggest
+    // EXTENDED/EXTERNAL column until the row fits.
     loop {
-        let cur: usize = eligible
-            .iter()
-            .filter(|&&i| !matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal))
-            .map(|&i| sizes[i])
-            .sum();
-        if cur <= main_target {
+        if cur_width(&plan, &sizes) <= target {
             break;
         }
-        let mut best: Option<usize> = None;
-        for &i in &eligible {
-            if !matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal)
-                && table.col_storage[i] == toast_storage::MAIN
-            {
-                if best.map_or(true, |b| sizes[i] > sizes[b]) {
-                    best = Some(i);
-                }
-            }
-        }
-        let Some(b) = best else { break };
-        plan[b] = if compressed[b].is_some() {
-            ToastPlan::CompressedExternal
-        } else {
-            ToastPlan::External
+        let Some(b) = biggest_attr(
+            table,
+            &eligible,
+            &plan,
+            &sizes,
+            &compressed,
+            &incompressible,
+            false,
+            false,
+        ) else {
+            break;
         };
+        externalize_attr(b, &mut plan, &compressed);
+    }
+
+    // Round 3 (PG's third loop): biggest-first compression over MAIN.
+    loop {
+        if cur_width(&plan, &sizes) <= target {
+            break;
+        }
+        let Some(b) = biggest_attr(
+            table,
+            &eligible,
+            &plan,
+            &sizes,
+            &compressed,
+            &incompressible,
+            true,
+            true,
+        ) else {
+            break;
+        };
+        try_compress_attr(
+            b,
+            values,
+            compress_ok,
+            &mut plan,
+            &mut sizes,
+            &mut compressed,
+            &mut incompressible,
+        );
+    }
+
+    // Round 4 (PG's fourth loop): externalize MAIN as a last resort
+    // against the bigger MAIN target.
+    loop {
+        if cur_width(&plan, &sizes) <= main_target {
+            break;
+        }
+        let Some(b) = biggest_attr(
+            table,
+            &eligible,
+            &plan,
+            &sizes,
+            &compressed,
+            &incompressible,
+            false,
+            true,
+        ) else {
+            break;
+        };
+        externalize_attr(b, &mut plan, &compressed);
     }
 
     plan
+}
+
+/// PG's `toast_tuple_find_biggest_attribute`: index of the largest
+/// eligible column bigger than `MAXALIGN(TOAST_POINTER_SIZE)`; for
+/// compression passes also skips incompressible and already-compressed
+/// columns. `main_only` selects MAIN columns (rounds 3-4) instead of
+/// EXTENDED/EXTERNAL (rounds 1-2).
+#[allow(clippy::too_many_arguments)]
+fn biggest_attr(
+    table: &Table,
+    eligible: &[usize],
+    plan: &[ToastPlan],
+    sizes: &[usize],
+    compressed: &[Option<Vec<u8>>],
+    incompressible: &[bool],
+    for_compression: bool,
+    main_only: bool,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for &i in eligible {
+        if matches!(plan[i], ToastPlan::External | ToastPlan::CompressedExternal) {
+            continue;
+        }
+        let storage = table.col_storage[i];
+        if main_only {
+            if storage != toast_storage::MAIN {
+                continue;
+            }
+        } else if !matches!(storage, toast_storage::EXTENDED | toast_storage::EXTERNAL) {
+            continue;
+        }
+        if for_compression && (incompressible[i] || compressed[i].is_some()) {
+            continue;
+        }
+        if sizes[i] <= MAXALIGN_TOAST_POINTER {
+            continue;
+        }
+        if best.map_or(true, |b| sizes[i] > sizes[b]) {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// Try PG-style compression on one column: on success the plan and size
+/// update, on failure the column is marked incompressible. PG only
+/// keeps the compressed form on a savings of more than 2 bytes
+/// (`toast_compress_datum`).
+#[allow(clippy::too_many_arguments)]
+fn try_compress_attr(
+    i: usize,
+    values: &[Value],
+    compress_ok: bool,
+    plan: &mut [ToastPlan],
+    sizes: &mut [usize],
+    compressed: &mut [Option<Vec<u8>>],
+    incompressible: &mut [bool],
+) {
+    if !compress_ok {
+        incompressible[i] = true;
+        return;
+    }
+    let raw = match toastable_bytes(&values[i]) {
+        Some(raw) => raw,
+        None => {
+            incompressible[i] = true;
+            return;
+        }
+    };
+    match compress_pglz(&raw) {
+        Some(c) if c.len() + 2 < raw.len() => {
+            sizes[i] = c.len();
+            compressed[i] = Some(c);
+            plan[i] = ToastPlan::Compressed;
+        }
+        _ => {
+            incompressible[i] = true;
+        }
+    }
+}
+
+/// Move one column out-of-line (PG's `toast_tuple_externalize`).
+fn externalize_attr(i: usize, plan: &mut [ToastPlan], compressed: &[Option<Vec<u8>>]) {
+    plan[i] = if compressed[i].is_some() {
+        ToastPlan::CompressedExternal
+    } else {
+        ToastPlan::External
+    };
 }
 
 /// Split bytes into toast-table chunks (`TOAST_MAX_CHUNK_SIZE` each).

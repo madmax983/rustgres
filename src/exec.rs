@@ -9885,6 +9885,16 @@ fn eval_grouped(
             let vb = eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, right,
             )?;
+            // v0.38: regclass/oid binary coercion (below). The grouped
+            // scope chain is outer scopes plus the grouping scope.
+            let gsc = Scope {
+                schema: gscope.schema,
+                row: gscope.row,
+                prov: gscope.prov,
+            };
+            let mut chained: Vec<Scope> = outer.to_vec();
+            chained.push(gsc);
+            let (va, vb) = coerce_regclass_cmp(q, &chained, left, right, va, vb)?;
             eval_cmp_vals(*op, &va, &vb)
         }
         Expr::And(a, b) => {
@@ -10438,6 +10448,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         Expr::Cmp { op, left, right } => {
             let va = eval_expr(q, scopes, left)?;
             let vb = eval_expr(q, scopes, right)?;
+            // v0.38: regclass/oid binary coercion (below).
+            let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
             eval_cmp_vals(*op, &va, &vb)
         }
         Expr::And(a, b) => {
@@ -10666,6 +10678,100 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
                 b.type_name()
             ),
         )),
+    }
+}
+
+/// v0.38: is this expression statically typed `regclass`? A
+/// `::regclass` cast, or a regclass-typed column (e.g. flowing through
+/// a view or CTE). PG treats regclass as binary-coercible to oid, so a
+/// comparison against an integer compares OIDs, not display text.
+fn expr_is_regclass(scopes: &[Scope], e: &Expr) -> bool {
+    match e {
+        Expr::Cast { to, .. } => *to == ColType::Regclass,
+        Expr::Column { table, name } => resolve_col(scopes, table.as_deref(), name)
+            .map(|(si, ci)| scopes[si].schema[ci].ty == ColType::Regclass)
+            .unwrap_or(false),
+        Expr::ResolvedCol { frame, idx } => scopes
+            .get(*frame)
+            .and_then(|s| s.schema.get(*idx))
+            .map(|c| c.ty == ColType::Regclass)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// v0.38: resolve a regclass-typed value to its OID. `Value::Text` here
+/// is the display form (`regclass_display`): `"-"` is OID 0, an
+/// all-digit string is the OID itself, anything else must name a
+/// visible relation (42P01, like the cast).
+fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError> {
+    match v {
+        Value::SmallInt(i) => Ok(*i as u32),
+        Value::Int(i) | Value::BigInt(i) => Ok(*i as u32),
+        Value::Text(s) => {
+            if s.as_ref() == "-" {
+                Ok(0)
+            } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                Ok(s.parse::<u32>().unwrap_or(0))
+            } else {
+                let t = q
+                    .eng
+                    .db
+                    .find_table(s, q.snap, q.own, q.session)
+                    .ok_or_else(|| {
+                        exec_err("42P01", format!("relation \"{}\" does not exist", s))
+                    })?;
+                Ok(t.oid)
+            }
+        }
+        _ => Err(exec_err(
+            "42846",
+            format!(
+                "cannot resolve regclass value of type {} to an OID",
+                v.type_name()
+            ),
+        )),
+    }
+}
+
+/// v0.38: PG's binary-coercible regclass/oid comparison. When one side
+/// of a comparison is statically typed regclass and the other side is
+/// integer-typed (or both sides are regclass), resolve the regclass
+/// display text back to its OID and compare as integers — PG19 applies
+/// `oideq` directly. Any other type combination keeps the existing
+/// value-level coercion, so `intcol = 'sometext'` still raises 22P02
+/// instead of resolving the text as a relation name.
+fn coerce_regclass_cmp(
+    q: &mut Q,
+    scopes: &[Scope],
+    left: &Expr,
+    right: &Expr,
+    va: Value,
+    vb: Value,
+) -> Result<(Value, Value), ExecError> {
+    if matches!(va, Value::Null) || matches!(vb, Value::Null) {
+        return Ok((va, vb));
+    }
+    fn is_int(v: &Value) -> bool {
+        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+    }
+    let l_rc = expr_is_regclass(scopes, left);
+    let r_rc = expr_is_regclass(scopes, right);
+    match (l_rc, r_rc, is_int(&va), is_int(&vb)) {
+        (true, _, _, true) => {
+            let oid = regclass_value_oid(q, &va)?;
+            Ok((Value::Int(oid as i64), vb))
+        }
+        (_, true, true, _) => {
+            let oid = regclass_value_oid(q, &vb)?;
+            Ok((va, Value::Int(oid as i64)))
+        }
+        (true, true, _, _) => {
+            let a = regclass_value_oid(q, &va)?;
+            let b = regclass_value_oid(q, &vb)?;
+            Ok((Value::Int(a as i64), Value::Int(b as i64)))
+        }
+        _ => Ok((va, vb)),
     }
 }
 
@@ -15396,7 +15502,10 @@ fn expand_replacement(repl: &str, s: &[char], caps: &crate::regex::Captures) -> 
                 }
                 i += 1;
             }
-            b'0'..=b'9' => {
+            b'1'..=b'9' => {
+                // v0.38: PG19 only treats \1..\9 as back-references
+                // (varlena.c: `*p >= '1' && *p <= '9'`); \0 is an unknown
+                // escape and keeps its backslash.
                 let g = (b[i] - b'0') as usize;
                 if let Some(Some((gs, ge))) = caps.groups.get(g) {
                     out.extend(s[*gs..*ge].iter());
