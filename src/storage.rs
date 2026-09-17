@@ -4016,7 +4016,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             name,
             prev,
             renamed_to,
-            ..
+            rewrite_rows,
         } => {
             // Remove our altered version (under the new name if renamed),
             // then restore the previous table under its original name.
@@ -4032,6 +4032,29 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .entry(name.clone())
                 .or_default()
                 .push(prev.clone());
+            // v0.42: a row-rewriting ALTER (ADD/DROP COLUMN) mints fresh
+            // row ids and migrates index entries at exec time, so rolling
+            // back must restore the old id->key mapping or index scans
+            // would miss the restored rows. Rebuild every live index on
+            // the table from the restored version's rows. Undo runs in
+            // reverse, so indexes created after the ALTER are already
+            // gone and dropped ones already restored — the defs present
+            // match the restored column positions.
+            if *rewrite_rows {
+                let rows: Vec<(Row, u64)> =
+                    prev.rows.iter().map(|r| (r.values.clone(), r.id)).collect();
+                for ix in eng.db.indexes.values_mut() {
+                    let ours = ix.def.table == *name
+                        || renamed_to.as_deref().is_some_and(|rt| ix.def.table == rt);
+                    if ours && ix.def.dropped_xmax == 0 {
+                        ix.tree.clear();
+                        for (values, id) in &rows {
+                            let key = ix.key_for(values);
+                            ix.insert(key, *id);
+                        }
+                    }
+                }
+            }
         }
         WriteOp::CreateView { name } => {
             if let Some(versions) = eng.db.views.get_mut(name) {

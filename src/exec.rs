@@ -12031,6 +12031,63 @@ fn text_value_of(parts: &[&Value]) -> Value {
     })
 }
 
+/// v0.42: validate input against `numeric(p)` / `numeric(p,s)` for
+/// pg_input_is_valid. Parses the typmod, runs the numeric input
+/// function, rounds to scale, then requires integer_digits + scale
+/// <= precision (PG19 numeric.c apply_typmod). Returns None if the
+/// typmod itself is malformed.
+fn pg_input_is_valid_numeric_typmod(input: &str, t: &str) -> Option<bool> {
+    let open = t.find('(')?;
+    let close = t.rfind(')')?;
+    if close != t.len() - 1 {
+        return None;
+    }
+    let args = &t[open + 1..close];
+    let mut parts = args.split(',');
+    let precision: i32 = parts.next()?.trim().parse().ok()?;
+    let scale: i32 = match parts.next() {
+        Some(s) => s.trim().parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    // PG numeric typmod bounds: 1..=1000 for precision (PG 18+),
+    // 0..=precision for scale. An out-of-range typmod means the type
+    // name is invalid, which pg_input_is_valid reports as false.
+    if !(1..=1000).contains(&precision) || scale < 0 || scale > precision {
+        return None;
+    }
+    let n = crate::storage::Numeric::parse(input).ok()?;
+    // NaN is valid for any numeric typmod in PG.
+    if n.is_nan() {
+        return Some(true);
+    }
+    // Infinities don't fit a constrained numeric.
+    if n.is_special() {
+        return Some(false);
+    }
+    let rounded = n.round_to(scale)?;
+    // Count integer digits from the public unscaled/scale fields.
+    // Value = unscaled * 10^-scale. Use the rounded value's actual
+    // scale (normalize() may have stripped trailing zeros).
+    let divisor = 10i128.checked_pow(rounded.scale as u32)?;
+    let int_part = rounded.unscaled.abs() / divisor;
+    let int_digits: i32 = if int_part == 0 {
+        1
+    } else {
+        // digits in int_part
+        let mut d = 0;
+        let mut v = int_part;
+        while v > 0 {
+            d += 1;
+            v /= 10;
+        }
+        d
+    };
+    Some(int_digits + scale <= precision)
+}
+
 /// v0.35: parse a `pg_input_is_valid` type argument naming a character
 /// type, returning `(is_char, typmod)`. `None` = not a character type.
 /// A malformed typmod is 22023, like PG's type parser. Bare `char`
@@ -14458,6 +14515,50 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             }
             match typ.to_ascii_lowercase().as_str() {
                 "bytea" => Ok(Value::Bool(crate::storage::parse_bytea(input).is_ok())),
+                // v0.42: PG19 numeric-family input validation (misc.c
+                // pg_input_is_valid runs the type's input function and
+                // maps soft errors to false). Each arm runs rustgres's
+                // equivalent of the PG input function.
+                "bool" | "boolean" => Ok(Value::Bool(cast_to_bool(&Value::text(input)).is_ok())),
+                "smallint" | "int2" => Ok(Value::Bool(
+                    parse_int_text(input)
+                        .map(|i| i16::try_from(i).is_ok())
+                        .unwrap_or(false),
+                )),
+                "int" | "integer" | "int4" => Ok(Value::Bool(
+                    parse_int_text(input)
+                        .map(|i| i32::try_from(i).is_ok())
+                        .unwrap_or(false),
+                )),
+                "bigint" | "int8" => Ok(Value::Bool(
+                    parse_int_text(input)
+                        .map(|i| i64::try_from(i).is_ok())
+                        .unwrap_or(false),
+                )),
+                // v0.42: int2vector is space-separated int2s (PG's
+                // int2vectorin splits on whitespace).
+                "int2vector" => Ok(Value::Bool({
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    !parts.is_empty()
+                        && parts.iter().all(|p| {
+                            parse_int_text(p)
+                                .map(|i| i16::try_from(i).is_ok())
+                                .unwrap_or(false)
+                        })
+                })),
+                "real" | "float4" => Ok(Value::Bool(parse_f32_checked(input).is_ok())),
+                "double precision" | "float8" | "float" => {
+                    Ok(Value::Bool(parse_f64_checked(input).is_ok()))
+                }
+                t if t == "numeric" || t == "decimal" => {
+                    Ok(Value::Bool(crate::storage::Numeric::parse(input).is_ok()))
+                }
+                // v0.42: numeric with typmod, e.g. numeric(8,4). PG
+                // rounds to scale then requires integer_digits + scale
+                // <= precision (numeric.c apply_typmod).
+                t if t.starts_with("numeric(") || t.starts_with("decimal(") => Ok(Value::Bool(
+                    pg_input_is_valid_numeric_typmod(input, t).unwrap_or(false),
+                )),
                 // v0.35: character types with typmod, via the same
                 // blank-tolerant input coercion as INSERT.
                 t => match parse_char_type_arg(t)? {
@@ -20081,7 +20182,13 @@ mod tests {
             err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'QQ')"),
             "0A000"
         );
-        assert_eq!(err_code(&mut eng, "SELECT to_char(42, 'YYYY')"), "42883");
+        // v0.42: PG19 supports to_char() on int4/int8/numeric (formatting.c
+        // lists Timestamp, Numeric, int4, int8, float4, float8), and
+        // non-pattern characters are copied literally to the output — so
+        // to_char(42, 'YYYY') is 'YYYY', not a 42883.
+        assert_eq!(one(&mut eng, "SELECT to_char(42, 'YYYY')"), "YYYY");
+        // PG always reserves the sign position: '  42', not ' 42'.
+        assert_eq!(one(&mut eng, "SELECT to_char(42, '999')"), "  42");
         // make_date / make_timestamp.
         assert_eq!(one(&mut eng, "SELECT make_date(2026, 9, 11)"), "2026-09-11");
         assert_eq!(one(&mut eng, "SELECT make_date(2024, 2, 29)"), "2024-02-29");
@@ -20918,6 +21025,86 @@ mod tests {
             t.col_compression[0],
             Some(crate::storage::ToastCompression::Pglz)
         );
+    }
+
+    /// v0.42: regression — a row-rewriting ALTER (ADD/DROP COLUMN) must
+    /// mint fresh row ids. Reusing ids left two row versions with the
+    /// same id across table versions, so a later UPDATE failed with a
+    /// phantom 40001 "concurrent update".
+    #[test]
+    fn v42_alter_rewrite_mints_fresh_row_ids() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t42r(v text)").unwrap();
+        run(&mut eng, "ALTER TABLE t42r SET (toast_tuple_target = 128)").unwrap();
+        run(&mut eng, "INSERT INTO t42r VALUES (repeat('O', 3000))").unwrap();
+        run(&mut eng, "ALTER TABLE t42r ADD COLUMN w text").unwrap();
+        // This UPDATE returned 40001 before the fix.
+        run(
+            &mut eng,
+            "UPDATE t42r SET w = repeat('W', 3000) WHERE v LIKE 'O%'",
+        )
+        .unwrap();
+        let got = rows_of(run(&mut eng, "SELECT left(v,3), left(w,3) FROM t42r").unwrap());
+        assert_eq!(got, vec![vec!["OOO".to_string(), "WWW".to_string()]]);
+        // Row ids are globally unique across the rewrite.
+        let t = eng.db.tables["t42r"].last().unwrap();
+        let mut ids: Vec<u64> = t.rows.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), t.rows.len());
+        // DROP COLUMN rewrites too.
+        run(&mut eng, "ALTER TABLE t42r DROP COLUMN w").unwrap();
+        run(&mut eng, "UPDATE t42r SET v = repeat('Z', 3000)").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT left(v,3) FROM t42r").unwrap());
+        assert_eq!(got, vec![vec!["ZZZ".to_string()]]);
+    }
+
+    /// v0.42: pg_input_is_valid for the numeric family (PG19 misc.c
+    /// runs the type's input function and maps soft errors to false).
+    /// Covers the 23 REAL-FAILs in boolean/int2/int4/int8/float4/
+    /// float8/numeric conformance suites.
+    #[test]
+    fn v42_pg_input_is_valid_numeric_family() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        let cases = [
+            // (input, type, expected)
+            ("'true'", "'bool'", "t"),
+            ("'asdf'", "'bool'", "f"),
+            ("'34'", "'int2'", "t"),
+            ("'asdf'", "'int2'", "f"),
+            ("'50000'", "'int2'", "f"),
+            ("' 1 3  5 '", "'int2vector'", "t"),
+            ("'34'", "'int4'", "t"),
+            ("'asdf'", "'int4'", "f"),
+            ("'1000000000000'", "'int4'", "f"),
+            ("'34'", "'int8'", "t"),
+            ("'asdf'", "'int8'", "f"),
+            ("'10000000000000000000'", "'int8'", "f"),
+            ("'34.5'", "'float4'", "t"),
+            ("'xyz'", "'float4'", "f"),
+            ("'1e400'", "'float4'", "f"),
+            ("'34.5'", "'float8'", "t"),
+            ("'xyz'", "'float8'", "f"),
+            ("'1e4000'", "'float8'", "f"),
+            ("'34.5'", "'numeric'", "t"),
+            ("'34xyz'", "'numeric'", "f"),
+            ("'1e400000'", "'numeric'", "f"),
+            ("'1234.567'", "'numeric(8,4)'", "t"),
+            ("'1234.567'", "'numeric(7,4)'", "f"),
+        ];
+        for (inp, typ, expected) in cases {
+            let q = format!("SELECT pg_input_is_valid({}, {})", inp, typ);
+            assert_eq!(
+                one(&mut eng, &q),
+                expected,
+                "pg_input_is_valid({}, {})",
+                inp,
+                typ
+            );
+        }
     }
 
     /// v0.41: SET COMPRESSION error taxonomy matches PG.
@@ -22667,8 +22854,14 @@ fn alter_add_column(
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
         .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
+    // v0.42: a rewrite must mint fresh row ids. Reusing the old ids
+    // violates the "globally unique, never reused" invariant: the old
+    // table version still holds rows with those ids, so UPDATE/DELETE
+    // misread the new version as a concurrent update (40001). PG's own
+    // rewrite is a DELETE+INSERT with new ctids; this is the same shape.
+    let new_ids: Vec<u64> = (0..old_rows.len()).map(|_| eng.alloc_row_id()).collect();
     let mut new_rows = Vec::with_capacity(old_rows.len());
-    for (old_id, values, old_toast) in old_rows {
+    for ((old_id, values, old_toast), new_id) in old_rows.into_iter().zip(new_ids) {
         let dv = match default {
             Some(d) => eval_default(
                 eng,
@@ -22701,7 +22894,7 @@ fn alter_add_column(
             &nv,
         )?;
         new_rows.push({
-            let mut rv = RowVersion::plain(old_id, Row::new(nv), ctx.own);
+            let mut rv = RowVersion::plain(new_id, Row::new(nv), ctx.own);
             // v0.41: ADD COLUMN must not orphan TOAST metadata — carry
             // the per-cell value ids forward (PG keeps the toast
             // pointers across a rewrite); the new column's flag is 0.
@@ -22709,6 +22902,13 @@ fn alter_add_column(
             flags.resize(old_cols, 0);
             flags.push(0);
             rv.toast = flags;
+            // v0.42: the row id changed, so migrate surviving index
+            // entries to the new id. The indexed key columns are
+            // untouched (the new column is appended), so the keys are
+            // identical; only the row id moves.
+            eng.db.index_remove_row(name, old_id, &values);
+            eng.db
+                .index_insert_row(name, new_id, &rv.values, ctx.session);
             rv
         });
     }
@@ -22929,10 +23129,13 @@ fn alter_drop_column(
         next.col_compression.remove(ci);
     }
     // CHECK expressions reference columns by name; nothing to shift.
-    // Rewrite rows without the column. Reuse old row ids so surviving
-    // indexes stay valid.
+    // Rewrite rows without the column. v0.42: mint fresh row ids (see
+    // ADD COLUMN above) — the surviving indexes are dropped and
+    // re-created from the rewritten rows below, so they pick the new
+    // ids up automatically.
+    let new_ids: Vec<u64> = (0..old_rows.len()).map(|_| eng.alloc_row_id()).collect();
     let mut new_rows = Vec::with_capacity(old_rows.len());
-    for (old_id, values, old_toast) in old_rows {
+    for ((_, values, old_toast), new_id) in old_rows.into_iter().zip(new_ids) {
         let mut values = values.to_vec();
         let mut flags = old_toast;
         if values.len() > ci {
@@ -22943,7 +23146,7 @@ fn alter_drop_column(
                 flags.remove(ci);
             }
         }
-        let mut rv = RowVersion::plain(old_id, Row::new(values), ctx.own);
+        let mut rv = RowVersion::plain(new_id, Row::new(values), ctx.own);
         flags.resize(rv.toast.len(), 0);
         rv.toast = flags;
         new_rows.push(rv);
