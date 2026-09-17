@@ -23466,6 +23466,63 @@ mod tests {
             ]
         );
     }
+    /// v0.49: a parenthesized expression as the first select-list item
+    /// parses as an expression, not a parenthesized query (PG19 gram.y:
+    /// only a target_list follows SELECT). Regression: `SELECT (-1)`
+    /// used to fail with "expected SELECT, found Minus".
+    #[test]
+    fn v49_paren_expr_first_select_item() {
+        let mut eng = engine();
+        let rows = rows_of(run(&mut eng, "SELECT (-1)").unwrap());
+        assert_eq!(rows, vec![vec!["-1".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT (1+2)").unwrap());
+        assert_eq!(rows, vec![vec!["3".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT (-1)::int").unwrap());
+        assert_eq!(rows, vec![vec!["-1".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT (1+2)::int").unwrap());
+        assert_eq!(rows, vec![vec!["3".to_string()]]);
+        // Non-first position already worked; keep it covered.
+        let rows = rows_of(run(&mut eng, "SELECT 1, (-1)::int").unwrap());
+        assert_eq!(rows, vec![vec!["1".to_string(), "-1".to_string()]]);
+    }
+
+    /// v0.49: PG's one-byte `"char"` type in `::` casts after a
+    /// parenthesized operand — the protocol-36 B9 case.
+    #[test]
+    fn v49_quoted_char_cast_after_paren() {
+        let mut eng = engine();
+        // (-1)::"char" is i4tochar(-1): byte 255, out as `\377`.
+        let rows = rows_of(run(&mut eng, r#"SELECT (-1)::"char""#).unwrap());
+        assert_eq!(rows, vec![vec!["\\377".to_string()]]);
+        let rows = rows_of(run(&mut eng, r#"SELECT 'a'::"char""#).unwrap());
+        assert_eq!(rows, vec![vec!["a".to_string()]]);
+        let rows = rows_of(run(&mut eng, r#"SELECT 65::"char""#).unwrap());
+        assert_eq!(rows, vec![vec!["A".to_string()]]);
+        // CAST(x AS "char") with the quoted name also works.
+        let rows = rows_of(run(&mut eng, r#"SELECT CAST((-1) AS "char")"#).unwrap());
+        assert_eq!(rows, vec![vec!["\\377".to_string()]]);
+    }
+
+    /// v0.49: `SELECT (SELECT ...)` is a scalar subquery expression, not
+    /// an unwrapped set branch — the 21000 multi-row check applies.
+    #[test]
+    fn v49_scalar_subquery_not_unwrapped() {
+        let mut eng = engine();
+        let err = run(&mut eng, "SELECT (SELECT id FROM users)").unwrap_err();
+        assert_eq!(err.code, "21000");
+        // Empty scalar subquery is NULL.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT (SELECT name FROM users WHERE id = 99) IS NULL AS e",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["t".to_string()]]);
+        // Single-row scalar subquery evaluates in place.
+        let rows = rows_of(run(&mut eng, "SELECT (SELECT 10 AS v) + 5").unwrap());
+        assert_eq!(rows, vec![vec!["15".to_string()]]);
+    }
 }
 
 // ============================================================================

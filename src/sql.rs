@@ -6284,17 +6284,17 @@ impl Parser {
     }
 
     /// v0.44: one set-operation branch where the SELECT keyword was
-    /// already consumed (the leftmost branch of `parse_select_query`):
-    /// either a parenthesized full query or a simple SELECT core.
+    /// already consumed (the leftmost branch of `parse_select_query`).
+    /// v0.49: per PG19 gram.y only a target_list can follow SELECT, so
+    /// a `(` here always opens a parenthesized *expression* (or scalar
+    /// subquery), never a parenthesized set branch — it must go through
+    /// parse_select_core, whose parse_primary handles `(SELECT ...)`.
+    /// The old `(` arm misparsed `SELECT (expr)` (e.g. `SELECT (-1)`)
+    /// as a query ("expected SELECT, found Minus") and silently
+    /// unwrapped scalar subqueries (`SELECT (SELECT id FROM users)`
+    /// lost its 21000 multi-row check).
     fn parse_set_branch(&mut self) -> Result<SelectStmt, SqlError> {
-        if *self.peek() == Token::LParen {
-            self.next();
-            let inner = self.parse_select_query_not_consumed()?;
-            self.expect(Token::RParen, "')'")?;
-            Ok(inner)
-        } else {
-            self.parse_select_core()
-        }
+        self.parse_select_core()
     }
 
     /// v0.44: parse a full query when the SELECT keyword has NOT been
