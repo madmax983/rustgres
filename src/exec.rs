@@ -40,9 +40,9 @@ use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertValue, IsolationLevel,
-    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SqlError, Stmt,
-    TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
-    parse_statement, validate_constraint_expr,
+    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SetOpKind,
+    SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
+    collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
     ColStats, ColType, Database, Engine, Numeric, Row, RowVersion, Sequence, ShellType, Snapshot,
@@ -1585,7 +1585,7 @@ fn describe_returning(
             .map(|(n, ty)| QCol {
                 qual: table.to_string(),
                 name: n.clone(),
-                ty: ty.clone(),
+                ty: *ty,
 
                 hidden: false,
                 src_ord: 0,
@@ -2459,7 +2459,7 @@ fn exec_insert(
                 .map(|(n, ty)| QCol {
                     qual: table.to_string(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
 
                     hidden: false,
                     src_ord: 0,
@@ -2471,7 +2471,7 @@ fn exec_insert(
                 .map(|(n, ty)| QCol {
                     qual: "excluded".to_string(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
 
                     hidden: false,
                     src_ord: 0,
@@ -2722,7 +2722,7 @@ fn exec_insert(
             .map(|(n, ty)| QCol {
                 qual: table.to_string(),
                 name: n.clone(),
-                ty: ty.clone(),
+                ty: *ty,
 
                 hidden: false,
                 src_ord: 0,
@@ -2865,7 +2865,7 @@ fn exec_update(
             .map(|(n, ty)| QCol {
                 qual: table.to_string(),
                 name: n.clone(),
-                ty: ty.clone(),
+                ty: *ty,
 
                 hidden: false,
                 src_ord: 0,
@@ -3087,7 +3087,7 @@ fn exec_update(
                 .map(|(n, ty)| QCol {
                     qual: table.to_string(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
 
                     hidden: false,
                     src_ord: 0,
@@ -3150,7 +3150,7 @@ fn exec_delete(
             .map(|(n, ty)| QCol {
                 qual: table.to_string(),
                 name: n.clone(),
-                ty: ty.clone(),
+                ty: *ty,
 
                 hidden: false,
                 src_ord: 0,
@@ -3258,7 +3258,7 @@ fn exec_delete(
                 .map(|(n, ty)| QCol {
                     qual: table.to_string(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
 
                     hidden: false,
                     src_ord: 0,
@@ -5829,6 +5829,15 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
     if !stmt.with.is_empty() {
         materialize_ctes(q, &stmt.with)?;
     }
+    // v0.44: set operations. The carrier's WITH is materialized above and
+    // visible to every branch; each branch runs as its own query level
+    // with its own privilege checks.
+    if stmt.set_op.is_some() {
+        let out = eval_set_op(q, stmt, outer);
+        q.ctes.truncate(base);
+        q.wctx = None;
+        return out;
+    }
     // v0.11: column privileges. Push this level's qualifier map, check
     // every column this level reads, then pop (balanced across view
     // expansion, which reuses `q`).
@@ -5841,6 +5850,361 @@ fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut
     // v0.10: the window context is per query level; never leak it.
     q.wctx = None;
     out
+}
+
+/// v0.44: evaluate a set-operation (`UNION` / `INTERSECT` / `EXCEPT`)
+/// carrier. The left branch is evaluated, then the chain is folded
+/// left-to-right (equal-precedence operators are left-associative;
+/// tighter `INTERSECT`s were nested during parsing). Column names come
+/// from the leftmost branch; types are resolved per column and every
+/// branch's rows are coerced to them. The root `ORDER BY` / `OFFSET` /
+/// `LIMIT` apply to the combined result.
+fn eval_set_op(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
+    let root = stmt
+        .set_op
+        .as_ref()
+        .ok_or_else(|| exec_err("XX000", "eval_set_op called on a plain SELECT"))?;
+    let mut acc = run_select(q, &root.left, outer)?;
+    for b in &root.chain {
+        let right = run_select(q, &b.right, outer)?;
+        acc = combine_set_branches(b.op, b.all, acc, right)?;
+    }
+    apply_setop_tail(q, outer, root, acc)
+}
+
+/// v0.44: combine two branch results with one set operator.
+fn combine_set_branches(
+    op: SetOpKind,
+    all: bool,
+    left: SelectOut,
+    right: SelectOut,
+) -> Result<SelectOut, ExecError> {
+    let op_name = match op {
+        SetOpKind::Union => "UNION",
+        SetOpKind::Intersect => "INTERSECT",
+        SetOpKind::Except => "EXCEPT",
+    };
+    if left.columns.len() != right.columns.len() {
+        return Err(exec_err(
+            "42804",
+            format!("each {op_name} query must have the same number of columns"),
+        ));
+    }
+    // Resolve a common type per column; names come from the left branch.
+    let mut out_cols: Vec<(String, ColType)> = Vec::with_capacity(left.columns.len());
+    for ((lname, lty), (_, rty)) in left.columns.iter().zip(right.columns.iter()) {
+        let common = common_supertype(op_name, lty, rty)?;
+        out_cols.push((lname.clone(), common));
+    }
+    let left_rows = coerce_set_rows(left.rows, &out_cols)?;
+    let right_rows = coerce_set_rows(right.rows, &out_cols)?;
+    let rows = match op {
+        SetOpKind::Union => {
+            if all {
+                let mut rows = left_rows;
+                rows.extend(right_rows);
+                rows
+            } else {
+                dedup_rows(left_rows.into_iter().chain(right_rows).collect())?
+            }
+        }
+        SetOpKind::Intersect => {
+            if all {
+                intersect_all_rows(left_rows, right_rows)?
+            } else {
+                let right_keys: std::collections::HashSet<Vec<u8>> =
+                    right_rows.iter().map(setop_row_key).collect();
+                let mut filtered = Vec::new();
+                for r in left_rows {
+                    if right_keys.contains(&setop_row_key(&r)) {
+                        filtered.push(r);
+                    }
+                }
+                dedup_rows(filtered)?
+            }
+        }
+        SetOpKind::Except => {
+            if all {
+                except_all_rows(left_rows, right_rows)?
+            } else {
+                let right_keys: std::collections::HashSet<Vec<u8>> =
+                    right_rows.iter().map(setop_row_key).collect();
+                let mut filtered = Vec::new();
+                for r in left_rows {
+                    if !right_keys.contains(&setop_row_key(&r)) {
+                        filtered.push(r);
+                    }
+                }
+                dedup_rows(filtered)?
+            }
+        }
+    };
+    Ok(SelectOut {
+        columns: out_cols,
+        rows,
+    })
+}
+
+/// v0.44: numeric kind rank for set-operation type widening.
+const fn setop_numeric_rank(t: ColType) -> Option<u8> {
+    match t {
+        ColType::SmallInt => Some(0),
+        ColType::Int => Some(1),
+        ColType::BigInt => Some(2),
+        ColType::Float4 => Some(3),
+        ColType::Float => Some(4),
+        ColType::Numeric => Some(5),
+        _ => None,
+    }
+}
+
+/// v0.44: character-family check for set-operation type resolution.
+const fn setop_is_char_family(t: ColType) -> bool {
+    matches!(
+        t,
+        ColType::Text | ColType::Char(_) | ColType::Varchar(_) | ColType::SingleChar
+    )
+}
+
+/// v0.44: Postgres `select_common_type` for set operations, restricted to
+/// the type pairs this engine can produce. Numeric kinds widen toward
+/// `NUMERIC`; the character family resolves to `TEXT`; anything else
+/// must match exactly.
+fn common_supertype(op_name: &str, a: &ColType, b: &ColType) -> Result<ColType, ExecError> {
+    if a == b {
+        return Ok(*a);
+    }
+    if let (Some(ra), Some(rb)) = (setop_numeric_rank(*a), setop_numeric_rank(*b)) {
+        return Ok(match ra.max(rb) {
+            0 => ColType::SmallInt,
+            1 => ColType::Int,
+            2 => ColType::BigInt,
+            3 => ColType::Float4,
+            4 => ColType::Float,
+            _ => ColType::Numeric,
+        });
+    }
+    if setop_is_char_family(*a) && setop_is_char_family(*b) {
+        // PG resolves varchar/bpchar unions to text (typmod is dropped).
+        return Ok(ColType::Text);
+    }
+    Err(exec_err(
+        "42804",
+        format!("{op_name} types {a:?} and {b:?} cannot be matched"),
+    ))
+}
+
+/// v0.44: coerce every cell of each row to the resolved output types
+/// (reuses the INSERT/UPDATE coercion rules).
+fn coerce_set_rows(rows: Vec<Row>, out_cols: &[(String, ColType)]) -> Result<Vec<Row>, ExecError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let cells_in = row.into_cells();
+        let mut cells = Vec::with_capacity(out_cols.len());
+        for (cell, (name, ty)) in cells_in.into_iter().zip(out_cols.iter()) {
+            cells.push(coerce_value(cell, ty, name)?);
+        }
+        out.push(Row::new(cells));
+    }
+    Ok(out)
+}
+
+/// v0.44: canonical key for a set-operation row. Uses `value_key` for
+/// most types, but normalizes `Numeric` by stripping trailing zeros so
+/// that `1.0` and `1.00` (equal by `compare_values`) get the same key.
+fn setop_row_key(row: &Row) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in row.iter() {
+        match v {
+            Value::Numeric(n) if n.special == crate::storage::NumericSpecial::Finite => {
+                let mut unscaled = n.unscaled;
+                let mut scale = n.scale;
+                while scale > 0 && unscaled % 10 == 0 {
+                    unscaled /= 10;
+                    scale -= 1;
+                }
+                out.push(8);
+                out.extend_from_slice(&unscaled.to_be_bytes());
+                out.extend_from_slice(&scale.to_be_bytes());
+            }
+            _ => value_key(v, &mut out),
+        }
+    }
+    out
+}
+
+/// v0.44: remove duplicate rows, keeping first-occurrence order.
+/// Uses a HashSet of canonical keys for O(n) performance.
+fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>, ExecError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let key = setop_row_key(&r);
+        if seen.insert(key) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// v0.44: `INTERSECT ALL`: each distinct row appears
+/// `min(left_count, right_count)` times. Uses HashMap for O(n).
+fn intersect_all_rows(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>, ExecError> {
+    let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    for r in &right {
+        *right_counts.entry(setop_row_key(r)).or_insert(0) += 1;
+    }
+    let mut out = Vec::new();
+    for l in left {
+        let key = setop_row_key(&l);
+        if let Some(count) = right_counts.get_mut(&key) {
+            if *count > 0 {
+                *count -= 1;
+                out.push(l);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v0.44: `EXCEPT ALL`: each left row is emitted unless a matching right
+/// row exists, consuming one right match per emitted suppression.
+/// Uses HashMap for O(n).
+fn except_all_rows(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>, ExecError> {
+    let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
+        std::collections::HashMap::new();
+    for r in &right {
+        *right_counts.entry(setop_row_key(r)).or_insert(0) += 1;
+    }
+    let mut out = Vec::new();
+    for l in left {
+        let key = setop_row_key(&l);
+        if let Some(count) = right_counts.get_mut(&key) {
+            if *count > 0 {
+                *count -= 1;
+                continue;
+            }
+        }
+        out.push(l);
+    }
+    Ok(out)
+}
+
+/// v0.44: apply the set-operation root's `ORDER BY` / `OFFSET` / `LIMIT`
+/// to the combined rows.
+fn apply_setop_tail(
+    q: &mut Q,
+    outer: &[Scope],
+    root: &SetOpRoot,
+    mut acc: SelectOut,
+) -> Result<SelectOut, ExecError> {
+    if !root.order_by.is_empty() {
+        // Build a scope over the combined output so ORDER BY expressions
+        // can reference output columns by name.
+        let schema: Vec<QCol> = acc
+            .columns
+            .iter()
+            .map(|(n, ty)| QCol {
+                qual: String::new(),
+                name: n.clone(),
+                ty: *ty,
+                hidden: false,
+                src_ord: 0,
+            })
+            .collect();
+        let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(acc.rows.len());
+        for row in acc.rows.drain(..) {
+            let scope = Scope {
+                schema: &schema,
+                row: &row,
+                prov: None,
+            };
+            let scopes = [scope];
+            let mut keys = Vec::with_capacity(root.order_by.len());
+            for term in &root.order_by {
+                keys.push(eval_setop_sort_key(q, &scopes, outer, term, &acc.columns)?);
+            }
+            keyed.push((keys, row));
+        }
+        let mut sort_err: Option<ExecError> = None;
+        keyed.sort_by(|(ka, _), (kb, _)| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            for (i, term) in root.order_by.iter().enumerate() {
+                match compare_values(&ka[i], &kb[i], term.desc, term.nulls_first) {
+                    Ok(std::cmp::Ordering::Equal) => {}
+                    Ok(ord) => return ord,
+                    Err(e) => {
+                        sort_err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+        acc.rows = keyed.into_iter().map(|(_, r)| r).collect();
+    }
+    if let Some(off) = root.offset {
+        let n = usize::try_from(off.max(0)).unwrap_or(usize::MAX);
+        if n < acc.rows.len() {
+            acc.rows.drain(..n);
+        } else {
+            acc.rows.clear();
+        }
+    }
+    if let Some(lim) = root.limit {
+        let n = usize::try_from(lim.max(0)).unwrap_or(usize::MAX);
+        acc.rows.truncate(n);
+    }
+    Ok(acc)
+}
+
+/// v0.44: evaluate one ORDER BY term of a set operation. PG restricts
+/// set-operation ORDER BY to output-column ordinals (integer literals)
+/// or bare output-column names. Anything else — including names that are
+/// not output columns — is an error (SQLSTATE 42703).
+fn eval_setop_sort_key(
+    q: &mut Q,
+    scopes: &[Scope],
+    _outer: &[Scope],
+    term: &OrderTerm,
+    columns: &[(String, ColType)],
+) -> Result<Value, ExecError> {
+    let ordinal: Option<usize> = match &term.expr {
+        Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) if *n >= 1 => usize::try_from(*n).ok(),
+        _ => None,
+    };
+    if let Some(n) = ordinal {
+        if n <= columns.len() {
+            return Ok(scopes[0].row[n - 1].clone());
+        }
+        return Err(exec_err(
+            "42803",
+            format!("ORDER BY position {n} is not in select list"),
+        ));
+    }
+    // Bare column name: must match an output column.
+    if let Expr::Column { name, .. } = &term.expr {
+        for (i, (col_name, _)) in columns.iter().enumerate() {
+            if col_name.eq_ignore_ascii_case(name) {
+                return Ok(scopes[0].row[i].clone());
+            }
+        }
+        return Err(exec_err(
+            "42703",
+            format!("column \"{name}\" does not exist"),
+        ));
+    }
+    // Arbitrary expressions are not allowed in set-operation ORDER BY.
+    Err(exec_err(
+        "42703",
+        "ORDER BY expressions must be output column names or ordinals".to_string(),
+    ))
 }
 
 /// v0.11: qualifier -> real-table map for one query level (see
@@ -5862,8 +6226,9 @@ fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
                 };
                 out.push((qual, real));
             }
-            FromItem::Derived { alias, .. } => out.push((alias.clone(), None)),
-            FromItem::Values { alias, .. } => out.push((alias.clone(), None)),
+            FromItem::Derived { alias, .. } | FromItem::Values { alias, .. } => {
+                out.push((alias.clone(), None));
+            }
             // v0.32: table function — no underlying table; privilege is
             // checked at the function's own level (none needed).
             FromItem::Function { name, alias, .. } => {
@@ -6448,6 +6813,14 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
 fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
     // v0.10: CTE shape rules (recursive UNION discipline).
     validate_ctes(&stmt.with)?;
+    // v0.44: validate every set-operation branch.
+    if let Some(root) = &stmt.set_op {
+        validate_select(&root.left)?;
+        for b in &root.chain {
+            validate_select(&b.right)?;
+        }
+        return Ok(());
+    }
     // v0.10: window-function placement rules.
     validate_windows(stmt)?;
     if let Some(w) = &stmt.where_ {
@@ -8743,7 +9116,7 @@ fn build_source(
                     .map(|(i, (n, ty))| QCol {
                         qual: qual.clone(),
                         name: n.clone(),
-                        ty: ty.clone(),
+                        ty: *ty,
 
                         hidden: false,
                         // v0.23: source ordinal for `qual.*` ordering.
@@ -18163,7 +18536,7 @@ fn from_schema_item(
                 .map(|(i, (n, ty))| QCol {
                     qual: qual.clone(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
                     hidden: false,
                     // v0.23: source ordinal for `qual.*` ordering.
                     src_ord: i as u32,
@@ -18366,6 +18739,44 @@ fn describe_select(
     describe_select_outer(eng, snap, own, session, stmt, &[], bindings)
 }
 
+/// v0.44: describe a set-operation root: describe every branch, require
+/// equal column counts, resolve a common type per column. Names come
+/// from the leftmost branch. `visible` already includes the carrier's
+/// WITH.
+fn describe_set_op(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    root: &SetOpRoot,
+    visible: &[CteDef],
+    bindings: &[Rc<CteBinding>],
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    let mut out = describe_select_outer(eng, snap, own, session, &root.left, visible, bindings)?;
+    for b in &root.chain {
+        let op_name = match b.op {
+            SetOpKind::Union => "UNION",
+            SetOpKind::Intersect => "INTERSECT",
+            SetOpKind::Except => "EXCEPT",
+        };
+        let r = describe_select_outer(eng, snap, own, session, &b.right, visible, bindings)?;
+        if r.len() != out.len() {
+            return Err(exec_err(
+                "42804",
+                format!("each {op_name} query must have the same number of columns"),
+            ));
+        }
+        let mut resolved: Vec<ColType> = Vec::with_capacity(out.len());
+        for ((_, lty), (_, rty)) in out.iter().zip(r.iter()) {
+            resolved.push(common_supertype(op_name, lty, rty)?);
+        }
+        for (i, ty) in resolved.into_iter().enumerate() {
+            out[i].1 = ty;
+        }
+    }
+    Ok(out)
+}
+
 /// v0.10: `outer` holds the CTE definitions visible from enclosing query
 /// levels (innermost last); the query's own WITH list is appended, so a
 /// CTE body only sees outer CTEs and earlier siblings.
@@ -18380,6 +18791,12 @@ fn describe_select_outer(
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     let mut visible: Vec<CteDef> = outer.to_vec();
     visible.extend(stmt.with.iter().cloned());
+    // v0.44: a set-operation carrier describes via its branches: names
+    // from the leftmost branch, types resolved per column. The carrier's
+    // WITH (now in `visible`) applies to every branch.
+    if let Some(root) = &stmt.set_op {
+        return describe_set_op(eng, snap, own, session, root, &visible, bindings);
+    }
     let schemas = from_schemas(eng, snap, own, session, &stmt.from, &visible, bindings)?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
@@ -19055,6 +19472,14 @@ fn infer_select(
     outer: &[&[QCol]],
     out: &mut [Option<ColType>],
 ) -> Result<(), ExecError> {
+    // v0.44: recurse through set-operation branches.
+    if let Some(root) = &s.set_op {
+        infer_select(&root.left, eng, snap, own, session, outer, out)?;
+        for b in &root.chain {
+            infer_select(&b.right, eng, snap, own, session, outer, out)?;
+        }
+        return Ok(());
+    }
     // Unknown tables are skipped (execution reports them).
     // v0.10: this level's own CTEs are visible to the FROM clause.
     let visible: Vec<CteDef> = s.with.clone();
@@ -19148,7 +19573,7 @@ pub fn infer_param_types(
                     .map(|(n, ty)| QCol {
                         qual: String::new(),
                         name: n.clone(),
-                        ty: ty.clone(),
+                        ty: *ty,
 
                         hidden: false,
                         src_ord: 0,
@@ -19197,7 +19622,7 @@ pub fn infer_param_types(
                             .map(|(n, ty)| QCol {
                                 qual: table.clone(),
                                 name: n.clone(),
-                                ty: ty.clone(),
+                                ty: *ty,
 
                                 hidden: false,
                                 src_ord: 0,
@@ -19258,7 +19683,7 @@ fn infer_returning(
                 .map(|(n, ty)| QCol {
                     qual: String::new(),
                     name: n.clone(),
-                    ty: ty.clone(),
+                    ty: *ty,
 
                     hidden: false,
                     src_ord: 0,
@@ -19297,7 +19722,7 @@ fn infer_on_conflict(
                     .map(|(n, ty)| QCol {
                         qual: String::new(),
                         name: n.clone(),
-                        ty: ty.clone(),
+                        ty: *ty,
 
                         hidden: false,
                         src_ord: 0,
@@ -19629,6 +20054,17 @@ fn subst_on_conflict(
 fn subst_select(s: &mut SelectStmt, params: &[Option<Value>]) -> Result<(), ExecError> {
     // v0.10: CTE bodies.
     subst_ctes(&mut s.with, params)?;
+    // v0.44: set-operation branches and the root ORDER BY.
+    if let Some(root) = s.set_op.as_mut() {
+        subst_select(&mut root.left, params)?;
+        for b in &mut root.chain {
+            subst_select(&mut b.right, params)?;
+        }
+        for term in &mut root.order_by {
+            subst_expr(&mut term.expr, params)?;
+        }
+        return Ok(());
+    }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             subst_expr(expr, params)?;

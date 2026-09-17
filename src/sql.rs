@@ -1182,6 +1182,11 @@ pub struct SelectStmt {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub for_update: bool,
+    /// v0.44: set-operation root when this statement is the carrier of a
+    /// `UNION` / `INTERSECT` / `EXCEPT` query. When `Some`, the fields
+    /// above are empty/ignored and the query is `set_op`'s branches.
+    /// `None` for plain SELECTs (zero behavior change).
+    pub set_op: Option<Box<SetOpRoot>>,
 }
 
 /// v0.10: one Common Table Expression.
@@ -1191,6 +1196,63 @@ pub struct CteDef {
     pub col_aliases: Vec<String>,
     pub body: CteBody,
     pub recursive: bool,
+}
+
+/// v0.44: an empty `SelectStmt` shell, used as the carrier of a
+/// set-operation root (its query fields stay empty/ignored).
+fn empty_select() -> SelectStmt {
+    SelectStmt {
+        with: Vec::new(),
+        distinct: false,
+        items: Vec::new(),
+        from: Vec::new(),
+        where_: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        for_update: false,
+        set_op: None,
+    }
+}
+
+/// v0.44: set-operation kinds for `UNION` / `INTERSECT` / `EXCEPT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// v0.44: one `OP [ALL | DISTINCT] <right-branch>` link in a set-operation
+/// chain. The right branch is a full `SelectStmt`: it may itself carry a
+/// `set_op` (how tighter-precedence `INTERSECT` nests) and its own
+/// parenthesized `ORDER BY` / `LIMIT` / `OFFSET`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetOpBranch {
+    pub op: SetOpKind,
+    pub all: bool,
+    pub right: Box<SelectStmt>,
+}
+
+/// v0.44: root of a set operation (`SELECT ... UNION/INTERSECT/EXCEPT ...`).
+/// Stored on a carrier `SelectStmt` via `SelectStmt::set_op`; the carrier's
+/// own query fields (`items`, `from`, ...) are empty and ignored — the
+/// branches below are the real queries. Chain links apply left-to-right;
+/// `INTERSECT` binds tighter than `UNION`/`EXCEPT` (like Postgres), which
+/// the parser achieves by nesting tighter ops inside the right branch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetOpRoot {
+    /// Leftmost branch.
+    pub left: Box<SelectStmt>,
+    /// `(op, all, right)` links, applied left-to-right.
+    pub chain: Vec<SetOpBranch>,
+    /// Trailing `ORDER BY` / `LIMIT` / `OFFSET`: apply to the combined
+    /// result, like Postgres.
+    pub order_by: Vec<OrderTerm>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 /// v0.10: a CTE body. Plain CTEs hold one SELECT; recursive CTEs hold the
@@ -2424,6 +2486,7 @@ fn is_reserved(word: &str) -> bool {
             | "distinct"
             | "drop"
             | "end"
+            | "except" // v0.44: set operations
             | "exists"
             | "fetch" // v0.16: cursors
             | "for"
@@ -2436,6 +2499,7 @@ fn is_reserved(word: &str) -> bool {
             | "inner"
             | "insert"
             | "into"
+            | "intersect" // v0.44: set operations
             | "is"
             | "isolation"
             | "join"
@@ -2639,6 +2703,16 @@ impl Parser {
     fn parse_top(&mut self) -> Result<Stmt, SqlError> {
         let kw = match self.next() {
             Token::Ident(s) => s,
+            // v0.44: a top-level parenthesized query, e.g.
+            // `(SELECT 1 UNION SELECT 2) UNION SELECT 3`.
+            Token::LParen => {
+                let inner = self.parse_select_query_not_consumed()?;
+                self.expect(Token::RParen, "')'")?;
+                // A parenthesized query may be followed by set operators.
+                let carrier = self.parse_set_chain(inner, 1)?;
+                let stmt = self.finish_select_query(carrier)?;
+                return Ok(Stmt::Select(stmt));
+            }
             other => return Err(err(format!("syntax error: unexpected {:?}", other))),
         };
         self.parse_top_kw(kw)
@@ -2650,7 +2724,7 @@ impl Parser {
         match kw.as_str() {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
-            "select" => Ok(Stmt::Select(self.parse_select_rest()?)),
+            "select" => Ok(Stmt::Select(self.parse_select_query()?)),
             "drop" => self.parse_drop(),
             // --- v0.11: GRANT / REVOKE
             "grant" => self.parse_grant(),
@@ -3703,7 +3777,7 @@ impl Parser {
         };
         // v0.10: `INSERT INTO ... SELECT ...` (or VALUES).
         let (rows, select) = if self.eat_keyword("select") {
-            let sel = self.parse_select_rest()?;
+            let sel = self.parse_select_query()?;
             (Vec::new(), Some(sel))
         } else {
             self.expect_keyword("values")?;
@@ -3931,7 +4005,7 @@ impl Parser {
         };
         match kw.as_str() {
             "select" => {
-                let mut sel = self.parse_select_rest()?;
+                let mut sel = self.parse_select_query()?;
                 sel.with = ctes;
                 Ok(Stmt::Select(sel))
             }
@@ -3979,7 +4053,16 @@ impl Parser {
                 )));
             }
         }
-        let first = self.parse_select_rest()?;
+        // v0.44: a non-recursive CTE body may be a general set operation
+        // (`WITH x AS (SELECT ... UNION ...)`, parsed by
+        // `parse_select_query`). A recursive CTE keeps the dedicated
+        // `non_recursive UNION [ALL] recursive` shape below, so parse its
+        // terms without set-operation climbing.
+        let first = if recursive {
+            self.parse_select_rest()?
+        } else {
+            self.parse_select_query()?
+        };
         if self.eat_keyword("union") {
             if !recursive {
                 return Err(SqlError {
@@ -4504,7 +4587,7 @@ impl Parser {
     /// `SELECT ...` inside parentheses (the `SELECT` keyword not yet consumed).
     fn parse_subquery(&mut self) -> Result<SelectStmt, SqlError> {
         match self.next() {
-            Token::Ident(s) if s == "select" => self.parse_select_rest(),
+            Token::Ident(s) if s == "select" => self.parse_select_query(),
             other => Err(err(format!(
                 "syntax error: expected SELECT, found {:?}",
                 other
@@ -4737,7 +4820,7 @@ impl Parser {
                 match self.peek() {
                     Token::Ident(s) if s == "select" => {
                         self.next();
-                        let sub = self.parse_select_rest()?;
+                        let sub = self.parse_select_query()?;
                         self.expect(Token::RParen, "')'")?;
                         Ok(Expr::ScalarSub(Box::new(sub)))
                     }
@@ -5683,7 +5766,7 @@ impl Parser {
         // `parse_select_rest` expects the SELECT keyword already
         // consumed (like `parse_top` does for a top-level SELECT).
         self.expect_keyword("select")?;
-        let query = self.parse_select_rest()?;
+        let query = self.parse_select_query()?;
         Ok(Stmt::Declare {
             name,
             query,
@@ -5824,7 +5907,12 @@ impl Parser {
     }
 
     /// The body of a SELECT after the `SELECT` keyword was consumed.
-    fn parse_select_rest(&mut self) -> Result<SelectStmt, SqlError> {
+    /// v0.44: the SELECT core: `SELECT [DISTINCT] ... HAVING`, without the
+    /// trailing `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` (see
+    /// `parse_select_tail`) and without set-operation climbing (see
+    /// `parse_select_query`). Used for set-operation branches, where
+    /// Postgres forbids a tail before the operator outside parentheses.
+    fn parse_select_core(&mut self) -> Result<SelectStmt, SqlError> {
         let distinct = if self.eat_keyword("distinct") {
             true
         } else {
@@ -5897,6 +5985,27 @@ impl Parser {
         } else {
             None
         };
+        Ok(SelectStmt {
+            with: Vec::new(),
+            distinct,
+            items,
+            from,
+            where_,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            for_update: false,
+            set_op: None,
+        })
+    }
+
+    /// v0.44: trailing `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` of a
+    /// SELECT. Split out of `parse_select_rest` so set-operation branches
+    /// can be parsed without consuming the outer query's tail (Postgres
+    /// forbids `ORDER BY` before a set-op outside parentheses).
+    fn parse_select_tail(&mut self, sel: &mut SelectStmt) -> Result<(), SqlError> {
         let order_by = if self.eat_keyword("order") {
             self.expect_keyword("by")?;
             let mut terms = Vec::new();
@@ -5948,13 +6057,12 @@ impl Parser {
                     Token::Number(raw) => match raw.parse::<i64>() {
                         Ok(n) => limit = Some(n),
                         Err(_) => {
-                            return Err(err(format!("syntax error: bad LIMIT value \"{}\"", raw)));
+                            return Err(err(format!("syntax error: bad LIMIT value \"{raw}\"")));
                         }
                     },
                     other => {
                         return Err(err(format!(
-                            "syntax error: expected LIMIT count, found {:?}",
-                            other
+                            "syntax error: expected LIMIT count, found {other:?}"
                         )));
                     }
                 }
@@ -5963,13 +6071,12 @@ impl Parser {
                     Token::Number(raw) => match raw.parse::<i64>() {
                         Ok(n) => offset = Some(n),
                         Err(_) => {
-                            return Err(err(format!("syntax error: bad OFFSET value \"{}\"", raw)));
+                            return Err(err(format!("syntax error: bad OFFSET value \"{raw}\"")));
                         }
                     },
                     other => {
                         return Err(err(format!(
-                            "syntax error: expected OFFSET count, found {:?}",
-                            other
+                            "syntax error: expected OFFSET count, found {other:?}"
                         )));
                     }
                 }
@@ -5983,19 +6090,165 @@ impl Parser {
         } else {
             false
         };
-        Ok(SelectStmt {
-            with: Vec::new(),
-            distinct,
-            items,
-            from,
-            where_,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            for_update,
-        })
+        sel.order_by = order_by;
+        sel.limit = limit;
+        sel.offset = offset;
+        sel.for_update = for_update;
+        Ok(())
+    }
+
+    /// The pre-v0.44 `parse_select_rest`: a simple SELECT with no
+    /// set-operation climbing. Kept for recursive-CTE terms (which detect
+    /// their own `UNION`) and as the branch parser for set operations.
+    fn parse_select_rest(&mut self) -> Result<SelectStmt, SqlError> {
+        let mut sel = self.parse_select_core()?;
+        self.parse_select_tail(&mut sel)?;
+        Ok(sel)
+    }
+
+    /// v0.44: parse a full query: a simple SELECT optionally followed by a
+    /// `UNION` / `INTERSECT` / `EXCEPT` chain and trailing `ORDER BY` /
+    /// `LIMIT` / `OFFSET`. Precedence follows Postgres: `INTERSECT` binds
+    /// tighter than `UNION`/`EXCEPT`; equal-precedence ops are
+    /// left-associative. A query with set-ops is returned as a carrier
+    /// `SelectStmt` whose `set_op` holds the branches; a plain SELECT is
+    /// returned exactly as `parse_select_rest` would produce it.
+    fn parse_select_query(&mut self) -> Result<SelectStmt, SqlError> {
+        let left = self.parse_set_branch()?;
+        let carrier = self.parse_set_chain(left, 1)?;
+        self.finish_select_query(carrier)
+    }
+
+    /// v0.44: one set-operation branch where the SELECT keyword was
+    /// already consumed (the leftmost branch of `parse_select_query`):
+    /// either a parenthesized full query or a simple SELECT core.
+    fn parse_set_branch(&mut self) -> Result<SelectStmt, SqlError> {
+        if *self.peek() == Token::LParen {
+            self.next();
+            let inner = self.parse_select_query_not_consumed()?;
+            self.expect(Token::RParen, "')'")?;
+            Ok(inner)
+        } else {
+            self.parse_select_core()
+        }
+    }
+
+    /// v0.44: parse a full query when the SELECT keyword has NOT been
+    /// consumed yet (right-hand branches of set operators, and
+    /// parenthesized queries). Delegates to `parse_select_query` once
+    /// SELECT is consumed.
+    fn parse_select_query_not_consumed(&mut self) -> Result<SelectStmt, SqlError> {
+        if *self.peek() == Token::LParen {
+            self.next();
+            let inner = self.parse_select_query_not_consumed()?;
+            self.expect(Token::RParen, "')'")?;
+            Ok(inner)
+        } else {
+            self.expect_keyword("select")?;
+            self.parse_select_query()
+        }
+    }
+
+    /// v0.44: parse one operand of a set operator (the right-hand side).
+    /// This is a branch core with NO trailing `ORDER BY` / `LIMIT` /
+    /// `OFFSET` — those belong to the outermost root and are parsed by
+    /// `finish_select_query`. A parenthesized operand is a full query
+    /// (its own tail stays inside the parens).
+    fn parse_set_operand(&mut self) -> Result<SelectStmt, SqlError> {
+        if *self.peek() == Token::LParen {
+            self.next();
+            let inner = self.parse_select_query_not_consumed()?;
+            self.expect(Token::RParen, "')'")?;
+            Ok(inner)
+        } else {
+            self.expect_keyword("select")?;
+            self.parse_select_core()
+        }
+    }
+
+    /// v0.44: shared tail of `parse_select_query`: parse the trailing
+    /// `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` and attach it to the
+    /// carrier (or to the plain SELECT when there are no set-ops).
+    fn finish_select_query(&mut self, mut carrier: SelectStmt) -> Result<SelectStmt, SqlError> {
+        let mut tail = empty_select();
+        self.parse_select_tail(&mut tail)?;
+        if let Some(root) = carrier.set_op.as_mut() {
+            if tail.for_update {
+                return Err(err(
+                    "syntax error: FOR UPDATE is not supported with set operations".to_string(),
+                ));
+            }
+            root.order_by = tail.order_by;
+            root.limit = tail.limit;
+            root.offset = tail.offset;
+        } else {
+            // No set-ops: plain SELECT; the tail belongs to it directly.
+            carrier.order_by = tail.order_by;
+            carrier.limit = tail.limit;
+            carrier.offset = tail.offset;
+            carrier.for_update = tail.for_update;
+        }
+        Ok(carrier)
+    }
+
+    /// v0.44: precedence-climbing for set operations. Parses
+    /// `left (OP [ALL|DISTINCT] right)*` for ops with precedence >=
+    /// `min_prec` (`INTERSECT` = 2, `UNION`/`EXCEPT` = 1). Returns `left`
+    /// with the chain accumulated on its carrier `set_op` (created on
+    /// first use), so equal-precedence ops stay left-associative while
+    /// tighter ops nest inside the right branch.
+    fn parse_set_chain(
+        &mut self,
+        mut left: SelectStmt,
+        min_prec: u8,
+    ) -> Result<SelectStmt, SqlError> {
+        // v0.44: the first operator in this invocation always creates a new
+        // carrier around `left` — even if `left` is already a carrier from
+        // a parenthesized subquery (which keeps its own ORDER BY/LIMIT).
+        // Subsequent operators in the same invocation append to that new
+        // carrier, preserving left-associativity for equal-precedence ops
+        // while tighter ops nest inside the right branch.
+        let mut first = true;
+        loop {
+            let (op, prec) = match self.peek() {
+                Token::Ident(kw) if kw == "union" && 1 >= min_prec => (SetOpKind::Union, 1),
+                Token::Ident(kw) if kw == "intersect" && 2 >= min_prec => (SetOpKind::Intersect, 2),
+                Token::Ident(kw) if kw == "except" && 1 >= min_prec => (SetOpKind::Except, 1),
+                _ => break,
+            };
+            self.next(); // consume the operator keyword
+            // `ALL` keeps duplicates; bare or `DISTINCT` deduplicates.
+            let all = if self.eat_keyword("all") {
+                true
+            } else {
+                self.eat_keyword("distinct");
+                false
+            };
+            let branch_stmt = self.parse_set_operand()?;
+            let right = self.parse_set_chain(branch_stmt, prec + 1)?;
+            let branch = SetOpBranch {
+                op,
+                all,
+                right: Box::new(right),
+            };
+            if first {
+                // First set-op in this invocation: wrap `left` as the
+                // carrier's left child.
+                let branch_stmt = std::mem::replace(&mut left, empty_select());
+                left.set_op = Some(Box::new(SetOpRoot {
+                    left: Box::new(branch_stmt),
+                    chain: vec![branch],
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                }));
+                first = false;
+            } else if let Some(root) = left.set_op.as_mut() {
+                // Subsequent equal-precedence op: append to our carrier.
+                root.chain.push(branch);
+            }
+        }
+        Ok(left)
     }
 
     /// FROM source [, ...] — commas become CROSS JOINs; explicit JOINs
