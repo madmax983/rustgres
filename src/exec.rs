@@ -10080,7 +10080,17 @@ fn project_row_expanded(
             }
         }
     }
-    let width = cols.iter().map(|(v, _)| v.len()).max().unwrap_or(0);
+    // v0.47: the fan-out width comes from the SRF columns only (PG19
+    // nodeProjectSet.c `ExecProjectSRF`: a row is produced only when at
+    // least one SRF yields a value — `hasresult`). Plain columns repeat
+    // and never create rows on their own, so an all-empty SRF set yields
+    // zero rows even next to plain columns.
+    let width = cols
+        .iter()
+        .filter(|(_, pad)| *pad)
+        .map(|(v, _)| v.len())
+        .max()
+        .unwrap_or(0);
     let mut out = Vec::with_capacity(width);
     for k in 0..width {
         let mut cells = Vec::with_capacity(cols.len());
@@ -10188,6 +10198,62 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
 /// With no GROUP BY and no input rows there is still exactly one (empty)
 /// group, so `SELECT count(*)` returns 0 rather than no rows — like
 /// Postgres. FOR UPDATE never reaches here (rejected in validation).
+/// v0.47: resolve GROUP BY ordinals to select-list expressions. PG19's
+/// parse analysis treats an integer literal in GROUP BY as an ordinal
+/// reference to the select list (`GROUP BY 1` groups by the first select
+/// item), never as a constant. Out-of-range ordinals — and ordinals
+/// pointing at `*` items, whose star expansion is unsupported in grouping
+/// keys — are 42803 ("GROUP BY position N is not in select list").
+fn resolve_group_ordinals(stmt: &SelectStmt) -> Result<Vec<Expr>, ExecError> {
+    let mut out = Vec::with_capacity(stmt.group_by.len());
+    for g in &stmt.group_by {
+        let ordinal = match g {
+            Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) => usize::try_from(*n).ok(),
+            _ => None,
+        };
+        match ordinal {
+            Some(n) if n >= 1 => match stmt.items.get(n - 1) {
+                Some(SelectItem::Expr { expr, .. }) => out.push(expr.clone()),
+                _ => {
+                    return Err(exec_err(
+                        "42803",
+                        format!("GROUP BY position {n} is not in select list"),
+                    ));
+                }
+            },
+            Some(n) => {
+                return Err(exec_err(
+                    "42803",
+                    format!("GROUP BY position {n} is not in select list"),
+                ));
+            }
+            None => out.push(g.clone()),
+        }
+    }
+    Ok(out)
+}
+
+/// v0.47: evaluate one GROUP BY key expression for a single input row,
+/// expanding a top-level SRF call to its output values (PG19's
+/// ProjectSet-below-Aggregate: one value per fanned-out row). Non-SRF
+/// keys yield exactly one value.
+fn eval_group_key_expanded(
+    q: &mut Q,
+    scopes: &[Scope],
+    key: &Expr,
+) -> Result<Vec<Value>, ExecError> {
+    if let Expr::Func { name, args } = key {
+        if is_srf(name) {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_expr(q, scopes, a)?);
+            }
+            return eval_srf_vals(name, &vals);
+        }
+    }
+    Ok(vec![eval_expr(q, scopes, key)?])
+}
+
 fn exec_agg(
     q: &mut Q,
     outer: &[Scope],
@@ -10199,9 +10265,29 @@ fn exec_agg(
     windows: &[ExecWindow],
 ) -> Result<Vec<OutRow>, ExecError> {
     // Group rows by their GROUP BY key, remembering first-seen order.
-    let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
+    // v0.47: GROUP BY ordinals resolve to select-list expressions (PG19
+    // parse analysis: `GROUP BY 1` groups by the first select item).
+    let group_keys = resolve_group_ordinals(stmt)?;
+    // v0.47: positions of top-level SRF calls in the grouping keys. When
+    // non-empty, input rows fan out per PG19's ProjectSet-below-Aggregate
+    // before grouping, and aggregates fold the expanded rows.
+    // v0.47: membership test for the SRF key positions, indexed by group
+    // key position.
+    let mut is_srf_key = vec![false; group_keys.len()];
+    for (i, g) in group_keys.iter().enumerate() {
+        if matches!(g, Expr::Func { name, .. } if is_srf(name)) {
+            is_srf_key[i] = true;
+        }
+    }
+    // v0.47: when any grouping key is an SRF, input rows fan out per
+    // PG19's ProjectSet-below-Aggregate before grouping, and aggregates
+    // fold the expanded rows.
+    let has_srf_keys = is_srf_key.iter().any(|&b| b);
+    // Expanded working rows (materialized only when SRF keys exist) and
+    // the per-row GROUP BY key values.
+    let mut xrows: Vec<QRow> = Vec::new();
+    let mut xkeys: Vec<Vec<Value>> = Vec::new();
+    for row in rows.iter() {
         let frame = Scope {
             schema,
             row: &row.cells,
@@ -10217,23 +10303,63 @@ fn exec_agg(
             scopes_storage = buf;
             &scopes_storage
         };
-        let mut key_vals = Vec::with_capacity(stmt.group_by.len());
-        let mut key_bytes = Vec::new();
-        for g in &stmt.group_by {
+        if !has_srf_keys {
             // GROUP BY exprs cannot contain aggregates (validated).
-            let v = eval_expr(q, scopes, g)?;
-            value_key(&v, &mut key_bytes);
-            key_vals.push(v);
+            let mut key_vals = Vec::with_capacity(group_keys.len());
+            for g in &group_keys {
+                key_vals.push(eval_expr(q, scopes, g)?);
+            }
+            xkeys.push(key_vals);
+        } else {
+            // v0.47: SRF-in-GROUP-BY expansion (PG19 nodeProjectSet.c
+            // `ExecProjectSRF`): each input row yields one row per SRF
+            // element; the width is the max SRF width, exhausted SRFs
+            // pad NULL, and an all-empty SRF set drops the row. Plain
+            // key expressions repeat their value on every fanned-out row.
+            let mut cols: Vec<Vec<Value>> = Vec::with_capacity(group_keys.len());
+            let mut width = 0;
+            for (ki, g) in group_keys.iter().enumerate() {
+                let vals = eval_group_key_expanded(q, scopes, g)?;
+                if is_srf_key[ki] {
+                    width = width.max(vals.len());
+                }
+                cols.push(vals);
+            }
+            for k in 0..width {
+                let mut key_vals = Vec::with_capacity(group_keys.len());
+                for (ki, vals) in cols.iter().enumerate() {
+                    if is_srf_key[ki] {
+                        key_vals.push(vals.get(k).cloned().unwrap_or(Value::Null));
+                    } else {
+                        key_vals.push(vals[0].clone());
+                    }
+                }
+                xrows.push(QRow {
+                    cells: row.cells.clone(),
+                    prov: row.prov.clone(),
+                });
+                xkeys.push(key_vals);
+            }
+        }
+    }
+    let rows_eff: &[QRow] = if !has_srf_keys { rows } else { &xrows };
+    // Group rows by their GROUP BY key, remembering first-seen order.
+    let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    for (i, key_vals) in xkeys.iter().enumerate() {
+        let mut key_bytes = Vec::new();
+        for v in key_vals {
+            value_key(v, &mut key_bytes);
         }
         match group_index.get(&key_bytes) {
             Some(&gi) => groups[gi].1.push(i),
             None => {
                 group_index.insert(key_bytes, groups.len());
-                groups.push((key_vals, vec![i]));
+                groups.push((key_vals.clone(), vec![i]));
             }
         }
     }
-    if groups.is_empty() && stmt.group_by.is_empty() {
+    if groups.is_empty() && group_keys.is_empty() {
         groups.push((Vec::new(), Vec::new()));
     }
     // v0.10: HAVING is evaluated BEFORE windows (Postgres: windows see
@@ -10241,7 +10367,7 @@ fn exec_agg(
     let mut surviving = Vec::with_capacity(groups.len());
     for (gi, (key_vals, idxs)) in groups.iter().enumerate() {
         let first: &[Value] = match idxs.first() {
-            Some(&i) => &rows[i].cells,
+            Some(&i) => &rows_eff[i].cells,
             None => &[],
         };
         let gscope = Scope {
@@ -10256,10 +10382,10 @@ fn exec_agg(
                 outer,
                 gscope,
                 schema,
-                rows,
+                rows_eff,
                 idxs,
                 key_vals,
-                &stmt.group_by,
+                &group_keys,
                 h,
             )?,
         };
@@ -10274,10 +10400,10 @@ fn exec_agg(
             q,
             outer,
             schema,
-            rows,
+            rows_eff,
             &groups,
             &surviving,
-            &stmt.group_by,
+            &group_keys,
             windows,
         )?;
         install_windows(q, windows, &inputs)?;
@@ -10311,7 +10437,7 @@ fn exec_agg(
         // of the group. Any correlated column must be group-bound for the
         // query to be valid, so every row in the group agrees on it.
         let (first, first_prov): (&[Value], Option<&[(String, u64)]>) = match idxs.first() {
-            Some(&i) => (&rows[i].cells, Some(&rows[i].prov)),
+            Some(&i) => (&rows_eff[i].cells, Some(&rows_eff[i].prov)),
             None => (&[], None),
         };
         let gscope = Scope {
@@ -10327,7 +10453,7 @@ fn exec_agg(
                     for c in schema.iter().filter(|c| !c.hidden) {
                         cells.push(grouped_col_value(
                             gscope,
-                            &stmt.group_by,
+                            &group_keys,
                             key_vals,
                             c.qual.as_str(),
                             &c.name,
@@ -10347,7 +10473,7 @@ fn exec_agg(
                         let c = &schema[i];
                         cells.push(grouped_col_value(
                             gscope,
-                            &stmt.group_by,
+                            &group_keys,
                             key_vals,
                             qual.as_str(),
                             &c.name,
@@ -10359,10 +10485,10 @@ fn exec_agg(
                     outer,
                     gscope,
                     schema,
-                    rows,
+                    rows_eff,
                     idxs,
                     key_vals,
-                    &stmt.group_by,
+                    &group_keys,
                     expr,
                 )?),
             }
@@ -10376,10 +10502,10 @@ fn exec_agg(
                     outer,
                     gscope,
                     schema,
-                    rows,
+                    rows_eff,
                     idxs,
                     key_vals,
-                    &stmt.group_by,
+                    &group_keys,
                     e,
                 )
             };
@@ -10571,6 +10697,18 @@ fn eval_grouped(
             eval_is_bool(&v, *neg, *val)
         }
         Expr::Func { name, args } => {
+            // v0.47: an SRF in the select list that is also a GROUP BY
+            // key reads the group's key value. PG19 expands such SRFs
+            // below the aggregate (ProjectSet under Agg), so the
+            // targetlist reference is the grouped value, not a fresh
+            // scalar call.
+            if is_srf(name) {
+                for (i, g) in group_by.iter().enumerate() {
+                    if e == g {
+                        return Ok(key_vals[i].clone());
+                    }
+                }
+            }
             // v0.37: pg_column_compression and pg_relation_size need
             // engine/provenance access; they cannot go through the pure
             // eval_func_vals path.
@@ -14896,17 +15034,36 @@ fn eval_table_function(
 }
 
 /// v0.32: set-returning functions that expand in the SELECT list (PG 19
-/// SRF-in-targetlist semantics). Unknown names are not SRFs.
+/// SRF-in-targetlist semantics). v0.47: `generate_series` joins
+/// `regexp_matches` — PG19's ProjectSet keeps SRFs at the top level of
+/// the targetlist (planner.c `adjust_paths_for_srfs`), which is exactly
+/// what this gate matches. Unknown names are not SRFs.
 fn is_srf(name: &str) -> bool {
-    matches!(name, "regexp_matches")
+    matches!(name, "regexp_matches" | "generate_series")
 }
 
 /// v0.32: evaluate a set-returning function to its output rows (one Value
 /// per row). Used by the SRF targetlist expansion.
+/// v0.47: `generate_series` reuses the FROM-clause table-function core
+/// (`eval_table_function`), flattened to one value per row — PG19's
+/// `generate_series` returns a single column.
 fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
     check_builtin_arity(name, vals)?;
     match name {
         "regexp_matches" => regexp_matches_rows(vals),
+        "generate_series" => {
+            let (_, rows) = eval_table_function(name, vals)?;
+            rows.into_iter()
+                .map(|mut r| {
+                    r.pop().ok_or_else(|| {
+                        exec_err(
+                            "XX000",
+                            "generate_series returned a row with no columns".to_string(),
+                        )
+                    })
+                })
+                .collect()
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {name} is not a set-returning function"),
@@ -18856,6 +19013,28 @@ fn func_result_type(
         "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
         // v0.45: format() returns text.
         "format" => Ok(ColType::Text),
+        // v0.47: SELECT-list SRF typing mirrors the FROM-clause table
+        // function (`table_function_col_types`): any numeric argument
+        // resolves to numeric, any bigint argument to bigint, otherwise
+        // int4 (unknown literals type as int4, like PG). Arity is
+        // checked here so Describe raises 42883 like PG's analysis.
+        "generate_series" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(exec_err(
+                    "42883",
+                    "function generate_series() does not exist".to_string(),
+                ));
+            }
+            let mut ty = ColType::Int;
+            for a in args {
+                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                    ColType::Numeric => return Ok(ColType::Numeric),
+                    ColType::BigInt => ty = ColType::BigInt,
+                    _ => {}
+                }
+            }
+            Ok(ty)
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -22646,6 +22825,161 @@ mod tests {
         .unwrap();
         let t = eng.db.tables["t41e"].last().unwrap();
         assert_eq!(t.col_compression, vec![None, None]);
+    }
+
+    /// v0.47: a top-level SRF call in the SELECT list fans each input
+    /// row out to one row per element (PG19 ProjectSet). The column is
+    /// named for the function and typed int4 for int literals.
+    #[test]
+    fn v47_select_list_srf_basic() {
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT generate_series(1, 3)").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].0, "generate_series");
+                assert_eq!(columns[0].1, ColType::Int);
+            }
+            _ => panic!("expected select"),
+        }
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ]
+        );
+    }
+
+    /// v0.47: plain select-list columns repeat on every fanned-out row;
+    /// an empty SRF set yields zero rows (PG19 `ExecProjectSRF`).
+    #[test]
+    fn v47_select_list_srf_repeat_and_empty() {
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT 1 AS t, generate_series(1, 3) AS x").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+                vec!["1".to_string(), "3".to_string()],
+            ]
+        );
+        let r = run(&mut eng, "SELECT generate_series(1, 0)").unwrap();
+        assert!(rows_of(r).is_empty());
+        // Strict: NULL input yields zero rows.
+        let r = run(&mut eng, "SELECT generate_series(NULL, 3)").unwrap();
+        assert!(rows_of(r).is_empty());
+    }
+
+    /// v0.47: multiple SRFs fan out to the max width; the exhausted one
+    /// pads NULL (PG19 `ExecProjectSRF` continuing rounds).
+    #[test]
+    fn v47_select_list_srf_multi_width() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "SELECT generate_series(1, 2), generate_series(10, 12)",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "11".to_string()],
+                vec!["NULL".to_string(), "12".to_string()],
+            ]
+        );
+    }
+
+    /// v0.47: SELECT-list SRF typing follows the FROM-clause rules
+    /// (int4/int8/numeric) and the error taxonomy is PG's.
+    #[test]
+    fn v47_select_list_srf_types_and_errors() {
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT generate_series(1::bigint, 2::bigint)").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => assert_eq!(columns[0].1, ColType::BigInt),
+            _ => panic!("expected select"),
+        }
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+        let r = run(&mut eng, "SELECT generate_series(1.5, 2.5)").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => assert_eq!(columns[0].1, ColType::Numeric),
+            _ => panic!("expected select"),
+        }
+        let err = run(&mut eng, "SELECT generate_series(1, 3, 0)").unwrap_err();
+        assert_eq!(err.code, "22023");
+        let err = run(&mut eng, "SELECT generate_series(1)").unwrap_err();
+        assert_eq!(err.code, "42883");
+        let err = run(&mut eng, "SELECT generate_series('a', 'b')").unwrap_err();
+        assert_eq!(err.code, "42883");
+    }
+
+    /// v0.47: GROUP BY ordinals resolve to select-list expressions (PG19
+    /// parse analysis), never to constants.
+    #[test]
+    fn v47_group_by_ordinal() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "SELECT id, count(*) FROM users GROUP BY 1 ORDER BY 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+                vec!["3".to_string(), "1".to_string()],
+            ]
+        );
+        // Out-of-range ordinals are 42803, like PG.
+        let err = run(&mut eng, "SELECT id FROM users GROUP BY 5").unwrap_err();
+        assert_eq!(err.code, "42803");
+        let err = run(&mut eng, "SELECT id FROM users GROUP BY 0").unwrap_err();
+        assert_eq!(err.code, "42803");
+    }
+
+    /// v0.47: an SRF in the GROUP BY keys expands below the aggregate
+    /// (PG19 ProjectSet under Agg): each input row fans out per SRF
+    /// element and aggregates fold the expanded rows.
+    #[test]
+    fn v47_group_by_srf_expands_below_agg() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE gs_ten(ten int)").unwrap();
+        run(&mut eng, "INSERT INTO gs_ten VALUES (0), (1), (2), (1)").unwrap();
+        // Expansions: 0 -> {}, 1 -> {1}, 2 -> {1,2}, 1 -> {1}:
+        // g=1 has 3 rows, g=2 has 1 row.
+        let r = run(
+            &mut eng,
+            "SELECT generate_series(1, ten) AS g, count(*) FROM gs_ten GROUP BY 1 ORDER BY 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "3".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+            ]
+        );
+        // The explicit-expression form groups identically.
+        let r = run(
+            &mut eng,
+            "SELECT generate_series(1, ten) AS g, count(*) FROM gs_ten GROUP BY generate_series(1, ten) ORDER BY 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "3".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+            ]
+        );
     }
 }
 
