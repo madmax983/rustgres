@@ -619,7 +619,13 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\bcurrent_setting\s*\(", "current_setting() unsupported"),
     (r"\btableoid\b", "tableoid system column unsupported"),
     (r"\bxmin\b|\bxmax\b", "xmin/xmax system columns unsupported"),
-    (r"\bgenerate_series\s*\(", "generate_series() unsupported"),
+    # v0.46: generate_series(int/int8/numeric) is supported as a
+    # FROM-clause table function, including implicit LATERAL
+    # (`FROM t, f(t.x)`). Still unsupported and kept masked: the
+    # timestamp/timestamptz variants, and empty SELECT lists.
+    (r"(?i)\bgenerate_series\s*\([^)]*::\s*(timestamp|timestamptz)\b",
+     "generate_series() timestamp variant unsupported"),
+    (r"(?i)\bselect\s+from\b", "empty SELECT list unsupported"),
     (r"\bgen_random_uuid\s*\(", "gen_random_uuid() unsupported"),
     (r"\bquote_ident\s*\(|\bquote_literal\s*\(", "quote_*() unsupported"),
     (r"\bOVER\s*\(", "window functions in this construct unsupported"),

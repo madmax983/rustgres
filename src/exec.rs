@@ -45,8 +45,9 @@ use crate::sql::{
     collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ColStats, ColType, Database, Engine, Numeric, Row, RowVersion, Sequence, ShellType, Snapshot,
-    Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
+    ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row, RowVersion, Sequence,
+    ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts,
+    toast_storage,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -5869,7 +5870,7 @@ fn eval_set_op(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOu
         let right = run_select(q, &b.right, outer)?;
         acc = combine_set_branches(b.op, b.all, acc, right)?;
     }
-    apply_setop_tail(q, outer, root, acc)
+    apply_setop_tail(outer, root, acc)
 }
 
 /// v0.44: combine two branch results with one set operator.
@@ -6094,12 +6095,20 @@ fn except_all_rows(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>, ExecErro
 /// v0.44: apply the set-operation root's `ORDER BY` / `OFFSET` / `LIMIT`
 /// to the combined rows.
 fn apply_setop_tail(
-    q: &mut Q,
     outer: &[Scope],
     root: &SetOpRoot,
     mut acc: SelectOut,
 ) -> Result<SelectOut, ExecError> {
     if !root.order_by.is_empty() {
+        // v0.46: validate the sort terms once up front, before touching any
+        // rows. PG resolves set-operation ORDER BY at analysis time against
+        // the leftmost branch's output names (see transformSetOperationStmt:
+        // "make lists of the dummy vars and their names for use in parsing
+        // ORDER BY"), so an invalid term must fail even when the combined
+        // result is empty (e.g. `... EXCEPT ...` with no surviving rows).
+        for term in &root.order_by {
+            validate_setop_sort_term(term, &acc.columns)?;
+        }
         // Build a scope over the combined output so ORDER BY expressions
         // can reference output columns by name.
         let schema: Vec<QCol> = acc
@@ -6123,7 +6132,7 @@ fn apply_setop_tail(
             let scopes = [scope];
             let mut keys = Vec::with_capacity(root.order_by.len());
             for term in &root.order_by {
-                keys.push(eval_setop_sort_key(q, &scopes, outer, term, &acc.columns)?);
+                keys.push(eval_setop_sort_key(&scopes, outer, term, &acc.columns)?);
             }
             keyed.push((keys, row));
         }
@@ -6164,24 +6173,22 @@ fn apply_setop_tail(
     Ok(acc)
 }
 
-/// v0.44: evaluate one ORDER BY term of a set operation. PG restricts
-/// set-operation ORDER BY to output-column ordinals (integer literals)
-/// or bare output-column names. Anything else — including names that are
-/// not output columns — is an error (SQLSTATE 42703).
-fn eval_setop_sort_key(
-    q: &mut Q,
-    scopes: &[Scope],
-    _outer: &[Scope],
+/// v0.46: validate one set-operation ORDER BY term against the combined
+/// output columns, without needing any row data. Split out of
+/// `eval_setop_sort_key` so the terms are checked once up front in
+/// `apply_setop_tail` — PG raises 42703/42803 at analysis time, i.e. even
+/// when the result is empty.
+fn validate_setop_sort_term(
     term: &OrderTerm,
     columns: &[(String, ColType)],
-) -> Result<Value, ExecError> {
+) -> Result<(), ExecError> {
     let ordinal: Option<usize> = match &term.expr {
         Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) if *n >= 1 => usize::try_from(*n).ok(),
         _ => None,
     };
     if let Some(n) = ordinal {
         if n <= columns.len() {
-            return Ok(scopes[0].row[n - 1].clone());
+            return Ok(());
         }
         return Err(exec_err(
             "42803",
@@ -6190,10 +6197,11 @@ fn eval_setop_sort_key(
     }
     // Bare column name: must match an output column.
     if let Expr::Column { name, .. } = &term.expr {
-        for (i, (col_name, _)) in columns.iter().enumerate() {
-            if col_name.eq_ignore_ascii_case(name) {
-                return Ok(scopes[0].row[i].clone());
-            }
+        if columns
+            .iter()
+            .any(|(col_name, _)| col_name.eq_ignore_ascii_case(name))
+        {
+            return Ok(());
         }
         return Err(exec_err(
             "42703",
@@ -6201,6 +6209,39 @@ fn eval_setop_sort_key(
         ));
     }
     // Arbitrary expressions are not allowed in set-operation ORDER BY.
+    Err(exec_err(
+        "42703",
+        "ORDER BY expressions must be output column names or ordinals".to_string(),
+    ))
+}
+
+/// v0.44: evaluate one ORDER BY term of a set operation. PG restricts
+/// set-operation ORDER BY to output-column ordinals (integer literals)
+/// or bare output-column names. Anything else — including names that are
+/// not output columns — is an error (SQLSTATE 42703).
+fn eval_setop_sort_key(
+    scopes: &[Scope],
+    _outer: &[Scope],
+    term: &OrderTerm,
+    columns: &[(String, ColType)],
+) -> Result<Value, ExecError> {
+    // Terms were validated up front in `apply_setop_tail`; re-validate
+    // here so this function's contract holds for every caller.
+    validate_setop_sort_term(term, columns)?;
+    if let Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) = &term.expr {
+        let i = usize::try_from(*n).unwrap_or(0);
+        if i >= 1 && i <= columns.len() {
+            return Ok(scopes[0].row[i - 1].clone());
+        }
+    }
+    if let Expr::Column { name, .. } = &term.expr {
+        for (i, (col_name, _)) in columns.iter().enumerate() {
+            if col_name.eq_ignore_ascii_case(name) {
+                return Ok(scopes[0].row[i].clone());
+            }
+        }
+    }
+    // Unreachable: the term validated above.
     Err(exec_err(
         "42703",
         "ORDER BY expressions must be output column names or ordinals".to_string(),
@@ -8211,6 +8252,11 @@ fn build_from(
     let mut acc_schema: Vec<QCol> = Vec::new();
     let mut acc_rows = vec![QRow::default()];
     for item in from {
+        // v0.46: the parser folds comma-separated FROM items into CROSS
+        // JOINs (`parse_from` in sql.rs), so `from` always holds exactly
+        // one item. Implicit LATERAL for comma joins (`FROM t, f(t.x)`)
+        // is handled in the Join arm of `build_source` below, where the
+        // left row is in scope when the function is evaluated.
         let (s2, mut r2) = build_source(q, outer, item, where_, need_prov, None, None)?;
         // Comma joins are inner joins: a WHERE conjunct that mentions only
         // this item's columns can filter its rows before the cross product.
@@ -8871,6 +8917,188 @@ fn combine_join_pair(l: &QRow, r: &QRow, layout: &JoinLayout, kind: JoinKind) ->
     }
 }
 
+/// v0.46: output column names of a table function, without evaluating
+/// its arguments. Every current table function names its columns
+/// independently of the argument values (`generate_series` and
+/// `regexp_split_to_table` use the function name; `pg_input_error_info`
+/// uses PG19's OUT parameter names). Used for the empty-input side of
+/// an implicit-LATERAL join, where PG still reports the function's
+/// columns with zero rows.
+fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecError> {
+    match name {
+        "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
+        "pg_input_error_info" => Ok(["message", "detail", "hint", "sql_error_code"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()),
+        _ => Err(exec_err(
+            "42883",
+            format!("function {name}() does not exist"),
+        )),
+    }
+}
+
+/// v0.46: output column types of a table function, resolved from the
+/// evaluated argument values. `generate_series` reports PG's real
+/// signatures (int4/int8/numeric, so the wire RowDescription carries
+/// the right OIDs); the other table functions return text.
+fn table_function_col_types(name: &str, vals: &[Value]) -> Result<Vec<ColType>, ExecError> {
+    match name {
+        "regexp_split_to_table" => Ok(vec![ColType::Text]),
+        "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
+        "generate_series" => {
+            // PG resolves mixed int/numeric to the numeric signature and
+            // int4/int8 mixes to int8 (implicit casts); all-NULL (strict,
+            // zero rows) defaults to int4, like PG's unknown literals.
+            let ty = if vals.iter().any(|v| matches!(v, Value::Numeric(_))) {
+                ColType::Numeric
+            } else if vals.iter().any(|v| matches!(v, Value::BigInt(_))) {
+                ColType::BigInt
+            } else {
+                ColType::Int
+            };
+            Ok(vec![ty])
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {name}() does not exist"),
+        )),
+    }
+}
+
+/// v0.46: the output schema of a function FROM item: the PG 19 column
+/// alias arity rule (more aliases than columns is 42601), then the
+/// v0.32/v0.43 naming (single-column functions take the table alias
+/// when present, else the function name; explicit column aliases win;
+/// multi-column functions keep their OUT names unless aliased
+/// positionally).
+fn function_item_schema(
+    name: &str,
+    col_names: &[String],
+    col_types: &[ColType],
+    alias: &Option<String>,
+    col_aliases: &[String],
+) -> Result<Vec<QCol>, ExecError> {
+    let qual = alias.clone().unwrap_or_else(|| name.to_string());
+    // PG 19 arity rule for column aliases (more aliases than
+    // columns is 42601), via check_col_alias_arity.
+    check_col_alias_arity(&qual, col_names.len(), col_aliases)?;
+    debug_assert_eq!(
+        col_names.len(),
+        col_types.len(),
+        "table function names and types run in parallel"
+    );
+    let ncols = col_names.len();
+    Ok(col_names
+        .iter()
+        .enumerate()
+        .map(|(i, cn)| {
+            let col_name = col_aliases
+                .get(i)
+                .cloned()
+                .or_else(|| if ncols == 1 { alias.clone() } else { None })
+                .unwrap_or_else(|| cn.clone());
+            QCol {
+                qual: qual.clone(),
+                name: col_name,
+                ty: col_types.get(i).copied().unwrap_or(ColType::Text),
+                hidden: false,
+                src_ord: i as u32,
+            }
+        })
+        .collect())
+}
+
+/// v0.46: evaluate one function FROM item against `scopes`: argument
+/// expressions, then the table function, then schema and rows. The
+/// caller chooses the scope chain — the outer query's scopes for the
+/// uncorrelated case, one accumulated input row per call for implicit
+/// LATERAL.
+fn eval_function_item(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+    alias: &Option<String>,
+    col_aliases: &[String],
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    let mut arg_vals = Vec::with_capacity(args.len());
+    for a in args {
+        arg_vals.push(eval_expr(q, scopes, a)?);
+    }
+    let (col_names, row_vals) = eval_table_function(name, &arg_vals)?;
+    // v0.46: PG's real output types (generate_series is int4/int8/
+    // numeric, so the wire RowDescription carries the right OIDs and
+    // the harness canonicalizes numerics by value, not by text).
+    let col_types = table_function_col_types(name, &arg_vals)?;
+    let schema = function_item_schema(name, &col_names, &col_types, alias, col_aliases)?;
+    let rows = row_vals
+        .into_iter()
+        .map(|cells| QRow {
+            cells: Row::new(cells),
+            prov: Vec::new(),
+        })
+        .collect();
+    Ok((schema, rows))
+}
+
+/// v0.46: true when a function FROM item's argument expressions reference
+/// columns of the FROM items already accumulated to its left. PG treats
+/// `FROM t, f(t.x)` as implicit LATERAL; such functions are re-evaluated
+/// once per input row instead of once per query.
+fn function_args_lateral(args: &[Expr], acc_schema: &[QCol]) -> bool {
+    let mut refs = Vec::new();
+    for a in args {
+        collect_column_refs(a, &mut refs);
+    }
+    refs.iter().any(|(qt, nm)| match qt {
+        Some(t) => acc_schema.iter().any(|c| c.qual == *t),
+        None => acc_schema.iter().any(|c| c.name == *nm),
+    })
+}
+
+/// v0.46: output schema of a table function in an implicit-LATERAL
+/// position, inferred statically from the argument *types* against the
+/// left input's schema. Row values aren't available (and must not
+/// matter): like a declared return type, the schema is fixed per query,
+/// so an empty left input still yields the right schema. Only
+/// `generate_series` has a type-dependent schema — the same
+/// int4/int8/numeric resolution as `table_function_col_types`; every
+/// other table function is all-text. Shared by the executor and the
+/// Describe path so wire OIDs agree with execution.
+#[allow(clippy::too_many_arguments)]
+fn lateral_function_schema(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+    args: &[Expr],
+    alias: &Option<String>,
+    col_aliases: &[String],
+    left: &[QCol],
+) -> Result<Vec<QCol>, ExecError> {
+    let out_names = table_function_col_names(name)?;
+    let col_types: Vec<ColType> = if name == "generate_series" {
+        let schemas = [left];
+        let mut tys = Vec::with_capacity(args.len());
+        for a in args {
+            tys.push(expr_type(eng, snap, own, session, &schemas, &[], a)?);
+        }
+        let ty = if tys.iter().any(|t| matches!(t, ColType::Numeric)) {
+            ColType::Numeric
+        } else if tys.iter().any(|t| matches!(t, ColType::BigInt)) {
+            ColType::BigInt
+        } else {
+            ColType::Int
+        };
+        vec![ty]
+    } else {
+        vec![ColType::Text; out_names.len()]
+    };
+    function_item_schema(name, &out_names, &col_types, alias, col_aliases)
+}
+
 fn build_source(
     q: &mut Q,
     outer: &[Scope],
@@ -9194,57 +9422,15 @@ fn build_source(
             Ok((apply_aliases(schema)?, rows))
         }
         // v0.32: set-returning table function (`regexp_split_to_table`).
-        // Uncorrelated (no LATERAL): args evaluate against the outer
-        // scope chain only, once per query.
+        // v0.46: args may reference preceding FROM items (implicit
+        // LATERAL); the caller selects the scope chain, so this arm just
+        // evaluates against whatever scopes it is given, once per call.
         FromItem::Function {
             name,
             args,
             alias,
             col_aliases,
-        } => {
-            let mut arg_vals = Vec::with_capacity(args.len());
-            for a in args {
-                arg_vals.push(eval_expr(q, outer, a)?);
-            }
-            let (col_names, row_vals) = eval_table_function(name, &arg_vals)?;
-            let qual = alias.clone().unwrap_or_else(|| name.clone());
-            // PG 19 arity rule for column aliases (more aliases than
-            // columns is 42601), via check_col_alias_arity.
-            check_col_alias_arity(&qual, col_names.len(), col_aliases)?;
-            // v0.32: a single-column function scan's column takes the
-            // table alias when one is present (PG: `SELECT * FROM
-            // generate_series(1,3) AS g` shows header `g`), else the
-            // function name; explicit column aliases win. v0.43:
-            // multi-column functions (pg_input_error_info) keep the
-            // function's OUT column names unless aliased positionally.
-            let ncols = col_names.len();
-            let schema: Vec<QCol> = col_names
-                .into_iter()
-                .enumerate()
-                .map(|(i, cn)| {
-                    let col_name = col_aliases
-                        .get(i)
-                        .cloned()
-                        .or_else(|| if ncols == 1 { alias.clone() } else { None })
-                        .unwrap_or(cn);
-                    QCol {
-                        qual: qual.clone(),
-                        name: col_name,
-                        ty: ColType::Text,
-                        hidden: false,
-                        src_ord: i as u32,
-                    }
-                })
-                .collect();
-            let rows = row_vals
-                .into_iter()
-                .map(|cells| QRow {
-                    cells: Row::new(cells),
-                    prov: Vec::new(),
-                })
-                .collect();
-            Ok((schema, rows))
-        }
+        } => eval_function_item(q, outer, name, args, alias, col_aliases),
         FromItem::Derived {
             sub,
             alias,
@@ -9369,6 +9555,84 @@ fn build_source(
             col_aliases,
         } => {
             let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None)?;
+            // v0.46: implicit LATERAL. Comma-separated FROM items parse
+            // into CROSS JOINs (`parse_from` in sql.rs), so `FROM t,
+            // f(t.x)` arrives here with the function on the right. When
+            // the right side is a table function whose arguments
+            // reference the left side's columns, PG re-evaluates the
+            // function once per left row (as if LATERAL). Only plain
+            // comma joins qualify: an explicit ON/USING/NATURAL (or a
+            // join-level alias) is a true join, not a comma.
+            let lateral = match (kind, on, using_alias) {
+                (JoinKind::Cross, None, None)
+                    if using.is_empty() && !natural && alias.is_none() =>
+                {
+                    match right.as_ref() {
+                        FromItem::Function {
+                            name,
+                            args,
+                            alias: falias,
+                            col_aliases,
+                        } if function_args_lateral(args, &lschema0) => Some((
+                            name.as_str(),
+                            args.as_slice(),
+                            falias,
+                            col_aliases.as_slice(),
+                        )),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((fname, fargs, falias, fcol_aliases)) = lateral {
+                // Static output schema from the argument *types* against
+                // the left schema (no row values yet — like a declared
+                // return type), so an empty left input still gets the
+                // right schema. Same merged layout as a regular join, so
+                // the describe path and execution agree exactly.
+                let rschema0 = lateral_function_schema(
+                    &*q.eng,
+                    q.snap,
+                    q.own,
+                    q.session,
+                    fname,
+                    fargs,
+                    falias,
+                    fcol_aliases,
+                    &lschema0,
+                )?;
+                let layout = plan_join(
+                    &lschema0,
+                    &rschema0,
+                    using,
+                    *natural,
+                    using_alias.as_deref(),
+                    alias.as_deref(),
+                    col_aliases,
+                )?;
+                let schema = layout.schema.clone();
+                let mut rows = Vec::new();
+                for l in &lrows0 {
+                    // The left row is the innermost scope when the
+                    // function's arguments are evaluated (PG's LATERAL
+                    // semantics); outer scopes stay visible behind it.
+                    let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                    scopes.extend_from_slice(outer);
+                    scopes.push(Scope {
+                        schema: &lschema0,
+                        row: &l.cells,
+                        prov: None,
+                    });
+                    let (_, frows) =
+                        eval_function_item(q, &scopes, fname, fargs, falias, fcol_aliases)?;
+                    // Inner-join semantics: a left row whose function
+                    // yields no rows contributes nothing.
+                    for f in &frows {
+                        rows.push(combine_join_pair(l, f, &layout, *kind));
+                    }
+                }
+                return Ok((schema, rows));
+            }
             let (rschema0, rrows0) = build_source(q, outer, right, where_, need_prov, None, None)?;
             // v0.23: resolve merged columns and the output layout (shared
             // with the describe path so both agree exactly).
@@ -13759,6 +14023,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
         "regexp_split_to_table" => (2..=3).contains(&n),
+        // v0.46: generate_series(int,int[,int]) / (bigint,bigint[,bigint])
+        // / (numeric,numeric[,numeric]) — PG19 int.c, int8.c, numeric.c.
+        "generate_series" => (2..=3).contains(&n),
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
         // v0.43: pg_input_error_info(input, type) -> record (table
@@ -14353,6 +14620,150 @@ fn regexp_matches_rows(vals: &[Value]) -> Result<Vec<Value>, ExecError> {
 }
 
 /// v0.32: table functions usable in FROM — currently
+/// v0.46: classified `generate_series` argument (PG19 int.c, int8.c,
+/// numeric.c). Only the numeric-capable signatures are supported.
+enum GsArg {
+    /// SmallInt/Int kinds (Value::Int always holds i32-range values).
+    Int(i64),
+    Big(i64),
+    Num(Numeric),
+}
+
+impl GsArg {
+    fn as_i64(&self) -> i64 {
+        match self {
+            GsArg::Int(i) | GsArg::Big(i) => *i,
+            GsArg::Num(_) => unreachable!("int path takes no numeric args"),
+        }
+    }
+
+    fn as_numeric(&self) -> Numeric {
+        match self {
+            GsArg::Int(i) | GsArg::Big(i) => Numeric::new(*i as i128, 0),
+            GsArg::Num(n) => n.clone(),
+        }
+    }
+}
+
+/// v0.46: integer `generate_series` core, reproducing PG19's
+/// `generate_series_step_int4` / `generate_series_step_int8` exactly:
+/// step 0 is 22023, and when the successor of an emitted value would
+/// overflow the C type, the emitted value is still the final row
+/// (`pg_add_s32/s64_overflow` semantics). The i128 accumulator makes
+/// the overflow test exact at both widths.
+fn generate_series_int(args: &[GsArg], is_big: bool) -> Result<Vec<Vec<Value>>, ExecError> {
+    let start = args[0].as_i64() as i128;
+    let finish = args[1].as_i64() as i128;
+    let step = if args.len() > 2 {
+        args[2].as_i64() as i128
+    } else {
+        1
+    };
+    if step == 0 {
+        return Err(exec_err("22023", "step size cannot equal zero"));
+    }
+    let hi: i128 = if is_big {
+        i64::MAX as i128
+    } else {
+        i32::MAX as i128
+    };
+    let lo: i128 = if is_big {
+        i64::MIN as i128
+    } else {
+        i32::MIN as i128
+    };
+    let mut rows = Vec::new();
+    let mut cur = start;
+    if step > 0 {
+        while cur <= finish {
+            rows.push(vec![if is_big {
+                Value::BigInt(cur as i64)
+            } else {
+                // v0.46: cur is within [start, finish], both i32-range.
+                Value::Int(cur as i64)
+            }]);
+            // PG emits `cur`, then stops if `cur + step` overflows.
+            if cur + step > hi {
+                break;
+            }
+            cur += step;
+        }
+    } else {
+        while cur >= finish {
+            rows.push(vec![if is_big {
+                Value::BigInt(cur as i64)
+            } else {
+                Value::Int(cur as i64)
+            }]);
+            if cur + step < lo {
+                break;
+            }
+            cur += step;
+        }
+    }
+    Ok(rows)
+}
+
+/// v0.46: numeric `generate_series`, per PG19 numeric.c
+/// `generate_series_step_numeric`: NaN/infinity start/stop/step are
+/// 22023 with PG's messages (checked start, stop, step, in that order,
+/// before the zero-step check); otherwise emit while `cur` has not
+/// passed `stop` in the step's direction. A sum that overflows the
+/// i128 mantissa is 22023 "numeric field overflow", like the `+`
+/// operator.
+fn generate_series_numeric(args: &[GsArg]) -> Result<Vec<Vec<Value>>, ExecError> {
+    let start = args[0].as_numeric();
+    let stop = args[1].as_numeric();
+    let step = if args.len() > 2 {
+        args[2].as_numeric()
+    } else {
+        Numeric::new(1, 0)
+    };
+    for (label, v) in [("start", &start), ("stop", &stop)] {
+        match v.special {
+            NumericSpecial::NaN => {
+                return Err(exec_err("22023", format!("{label} value cannot be NaN")));
+            }
+            NumericSpecial::PosInf | NumericSpecial::NegInf => {
+                return Err(exec_err(
+                    "22023",
+                    format!("{label} value cannot be infinity"),
+                ));
+            }
+            NumericSpecial::Finite => {}
+        }
+    }
+    match step.special {
+        NumericSpecial::NaN => {
+            return Err(exec_err("22023", "step size cannot be NaN"));
+        }
+        NumericSpecial::PosInf | NumericSpecial::NegInf => {
+            return Err(exec_err("22023", "step size cannot be infinity"));
+        }
+        NumericSpecial::Finite => {}
+    }
+    if step.is_zero() {
+        return Err(exec_err("22023", "step size cannot equal zero"));
+    }
+    let step_pos = step.unscaled > 0;
+    let mut rows = Vec::new();
+    let mut cur = start;
+    loop {
+        let ord = cur.cmp(&stop);
+        if step_pos && ord == Ordering::Greater {
+            break;
+        }
+        if !step_pos && ord == Ordering::Less {
+            break;
+        }
+        rows.push(vec![Value::Numeric(cur.clone())]);
+        cur = cur
+            .checked_add(&step)
+            .ok_or_else(|| exec_err("22023", "numeric field overflow"))?;
+    }
+    Ok(rows)
+}
+
 /// `regexp_split_to_table(string, pattern [, flags])` (PG 19). Returns one
 /// value per split piece. NULL input yields zero rows; the 'g' flag is
 /// rejected (the split is internally global, like PG).
@@ -14429,6 +14840,46 @@ fn eval_table_function(
                 Err(PgInputFailure::Hard(e)) => return Err(e),
             };
             Ok((cols, vec![row]))
+        }
+        // v0.46: generate_series(int,int[,int]) / (bigint,bigint[,bigint])
+        // / (numeric,numeric[,numeric]) — PG19 int.c, int8.c, numeric.c
+        // (`generate_series_step_int4/int8`, `generate_series_numeric`).
+        // Strict: any NULL argument yields zero rows (proisstrict is the
+        // initdb default 't', like abs()). The timestamp/interval forms
+        // stay 42883 (unsupported), as do non-numeric argument types.
+        "generate_series" => {
+            let mut has_num = false;
+            let mut has_big = false;
+            let mut gs_args: Vec<GsArg> = Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => return Ok((vec![name.to_string()], Vec::new())),
+                    Value::SmallInt(i) => gs_args.push(GsArg::Int(*i as i64)),
+                    Value::Int(i) => gs_args.push(GsArg::Int(*i)),
+                    Value::BigInt(i) => {
+                        has_big = true;
+                        gs_args.push(GsArg::Big(*i));
+                    }
+                    Value::Numeric(n) => {
+                        has_num = true;
+                        gs_args.push(GsArg::Num(n.clone()));
+                    }
+                    // v0.32 convention: strict, no implicit casts (like
+                    // str_arg); PG's "function does not exist" for a bad
+                    // signature is 42883.
+                    other => return Err(func_arg_err(name, other)),
+                }
+            }
+            // PG resolves mixed int/numeric to the numeric signature and
+            // int4/int8 mixes to int8 (implicit casts); Value::Int always
+            // holds i32-range values (literals outside it parse as
+            // BigInt), so the int4 path needs no range check.
+            let rows = if has_num {
+                generate_series_numeric(&gs_args)?
+            } else {
+                generate_series_int(&gs_args, has_big)?
+            };
+            Ok((vec![name.to_string()], rows))
         }
         _ => Err(exec_err(
             "42883",
@@ -18817,56 +19268,30 @@ fn from_schema_item(
         }
         // v0.32: table functions describe as their output columns (all
         // text); unknown functions are 42883. v0.43: pg_input_error_info
-        // describes as PG's four OUT columns.
+        // describes as PG's four OUT columns. v0.46: shared
+        // table_function_col_names (adds generate_series); the schema is
+        // statically inferred from the argument types (same helper as
+        // the executor), so wire OIDs match execution. Prior FROM items
+        // (`out`) are visible to the arguments, as in the executor.
         FromItem::Function {
             name,
+            args,
             alias,
             col_aliases,
-            ..
         } => {
-            // v0.43: output column names per function (PG19 pg_proc.dat
-            // OUT parameter names for pg_input_error_info).
-            let out_names: Vec<String> = match name.as_str() {
-                "regexp_split_to_table" => vec![name.clone()],
-                "pg_input_error_info" => ["message", "detail", "hint", "sql_error_code"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                _ => {
-                    return Err(exec_err(
-                        "42883",
-                        format!("function {name}() does not exist"),
-                    ));
-                }
-            };
-            let qual = alias.clone().unwrap_or_else(|| name.clone());
-            check_col_alias_arity(&qual, out_names.len(), col_aliases)?;
-            // v0.32: single-column function scan — the column takes the
-            // table alias when present (see build_source), else the
-            // function name; explicit column aliases win. v0.43:
-            // multi-column functions keep their OUT names unless aliased.
-            let ncols = out_names.len();
-            out.push(
-                out_names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, cn)| {
-                        let col_name = col_aliases
-                            .get(i)
-                            .cloned()
-                            .or_else(|| if ncols == 1 { alias.clone() } else { None })
-                            .unwrap_or(cn);
-                        QCol {
-                            qual: qual.clone(),
-                            name: col_name,
-                            ty: ColType::Text,
-
-                            hidden: false,
-                            src_ord: i as u32,
-                        }
-                    })
-                    .collect(),
-            );
+            let left: Vec<QCol> = out.iter().flatten().cloned().collect();
+            let cols = lateral_function_schema(
+                eng,
+                snap,
+                own,
+                session,
+                name,
+                args,
+                alias,
+                col_aliases,
+                &left,
+            )?;
+            out.push(cols);
             Ok(())
         }
         // v0.14: VALUES columns are `column1`, ... typed from the first
@@ -18910,6 +19335,7 @@ fn from_schema_item(
         FromItem::Join {
             left,
             right,
+            kind,
             using,
             natural,
             using_alias,
@@ -18921,10 +19347,37 @@ fn from_schema_item(
             // as the executor builds), not two side-by-side schemas.
             let mut l: Vec<Vec<QCol>> = Vec::new();
             from_schema_item(eng, snap, own, session, left, &mut l, visible, bindings)?;
-            let mut r: Vec<Vec<QCol>> = Vec::new();
-            from_schema_item(eng, snap, own, session, right, &mut r, visible, bindings)?;
             let lflat: Vec<QCol> = l.into_iter().flatten().collect();
-            let rflat: Vec<QCol> = r.into_iter().flatten().collect();
+            // v0.46: implicit LATERAL (comma joins parse into CROSS
+            // JOINs): a right-side table function referencing left
+            // columns gets its schema from static arg-type inference
+            // against the left schema — the same helper the executor
+            // uses, so Describe and execution agree.
+            let rflat: Vec<QCol> = match (kind, right.as_ref()) {
+                (
+                    JoinKind::Cross,
+                    FromItem::Function {
+                        name,
+                        args,
+                        alias: falias,
+                        col_aliases: fca,
+                    },
+                ) if using.is_empty()
+                    && !natural
+                    && using_alias.is_none()
+                    && alias.is_none()
+                    && function_args_lateral(args, &lflat) =>
+                {
+                    lateral_function_schema(
+                        eng, snap, own, session, name, args, falias, fca, &lflat,
+                    )?
+                }
+                _ => {
+                    let mut r: Vec<Vec<QCol>> = Vec::new();
+                    from_schema_item(eng, snap, own, session, right, &mut r, visible, bindings)?;
+                    r.into_iter().flatten().collect()
+                }
+            };
             let layout = plan_join(
                 &lflat,
                 &rflat,
