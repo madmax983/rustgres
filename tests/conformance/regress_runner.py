@@ -618,7 +618,6 @@ EXPECTED_FAIL_PATTERNS = [
     (r"::\s*regclass\b|::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
      "reg* pseudotypes unsupported"),
     (r"\bcurrent_setting\s*\(", "current_setting() unsupported"),
-    (r"\bpg_input_error_info\s*\(", "pg_input_error_info() builtin missing"),
     (r"\btableoid\b", "tableoid system column unsupported"),
     (r"\bxmin\b|\bxmax\b", "xmin/xmax system columns unsupported"),
     (r"\bgenerate_series\s*\(", "generate_series() unsupported"),

@@ -8833,31 +8833,40 @@ fn build_source(
             for a in args {
                 arg_vals.push(eval_expr(q, outer, a)?);
             }
-            let row_vals = eval_table_function(name, &arg_vals)?;
+            let (col_names, row_vals) = eval_table_function(name, &arg_vals)?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             // PG 19 arity rule for column aliases (more aliases than
             // columns is 42601), via check_col_alias_arity.
-            check_col_alias_arity(&qual, 1, col_aliases)?;
+            check_col_alias_arity(&qual, col_names.len(), col_aliases)?;
             // v0.32: a single-column function scan's column takes the
             // table alias when one is present (PG: `SELECT * FROM
             // generate_series(1,3) AS g` shows header `g`), else the
-            // function name; explicit column aliases win.
-            let col_name = col_aliases
-                .first()
-                .cloned()
-                .or(alias.clone())
-                .unwrap_or_else(|| name.clone());
-            let schema = vec![QCol {
-                qual,
-                name: col_name,
-                ty: ColType::Text,
-                hidden: false,
-                src_ord: 0,
-            }];
+            // function name; explicit column aliases win. v0.43:
+            // multi-column functions (pg_input_error_info) keep the
+            // function's OUT column names unless aliased positionally.
+            let ncols = col_names.len();
+            let schema: Vec<QCol> = col_names
+                .into_iter()
+                .enumerate()
+                .map(|(i, cn)| {
+                    let col_name = col_aliases
+                        .get(i)
+                        .cloned()
+                        .or_else(|| if ncols == 1 { alias.clone() } else { None })
+                        .unwrap_or(cn);
+                    QCol {
+                        qual: qual.clone(),
+                        name: col_name,
+                        ty: ColType::Text,
+                        hidden: false,
+                        src_ord: i as u32,
+                    }
+                })
+                .collect();
             let rows = row_vals
                 .into_iter()
-                .map(|v| QRow {
-                    cells: Row::new(vec![v]),
+                .map(|cells| QRow {
+                    cells: Row::new(cells),
                     prov: Vec::new(),
                 })
                 .collect();
@@ -12031,12 +12040,12 @@ fn text_value_of(parts: &[&Value]) -> Value {
     })
 }
 
-/// v0.42: validate input against `numeric(p)` / `numeric(p,s)` for
-/// pg_input_is_valid. Parses the typmod, runs the numeric input
-/// function, rounds to scale, then requires integer_digits + scale
-/// <= precision (PG19 numeric.c apply_typmod). Returns None if the
-/// typmod itself is malformed.
-fn pg_input_is_valid_numeric_typmod(input: &str, t: &str) -> Option<bool> {
+/// v0.43: parse a `numeric(p)` / `numeric(p,s)` typmod for the pg_input_*
+/// family, returning `(precision, scale)`. `None` = malformed (PG raises
+/// 22023 here; the engine's pg_input_is_valid has historically reported
+/// malformed typmods as false, and pg_input_error_info mirrors that as a
+/// soft `invalid type modifier` row).
+fn parse_numeric_typmod(t: &str) -> Option<(i32, i32)> {
     let open = t.find('(')?;
     let close = t.rfind(')')?;
     if close != t.len() - 1 {
@@ -12053,39 +12062,309 @@ fn pg_input_is_valid_numeric_typmod(input: &str, t: &str) -> Option<bool> {
         return None;
     }
     // PG numeric typmod bounds: 1..=1000 for precision (PG 18+),
-    // 0..=precision for scale. An out-of-range typmod means the type
-    // name is invalid, which pg_input_is_valid reports as false.
+    // 0..=precision for scale.
     if !(1..=1000).contains(&precision) || scale < 0 || scale > precision {
         return None;
     }
-    let n = crate::storage::Numeric::parse(input).ok()?;
-    // NaN is valid for any numeric typmod in PG.
-    if n.is_nan() {
-        return Some(true);
-    }
-    // Infinities don't fit a constrained numeric.
-    if n.is_special() {
-        return Some(false);
-    }
-    let rounded = n.round_to(scale)?;
-    // Count integer digits from the public unscaled/scale fields.
-    // Value = unscaled * 10^-scale. Use the rounded value's actual
-    // scale (normalize() may have stripped trailing zeros).
+    Some((precision, scale))
+}
+
+/// v0.43: integer digits of a scale-rounded `Numeric`: value =
+/// unscaled * 10^-scale. `None` only if 10^scale overflows i128, which
+/// cannot happen for a parsed value at a legal scale.
+fn numeric_integer_digits(rounded: &crate::storage::Numeric) -> Option<i32> {
     let divisor = 10i128.checked_pow(rounded.scale as u32)?;
     let int_part = rounded.unscaled.abs() / divisor;
-    let int_digits: i32 = if int_part == 0 {
-        1
-    } else {
-        // digits in int_part
-        let mut d = 0;
-        let mut v = int_part;
-        while v > 0 {
-            d += 1;
-            v /= 10;
+    if int_part == 0 {
+        return Some(1);
+    }
+    let mut d = 0;
+    let mut v = int_part;
+    while v > 0 {
+        d += 1;
+        v /= 10;
+    }
+    Some(d)
+}
+
+/// v0.43: a "soft" input error, PG19 misc.c `ErrorSaveContext` style: the
+/// PG-exact primary message, optional detail/hint, and the 5-char SQLSTATE
+/// from the type's input function.
+struct PgInputError {
+    message: String,
+    detail: Option<String>,
+    hint: Option<String>,
+    code: &'static str,
+}
+
+impl PgInputError {
+    fn soft(code: &'static str, message: impl Into<String>) -> Self {
+        PgInputError {
+            message: message.into(),
+            detail: None,
+            hint: None,
+            code,
         }
-        d
+    }
+}
+
+/// v0.43: how `pg_input_validate` failed. `Soft` is the input function's
+/// soft error (pg_input_is_valid reports false; pg_input_error_info
+/// returns it as a row). `Hard` is raised outside the soft-error context
+/// and propagates: unknown type name -> 42883 (the engine's v0.29
+/// choice), malformed character typmod -> 22023 (v0.35).
+enum PgInputFailure {
+    Soft(PgInputError),
+    Hard(ExecError),
+}
+
+impl From<ExecError> for PgInputFailure {
+    fn from(e: ExecError) -> Self {
+        PgInputFailure::Hard(e)
+    }
+}
+
+/// v0.43: integer-family input validation with PG-exact soft errors (PG19
+/// int.c: `invalid input syntax for type %s: "%s"` / 22P02 vs `value "%s"
+/// is out of range for type %s` / 22003). `pgname` is the PG type name
+/// (smallint/integer/bigint); `bits` selects the range check.
+fn pg_input_validate_int(input: &str, pgname: &str, bits: u32) -> Result<(), PgInputFailure> {
+    let range_err = || {
+        PgInputFailure::Soft(PgInputError::soft(
+            "22003",
+            format!("value {input:?} is out of range for type {pgname}"),
+        ))
     };
-    Some(int_digits + scale <= precision)
+    let v = match parse_int_text(input) {
+        Ok(v) => v,
+        Err(e) if e.code == "22P02" => {
+            return Err(PgInputFailure::Soft(PgInputError::soft(
+                "22P02",
+                format!("invalid input syntax for type {pgname}: {input:?}"),
+            )));
+        }
+        // v0.25's i128 overflow ("value overflows integer") is out of
+        // range for every int width, like PG's ERANGE path.
+        Err(_) => return Err(range_err()),
+    };
+    let in_range = match bits {
+        16 => i16::try_from(v).is_ok(),
+        32 => i32::try_from(v).is_ok(),
+        _ => i64::try_from(v).is_ok(),
+    };
+    if in_range { Ok(()) } else { Err(range_err()) }
+}
+
+/// v0.43: int2vector validation (PG19 int.c int2vectorin):
+/// whitespace-separated int2s; element errors name the element type
+/// ("smallint") and quote the failing element. The empty string is a
+/// valid empty vector, like PG (this also corrects pg_input_is_valid,
+/// which previously rejected it).
+fn pg_input_validate_int2vector(input: &str) -> Result<(), PgInputFailure> {
+    for elem in input.split_whitespace() {
+        let range_err = || {
+            PgInputFailure::Soft(PgInputError::soft(
+                "22003",
+                format!("value {elem:?} is out of range for type smallint"),
+            ))
+        };
+        match parse_int_text(elem) {
+            Ok(v) => {
+                if i16::try_from(v).is_err() {
+                    return Err(range_err());
+                }
+            }
+            Err(e) if e.code == "22P02" => {
+                return Err(PgInputFailure::Soft(PgInputError::soft(
+                    "22P02",
+                    format!("invalid input syntax for type smallint: {elem:?}"),
+                )));
+            }
+            Err(_) => return Err(range_err()),
+        }
+    }
+    Ok(())
+}
+
+/// v0.43: `numeric(p[,s])` / `decimal(p[,s])` validation with PG-exact soft
+/// errors (PG19 numeric.c apply_typmod / apply_typmod_special):
+/// `numeric field overflow` / 22003, with the `must round to an absolute
+/// value less than 10^N` detail (N = precision - scale; "1" when N = 0),
+/// or `cannot hold an infinite value` for infinities. NaN is valid for any
+/// typmod, like PG. A malformed typmod is a soft `invalid type modifier`
+/// (22023), mirroring pg_input_is_valid's historical false.
+fn pg_input_validate_numeric_typmod(input: &str, t: &str) -> Result<(), PgInputFailure> {
+    let (precision, scale) = match parse_numeric_typmod(t) {
+        Some(ps) => ps,
+        None => {
+            return Err(PgInputFailure::Soft(PgInputError::soft(
+                "22023",
+                "invalid type modifier",
+            )));
+        }
+    };
+    let maxdigits = precision - scale;
+    let bound = if maxdigits == 0 {
+        "1".to_string()
+    } else {
+        format!("10^{maxdigits}")
+    };
+    let field_overflow = |detail: String| {
+        PgInputFailure::Soft(PgInputError {
+            message: "numeric field overflow".to_string(),
+            detail: Some(detail),
+            hint: None,
+            code: "22003",
+        })
+    };
+    let n = match crate::storage::Numeric::parse(input) {
+        Ok(n) => n,
+        Err(crate::storage::NumericParseError::Syntax) => {
+            return Err(PgInputFailure::Soft(PgInputError::soft(
+                "22P02",
+                format!("invalid input syntax for type numeric: {input:?}"),
+            )));
+        }
+        Err(crate::storage::NumericParseError::Overflow) => {
+            return Err(PgInputFailure::Soft(PgInputError::soft(
+                "22003",
+                "value overflows numeric format",
+            )));
+        }
+    };
+    if n.is_nan() {
+        return Ok(());
+    }
+    if n.is_special() {
+        return Err(field_overflow(format!(
+            "A field with precision {precision}, scale {scale} cannot hold an infinite value."
+        )));
+    }
+    let int_digits = n
+        .round_to(scale)
+        .and_then(|r| numeric_integer_digits(&r))
+        // Unreachable for parsed values at a legal scale; an
+        // astronomically large value cannot fit the typmod anyway.
+        .ok_or_else(|| {
+            field_overflow(format!(
+                "A field with precision {precision}, scale {scale} must round to an absolute value less than {bound}."
+            ))
+        })?;
+    if int_digits + scale > precision {
+        return Err(field_overflow(format!(
+            "A field with precision {precision}, scale {scale} must round to an absolute value less than {bound}."
+        )));
+    }
+    Ok(())
+}
+
+/// v0.43: shared input-validation core for `pg_input_is_valid` and
+/// `pg_input_error_info` (PG19 misc.c `pg_input_is_valid_common`). Runs the
+/// type's input function against `input`; `Ok(())` = valid input. The type
+/// dispatch mirrors the v0.29/v0.35/v0.42 `pg_input_is_valid` arms exactly
+/// so the two functions cannot drift. `fn_name` names the caller for the
+/// 42883 unknown-type error.
+fn pg_input_validate(fn_name: &str, input: &str, typ: &str) -> Result<(), PgInputFailure> {
+    // v0.36: PG's one-byte `"char"` type (the quotes are part of the name;
+    // like PG it never folds case, so this check runs on the un-lowercased
+    // spelling). charin is total: every input is valid.
+    if typ.trim() == "\"char\"" {
+        return Ok(());
+    }
+    // Map an input-function ExecError straight into a soft error; the
+    // messages below are already PG-exact (bool, bytea, char/varchar).
+    let soft = |e: ExecError| {
+        PgInputFailure::Soft(PgInputError {
+            message: e.message,
+            detail: None,
+            hint: None,
+            code: e.code,
+        })
+    };
+    // v0.43: float overflow drops PG's missing "value " prefix (PG19
+    // float.c: `"%s" is out of range for type double precision`); the
+    // 22P02 syntax message is already exact.
+    let float_err = |e: ExecError, pgname: &str| {
+        PgInputFailure::Soft(if e.code == "22003" {
+            PgInputError::soft(
+                "22003",
+                format!("{input:?} is out of range for type {pgname}"),
+            )
+        } else {
+            PgInputError {
+                message: e.message,
+                detail: None,
+                hint: None,
+                code: e.code,
+            }
+        })
+    };
+    match typ.to_ascii_lowercase().as_str() {
+        "bytea" => crate::storage::parse_bytea(input).map(|_| ()).map_err(|e| {
+            use crate::storage::ByteaParseError;
+            PgInputFailure::Soft(match e {
+                ByteaParseError::OddHexDigits => {
+                    PgInputError::soft("22023", "invalid hexadecimal data: odd number of digits")
+                }
+                ByteaParseError::BadHexDigit(c) => {
+                    PgInputError::soft("22023", format!("invalid hexadecimal digit: \"{c}\""))
+                }
+                ByteaParseError::Invalid => {
+                    PgInputError::soft("22P02", "invalid input syntax for type bytea")
+                }
+            })
+        }),
+        "bool" | "boolean" => cast_to_bool(&Value::text(input)).map(|_| ()).map_err(soft),
+        "smallint" | "int2" => pg_input_validate_int(input, "smallint", 16),
+        "int" | "integer" | "int4" => pg_input_validate_int(input, "integer", 32),
+        "bigint" | "int8" => pg_input_validate_int(input, "bigint", 64),
+        "int2vector" => pg_input_validate_int2vector(input),
+        "real" | "float4" => parse_f32_checked(input)
+            .map(|_| ())
+            .map_err(|e| float_err(e, "real")),
+        "double precision" | "float8" | "float" => parse_f64_checked(input)
+            .map(|_| ())
+            .map_err(|e| float_err(e, "double precision")),
+        t if t == "numeric" || t == "decimal" => {
+            match crate::storage::Numeric::parse(input) {
+                Ok(_) => Ok(()),
+                Err(crate::storage::NumericParseError::Syntax) => {
+                    Err(PgInputFailure::Soft(PgInputError::soft(
+                        "22P02",
+                        format!("invalid input syntax for type numeric: {input:?}"),
+                    )))
+                }
+                // v0.43: PG19 numeric.c says "value overflows numeric
+                // format" (the bare-numeric cast path keeps its
+                // historical text; only the soft error is exact).
+                Err(crate::storage::NumericParseError::Overflow) => Err(PgInputFailure::Soft(
+                    PgInputError::soft("22003", "value overflows numeric format"),
+                )),
+            }
+        }
+        t if t.starts_with("numeric(") || t.starts_with("decimal(") => {
+            pg_input_validate_numeric_typmod(input, t)
+        }
+        // v0.35: character types with typmod, via the same blank-tolerant
+        // input coercion as INSERT. A malformed typmod is 22023, like PG's
+        // type parser (hard error, via `?`).
+        t => match parse_char_type_arg(t)? {
+            Some((is_char, n)) => {
+                let label = if is_char {
+                    "character"
+                } else {
+                    "character varying"
+                };
+                coerce_char_len(input, n, false, is_char, label)
+                    .map(|_| ())
+                    .map_err(soft)
+            }
+            None => Err(PgInputFailure::Hard(exec_err(
+                "42883",
+                format!("function {fn_name}(unknown, {typ}) does not exist"),
+            ))),
+        },
+    }
 }
 
 /// v0.35: parse a `pg_input_is_valid` type argument naming a character
@@ -13109,6 +13388,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_split_to_table" => (2..=3).contains(&n),
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
+        // v0.43: pg_input_error_info(input, type) -> record (table
+        // function in FROM; PG19 misc.c).
+        "pg_input_error_info" => n == 2,
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
         "pg_relation_size" => n == 1 || n == 2,
@@ -13697,23 +13979,30 @@ fn regexp_matches_rows(vals: &[Value]) -> Result<Vec<Value>, ExecError> {
 /// `regexp_split_to_table(string, pattern [, flags])` (PG 19). Returns one
 /// value per split piece. NULL input yields zero rows; the 'g' flag is
 /// rejected (the split is internally global, like PG).
-fn eval_table_function(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+/// v0.32: table functions. v0.43: returns the output column names plus one
+/// row per output row (one `Value` per column), so multi-column functions
+/// like `pg_input_error_info` work. `regexp_split_to_table` keeps its
+/// single text column named for the function.
+fn eval_table_function(
+    name: &str,
+    vals: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>), ExecError> {
     // v0.32: arity is validated like scalar builtins (42883, as PG's
     // "function ... does not exist" for a bad signature).
     check_builtin_arity(name, vals)?;
     match name {
         "regexp_split_to_table" => {
             let s = match str_arg(name, &vals[0])? {
-                None => return Ok(Vec::new()),
+                None => return Ok((vec![name.to_string()], Vec::new())),
                 Some(s) => s.to_string(),
             };
             let pat = match str_arg(name, &vals[1])? {
-                None => return Ok(Vec::new()),
+                None => return Ok((vec![name.to_string()], Vec::new())),
                 Some(p) => p.to_string(),
             };
             let flags = if vals.len() > 2 {
                 match str_arg(name, &vals[2])? {
-                    None => return Ok(Vec::new()),
+                    None => return Ok((vec![name.to_string()], Vec::new())),
                     Some(f) => f.to_string(),
                 }
             } else {
@@ -13724,10 +14013,45 @@ fn eval_table_function(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecErr
                 .map_err(|e| exec_err("2201B", format!("invalid regular expression: {e}")))?;
             let sc: Vec<char> = s.chars().collect();
             let matches = regexp_find_all(&re, &sc, true, true);
-            Ok(regexp_split_result(&sc, &matches)
+            let rows = regexp_split_result(&sc, &matches)
                 .into_iter()
-                .map(Value::text)
-                .collect())
+                .map(|v| vec![Value::text(v)])
+                .collect();
+            Ok((vec![name.to_string()], rows))
+        }
+        // v0.43: pg_input_error_info(input text, type text), PG19 misc.c.
+        // Returns the input function's soft error as PG's four OUT
+        // columns (message, detail, hint, sql_error_code); a valid input
+        // yields one row of NULLs. NULL arguments yield no rows, like the
+        // other table functions. Hard errors (unknown type -> 42883,
+        // malformed char typmod -> 22023) propagate.
+        "pg_input_error_info" => {
+            // PG19 pg_proc.dat OUT parameter names.
+            let cols = vec![
+                "message".to_string(),
+                "detail".to_string(),
+                "hint".to_string(),
+                "sql_error_code".to_string(),
+            ];
+            let input = match str_arg(name, &vals[0])? {
+                None => return Ok((cols, Vec::new())),
+                Some(s) => s.to_string(),
+            };
+            let typ = match str_arg(name, &vals[1])? {
+                None => return Ok((cols, Vec::new())),
+                Some(s) => s.to_string(),
+            };
+            let row = match pg_input_validate("pg_input_error_info", &input, &typ) {
+                Ok(()) => vec![Value::Null, Value::Null, Value::Null, Value::Null],
+                Err(PgInputFailure::Soft(e)) => vec![
+                    Value::text(e.message),
+                    e.detail.map(Value::text).unwrap_or(Value::Null),
+                    e.hint.map(Value::text).unwrap_or(Value::Null),
+                    Value::text(e.code),
+                ],
+                Err(PgInputFailure::Hard(e)) => return Err(e),
+            };
+            Ok((cols, vec![row]))
         }
         _ => Err(exec_err(
             "42883",
@@ -14494,9 +14818,10 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Ok(Value::BigInt(b.iter().map(|x| x.count_ones() as i64).sum()))
         }
         // v0.29: pg_input_is_valid(input text, type text) -> bool.
-        // Probes whether the input parses as the named type without
-        // raising. Currently supports 'bytea' (the strings.sql coverage);
-        // other types are 42883, like an undefined function.
+        // v0.43: probes via the shared pg_input_validate core (PG19
+        // misc.c pg_input_is_valid_common); soft input errors report
+        // false, hard errors (unknown type -> 42883, malformed char
+        // typmod -> 22023) propagate.
         "pg_input_is_valid" => {
             let input = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
@@ -14506,80 +14831,10 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
-            // v0.36: PG's one-byte `"char"` type (the quotes are part of
-            // the name; like PG it never folds case, so this check runs
-            // on the un-lowercased spelling). charin is total: every
-            // input is valid.
-            if typ.trim() == "\"char\"" {
-                return Ok(Value::Bool(true));
-            }
-            match typ.to_ascii_lowercase().as_str() {
-                "bytea" => Ok(Value::Bool(crate::storage::parse_bytea(input).is_ok())),
-                // v0.42: PG19 numeric-family input validation (misc.c
-                // pg_input_is_valid runs the type's input function and
-                // maps soft errors to false). Each arm runs rustgres's
-                // equivalent of the PG input function.
-                "bool" | "boolean" => Ok(Value::Bool(cast_to_bool(&Value::text(input)).is_ok())),
-                "smallint" | "int2" => Ok(Value::Bool(
-                    parse_int_text(input)
-                        .map(|i| i16::try_from(i).is_ok())
-                        .unwrap_or(false),
-                )),
-                "int" | "integer" | "int4" => Ok(Value::Bool(
-                    parse_int_text(input)
-                        .map(|i| i32::try_from(i).is_ok())
-                        .unwrap_or(false),
-                )),
-                "bigint" | "int8" => Ok(Value::Bool(
-                    parse_int_text(input)
-                        .map(|i| i64::try_from(i).is_ok())
-                        .unwrap_or(false),
-                )),
-                // v0.42: int2vector is space-separated int2s (PG's
-                // int2vectorin splits on whitespace).
-                "int2vector" => Ok(Value::Bool({
-                    let parts: Vec<&str> = input.split_whitespace().collect();
-                    !parts.is_empty()
-                        && parts.iter().all(|p| {
-                            parse_int_text(p)
-                                .map(|i| i16::try_from(i).is_ok())
-                                .unwrap_or(false)
-                        })
-                })),
-                "real" | "float4" => Ok(Value::Bool(parse_f32_checked(input).is_ok())),
-                "double precision" | "float8" | "float" => {
-                    Ok(Value::Bool(parse_f64_checked(input).is_ok()))
-                }
-                t if t == "numeric" || t == "decimal" => {
-                    Ok(Value::Bool(crate::storage::Numeric::parse(input).is_ok()))
-                }
-                // v0.42: numeric with typmod, e.g. numeric(8,4). PG
-                // rounds to scale then requires integer_digits + scale
-                // <= precision (numeric.c apply_typmod).
-                t if t.starts_with("numeric(") || t.starts_with("decimal(") => Ok(Value::Bool(
-                    pg_input_is_valid_numeric_typmod(input, t).unwrap_or(false),
-                )),
-                // v0.35: character types with typmod, via the same
-                // blank-tolerant input coercion as INSERT.
-                t => match parse_char_type_arg(t)? {
-                    Some((is_char, n)) => {
-                        let label = if is_char {
-                            "character"
-                        } else {
-                            "character varying"
-                        };
-                        Ok(Value::Bool(
-                            coerce_char_len(input, n, false, is_char, label).is_ok(),
-                        ))
-                    }
-                    None => Err(exec_err(
-                        "42883",
-                        format!(
-                            "function pg_input_is_valid(unknown, {}) does not exist",
-                            typ
-                        ),
-                    )),
-                },
+            match pg_input_validate("pg_input_is_valid", input, typ) {
+                Ok(()) => Ok(Value::Bool(true)),
+                Err(PgInputFailure::Soft(_)) => Ok(Value::Bool(false)),
+                Err(PgInputFailure::Hard(e)) => Err(e),
             }
         }
         "crc32" => {
@@ -17941,38 +18196,58 @@ fn from_schema_item(
             );
             Ok(())
         }
-        // v0.32: table functions describe as their single output column
-        // (currently always text); unknown functions are 42883.
+        // v0.32: table functions describe as their output columns (all
+        // text); unknown functions are 42883. v0.43: pg_input_error_info
+        // describes as PG's four OUT columns.
         FromItem::Function {
             name,
             alias,
             col_aliases,
             ..
         } => {
-            if !matches!(name.as_str(), "regexp_split_to_table") {
-                return Err(exec_err(
-                    "42883",
-                    format!("function {name}() does not exist"),
-                ));
-            }
+            // v0.43: output column names per function (PG19 pg_proc.dat
+            // OUT parameter names for pg_input_error_info).
+            let out_names: Vec<String> = match name.as_str() {
+                "regexp_split_to_table" => vec![name.clone()],
+                "pg_input_error_info" => ["message", "detail", "hint", "sql_error_code"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                _ => {
+                    return Err(exec_err(
+                        "42883",
+                        format!("function {name}() does not exist"),
+                    ));
+                }
+            };
             let qual = alias.clone().unwrap_or_else(|| name.clone());
-            check_col_alias_arity(&qual, 1, col_aliases)?;
+            check_col_alias_arity(&qual, out_names.len(), col_aliases)?;
             // v0.32: single-column function scan — the column takes the
             // table alias when present (see build_source), else the
-            // function name; explicit column aliases win.
-            let col_name = col_aliases
-                .first()
-                .cloned()
-                .or(alias.clone())
-                .unwrap_or_else(|| name.clone());
-            out.push(vec![QCol {
-                qual,
-                name: col_name,
-                ty: ColType::Text,
+            // function name; explicit column aliases win. v0.43:
+            // multi-column functions keep their OUT names unless aliased.
+            let ncols = out_names.len();
+            out.push(
+                out_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cn)| {
+                        let col_name = col_aliases
+                            .get(i)
+                            .cloned()
+                            .or_else(|| if ncols == 1 { alias.clone() } else { None })
+                            .unwrap_or(cn);
+                        QCol {
+                            qual: qual.clone(),
+                            name: col_name,
+                            ty: ColType::Text,
 
-                hidden: false,
-                src_ord: 0,
-            }]);
+                            hidden: false,
+                            src_ord: i as u32,
+                        }
+                    })
+                    .collect(),
+            );
             Ok(())
         }
         // v0.14: VALUES columns are `column1`, ... typed from the first
@@ -21077,6 +21352,9 @@ mod tests {
             ("'asdf'", "'int2'", "f"),
             ("'50000'", "'int2'", "f"),
             ("' 1 3  5 '", "'int2vector'", "t"),
+            // v0.43: PG's int2vectorin accepts the empty string as an
+            // empty vector (verified against REL_19_STABLE int.c).
+            ("''", "'int2vector'", "t"),
             ("'34'", "'int4'", "t"),
             ("'asdf'", "'int4'", "f"),
             ("'1000000000000'", "'int4'", "f"),
@@ -21105,6 +21383,96 @@ mod tests {
                 typ
             );
         }
+    }
+
+    /// v0.43: pg_input_error_info returns PG's four OUT columns with the
+    /// input function's PG-exact soft error, or one row of NULLs for
+    /// valid input (PG19 misc.c, verified against REL_19_STABLE source
+    /// and the PG regression .out files).
+    #[test]
+    fn v43_pg_input_error_info() {
+        let mut eng = engine();
+        let info = |eng: &mut Engine, inp: &str, typ: &str| -> Vec<Vec<String>> {
+            let q = format!("SELECT * FROM pg_input_error_info({inp}, {typ})");
+            rows_of(run(eng, &q).unwrap())
+        };
+        // Column names are PG's OUT parameter names (pg_proc.dat).
+        assert_eq!(
+            select_cols(&mut eng, "SELECT * FROM pg_input_error_info('x', 'bool')"),
+            vec!["message", "detail", "hint", "sql_error_code"]
+        );
+        // Valid input -> one row of NULLs.
+        assert_eq!(
+            info(&mut eng, "'true'", "'bool'"),
+            vec![vec!["NULL", "NULL", "NULL", "NULL"]]
+        );
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            // (input, type, message, detail, sqlstate)
+            (
+                "'junk'",
+                "'bool'",
+                "invalid input syntax for type boolean: \"junk\"",
+                "NULL",
+                "22P02",
+            ),
+            (
+                "'50000'",
+                "'int2'",
+                "value \"50000\" is out of range for type smallint",
+                "NULL",
+                "22003",
+            ),
+            (
+                "'1 asdf'",
+                "'int2vector'",
+                "invalid input syntax for type smallint: \"asdf\"",
+                "NULL",
+                "22P02",
+            ),
+            (
+                "'1e4000'",
+                "'float8'",
+                "\"1e4000\" is out of range for type double precision",
+                "NULL",
+                "22003",
+            ),
+            (
+                "'1e400000'",
+                "'numeric'",
+                "value overflows numeric format",
+                "NULL",
+                "22003",
+            ),
+            (
+                "'1234.567'",
+                "'numeric(7,4)'",
+                "numeric field overflow",
+                "A field with precision 7, scale 4 must round to an absolute value less than 10^3.",
+                "22003",
+            ),
+            (
+                "'abcde'",
+                "'char(4)'",
+                "value too long for type character(4)",
+                "NULL",
+                "22001",
+            ),
+        ];
+        for (inp, typ, message, detail, code) in cases {
+            assert_eq!(
+                info(&mut eng, inp, typ),
+                vec![vec![
+                    message.to_string(),
+                    detail.to_string(),
+                    "NULL".to_string(),
+                    code.to_string()
+                ]],
+                "pg_input_error_info({inp}, {typ})",
+            );
+        }
+        // Hard errors propagate: unknown type -> 42883.
+        let err = run(&mut eng, "SELECT * FROM pg_input_error_info('x', 'bogus')").unwrap_err();
+        assert_eq!(err.code, "42883");
     }
 
     /// v0.41: SET COMPRESSION error taxonomy matches PG.
