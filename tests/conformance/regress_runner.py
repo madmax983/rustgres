@@ -636,7 +636,10 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\bNULLS\s+(FIRST|LAST)\b", "NULLS FIRST/LAST unsupported"),
     # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
     (r"(?is)^\s*explain\s*\(", "EXPLAIN with (option, ...) syntax unsupported"),
-    (r"(?i)\bselect\s+distinct\s+on\s*\(", "SELECT DISTINCT ON unsupported"),
+    # v0.52: SELECT DISTINCT ON is implemented (PG19 Unique-under-sort
+    # semantics); the mask is removed so the corpus statements are
+    # exercised. The EXPLAIN variants above stay masked; the
+    # ROW()-constructor variants below classify under row().
     (r"(?is)^\s*create\s+rule\b", "CREATE RULE unsupported"),
     (r"(?is)^\s*drop\s+rule\b", "DROP RULE unsupported"),
     (r"(?i)\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),

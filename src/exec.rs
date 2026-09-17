@@ -4343,8 +4343,14 @@ fn plan_order_scan(
     stmt: &SelectStmt,
 ) -> Option<OrderHint> {
     // Only the simplest shape: single base table, no filter, no
-    // aggregation / DISTINCT / grouping.
-    if stmt.from.len() != 1 || stmt.where_.is_some() || stmt.distinct {
+    // aggregation / DISTINCT / grouping. v0.52: DISTINCT ON bails too —
+    // its first-row-per-group filter removes rows, which would break the
+    // early-LIMIT truncation below (same reason as plain DISTINCT).
+    if stmt.from.len() != 1
+        || stmt.where_.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+    {
         return None;
     }
     if is_agg_query(stmt) || !stmt.group_by.is_empty() || stmt.having.is_some() {
@@ -4863,7 +4869,41 @@ fn plan_select(
         node.set_filter(format!("{:?}", w));
     }
     // 3. Aggregation / DISTINCT.
-    if is_agg_query(stmt) {
+    // v0.52: DISTINCT ON plans as Unique over Sort (PG19), with the
+    // effective sort keys (distinct exprs ++ ORDER BY tail); an Aggregate
+    // node (GROUP BY / aggregates, which DISTINCT ON allows) goes below
+    // the Sort. The planner has no FROM schema, so ORDER BY ordinals over
+    // `*` cannot be expanded here (documented limitation).
+    if !stmt.distinct_on.is_empty() {
+        if is_agg_query(stmt) {
+            let rows = if stmt.group_by.is_empty() {
+                1
+            } else {
+                node.rows()
+            };
+            node = PlanNode::Aggregate {
+                rows,
+                child: Box::new(node),
+            };
+        }
+        let (effective, _) = check_distinct_on_order(stmt, None)?;
+        let keys = effective
+            .iter()
+            .map(order_term_text)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = node.rows();
+        node = PlanNode::Sort {
+            keys,
+            rows,
+            child: Box::new(node),
+        };
+        let rows = node.rows();
+        node = PlanNode::Unique {
+            rows,
+            child: Box::new(node),
+        };
+    } else if is_agg_query(stmt) {
         let rows = if stmt.group_by.is_empty() {
             1
         } else {
@@ -4881,7 +4921,8 @@ fn plan_select(
         };
     }
     // 4. ORDER BY → Sort, unless the index-order scan provides it.
-    if !stmt.order_by.is_empty() && !ordered {
+    // DISTINCT ON already built its Sort above (with effective keys).
+    if stmt.distinct_on.is_empty() && !stmt.order_by.is_empty() && !ordered {
         let keys = stmt
             .order_by
             .iter()
@@ -5685,6 +5726,8 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
         || stmt.group_by.iter().any(expr_uses)
         || stmt.having.as_ref().is_some_and(expr_uses)
         || stmt.order_by.iter().any(|o| expr_uses(&o.expr))
+        // v0.52: DISTINCT ON expressions can call it too.
+        || stmt.distinct_on.iter().any(expr_uses)
         || stmt.with.iter().any(|c| match &c.body {
             CteBody::Simple(s) => stmt_uses_pg_column_compression(s),
             CteBody::Union { left, right, .. } => {
@@ -6499,6 +6542,10 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
     for o in &stmt.order_by {
         crate::sql::collect_col_refs(&o.expr, &mut refs);
     }
+    // v0.52: DISTINCT ON expressions read input columns too.
+    for d in &stmt.distinct_on {
+        crate::sql::collect_col_refs(d, &mut refs);
+    }
 
     // All (table, column) pairs this level needs SELECT on.
     let mut needed: Vec<(String, String)> = Vec::new();
@@ -6905,6 +6952,28 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         early_limit,
     )?;
     let rows = apply_where(q, outer, &schema, rows, stmt.where_.as_ref())?;
+    // v0.52: `SELECT DISTINCT ON` — PG19 parse analysis
+    // (`transformDistinctOnClause`): check the ORDER BY prefix rule
+    // (42803) and rewrite ORDER BY to the effective sort order (matching
+    // key terms in ORDER BY order, then implicit ASC keys for any
+    // unmatched DISTINCT ON expressions, then the non-key tail). PG always
+    // sorts by the distinct keys, even with no user ORDER BY. Returns the
+    // rewritten statement plus each DISTINCT ON expression's index in the
+    // effective order (used by the aggregate path to derive group keys
+    // from exec_agg's precomputed sort keys).
+    let owned_distinct: SelectStmt;
+    let distinct_pos: Option<Vec<usize>>;
+    let stmt: &SelectStmt = if stmt.distinct_on.is_empty() {
+        distinct_pos = None;
+        stmt
+    } else {
+        let (effective, key_pos) = check_distinct_on_order(stmt, Some(&schema))?;
+        let mut s = stmt.clone();
+        s.order_by = effective;
+        owned_distinct = s;
+        distinct_pos = Some(key_pos);
+        &owned_distinct
+    };
     // v0.10: window functions — stamp each Expr::Window with its index
     // (clone only when needed). `windows` was collected above.
     let owned_stmt: SelectStmt;
@@ -6926,26 +6995,32 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
     }
     // Non-aggregated queries with ORDER BY keep the full row around: an
     // ORDER BY term may reference a non-projected column (v0.1 behavior).
-    let keep_full = !agg && !stmt.distinct && !stmt.order_by.is_empty();
+    // v0.52: DISTINCT ON always keeps it — the group keys are evaluated
+    // from the pre-projection row after sorting, and a deferred
+    // SRF-in-targetlist expansion needs the input row back.
+    let has_distinct_on = !stmt.distinct_on.is_empty();
+    let keep_full = !agg && (has_distinct_on || (!stmt.distinct && !stmt.order_by.is_empty()));
+    // v0.32: SRF-in-targetlist expansion (PG 19). A top-level
+    // set-returning function call in the SELECT list fans each input
+    // row out to one row per returned element. Only on the plain
+    // projection path: aggregates and windowed queries keep the
+    // scalar (first-row-or-NULL) reading. v0.52: with DISTINCT ON the
+    // expansion is deferred until after the first-row-per-group filter
+    // (PG's ProjectSet sits above Unique).
+    let expand_srf = windows.is_empty()
+        && stmt.items.iter().any(|it| {
+            matches!(
+                it,
+                SelectItem::Expr {
+                    expr: Expr::Func { name, .. },
+                    ..
+                } if is_srf(name)
+            )
+        });
     let mut orows: Vec<OutRow> = if agg {
         exec_agg(q, outer, stmt, &schema, &rows, &out_cols, &windows)?
     } else {
         let mut v = Vec::with_capacity(rows.len());
-        // v0.32: SRF-in-targetlist expansion (PG 19). A top-level
-        // set-returning function call in the SELECT list fans each input
-        // row out to one row per returned element. Only on the plain
-        // projection path: aggregates and windowed queries keep the
-        // scalar (first-row-or-NULL) reading.
-        let expand_srf = windows.is_empty()
-            && stmt.items.iter().any(|it| {
-                matches!(
-                    it,
-                    SelectItem::Expr {
-                        expr: Expr::Func { name, .. },
-                        ..
-                    } if is_srf(name)
-                )
-            });
         for (ri, r) in rows.into_iter().enumerate() {
             let full = keep_full.then(|| r.cells.clone());
             // v0.10: point the window context at this input row before
@@ -6953,7 +7028,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             if let Some(wctx) = q.wctx.as_mut() {
                 wctx.row = ri;
             }
-            if expand_srf {
+            if expand_srf && !has_distinct_on {
                 for (cells, prov) in
                     project_row_expanded(q, outer, stmt, &schema, r, out_cols.len())?
                 {
@@ -6970,7 +7045,8 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             // project_row takes the row by value: plain `SELECT *` moves
             // it through with zero copies, and provenance moves rather
             // than cloning.
-            let (cells, prov) = project_row(q, outer, stmt, &schema, r, out_cols.len())?;
+            let (cells, prov) =
+                project_row(q, outer, stmt, &schema, r, out_cols.len(), has_distinct_on)?;
             v.push(OutRow {
                 cells,
                 prov,
@@ -6993,7 +7069,42 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             seen.insert(k)
         });
     }
-    if !stmt.order_by.is_empty() && order_hint.is_none() {
+    if has_distinct_on {
+        // v0.52: `SELECT DISTINCT ON`. PG19 always sorts by the effective
+        // ORDER BY (distinct keys ++ tail — the rewrite above guarantees
+        // the keys come first, so equal keys are adjacent) and keeps the
+        // first row per group of equal distinct expressions (NULLs group
+        // together). plan_order_scan bails on DISTINCT ON, so the
+        // index-order path cannot skip this sort. On the aggregate path
+        // the group keys come from exec_agg's precomputed sort keys.
+        apply_order(q, outer, stmt, &schema, &out_cols, &mut orows)?;
+        // Aggregate rows have no pre-projection row; their group keys
+        // come from exec_agg's precomputed sort keys. Plain rows keep the
+        // full row and evaluate the key expressions from it.
+        let key_pos = if agg { distinct_pos.as_deref() } else { None };
+        distinct_on_filter(q, outer, stmt, &schema, &mut orows, key_pos)?;
+        if expand_srf && !agg {
+            let mut expanded = Vec::with_capacity(orows.len());
+            for o in orows {
+                let row = QRow {
+                    cells: o.full.expect("DISTINCT ON keeps full pre-projection rows"),
+                    prov: o.prov,
+                };
+                for (cells, prov) in
+                    project_row_expanded(q, outer, stmt, &schema, row, out_cols.len())?
+                {
+                    expanded.push(OutRow {
+                        cells,
+                        prov,
+                        full: None,
+                        sort_keys: None,
+                        win_idx: None,
+                    });
+                }
+            }
+            orows = expanded;
+        }
+    } else if !stmt.order_by.is_empty() && order_hint.is_none() {
         apply_order(q, outer, stmt, &schema, &out_cols, &mut orows)?;
     }
     if let Some(n) = stmt.offset {
@@ -7082,8 +7193,20 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
     for o in &stmt.order_by {
         validate_expr(&o.expr)?;
     }
+    // v0.52: `SELECT DISTINCT ON` shape rules. Aggregates and window
+    // functions are legal inside DISTINCT ON expressions (PG19 allows
+    // `DISTINCT ON (count(*))` and `DISTINCT ON (rank() OVER (...))`; the
+    // expressions are evaluated at group level / from window values like
+    // any other). The ORDER BY prefix rule (42803) is enforced by
+    // `check_distinct_on_order` in run_select_inner, which needs the FROM
+    // schema to resolve ordinals over `*` — validate_select has no schema.
+    if !stmt.distinct_on.is_empty() {
+        for e in &stmt.distinct_on {
+            validate_expr(e)?;
+        }
+    }
     if stmt.for_update {
-        if stmt.distinct {
+        if stmt.distinct || !stmt.distinct_on.is_empty() {
             return Err(exec_err(
                 "0A000",
                 "FOR UPDATE is not allowed with DISTINCT clause",
@@ -7418,6 +7541,10 @@ fn validate_windows(stmt: &SelectStmt) -> Result<(), ExecError> {
     for o in &stmt.order_by {
         validate_window_expr(&o.expr, false)?;
     }
+    // v0.52: DISTINCT ON expressions may contain windows.
+    for e in &stmt.distinct_on {
+        validate_window_expr(e, false)?;
+    }
     Ok(())
 }
 
@@ -7669,6 +7796,10 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
     for o in &stmt.order_by {
         walk(&o.expr, &mut visit);
     }
+    // v0.52: window functions are legal inside DISTINCT ON expressions.
+    for e in &stmt.distinct_on {
+        walk(e, &mut visit);
+    }
     out
 }
 
@@ -7751,6 +7882,10 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
     }
     for o in &mut stmt.order_by {
         stamp(&mut o.expr, windows);
+    }
+    // v0.52: stamp DISTINCT ON window expressions too.
+    for e in &mut stmt.distinct_on {
+        stamp(e, windows);
     }
 }
 
@@ -8392,6 +8527,10 @@ fn is_agg_query(stmt: &SelectStmt) -> bool {
             _ => false,
         })
         || stmt.order_by.iter().any(|o| contains_agg(&o.expr))
+        // v0.52: an aggregate inside DISTINCT ON (e.g. `DISTINCT ON
+        // (count(*))`) makes the whole query aggregated — PG19 treats the
+        // key as a group-level expression.
+        || stmt.distinct_on.iter().any(|e| contains_agg(e))
 }
 
 // ---------------------------------------------------------------------------
@@ -10150,6 +10289,10 @@ fn project_row(
     schema: &[QCol],
     row: QRow,
     out_ncols: usize,
+    // v0.52: for DISTINCT ON's initial projection, SRFs become NULL
+    // placeholders (the real expansion is deferred until after the
+    // first-row-per-group filter).
+    srf_placeholder: bool,
 ) -> Result<(Row, Vec<(String, u64)>), ExecError> {
     // Fast path: plain `SELECT *` moves the row through untouched — no
     // scope chain, no per-row allocation at all. Disabled when the schema
@@ -10166,7 +10309,15 @@ fn project_row(
     let scopes = projection_scopes(outer, stmt, schema, &row);
     let mut cells = Vec::with_capacity(out_ncols);
     for item in &stmt.items {
-        cells.extend(project_item_values(q, &scopes, schema, &row, item, false)?);
+        cells.extend(project_item_values(
+            q,
+            &scopes,
+            schema,
+            &row,
+            item,
+            false,
+            srf_placeholder,
+        )?);
     }
     Ok((Row::new(cells), row.prov))
 }
@@ -10199,6 +10350,10 @@ fn projection_scopes<'a>(
 /// v0.32: evaluate one SELECT-list item to its column values. With
 /// `expand_srf`, a top-level set-returning function call produces one value
 /// per output row instead of a single scalar (PG 19 SRF-in-targetlist).
+/// v0.52: with `srf_placeholder`, an SRF evaluates to NULL — used for
+/// DISTINCT ON's initial projection, where the real SRF expansion is
+/// deferred until after the first-row-per-group filter (the placeholder
+/// is never observed; the filter keys and sort don't touch it).
 fn project_item_values(
     q: &mut Q,
     scopes: &[Scope],
@@ -10206,6 +10361,7 @@ fn project_item_values(
     row: &QRow,
     item: &SelectItem,
     expand_srf: bool,
+    srf_placeholder: bool,
 ) -> Result<Vec<Value>, ExecError> {
     match item {
         // v0.23: hidden columns are skipped by `*` (they stay
@@ -10239,6 +10395,15 @@ fn project_item_values(
                     }
                 }
             }
+            // v0.52: DISTINCT ON defers SRF expansion; the initial
+            // projection uses a NULL placeholder.
+            if srf_placeholder {
+                if let Expr::Func { name, .. } = expr {
+                    if is_srf(name) {
+                        return Ok(vec![Value::Null]);
+                    }
+                }
+            }
             Ok(vec![eval_expr(q, scopes, expr)?])
         }
     }
@@ -10260,7 +10425,7 @@ fn project_row_expanded(
     // (values, pad_with_null): SRF columns pad, plain columns repeat.
     let mut cols: Vec<(Vec<Value>, bool)> = Vec::with_capacity(out_ncols);
     for item in &stmt.items {
-        let vals = project_item_values(q, &scopes, schema, &row, item, true)?;
+        let vals = project_item_values(q, &scopes, schema, &row, item, true, false)?;
         let srf_col = matches!(
             item,
             SelectItem::Expr {
@@ -11332,8 +11497,11 @@ fn apply_order(
             Some(k) => k.clone(),
             None => {
                 let mut fallback = |e: &Expr| -> Result<Value, ExecError> {
-                    if stmt.distinct {
+                    if stmt.distinct && stmt.distinct_on.is_empty() {
                         // DISTINCT queries can only sort by their output.
+                        // v0.52: DISTINCT ON is exempt — its ORDER BY may
+                        // name non-projected columns (PG allows
+                        // `SELECT DISTINCT ON (a) a FROM t ORDER BY a, b`).
                         return Err(exec_err(
                             "42703",
                             "ORDER BY expression must appear in the select list",
@@ -11420,6 +11588,268 @@ fn apply_order(
     Ok(())
 }
 
+/// v0.52: expand the SELECT list to one expression per output column, for
+/// resolving ORDER BY ordinals in the DISTINCT ON prefix check. `*`
+/// expands against the schema (skipping hidden columns, like projection);
+/// `qual.*` uses the qualifier's source-column order. Returns None when
+/// the ordinal is out of range or `*` cannot be expanded (no schema — the
+/// EXPLAIN planner path).
+fn nth_output_expr(items: &[SelectItem], schema: Option<&[QCol]>, n: i64) -> Option<Expr> {
+    if n < 1 {
+        return None;
+    }
+    let mut idx = 0i64;
+    for item in items {
+        match item {
+            SelectItem::Expr { expr, .. } => {
+                idx += 1;
+                if idx == n {
+                    return Some(expr.clone());
+                }
+            }
+            SelectItem::All => {
+                let schema = schema?;
+                for c in schema.iter().filter(|c| !c.hidden) {
+                    idx += 1;
+                    if idx == n {
+                        return Some(Expr::Column {
+                            table: Some(c.qual.clone()),
+                            name: c.name.clone(),
+                        });
+                    }
+                }
+            }
+            SelectItem::AllOf(qual) => {
+                let schema = schema?;
+                for i in qual_star_order(schema, qual) {
+                    idx += 1;
+                    if idx == n {
+                        let c = &schema[i];
+                        return Some(Expr::Column {
+                            table: Some(c.qual.clone()),
+                            name: c.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// v0.52: resolve an ORDER BY term to the expression it denotes, for the
+/// DISTINCT ON prefix check. Ordinals resolve to the nth output expression
+/// (`*` expanded via the schema when available); an unqualified column
+/// naming an explicit output alias resolves to the aliased expression (PG
+/// prefers the output name). Anything else denotes itself. Returns None
+/// when the term cannot be resolved statically.
+fn resolve_distinct_order_term(
+    items: &[SelectItem],
+    schema: Option<&[QCol]>,
+    expr: &Expr,
+) -> Option<Expr> {
+    if let Expr::Literal(Literal::Int(n)) = expr {
+        return nth_output_expr(items, schema, *n);
+    }
+    if let Expr::Column { table: None, name } = expr {
+        for item in items {
+            if let SelectItem::Expr {
+                expr: e,
+                alias: Some(a),
+            } = item
+            {
+                if a == name {
+                    return Some(e.clone());
+                }
+            }
+        }
+    }
+    Some(expr.clone())
+}
+
+/// v0.52: PG19 compares analyzed DISTINCT ON / ORDER BY expressions with
+/// `equal()`. After parse analysis `don.a` and `a` are the same Var, so a
+/// syntactic check must treat a qualified column as matching an
+/// unqualified column with the same name (and vice versa). Anything else
+/// needs structural equality. (Known gap: in a join, `t.a` also matches an
+/// unqualified `a` that actually denotes `s.a`; PG would 42803 there while
+/// this accepts. The mismatch is fail-safe — it can only sort by a term
+/// the query already sorts by.)
+fn distinct_exprs_match(d: &Expr, o: &Expr) -> bool {
+    if d == o {
+        return true;
+    }
+    match (d, o) {
+        (
+            Expr::Column {
+                table: t1,
+                name: n1,
+            },
+            Expr::Column {
+                table: t2,
+                name: n2,
+            },
+        ) if n1 == n2 => t1 == t2 || t1.is_none() || t2.is_none(),
+        _ => false,
+    }
+}
+
+/// v0.52: PG19 `transformDistinctOnClause` (parse_clause.c), as a syntactic
+/// check. Verifies the DISTINCT ON expressions match the initial ORDER BY
+/// expressions (42803: permutations and short prefixes are fine — missing
+/// keys are appended implicitly; a key after a non-key term is an error)
+/// and builds the *effective* sort order: the ORDER BY terms matching
+/// DISTINCT ON keys (in ORDER BY order, each keeping its direction), then
+/// any unmatched DISTINCT ON keys as implicit `ASC NULLS LAST` terms, then
+/// the remaining ORDER BY tail. Also returns, per DISTINCT ON expression,
+/// its index in the effective order, so the aggregate path can derive
+/// group keys from the sort keys exec_agg precomputes. `schema` (None from
+/// the EXPLAIN planner) is only needed to expand `*` for ORDER BY
+/// ordinals.
+fn check_distinct_on_order(
+    stmt: &SelectStmt,
+    schema: Option<&[QCol]>,
+) -> Result<(Vec<OrderTerm>, Vec<usize>), ExecError> {
+    let n = stmt.distinct_on.len();
+    let resolved: Vec<Option<Expr>> = stmt
+        .order_by
+        .iter()
+        .map(|t| resolve_distinct_order_term(&stmt.items, schema, &t.expr))
+        .collect();
+    let mut effective: Vec<OrderTerm> = Vec::new();
+    let mut term_matched = vec![false; stmt.order_by.len()];
+    let mut key_matched = vec![false; n];
+    let mut key_pos = vec![usize::MAX; n];
+    let mut seen_tail = false;
+    for (i, (term, re)) in stmt.order_by.iter().zip(resolved.iter()).enumerate() {
+        let mut hit = None;
+        if let Some(re) = re {
+            for (j, d) in stmt.distinct_on.iter().enumerate() {
+                if !key_matched[j] && distinct_exprs_match(d, re) {
+                    hit = Some(j);
+                    break;
+                }
+            }
+        }
+        match hit {
+            Some(j) => {
+                // A DISTINCT ON key after a non-key ORDER BY term can
+                // never be a prefix (PG19 42803).
+                if seen_tail {
+                    return Err(exec_err(
+                        "42803",
+                        "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                    ));
+                }
+                key_matched[j] = true;
+                key_pos[j] = effective.len();
+                term_matched[i] = true;
+                effective.push(term.clone());
+            }
+            None => {
+                seen_tail = true;
+            }
+        }
+    }
+    // Unmatched DISTINCT ON keys become implicit sort keys (PG19 sorts by
+    // them); a non-key ORDER BY term before them is 42803.
+    for (j, d) in stmt.distinct_on.iter().enumerate() {
+        if !key_matched[j] {
+            if seen_tail {
+                return Err(exec_err(
+                    "42803",
+                    "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                ));
+            }
+            key_pos[j] = effective.len();
+            effective.push(OrderTerm {
+                expr: d.clone(),
+                desc: false,
+                nulls_first: None,
+            });
+        }
+    }
+    // The non-key ORDER BY tail keeps its relative order.
+    for (i, term) in stmt.order_by.iter().enumerate() {
+        if !term_matched[i] {
+            effective.push(term.clone());
+        }
+    }
+    Ok((effective, key_pos))
+}
+
+/// v0.52: `SELECT DISTINCT ON` — keep the first row of each group of rows
+/// whose DISTINCT ON expressions are equal (NULLs group together, via the
+/// canonical `value_key`, like the plain-DISTINCT filter). Callers sort by
+/// the effective ORDER BY (distinct keys ++ tail) first — PG19 always
+/// sorts, even with no user ORDER BY — so "first" is the ORDER BY winner.
+/// Group keys are evaluated against the full pre-projection row, which
+/// DISTINCT ON queries always retain. `distinct_pos` is Some on the
+/// aggregate path: there is no pre-projection row, so the keys are derived
+/// from the sort keys exec_agg precomputed for the effective ORDER BY
+/// (each DISTINCT ON expression's index into them).
+fn distinct_on_filter(
+    q: &mut Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    schema: &[QCol],
+    orows: &mut Vec<OutRow>,
+    distinct_pos: Option<&[usize]>,
+) -> Result<(), ExecError> {
+    // Aggregate path: derive group keys from precomputed sort keys.
+    if let Some(dpos) = distinct_pos {
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut kept: Vec<OutRow> = Vec::with_capacity(orows.len());
+        for o in orows.drain(..) {
+            let sk = o.sort_keys.as_ref().expect(
+                "DISTINCT ON with aggregates precomputes sort keys for the effective ORDER BY",
+            );
+            let mut k = Vec::new();
+            for &p in dpos {
+                value_key(&sk[p], &mut k);
+            }
+            if seen.insert(k) {
+                kept.push(o);
+            }
+        }
+        *orows = kept;
+        return Ok(());
+    }
+    // Plain path: evaluate the DISTINCT ON expressions against the full
+    // pre-projection row. Window terms read their precomputed values via
+    // the row's pre-projection index (like apply_order does).
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(orows.len());
+    for o in orows.iter() {
+        if let Some(wi) = o.win_idx {
+            if let Some(wctx) = q.wctx.as_mut() {
+                wctx.row = wi;
+            }
+        }
+        let frame = Scope {
+            schema,
+            row: o.full.as_deref().unwrap_or(&[]),
+            prov: None,
+        };
+        let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+        scopes.extend_from_slice(outer);
+        scopes.push(frame);
+        let mut k = Vec::new();
+        for e in &stmt.distinct_on {
+            value_key(&eval_expr(q, &scopes, e)?, &mut k);
+        }
+        keys.push(k);
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut kept: Vec<OutRow> = Vec::with_capacity(orows.len());
+    for (o, k) in orows.drain(..).zip(keys.into_iter()) {
+        if seen.insert(k) {
+            kept.push(o);
+        }
+    }
+    *orows = kept;
+    Ok(())
+}
+
 /// One ORDER BY key. Resolution order, Postgres-style:
 /// 1. a positive integer literal = 1-based position in the select list;
 /// 2. an expression structurally identical to a select-list expression;
@@ -11427,7 +11857,8 @@ fn apply_order(
 /// 4. the caller-supplied fallback: for plain non-DISTINCT queries, any
 ///    expression over the FROM row (the v0.1-v0.5 behavior); for aggregated
 ///    queries, a group-level expression (aggregates / GROUP BY columns);
-///    for DISTINCT queries, an error — output only.
+///    for plain DISTINCT queries, an error — output only (v0.52: DISTINCT
+///    ON is exempt and may sort by non-projected columns, like Postgres).
 fn order_key(
     stmt: &SelectStmt,
     out_qcols: &[QCol],
@@ -23668,6 +24099,290 @@ mod tests {
             eval_bitnot_val(&Value::SmallInt(5)).unwrap(),
             Value::Int(!5i64)
         );
+    }
+
+    /// v0.52: `SELECT DISTINCT ON` basics — one row per group of equal key
+    /// expressions (NULLs group), the ORDER BY winner kept. Verified
+    /// against PostgreSQL 16.2 (2026-09-17).
+    #[test]
+    fn v52_distinct_on_basics() {
+        let mut eng = engine();
+        let mut q = |e: &str| rows_of(run(&mut eng, e).unwrap());
+        // One row per uid: the smallest amt.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid, amt"),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // DESC picks the largest amt per group.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid, amt DESC"),
+            vec![
+                vec!["1".to_string(), "20".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // The DISTINCT ON expression need not be projected, and ORDER BY
+        // may name non-projected columns (no 42703, unlike plain DISTINCT).
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) amt FROM orders ORDER BY uid, amt"),
+            vec![vec!["10".to_string()], vec!["5".to_string()]]
+        );
+        // Multiple DISTINCT ON expressions.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid, amt) uid, amt FROM orders ORDER BY uid, amt"),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // ORDER BY ordinals resolve for the prefix check.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY 1, 2"),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // Output aliases resolve for the prefix check.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid AS u, amt FROM orders ORDER BY u, amt"),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // Expression keys: buckets by amt % 2, smallest amt per bucket.
+        assert_eq!(
+            q("SELECT DISTINCT ON (amt % 2) amt FROM orders ORDER BY amt % 2, amt"),
+            vec![vec!["10".to_string()], vec!["5".to_string()]]
+        );
+        // Works through a derived table (the corpus shape).
+        assert_eq!(
+            q("SELECT * FROM (SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid, amt) s"),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // LIMIT applies after the first-row-per-group filter.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid, amt LIMIT 1"),
+            vec![vec!["1".to_string(), "10".to_string()]]
+        );
+    }
+
+    /// v0.52: NULL DISTINCT ON keys group together (NULLs equal, like PG).
+    #[test]
+    fn v52_distinct_on_nulls_group() {
+        let mut eng = engine();
+        run(&mut eng, "INSERT INTO orders VALUES (7, NULL, 30)").unwrap();
+        run(&mut eng, "INSERT INTO orders VALUES (8, NULL, 40)").unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid, amt",
+            )
+            .unwrap(),
+        );
+        // ASC puts NULLs last; the two NULL-uid rows form one group and
+        // the smallest amt (30) wins.
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+                vec!["NULL".to_string(), "30".to_string()],
+            ]
+        );
+    }
+
+    /// v0.52: without ORDER BY, PG still sorts by the distinct keys (the
+    /// "arbitrary" first row is the first after that sort).
+    #[test]
+    fn v52_distinct_on_no_order_by() {
+        let mut eng = engine();
+        // Output comes out ordered by the distinct key, like PG.
+        let rows = rows_of(run(&mut eng, "SELECT DISTINCT ON (uid) uid FROM orders").unwrap());
+        assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+        // The winner is the first row after sorting by the key: uid=1's
+        // smallest id (1, amt 10) beats (2, amt 20).
+        let rows = rows_of(run(&mut eng, "SELECT DISTINCT ON (uid) uid, amt FROM orders").unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+    }
+
+    /// v0.52: the DISTINCT ON prefix rule is PG19's set-prefix rule, not
+    /// positional: ORDER BY may permute the keys, may name fewer keys than
+    /// DISTINCT ON (the rest are appended implicitly), but a key after a
+    /// non-key term — or an unreached key with a non-key tail — is 42803.
+    #[test]
+    fn v52_distinct_on_order_prefix_42803() {
+        let mut eng = engine();
+        let mut e = |s: &str| run(&mut eng, s).unwrap_err();
+        // Key after a non-key term: 42803.
+        let err = e("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY amt, uid");
+        assert_eq!(err.code, "42803");
+        assert!(
+            err.message
+                .contains("must match initial ORDER BY expressions")
+        );
+        // Structurally different expression: 42803.
+        let err = e("SELECT DISTINCT ON (uid) uid, amt FROM orders ORDER BY uid + 0, amt");
+        assert_eq!(err.code, "42803");
+        // Unreached key with a non-key tail: 42803.
+        let err = e("SELECT DISTINCT ON (uid, amt) uid, amt FROM orders ORDER BY uid, amt + 100");
+        assert_eq!(err.code, "42803");
+        // Permuted keys: fine.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT ON (uid, amt) uid, amt FROM orders ORDER BY amt, uid",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["2".to_string(), "5".to_string()],
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+            ]
+        );
+        // Short prefix: the missing key is appended implicitly (ASC).
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT ON (uid, amt) uid, amt FROM orders ORDER BY uid",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // Duplicate keys and duplicate ORDER BY terms: fine.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT ON (uid, uid) uid, amt FROM orders ORDER BY uid, uid, amt",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+    }
+
+    /// v0.52: DISTINCT ON supports GROUP BY and aggregates (PG19) — the
+    /// filter runs above the grouping, keyed by group-level expressions.
+    #[test]
+    fn v52_distinct_on_group_by() {
+        let mut eng = engine();
+        let mut q = |e: &str| rows_of(run(&mut eng, e).unwrap());
+        // One row per group, like a plain DISTINCT ON over the groups.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, count(*) FROM orders GROUP BY uid"),
+            vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+            ]
+        );
+        // ORDER BY picks the winner among groups.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid) uid, max(amt) FROM orders GROUP BY uid ORDER BY uid"),
+            vec![
+                vec!["1".to_string(), "20".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+        // An expression key over group columns.
+        assert_eq!(
+            q("SELECT DISTINCT ON (uid + 0) uid, count(*) FROM orders GROUP BY uid"),
+            vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+            ]
+        );
+        // An aggregate key: the counts (2 and 1) are distinct, so both
+        // groups survive; ORDER BY count(*) orders them.
+        assert_eq!(
+            q(
+                "SELECT DISTINCT ON (count(*)) uid, count(*) FROM orders GROUP BY uid ORDER BY count(*)"
+            ),
+            vec![
+                vec!["2".to_string(), "1".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+            ]
+        );
+        // A non-grouped column in the DISTINCT ON key is the ordinary
+        // grouping error (PG19 42803).
+        let err = run(
+            &mut eng,
+            "SELECT DISTINCT ON (amt) uid, count(*) FROM orders GROUP BY uid",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+        // An aggregate key without GROUP BY makes the whole query
+        // aggregated, so the bare column is the grouping error.
+        let err = run(&mut eng, "SELECT DISTINCT ON (count(*)) uid FROM orders").unwrap_err();
+        assert_eq!(err.code, "42803");
+    }
+
+    /// v0.52: window functions are legal inside DISTINCT ON expressions
+    /// (PG19) — the key reads the precomputed window value.
+    #[test]
+    fn v52_distinct_on_window_key() {
+        let mut eng = engine();
+        // ranks by amt: (2,5)->1, (1,10)->2, (1,20)->3 — all distinct.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT ON (rank() OVER (ORDER BY amt)) uid, amt FROM orders ORDER BY rank() OVER (ORDER BY amt), uid",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["2".to_string(), "5".to_string()],
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+            ]
+        );
+    }
+
+    /// v0.52: DISTINCT ON shape rejections — FOR UPDATE (0A000), the
+    /// mandatory parens (42601), and the comma-after-ON syntax PG rejects
+    /// (42601). Note: the v0.52 assignment brief claimed
+    /// `SELECT DISTINCT ON (a), b` is valid, but real PostgreSQL rejects
+    /// the comma — this implementation follows PostgreSQL.
+    #[test]
+    fn v52_distinct_on_rejects_bad_shapes() {
+        let mut eng = engine();
+        let mut e = |s: &str| run(&mut eng, s).unwrap_err();
+        assert_eq!(
+            e("SELECT DISTINCT ON (uid) uid FROM orders FOR UPDATE").code,
+            "0A000"
+        );
+        assert_eq!(e("SELECT DISTINCT ON uid, amt FROM orders").code, "42601");
+        assert_eq!(e("SELECT DISTINCT ON (uid), amt FROM orders").code, "42601");
     }
 }
 

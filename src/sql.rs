@@ -1180,6 +1180,10 @@ pub struct SelectStmt {
     /// v0.10: `WITH [RECURSIVE] ...` CTEs, in definition order.
     pub with: Vec<CteDef>,
     pub distinct: bool,
+    /// v0.52: `SELECT DISTINCT ON (expr [, ...])` (PG19 gram.y
+    /// DistinctClause). Empty when absent; mutually exclusive with
+    /// `distinct` (the parser enforces it).
+    pub distinct_on: Vec<Expr>,
     pub items: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub where_: Option<Expr>,
@@ -1211,6 +1215,7 @@ fn empty_select() -> SelectStmt {
     SelectStmt {
         with: Vec::new(),
         distinct: false,
+        distinct_on: Vec::new(),
         items: Vec::new(),
         from: Vec::new(),
         where_: None,
@@ -6077,12 +6082,30 @@ impl Parser {
     /// `parse_select_query`). Used for set-operation branches, where
     /// Postgres forbids a tail before the operator outside parentheses.
     fn parse_select_core(&mut self) -> Result<SelectStmt, SqlError> {
-        let distinct = if self.eat_keyword("distinct") {
-            true
+        // v0.52: `SELECT DISTINCT ON (expr [, ...])` (PG19 gram.y
+        // DistinctClause). Like Postgres, ON after DISTINCT always
+        // introduces DISTINCT ON — `SELECT DISTINCT on FROM t` is a
+        // syntax error, not DISTINCT over a column named `on`.
+        let mut distinct = false;
+        let mut distinct_on: Vec<Expr> = Vec::new();
+        if self.eat_keyword("distinct") {
+            if self.eat_keyword("on") {
+                self.expect(Token::LParen, "'('")?;
+                loop {
+                    distinct_on.push(self.parse_or()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
+            } else {
+                distinct = true;
+            }
         } else {
             // ALL is the default; consume it if present.
             self.eat_keyword("all");
-            false
         };
         let mut items = Vec::new();
         loop {
@@ -6152,6 +6175,7 @@ impl Parser {
         Ok(SelectStmt {
             with: Vec::new(),
             distinct,
+            distinct_on,
             items,
             from,
             where_,
