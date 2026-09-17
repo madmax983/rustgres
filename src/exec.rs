@@ -12387,14 +12387,6 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
         // (smallint/int/bigint/numeric), not for real/double.
         return Err(op_err(op, a, b));
     }
-    // Postgres promotes smallint <op> smallint to integer (int4):
-    // e.g. 30000::smallint + 30000::smallint = 60000 :: integer, and
-    // (-32768)::int2 * (-1)::int2 = 32768 :: integer (no overflow).
-    let icat = if cat == NumCat::Small {
-        NumCat::Int
-    } else {
-        cat
-    };
     match cat {
         NumCat::Numeric => {
             let x = to_numeric_opt(a)
@@ -12494,13 +12486,22 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
             if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0 {
                 return Err(exec_err("22012", "division by zero"));
             }
-            let r = match op {
-                ArithOp::Add => x.checked_add(y),
-                ArithOp::Sub => x.checked_sub(y),
-                ArithOp::Mul => x.checked_mul(y),
-                // i128::MIN / -1 is the only overflow here.
-                ArithOp::Div => x.checked_div(y),
-                ArithOp::Mod => x.checked_rem(y),
+            // v0.50: Postgres (int.c, int8.c, REL_19_STABLE) checks integer
+            // arithmetic for overflow against the *result* type and raises
+            // 22003 — smallint pairs do NOT promote to integer, so e.g.
+            // 30000::int2 + 30000::int2 and (-32768)::int2 * (-1)::int2 are
+            // "smallint out of range", not int4 results. Operands are at most
+            // i64 in magnitude (to_i128), so these i128 intermediates cannot
+            // overflow and cannot divide by zero (y == 0 is rejected above);
+            // the range check in fit_int_result is the only possible failure.
+            // Modulo matches PG exactly: INT_MIN % -1 is 0, never an error
+            // (division by zero is still 22012).
+            let r: i128 = match op {
+                ArithOp::Add => x + y,
+                ArithOp::Sub => x - y,
+                ArithOp::Mul => x * y,
+                ArithOp::Div => x / y,
+                ArithOp::Mod => x % y,
                 ArithOp::Pow => unreachable!("^ is handled before the category dispatch"),
                 ArithOp::BitAnd
                 | ArithOp::BitOr
@@ -12510,8 +12511,7 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
                     unreachable!("bitwise ops return early via eval_bitwise")
                 }
             };
-            let r = r.ok_or_else(|| exec_err("22003", "integer out of range"))?;
-            fit_int_result(icat, r)
+            fit_int_result(cat, r)
         }
     }
 }
@@ -12581,14 +12581,20 @@ fn eval_bitnot_val(v: &Value) -> Result<Value, ExecError> {
 }
 
 /// Fit an i128 arithmetic result into the resolved integer kind.
+/// v0.50: Postgres raises 22003 with a per-type message on overflow
+/// ("smallint out of range" / "integer out of range" / "bigint out of
+/// range"), matching int.c / int8.c on REL_19_STABLE.
 fn fit_int_result(icat: NumCat, r: i128) -> Result<Value, ExecError> {
-    let ovf = || exec_err("22003", "integer out of range");
     match icat {
         NumCat::Small => Ok(Value::SmallInt(
             i16::try_from(r).map_err(|_| exec_err("22003", "smallint out of range"))?,
         )),
-        NumCat::Int => Ok(Value::Int(i32::try_from(r).map_err(|_| ovf())? as i64)),
-        _ => Ok(Value::BigInt(i64::try_from(r).map_err(|_| ovf())?)),
+        NumCat::Int => Ok(Value::Int(
+            i32::try_from(r).map_err(|_| exec_err("22003", "integer out of range"))? as i64,
+        )),
+        _ => Ok(Value::BigInt(
+            i64::try_from(r).map_err(|_| exec_err("22003", "bigint out of range"))?,
+        )),
     }
 }
 
@@ -20280,10 +20286,8 @@ fn combine_arith_types(
                             // types (not real/double).
                             return Err(op_err(x, y));
                         }
-                        // int2 <op> int2 -> int4, like Postgres.
-                        if rx == 0 && ry == 0 {
-                            return Ok(ColType::Int);
-                        }
+                        // v0.50: int2 <op> int2 -> int2 (Postgres int2pl etc.
+                        // return smallint; there is no promotion to int4).
                         Ok(rank_type(rx.max(ry)))
                     }
                     _ => Err(op_err(x, y)),
@@ -23522,6 +23526,70 @@ mod tests {
         // Single-row scalar subquery evaluates in place.
         let rows = rows_of(run(&mut eng, "SELECT (SELECT 10 AS v) + 5").unwrap());
         assert_eq!(rows, vec![vec!["15".to_string()]]);
+    }
+
+    /// v0.50: integer arithmetic overflow detection, matching Postgres
+    /// int.c / int8.c (REL_19_STABLE): +,-,*,/ and INT_MIN/-1 raise 22003
+    /// with a per-type message; int2 pairs do NOT promote to int4.
+    #[test]
+    fn v50_int_overflow_detection() {
+        use ArithOp::{Add, Div, Mod, Mul};
+        let ovf = |op, a: Value, b: Value| {
+            let e = eval_arith(op, &a, &b).unwrap_err();
+            (e.code, e.message)
+        };
+        // int2 overflow: no promotion to int4.
+        assert_eq!(
+            ovf(Add, Value::SmallInt(30000), Value::SmallInt(30000)),
+            ("22003", "smallint out of range".to_string())
+        );
+        assert_eq!(
+            ovf(Mul, Value::SmallInt(-32768), Value::SmallInt(-1)),
+            ("22003", "smallint out of range".to_string())
+        );
+        assert_eq!(
+            ovf(Div, Value::SmallInt(-32768), Value::SmallInt(-1)),
+            ("22003", "smallint out of range".to_string())
+        );
+        // int2 boundary results keep the smallint type.
+        assert_eq!(
+            eval_arith(Add, &Value::SmallInt(32767), &Value::SmallInt(0)).unwrap(),
+            Value::SmallInt(32767)
+        );
+        assert_eq!(
+            eval_arith(Mul, &Value::SmallInt(-32768), &Value::SmallInt(1)).unwrap(),
+            Value::SmallInt(-32768)
+        );
+        // int4 overflow.
+        assert_eq!(
+            ovf(Add, Value::Int(i32::MAX as i64), Value::Int(1)),
+            ("22003", "integer out of range".to_string())
+        );
+        assert_eq!(
+            ovf(Mul, Value::Int(i32::MIN as i64), Value::Int(-1)),
+            ("22003", "integer out of range".to_string())
+        );
+        // int8 overflow; INT_MIN % -1 is 0, not an error.
+        assert_eq!(
+            ovf(Add, Value::BigInt(i64::MAX), Value::BigInt(1)),
+            ("22003", "bigint out of range".to_string())
+        );
+        assert_eq!(
+            ovf(Div, Value::BigInt(i64::MIN), Value::BigInt(-1)),
+            ("22003", "bigint out of range".to_string())
+        );
+        assert_eq!(
+            eval_arith(Mod, &Value::BigInt(i64::MIN), &Value::BigInt(-1)).unwrap(),
+            Value::BigInt(0)
+        );
+        // Mixed widths resolve to the wider type.
+        assert_eq!(
+            eval_arith(Add, &Value::SmallInt(30000), &Value::Int(30000)).unwrap(),
+            Value::Int(60000)
+        );
+        // Division by zero is still 22012, not 22003.
+        let e = eval_arith(Div, &Value::Int(1), &Value::Int(0)).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("22012", "division by zero"));
     }
 }
 
