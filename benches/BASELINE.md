@@ -2,6 +2,101 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `IndexKey::cmp` builds a Zip iterator for single-column keys — baseline — 2026-09-17
+
+**Workload**: `benches/profile_idxscan.py` (new) — a fixed-iteration-count
+driver, same rationale as `profile_join.py`/`profile_insert.py`/
+`profile_toast.py`: two profiling runs must do identical work for a
+before/after counter comparison to mean anything. This driver loads a
+fixed 50,000-row table with a secondary index on one `INT` column (the
+same shape as `bench.py`'s `idxscan` workload), then sends an exact COUNT
+of `WHERE id BETWEEN lo AND lo+width-1` range queries over the real wire
+protocol against that index:
+
+```sql
+CREATE TABLE bench_idxscan(id INT, grp INT, name TEXT)
+-- 50,000 rows loaded in 1000-row batches
+CREATE INDEX bench_idxscan_id ON bench_idxscan(id)
+SELECT * FROM bench_idxscan WHERE id BETWEEN <lo> AND <lo+19>
+-- repeated 1000 times, walking evenly across the key space
+```
+
+No prior Bolt round has profiled `src/index.rs` or the index-scan access
+path in `src/exec.rs` (`plan_access_path`/`index_scan_ids`) — every
+previous round targeted the tokenizer/parser, row send/project,
+join/order-by comparisons, INSERT, or TOAST. The query count is
+deliberately large (1000 iterations of a narrow 20-row range, rather than
+a handful of wide scans) so the *scan* path's own cost has a fair chance
+against the one-time cost of building the 50,000-row table and its index
+— a first attempt at this workload with `--count 50 --width 1000` (same
+total rows touched) turned out to still be dominated by that one-time
+setup (INSERT/WAL/parsing), confirming that a real fixed-iteration
+driver, not just "big COUNT queries," is needed to isolate a scan-shaped
+cost the same way `profile_fixed.py` first established for the tokenizer.
+
+**Profile** (Callgrind, HEAD = `b3e5302`, PROGRAM TOTALS `Ir` =
+6,156,939,810 / 6,157,020,215 on two runs, 0.0013% apart — Ir is
+admissible on this workload). Top self-costs (`callgrind_annotate
+--auto=no`):
+
+| function | Ir | % of total |
+|---|---|---|
+| `__memcpy_avx_unaligned_erms` (libc) | 609,960,741 | 9.91% |
+| `<Iter<T> as Iterator>::next` | 171,901,902 | 2.79% |
+| `index::index_key_cmp` | 126,002,944 | 2.05% |
+| `wal::crc32` | 118,687,702 | 1.92% |
+| `Iterator::try_fold` | 117,926,753 | 1.92% |
+| `index::exact_as_i64` | 82,689,432 | 1.34% |
+| `Vec::extend_desugared` | 89,273,354 | 1.45% |
+| `<Enumerate<I> as Iterator>::next` | 80,781,927 | 1.31% |
+| `sql::tokenize` | 75,997,337 | 1.23% |
+| `<IndexKey as Ord>::cmp` | 65,511,064 | 1.06% |
+| `Iterator::zip` | 63,930,654 | 1.04% |
+| `<Zip<A,B>>::new` | 63,930,304 | 1.04% |
+| `<Zip<A,B>>::next` | 63,168,482 | 1.03% |
+| `<IndexKey as Ord>::cmp::{{closure}}` | 50,110,696 | 0.81% |
+| `index::is_exact_numeric` | 35,438,328 | 0.58% |
+
+`src/index.rs`'s own functions (`index_key_cmp` + `exact_as_i64` +
+`<IndexKey as Ord>::cmp` + its closure + `is_exact_numeric`) sum to
+**5.84%** of this profile — just above the 5%-of-profile relevance bar —
+and the `Iterator::zip`/`Zip::new`/`Zip::next` trio immediately below
+them (3.11% more) is, in this workload, driven from exactly one call
+site: `<IndexKey as Ord>::cmp`'s `self.0.iter().zip(other.0.iter())`
+(this workload has no joins or other zipped-iterator code on its path).
+Both groups are exercised by every B-tree comparison the index does,
+during row insertion (building the 50,000-row index, `O(log n)`
+comparisons per insert) and during the range scans themselves.
+
+**Hypothesis**: `IndexKey` wraps `Vec<Value>` to support composite
+(multi-column) indexes, so `<IndexKey as Ord>::cmp` is written as a
+general lexicographic-compare-over-a-sequence using
+`Iterator::zip`/`Iterator::map`/`Iterator::find`. But every index in this
+benchmark's schema — and the common case for real single-column indexes
+(a lone `id`, `email`, `created_at`, a foreign key, ...) — has exactly
+one key column, so `self.0` and `other.0` are always 1-element slices:
+the general path constructs a `Zip` iterator, maps each pair through
+`index_key_cmp`, and calls `Iterator::find` to locate the first
+non-`Equal` result, all to compare a single pair of values and fall back
+to comparing two lengths that are already known to be equal. A direct
+`if let ([a], [b]) = (...) { return index_key_cmp(a, b); }` fast path
+ahead of the general case removes that iterator-construction/driving
+overhead for the overwhelmingly common shape, while leaving genuinely
+composite keys on the untouched general path. Fix follows in the entry
+above.
+
+**Reproduce**:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_idxscan.py --count 1000 --width 20 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+```
+
 ## Bolt: `compress_pglz` reallocates its 64K-entry match table every call — fix — 2026-09-16
 
 Fixes the target identified in the baseline entry immediately below this
