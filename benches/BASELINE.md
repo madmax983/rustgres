@@ -2,6 +2,91 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `IndexKey::cmp` builds a Zip iterator for single-column keys — fix — 2026-09-17
+
+Fixes the target identified in the baseline entry immediately below this
+one. `src/index.rs`'s `impl Ord for IndexKey` opened with
+`self.0.iter().zip(other.0.iter()).map(|(a, b)| index_key_cmp(a, b)).find(...)`
+— building an `Iterator`/`Zip`/`Map` chain and driving it through
+`Iterator::find` — for *every* B-tree comparison a secondary index does,
+both while it's being built (one comparison per row insert, descending
+`O(log n)` tree levels) and while it's scanned. The fix adds one
+directly-checked fast path ahead of that chain:
+
+```rust
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if let ([a], [b]) = (self.0.as_slice(), other.0.as_slice()) {
+            return index_key_cmp(a, b);
+        }
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .map(|(a, b)| index_key_cmp(a, b))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| self.0.len().cmp(&other.0.len()))
+    }
+}
+```
+
+Single-column indexes are the overwhelmingly common case — every index in
+this repo's benchmark workloads, and most real-world ones (a lone `id`,
+`email`, `created_at`, ...) — so this turns the common-case comparison
+into one direct `index_key_cmp` call instead of constructing and driving
+`Zip`/`Map`/`find` machinery for a one-element sequence. The general
+lexicographic path for genuinely composite (multi-column) keys is
+untouched, so its behavior — and output — is identical either way; for
+the single-column case the result is also identical, since comparing one
+pair of elements and falling back to a (trivially-equal, both length 1)
+length comparison is exactly what `index_key_cmp(a, b)` alone computes.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_idxscan.py --count 1000
+--width 20` — the same 50,000-row / 1000-range-query workload from the
+baseline entry below, same machine, this session; two runs each side to
+confirm determinism):
+
+| | Ir, run 1 | Ir, run 2 | average |
+|---|---|---|---|
+| before (HEAD, baseline entry below) | 6,156,939,810 | 6,157,020,215 | 6,156,980,012.5 |
+| after (this fix) | 5,149,671,350 | 5,149,004,135 | 5,149,337,742.5 |
+
+**Delta: -16.37%** — far above the ≥5%-of-profile impact floor (the
+target was already measured at ~5.8% of this profile in the baseline
+entry; the actual win is roughly 3x that share, because removing the
+iterator chain also collapses the `Iterator::zip`/`Zip::new`/`Zip::next`
+machinery it was driving, which the baseline entry counted separately).
+Both before-pairs and both after-pairs agree to within 0.013%/0.0013%
+respectively — far inside the noise band, so -16.37% is signal.
+
+**Correctness**: `cargo test --all-features` — 138 passed, 1 pre-existing
+failure (`exec::tests::v17_datetime_functions`, a `to_char` `"YYYY"`-format
+assertion unrelated to indexing; reproduces identically via `git stash`,
+same failure noted in every prior BASELINE.md entry in this file). All
+`index::tests::*` unit tests (`nulls_sort_high`, `mixed_exact_numerics_compare`,
+`key_ord_is_lexicographic` — the last one exercises the untouched
+composite-key path directly) pass unchanged. `cargo fmt --all -- --check`
+is clean. `cargo clippy --all-targets --all-features -- -D warnings`
+fails to compile with the same 283 pre-existing errors (the
+`useless_vec`/toolchain-mismatch issue noted in earlier entries) on both
+the pre-change and post-change tree, confirmed via `git stash`; no new
+clippy findings.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_idxscan.py --count 1000 --width 20 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/index.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
 ## Bolt: `IndexKey::cmp` builds a Zip iterator for single-column keys — baseline — 2026-09-17
 
 **Workload**: `benches/profile_idxscan.py` (new) — a fixed-iteration-count

@@ -166,6 +166,15 @@ impl PartialOrd for IndexKey {
 
 impl Ord for IndexKey {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Single-column indexes are the overwhelmingly common case (every
+        // index in this benchmark's workloads, and most real ones), so
+        // skip the Zip/map/find iterator chain — built and driven on
+        // every B-tree comparison during both index maintenance and
+        // scans — in favor of one direct index_key_cmp call. Composite
+        // keys keep the general lexicographic path below unchanged.
+        if let ([a], [b]) = (self.0.as_slice(), other.0.as_slice()) {
+            return index_key_cmp(a, b);
+        }
         self.0
             .iter()
             .zip(other.0.iter())
