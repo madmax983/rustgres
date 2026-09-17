@@ -248,6 +248,24 @@ fn require_view_owner(eng: &Engine, ctx: &StmtCtx, view: &str) -> Result<(), Exe
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     match stmt {
         Stmt::CreateTable { name, def, temp } => exec_create(eng, ctx, name, def, *temp),
+        // v0.48: CREATE TABLE ... AS <query>.
+        Stmt::CreateTableAs {
+            name,
+            col_aliases,
+            select,
+            temp,
+            if_not_exists,
+            with_data,
+        } => exec_create_table_as(
+            eng,
+            ctx,
+            name,
+            col_aliases,
+            select,
+            *temp,
+            *if_not_exists,
+            *with_data,
+        ),
         Stmt::Insert {
             table,
             columns,
@@ -467,6 +485,36 @@ fn exec_create(
     def: &TableDef,
     temp: bool,
 ) -> Result<ExecResult, ExecError> {
+    create_table_from_def(eng, ctx, name, def, temp)?;
+    // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
+    // table is empty, so no duplicate check is needed. (v0.22: temp
+    // tables get none — the global index map cannot represent them.)
+    if !temp {
+        if let Some(pk) = &def.pkey {
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+        }
+        for u in &def.uniques {
+            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "CREATE TABLE".to_string(),
+    })
+}
+
+/// v0.48: the table-creation core shared by CREATE TABLE and
+/// CREATE TABLE AS (PG19 heap_create / create_ctas_internal): temp
+/// tables land in the session-local map, permanent ones in the
+/// catalog, TOAST backing is created eagerly. FK validation runs here
+/// (a CTAS definition never carries constraints, so it is a no-op
+/// there); backing unique indexes stay with plain CREATE TABLE above.
+fn create_table_from_def(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    def: &TableDef,
+    temp: bool,
+) -> Result<(), ExecError> {
     // v0.22: CREATE TEMP TABLE creates a session-local table in
     // `Database::temp_tables[session]`, shadowing any permanent table of
     // the same name *only within this session* (PostgreSQL semantics).
@@ -507,9 +555,7 @@ fn exec_create(
         // table's indexes. PRIMARY KEY / UNIQUE constraints on temp
         // tables are recorded in the table definition and enforced by a
         // session-local scan (`Database::temp_scan_constraint`).
-        return Ok(ExecResult::Command {
-            tag: "CREATE TABLE".to_string(),
-        });
+        return Ok(());
     }
     if eng
         .db
@@ -552,17 +598,7 @@ fn exec_create(
     for fk in &def.fks {
         validate_fk_def(eng, ctx, name, fk)?;
     }
-    // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
-    // table is empty, so no duplicate check is needed.
-    if let Some(pk) = &def.pkey {
-        create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
-    }
-    for u in &def.uniques {
-        create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
-    }
-    Ok(ExecResult::Command {
-        tag: "CREATE TABLE".to_string(),
-    })
+    Ok(())
 }
 
 /// Validate a foreign-key definition: the referenced table exists, the
@@ -2164,6 +2200,154 @@ fn toast_delete_chunks(
     Ok(())
 }
 
+/// v0.48: apply pre-built `(row id, row)` inserts to a table: push row
+/// versions, record undo write ops, TOAST wide values, and maintain
+/// indexes. Shared by INSERT and CREATE TABLE AS.
+fn apply_row_inserts(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    inserts: &[(u64, Row)],
+) -> Result<(), ExecError> {
+    {
+        let t = eng
+            .db
+            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible; engine lock held throughout");
+        for (id, values) in inserts {
+            t.push_version(RowVersion::plain(*id, values.clone(), ctx.own));
+            ctx.writes.push(WriteOp::InsertRow {
+                table: table.to_string(),
+                row_id: *id,
+            });
+        }
+    }
+    // v0.37: TOAST the new rows (separate borrows inside).
+    for (id, values) in inserts {
+        toast_new_row(eng, ctx, table, *id, values)?;
+    }
+    for (id, values) in inserts {
+        eng.db.index_insert_row(table, *id, values, ctx.session);
+    }
+    Ok(())
+}
+
+/// v0.48: `CREATE TABLE ... AS <query>` (PG19 createas.c / intorel.c).
+/// The query runs first — parse analysis and execution must succeed
+/// before anything is created (statement atomicity). The table's
+/// columns are inferred from the query's output names and types;
+/// explicit aliases rename them positionally. Completes with
+/// `SELECT <n>`, like PostgreSQL.
+///
+/// Honest deviation: `WITH NO DATA` still executes the query and
+/// discards the rows (Postgres skips execution); observable only via
+/// volatile functions in the query.
+#[allow(clippy::too_many_arguments)]
+fn exec_create_table_as(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col_aliases: &[String],
+    select: &SelectStmt,
+    temp: bool,
+    if_not_exists: bool,
+    with_data: bool,
+) -> Result<ExecResult, ExecError> {
+    // Existence check first, like CREATE TABLE (42P07).
+    if eng
+        .db
+        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .is_some()
+        || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
+    {
+        if if_not_exists {
+            // PG: NOTICE "relation already exists, skipping", tag SELECT 0.
+            return Ok(ExecResult::Command {
+                tag: "SELECT 0".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", name),
+        ));
+    }
+    // Run the query before creating anything.
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let out = {
+        let mut q = Q {
+            eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            session: ctx.session,
+            role: ctx.role,
+            read_only: ctx.read_only,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            priv_scopes: Vec::new(),
+        };
+        run_select(&mut q, select, &[])?
+    };
+    if !lock_ids.is_empty() {
+        acquire_row_locks(eng, ctx.own, &lock_ids)?;
+    }
+    // Column names: explicit aliases rename positionally.
+    let mut columns: Vec<(String, ColType)> = out.columns;
+    if !col_aliases.is_empty() {
+        if col_aliases.len() != columns.len() {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "table \"{}\" has {} columns available but {} specified",
+                    name,
+                    columns.len(),
+                    col_aliases.len()
+                ),
+            ));
+        }
+        for ((n, _), a) in columns.iter_mut().zip(col_aliases.iter()) {
+            *n = a.clone();
+        }
+    }
+    // Duplicate names are 42701 — except repeated `?column?`, which
+    // Postgres permits for unnamed expression outputs.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (n, _) in &columns {
+            if n != "?column?" && !seen.insert(n) {
+                return Err(exec_err(
+                    "42701",
+                    format!("column \"{}\" specified more than once", n),
+                ));
+            }
+        }
+    }
+    let ncols = columns.len();
+    let def = crate::sql::TableDef {
+        columns,
+        not_null: vec![false; ncols],
+        defaults: vec![None; ncols],
+        compression: vec![None; ncols],
+        checks: Vec::new(),
+        uniques: Vec::new(),
+        pkey: None,
+        fks: Vec::new(),
+    };
+    create_table_from_def(eng, ctx, name, &def, temp)?;
+    let n = if with_data { out.rows.len() } else { 0 };
+    if with_data {
+        let mut inserts: Vec<(u64, Row)> = Vec::with_capacity(out.rows.len());
+        for row in out.rows {
+            inserts.push((eng.alloc_row_id(), row));
+        }
+        apply_row_inserts(eng, ctx, name, &inserts)?;
+    }
+    Ok(ExecResult::Command {
+        tag: format!("SELECT {}", n),
+    })
+}
+
 fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -2653,27 +2837,8 @@ fn exec_insert(
     // dhat on benches/profile_insert.py: this was the single largest
     // allocation site in the workload, ~26% of bytes allocated).
     ctx.writes.reserve(n);
-    // Apply inserts.
-    {
-        let t = eng
-            .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
-            .expect("table still visible; engine lock held throughout");
-        for (id, values) in &inserts {
-            t.push_version(RowVersion::plain(*id, values.clone(), ctx.own));
-            ctx.writes.push(WriteOp::InsertRow {
-                table: table.to_string(),
-                row_id: *id,
-            });
-        }
-    }
-    // v0.37: TOAST the new rows (separate borrows inside).
-    for (id, values) in &inserts {
-        toast_new_row(eng, ctx, table, *id, values)?;
-    }
-    for (id, values) in &inserts {
-        eng.db.index_insert_row(table, *id, values, ctx.session);
-    }
+    // Apply inserts (versions, TOAST, index maintenance).
+    apply_row_inserts(eng, ctx, table, &inserts)?;
     // Apply DO UPDATEs: delete old version + insert new version.
     // Pre-allocate the new row ids (the table borrow below conflicts).
     let mut update_ids = Vec::with_capacity(updates.len());
@@ -5492,6 +5657,7 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
             Expr::Not(e) | Expr::BitNot(e) => expr_uses(e),
             Expr::IsNull { expr, .. } => expr_uses(expr),
+            Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Agg { arg, arg2, .. } => {
                 arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
             }
@@ -5700,6 +5866,11 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::BitNot(x) => Ok(Expr::BitNot(Box::new(r(x)?))),
         Expr::IsNull { expr, neg } => Ok(Expr::IsNull {
             expr: Box::new(r(expr)?),
+            neg: *neg,
+        }),
+        Expr::IsDistinctFrom { left, right, neg } => Ok(Expr::IsDistinctFrom {
+            left: Box::new(r(left)?),
+            right: Box::new(r(right)?),
             neg: *neg,
         }),
         // Can't occur in a JOIN ON (rejected by validation), but resolve
@@ -7007,6 +7178,10 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
         | Expr::BitNot(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_expr(x),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            validate_expr(left)?;
+            validate_expr(right)
+        }
         Expr::Cast { expr, .. } => validate_expr(expr),
         Expr::Func { args, .. } => {
             for a in args {
@@ -7047,6 +7222,7 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::BitNot(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_agg(x),
+        Expr::IsDistinctFrom { left, right, .. } => contains_agg(left) || contains_agg(right),
         Expr::Cast { expr, .. } => contains_agg(expr),
         Expr::Func { args, .. } => args.iter().any(contains_agg),
         Expr::Extract { from, .. } => contains_agg(from),
@@ -7087,6 +7263,7 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::BitNot(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_window(x),
+        Expr::IsDistinctFrom { left, right, .. } => contains_window(left) || contains_window(right),
         Expr::Cast { expr, .. } => contains_window(expr),
         Expr::Func { args, .. } => args.iter().any(contains_window),
         Expr::Agg { arg, arg2, .. } => {
@@ -7328,6 +7505,10 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         | Expr::BitNot(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_window_expr(x, in_agg),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            validate_window_expr(left, in_agg)?;
+            validate_window_expr(right, in_agg)
+        }
         Expr::Cast { expr, .. } => validate_window_expr(expr, in_agg),
         Expr::Func { args, .. } => {
             for a in args {
@@ -7457,6 +7638,10 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
             | Expr::BitNot(x)
             | Expr::IsNull { expr: x, .. }
             | Expr::IsBool { expr: x, .. } => walk(x, visit),
+            Expr::IsDistinctFrom { left, right, .. } => {
+                walk(left, visit);
+                walk(right, visit);
+            }
             Expr::Cast { expr, .. } => walk(expr, visit),
             Expr::Func { args, .. } => {
                 for a in args {
@@ -7536,6 +7721,10 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
             | Expr::BitNot(x)
             | Expr::IsNull { expr: x, .. }
             | Expr::IsBool { expr: x, .. } => stamp(x, windows),
+            Expr::IsDistinctFrom { left, right, .. } => {
+                stamp(left, windows);
+                stamp(right, windows);
+            }
             Expr::Cast { expr, .. } => stamp(expr, windows),
             Expr::Func { args, .. } => {
                 for a in args {
@@ -8344,6 +8533,9 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
         Expr::Not(x) => pushable_columns(x, cols),
         Expr::BitNot(x) => pushable_columns(x, cols),
         Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => pushable_columns(x, cols),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            pushable_columns(left, cols) && pushable_columns(right, cols)
+        }
         _ => false,
     }
 }
@@ -8474,6 +8666,10 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         Expr::Not(x) => collect_column_refs(x, out),
         Expr::BitNot(x) => collect_column_refs(x, out),
         Expr::IsNull { expr: x, .. } => collect_column_refs(x, out),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
         Expr::Agg { arg, arg2, .. } => {
             if let Some(x) = arg {
                 collect_column_refs(x, out);
@@ -10813,6 +11009,16 @@ fn eval_grouped(
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
         }
+        // v0.48: `IS [NOT] DISTINCT FROM` in the grouped path.
+        Expr::IsDistinctFrom { left, right, neg } => {
+            let l = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, left,
+            )?;
+            let r = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, right,
+            )?;
+            eval_is_distinct_from(l, r, *neg)
+        }
         // v0.10: a top-level window in the select list (or ORDER BY
         // fallback) reads its precomputed value from the query's
         // window context. Nested windows never reach here: validation
@@ -11368,6 +11574,15 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let v = eval_expr(q, scopes, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
         }
+        // v0.48: `IS [NOT] DISTINCT FROM` — the NULL-safe comparison
+        // (PG19): NULLs compare equal and never produce unknown; NaN
+        // compares equal to NaN (unlike `=`); otherwise it is the
+        // negation of `=`.
+        Expr::IsDistinctFrom { left, right, neg } => {
+            let l = eval_expr(q, scopes, left)?;
+            let r = eval_expr(q, scopes, right)?;
+            eval_is_distinct_from(l, r, *neg)
+        }
         // Aggregates only evaluate in the grouped path; reaching the
         // row-level evaluator is a validation bug (validate_select keeps
         // them out of WHERE/ON/GROUP BY, and is_agg_query routes select
@@ -11667,6 +11882,37 @@ fn coerce_regclass_cmp(
         }
         _ => Ok((va, vb)),
     }
+}
+
+/// v0.48: NaN test across the float/numeric value kinds, for
+/// `IS DISTINCT FROM` (PG19 treats NaN as equal to NaN there, unlike
+/// the `=` operator).
+fn is_nan_val(v: &Value) -> bool {
+    match v {
+        Value::Numeric(n) => n.is_nan(),
+        Value::Float(f) => f.is_nan(),
+        Value::Float4(f) => f.is_nan(),
+        _ => false,
+    }
+}
+
+/// v0.48: shared `IS [NOT] DISTINCT FROM` value logic for the row
+/// and grouped evaluators (PG19): NULLs compare equal and never
+/// produce unknown; NaN compares equal to NaN (unlike `=`); otherwise
+/// the negation of `=`.
+fn eval_is_distinct_from(l: Value, r: Value, neg: bool) -> Result<Value, ExecError> {
+    let distinct = match (&l, &r) {
+        (Value::Null, Value::Null) => false,
+        (Value::Null, _) | (_, Value::Null) => true,
+        _ if is_nan_val(&l) && is_nan_val(&r) => false,
+        _ => match eval_cmp_vals(CmpOp::Eq, &l, &r)? {
+            Value::Bool(eq) => !eq,
+            // Unreachable for non-null inputs (`=` never returns NULL
+            // there); stay total, never panic.
+            _ => true,
+        },
+    };
+    Ok(Value::Bool(distinct != neg))
 }
 
 fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
@@ -19801,6 +20047,7 @@ fn expr_type(
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::IsBool { .. }
+        | Expr::IsDistinctFrom { .. }
         | Expr::Like { .. }
         | Expr::Between { .. }
         | Expr::InSub { .. }
@@ -20268,6 +20515,10 @@ fn infer_expr(
         }
         Expr::Not(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
             infer_expr(x, eng, snap, own, session, schemas, out)
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            infer_expr(left, eng, snap, own, session, schemas, out)?;
+            infer_expr(right, eng, snap, own, session, schemas, out)
         }
         Expr::Agg { arg, .. } => {
             if let Some(a) = arg {
@@ -21059,6 +21310,10 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
         | Expr::BitNot(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => subst_expr(x, params)?,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            subst_expr(left, params)?;
+            subst_expr(right, params)?;
+        }
         Expr::Cast { expr, .. } => subst_expr(expr, params)?,
         Expr::Func { args, .. } => {
             for a in args {
@@ -21461,6 +21716,236 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(rows, vec![vec!["2".to_string()], vec!["3".to_string()]]);
+    }
+
+    /// v0.48: `IS [NOT] DISTINCT FROM` — the NULL-safe comparison
+    /// (PG19 gram.y). The corpus block from PG19's `select_distinct`
+    /// regression test, adapted to the in-memory harness.
+    #[test]
+    fn is_distinct_from_semantics() {
+        let mut eng = engine();
+        let mut q = |e: &str| rows_of(run(&mut eng, e).unwrap());
+        assert_eq!(
+            q("SELECT 1 IS DISTINCT FROM 2"),
+            vec![vec!["t".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 2 IS DISTINCT FROM 2"),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 2 IS DISTINCT FROM null"),
+            vec![vec!["t".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT null IS DISTINCT FROM null"),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 1 IS NOT DISTINCT FROM 2"),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 2 IS NOT DISTINCT FROM 2"),
+            vec![vec!["t".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 2 IS NOT DISTINCT FROM null"),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT null IS NOT DISTINCT FROM null"),
+            vec![vec!["t".to_string()]]
+        );
+        // Cross-type and never-unknown: the result is always t/f,
+        // even when an operand is NULL.
+        assert_eq!(
+            q("SELECT 1 IS DISTINCT FROM 1.0"),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            q("SELECT 'a' IS DISTINCT FROM 'b'"),
+            vec![vec!["t".to_string()]]
+        );
+        // Never unknown: the result is always t/f, even with NULL
+        // operands.
+        assert_eq!(
+            q("SELECT NULL IS DISTINCT FROM 1"),
+            vec![vec!["t".to_string()]]
+        );
+    }
+
+    /// v0.48: duplicate NULLs collapse in `IS DISTINCT FROM`, and NaN
+    /// compares equal to NaN (unlike `=`).
+    #[test]
+    fn is_distinct_from_null_and_nan() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT id FROM users WHERE id IS DISTINCT FROM NULL",
+            )
+            .unwrap(),
+        );
+        // NULLs are not distinct from NULL: all three non-null rows.
+        assert_eq!(rows.len(), 3);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT 'nan'::numeric IS DISTINCT FROM 'nan'::numeric",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["f".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT 'nan'::float8 IS DISTINCT FROM 'nan'::float8",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["f".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT 'nan'::numeric = 'nan'::numeric").unwrap());
+        assert_eq!(rows, vec![vec!["f".to_string()]]);
+    }
+
+    /// v0.48: `IS DISTINCT FROM` works in WHERE and in the grouped
+    /// (HAVING) path, sharing one value-level implementation.
+    #[test]
+    fn is_distinct_from_in_where_and_grouped() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT id FROM users WHERE id IS DISTINCT FROM 2 ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["1".to_string()], vec!["3".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT uid, sum(amt) AS total FROM orders GROUP BY uid HAVING sum(amt) IS DISTINCT FROM 30 ORDER BY uid",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["2".to_string(), "5".to_string()]]);
+    }
+
+    /// v0.48: single-expression SELECT DISTINCT dedups after projection.
+    #[test]
+    fn select_distinct_single_expression() {
+        let mut eng = engine();
+        let rows = rows_of(run(&mut eng, "SELECT DISTINCT uid FROM orders ORDER BY uid").unwrap());
+        assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+        let rows =
+            rows_of(run(&mut eng, "SELECT DISTINCT amt % 10 FROM orders ORDER BY 1").unwrap());
+        assert_eq!(rows, vec![vec!["0".to_string()], vec!["5".to_string()]]);
+    }
+
+    /// v0.48: SELECT DISTINCT dedups on the full projected row.
+    #[test]
+    fn select_distinct_full_row() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT uid, amt FROM orders ORDER BY uid, amt",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+                vec!["2".to_string(), "5".to_string()],
+            ]
+        );
+    }
+
+    /// v0.48: duplicate NULL rows collapse under DISTINCT.
+    #[test]
+    fn select_distinct_null_collapse() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE dnull (a int, b int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO dnull VALUES (1, NULL), (NULL, NULL), (1, NULL), (NULL, NULL), (2, 3)",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT a, b FROM dnull ORDER BY a NULLS LAST, b NULLS LAST",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "NULL".to_string()],
+                vec!["2".to_string(), "3".to_string()],
+                vec!["NULL".to_string(), "NULL".to_string()],
+            ]
+        );
+    }
+
+    /// v0.48: DISTINCT applies before ORDER BY and LIMIT.
+    #[test]
+    fn select_distinct_before_order_limit() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT uid FROM orders ORDER BY uid DESC LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["2".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT uid FROM orders ORDER BY uid LIMIT 1 OFFSET 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// v0.48: CREATE TABLE AS SELECT (CTAS) — small versions of the
+    /// v0.48 target queries, with table row counts checked.
+    #[test]
+    fn ctas_distinct_group_counts() {
+        let mut eng = engine();
+        let tag = rows_of(
+            run(
+                &mut eng,
+                "CREATE TABLE distinct_group_1 AS SELECT DISTINCT g % 100 AS grp FROM generate_series(0, 999) g",
+            )
+            .unwrap(),
+        );
+        assert_eq!(tag, vec![vec!["SELECT 100".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT count(*) FROM distinct_group_1").unwrap());
+        assert_eq!(rows, vec![vec!["100".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT DISTINCT (g % 100)::text FROM generate_series(0, 999) g",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 100);
+        let tag = rows_of(
+            run(
+                &mut eng,
+                "CREATE TABLE distinct_hash_text AS SELECT DISTINCT (g % 100)::text AS h FROM generate_series(0, 999) g",
+            )
+            .unwrap(),
+        );
+        assert_eq!(tag, vec![vec!["SELECT 100".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT count(*) FROM distinct_hash_text").unwrap());
+        assert_eq!(rows, vec![vec!["100".to_string()]]);
     }
 
     #[test]
@@ -24520,6 +25005,10 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(high, old, new);
         }
         Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => rename_col_in_expr(expr, old, new),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            rename_col_in_expr(left, old, new);
+            rename_col_in_expr(right, old, new);
+        }
         Expr::Extract { from, .. } => rename_col_in_expr(from, old, new),
         Expr::Cmp { left, right, .. } => {
             rename_col_in_expr(left, old, new);

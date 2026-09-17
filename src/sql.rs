@@ -1015,6 +1015,13 @@ pub enum Expr {
         expr: Box<Expr>,
         neg: bool,
     },
+    /// v0.48: `a IS [NOT] DISTINCT FROM b` — the NULL-safe comparison
+    /// (PG19 gram.y): NULLs compare equal, never unknown.
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        neg: bool,
+    },
     Agg {
         func: AggFunc,
         /// None = COUNT(*).
@@ -1781,6 +1788,10 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
             collect_col_refs(high, out);
         }
         Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => collect_col_refs(expr, out),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
         Expr::Extract { from, .. } => collect_col_refs(from, out),
         Expr::Cmp { left, right, .. } => {
             collect_col_refs(left, out);
@@ -1897,6 +1908,18 @@ pub enum Stmt {
         /// if it already exists (session-local semantics approximation
         /// for pg_regress conformance).
         temp: bool,
+    },
+    /// v0.48: `CREATE TABLE ... AS <query>` (CTAS, PG19 createas.c):
+    /// the table's columns are inferred from the query's output names
+    /// and types; explicit aliases rename them positionally.
+    CreateTableAs {
+        name: String,
+        col_aliases: Vec<String>,
+        select: Box<SelectStmt>,
+        temp: bool,
+        if_not_exists: bool,
+        /// `WITH NO DATA` creates the table without populating it.
+        with_data: bool,
     },
     // --- v0.9: ALTER TABLE ---
     AlterTable {
@@ -2415,6 +2438,7 @@ fn max_param_expr(e: &Expr) -> usize {
         | Expr::BitNot(expr)
         | Expr::IsNull { expr, .. } => max_param_expr(expr),
         Expr::IsBool { expr, .. } => max_param_expr(expr),
+        Expr::IsDistinctFrom { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Func { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
         Expr::Extract { from, .. } => max_param_expr(from),
         Expr::Agg { arg, arg2, .. } => arg
@@ -3138,7 +3162,24 @@ impl Parser {
             false
         };
         self.expect_keyword("table")?;
+        // v0.48: CTAS accepts IF NOT EXISTS (PG19 CreateStmt).
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
+        // v0.48: `CREATE TABLE name AS <query>` (CTAS) versus the
+        // column-definition list. A parenthesized group after the name
+        // is the CTAS column-*alias* list only when `AS` follows its
+        // closing paren (Postgres makes the same grammatical
+        // distinction); otherwise it is the column definitions.
+        let as_consumed = self.eat_keyword("as");
+        if as_consumed || self.ctas_aliases_ahead() {
+            return self.parse_create_table_as(name, temp, if_not_exists, as_consumed);
+        }
         self.expect(Token::LParen, "'('")?;
         let mut items: Vec<TableItem> = Vec::new();
         loop {
@@ -3160,6 +3201,114 @@ impl Parser {
         }
         let def = build_table_def(&name, items)?;
         Ok(Stmt::CreateTable { name, def, temp })
+    }
+
+    /// v0.48: true when the tokens ahead are `( ... ) AS` — the CTAS
+    /// column-alias list — rather than a column-definition list. Scans
+    /// to the matching close paren (depth-counted) and checks the token
+    /// after it, without consuming anything.
+    fn ctas_aliases_ahead(&self) -> bool {
+        if *self.peek() != Token::LParen {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut k = 0usize;
+        loop {
+            match self.tokens.get(self.pos + k) {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(self.pos + k + 1),
+                            Some(Token::Ident(s)) if s == "as"
+                        );
+                    }
+                }
+                None => return false,
+                _ => {}
+            }
+            k += 1;
+            // Defensive bound: a real column list never scans this far.
+            if k > 4096 {
+                return false;
+            }
+        }
+    }
+
+    /// v0.48: `CREATE [TEMP] TABLE [IF NOT EXISTS] name [(alias, ...)]
+    /// AS <query> [WITH [NO] DATA]` (PG19 createas.c). `as_consumed`
+    /// tells whether `parse_create` already ate the `AS` keyword (when
+    /// it did, a following paren group starts the query, not aliases).
+    fn parse_create_table_as(
+        &mut self,
+        name: String,
+        temp: bool,
+        if_not_exists: bool,
+        as_consumed: bool,
+    ) -> Result<Stmt, SqlError> {
+        // Optional column aliases rename the query's output columns
+        // positionally (PG19 SelectInto).
+        let col_aliases = if !as_consumed && *self.peek() == Token::LParen {
+            self.next(); // '('
+            let mut aliases = Vec::new();
+            loop {
+                aliases.push(self.expect_ident()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            self.expect_keyword("as")?;
+            aliases
+        } else {
+            Vec::new()
+        };
+        // The query: SELECT, WITH...SELECT, or a parenthesized query.
+        // (TABLE / VALUES query forms are not supported in this version.)
+        // Note: when `as_consumed` is false the only leading paren group
+        // was the alias list, already consumed above — so any `(` here
+        // starts a parenthesized query.
+        let select = if *self.peek() == Token::LParen {
+            self.next(); // '('
+            let q = self.parse_select_query_not_consumed()?;
+            self.expect(Token::RParen, "')'")?;
+            q
+        } else if matches!(self.peek(), Token::Ident(s) if s == "with") {
+            match self.parse_with()? {
+                Stmt::Select(sel) => sel,
+                _ => {
+                    return Err(err(
+                        "syntax error: CREATE TABLE AS requires a SELECT query".to_string()
+                    ));
+                }
+            }
+        } else {
+            self.expect_keyword("select")?;
+            self.parse_select_query()?
+        };
+        // Optional trailing `WITH [NO] DATA` (default: WITH DATA).
+        let with_data = if self.eat_keyword("with") {
+            let no_data = self.eat_keyword("no");
+            self.expect_keyword("data")?;
+            !no_data
+        } else {
+            true
+        };
+        Ok(Stmt::CreateTableAs {
+            name,
+            col_aliases,
+            select: Box::new(select),
+            temp,
+            if_not_exists,
+            with_data,
+        })
     }
 
     /// True when the next tokens start a table-level constraint rather
@@ -4549,35 +4698,50 @@ impl Parser {
             }
             None => left,
         };
-        // `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`.
+        // `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`,
+        // `IS [NOT] DISTINCT FROM`.
         if self.eat_keyword("is") {
             let neg = self.eat_keyword("not");
-            match self.peek() {
-                Token::Ident(s) if s == "null" => {
-                    self.next();
-                    expr = Expr::IsNull {
-                        expr: Box::new(expr),
-                        neg,
-                    };
-                }
-                Token::Ident(s) if s == "true" || s == "false" || s == "unknown" => {
-                    let val = match s.as_str() {
-                        "true" => Some(true),
-                        "false" => Some(false),
-                        _ => None,
-                    };
-                    self.next();
-                    expr = Expr::IsBool {
-                        expr: Box::new(expr),
-                        neg,
-                        val,
-                    };
-                }
-                other => {
-                    return Err(err(format!(
-                        "syntax error: expected NULL, TRUE, FALSE or UNKNOWN after IS, found {:?}",
-                        other
-                    )));
+            // v0.48: `IS [NOT] DISTINCT FROM` (PG19 gram.y) — the
+            // NULL-safe comparison. Same precedence level as the other
+            // IS forms; the right operand parses at the next-tighter
+            // level, like `=` does.
+            if self.eat_keyword("distinct") {
+                self.expect_keyword("from")?;
+                let right = self.parse_bitor()?;
+                expr = Expr::IsDistinctFrom {
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                    neg,
+                };
+            } else {
+                match self.peek() {
+                    Token::Ident(s) if s == "null" => {
+                        self.next();
+                        expr = Expr::IsNull {
+                            expr: Box::new(expr),
+                            neg,
+                        };
+                    }
+                    Token::Ident(s) if s == "true" || s == "false" || s == "unknown" => {
+                        let val = match s.as_str() {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        };
+                        self.next();
+                        expr = Expr::IsBool {
+                            expr: Box::new(expr),
+                            neg,
+                            val,
+                        };
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected NULL, TRUE, FALSE, UNKNOWN or DISTINCT after IS, found {:?}",
+                            other
+                        )));
+                    }
                 }
             }
         }
@@ -7525,6 +7689,10 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => {
             validate_constraint_expr(expr, what)
         }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            validate_constraint_expr(left, what)?;
+            validate_constraint_expr(right, what)
+        }
         Expr::Extract { from, .. } => validate_constraint_expr(from, what),
         Expr::Cmp { left, right, .. } => {
             validate_constraint_expr(left, what)?;
@@ -7758,6 +7926,14 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         Expr::IsNull { expr, neg } => {
             out.push_str(&format!("(isnull {} ", if *neg { 1 } else { 0 }));
             encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        // v0.48: IS [NOT] DISTINCT FROM round-trips like IS NULL.
+        Expr::IsDistinctFrom { left, right, neg } => {
+            out.push_str(&format!("(isdistinctfrom {} ", if *neg { 1 } else { 0 }));
+            encode_expr_inner(left, out);
+            out.push(' ');
+            encode_expr_inner(right, out);
             out.push(')');
         }
         // Aggregates, subqueries, windows and pre-resolved columns can never
@@ -8013,6 +8189,17 @@ impl<'a> SexprParser<'a> {
                 let x = self.expr()?;
                 Expr::IsNull {
                     expr: Box::new(x),
+                    neg,
+                }
+            }
+            // v0.48: IS [NOT] DISTINCT FROM.
+            "isdistinctfrom" => {
+                let neg = self.atom()? == "1";
+                let l = self.expr()?;
+                let r = self.expr()?;
+                Expr::IsDistinctFrom {
+                    left: Box::new(l),
+                    right: Box::new(r),
                     neg,
                 }
             }

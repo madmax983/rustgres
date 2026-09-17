@@ -1637,6 +1637,9 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
         Stmt::Select(s) if s.for_update => Some("SELECT FOR UPDATE"),
         // DDL (schema and privilege changes are writes).
         Stmt::CreateTable { .. } => Some("CREATE TABLE"),
+        // v0.48: CTAS is a write too (PG19: "cannot execute CREATE
+        // TABLE AS in a read-only transaction").
+        Stmt::CreateTableAs { .. } => Some("CREATE TABLE AS"),
         Stmt::AlterTable { .. } => Some("ALTER TABLE"),
         Stmt::DropTable { .. } => Some("DROP TABLE"),
         Stmt::CreateIndex { .. } => Some("CREATE INDEX"),
