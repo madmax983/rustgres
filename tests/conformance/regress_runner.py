@@ -594,8 +594,7 @@ def norm_expected_cell(cell, null_display):
 
 # (regex, reason) -- matched against the statement text, case-insensitive.
 # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
-# (UNION_PATTERN defined before the list; WITH RECURSIVE is supported.)
-UNION_PATTERN = r"(?i)\bunion\b"
+# (UNION_PATTERN removed in v0.44: UNION/INTERSECT/EXCEPT are supported.)
 EXPECTED_FAIL_PATTERNS = [
     (r"^\s*create\s+(or\s+replace\s+)?function\b", "CREATE FUNCTION (procedural languages) unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?procedure\b", "CREATE PROCEDURE unsupported"),
@@ -622,7 +621,6 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\bxmin\b|\bxmax\b", "xmin/xmax system columns unsupported"),
     (r"\bgenerate_series\s*\(", "generate_series() unsupported"),
     (r"\bgen_random_uuid\s*\(", "gen_random_uuid() unsupported"),
-    (r"\bformat\s*\(", "format() unsupported"),
     (r"\bquote_ident\s*\(|\bquote_literal\s*\(", "quote_*() unsupported"),
     (r"\bOVER\s*\(", "window functions in this construct unsupported"),
     (r"\bWITH\s+ORDINALITY\b", "WITH ORDINALITY unsupported"),
@@ -639,7 +637,19 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\(\s*\w+(\s*,\s*\w+)+\s*\)\s*(not\s+)?in\s*\(\s*select\b",
      "row-wise IN (subquery) unsupported"),
     (r"(?i)\bshipped_view\b", "depends on CREATE RULE (unsupported)"),
-    (UNION_PATTERN, "UNION/INTERSECT/EXCEPT set operations unsupported"),
+    # v0.44: UNION/INTERSECT/EXCEPT are supported; the old broad pattern is
+    # removed. Statements using them with other unsupported constructs are
+    # classified under those constructs below.
+    # v0.45: array[...], row(), CREATE TYPE, and empty SELECT lists were
+    # unmasked by UNION support (v0.44 +10 REAL-FAIL); classify honestly.
+    (r"(?i)\barray\s*\[", "array[...] literal syntax unsupported"),
+    (r"(?i)\brow\s*\(", "row() constructor unsupported"),
+    (r"(?i)^\s*create\s+type\b", "CREATE TYPE unsupported"),
+    (r"(?i)^\s*select\s*;\s*$", "empty SELECT list unsupported"),
+    (r"(?i)\bselect\s+(union|intersect|except)\s+select\b", "empty SELECT list unsupported"),
+    # v0.45: format() is supported, but VARIADIC array form needs array
+    # literal/coercion support not yet implemented.
+    (r"(?i)\bformat\s*\([^)]*\bvariadic\b", "format() with VARIADIC array unsupported"),
     (r"(?i)\blateral\b", "LATERAL joins unsupported"),
     (r"(?i)\bunnest\s*\(", "unnest() unsupported"),
     (r"\)\s*\[", "subscript on subquery/expression result unsupported"),
@@ -688,8 +698,6 @@ def classify_expected_fail(stmt):
         return "UPDATE ... FROM unsupported"
     has_recursive = re.search(r"(?is)\bwith\s+recursive\b", stmt) is not None
     for pat, reason in EXPECTED_FAIL_PATTERNS:
-        if pat == UNION_PATTERN and has_recursive:
-            continue
         if re.search(pat, stmt, re.IGNORECASE | re.DOTALL):
             return reason
     return None

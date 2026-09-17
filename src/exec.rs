@@ -13780,6 +13780,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.16: new string/math built-ins.
         "concat" => true, // concat() with no args is '' (Postgres).
         "concat_ws" => n >= 1,
+        // v0.45: format(fmt, ...) is variadic (at least the format string).
+        "format" => n >= 1,
         "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
         // v0.24: missing string built-ins (pg_regress 42883 cluster).
         "repeat" => n == 2,
@@ -13960,6 +13962,8 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             crate::server::SERVER_VERSION
         ))),
         "coalesce" | "nullif" | "greatest" | "least" => eval_cond_func(name, vals),
+        // v0.45: format(fmt, ...) per PG19 text_format().
+        "format" => pg_format_text(vals),
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress
         // conformance): booleq(x,y) ≡ x = y, boolne(x,y) ≡ x <> y, etc.
         "booleq" | "int4eq" | "texteq" => eval_cmp_vals(CmpOp::Eq, &vals[0], &vals[1]),
@@ -16365,6 +16369,246 @@ fn expand_replacement(repl: &str, s: &[char], caps: &crate::regex::Captures) -> 
     out
 }
 
+/// v0.45: `format(fmt, args...)` per PG19 `text_format()` in
+/// `src/backend/utils/adt/varlena.c`. Printf-style formatting with `%s`
+/// (string), `%I` (SQL identifier), `%L` (SQL literal), `%%` (percent),
+/// positional `%n$`, `-` flag, and constant or `*`-indirect widths.
+/// NULL fmt -> NULL. NULL with `%s` -> empty; with `%L` -> `NULL`;
+/// with `%I` -> 22004 error. Too few args, bad specifiers, and
+/// argument 0 all raise 22023, like PG.
+fn pg_format_text(vals: &[Value]) -> Result<Value, ExecError> {
+    // vals[0] is the format string; args are 1-based from vals[1..].
+    let fmt = match &vals[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => s.to_string(),
+        Value::BpChar(s) => s.to_string(),
+        // PG stringifies non-text fmt via the type output function.
+        v => v.to_text().unwrap_or_default(),
+    };
+    let nargs = vals.len() - 1; // number of format arguments
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut arg: usize = 1; // next argument position (1-based)
+    let mut i = 0;
+    // Stringify a value like PG's type output function. Bool renders as
+    // true/false (not the wire t/f).
+    let stringify = |v: &Value| -> Option<String> {
+        match v {
+            Value::Bool(b) => Some(if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }),
+            _ => v.to_text(),
+        }
+    };
+    // Fetch the 1-based argument, or raise "too few arguments".
+    let get_arg = |pos: usize| -> Result<&Value, ExecError> {
+        if pos < 1 || pos > nargs {
+            return Err(exec_err("22023", "too few arguments for format()"));
+        }
+        Ok(&vals[pos])
+    };
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= chars.len() {
+            return Err(exec_err("22023", "unterminated format() type specifier"));
+        }
+        // Easy case: %% outputs a single %.
+        if chars[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // Parse [argpos$][flags][width] — the type char is not consumed here.
+        let mut argpos: i64 = -1;
+        let mut widthpos: i64 = -1;
+        let mut minus_flag = false;
+        let mut width: i64 = 0;
+        // Try to identify the first number: argpos (n$) or width (n).
+        let mut n: i64 = 0;
+        let mut has_digits = false;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            has_digits = true;
+            n = n
+                .saturating_mul(10)
+                .saturating_add((chars[i] as i64) - ('0' as i64));
+            i += 1;
+        }
+        let mut width_done = false;
+        if has_digits {
+            if i < chars.len() && chars[i] == '$' {
+                if n == 0 {
+                    return Err(exec_err(
+                        "22023",
+                        "format specifies argument 0, but arguments are numbered from 1",
+                    ));
+                }
+                argpos = n;
+                i += 1;
+            } else {
+                width = n;
+                width_done = true;
+            }
+        }
+        if !width_done {
+            // Flags (only '-' supported).
+            while i < chars.len() && chars[i] == '-' {
+                minus_flag = true;
+                i += 1;
+            }
+            // Width: '*' (indirect) or digits (direct).
+            if i < chars.len() && chars[i] == '*' {
+                i += 1;
+                // Optional n$ after '*'.
+                let mut wn: i64 = 0;
+                let mut whas = false;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    whas = true;
+                    wn = wn
+                        .saturating_mul(10)
+                        .saturating_add((chars[i] as i64) - ('0' as i64));
+                    i += 1;
+                }
+                if whas {
+                    if i >= chars.len() || chars[i] != '$' {
+                        return Err(exec_err(
+                            "22023",
+                            "width argument position must be ended by \"$\"",
+                        ));
+                    }
+                    if wn == 0 {
+                        return Err(exec_err(
+                            "22023",
+                            "format specifies argument 0, but arguments are numbered from 1",
+                        ));
+                    }
+                    widthpos = wn;
+                    i += 1;
+                } else {
+                    widthpos = 0; // take next arg as width
+                }
+            } else {
+                let mut wn: i64 = 0;
+                let mut whas = false;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    whas = true;
+                    wn = wn
+                        .saturating_mul(10)
+                        .saturating_add((chars[i] as i64) - ('0' as i64));
+                    i += 1;
+                }
+                if whas {
+                    width = wn;
+                }
+            }
+        }
+        if i >= chars.len() {
+            return Err(exec_err("22023", "unterminated format() type specifier"));
+        }
+        let conv = chars[i];
+        i += 1;
+        if !matches!(conv, 's' | 'I' | 'L') {
+            return Err(exec_err(
+                "22023",
+                format!("unrecognized format() type specifier \"{conv}\""),
+            ));
+        }
+        // If indirect width was specified, get its value.
+        if widthpos >= 0 {
+            if widthpos > 0 {
+                arg = widthpos as usize;
+            }
+            let wval = get_arg(arg)?;
+            arg += 1;
+            width = match wval {
+                Value::Null => 0,
+                Value::SmallInt(x) => *x as i64,
+                Value::Int(x) => *x,
+                Value::BigInt(x) => *x,
+                // PG converts other types via output then strtoint32.
+                v => stringify(v).unwrap_or_default().parse::<i64>().unwrap_or(0),
+            };
+        }
+        // Collect the specified or next argument position.
+        if argpos > 0 {
+            arg = argpos as usize;
+        }
+        let val = get_arg(arg)?;
+        arg += 1;
+        // Format the value.
+        let mut s = match conv {
+            's' => stringify(val).unwrap_or_default(),
+            'I' => match stringify(val) {
+                None => {
+                    return Err(exec_err(
+                        "22004",
+                        "null values cannot be formatted as an SQL identifier",
+                    ));
+                }
+                Some(st) => pg_quote_identifier(&st),
+            },
+            'L' => match stringify(val) {
+                None => "NULL".to_string(),
+                Some(st) => pg_quote_literal(&st),
+            },
+            _ => unreachable!(),
+        };
+        // Apply width padding (character count, like PG's pg_mbstrlen).
+        if width != 0 {
+            let len = s.chars().count() as i64;
+            let (left, w) = if width < 0 {
+                (true, width.saturating_abs())
+            } else {
+                (minus_flag, width)
+            };
+            if len < w {
+                let pad = " ".repeat((w - len) as usize);
+                if left {
+                    s.push_str(&pad);
+                } else {
+                    s = pad + &s;
+                }
+            }
+        }
+        out.push_str(&s);
+    }
+    Ok(Value::text(out))
+}
+
+/// Quote a string as an SQL identifier, like PG's quote_identifier:
+/// bare if it matches [a-z_][a-z0-9_$]*, else double-quoted with
+/// embedded quotes doubled.
+fn pg_quote_identifier(s: &str) -> String {
+    let bare = !s.is_empty()
+        && s.chars()
+            .next()
+            .map_or(false, |c| c == '_' || c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit() || c == '$');
+    if bare {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+}
+
+/// Quote a string as an SQL literal, like PG's quote_literal_cstr:
+/// single-quoted with embedded quotes doubled; E'' syntax if the
+/// string contains backslashes.
+fn pg_quote_literal(s: &str) -> String {
+    if s.contains('\\') {
+        format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+}
+
 /// Port of PostgreSQL 19 `replace_text_regexp`
 /// (src/backend/utils/adt/varlena.c, REL_19_STABLE).
 ///
@@ -18159,6 +18403,8 @@ fn func_result_type(
         "nextval" | "currval" | "setval" => Ok(ColType::Int),
         // v0.14: PostgreSQL internal operator-function aliases return boolean.
         "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
+        // v0.45: format() returns text.
+        "format" => Ok(ColType::Text),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
