@@ -12516,10 +12516,13 @@ fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     }
 }
 
-/// v0.25: `& | # << >>` on smallint/integer/bigint. Postgres promotes
-/// smallint pairs to integer (like arithmetic); shifts use C/x86
-/// semantics (the count is masked to the width, int2/int4 shift in 32
-/// bits then truncate). Anything non-integer is 42883.
+/// v0.25: `& | # << >>` on smallint/integer/bigint.
+/// v0.51: PG19 (int.c, REL_19_STABLE) returns the max operand type — no
+/// smallint->integer promotion. int2and/int2or/int2xor/int2shl/int2shr
+/// all PG_RETURN_INT16. Shifts use C integer promotion: the shift is
+/// computed in 32 bits (as C does after promoting int16 to int) and
+/// then truncated to int16 — it *wraps*, never raises 22003, so
+/// 1::int2 << 15 is -32768. Anything non-integer is 42883.
 fn eval_bitwise(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     let (ca, cb) = match (num_cat(a), num_cat(b)) {
         (Some(x), Some(y)) => (x, y),
@@ -12529,12 +12532,10 @@ fn eval_bitwise(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     if !int_kind(ca) || !int_kind(cb) {
         return Err(op_err(op, a, b));
     }
-    // Postgres resolves smallint <op> smallint to integer.
-    let icat = if ca == NumCat::Small && cb == NumCat::Small {
-        NumCat::Int
-    } else {
-        ca.max(cb)
-    };
+    // v0.51: PG19 returns the operand max type (int2 pairs stay int2);
+    // the v0.25 smallint->int promotion was wrong (it survived v0.50,
+    // which fixed the arithmetic promotion only).
+    let icat = ca.max(cb);
     let x = to_i128(a);
     let y = to_i128(b);
     let r: i128 = match op {
@@ -12544,14 +12545,23 @@ fn eval_bitwise(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
         ArithOp::Shl => {
             if matches!(icat, NumCat::Big) {
                 (x as i64).wrapping_shl(y as u32) as i128
+            } else if matches!(icat, NumCat::Small) {
+                // int.c int2shl: C promotes int16 to int, shifts in 32
+                // bits, then PG_RETURN_INT16 truncates. 1::int2 << 15
+                // wraps to -32768 (never 22003).
+                ((x as i32).wrapping_shl(y as u32) as i16) as i128
             } else {
-                // int2/int4: C promotes to 32 bits before shifting.
+                // int4: C promotes to 32 bits before shifting.
                 (x as i32).wrapping_shl(y as u32) as i128
             }
         }
         ArithOp::Shr => {
             if matches!(icat, NumCat::Big) {
                 (x as i64).wrapping_shr(y as u32) as i128
+            } else if matches!(icat, NumCat::Small) {
+                // int2shr: arithmetic right shift after promotion to
+                // int, then truncate to int16.
+                ((x as i32).wrapping_shr(y as u32) as i16) as i128
             } else {
                 (x as i32).wrapping_shr(y as u32) as i128
             }
@@ -20257,16 +20267,13 @@ fn combine_arith_types(
                             | ArithOp::Shr
                     ) =>
                 {
-                    // v0.25: bitwise operators only accept the integer
-                    // kinds; smallint pairs promote to integer, like PG.
+                    // v0.51: bitwise operators only accept the integer
+                    // kinds; the result type is the operand max kind —
+                    // int2 pairs stay int2 (PG19 pg_operator.dat
+                    // L4398-4410; the v0.25 int2->int4 promotion was
+                    // wrong, like the arithmetic one fixed in v0.50).
                     match (numeric_rank(x), numeric_rank(y)) {
-                        (Some(rx), Some(ry)) if rx <= 2 && ry <= 2 => {
-                            if rx == 0 && ry == 0 {
-                                Ok(ColType::Int)
-                            } else {
-                                Ok(rank_type(rx.max(ry)))
-                            }
-                        }
+                        (Some(rx), Some(ry)) if rx <= 2 && ry <= 2 => Ok(rank_type(rx.max(ry))),
                         _ => Err(op_err(x, y)),
                     }
                 }
@@ -23590,6 +23597,77 @@ mod tests {
         // Division by zero is still 22012, not 22003.
         let e = eval_arith(Div, &Value::Int(1), &Value::Int(0)).unwrap_err();
         assert_eq!((e.code, e.message.as_str()), ("22012", "division by zero"));
+    }
+
+    /// v0.51: int2 bitwise operators (`& | # << >>`) return int2, like
+    /// PG19 int.c (int2and/int2or/int2xor/int2shl/int2shr all
+    /// PG_RETURN_INT16) — no promotion to int4. Shifts use C
+    /// wrap-then-truncate semantics (integer promotion to int, shift in
+    /// 32 bits, truncate to int16), never 22003: 1::int2 << 15 is
+    /// -32768. int4/int8 bitwise already return their own width (only
+    /// asserted here).
+    #[test]
+    fn v51_int2_bitwise_returns_int2() {
+        use ArithOp::{BitAnd, BitOr, BitXor, Shl, Shr};
+        // & | # stay int2; never overflow.
+        assert_eq!(
+            eval_arith(BitAnd, &Value::SmallInt(0b1100), &Value::SmallInt(0b1010)).unwrap(),
+            Value::SmallInt(0b1000)
+        );
+        assert_eq!(
+            eval_arith(BitOr, &Value::SmallInt(0b1100), &Value::SmallInt(0b1010)).unwrap(),
+            Value::SmallInt(0b1110)
+        );
+        assert_eq!(
+            eval_arith(BitXor, &Value::SmallInt(0b1100), &Value::SmallInt(0b1010)).unwrap(),
+            Value::SmallInt(0b0110)
+        );
+        assert_eq!(
+            eval_arith(BitAnd, &Value::SmallInt(-1), &Value::SmallInt(0x7fff)).unwrap(),
+            Value::SmallInt(0x7fff)
+        );
+        // << wraps into the sign bit: 1 << 15 = 32768 -> -32768, not 22003.
+        assert_eq!(
+            eval_arith(Shl, &Value::SmallInt(1), &Value::SmallInt(15)).unwrap(),
+            Value::SmallInt(-32768)
+        );
+        // 20000 << 2 = 80000 = 0x13880 -> truncate to 0x3880 = 14464.
+        assert_eq!(
+            eval_arith(Shl, &Value::SmallInt(20000), &Value::SmallInt(2)).unwrap(),
+            Value::SmallInt(14464)
+        );
+        // >> is an arithmetic right shift after promotion.
+        assert_eq!(
+            eval_arith(Shr, &Value::SmallInt(-1), &Value::SmallInt(1)).unwrap(),
+            Value::SmallInt(-1)
+        );
+        assert_eq!(
+            eval_arith(Shr, &Value::SmallInt(-32768), &Value::SmallInt(15)).unwrap(),
+            Value::SmallInt(-1)
+        );
+        // int4 / int8 pairs return their own width (unchanged semantics).
+        assert_eq!(
+            eval_arith(Shl, &Value::Int(1), &Value::Int(31)).unwrap(),
+            Value::Int(-2147483648)
+        );
+        assert_eq!(
+            eval_arith(BitOr, &Value::Int(5), &Value::Int(2)).unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(
+            eval_arith(BitAnd, &Value::BigInt(-1), &Value::BigInt(42)).unwrap(),
+            Value::BigInt(42)
+        );
+        // Mixed widths still resolve to the wider type.
+        assert_eq!(
+            eval_arith(BitOr, &Value::SmallInt(5), &Value::Int(2)).unwrap(),
+            Value::Int(7)
+        );
+        // Unary ~ on int2 still promotes to int4 (PG has no int2not).
+        assert_eq!(
+            eval_bitnot_val(&Value::SmallInt(5)).unwrap(),
+            Value::Int(!5i64)
+        );
     }
 }
 
