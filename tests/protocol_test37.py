@@ -147,7 +147,9 @@ check("C2 unknown option message",
 check("D1 show", val("SHOW default_toast_compression") == "pglz")
 check("D2 set pglz", err_of("SET default_toast_compression = 'pglz'") is None)
 check("D3 set case-insensitive", err_of("SET default_toast_compression = 'PGLZ'") is None)
-check("D4 set lz4 rejected", err_of("SET default_toast_compression = 'lz4'") == "22023")
+check("D4 set lz4 accepted (v0.41: lz4 is a real method now)",
+      err_of("SET default_toast_compression = 'lz4'") is None)
+check("D4b show lz4", val("SHOW default_toast_compression") == "lz4")
 check("D5 set bogus rejected", err_of("SET default_toast_compression = 'snappy'") == "22023")
 check("D6 reset", err_of("RESET default_toast_compression") is None)
 check("D7 still pglz after reset", val("SHOW default_toast_compression") == "pglz")

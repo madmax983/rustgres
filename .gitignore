@@ -1,4 +1,6 @@
 /target
+/target-wip
+/hidden_files
 /rustgres-data
 __pycache__/
 *.pyc

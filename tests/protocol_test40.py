@@ -175,6 +175,10 @@ def main():
     try:
         c = Conn()
 
+        # v0.41: the session default is now lz4 (PG19 LZ4 build); this
+        # suite asserts exact PGLZ bytes, so pin PGLZ explicitly.
+        c.do_sql("SET default_toast_compression = 'pglz'")
+
         # A. PG19 compression decisions.
         c.do_sql("DROP TABLE IF EXISTS t40pglz")
         c.do_sql("CREATE TABLE t40pglz(a text, b text, c text)")

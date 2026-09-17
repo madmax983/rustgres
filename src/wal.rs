@@ -23,12 +23,12 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 9 (`RGSWAL09` / `RGSCHK07`) is NOT compatible with v0.38
-//! or earlier: v0.39 adds per-row toast flags and toast provenance
-//! (value-id compression metadata) to InsertRows/UpdateRows/DeleteRows
-//! records so TOAST metadata survives WAL replay. Like every format
-//! bump, old data directories are refused with a clear error instead of
-//! being misread. v0.37 was `RGSWAL08` / `RGSCHK07`.
+//! Format version 10 (`RGSWAL10` / `RGSCHK08`) is NOT compatible with v0.40
+//! or earlier: v0.41 stores the compression *method* (`pglz`/`lz4`) in
+//! TOAST metadata and per-column `COMPRESSION` settings, replacing the
+//! old compressed flags. Like every format bump, old data directories
+//! are refused with a clear error instead of being misread. v0.39 was
+//! `RGSWAL09` / `RGSCHK07`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -127,11 +127,11 @@ use crate::storage::{ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK07";
-/// v0.37: version 7 adds TOAST metadata (table OIDs, storage strategies,
-/// toast tables, per-cell toast flags). v6 checkpoints are refused; remove
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK08";
+/// v0.41: version 8 adds per-column compression methods and method
+/// codes in TOAST metadata. v7 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
-const CHKPT_VERSION: u32 = 7;
+const CHKPT_VERSION: u32 = 8;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -144,7 +144,10 @@ const CHKPT_VERSION: u32 = 7;
 /// the (value id, compressed) provenance for value ids introduced by the
 /// row, so TOAST metadata survives crash recovery via WAL replay (not
 /// just checkpoints). Old `RGSWAL08` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL09";
+/// v0.41: `RGSWAL10` — TOAST metadata carries the compression *method*
+/// (`pglz`/`lz4`) per value id and per column (`col_compression`),
+/// not just a compressed flag. Old `RGSWAL09` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL10";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -264,6 +267,9 @@ pub enum WalRecord {
         oid: u32,
         /// v0.37: toast table OID (pg_class.reltoastrelid).
         toast_relid: u32,
+        /// v0.41: per-column explicit compression methods as
+        /// ToastCompression codes, 0 = default (`col_compression`).
+        col_compression: Vec<u8>,
         xmin: u64,
     },
     InsertRows {
@@ -330,8 +336,11 @@ pub enum WalRecord {
         toast_relid: u32,
         toast_target: u32,
         col_storage: Vec<u8>,
+        /// v0.41: per-column explicit compression methods as
+        /// ToastCompression codes, 0 = default (`col_compression`).
+        col_compression: Vec<u8>,
         next_value_id: u32,
-        /// (value_id, compressed) pairs.
+        /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
         xmin: u64,
     },
@@ -782,6 +791,7 @@ impl Enc {
                 col_acl,
                 oid,
                 toast_relid,
+                col_compression,
                 xmin,
             } => {
                 self.u8(1);
@@ -793,6 +803,11 @@ impl Enc {
                 self.col_acl_list(col_acl);
                 self.u32(*oid);
                 self.u32(*toast_relid);
+                // v0.41: per-column compression methods.
+                self.u32(col_compression.len() as u32);
+                for m in col_compression {
+                    self.u8(*m);
+                }
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -893,6 +908,7 @@ impl Enc {
                 toast_relid,
                 toast_target,
                 col_storage,
+                col_compression,
                 next_value_id,
                 toast_info,
                 xmin,
@@ -912,6 +928,11 @@ impl Enc {
                 self.u32(col_storage.len() as u32);
                 for s in col_storage {
                     self.u8(*s);
+                }
+                // v0.41: per-column compression methods.
+                self.u32(col_compression.len() as u32);
+                for m in col_compression {
+                    self.u8(*m);
                 }
                 self.u32(*next_value_id);
                 self.u32(toast_info.len() as u32);
@@ -1306,6 +1327,12 @@ impl<'a> Dec<'a> {
                 // v0.37: oid, toast_relid precede xmin, matching encode order.
                 let oid = self.u32()?;
                 let toast_relid = self.u32()?;
+                // v0.41: per-column compression methods.
+                let n_compression = self.u32()? as usize;
+                let mut col_compression = Vec::with_capacity(n_compression);
+                for _ in 0..n_compression {
+                    col_compression.push(self.u8()?);
+                }
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -1316,6 +1343,7 @@ impl<'a> Dec<'a> {
                     col_acl,
                     oid,
                     toast_relid,
+                    col_compression,
                     xmin,
                 })
             }
@@ -1416,6 +1444,12 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_storage {
                     col_storage.push(self.u8()?);
                 }
+                // v0.41: per-column compression methods.
+                let n_compression = self.u32()? as usize;
+                let mut col_compression = Vec::with_capacity(n_compression);
+                for _ in 0..n_compression {
+                    col_compression.push(self.u8()?);
+                }
                 let next_value_id = self.u32()?;
                 let n_ti = self.u32()? as usize;
                 let mut toast_info = Vec::with_capacity(n_ti);
@@ -1435,6 +1469,7 @@ impl<'a> Dec<'a> {
                     toast_relid,
                     toast_target,
                     col_storage,
+                    col_compression,
                     next_value_id,
                     toast_info,
                     xmin,
@@ -1874,6 +1909,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             col_acl,
             oid,
             toast_relid,
+            col_compression,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
@@ -1884,6 +1920,21 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // v0.37: restore the table OID and its toast table link.
             t.oid = *oid;
             t.toast_relid = *toast_relid;
+            // v0.41: restore per-column compression methods (0 = default).
+            t.col_compression = col_compression
+                .iter()
+                .map(|&code| {
+                    if code == 0 {
+                        Ok(None)
+                    } else {
+                        crate::storage::ToastCompression::from_code(code)
+                            .map(Some)
+                            .ok_or_else(|| {
+                                format!("WAL replay: unknown toast compression code {}", code)
+                            })
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             // v0.37: advance the OID counter past every restored OID, or
             // the next CREATE after replay would hand out a colliding OID.
             eng.db.next_oid = eng
@@ -1938,12 +1989,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         rv.toast = row.toast.clone();
                     }
                     for (vid, compressed) in &row.toast_meta {
-                        t.toast_info.insert(
-                            *vid,
-                            crate::storage::ToastInfo {
-                                compressed: *compressed != 0,
-                            },
-                        );
+                        // v0.41: the byte is a method code (0 = plain).
+                        let info = decode_toast_method(*compressed)?;
+                        t.toast_info.insert(*vid, info);
                         if t.next_value_id <= *vid {
                             t.next_value_id = vid + 1;
                         }
@@ -2025,12 +2073,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     rv.toast = r.toast.clone();
                 }
                 for (vid, compressed) in &r.toast_meta {
-                    t.toast_info.insert(
-                        *vid,
-                        crate::storage::ToastInfo {
-                            compressed: *compressed != 0,
-                        },
-                    );
+                    // v0.41: the byte is a method code (0 = plain).
+                    let info = decode_toast_method(*compressed)?;
+                    t.toast_info.insert(*vid, info);
                     if t.next_value_id <= *vid {
                         t.next_value_id = vid + 1;
                     }
@@ -2109,6 +2154,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             toast_relid,
             toast_target,
             col_storage,
+            col_compression,
             next_value_id,
             toast_info,
             xmin,
@@ -2158,18 +2204,29 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .max(toast_relid.wrapping_add(1));
             t.toast_target = *toast_target;
             t.col_storage = col_storage.clone();
+            // v0.41: per-column compression methods (0 = default).
+            t.col_compression = col_compression
+                .iter()
+                .map(|&code| {
+                    if code == 0 {
+                        Ok(None)
+                    } else {
+                        crate::storage::ToastCompression::from_code(code)
+                            .map(Some)
+                            .ok_or_else(|| {
+                                format!("WAL replay: unknown toast compression code {}", code)
+                            })
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             t.next_value_id = (*next_value_id).max(1);
             t.toast_info = toast_info
                 .iter()
                 .map(|(k, c)| {
-                    (
-                        *k,
-                        crate::storage::ToastInfo {
-                            compressed: *c != 0,
-                        },
-                    )
+                    // v0.41: the byte is a method code (0 = plain).
+                    decode_toast_method(*c).map(|info| (*k, info))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             versions.push(t);
         }
         WalRecord::CreateView {
@@ -2501,6 +2558,12 @@ pub fn records_for_commit(
                     col_acl: ours.col_acl.iter().map(WalColAcl::of).collect(),
                     oid: ours.oid,
                     toast_relid: ours.toast_relid,
+                    // v0.41: compression method codes, 0 = default.
+                    col_compression: ours
+                        .col_compression
+                        .iter()
+                        .map(|m| m.map(|m| m.code()).unwrap_or(0))
+                        .collect(),
                     xmin: own,
                 });
             }
@@ -2531,11 +2594,17 @@ pub fn records_for_commit(
                     toast_relid: ours.toast_relid,
                     toast_target: ours.toast_target,
                     col_storage: ours.col_storage.clone(),
+                    // v0.41: compression method codes, 0 = default.
+                    col_compression: ours
+                        .col_compression
+                        .iter()
+                        .map(|m| m.map(|m| m.code()).unwrap_or(0))
+                        .collect(),
                     next_value_id: ours.next_value_id,
                     toast_info: ours
                         .toast_info
                         .iter()
-                        .map(|(k, v)| (*k, v.compressed as u8))
+                        .map(|(k, v)| (*k, if v.compressed { v.method.code() } else { 0 }))
                         .collect(),
                     xmin: own,
                 });
@@ -2838,6 +2907,8 @@ fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, Vec<u32>, bool)>
 /// v0.39: collect the (value id, compressed) provenance for the nonzero
 /// toast flags of one row, from the live table's `toast_info`. Returns an
 /// empty vec when the row carries no toasted cells.
+/// v0.41: the byte is the compression *method* code (0 = not
+/// compressed, `b'p'`/`b'l'`), so the method survives WAL replay.
 fn toast_meta_for(eng: &Engine, table: &str, flags: &[u32]) -> Vec<(u32, u8)> {
     if flags.iter().all(|f| *f == 0) {
         return Vec::new();
@@ -2850,14 +2921,33 @@ fn toast_meta_for(eng: &Engine, table: &str, flags: &[u32]) -> Vec<(u32, u8)> {
         if vid == 0 || out.iter().any(|(k, _)| *k == vid) {
             continue;
         }
-        let compressed = t
+        let code = t
             .toast_info
             .get(&vid)
-            .map(|i| i.compressed)
-            .unwrap_or(false);
-        out.push((vid, u8::from(compressed)));
+            .map(|i| if i.compressed { i.method.code() } else { 0 })
+            .unwrap_or(0);
+        out.push((vid, code));
     }
     out
+}
+
+/// v0.41: decode a WAL/checkpoint toast method byte (0 = not
+/// compressed, otherwise a `ToastCompression` code). Unknown codes are
+/// a loud decode error — never silently reinterpreted.
+fn decode_toast_method(byte: u8) -> Result<crate::storage::ToastInfo, String> {
+    if byte == 0 {
+        return Ok(crate::storage::ToastInfo {
+            compressed: false,
+            method: crate::storage::ToastCompression::Pglz,
+        });
+    }
+    match crate::storage::ToastCompression::from_code(byte) {
+        Some(method) => Ok(crate::storage::ToastInfo {
+            compressed: true,
+            method,
+        }),
+        None => Err(format!("unknown toast compression code {}", byte)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3142,12 +3232,24 @@ impl Wal {
                 for s in &t.col_storage {
                     body.u8(*s);
                 }
+                // v0.41: per-column explicit compression methods
+                // (ToastCompression codes, `p`/`l`), parallel to columns.
+                body.u32(t.col_compression.len() as u32);
+                for m in &t.col_compression {
+                    body.u8(m.map(|m| m.code()).unwrap_or(0));
+                }
                 let mut toast_keys: Vec<u32> = t.toast_info.keys().copied().collect();
                 toast_keys.sort_unstable();
                 body.u32(toast_keys.len() as u32);
                 for k in &toast_keys {
                     body.u32(*k);
-                    body.u8(t.toast_info[k].compressed as u8);
+                    // v0.41: method code (0 = not compressed).
+                    let info = &t.toast_info[k];
+                    body.u8(if info.compressed {
+                        info.method.code()
+                    } else {
+                        0
+                    });
                 }
                 body.u32(t.next_value_id);
                 let live_rows: Vec<&RowVersion> = t
@@ -3458,12 +3560,29 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         for _ in 0..n_storage {
             col_storage.push(d.u8().map_err(|e| bad(&e))?);
         }
+        // v0.41: per-column explicit compression methods (0 = default).
+        let n_compression = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut col_compression = Vec::with_capacity(n_compression);
+        for _ in 0..n_compression {
+            let code = d.u8().map_err(|e| bad(&e))?;
+            let method = if code == 0 {
+                None
+            } else {
+                Some(
+                    crate::storage::ToastCompression::from_code(code)
+                        .ok_or_else(|| bad(&format!("unknown toast compression code {}", code)))?,
+                )
+            };
+            col_compression.push(method);
+        }
         let n_toast_info = d.u32().map_err(|e| bad(&e))? as usize;
         let mut toast_info = std::collections::HashMap::new();
         for _ in 0..n_toast_info {
             let k = d.u32().map_err(|e| bad(&e))?;
-            let compressed = d.u8().map_err(|e| bad(&e))? != 0;
-            toast_info.insert(k, crate::storage::ToastInfo { compressed });
+            let code = d.u8().map_err(|e| bad(&e))?;
+            // v0.41: the byte is a method code (0 = plain).
+            let info = decode_toast_method(code).map_err(|e| bad(&e))?;
+            toast_info.insert(k, info);
         }
         let next_value_id = d.u32().map_err(|e| bad(&e))?.max(1);
         let n_rows = d.u32().map_err(|e| bad(&e))? as usize;
@@ -3504,6 +3623,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         __t.toast_relid = toast_relid;
         __t.toast_target = toast_target;
         __t.col_storage = col_storage;
+        __t.col_compression = col_compression;
         __t.toast_info = toast_info;
         __t.next_value_id = next_value_id;
         match crate::sql::decode_constraints(&constraints) {
@@ -3751,6 +3871,7 @@ mod tests {
                 col_acl: vec![],
                 oid: 16384,
                 toast_relid: 16385,
+                col_compression: vec![0],
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -3962,6 +4083,7 @@ mod tests {
                 col_acl: vec![],
                 oid: 16384,
                 toast_relid: 0,
+                col_compression: vec![0],
                 xmin: 4,
             },
         )

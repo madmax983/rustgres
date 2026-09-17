@@ -23,8 +23,10 @@
 //!   Framing differs: PG carries the original length in the compressed
 //!   varlena header, while rustgres prepends a 4-byte little-endian
 //!   length (read back by the test-only decompressor).
-//! - `default_toast_compression = lz4` is accepted but maps to pglz:
-//!   rustgres has no LZ4 implementation (documented in server.rs).
+//! - v0.41: a pure-std LZ4 block codec, plus per-column `COMPRESSION`
+//!   selection. `default_toast_compression` accepts `pglz` (the PG19
+//!   default) and `lz4`; the session default steers new writes unless a
+//!   column has an explicit `COMPRESSION` method.
 
 use crate::storage::{Table, ToastInfo, Value, toast_consts, toast_storage};
 use std::cell::RefCell;
@@ -422,6 +424,282 @@ pub fn decompress_pglz(input: &[u8]) -> Option<Vec<u8>> {
         None
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.41: LZ4 block codec (PG19 `lz4_compress_datum` / `lz4_decompress_datum`)
+// ---------------------------------------------------------------------------
+//
+// Pure-std implementation of the LZ4 block format, faithful to the real
+// `LZ4_compress_default()` / `LZ4_decompress_safe()` in the vendored
+// `lz4.c` (`hidden_files/lz4ref/`, taken from the PG19 tree). Only the
+// *format* is compatible: the encoder is a deliberately simple hash-chain
+// matcher (no backward catch-up, no lazy evaluation, no skip
+// acceleration), so its ratio trails the real compressor. What matters
+// for `toast_compression.c` is structural validity, which the real
+// `LZ4_decompress_safe()` confirms: a C harness in `hidden_files/lz4ref/`
+// decodes this encoder's output with the genuine `lz4.c`.
+//
+// Encoder invariants (mirroring `lz4.c`'s `LZ4_compress_generic`):
+// - matches are >= 4 bytes (`MINMATCH`), offsets in `1..=65535`, and
+//   always point into already-written output;
+// - a match never starts in the last 12 input bytes (`MFLIMIT`) and
+//   never extends into the last 5 (`LASTLITERALS`), so every block ends
+//   with a non-empty literals-only tail — exactly what the decoder's
+//   end-of-block rules require.
+
+/// Compress one LZ4 block (no framing). Positions are tracked as `u32`,
+/// so inputs larger than `u32::MAX` bytes are not supported (the framed
+/// wrapper refuses them first).
+fn lz4_compress_block(input: &[u8]) -> Vec<u8> {
+    const MINMATCH: usize = 4;
+    const MFLIMIT: usize = 12;
+    const LASTLITERALS: usize = 5;
+    const DISTANCE_MAX: usize = 65535;
+    const HASH_LOG: u32 = 12;
+
+    let n = input.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n + n / 255 + 16);
+    if n == 0 {
+        // Real LZ4 emits a single empty-literals token for empty input.
+        out.push(0);
+        return out;
+    }
+    // Last written position+1 per hash bucket; 0 = empty.
+    let mut table = vec![0u32; 1 << HASH_LOG];
+    let mut anchor = 0usize;
+    let mut pos = 0usize;
+
+    // Emit one LZ4 sequence: `literals`, then optionally a match of
+    // `match_len` bytes at `offset` bytes back.
+    let emit = |out: &mut Vec<u8>, literals: &[u8], mtch: Option<(usize, usize)>| {
+        let ll = literals.len();
+        let mut token: u8 = if ll >= 15 { 0xF0 } else { (ll << 4) as u8 };
+        let mut ml_ext = 0usize;
+        if let Some((_, match_len)) = mtch {
+            let ml = match_len - MINMATCH;
+            token |= if ml >= 15 { 0x0F } else { ml as u8 };
+            ml_ext = ml;
+        }
+        out.push(token);
+        if ll >= 15 {
+            let mut rem = ll - 15;
+            while rem >= 255 {
+                out.push(255);
+                rem -= 255;
+            }
+            out.push(rem as u8);
+        }
+        out.extend_from_slice(literals);
+        if let Some((offset, _)) = mtch {
+            out.extend_from_slice(&(offset as u16).to_le_bytes());
+            if ml_ext >= 15 {
+                let mut rem = ml_ext - 15;
+                while rem >= 255 {
+                    out.push(255);
+                    rem -= 255;
+                }
+                out.push(rem as u8);
+            }
+        }
+    };
+
+    while pos + MFLIMIT <= n {
+        // `pos + 12 <= n`, so reading 4 bytes at `pos` is in bounds.
+        let seq = u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
+        let h = (seq.wrapping_mul(2654435761) >> (32 - HASH_LOG)) as usize;
+        let cand_plus1 = table[h];
+        table[h] = (pos + 1) as u32;
+        let mut found: Option<(usize, usize)> = None;
+        if cand_plus1 != 0 {
+            let c = (cand_plus1 - 1) as usize;
+            if c < pos && pos - c <= DISTANCE_MAX {
+                // Cap the match so the last LASTLITERALS bytes stay
+                // literals (`pos + 12 <= n`, so the cap is >= 7).
+                let max_len = (n - LASTLITERALS) - pos;
+                let mut len = 0usize;
+                // `c < pos` and `len < max_len` keep `c + len < n`.
+                while len < max_len && input[c + len] == input[pos + len] {
+                    len += 1;
+                }
+                if len >= MINMATCH {
+                    found = Some((pos - c, len));
+                }
+            }
+        }
+        if let Some((offset, match_len)) = found {
+            emit(&mut out, &input[anchor..pos], Some((offset, match_len)));
+            pos += match_len;
+            anchor = pos;
+        } else {
+            pos += 1;
+        }
+    }
+    // Final literals-only tail. `pos` advances by 1 or by a match ending
+    // at most at `n - LASTLITERALS`, so `pos < n` and this is non-empty.
+    emit(&mut out, &input[anchor..], None);
+    out
+}
+
+/// Decompress one LZ4 block into exactly `out_len` bytes, mirroring the
+/// acceptance rules of the real `LZ4_decompress_safe()` (vendored
+/// `lz4.c`): extension-byte read limits, the last-sequence rule
+/// (literals must consume exactly the remaining input), and the hard
+/// "last 5 output bytes must be literals" rule. Returns `None` on any
+/// corrupt or truncated input.
+///
+/// Test-only, like [`decompress_pglz`]: the engine keeps values
+/// detoasted inline, so no production path decompresses.
+#[cfg(test)]
+fn lz4_decompress_block(input: &[u8], out_len: usize) -> Option<Vec<u8>> {
+    const MINMATCH: usize = 4;
+    const RUN_MASK: usize = 15;
+    const ML_MASK: usize = 15;
+    const LASTLITERALS: usize = 5;
+    const MFLIMIT: usize = 12;
+
+    let mut out = vec![0u8; out_len];
+    let mut ip = 0usize;
+    let mut op = 0usize;
+    loop {
+        if ip >= input.len() {
+            return None; // truncated: expected a token
+        }
+        let token = input[ip];
+        ip += 1;
+        let mut lit_len = (token >> 4) as usize;
+        if lit_len == RUN_MASK {
+            // Extension bytes may not reach into the last RUN_MASK input
+            // bytes (mirrors `read_variable_length`'s `iend - RUN_MASK`).
+            let ilimit = input.len().checked_sub(RUN_MASK)?;
+            loop {
+                if ip >= ilimit {
+                    return None;
+                }
+                let b = input[ip];
+                ip += 1;
+                lit_len = lit_len.checked_add(b as usize)?;
+                if ip > ilimit {
+                    return None;
+                }
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        let lit_end = ip.checked_add(lit_len)?;
+        let op_end = op.checked_add(lit_len)?;
+        if lit_end > input.len().saturating_sub(2 + 1 + LASTLITERALS)
+            || op_end > out_len.saturating_sub(MFLIMIT)
+        {
+            // Must be the last sequence: the literals consume exactly
+            // the remaining input and fit the output.
+            if lit_end != input.len() || op_end > out_len {
+                return None;
+            }
+            out[op..op_end].copy_from_slice(&input[ip..lit_end]);
+            op = op_end;
+            ip = lit_end;
+            break;
+        }
+        out[op..op_end].copy_from_slice(&input[ip..lit_end]);
+        ip = lit_end;
+        op = op_end;
+        // Match offset.
+        if ip + 2 > input.len() {
+            return None;
+        }
+        let offset = u16::from_le_bytes([input[ip], input[ip + 1]]) as usize;
+        ip += 2;
+        if offset == 0 || offset > op {
+            return None;
+        }
+        let mut match_len = (token & 0x0F) as usize;
+        if match_len == ML_MASK {
+            // Match-length extensions may not reach into the last
+            // LASTLITERALS - 1 input bytes (`iend - LASTLITERALS + 1`).
+            let ilimit = input.len().checked_sub(LASTLITERALS - 1)?;
+            loop {
+                if ip >= input.len() {
+                    return None;
+                }
+                let b = input[ip];
+                ip += 1;
+                match_len = match_len.checked_add(b as usize)?;
+                if ip > ilimit {
+                    return None;
+                }
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        match_len += MINMATCH;
+        let match_end = op.checked_add(match_len)?;
+        // PG's hard rule: the last LASTLITERALS output bytes must be
+        // literals; a match reaching into them is corrupt.
+        if out_len < LASTLITERALS || match_end > out_len - LASTLITERALS {
+            return None;
+        }
+        for i in 0..match_len {
+            out[op + i] = out[op + i - offset];
+        }
+        op = match_end;
+    }
+    if op == out_len && ip == input.len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// v0.41: PG19 `lz4_compress_datum()` — LZ4-block compression of a datum,
+/// in rustgres's framed form (4-byte LE original length + raw block).
+/// Returns `None` when compression does not shrink the input: PG refuses
+/// the compressed form when `compressed_len > original_len`
+/// (`toast_compression.c`); the additional ">2 bytes net win" rule is
+/// `toast_compress_datum()`'s and lives in the planner
+/// ([`try_compress_attr`]), exactly like PG splits the two gates.
+pub fn compress_lz4(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() > u32::MAX as usize {
+        return None;
+    }
+    let block = lz4_compress_block(input);
+    // PG's gate: refuse only when the block is *larger* than the input;
+    // equal size still compresses (the >2-byte rule decides in the
+    // planner).
+    if block.len() > input.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(block.len() + 4);
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&block);
+    Some(out)
+}
+
+/// Framed LZ4 decompression (inverse of [`compress_lz4`]).
+/// Test-only, like [`decompress_pglz`].
+#[cfg(test)]
+pub fn decompress_lz4(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() < 4 {
+        return None;
+    }
+    let orig_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    if orig_len > 1_000_000_000 {
+        return None;
+    }
+    lz4_decompress_block(&input[4..], orig_len)
+}
+
+/// Compress with the given method (PG19 `toast_compress_datum()`'s
+/// method dispatch). The `None`-when-not-smaller contract is the
+/// method's own; the planner applies the shared >2-byte net-win rule.
+pub fn compress_value(input: &[u8], method: crate::storage::ToastCompression) -> Option<Vec<u8>> {
+    match method {
+        crate::storage::ToastCompression::Pglz => compress_pglz(input),
+        crate::storage::ToastCompression::Lz4 => compress_lz4(input),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Toast decision logic (heaptoast.c strategy)
 // ---------------------------------------------------------------------------
@@ -431,7 +709,7 @@ pub fn decompress_pglz(input: &[u8]) -> Option<Vec<u8>> {
 pub enum ToastPlan {
     /// Keep inline as-is.
     Plain,
-    /// Keep inline, compressed (pglz).
+    /// Keep inline, compressed (method recorded in `toast_info`).
     Compressed,
     /// Move out-of-line (chunks in the toast table), uncompressed.
     External,
@@ -495,7 +773,12 @@ fn toastable_bytes(v: &Value) -> Option<Vec<u8>> {
 /// order (was: compress-all then externalize-biggest), externalized
 /// columns now count the 20-byte toast pointer (was: zero), and the
 /// limit is `target - hoff` (was: `target`).
-pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<ToastPlan> {
+pub fn plan_toast(
+    table: &Table,
+    values: &[Value],
+    compress_ok: bool,
+    default_method: crate::storage::ToastCompression,
+) -> Vec<ToastPlan> {
     let n = values.len();
     let mut plan = vec![ToastPlan::Plain; n];
     // Only toastable columns with toastable values participate.
@@ -537,6 +820,18 @@ pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<Toa
     // Columns proven incompressible (PG's TOASTCOL_INCOMPRESSIBLE):
     // skipped by later compression passes, still movable out-of-line.
     let mut incompressible = vec![false; n];
+    // v0.41: PG19 resolves a column without an explicit compression
+    // method to the session's `default_toast_compression` at compression
+    // time (`toast_tuple_try_compression` consults `attcompression`,
+    // falling back to the GUC when it is invalid/default).
+    let method_for = |i: usize| {
+        table
+            .col_compression
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(default_method)
+    };
 
     // Current row width: externalized columns count the toast pointer.
     let cur_width = |plan: &[ToastPlan], sizes: &[usize]| -> usize {
@@ -576,6 +871,7 @@ pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<Toa
                 b,
                 values,
                 compress_ok,
+                method_for(b),
                 &mut plan,
                 &mut sizes,
                 &mut compressed,
@@ -631,6 +927,7 @@ pub fn plan_toast(table: &Table, values: &[Value], compress_ok: bool) -> Vec<Toa
             b,
             values,
             compress_ok,
+            method_for(b),
             &mut plan,
             &mut sizes,
             &mut compressed,
@@ -707,12 +1004,15 @@ fn biggest_attr(
 /// Try PG-style compression on one column: on success the plan and size
 /// update, on failure the column is marked incompressible. PG only
 /// keeps the compressed form on a savings of more than 2 bytes
-/// (`toast_compress_datum`).
+/// (`toast_compress_datum`); the per-method "refuse when not smaller"
+/// gate is the compressor's own (`pglz_compress` /
+/// `lz4_compress_datum`).
 #[allow(clippy::too_many_arguments)]
 fn try_compress_attr(
     i: usize,
     values: &[Value],
     compress_ok: bool,
+    method: crate::storage::ToastCompression,
     plan: &mut [ToastPlan],
     sizes: &mut [usize],
     compressed: &mut [Option<Vec<u8>>],
@@ -729,7 +1029,7 @@ fn try_compress_attr(
             return;
         }
     };
-    match compress_pglz(&raw) {
+    match compress_value(&raw, method) {
         Some(c) if c.len() + 2 < raw.len() => {
             sizes[i] = c.len();
             compressed[i] = Some(c);
@@ -763,6 +1063,7 @@ pub fn out_of_line_bytes(
     idx: usize,
     plan: ToastPlan,
     compress_ok: bool,
+    method: crate::storage::ToastCompression,
 ) -> Option<Vec<u8>> {
     match plan {
         ToastPlan::Plain | ToastPlan::Compressed => None,
@@ -770,7 +1071,7 @@ pub fn out_of_line_bytes(
         ToastPlan::CompressedExternal => {
             let raw = toastable_bytes(&values[idx])?;
             if compress_ok {
-                Some(compress_pglz(&raw).unwrap_or(raw))
+                Some(compress_value(&raw, method).unwrap_or(raw))
             } else {
                 Some(raw)
             }
@@ -779,8 +1080,16 @@ pub fn out_of_line_bytes(
 }
 
 /// v0.37: record a toasted cell in the table's `toast_info`.
-pub fn record_toast_info(table: &mut Table, value_id: u32, compressed: bool) {
-    table.toast_info.insert(value_id, ToastInfo { compressed });
+/// v0.41: also records which compressor produced the stored bytes.
+pub fn record_toast_info(
+    table: &mut Table,
+    value_id: u32,
+    compressed: bool,
+    method: crate::storage::ToastCompression,
+) {
+    table
+        .toast_info
+        .insert(value_id, ToastInfo { compressed, method });
 }
 
 #[cfg(test)]
@@ -896,5 +1205,130 @@ mod tests {
         let mut d = c.clone();
         d[0] = 0x01;
         assert!(decompress_pglz(&d).is_none());
+    }
+
+    // --- v0.41: LZ4 ---
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The Rust decoder must accept genuine `lz4.c`
+    /// `LZ4_compress_default()` output (vendored vectors).
+    #[test]
+    fn lz4_decoder_accepts_real_c_vectors() {
+        let fixture = include_str!("../tests/data/lz4_vectors.txt");
+        let mut n = 0;
+        for line in fixture.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 4, "bad vector line: {}", line);
+            let orig_len: usize = parts[0].parse().unwrap();
+            let comp = hex_decode(parts[2]);
+            let orig = hex_decode(parts[3]);
+            assert_eq!(orig.len(), orig_len);
+            // Frame like compress_lz4 does, then decode.
+            let mut framed = (orig_len as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&comp);
+            assert_eq!(
+                decompress_lz4(&framed).unwrap(),
+                orig,
+                "vector kind={} len={}",
+                parts[1],
+                orig_len
+            );
+            n += 1;
+        }
+        assert!(n >= 11, "expected 11 vectors, got {}", n);
+    }
+
+    #[test]
+    fn lz4_encoder_roundtrip_battery() {
+        let mut seed: u64 = 0xdeadbeef;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as u8
+        };
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for &n in &[0usize, 1, 5, 12, 13, 64, 256, 1024, 4096] {
+            cases.push((0..n).map(|_| rnd()).collect());
+        }
+        for &n in &[64usize, 1024, 8192] {
+            let t = b"the quick brown fox jumps over the lazy dog. ";
+            cases.push((0..n).map(|i| t[i % t.len()]).collect());
+        }
+        cases.push(vec![b'Q'; 5000]);
+        cases.push(
+            (0..2000)
+                .map(|i| if i % 2 == 0 { b'a' } else { b'b' })
+                .collect(),
+        );
+        cases.push((0..3000).map(|i| (i % 251) as u8).collect());
+        for data in &cases {
+            match compress_lz4(data) {
+                None => {
+                    // PG's gate: refused only when the block would be
+                    // *larger* than the input.
+                    let block = lz4_compress_block(data);
+                    assert!(
+                        block.len() > data.len(),
+                        "refused compressible input of len {}",
+                        data.len()
+                    );
+                }
+                Some(c) => {
+                    // Framed form: 4-byte LE original length + raw block.
+                    assert!(c.len() >= 4);
+                    assert_eq!(
+                        u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize,
+                        data.len()
+                    );
+                    assert!(c.len() - 4 <= data.len());
+                    assert_eq!(decompress_lz4(&c).unwrap(), *data);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lz4_decoder_rejects_corrupt() {
+        let data: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let c = compress_lz4(&data).expect("should compress");
+        // Truncated block.
+        assert!(decompress_lz4(&c[..c.len() - 1]).is_none());
+        // Truncated frame.
+        assert!(decompress_lz4(&c[..3]).is_none());
+        // Garbage token stream.
+        let mut bad = (data.len() as u32).to_le_bytes().to_vec();
+        bad.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(decompress_lz4(&bad).is_none());
+        // Offset pointing before the output (offset > bytes written).
+        let mut bad = (data.len() as u32).to_le_bytes().to_vec();
+        bad.push(0x10); // 1 literal, match token
+        bad.push(b'X'); // the literal
+        bad.extend_from_slice(&[0xFF, 0x00]); // offset 255, no history
+        assert!(decompress_lz4(&bad).is_none());
+        // Wrong framed length.
+        let mut bad = c.clone();
+        bad[0] ^= 0xFF;
+        assert!(decompress_lz4(&bad).is_none());
+    }
+
+    #[test]
+    fn lz4_method_dispatch_differs_from_pglz() {
+        use crate::storage::ToastCompression;
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".repeat(60);
+        let p = compress_value(&data, ToastCompression::Pglz).expect("pglz");
+        let l = compress_value(&data, ToastCompression::Lz4).expect("lz4");
+        // Different algorithms: payloads differ (both are valid).
+        assert_ne!(p, l);
+        assert_eq!(decompress_pglz(&p).unwrap(), data);
+        assert_eq!(decompress_lz4(&l).unwrap(), data);
     }
 }

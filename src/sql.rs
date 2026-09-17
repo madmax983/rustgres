@@ -1288,6 +1288,9 @@ pub struct TableDef {
     pub columns: Vec<(String, ColType)>,
     pub not_null: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
+    /// v0.41: raw `COMPRESSION` option per column, parallel to
+    /// `columns` (`None` = not specified). Validated in exec.
+    pub compression: Vec<Option<String>>,
     pub checks: Vec<CheckDef>,
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
@@ -1302,6 +1305,8 @@ pub enum AlterAction {
         col_type: ColType,
         not_null: bool,
         default: Option<DefaultExpr>,
+        /// v0.41: raw `COMPRESSION` option (`None` = not specified).
+        compression: Option<String>,
         checks: Vec<CheckDef>,
         uniques: Vec<UniqueDef>,
         pkey: Option<UniqueDef>,
@@ -1343,6 +1348,14 @@ pub enum AlterAction {
     /// `mode` is the raw mode name (`plain`/`external`/`extended`/
     /// `main`/`default`); validated in exec against PG's rules.
     SetStorage {
+        column: String,
+        mode: String,
+    },
+    /// v0.41: ALTER TABLE name ALTER COLUMN col SET COMPRESSION
+    /// method. `mode` is the raw method name (`pglz`/`lz4`/`default`);
+    /// validated in exec against PG19's rules (0A000 on non-toastable
+    /// types, 22023 on unknown methods).
+    SetCompression {
         column: String,
         mode: String,
     },
@@ -1391,6 +1404,10 @@ enum TableItem {
 struct ParsedColDef {
     name: String,
     col_type: ColType,
+    /// v0.41: PG19 `opt_column_compression`: `COMPRESSION method` /
+    /// `COMPRESSION DEFAULT` right after the type name. Raw name;
+    /// validated in exec (`default` = no explicit method).
+    compression: Option<String>,
     cons: Vec<ColCon>,
 }
 
@@ -1447,6 +1464,7 @@ impl TableDef {
             columns: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
+            compression: Vec::new(),
             checks: Vec::new(),
             uniques: Vec::new(),
             pkey: None,
@@ -1596,6 +1614,8 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
             def.columns.push((c.name.clone(), c.col_type.clone()));
             def.not_null.push(false);
             def.defaults.push(None);
+            // v0.41: raw COMPRESSION option travels with the column.
+            def.compression.push(c.compression.clone());
         }
     }
     if def.columns.is_empty() {
@@ -3080,6 +3100,13 @@ impl Parser {
     fn parse_column_def(&mut self) -> Result<ParsedColDef, SqlError> {
         let name = self.expect_ident()?;
         let col_type = self.parse_col_type()?;
+        // v0.41: PG19 `opt_column_compression` sits between the type
+        // name and the column constraints.
+        let compression = if self.eat_keyword("compression") {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         let mut cons = Vec::new();
         loop {
             let cname = if self.eat_keyword("constraint") {
@@ -3122,6 +3149,7 @@ impl Parser {
         Ok(ParsedColDef {
             name,
             col_type,
+            compression,
             cons,
         })
     }
@@ -3328,6 +3356,7 @@ impl Parser {
                 col_type: col.col_type,
                 not_null,
                 default,
+                compression: col.compression,
                 checks,
                 uniques,
                 pkey,
@@ -3359,6 +3388,15 @@ impl Parser {
                 if self.eat_keyword("storage") {
                     let mode = self.expect_ident()?;
                     return Ok(AlterAction::SetStorage {
+                        column: cname,
+                        mode,
+                    });
+                }
+                // v0.41: ALTER COLUMN c SET COMPRESSION method
+                // (PG19 `AT_SetCompression`).
+                if self.eat_keyword("compression") {
+                    let mode = self.expect_ident()?;
+                    return Ok(AlterAction::SetCompression {
                         column: cname,
                         mode,
                     });

@@ -86,6 +86,10 @@ pub(crate) struct Session {
     /// v0.29: `bytea_output` GUC (hex|escape). Controls bytea wire output
     /// format, like PG. Default is hex.
     bytea_output: crate::storage::ByteaOutput,
+    /// v0.41: `default_toast_compression` GUC (PG19 enum GUC). Which
+    /// compressor TOAST uses for columns without an explicit
+    /// `COMPRESSION` method. Default is pglz.
+    default_toast_compression: crate::storage::ToastCompression,
 }
 
 /// v0.17: honest version identity. rustgres reports its OWN version, not
@@ -151,6 +155,7 @@ impl Session {
             next_txn_read_only: None,
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
+            default_toast_compression: crate::storage::ToastCompression::default(),
         }
     }
 }
@@ -998,6 +1003,7 @@ fn copy_to_fetch(
             role: &session.role,
             read_only: t.read_only == Some(true),
             writes: &mut t.writes,
+            default_toast_compression: session.default_toast_compression,
         };
         match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
             Ok(r) => Ok(r),
@@ -1018,6 +1024,7 @@ fn copy_to_fetch(
                 session: session.sid,
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
+                default_toast_compression: session.default_toast_compression,
                 writes: &mut writes,
             };
             exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
@@ -1139,6 +1146,7 @@ fn copy_from_ingest(
                 session: session.sid,
                 role: &session.role,
                 read_only: t.read_only == Some(true),
+                default_toast_compression: session.default_toast_compression,
                 writes: &mut t.writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1160,6 +1168,7 @@ fn copy_from_ingest(
                 session: session.sid,
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
+                default_toast_compression: session.default_toast_compression,
                 writes: &mut writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1515,6 +1524,7 @@ fn cursor_declare(
             session.sid,
             &session.role,
             session.default_txn_read_only == Some(true),
+            session.default_toast_compression,
             &sel,
         )
     };
@@ -1670,11 +1680,9 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
             }
             .to_string(),
         ),
-        // v0.37: `default_toast_compression` is always "pglz" (like a PG
-        // built without LZ4): rustgres has no LZ4 implementation, so
-        // `lz4` is rejected with 22023 instead of being silently
-        // accepted.
-        "default_toast_compression" => Some("pglz".to_string()),
+        // v0.41: `default_toast_compression` is a real session GUC now
+        // (PG19 enum GUC): pglz or lz4, default pglz (matching PG19).
+        "default_toast_compression" => Some(session.default_toast_compression.name().to_string()),
         "server_version" => Some(SERVER_VERSION.to_string()),
         "server_version_num" => Some(SERVER_VERSION_NUM.to_string()),
         "transaction_isolation" => {
@@ -1786,23 +1794,21 @@ fn stmt_set_guc(
                 tag: "SET".to_string(),
             })
         }
-        // v0.37: `default_toast_compression`. PG19 lists pglz and (when
-        // built with it) lz4. rustgres has no LZ4 implementation, so only
-        // pglz (and DEFAULT) is accepted; lz4 is rejected with 22023, like
-        // a PG built without LZ4 support.
+        // v0.41: `default_toast_compression` is a real session GUC
+        // (PG19 enum GUC): pglz or lz4; DEFAULT (and RESET) restore the
+        // compiled default (pglz, like PG19). Anything else
+        // is 22023, like PG.
         "default_toast_compression" => {
-            match value {
-                SetValue::Default => {}
-                SetValue::Str(s) => match s.to_ascii_lowercase().as_str() {
-                    "pglz" => {}
-                    _ => {
-                        return Err(ExecError {
-                            code: "22023",
-                            message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                        });
-                    }
-                },
+            let v = match value {
+                SetValue::Default => crate::storage::ToastCompression::default(),
+                SetValue::Str(s) => {
+                    crate::storage::ToastCompression::from_name(s).ok_or_else(|| ExecError {
+                        code: "22023",
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                    })?
+                }
             };
+            session.default_toast_compression = v;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
@@ -1832,12 +1838,14 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 /// v0.17: `RESET name` / `RESET ALL` (tag "RESET", like PG). Session
 /// transaction characteristics are not GUCs and survive RESET ALL.
 /// v0.29: `bytea_output` resets to hex.
-/// v0.37: `default_toast_compression` resets to pglz.
+/// v0.41: `default_toast_compression` resets to the compiled default
+/// (lz4, like a PG19 LZ4 build).
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
         "all" => {
             session.default_txn_read_only = None;
             session.bytea_output = crate::storage::ByteaOutput::Hex;
+            session.default_toast_compression = crate::storage::ToastCompression::default();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -1854,11 +1862,14 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
                 tag: "RESET".to_string(),
             })
         }
-        // v0.37: `default_toast_compression` is a constant "pglz";
-        // RESET is a no-op that still reports the tag, like PG.
-        "default_toast_compression" => Ok(ExecResult::Command {
-            tag: "RESET".to_string(),
-        }),
+        // v0.41: `default_toast_compression` resets to the compiled
+        // default (pglz), like PG.
+        "default_toast_compression" => {
+            session.default_toast_compression = crate::storage::ToastCompression::default();
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
@@ -1950,6 +1961,7 @@ fn run_statement(
                     session.sid,
                     &session.role,
                     session.default_txn_read_only == Some(true),
+                    session.default_toast_compression,
                     &a,
                 )?;
             }
@@ -1992,6 +2004,7 @@ fn run_statement(
                     session.sid,
                     &session.role,
                     session.default_txn_read_only == Some(true),
+                    session.default_toast_compression,
                     stmt,
                 )
             }
@@ -2059,6 +2072,7 @@ fn txn_execute(
             session: session.sid,
             role: &session.role,
             read_only: t.read_only == Some(true),
+            default_toast_compression: session.default_toast_compression,
             writes: &mut t.writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -2098,6 +2112,8 @@ fn autocommit_execute(
     // v0.17: effective read-only for this implicit transaction (from
     // `default_transaction_read_only`); gates nextval/setval.
     read_only: bool,
+    // v0.41: session's `default_toast_compression` GUC.
+    default_toast_compression: crate::storage::ToastCompression,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
     let mut guard = lock_engine(engine);
@@ -2112,6 +2128,7 @@ fn autocommit_execute(
             session: sid,
             role,
             read_only,
+            default_toast_compression,
             writes: &mut writes,
         };
         exec::execute(&mut *guard, &mut ctx, stmt)
@@ -3179,6 +3196,7 @@ mod tests {
             next_txn_read_only: None,
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
+            default_toast_compression: crate::storage::ToastCompression::default(),
             txn: Some(Txn {
                 xid,
                 level,

@@ -209,8 +209,64 @@ pub mod toast_storage {
 /// keyed by value id in `Table::toast_info`.
 #[derive(Clone, Debug, Default)]
 pub struct ToastInfo {
-    /// The stored form is compressed (always `pglz` in v0.37).
+    /// The stored form is compressed.
     pub compressed: bool,
+    /// v0.41: which compressor produced the stored bytes (PG19's
+    /// `attcompression` method code). Meaningful only when
+    /// `compressed` is true.
+    pub method: ToastCompression,
+}
+
+/// v0.41: TOAST compression methods (PG19 `ToastCompressionId` /
+/// `attcompression` codes in `toast_compression.h`). The `u8` code is
+/// the on-wire/varlena method character: `b'p'` for PGLZ, `b'l'` for
+/// LZ4. This is also which compressor TOAST uses for a column without
+/// an explicit `COMPRESSION` method: PG19's `default_toast_compression`
+/// defaults to `pglz` even in LZ4-enabled builds (`lz4` is opt-in per
+/// column or via SET); we match that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToastCompression {
+    #[default]
+    Pglz,
+    Lz4,
+}
+
+impl ToastCompression {
+    /// Method character, as PG stores it in `attcompression` and the
+    /// compressed-varlena header.
+    pub fn code(self) -> u8 {
+        match self {
+            ToastCompression::Pglz => b'p',
+            ToastCompression::Lz4 => b'l',
+        }
+    }
+
+    /// Method name, as `pg_column_compression()` reports it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ToastCompression::Pglz => "pglz",
+            ToastCompression::Lz4 => "lz4",
+        }
+    }
+
+    /// Parse a method name (case-insensitive), like PG's
+    /// `CompressionNameToMethod`; `None` for unknown names.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "pglz" => Some(ToastCompression::Pglz),
+            "lz4" => Some(ToastCompression::Lz4),
+            _ => None,
+        }
+    }
+
+    /// Decode a stored method code; `None` for unknown codes.
+    pub fn from_code(b: u8) -> Option<Self> {
+        match b {
+            b'p' => Some(ToastCompression::Pglz),
+            b'l' => Some(ToastCompression::Lz4),
+            _ => None,
+        }
+    }
 }
 
 /// v0.37: TOAST constants adapted from PG19 `access/heaptoast.h`.
@@ -2191,6 +2247,11 @@ pub struct Table {
     /// Per-column TOAST storage strategy (`toast_storage::*`), parallel
     /// to `columns`.
     pub col_storage: Vec<u8>,
+    /// v0.41: per-column TOAST compression method, parallel to
+    /// `columns`; `None` = no explicit method (PG's invalid/default
+    /// `attcompression`), resolved to the session's
+    /// `default_toast_compression` at compression time.
+    pub col_compression: Vec<Option<ToastCompression>>,
     /// Toast value id -> storage state, for cells recorded in
     /// `RowVersion::toast`.
     pub toast_info: HashMap<u32, ToastInfo>,
@@ -2228,6 +2289,8 @@ impl Table {
             toast_relid: 0,
             toast_target: toast_consts::TOAST_TUPLE_TARGET,
             col_storage,
+            // v0.41: no explicit per-column compression methods.
+            col_compression: vec![None; n],
             toast_info: HashMap::new(),
             next_value_id: 1,
         }

@@ -996,6 +996,7 @@ mod tests {
                 xmin: 1,
                 oid: 0,
                 toast_relid: 0,
+                col_compression: vec![],
             },
             WalRecord::InsertRows {
                 table: "t".into(),

@@ -91,6 +91,10 @@ pub struct StmtCtx<'a> {
     /// setval) fail with 25006. Set by the server from the effective
     /// transaction mode.
     pub read_only: bool,
+    /// v0.41: session's `default_toast_compression` GUC, consulted by
+    /// TOAST for columns without an explicit `COMPRESSION` method.
+    /// Set by the server from the session, like `read_only`.
+    pub default_toast_compression: crate::storage::ToastCompression,
 }
 
 /// Outcome of executing one statement.
@@ -477,6 +481,14 @@ fn exec_create(
         let mut t = Table::with_def(def, ctx.own);
         // v0.11: the creating role owns the table.
         t.owner = ctx.role.to_string();
+        // v0.41: validate each column's COMPRESSION option (PG19
+        // GetAttributeCompression) and store the explicit methods.
+        t.col_compression = def
+            .columns
+            .iter()
+            .zip(def.compression.iter())
+            .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
+            .collect::<Result<Vec<_>, _>>()?;
         tmps.insert(name.to_string(), t);
         ctx.writes.push(WriteOp::CreateTempTable {
             session: ctx.session,
@@ -515,6 +527,14 @@ fn exec_create(
     let mut t = Table::with_def(def, ctx.own);
     // v0.11: the creating role owns the table.
     t.owner = ctx.role.to_string();
+    // v0.41: validate each column's COMPRESSION option (PG19
+    // GetAttributeCompression) and store the explicit methods.
+    t.col_compression = def
+        .columns
+        .iter()
+        .zip(def.compression.iter())
+        .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
+        .collect::<Result<Vec<_>, _>>()?;
     // v0.37: assign the table OID (pg_class.oid).
     t.oid = eng.db.alloc_oid();
     // v0.37: PG creates the toast table at CREATE TABLE when the table
@@ -1960,7 +1980,8 @@ fn toast_new_row(
     {
         return Ok(());
     }
-    // v0.37: compression uses the pglz-named custom LZ77 (see toast.rs).
+    // v0.41: compression uses the session's default_toast_compression
+    // GUC unless the column has an explicit COMPRESSION method.
     const COMPRESS_OK: bool = true;
     // Phase 1: plan with a shared borrow.
     let plan = {
@@ -1973,7 +1994,7 @@ fn toast_new_row(
                     format!("relation \"{}\" does not exist", table_name),
                 )
             })?;
-        crate::toast::plan_toast(t, values, COMPRESS_OK)
+        crate::toast::plan_toast(t, values, COMPRESS_OK, ctx.default_toast_compression)
     };
     if plan.iter().all(|p| *p == crate::toast::ToastPlan::Plain) {
         return Ok(());
@@ -1997,9 +2018,18 @@ fn toast_new_row(
                 p,
                 crate::toast::ToastPlan::Compressed | crate::toast::ToastPlan::CompressedExternal
             );
-            crate::toast::record_toast_info(t, vid, compressed);
+            // v0.41: the column's explicit method, else the session GUC
+            // (PG resolves invalid/default attcompression at write time).
+            let method = t
+                .col_compression
+                .get(i)
+                .copied()
+                .flatten()
+                .unwrap_or(ctx.default_toast_compression);
+            crate::toast::record_toast_info(t, vid, compressed, method);
             flags[i] = vid;
-            if let Some(bytes) = crate::toast::out_of_line_bytes(values, i, *p, COMPRESS_OK) {
+            if let Some(bytes) = crate::toast::out_of_line_bytes(values, i, *p, COMPRESS_OK, method)
+            {
                 chunks.push((vid, bytes));
             }
         }
@@ -5115,7 +5145,6 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
     }
     (schema, rows)
 }
-
 // ---------------------------------------------------------------------------
 // v0.11: role catalogs (virtual). A real table by the same name takes
 // precedence, like pg_stats. `pg_authid` masks password verifiers from
@@ -12767,9 +12796,10 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
 /// v0.37: `pg_column_compression(any)` — like PG19's implementation in
 /// `varlena.c`: NULL for a NULL argument and for fixed-width types;
 /// for a varlena value, the stored compression method name when the
-/// value is compressed in its row, else NULL. Our compressor is a
-/// custom LZ77 that reports under the `pglz` name (it is not
-/// PGLZ byte-compatible).
+/// value is compressed in its row, else NULL.
+/// v0.41: reports the actual recorded method (`pglz` or `lz4`) instead
+/// of always `pglz`; the stale "custom LZ77" note is gone since v0.40
+/// made the PGLZ payload byte-identical to PG19's `pglz_compress()`.
 ///
 /// The argument may be any expression (PG's function is not restricted
 /// to simple column references): only a plain column reference on a
@@ -12858,7 +12888,7 @@ fn pg_column_compression_value(
         return Ok(Value::Null);
     }
     match t.toast_info.get(&flag) {
-        Some(info) if info.compressed => Ok(Value::text("pglz")),
+        Some(info) if info.compressed => Ok(Value::text(info.method.name())),
         _ => Ok(Value::Null),
     }
 }
@@ -19491,6 +19521,7 @@ mod tests {
             session: 0,
             role: "postgres",
             read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
         };
         execute(eng, &mut ctx, &stmt)
     }
@@ -19759,6 +19790,7 @@ mod tests {
             session: 0,
             role: "postgres",
             read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
         };
         let sel = parse_statement("SELECT * FROM users WHERE id = 1 FOR UPDATE").unwrap();
         execute(&mut eng, &mut ctx, &sel).unwrap();
@@ -19774,6 +19806,7 @@ mod tests {
             session: 0,
             role: "postgres",
             read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
         };
         let upd = parse_statement("UPDATE users SET name = 'x' WHERE id = 1").unwrap();
         let e = execute(&mut eng, &mut ctx2, &upd).unwrap_err();
@@ -20821,6 +20854,108 @@ mod tests {
             panic!("join");
         };
         assert_eq!(col_aliases, &vec!["p".to_string(), "q".to_string()]);
+    }
+    /// v0.41: ADD COLUMN rewrites rows; the per-cell TOAST value ids must
+    /// survive the rewrite (PG keeps the toast pointers), so
+    /// `pg_column_compression` still reports the value's method.
+    #[test]
+    fn v41_add_column_preserves_toast_method() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t41ac(v text)").unwrap();
+        run(&mut eng, "ALTER TABLE t41ac SET (toast_tuple_target = 128)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t41ac ALTER COLUMN v SET COMPRESSION pglz",
+        )
+        .unwrap();
+        run(&mut eng, "INSERT INTO t41ac VALUES (repeat('N', 3000))").unwrap();
+        let before = rows_of(run(&mut eng, "SELECT pg_column_compression(v) FROM t41ac").unwrap());
+        assert_eq!(before, vec![vec!["pglz".to_string()]]);
+        run(&mut eng, "ALTER TABLE t41ac ADD COLUMN w text").unwrap();
+        let after = rows_of(run(&mut eng, "SELECT pg_column_compression(v) FROM t41ac").unwrap());
+        assert_eq!(after, vec![vec!["pglz".to_string()]]);
+        // Values themselves survive too.
+        let len = rows_of(run(&mut eng, "SELECT length(v) FROM t41ac").unwrap());
+        assert_eq!(len, vec![vec!["3000".to_string()]]);
+        // col_compression stays parallel to columns (None for the new col).
+        let t = eng.db.tables["t41ac"].last().unwrap();
+        assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.col_compression.len(), 2);
+        assert_eq!(
+            t.col_compression[0],
+            Some(crate::storage::ToastCompression::Pglz)
+        );
+        assert_eq!(t.col_compression[1], None);
+    }
+
+    /// v0.41: DROP COLUMN drops only the removed column's TOAST flag and
+    /// its `col_compression` entry; surviving cells keep their methods.
+    #[test]
+    fn v41_drop_column_preserves_surviving_toast_method() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t41dc(a text, b text)").unwrap();
+        run(&mut eng, "ALTER TABLE t41dc SET (toast_tuple_target = 128)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t41dc ALTER COLUMN b SET COMPRESSION pglz",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO t41dc VALUES (repeat('A', 3000), repeat('B', 3000))",
+        )
+        .unwrap();
+        // Column a used the session default in the test harness (pglz).
+        run(&mut eng, "ALTER TABLE t41dc DROP COLUMN a").unwrap();
+        let after = rows_of(run(&mut eng, "SELECT pg_column_compression(b) FROM t41dc").unwrap());
+        assert_eq!(after, vec![vec!["pglz".to_string()]]);
+        let len = rows_of(run(&mut eng, "SELECT length(b) FROM t41dc").unwrap());
+        assert_eq!(len, vec![vec!["3000".to_string()]]);
+        let t = eng.db.tables["t41dc"].last().unwrap();
+        assert_eq!(t.columns.len(), 1);
+        assert_eq!(t.col_compression.len(), 1);
+        assert_eq!(
+            t.col_compression[0],
+            Some(crate::storage::ToastCompression::Pglz)
+        );
+    }
+
+    /// v0.41: SET COMPRESSION error taxonomy matches PG.
+    #[test]
+    fn v41_set_compression_errors() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t41e(v text, i int)").unwrap();
+        let e = run(
+            &mut eng,
+            "ALTER TABLE t41e ALTER COLUMN missing SET COMPRESSION pglz",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "42703");
+        let e = run(
+            &mut eng,
+            "ALTER TABLE t41e ALTER COLUMN i SET COMPRESSION lz4",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "0A000");
+        let e = run(
+            &mut eng,
+            "ALTER TABLE t41e ALTER COLUMN v SET COMPRESSION zstd",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22023");
+        // DEFAULT clears explicit metadata.
+        run(
+            &mut eng,
+            "ALTER TABLE t41e ALTER COLUMN v SET COMPRESSION pglz",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t41e ALTER COLUMN v SET COMPRESSION DEFAULT",
+        )
+        .unwrap();
+        let t = eng.db.tables["t41e"].last().unwrap();
+        assert_eq!(t.col_compression, vec![None, None]);
     }
 }
 
@@ -22023,6 +22158,84 @@ fn alter_set_storage(
     })
 }
 
+/// v0.41: validate one column's `COMPRESSION` option, following PG19's
+/// `GetAttributeCompression`: absent or `default` = no explicit method
+/// (`None`); an explicit method on a non-toastable type is 0A000 (PG
+/// checks toastability *before* the method name); an unknown method is
+/// 22023.
+fn parse_column_compression(
+    col_type: &ColType,
+    mode: Option<&str>,
+) -> Result<Option<crate::storage::ToastCompression>, ExecError> {
+    let mode = match mode {
+        None => return Ok(None),
+        Some(m) => m,
+    };
+    if mode.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    if !col_type.is_toastable() {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "column data type {} does not support compression",
+                col_type.sql_name(),
+            ),
+        ));
+    }
+    crate::storage::ToastCompression::from_name(mode)
+        .map(Some)
+        .ok_or_else(|| exec_err("22023", format!("invalid compression method \"{}\"", mode)))
+}
+
+/// v0.41: ALTER TABLE name ALTER COLUMN col SET COMPRESSION method.
+/// Follows PG19's `ATExecSetCompression` / `GetAttributeCompression`:
+/// `default` clears the explicit method (resolves to the session GUC at
+/// write time); an explicit method on a non-toastable type is 0A000;
+/// an unknown method is 22023. Like PG, this only records metadata for
+/// future writes — existing values are not rewritten.
+fn alter_set_compression(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    column: &str,
+    mode: &str,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let col_idx = t
+        .columns
+        .iter()
+        .position(|(n, _)| n == column)
+        .ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column, name
+                ),
+            )
+        })?;
+    let col_type = t.columns[col_idx].1.clone();
+    // PG's GetAttributeCompression: default = no explicit method,
+    // 0A000 on non-toastable types, 22023 on unknown methods.
+    let method = parse_column_compression(&col_type, Some(mode))?;
+    let mut next = t;
+    // `col_compression` parallels `columns`; grow defensively if an
+    // older code path left it short.
+    if next.col_compression.len() < next.columns.len() {
+        next.col_compression.resize(next.columns.len(), None);
+    }
+    next.col_compression[col_idx] = method;
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
 /// v0.37: ALTER TABLE name SET (opt = val, ...). Only
 /// `toast_tuple_target` is supported (range 128..=8160, like PG's
 /// reloption); anything else is 22023 ("unrecognized parameter").
@@ -22181,6 +22394,13 @@ fn alter_swap(
         "col_storage out of sync with columns in ALTER TABLE {}",
         name
     );
+    // v0.41: same for the per-column COMPRESSION metadata.
+    debug_assert_eq!(
+        next.col_compression.len(),
+        next.columns.len(),
+        "col_compression out of sync with columns in ALTER TABLE {}",
+        name
+    );
     next.created_xmin = ctx.own;
     next.dropped_xmax = 0;
     let rewrite = new_rows.is_some();
@@ -22316,12 +22536,24 @@ fn exec_alter(
             col_type,
             not_null,
             default,
+            compression,
             checks,
             uniques,
             pkey,
             fks,
         } => alter_add_column(
-            eng, ctx, name, col, col_type, *not_null, default, checks, uniques, pkey, fks,
+            eng,
+            ctx,
+            name,
+            col,
+            col_type,
+            *not_null,
+            default,
+            compression,
+            checks,
+            uniques,
+            pkey,
+            fks,
         ),
         AlterAction::DropColumn { name: col, cascade } => {
             alter_drop_column(eng, ctx, name, col, *cascade)
@@ -22347,6 +22579,9 @@ fn exec_alter(
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
         // v0.37
         AlterAction::SetStorage { column, mode } => alter_set_storage(eng, ctx, name, column, mode),
+        AlterAction::SetCompression { column, mode } => {
+            alter_set_compression(eng, ctx, name, column, mode)
+        }
         AlterAction::SetRelOptions { options } => alter_set_reloptions(eng, ctx, name, options),
     }
 }
@@ -22360,6 +22595,7 @@ fn alter_add_column(
     col_type: &ColType,
     not_null: bool,
     default: &Option<DefaultExpr>,
+    compression: &Option<String>,
     checks: &[CheckDef],
     uniques: &[UniqueDef],
     pkey: &Option<UniqueDef>,
@@ -22395,6 +22631,12 @@ fn alter_add_column(
     next.columns.push((col.to_string(), col_type.clone()));
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.push(col_type.default_toast_storage());
+    // v0.41: validate the COMPRESSION option like CREATE TABLE does.
+    let method = parse_column_compression(col_type, compression.as_deref())?;
+    if next.col_compression.len() < next.columns.len() - 1 {
+        next.col_compression.resize(next.columns.len() - 1, None);
+    }
+    next.col_compression.push(method);
     next.not_null.push(not_null);
     next.defaults.push(default.clone());
     next.checks.extend(checks.iter().cloned());
@@ -22419,14 +22661,14 @@ fn alter_add_column(
     // replays them as InsertRows. Copy the visible rows out first; the
     // borrow of `t` must end before eval_default.
     let old_cols = t.columns.len();
-    let old_rows: Vec<(u64, Row)> = t
+    let old_rows: Vec<(u64, Row, Vec<u32>)> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
-        .map(|r| (r.id, r.values.clone()))
+        .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
     let mut new_rows = Vec::with_capacity(old_rows.len());
-    for (old_id, values) in old_rows {
+    for (old_id, values, old_toast) in old_rows {
         let dv = match default {
             Some(d) => eval_default(
                 eng,
@@ -22458,7 +22700,17 @@ fn alter_add_column(
             name,
             &nv,
         )?;
-        new_rows.push(RowVersion::plain(old_id, Row::new(nv), ctx.own));
+        new_rows.push({
+            let mut rv = RowVersion::plain(old_id, Row::new(nv), ctx.own);
+            // v0.41: ADD COLUMN must not orphan TOAST metadata — carry
+            // the per-cell value ids forward (PG keeps the toast
+            // pointers across a rewrite); the new column's flag is 0.
+            let mut flags = old_toast;
+            flags.resize(old_cols, 0);
+            flags.push(0);
+            rv.toast = flags;
+            rv
+        });
     }
     // Backing indexes for new unique/pkey constraints.
     let mut new_indexes: Vec<(String, Vec<String>)> = Vec::new();
@@ -22594,11 +22846,11 @@ fn alter_drop_column(
     // Snapshot the table state and end `t`'s borrow before CASCADE
     // mutations (they need `eng` mutably).
     let mut next = t.clone();
-    let old_rows: Vec<(u64, Row)> = t
+    let old_rows: Vec<(u64, Row, Vec<u32>)> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
-        .map(|r| (r.id, r.values.clone()))
+        .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
     let _ = t;
     // CASCADE: drop dependent objects.
@@ -22672,16 +22924,29 @@ fn alter_drop_column(
     next.defaults.remove(ci);
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.remove(ci);
+    // v0.41: keep the per-column COMPRESSION metadata parallel too.
+    if next.col_compression.len() > ci {
+        next.col_compression.remove(ci);
+    }
     // CHECK expressions reference columns by name; nothing to shift.
     // Rewrite rows without the column. Reuse old row ids so surviving
     // indexes stay valid.
     let mut new_rows = Vec::with_capacity(old_rows.len());
-    for (old_id, values) in old_rows {
+    for (old_id, values, old_toast) in old_rows {
         let mut values = values.to_vec();
+        let mut flags = old_toast;
         if values.len() > ci {
             values.remove(ci);
+            // v0.41: DROP COLUMN keeps the surviving cells' TOAST value
+            // ids (only the dropped column's flag goes away with it).
+            if flags.len() > ci {
+                flags.remove(ci);
+            }
         }
-        new_rows.push(RowVersion::plain(old_id, Row::new(values), ctx.own));
+        let mut rv = RowVersion::plain(old_id, Row::new(values), ctx.own);
+        flags.resize(rv.toast.len(), 0);
+        rv.toast = flags;
+        new_rows.push(rv);
     }
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
     // Shift index positions: drop and re-create each surviving index with
