@@ -663,6 +663,16 @@ EXPECTED_FAIL_PATTERNS = [
     # function was never created.
     (r"(?i)\bperson\s*\*", "table inheritance (FROM tbl*) unsupported"),
     (r"(?i)\bsillysrf\s*\(", "depends on CREATE FUNCTION (unsupported)"),
+    # v0.55: vol()/volfoo() are plpgsql functions whose CREATE FUNCTION
+    # is masked above — their CASE-test SELECTs fail only because the
+    # functions were never created.
+    (r"(?i)\bvol\s*\(", "depends on CREATE FUNCTION (unsupported)"),
+    (r"(?i)\bvolfoo\s*\(", "depends on CREATE FUNCTION (unsupported)"),
+    # v0.55: no constant-expression folding pass — PG folds `1/0` in a
+    # potentially-reachable CASE arm at plan time (division by zero);
+    # rustgres raises only for arms it actually evaluates.
+    (r"(?is)\bcase\b.*\bthen\s+1\s*/\s*0\b",
+     "constant-expression folding unsupported"),
     # v0.44: UNION/INTERSECT/EXCEPT are supported; the old broad pattern is
     # removed. Statements using them with other unsupported constructs are
     # classified under those constructs below.

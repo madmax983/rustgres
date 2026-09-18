@@ -5697,6 +5697,16 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::Cmp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
             Expr::Not(e) | Expr::BitNot(e) | Expr::Neg(e) => expr_uses(e),
+            // v0.55: CASE (any arm may reference the column).
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_deref().is_some_and(expr_uses)
+                    || whens.iter().any(|(k, r)| expr_uses(k) || expr_uses(r))
+                    || else_.as_deref().is_some_and(expr_uses)
+            }
             Expr::IsNull { expr, .. } => expr_uses(expr),
             Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Agg { arg, arg2, .. } => {
@@ -5908,6 +5918,19 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::Not(x) => Ok(Expr::Not(Box::new(r(x)?))),
         Expr::BitNot(x) => Ok(Expr::BitNot(Box::new(r(x)?))),
         Expr::Neg(x) => Ok(Expr::Neg(Box::new(r(x)?))),
+        // v0.55: resolve columns inside every CASE arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Ok(Expr::Case {
+            operand: operand.as_deref().map(r).transpose()?.map(Box::new),
+            whens: whens
+                .iter()
+                .map(|(k, v)| Ok((Box::new(r(k)?), Box::new(r(v)?))))
+                .collect::<Result<Vec<_>, _>>()?,
+            else_: else_.as_deref().map(r).transpose()?.map(Box::new),
+        }),
         Expr::IsNull { expr, neg } => Ok(Expr::IsNull {
             expr: Box::new(r(expr)?),
             neg: *neg,
@@ -6208,6 +6231,49 @@ fn common_supertype(op_name: &str, a: &ColType, b: &ColType) -> Result<ColType, 
         "42804",
         format!("{op_name} types {a:?} and {b:?} cannot be matched"),
     ))
+}
+
+/// v0.55: resolve a CASE expression's result type — PG19's
+/// `select_common_type` over all result arms plus ELSE. Untyped NULL
+/// literals and unknown (text) literals do not constrain the common
+/// type (PG coerces unknown literals to the resolved type); if every
+/// arm is unknown the result is text.
+#[allow(clippy::too_many_arguments)]
+fn case_result_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schemas: &[&[QCol]],
+    ctes: &[CteDef],
+    whens: &[(Box<Expr>, Box<Expr>)],
+    else_: &Option<Box<Expr>>,
+) -> Result<ColType, ExecError> {
+    fn unknown(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Literal(Literal::Null) | Expr::Literal(Literal::Text(_))
+        )
+    }
+    let mut acc: Option<ColType> = None;
+    let mut arms: Vec<&Expr> = Vec::with_capacity(whens.len() + 1);
+    for (_, r) in whens {
+        arms.push(r);
+    }
+    if let Some(e) = else_.as_deref() {
+        arms.push(e);
+    }
+    for e in arms {
+        if unknown(e) {
+            continue;
+        }
+        let t = expr_type(eng, snap, own, session, schemas, ctes, e)?;
+        acc = Some(match acc {
+            Some(a) => common_supertype("CASE", &a, &t)?,
+            None => t,
+        });
+    }
+    Ok(acc.unwrap_or(ColType::Text))
 }
 
 /// v0.44: coerce every cell of each row to the resolved output types
@@ -7303,6 +7369,24 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
         | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_expr(x),
+        // v0.55: validate every CASE arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                validate_expr(o)?;
+            }
+            for (k, r) in whens {
+                validate_expr(k)?;
+                validate_expr(r)?;
+            }
+            if let Some(e) = else_ {
+                validate_expr(e)?;
+            }
+            Ok(())
+        }
         Expr::IsDistinctFrom { left, right, .. } => {
             validate_expr(left)?;
             validate_expr(right)
@@ -7348,6 +7432,19 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_agg(x),
+        // v0.55: an aggregate anywhere in a CASE (operand, WHEN key,
+        // result, or ELSE) is an aggregate at this level.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(contains_agg)
+                || whens
+                    .iter()
+                    .any(|(k, r)| contains_agg(k) || contains_agg(r))
+                || else_.as_deref().is_some_and(contains_agg)
+        }
         Expr::IsDistinctFrom { left, right, .. } => contains_agg(left) || contains_agg(right),
         Expr::Cast { expr, .. } => contains_agg(expr),
         Expr::Func { args, .. } => args.iter().any(contains_agg),
@@ -7390,6 +7487,18 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_window(x),
+        // v0.55: a window function anywhere in a CASE counts.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(contains_window)
+                || whens
+                    .iter()
+                    .any(|(k, r)| contains_window(k) || contains_window(r))
+                || else_.as_deref().is_some_and(contains_window)
+        }
         Expr::IsDistinctFrom { left, right, .. } => contains_window(left) || contains_window(right),
         Expr::Cast { expr, .. } => contains_window(expr),
         Expr::Func { args, .. } => args.iter().any(contains_window),
@@ -7637,6 +7746,25 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_window_expr(x, in_agg),
+        // v0.55: windows may appear in any CASE arm (a CASE is not a
+        // window boundary); nesting rules propagate unchanged.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                validate_window_expr(o, in_agg)?;
+            }
+            for (k, r) in whens {
+                validate_window_expr(k, in_agg)?;
+                validate_window_expr(r, in_agg)?;
+            }
+            if let Some(e) = else_ {
+                validate_window_expr(e, in_agg)?;
+            }
+            Ok(())
+        }
         Expr::IsDistinctFrom { left, right, .. } => {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)
@@ -8813,6 +8941,23 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         Expr::Not(x) => collect_column_refs(x, out),
         Expr::BitNot(x) => collect_column_refs(x, out),
         Expr::Neg(x) => collect_column_refs(x, out),
+        // v0.55: column references in every CASE arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_column_refs(o, out);
+            }
+            for (k, r) in whens {
+                collect_column_refs(k, out);
+                collect_column_refs(r, out);
+            }
+            if let Some(e) = else_ {
+                collect_column_refs(e, out);
+            }
+        }
         Expr::IsNull { expr: x, .. } => collect_column_refs(x, out),
         Expr::IsDistinctFrom { left, right, .. } => {
             collect_column_refs(left, out);
@@ -11183,6 +11328,19 @@ fn eval_grouped(
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             eval_neg_val(&v)
         }
+        // v0.55: CASE in the grouped path (e.g. aggregates inside arms).
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let mut schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+            schemas.push(gscope.schema);
+            let ty = case_eval_type(q.eng, q.snap, q.own, q.session, &schemas, whens, else_)?;
+            eval_case(operand, whens, else_, ty, |e| {
+                eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, e)
+            })
+        }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
@@ -12018,6 +12176,17 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let v = eval_expr(q, scopes, x)?;
             eval_neg_val(&v)
         }
+        // v0.55: CASE (PG19). Arms short-circuit; the taken result is
+        // coerced to the CASE's resolved result type.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+            let ty = case_eval_type(q.eng, q.snap, q.own, q.session, &schemas, whens, else_)?;
+            eval_case(operand, whens, else_, ty, |e| eval_expr(q, scopes, e))
+        }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_expr(q, scopes, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
@@ -12424,6 +12593,82 @@ fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
             CmpOp::Gt => ord == Ordering::Greater,
             CmpOp::Ge => ord != Ordering::Less,
         })),
+    }
+}
+
+/// v0.55: shared CASE evaluation (PG19 semantics). `ev` evaluates one
+/// sub-expression in the caller's scope; `result_ty` is the CASE's
+/// statically resolved result type (None = unknown at eval time), to
+/// which the taken arm is coerced.
+///
+/// * The simple-CASE operand is evaluated exactly once.
+/// * Arms short-circuit: neither the conditions/results of later arms
+///   nor the untaken arms' errors are evaluated (`CASE WHEN 1=0 THEN
+///   1/0 ...` does not raise).
+/// * Simple-CASE uses regular `=` semantics: NULL never matches a WHEN
+///   key (it is not `IS NOT DISTINCT FROM`).
+/// * A searched-CASE WHEN must be boolean-or-NULL (NULL counts as not
+///   true); anything else is 42804, like WHERE.
+fn eval_case<E>(
+    operand: &Option<Box<Expr>>,
+    whens: &[(Box<Expr>, Box<Expr>)],
+    else_: &Option<Box<Expr>>,
+    result_ty: Option<ColType>,
+    mut ev: E,
+) -> Result<Value, ExecError>
+where
+    E: FnMut(&Expr) -> Result<Value, ExecError>,
+{
+    let op_val = match operand {
+        Some(o) => Some(ev(o)?),
+        None => None,
+    };
+    for (cond, result) in whens {
+        let take = match &op_val {
+            Some(ov) => {
+                let kv = ev(cond)?;
+                matches!(eval_cmp_vals(CmpOp::Eq, ov, &kv)?, Value::Bool(true))
+            }
+            None => check_bool(ev(cond)?, "WHEN")?,
+        };
+        if take {
+            let v = ev(result)?;
+            return match &result_ty {
+                Some(t) => coerce_value(v, t, "CASE"),
+                None => Ok(v),
+            };
+        }
+    }
+    let v = match else_ {
+        Some(e) => ev(e)?,
+        None => Value::Null,
+    };
+    match &result_ty {
+        Some(t) => coerce_value(v, t, "CASE"),
+        None => Ok(v),
+    }
+}
+
+/// v0.55: eval-time CASE result type. Best-effort: CTE references inside
+/// arms cannot be resolved here (the evaluator holds materialized CTE
+/// bindings, not `CteDef`s), so 42P01 falls back to `None` — no
+/// coercion, which is safe because the plan-time `expr_type` check
+/// (with real CTEs) already validated the arms and fixed the output
+/// column type. Any other error propagates.
+#[allow(clippy::too_many_arguments)]
+fn case_eval_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schemas: &[&[QCol]],
+    whens: &[(Box<Expr>, Box<Expr>)],
+    else_: &Option<Box<Expr>>,
+) -> Result<Option<ColType>, ExecError> {
+    match case_result_type(eng, snap, own, session, schemas, &[], whens, else_) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.code == "42P01" => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -20501,6 +20746,8 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         }
         // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
         Expr::Func { name, .. } => (name.clone(), 2),
+        // v0.55: PG names an unaliased CASE output column "case".
+        Expr::Case { .. } => ("case".to_string(), 2),
         _ => ("?column?".to_string(), 0),
     }
 }
@@ -20580,6 +20827,38 @@ fn expr_type(
                     format!("operator does not exist: - {}", t.sql_name()),
                 )),
             }
+        }
+        // v0.55: PG19 CASE result type = common type of all result
+        // arms (+ ELSE). For simple CASE, the operand and WHEN keys
+        // must additionally share a comparable type (unknown/NULL
+        // literals don't constrain, like PG's unknown-type coercion).
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(op) = operand {
+                let mut cmp_acc: Option<ColType> = None;
+                let mut keys: Vec<&Expr> = Vec::with_capacity(whens.len() + 1);
+                keys.push(op);
+                for (k, _) in whens.iter() {
+                    keys.push(k);
+                }
+                for k in keys {
+                    if matches!(
+                        k,
+                        Expr::Literal(Literal::Null) | Expr::Literal(Literal::Text(_))
+                    ) {
+                        continue;
+                    }
+                    let t = expr_type(eng, snap, own, session, schemas, ctes, k)?;
+                    cmp_acc = Some(match cmp_acc {
+                        Some(a) => common_supertype("CASE", &a, &t)?,
+                        None => t,
+                    });
+                }
+            }
+            case_result_type(eng, snap, own, session, schemas, ctes, whens, else_)
         }
         Expr::Concat(..) => Ok(ColType::Text),
         Expr::Cmp { .. }
@@ -20701,6 +20980,33 @@ fn arith_operand_type(
         Expr::BitNot(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
         // v0.53: `-x` result type via the shared expr_type rule.
         Expr::Neg(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        // v0.55: best-effort CASE hint = common type of the result
+        // arms' hints (unknown literals skipped, conflicts ignored).
+        Expr::Case { whens, else_, .. } => {
+            let mut acc: Option<ColType> = None;
+            let mut arms: Vec<&Expr> = Vec::with_capacity(whens.len() + 1);
+            for (_, r) in whens.iter() {
+                arms.push(r);
+            }
+            if let Some(e) = else_.as_deref() {
+                arms.push(e);
+            }
+            for a in arms {
+                if matches!(
+                    a,
+                    Expr::Literal(Literal::Null) | Expr::Literal(Literal::Text(_))
+                ) {
+                    continue;
+                }
+                if let Some(t) = hint_type(eng, snap, own, session, schemas, a) {
+                    acc = Some(match acc {
+                        Some(prev) => common_supertype("CASE", &prev, &t).unwrap_or(prev),
+                        None => t,
+                    });
+                }
+            }
+            Ok(acc)
+        }
         // Boolean / predicate expressions can't be arithmetic operands.
         _ => Err(exec_err(
             "42883",
@@ -21068,6 +21374,55 @@ fn infer_expr(
                 pin_param(out, p, ColType::Int)?;
             }
             infer_expr(x, eng, snap, own, session, schemas, out)
+        }
+        // v0.55: recurse into every CASE arm; pin `$N` WHEN keys to
+        // the simple-CASE operand's type and `$N` results to a sibling
+        // result arm's type.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                infer_expr(o, eng, snap, own, session, schemas, out)?;
+            }
+            for (k, r) in whens {
+                infer_expr(k, eng, snap, own, session, schemas, out)?;
+                infer_expr(r, eng, snap, own, session, schemas, out)?;
+            }
+            if let Some(e) = else_ {
+                infer_expr(e, eng, snap, own, session, schemas, out)?;
+            }
+            if let Some(o) = operand {
+                if let Some(t) = hint_type(eng, snap, own, session, schemas, o) {
+                    for (k, _) in whens {
+                        if let Expr::Param(p) = **k {
+                            pin_param(out, p, t.clone())?;
+                        }
+                    }
+                }
+            }
+            let mut results: Vec<&Expr> = Vec::with_capacity(whens.len() + 1);
+            for (_, r) in whens.iter() {
+                results.push(r);
+            }
+            if let Some(e) = else_.as_deref() {
+                results.push(e);
+            }
+            for r in &results {
+                if let Expr::Param(p) = **r {
+                    for s in &results {
+                        if std::ptr::eq(*r, *s) {
+                            continue;
+                        }
+                        if let Some(t) = hint_type(eng, snap, own, session, schemas, s) {
+                            pin_param(out, p, t)?;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
         Expr::IsDistinctFrom { left, right, .. } => {
             infer_expr(left, eng, snap, own, session, schemas, out)?;
@@ -22919,6 +23274,156 @@ mod tests {
         assert_eq!(err_code(&mut eng, "SELECT - (-2147483648::int)"), "22003");
         // Unknown-literal path preserved: fails at evaluation like PG.
         assert_eq!(err_code(&mut eng, "SELECT -'2026-01-01'"), "22P02");
+    }
+
+    // v0.55: CASE (simple and searched), PG19 semantics.
+    #[test]
+    fn v55_case_basics() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        let err_code =
+            |eng: &mut Engine, sql: &str| -> &'static str { run(eng, sql).unwrap_err().code };
+        // Searched form.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE WHEN 1=0 THEN 'no' WHEN 1=1 THEN 'yes' ELSE '?' END"
+            ),
+            "yes"
+        );
+        assert_eq!(one(&mut eng, "SELECT CASE WHEN false THEN 1 END"), "NULL");
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE WHEN true THEN 1 WHEN true THEN 2 ELSE 3 END"
+            ),
+            "1"
+        );
+        // NULL WHEN is not true; non-boolean WHEN is 42804.
+        assert_eq!(
+            one(&mut eng, "SELECT CASE WHEN NULL THEN 1 ELSE 2 END"),
+            "2"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT CASE WHEN 1 THEN 2 END"), "42804");
+        assert_eq!(
+            err_code(&mut eng, "SELECT CASE WHEN 'x' THEN 2 END"),
+            "42804"
+        );
+        // Simple form: operand evaluated once, `=` semantics (NULL never matches).
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE 'a' WHEN 'a' THEN 1 WHEN 'b' THEN 2 ELSE 3 END"
+            ),
+            "1"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END"
+            ),
+            "two"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT CASE NULL WHEN NULL THEN 1 ELSE 2 END"),
+            "2"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT CASE 1 WHEN NULL THEN 'n' ELSE 'o' END"),
+            "o"
+        );
+        // Unknown literal keys coerce to the operand type, like PG.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE 1 WHEN '1' THEN 'one' ELSE 'other' END"
+            ),
+            "one"
+        );
+        // Short-circuit: untaken arms' errors never fire.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE WHEN 1=0 THEN 1/0 WHEN 1=1 THEN 1 ELSE 2/0 END"
+            ),
+            "1"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE 1 WHEN 0 THEN 1/0 WHEN 1 THEN 1 ELSE 2/0 END"
+            ),
+            "1"
+        );
+        // Result type unification; taken arm coerced to it (type oids
+        // asserted in protocol_test56).
+        assert_eq!(
+            one(&mut eng, "SELECT CASE WHEN false THEN 1 ELSE 2.5 END"),
+            "2.5"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT CASE WHEN true THEN 1 ELSE 2.5 END"),
+            "1"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT CASE WHEN true THEN 1 ELSE now() END"),
+            "42804"
+        );
+        // Nested CASE.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE WHEN true THEN CASE WHEN false THEN 1 ELSE 2 END ELSE 3 END"
+            ),
+            "2"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT CASE CASE WHEN true THEN 1 ELSE 2 END WHEN 1 THEN 'one' ELSE 'other' END"
+            ),
+            "one"
+        );
+    }
+
+    // v0.55: CASE over table rows, in UPDATE, and with aggregates.
+    #[test]
+    fn v55_case_rows() {
+        let mut eng = engine();
+        // users(id int, name text): (1,'ann'), (2,'bob'), (3,'cid')
+        let out = rows_of(run(&mut eng, "SELECT id, CASE WHEN id = 1 THEN 'one' WHEN id = 2 THEN 'two' ELSE 'other' END FROM users ORDER BY id").unwrap());
+        assert_eq!(
+            out,
+            vec![vec!["1", "one"], vec!["2", "two"], vec!["3", "other"]]
+        );
+        // CASE in UPDATE (pg_regress case.sql pattern).
+        run(
+            &mut eng,
+            "UPDATE users SET id = CASE WHEN id >= 3 THEN (-id) ELSE (2 * id) END",
+        )
+        .unwrap();
+        let out = rows_of(run(&mut eng, "SELECT id FROM users ORDER BY id").unwrap());
+        assert_eq!(out, vec![vec!["-3"], vec!["2"], vec!["4"]]);
+        // Aggregate inside CASE takes the grouped path.
+        let out = rows_of(
+            run(
+                &mut eng,
+                "SELECT CASE WHEN count(*) > 2 THEN 'many' ELSE 'few' END FROM users",
+            )
+            .unwrap(),
+        );
+        assert_eq!(out, vec![vec!["many"]]);
+        // CASE in WHERE (ids are now 2, 4, -3 after the UPDATE above).
+        let out = rows_of(
+            run(
+                &mut eng,
+                "SELECT id FROM users WHERE CASE WHEN id > 1 THEN true ELSE false END ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(out, vec![vec!["2"], vec!["4"]]);
     }
 
     // v0.16: cursor_window positioning semantics (Postgres rules).
@@ -26057,6 +26562,23 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::Not(a) => rename_col_in_expr(a, old, new),
         Expr::BitNot(a) => rename_col_in_expr(a, old, new),
         Expr::Neg(a) => rename_col_in_expr(a, old, new),
+        // v0.55: rename inside every CASE arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                rename_col_in_expr(o, old, new);
+            }
+            for (k, r) in whens {
+                rename_col_in_expr(k, old, new);
+                rename_col_in_expr(r, old, new);
+            }
+            if let Some(e) = else_ {
+                rename_col_in_expr(e, old, new);
+            }
+        }
         Expr::Like { expr, pattern, .. } => {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(pattern, old, new);

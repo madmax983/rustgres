@@ -1016,6 +1016,15 @@ pub enum Expr {
     /// Type-preserving: `-smallint` stays smallint, unlike the old
     /// `0 - x` desugar which widened through integer.
     Neg(Box<Expr>),
+    /// v0.55: `CASE [operand] WHEN k THEN r ... [ELSE e] END` (PG19
+    /// gram.y: `CASE case_arg when_clause_list case_default END_P`).
+    /// `operand` is `None` for the searched form. Each `whens` entry is
+    /// `(condition-or-key, result)`.
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Box<Expr>, Box<Expr>)>,
+        else_: Option<Box<Expr>>,
+    },
     IsNull {
         expr: Box<Expr>,
         neg: bool,
@@ -1787,6 +1796,23 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Not(a) => collect_col_refs(a, out),
         Expr::BitNot(a) => collect_col_refs(a, out),
         Expr::Neg(a) => collect_col_refs(a, out),
+        // v0.55: CASE — collect from every arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_col_refs(o, out);
+            }
+            for (k, r) in whens {
+                collect_col_refs(k, out);
+                collect_col_refs(r, out);
+            }
+            if let Some(e) = else_ {
+                collect_col_refs(e, out);
+            }
+        }
         Expr::Like { expr, pattern, .. } => {
             collect_col_refs(expr, out);
             collect_col_refs(pattern, out);
@@ -2449,6 +2475,21 @@ fn max_param_expr(e: &Expr) -> usize {
         | Expr::BitNot(expr)
         | Expr::Neg(expr)
         | Expr::IsNull { expr, .. } => max_param_expr(expr),
+        // v0.55: CASE — max over every arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let mut m = operand.as_deref().map(max_param_expr).unwrap_or(0);
+            for (k, r) in whens {
+                m = m.max(max_param_expr(k)).max(max_param_expr(r));
+            }
+            if let Some(e) = else_ {
+                m = m.max(max_param_expr(e));
+            }
+            m
+        }
         Expr::IsBool { expr, .. } => max_param_expr(expr),
         Expr::IsDistinctFrom { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Func { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
@@ -5019,6 +5060,46 @@ impl Parser {
         }
     }
 
+    /// v0.55: `CASE [operand] WHEN w THEN r ... [ELSE e] END` (PG19
+    /// gram.y: `CASE case_arg when_clause_list case_default END_P`).
+    /// The WHEN/THEN/ELSE arms are `a_expr`s. `CASE WHEN ...` (no
+    /// operand) is the searched form; otherwise the simple form. Like
+    /// PG, an empty WHEN list or a missing END is a syntax error.
+    fn parse_case(&mut self) -> Result<Expr, SqlError> {
+        // Searched CASE when WHEN follows immediately; otherwise parse
+        // the simple-CASE operand. The operand is an a_expr, so it
+        // cannot swallow the WHEN keyword.
+        let operand = if self.eat_keyword("when") {
+            None
+        } else {
+            let op = self.parse_or()?;
+            self.expect_keyword("when")?;
+            Some(Box::new(op))
+        };
+        let mut whens = Vec::new();
+        loop {
+            // First iteration: WHEN was already consumed above.
+            let cond = self.parse_or()?;
+            self.expect_keyword("then")?;
+            let result = self.parse_or()?;
+            whens.push((Box::new(cond), Box::new(result)));
+            if !self.eat_keyword("when") {
+                break;
+            }
+        }
+        let else_ = if self.eat_keyword("else") {
+            Some(Box::new(self.parse_or()?))
+        } else {
+            None
+        };
+        self.expect_keyword("end")?;
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_,
+        })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, SqlError> {
         match self.peek() {
             Token::LParen => {
@@ -5104,6 +5185,13 @@ impl Parser {
                         sub: Box::new(sub),
                         neg: false,
                     });
+                }
+                // v0.55: `CASE [operand] WHEN ... THEN ... [ELSE ...]
+                // END`. CASE is reserved in PG19, so the keyword always
+                // starts a CASE expression (a column literally named
+                // "case" must be double-quoted).
+                if name == "case" {
+                    return self.parse_case();
                 }
                 // `CAST(x AS type)` — special form, not a function call.
                 if name == "cast" && *self.peek() == Token::LParen {
@@ -7896,6 +7984,24 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::Not(a) => validate_constraint_expr(a, what),
         Expr::BitNot(a) => validate_constraint_expr(a, what),
         Expr::Neg(a) => validate_constraint_expr(a, what),
+        // v0.55: CASE is allowed in CHECK/DEFAULT — validate arms.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                validate_constraint_expr(o, what)?;
+            }
+            for (k, r) in whens {
+                validate_constraint_expr(k, what)?;
+                validate_constraint_expr(r, what)?;
+            }
+            if let Some(e) = else_ {
+                validate_constraint_expr(e, what)?;
+            }
+            Ok(())
+        }
         Expr::Like { expr, pattern, .. } => {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(pattern, what)
@@ -8147,6 +8253,31 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         Expr::Neg(a) => {
             out.push_str("(neg ");
             encode_expr_inner(a, out);
+            out.push(')');
+        }
+        // v0.55: CASE — `(case <operand|_> (when <k> <r>)... <else|_>)`.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            out.push_str("(case ");
+            match operand {
+                Some(o) => encode_expr_inner(o, out),
+                None => out.push('_'),
+            }
+            for (k, r) in whens {
+                out.push_str(" (when ");
+                encode_expr_inner(k, out);
+                out.push(' ');
+                encode_expr_inner(r, out);
+                out.push(')');
+            }
+            out.push(' ');
+            match else_ {
+                Some(e) => encode_expr_inner(e, out),
+                None => out.push('_'),
+            }
             out.push(')');
         }
         Expr::IsNull { expr, neg } => {
