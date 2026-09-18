@@ -12295,9 +12295,21 @@ fn coerce_regclass_cmp(
     fn is_int(v: &Value) -> bool {
         matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
     }
-    let l_rc = expr_is_regclass(scopes, left);
-    let r_rc = expr_is_regclass(scopes, right);
-    match (l_rc, r_rc, is_int(&va), is_int(&vb)) {
+    let a_int = is_int(&va);
+    let b_int = is_int(&vb);
+    // A regclass-typed expression only ever evaluates to `Value::Text`:
+    // `eval_regclass_cast` (the only producer of a regclass value) always
+    // returns `Value::text(..)` (see its doc comment), and column
+    // assignment into a regclass target goes through the same Text-only
+    // path. So an int-valued operand can never itself be regclass-typed,
+    // and `expr_is_regclass`'s scope/schema walk is skippable for that
+    // side — this is the common case (`eval_expr`'s comparisons are
+    // overwhelmingly int-vs-int: join keys, id filters), where both
+    // lookups below are now skipped entirely instead of running on every
+    // single comparison.
+    let l_rc = !a_int && expr_is_regclass(scopes, left);
+    let r_rc = !b_int && expr_is_regclass(scopes, right);
+    match (l_rc, r_rc, a_int, b_int) {
         (true, _, _, true) => {
             let oid = regclass_value_oid(q, &va)?;
             Ok((Value::Int(oid as i64), vb))

@@ -2,6 +2,211 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `coerce_regclass_cmp` runs `expr_is_regclass` on every comparison — fix — 2026-09-18
+
+Fixes the target identified in the baseline entry immediately below this
+one. `coerce_regclass_cmp` (`src/exec.rs`) unconditionally called
+`expr_is_regclass(scopes, left)` and `expr_is_regclass(scopes, right)` —
+each a scope/schema walk — on every single comparison `eval_expr`
+evaluates, to check whether either side is statically `regclass`-typed.
+The fix skips a side's check when that side's already-evaluated `Value`
+is an int variant:
+
+```rust
+let a_int = is_int(&va);
+let b_int = is_int(&vb);
+// A regclass-typed expression only ever evaluates to `Value::Text` ...
+let l_rc = !a_int && expr_is_regclass(scopes, left);
+let r_rc = !b_int && expr_is_regclass(scopes, right);
+match (l_rc, r_rc, a_int, b_int) {
+    // ... arms unchanged ...
+}
+```
+
+**Why this is exact, not approximate**: `eval_regclass_cast` — the only
+producer of a regclass value anywhere in this codebase — always returns
+`Value::text(regclass_display(..))` (its own doc comment: "A regclass
+value is represented by its display text"), and assignment into a
+`REGCLASS`-typed column goes through the same Text-only path
+(`coerce_int_lit`'s catch-all routes through `coerce_value`, which has no
+widening arm targeting `ColType::Regclass` and no `Value::Text`/`BpChar`
+source, so it rejects an int literal assigned to a regclass column
+outright — confirmed by reading, not assumed). So a regclass-typed
+expression can never evaluate to an int-variant `Value`; contrapositively,
+`is_int(&va)` being true already *proves* `expr_is_regclass(scopes,
+left)` would return `false`, without calling it. `l_rc = !a_int &&
+expr_is_regclass(scopes, left)` therefore computes the exact same boolean
+as the original unconditional `expr_is_regclass(scopes, left)` in every
+case — Rust's `&&` short-circuits, so the call is skipped, not just its
+result discarded. Same argument for `r_rc`/`b_int`. The `match` arms
+below are untouched. `eval_expr`'s comparisons are overwhelmingly
+int-vs-int (join keys, id filters, this workload's `u.id = o.uid` and
+`u.id < 20`), so both scope walks are now skipped entirely in the common
+case instead of running unconditionally on every comparison.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_join.py --count 100`
+— the same 20x2000 join+filter+GROUP BY workload from the baseline entry
+below, same machine, this session; two runs each side to confirm
+determinism — before-runs agree to within 0.000023%, after-runs to
+within 0.000034%):
+
+| | Ir |
+|---|---|
+| before (HEAD, baseline entry below) | 9,478,577,165 |
+| after, run 1 | 7,869,296,835 |
+| after, run 2 | 7,869,299,524 |
+| after (average) | 7,869,298,179.5 |
+
+**Delta: -16.98%** — far above the ≥5%-of-profile impact floor (the
+target was measured at 10.10% of this profile in the baseline entry
+below). The win exceeds even that share because eliminating the two
+`expr_is_regclass` calls also removes the small helper functions they
+drove (`resolve_col`'s `Option::and_then`/`map` chain, `Scope`/schema
+array lookups) and their call/return overhead, none of which show up
+as `coerce_regclass_cmp`'s or `expr_is_regclass`'s own self-cost line in
+the profile individually — `expr_is_regclass` and its `resolve_col`
+closure (a combined 5.56% of the baseline profile) no longer appear at
+all in the after-profile's top-cost listing. Every other hot function's
+self-cost (`eval_expr`, `eval_cmp_vals`, `build_source`, `cmp_ordering`,
+`coerce_text_numeric`, `<Value as Clone>::clone`, ...) is bit-for-bit
+unchanged between before and after, confirming the change is isolated to
+the intended call sites.
+
+**Behavior**: unchanged. `cargo test --all-features` — 168 passed, 0
+failed, identical to the pre-change tree (confirmed via `git stash`).
+`cargo fmt --all -- --check` is clean. `cargo clippy --all-targets
+--all-features -- -D warnings` fails to compile with the same 280
+pre-existing errors (an unrelated toolchain/lint-version mismatch —
+`collapsible_if` in `main.rs`, `useless_vec` in `toast.rs`, etc.) on both
+the pre-change and post-change tree (confirmed via `git stash`); no new
+clippy findings. `tests/protocol_test37-41.py` (the regclass-specific
+protocol suites) all pass unchanged: 60/27/25/17/31 passed, 0 failed.
+`tests/conformance/regress_runner.py --tests join,insert,strings`
+(PostgreSQL regression-suite subset, semantic comparison) scores
+identically before and after: `join` EXPECTED-FAIL=479 PASS=440
+REAL-FAIL=55, `insert` EXPECTED-FAIL=297 PASS=50 REAL-FAIL=39 SKIP=14,
+`strings` EXPECTED-FAIL=12 PASS=565 SKIP=3 — same REAL-FAIL set on both
+trees (confirmed via `git stash`), none involving comparisons or
+regclass. The full `tests/protocol_test*.py` sweep surfaces two
+pre-existing, unrelated failures — `protocol_test7`'s and
+`protocol_test25`'s int2-arithmetic-overflow-promotion gap
+(`30000::smallint + 30000::smallint` raising `22003` instead of
+promoting) — reproduced identically on the pre-change tree via `git
+stash`; this is a v0.50 arithmetic-overflow-detection gap, unrelated to
+comparisons or regclass, and this change touches neither `eval_arith` nor
+any overflow-detection code.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
+## Bolt: `coerce_regclass_cmp` runs `expr_is_regclass` on every comparison — baseline — 2026-09-18
+
+**Workload**: `benches/profile_join.py` (existing, from the equi-join/
+`coerce_text_numeric` Bolt rounds), default scaled-down shape — an exact
+**100** iterations of
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+(`--users 200 --orders 2000 --filter 20`, the script's own defaults —
+chosen so a callgrind run finishes in a reasonable time; the full
+`--users 2000 --orders 20000 --filter 200` shape used by earlier rounds
+in this file did not finish a 5-iteration callgrind run within 600s on
+this session's machine, so this round uses the smaller, still-realistic
+shape) over the real wire protocol. Every equi-join comparison
+(`u.id = o.uid`) and WHERE filter comparison (`u.id < 20`) in the whole
+workload runs through `Expr::Cmp` in `exec::eval_expr`, so this exercises
+`coerce_regclass_cmp` for real, not against a synthetic slice of it alone.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | head -40
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged): 9,478,577,165
+total instructions over the 100-iteration run. Top `rustgres::exec`
+self-costs:
+
+| function | Ir | % of total |
+|---|---|---|
+| `eval_expr` (both monomorphizations) | 1,557,160,000 | 16.43% |
+| `eval_cmp_vals` | 507,560,000 | 5.35% |
+| `build_source` | 488,576,500 | 5.15% |
+| `coerce_regclass_cmp` | 430,360,000 | **4.54%** |
+| `expr_is_regclass` | 380,980,000 | **4.02%** |
+| `cmp_ordering` | 292,320,000 | 3.08% |
+| `expr_is_regclass::{{closure}}` (its `resolve_col`/scope-walk closure) | 146,100,000 | **1.54%** |
+| `coerce_text_numeric` | 138,040,000 | 1.46% |
+
+**Target**: `exec::coerce_regclass_cmp` (`src/exec.rs`), called from
+`eval_expr`'s `Expr::Cmp` arm (and `eval_grouped`'s) on **every single
+comparison in the entire query** — the join's `ON` condition and the
+`WHERE u.id < 20` filter alike — to check whether either side is
+statically typed `regclass` (PG's binary-coercible regclass/oid
+comparison). It does this by calling `expr_is_regclass(scopes, left)` and
+`expr_is_regclass(scopes, right)` unconditionally, each of which walks the
+scope chain and looks up the referenced column's declared type. regclass
+is an exceedingly rare type in real workloads (a `::regclass` cast or a
+`REGCLASS`-typed column) — this workload's `bench_u`/`bench_o` tables are
+plain `INT`/`TEXT` — yet the check runs on every comparison regardless.
+Combined self-cost of `coerce_regclass_cmp` + `expr_is_regclass` +
+`expr_is_regclass::{{closure}}` is **10.10%** of this profile, on top of
+`eval_expr` (16.43%) whose self-cost includes driving these calls; far
+above the 5%-of-profile relevance bar.
+
+**Mechanism**: `expr_is_regclass` requires a scope/schema walk
+(`resolve_col` for `Expr::Column`, or an `Option::and_then`/`map` chain
+for the already-resolved `Expr::ResolvedCol`) to answer a question that,
+for the overwhelmingly common case of an int-vs-int comparison (join
+keys, id filters), is answerable for free from information already in
+hand: `eval_regclass_cast` — the only producer of a regclass value in
+this codebase — always returns `Value::text(regclass_display(..))` (see
+its doc comment at `src/exec.rs:14012`), and assigning a value into a
+`REGCLASS`-typed column goes through the same Text-only path
+(`coerce_int_lit`/`coerce_value` reject an int literal assigned to a
+regclass column outright). So a regclass-typed expression can never
+evaluate to an int-variant `Value`, which means an **int-valued operand's
+expression can never itself be regclass-typed** — `is_int(&va)` being
+true already proves `expr_is_regclass(scopes, left)` is `false`, without
+needing to call it. `eval_expr`'s comparisons are overwhelmingly
+int-vs-int, so this fast fact skips the scope walk entirely in the common
+case.
+
+**Baseline numbers** (this commit, `coerce_regclass_cmp` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind total instructions (`Ir`), 100-iteration 20x2000 join+filter+GROUP BY | 9,478,577,165 |
+| `coerce_regclass_cmp` self `Ir` | 430,360,000 (4.54%) |
+| `expr_is_regclass` self `Ir` | 380,980,000 (4.02%) |
+| `expr_is_regclass::{{closure}}` self `Ir` | 146,100,000 (1.54%) |
+| combined | 957,440,000 (10.10%) |
+
+Fix follows in the next commit.
+
 ## Bolt: `IndexKey::cmp` builds a Zip iterator for single-column keys — fix — 2026-09-17
 
 Fixes the target identified in the baseline entry immediately below this
