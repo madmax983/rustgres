@@ -2761,6 +2761,12 @@ impl Parser {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
             "select" => Ok(Stmt::Select(self.parse_select_query()?)),
+            // v0.54: PG19 `simple_select: values_clause | TABLE relation_expr`
+            // — VALUES and TABLE are full top-level queries, not just
+            // FROM items. Both desugar to the SELECT the executor
+            // already handles, then flow through set-ops and the tail.
+            "values" => Ok(Stmt::Select(self.parse_values_query()?)),
+            "table" => Ok(Stmt::Select(self.parse_table_query()?)),
             "drop" => self.parse_drop(),
             // --- v0.11: GRANT / REVOKE
             "grant" => self.parse_grant(),
@@ -4663,12 +4669,33 @@ impl Parser {
                     neg,
                 });
             }
-            let mut items = vec![self.parse_or()?];
-            while *self.peek() == Token::Comma {
+            let mut items = if matches!(self.peek(), Token::Ident(s) if s == "values") {
+                // v0.54: `IN (VALUES (v1), (v2), ...)` — a VALUES list
+                // desugars exactly like a value list. Each row must hold
+                // one column (like PG's "subquery has too many columns").
                 self.next();
-                items.push(self.parse_or()?);
-            }
-            self.expect(Token::RParen, "')'")?;
+                let rows = self.parse_values_rows()?;
+                let mut items = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if row.len() != 1 {
+                        return Err(err(format!(
+                            "syntax error: IN (VALUES ...) row has {} columns, expected 1",
+                            row.len()
+                        )));
+                    }
+                    items.push(row.into_iter().next().unwrap());
+                }
+                self.expect(Token::RParen, "')'")?;
+                items
+            } else {
+                let mut items = vec![self.parse_or()?];
+                while *self.peek() == Token::Comma {
+                    self.next();
+                    items.push(self.parse_or()?);
+                }
+                self.expect(Token::RParen, "')'")?;
+                items
+            };
             let mut expr = Expr::Cmp {
                 op: CmpOp::Eq,
                 left: Box::new(left.clone()),
@@ -5010,11 +5037,28 @@ impl Parser {
                         // have been disabled by an enclosing SUBSTRING).
                         let save_similar = self.allow_similar_to;
                         self.allow_similar_to = true;
-                        let e = self.parse_or();
+                        let first = self.parse_or();
                         self.allow_similar_to = save_similar;
-                        let e = e?;
+                        let first = first?;
+                        if *self.peek() == Token::Comma {
+                            // v0.54: row constructor `(e1, e2, ...)`. The
+                            // only supported use is row-wise
+                            // `[NOT] IN (VALUES ...)`, desugared here;
+                            // anything else is a syntax error.
+                            let mut items = vec![first];
+                            while *self.peek() == Token::Comma {
+                                self.next();
+                                let save = self.allow_similar_to;
+                                self.allow_similar_to = true;
+                                let e = self.parse_or();
+                                self.allow_similar_to = save;
+                                items.push(e?);
+                            }
+                            self.expect(Token::RParen, "')'")?;
+                            return self.parse_row_in(items);
+                        }
                         self.expect(Token::RParen, "')'")?;
-                        Ok(e)
+                        Ok(first)
                     }
                 }
             }
@@ -5167,6 +5211,67 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    /// v0.54: the tail of a row constructor `(e1, ..., en)` parsed by
+    /// `parse_primary`: expect `[NOT] IN (VALUES ...)` and desugar to
+    /// `(e1=r11 AND ... AND en=r1n) OR (e1=r21 AND ...) ...`
+    /// (`NOT (...)` for `NOT IN`). The AND/OR desugar preserves PG's
+    /// three-valued row-comparison logic. Any other use of a row
+    /// constructor — including row-wise `IN (subquery)` — is a syntax
+    /// error here.
+    fn parse_row_in(&mut self, items: Vec<Expr>) -> Result<Expr, SqlError> {
+        let neg = if self.eat_keyword("not") {
+            self.expect_keyword("in")?;
+            true
+        } else {
+            self.expect_keyword("in")?;
+            false
+        };
+        self.expect(Token::LParen, "'('")?;
+        if !matches!(self.peek(), Token::Ident(s) if s == "values") {
+            return Err(err(
+                "syntax error: row-wise IN with a subquery is not supported".to_string(),
+            ));
+        }
+        self.next();
+        let rows = self.parse_values_rows()?;
+        self.expect(Token::RParen, "')'")?;
+        let n = items.len();
+        let mut expr: Option<Expr> = None;
+        for row in rows {
+            if row.len() != n {
+                return Err(err(format!(
+                    "syntax error: IN (VALUES ...) row has {} columns, expected {}",
+                    row.len(),
+                    n
+                )));
+            }
+            let mut conj: Option<Expr> = None;
+            for (item, val) in items.iter().zip(row.iter()) {
+                let term = Expr::Cmp {
+                    op: CmpOp::Eq,
+                    left: Box::new(item.clone()),
+                    right: Box::new(val.clone()),
+                };
+                conj = Some(match conj {
+                    None => term,
+                    Some(c) => Expr::And(Box::new(c), Box::new(term)),
+                });
+            }
+            // parse_values_rows guarantees at least one row.
+            let disjunct = conj.unwrap();
+            expr = Some(match expr {
+                None => disjunct,
+                Some(e) => Expr::Or(Box::new(e), Box::new(disjunct)),
+            });
+        }
+        // parse_values_rows guarantees at least one row.
+        let mut expr = expr.unwrap();
+        if neg {
+            expr = Expr::Not(Box::new(expr));
+        }
+        Ok(expr)
     }
 
     /// `count(*)`, `count(e)`, `sum(e)`, `avg(e)`, `min(e)`, `max(e)`.
@@ -5342,32 +5447,7 @@ impl Parser {
         if self.eat_keyword("order") {
             self.expect_keyword("by")?;
             loop {
-                let expr = self.parse_or()?;
-                let desc = if self.eat_keyword("desc") {
-                    true
-                } else {
-                    self.eat_keyword("asc");
-                    false
-                };
-                let nulls_first = if self.eat_keyword("nulls") {
-                    if self.eat_keyword("first") {
-                        Some(true)
-                    } else if self.eat_keyword("last") {
-                        Some(false)
-                    } else {
-                        return Err(err(format!(
-                            "syntax error: expected FIRST or LAST after NULLS, found {:?}",
-                            self.peek()
-                        )));
-                    }
-                } else {
-                    None
-                };
-                order_by.push(OrderTerm {
-                    expr,
-                    desc,
-                    nulls_first,
-                });
+                order_by.push(self.parse_order_term()?);
                 if *self.peek() == Token::Comma {
                     self.next();
                     continue;
@@ -6204,39 +6284,62 @@ impl Parser {
     /// SELECT. Split out of `parse_select_rest` so set-operation branches
     /// can be parsed without consuming the outer query's tail (Postgres
     /// forbids `ORDER BY` before a set-op outside parentheses).
+    /// v0.54: one `ORDER BY` sort term: `expr [ASC | DESC | USING op]
+    /// [NULLS FIRST | NULLS LAST]`. PG19's gram.y `sortby` is
+    /// `a_expr USING qual_all_Op | a_expr ASC | a_expr DESC | a_expr`,
+    /// so `USING` is exclusive with ASC/DESC (the sort operator alone
+    /// determines the direction), but `NULLS FIRST | NULLS LAST` may
+    /// still follow `USING`. Only the btree `<`/`>` sort operators map
+    /// to a direction; anything else is 0A000 (not implemented), not a
+    /// syntax error.
+    fn parse_order_term(&mut self) -> Result<OrderTerm, SqlError> {
+        let expr = self.parse_or()?;
+        let desc = if self.eat_keyword("using") {
+            match self.next() {
+                Token::Lt => false,
+                Token::Gt => true,
+                other => {
+                    return Err(SqlError {
+                        message: format!("ORDER BY USING with operator {other:?} is not supported"),
+                        code: "0A000",
+                    });
+                }
+            }
+        } else if self.eat_keyword("desc") {
+            true
+        } else {
+            // ASC is the default; an explicit ASC is just consumed.
+            self.eat_keyword("asc");
+            false
+        };
+        // v0.7: explicit `NULLS FIRST` / `NULLS LAST`.
+        let nulls_first = if self.eat_keyword("nulls") {
+            if self.eat_keyword("first") {
+                Some(true)
+            } else if self.eat_keyword("last") {
+                Some(false)
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected FIRST or LAST after NULLS, found {:?}",
+                    self.peek()
+                )));
+            }
+        } else {
+            None
+        };
+        Ok(OrderTerm {
+            expr,
+            desc,
+            nulls_first,
+        })
+    }
+
     fn parse_select_tail(&mut self, sel: &mut SelectStmt) -> Result<(), SqlError> {
         let order_by = if self.eat_keyword("order") {
             self.expect_keyword("by")?;
             let mut terms = Vec::new();
             loop {
-                let expr = self.parse_or()?;
-                let desc = if self.eat_keyword("desc") {
-                    true
-                } else {
-                    // ASC is the default; an explicit ASC is just consumed.
-                    self.eat_keyword("asc");
-                    false
-                };
-                // v0.7: explicit `NULLS FIRST` / `NULLS LAST`.
-                let nulls_first = if self.eat_keyword("nulls") {
-                    if self.eat_keyword("first") {
-                        Some(true)
-                    } else if self.eat_keyword("last") {
-                        Some(false)
-                    } else {
-                        return Err(err(format!(
-                            "syntax error: expected FIRST or LAST after NULLS, found {:?}",
-                            self.peek()
-                        )));
-                    }
-                } else {
-                    None
-                };
-                terms.push(OrderTerm {
-                    expr,
-                    desc,
-                    nulls_first,
-                });
+                terms.push(self.parse_order_term()?);
                 if *self.peek() == Token::Comma {
                     self.next();
                     continue;
@@ -6342,6 +6445,14 @@ impl Parser {
             let inner = self.parse_select_query_not_consumed()?;
             self.expect(Token::RParen, "')'")?;
             Ok(inner)
+        } else if matches!(self.peek(), Token::Ident(s) if s == "values") {
+            // v0.54: `(VALUES ...)` — a parenthesized VALUES branch.
+            self.next();
+            self.parse_values_query()
+        } else if matches!(self.peek(), Token::Ident(s) if s == "table") {
+            // v0.54: `(TABLE name)` — a parenthesized TABLE branch.
+            self.next();
+            self.parse_table_query()
         } else {
             self.expect_keyword("select")?;
             self.parse_select_query()
@@ -6359,10 +6470,112 @@ impl Parser {
             let inner = self.parse_select_query_not_consumed()?;
             self.expect(Token::RParen, "')'")?;
             Ok(inner)
+        } else if matches!(self.peek(), Token::Ident(s) if s == "values") {
+            // v0.54: PG19 `simple_select: values_clause` — a VALUES list is
+            // a full set-operation branch, like SELECT.
+            self.next();
+            Ok(Self::values_branch(self.parse_values_rows()?))
+        } else if matches!(self.peek(), Token::Ident(s) if s == "table") {
+            // v0.54: PG19 `simple_select: TABLE relation_expr`.
+            self.next();
+            Ok(Self::table_branch(self.parse_table_name()?))
         } else {
             self.expect_keyword("select")?;
             self.parse_select_core()
         }
+    }
+
+    /// v0.54: desugar a standalone `VALUES` row list into the SELECT the
+    /// executor already understands: `SELECT * FROM (VALUES ...)`. Used
+    /// both for top-level `VALUES` queries and for set-op branches.
+    fn values_branch(rows: Vec<Vec<Expr>>) -> SelectStmt {
+        let mut sel = empty_select();
+        sel.items = vec![SelectItem::All];
+        sel.from = vec![FromItem::Values {
+            rows,
+            // PG auto-names the VALUES RTE; the name never surfaces.
+            alias: "_values".to_string(),
+            col_aliases: Vec::new(),
+        }];
+        sel
+    }
+
+    /// v0.54: desugar `TABLE name` into `SELECT * FROM name`.
+    fn table_branch(name: String) -> SelectStmt {
+        let mut sel = empty_select();
+        sel.items = vec![SelectItem::All];
+        sel.from = vec![FromItem::Table {
+            name,
+            alias: None,
+            col_aliases: Vec::new(),
+        }];
+        sel
+    }
+
+    /// v0.54: `relation_expr` for `TABLE name` — an optionally
+    /// schema-qualified table name, like `FROM name`.
+    fn parse_table_name(&mut self) -> Result<String, SqlError> {
+        let name = self.expect_ident()?;
+        if *self.peek() == Token::Dot {
+            self.next();
+            Ok(format!("{}.{}", name, self.expect_ident()?))
+        } else {
+            Ok(name)
+        }
+    }
+
+    /// v0.54: the `(expr, ...) [, ...]` row list of a `VALUES` clause
+    /// (the `VALUES` keyword itself already consumed). Shared by the
+    /// FROM-item parser, top-level `VALUES` queries, and set-op branches.
+    fn parse_values_rows(&mut self) -> Result<Vec<Vec<Expr>>, SqlError> {
+        let mut rows: Vec<Vec<Expr>> = Vec::new();
+        loop {
+            self.expect(Token::LParen, "'('")?;
+            let mut row = Vec::new();
+            loop {
+                row.push(self.parse_or()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in VALUES row, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            rows.push(row);
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        if rows.is_empty() {
+            return Err(err(
+                "syntax error: VALUES requires at least one row".to_string()
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// v0.54: PG19 `simple_select: values_clause` as a top-level query:
+    /// `VALUES (...) [, ...] [set-ops] [ORDER BY ...] [LIMIT ...]`.
+    fn parse_values_query(&mut self) -> Result<SelectStmt, SqlError> {
+        let rows = self.parse_values_rows()?;
+        let left = Self::values_branch(rows);
+        let carrier = self.parse_set_chain(left, 1)?;
+        self.finish_select_query(carrier)
+    }
+
+    /// v0.54: PG19 `simple_select: TABLE relation_expr` as a top-level
+    /// query: `TABLE name [set-ops] [ORDER BY ...] [LIMIT ...]`.
+    fn parse_table_query(&mut self) -> Result<SelectStmt, SqlError> {
+        let name = self.parse_table_name()?;
+        let left = Self::table_branch(name);
+        let carrier = self.parse_set_chain(left, 1)?;
+        self.finish_select_query(carrier)
     }
 
     /// v0.44: shared tail of `parse_select_query`: parse the trailing
@@ -6570,35 +6783,7 @@ impl Parser {
             }
             let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
                 self.next();
-                let mut rows: Vec<Vec<Expr>> = Vec::new();
-                loop {
-                    self.expect(Token::LParen, "'('")?;
-                    let mut row = Vec::new();
-                    loop {
-                        row.push(self.parse_or()?);
-                        match self.next() {
-                            Token::Comma => continue,
-                            Token::RParen => break,
-                            other => {
-                                return Err(err(format!(
-                                    "syntax error: expected ',' or ')' in VALUES row, found {:?}",
-                                    other
-                                )));
-                            }
-                        }
-                    }
-                    rows.push(row);
-                    if *self.peek() == Token::Comma {
-                        self.next();
-                    } else {
-                        break;
-                    }
-                }
-                if rows.is_empty() {
-                    return Err(err(
-                        "syntax error: VALUES requires at least one row".to_string()
-                    ));
-                }
+                let rows = self.parse_values_rows()?;
                 FromItem::Values {
                     rows,
                     alias: String::new(),

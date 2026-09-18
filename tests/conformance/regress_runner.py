@@ -54,29 +54,31 @@ STMT_TIMEOUT = 30.0
 # ---------------------------------------------------------------------------
 
 TESTS = [
-    # (name, need_tenk)
-    ("boolean", False),
-    ("char", False),
-    ("name", False),
-    ("text", False),
-    ("varchar", False),
-    ("int2", False),
-    ("int4", False),
-    ("int8", False),
-    ("float4", False),
-    ("float8", False),
-    ("numeric", False),
-    ("strings", False),
-    ("select", False),
-    ("select_distinct", False),
-    ("select_having", False),
-    ("case", False),
-    ("union", True),
-    ("subselect", True),
-    ("join", True),
-    ("transactions", False),
-    ("insert", False),
-    ("delete", False),
+    # (name, need_tenk, need_onek): tenk1/tenk2 for the join/subselect/union
+    # families; onek/onek2 for the select/subselect/join families (PG's
+    # test_setup.sql builds onek/onek2 as 1000-row slices of tenk1).
+    ("boolean", False, False),
+    ("char", False, False),
+    ("name", False, False),
+    ("text", False, False),
+    ("varchar", False, False),
+    ("int2", False, False),
+    ("int4", False, False),
+    ("int8", False, False),
+    ("float4", False, False),
+    ("float8", False, False),
+    ("numeric", False, False),
+    ("strings", False, False),
+    ("select", False, True),
+    ("select_distinct", False, True),
+    ("select_having", False, False),
+    ("case", False, False),
+    ("union", True, False),
+    ("subselect", True, True),
+    ("join", True, True),
+    ("transactions", False, False),
+    ("insert", False, False),
+    ("delete", False, False),
 ]
 
 # ---------------------------------------------------------------------------
@@ -645,7 +647,22 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),
     (r"\(\s*\w+(\s*,\s*\w+)+\s*\)\s*(not\s+)?in\s*\(\s*select\b",
      "row-wise IN (subquery) unsupported"),
+    # v0.54: zero-column tables (CREATE TABLE t(); INSERT ... DEFAULT
+    # VALUES) are not supported; the following LATERAL test is already
+    # masked separately.
+    (r"(?i)\bnocols\b", "zero-column tables unsupported"),
+    # v0.54: whole-row Vars (`SELECT foo FROM (...) AS foo`) need composite
+    # row values, which the executor does not model.
+    (r"(?is)^\s*select\s+(\w+)\s+from\s*\(\s*select\b.*\)\s*as\s+\1\s*;?\s*$",
+     "whole-row Vars unsupported"),
     (r"(?i)\bshipped_view\b", "depends on CREATE RULE (unsupported)"),
+    # v0.54: inheritance (`FROM person*`) is unsupported; the person tables
+    # themselves are never created (PG's test_setup.sql builds them via
+    # CREATE TABLE ... INHERITS). sillysrf is an SQL-language SRF whose
+    # CREATE FUNCTION is masked above — its SELECTs fail only because the
+    # function was never created.
+    (r"(?i)\bperson\s*\*", "table inheritance (FROM tbl*) unsupported"),
+    (r"(?i)\bsillysrf\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.44: UNION/INTERSECT/EXCEPT are supported; the old broad pattern is
     # removed. Statements using them with other unsupported constructs are
     # classified under those constructs below.
@@ -741,7 +758,43 @@ def classify_too_slow(stmt):
 # ---------------------------------------------------------------------------
 
 
-def setup_statements(need_tenk):
+TENK_DDL = ("CREATE TABLE %s (unique1 int4, unique2 int4, two int4, four int4, "
+            "ten int4, twenty int4, hundred int4, thousand int4, twothousand int4, "
+            "fivethous int4, tenthous int4, odd int4, even int4, "
+            "stringu1 name, stringu2 name, string4 name)")
+TENK_COLS = ("unique1, unique2, two, four, ten, twenty, hundred, thousand, "
+             "twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4")
+
+
+def _load_data_table(stmts, table, datafile, expect_rows):
+    """Append DDL + chunked multi-row INSERTs loading a PG regress .data file.
+
+    PG's test_setup.sql loads these with server-side COPY; the harness
+    reproduces the same rows with multi-row INSERTs.
+    """
+    stmts.append(TENK_DDL % table)
+    with open(os.path.join(DATA, datafile), encoding="utf-8") as f:
+        rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+    assert len(rows) == expect_rows, "%s row count changed: %d" % (datafile, len(rows))
+    assert all(len(r) == 16 for r in rows), "%s column count changed" % datafile
+    for i in range(0, len(rows), 500):
+        chunk = rows[i : i + 500]
+        vals = []
+        for r in chunk:
+            nums = ",".join(r[:13])
+            strs = ",".join("'" + s.replace("'", "''") + "'" for s in r[13:])
+            vals.append("(%s,%s)" % (nums, strs))
+        stmts.append("INSERT INTO %s (%s) VALUES %s" % (table, TENK_COLS, ",".join(vals)))
+    stmts.append("VACUUM " + table)
+
+
+def _tenk_setup(stmts, tables):
+    """Append tenk-family DDL + data load for the named tables."""
+    for tbl in tables:
+        _load_data_table(stmts, tbl, "tenk.data", 10000)
+
+
+def setup_statements(need_tenk, need_onek):
     stmts = [
         "CREATE TABLE CHAR_TBL(f1 char(4))",
         "INSERT INTO CHAR_TBL (f1) VALUES ('a'), ('ab'), ('abcd'), ('abcd    ')",
@@ -771,30 +824,12 @@ def setup_statements(need_tenk):
         "VACUUM VARCHAR_TBL",
     ]
     if need_tenk:
-        cols = ("unique1, unique2, two, four, ten, twenty, hundred, thousand, "
-                "twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4")
-        ddl = ("CREATE TABLE %s (unique1 int4, unique2 int4, two int4, four int4, "
-               "ten int4, twenty int4, hundred int4, thousand int4, twothousand int4, "
-               "fivethous int4, tenthous int4, odd int4, even int4, "
-               "stringu1 name, stringu2 name, string4 name)")
-        stmts.append(ddl % "tenk1")
-        stmts.append(ddl % "tenk2")
-        # load tenk.data in chunks of multi-row INSERTs
-        with open(os.path.join(DATA, "tenk.data"), encoding="utf-8") as f:
-            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
-        assert len(rows) == 10000, "tenk.data row count changed: %d" % len(rows)
-        assert all(len(r) == 16 for r in rows), "tenk.data column count changed"
-        for tbl in ("tenk1", "tenk2"):
-            for i in range(0, len(rows), 500):
-                chunk = rows[i : i + 500]
-                vals = []
-                for r in chunk:
-                    nums = ",".join(r[:13])
-                    strs = ",".join("'" + s.replace("'", "''") + "'" for s in r[13:])
-                    vals.append("(%s,%s)" % (nums, strs))
-                stmts.append("INSERT INTO %s (%s) VALUES %s" % (tbl, cols, ",".join(vals)))
-        stmts.append("VACUUM tenk1")
-        stmts.append("VACUUM tenk2")
+        _tenk_setup(stmts, ("tenk1", "tenk2"))
+    # PG's test_setup.sql loads onek from data/onek.data (a separate file,
+    # not a tenk slice) and clones it with CTAS: onek2 holds the same rows.
+    if need_onek:
+        _load_data_table(stmts, "onek", "onek.data", 1000)
+        stmts.append("CREATE TABLE onek2 AS SELECT * FROM onek")
     return stmts
 
 
@@ -1092,14 +1127,15 @@ def main():
         print("missing %s; run `cargo build` first" % BIN)
         return 2
 
-    tests = [(n, t) for n, t in TESTS if only is None or n in only]
+    tests = [(n, t, o) for n, t, o in TESTS if only is None or n in only]
     server = Server()
     server.start()
     all_results = {}
-    need_tenk_any = any(t for _, t in tests)
+    need_tenk_any = any(t for _, t, _ in tests)
+    need_onek_any = any(o for _, _, o in tests)
 
     def run_setup(c):
-        setup = setup_statements(need_tenk_any)
+        setup = setup_statements(need_tenk_any, need_onek_any)
         print("setup: %d statements ..." % len(setup), flush=True)
         t0 = time.time()
         for s in setup:
@@ -1111,7 +1147,7 @@ def main():
 
     wedged = {}  # stmt -> reason: kills the connection; skip on retry
     try:
-        for name, need_tenk in tests:
+        for name, need_tenk, need_onek in tests:
             # pg_regress runs each file in its own psql session. Use a fresh
             # server+connection per suite so one file's abandoned transaction
             # state (e.g. transactions.sql's last test) cannot poison the next
