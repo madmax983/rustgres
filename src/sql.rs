@@ -1011,6 +1011,11 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     BitNot(Box<Expr>), // v0.25: `~` bitwise NOT
+    /// v0.53: unary minus as a first-class operator (PG19 gram.y gives
+    /// `-`/`+` UMINUS precedence: tighter than `^`, looser than `::`).
+    /// Type-preserving: `-smallint` stays smallint, unlike the old
+    /// `0 - x` desugar which widened through integer.
+    Neg(Box<Expr>),
     IsNull {
         expr: Box<Expr>,
         neg: bool,
@@ -1781,6 +1786,7 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         }
         Expr::Not(a) => collect_col_refs(a, out),
         Expr::BitNot(a) => collect_col_refs(a, out),
+        Expr::Neg(a) => collect_col_refs(a, out),
         Expr::Like { expr, pattern, .. } => {
             collect_col_refs(expr, out);
             collect_col_refs(pattern, out);
@@ -2441,6 +2447,7 @@ fn max_param_expr(e: &Expr) -> usize {
         Expr::Cast { expr, .. }
         | Expr::Not(expr)
         | Expr::BitNot(expr)
+        | Expr::Neg(expr)
         | Expr::IsNull { expr, .. } => max_param_expr(expr),
         Expr::IsBool { expr, .. } => max_param_expr(expr),
         Expr::IsDistinctFrom { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
@@ -4928,29 +4935,38 @@ impl Parser {
         Ok(expr)
     }
 
-    /// unary := (`-` | `+` | `~` | `@` | `|/` | `||/`) unary | primary.
-    /// `-x` desugars to `0 - x` (so `-NULL` is NULL and `-'2026-01-01'`
-    /// fails at evaluation, like Postgres). The prefix operators desugar
-    /// to function calls, like Postgres' parser does: `@x` -> `abs(x)`,
-    /// `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`. v0.25: `~x` is bitwise NOT.
+    /// unary := (`-` | `+`) unary | genprefix | primary, where
+    /// genprefix := (`~` | `@` | `|/` | `||/`) cmp.
+    /// `-`/`+` sit at PG19's UMINUS precedence (gram.y): tighter than
+    /// `^` (so `-2^2` is `(-2)^2`) but looser than `::` (so `-5::int`
+    /// is `-(5::int)`). v0.53: `-x` is a first-class `Expr::Neg`
+    /// (PG's doNegate) — type-preserving, NULL stays NULL, and
+    /// `-'2026-01-01'` fails at evaluation, like Postgres.
+    /// The generic prefix operators are PG19's `qual_Op a_expr %prec Op`
+    /// — the loosest precedence in the grammar — so their operand is a
+    /// full comparison-level expression: `~1 + 1` is `~(1 + 1)`,
+    /// `~5::int2` is `~(5::int2)`, `@ 5 - 10` is `@(5 - 10)`. They
+    /// desugar like Postgres' parser does: `~x` -> bitwise NOT,
+    /// `@x` -> `abs(x)`, `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`.
     fn parse_unary(&mut self) -> Result<Expr, SqlError> {
         match self.peek() {
             Token::Minus => {
                 self.next();
                 let inner = self.parse_unary()?;
-                Ok(Expr::Arith {
-                    op: ArithOp::Sub,
-                    left: Box::new(Expr::Literal(Literal::Int(0))),
-                    right: Box::new(inner),
-                })
+                Ok(Expr::Neg(Box::new(inner)))
             }
             Token::Plus => {
                 self.next();
                 self.parse_unary()
             }
+            Token::Tilde => {
+                self.next();
+                let inner = self.parse_cmp()?;
+                Ok(Expr::BitNot(Box::new(inner)))
+            }
             Token::At => {
                 self.next();
-                let inner = self.parse_unary()?;
+                let inner = self.parse_cmp()?;
                 Ok(Expr::Func {
                     name: "abs".to_string(),
                     args: vec![inner],
@@ -4958,7 +4974,7 @@ impl Parser {
             }
             Token::PipeSlash => {
                 self.next();
-                let inner = self.parse_unary()?;
+                let inner = self.parse_cmp()?;
                 Ok(Expr::Func {
                     name: "sqrt".to_string(),
                     args: vec![inner],
@@ -4966,16 +4982,11 @@ impl Parser {
             }
             Token::PipePipeSlash => {
                 self.next();
-                let inner = self.parse_unary()?;
+                let inner = self.parse_cmp()?;
                 Ok(Expr::Func {
                     name: "cbrt".to_string(),
                     args: vec![inner],
                 })
-            }
-            Token::Tilde => {
-                self.next();
-                let inner = self.parse_unary()?;
-                Ok(Expr::BitNot(Box::new(inner)))
             }
             _ => self.parse_primary(),
         }
@@ -7699,6 +7710,7 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         }
         Expr::Not(a) => validate_constraint_expr(a, what),
         Expr::BitNot(a) => validate_constraint_expr(a, what),
+        Expr::Neg(a) => validate_constraint_expr(a, what),
         Expr::Like { expr, pattern, .. } => {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(pattern, what)
@@ -7944,6 +7956,11 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         }
         Expr::BitNot(a) => {
             out.push_str("(bitnot ");
+            encode_expr_inner(a, out);
+            out.push(')');
+        }
+        Expr::Neg(a) => {
+            out.push_str("(neg ");
             encode_expr_inner(a, out);
             out.push(')');
         }
@@ -8207,6 +8224,10 @@ impl<'a> SexprParser<'a> {
             "bitnot" => {
                 let a = self.expr()?;
                 Expr::BitNot(Box::new(a))
+            }
+            "neg" => {
+                let a = self.expr()?;
+                Expr::Neg(Box::new(a))
             }
             "isnull" => {
                 let neg = self.atom()? == "1";

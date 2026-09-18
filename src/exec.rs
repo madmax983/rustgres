@@ -5696,7 +5696,7 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::Extract { from, .. } => expr_uses(from),
             Expr::Cmp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
-            Expr::Not(e) | Expr::BitNot(e) => expr_uses(e),
+            Expr::Not(e) | Expr::BitNot(e) | Expr::Neg(e) => expr_uses(e),
             Expr::IsNull { expr, .. } => expr_uses(expr),
             Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Agg { arg, arg2, .. } => {
@@ -5907,6 +5907,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::Or(a, b) => Ok(Expr::Or(Box::new(r(a)?), Box::new(r(b)?))),
         Expr::Not(x) => Ok(Expr::Not(Box::new(r(x)?))),
         Expr::BitNot(x) => Ok(Expr::BitNot(Box::new(r(x)?))),
+        Expr::Neg(x) => Ok(Expr::Neg(Box::new(r(x)?))),
         Expr::IsNull { expr, neg } => Ok(Expr::IsNull {
             expr: Box::new(r(expr)?),
             neg: *neg,
@@ -7299,6 +7300,7 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
         }
         Expr::Not(x)
         | Expr::BitNot(x)
+        | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_expr(x),
         Expr::IsDistinctFrom { left, right, .. } => {
@@ -7343,6 +7345,7 @@ fn contains_agg(e: &Expr) -> bool {
         } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
         Expr::Not(x)
         | Expr::BitNot(x)
+        | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_agg(x),
         Expr::IsDistinctFrom { left, right, .. } => contains_agg(left) || contains_agg(right),
@@ -7384,6 +7387,7 @@ fn contains_window(e: &Expr) -> bool {
         } => contains_window(expr) || contains_window(low) || contains_window(high),
         Expr::Not(x)
         | Expr::BitNot(x)
+        | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => contains_window(x),
         Expr::IsDistinctFrom { left, right, .. } => contains_window(left) || contains_window(right),
@@ -7630,6 +7634,7 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         }
         Expr::Not(x)
         | Expr::BitNot(x)
+        | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_window_expr(x, in_agg),
         Expr::IsDistinctFrom { left, right, .. } => {
@@ -7763,6 +7768,7 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
             }
             Expr::Not(x)
             | Expr::BitNot(x)
+            | Expr::Neg(x)
             | Expr::IsNull { expr: x, .. }
             | Expr::IsBool { expr: x, .. } => walk(x, visit),
             Expr::IsDistinctFrom { left, right, .. } => {
@@ -7850,6 +7856,7 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
             }
             Expr::Not(x)
             | Expr::BitNot(x)
+            | Expr::Neg(x)
             | Expr::IsNull { expr: x, .. }
             | Expr::IsBool { expr: x, .. } => stamp(x, windows),
             Expr::IsDistinctFrom { left, right, .. } => {
@@ -8671,6 +8678,7 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
         Expr::And(a, b) | Expr::Or(a, b) => pushable_columns(a, cols) && pushable_columns(b, cols),
         Expr::Not(x) => pushable_columns(x, cols),
         Expr::BitNot(x) => pushable_columns(x, cols),
+        Expr::Neg(x) => pushable_columns(x, cols),
         Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => pushable_columns(x, cols),
         Expr::IsDistinctFrom { left, right, .. } => {
             pushable_columns(left, cols) && pushable_columns(right, cols)
@@ -8804,6 +8812,7 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::Not(x) => collect_column_refs(x, out),
         Expr::BitNot(x) => collect_column_refs(x, out),
+        Expr::Neg(x) => collect_column_refs(x, out),
         Expr::IsNull { expr: x, .. } => collect_column_refs(x, out),
         Expr::IsDistinctFrom { left, right, .. } => {
             collect_column_refs(left, out);
@@ -11170,6 +11179,10 @@ fn eval_grouped(
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             eval_bitnot_val(&v)
         }
+        Expr::Neg(x) => {
+            let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
+            eval_neg_val(&v)
+        }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, x)?;
             Ok(Value::Bool((v == Value::Null) != *neg))
@@ -12000,6 +12013,10 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         Expr::BitNot(x) => {
             let v = eval_expr(q, scopes, x)?;
             eval_bitnot_val(&v)
+        }
+        Expr::Neg(x) => {
+            let v = eval_expr(q, scopes, x)?;
+            eval_neg_val(&v)
         }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_expr(q, scopes, x)?;
@@ -13029,6 +13046,47 @@ fn eval_bitnot_val(v: &Value) -> Result<Value, ExecError> {
         _ => Err(exec_err(
             "42883",
             format!("operator does not exist: ~ {}", v.type_name()),
+        )),
+    }
+}
+
+/// v0.53: unary minus as a first-class operator (PG19's doNegate).
+/// Type-preserving: `-smallint` stays smallint (the old `0 - x`
+/// desugar widened it to integer). Overflow raises 22003 with the
+/// per-type message, like the binary operators. NULL stays NULL; an
+/// unknown-type text literal keeps the old `0 - x` resolution path
+/// (so `-'5'` is still -5 and `-'2026-01-01'` still fails at
+/// evaluation, like Postgres).
+fn eval_neg_val(v: &Value) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    if let Value::Text(_) = v {
+        // v0.7 unknown-literal path: text resolves against the other
+        // side's numeric type, exactly as `0 - x` did before v0.53.
+        return eval_arith(ArithOp::Sub, &Value::Int(0), v);
+    }
+    match v {
+        Value::SmallInt(i) => i
+            .checked_neg()
+            .map(Value::SmallInt)
+            .ok_or_else(|| exec_err("22003", "smallint out of range")),
+        Value::Int(i) => {
+            let x = *i as i32;
+            x.checked_neg()
+                .map(|r| Value::Int(r as i64))
+                .ok_or_else(|| exec_err("22003", "integer out of range"))
+        }
+        Value::BigInt(i) => i
+            .checked_neg()
+            .map(Value::BigInt)
+            .ok_or_else(|| exec_err("22003", "bigint out of range")),
+        Value::Float4(f) => Ok(Value::Float4(-f)),
+        Value::Float(f) => Ok(Value::Float(-f)),
+        Value::Numeric(n) => Ok(Value::Numeric(n.neg())),
+        _ => Err(exec_err(
+            "42883",
+            format!("operator does not exist: - {}", v.type_name()),
         )),
     }
 }
@@ -20490,12 +20548,36 @@ fn expr_type(
         Expr::BitNot(x) => {
             // v0.25: `~smallint`/`~int` -> int, `~bigint` -> bigint (PG
             // promotes smallint, having no int2not).
+            // v0.53: `~ NULL` is NULL::int (PG resolves the unknown-type
+            // NULL to int4 for `~`); eval_bitnot_val already NULL-propagates.
+            if matches!(**x, Expr::Literal(Literal::Null)) {
+                return Ok(ColType::Int);
+            }
             match expr_type(eng, snap, own, session, schemas, ctes, x)? {
                 ColType::BigInt => Ok(ColType::BigInt),
                 ColType::SmallInt | ColType::Int => Ok(ColType::Int),
                 t => Err(exec_err(
                     "42883",
                     format!("operator does not exist: ~ {}", t.sql_name()),
+                )),
+            }
+        }
+        Expr::Neg(x) => {
+            // v0.53: PG19 doNegate preserves the operand type (`-int2`
+            // stays int2 — the old `0 - x` desugar widened it to int).
+            // An unknown-type (text) literal resolves to integer, as
+            // the old `0 - text` typing did.
+            match expr_type(eng, snap, own, session, schemas, ctes, x)? {
+                t @ (ColType::SmallInt
+                | ColType::Int
+                | ColType::BigInt
+                | ColType::Float4
+                | ColType::Float
+                | ColType::Numeric) => Ok(t),
+                ColType::Text => Ok(ColType::Int),
+                t => Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: - {}", t.sql_name()),
                 )),
             }
         }
@@ -20617,6 +20699,8 @@ fn arith_operand_type(
         Expr::Concat(..) => Ok(Some(ColType::Text)),
         // v0.25: `~x` result type via the shared expr_type rule.
         Expr::BitNot(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        // v0.53: `-x` result type via the shared expr_type rule.
+        Expr::Neg(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
         // Boolean / predicate expressions can't be arithmetic operands.
         _ => Err(exec_err(
             "42883",
@@ -20877,6 +20961,13 @@ fn hint_type(
         )
         .ok(),
         Expr::Cast { to, .. } => Some(*to),
+        // v0.53: `-x` hints like the old `0 - x` desugar.
+        Expr::Neg(x) => combine_arith_types(
+            ArithOp::Sub,
+            Some(ColType::Int),
+            hint_type(eng, snap, own, session, schemas, x),
+        )
+        .ok(),
         Expr::Concat(..) => Some(ColType::Text),
         Expr::Extract { .. } => Some(ColType::Numeric),
         Expr::Func { name, args } => {
@@ -20968,6 +21059,14 @@ fn infer_expr(
             infer_expr(b, eng, snap, own, session, schemas, out)
         }
         Expr::Not(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+            infer_expr(x, eng, snap, own, session, schemas, out)
+        }
+        Expr::Neg(x) => {
+            // v0.53: unary minus pins a param like the old `0 - x`
+            // desugar did — the param takes the `0` side's type.
+            if let Expr::Param(p) = **x {
+                pin_param(out, p, ColType::Int)?;
+            }
             infer_expr(x, eng, snap, own, session, schemas, out)
         }
         Expr::IsDistinctFrom { left, right, .. } => {
@@ -21762,6 +21861,7 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
         }
         Expr::Not(x)
         | Expr::BitNot(x)
+        | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => subst_expr(x, params)?,
         Expr::IsDistinctFrom { left, right, .. } => {
@@ -22786,6 +22886,39 @@ mod tests {
             "42883"
         );
         assert_eq!(err_code(&mut eng, "SELECT justify_days(now())"), "42883");
+    }
+
+    // v0.53: unary minus as first-class Expr::Neg (PG19 doNegate, UMINUS
+    // precedence) + generic prefix operators (~, @, |/, ||/) at PG19's
+    // loosest precedence (qual_Op a_expr %prec Op).
+    #[test]
+    fn v53_unary_minus_prefix_precedence() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        let err_code =
+            |eng: &mut Engine, sql: &str| -> &'static str { run(eng, sql).unwrap_err().code };
+        // Prefix operators bind loosest: operand is a full expression.
+        assert_eq!(one(&mut eng, "SELECT ~ 1 + 1"), "-3"); // ~(1+1)
+        assert_eq!(one(&mut eng, "SELECT @ 5 - 10"), "5"); // @(5-10)
+        assert_eq!(one(&mut eng, "SELECT |/ 2 + 7"), "3"); // |/(2+7)
+        assert_eq!(one(&mut eng, "SELECT ||/ 35 - 8"), "3"); // ||/(35-8)
+        assert_eq!(one(&mut eng, "SELECT ~ 5::int2"), "-6"); // ~(5::int2)
+        assert_eq!(one(&mut eng, "SELECT ~ 7::bigint"), "-8");
+        assert_eq!(one(&mut eng, "SELECT ~ NULL"), "NULL");
+        // UMINUS: tighter than ^, looser than ::.
+        assert_eq!(one(&mut eng, "SELECT - 2 ^ 2"), "4"); // (-2)^2
+        assert_eq!(one(&mut eng, "SELECT - -5"), "5");
+        assert_eq!(one(&mut eng, "SELECT -(3+4)"), "-7");
+        assert_eq!(one(&mut eng, "SELECT - 30000::smallint"), "-30000");
+        assert_eq!(one(&mut eng, "SELECT - NULL"), "NULL");
+        assert_eq!(one(&mut eng, "SELECT -'5'"), "-5");
+        // doNegate overflow: 22003 with the per-type message.
+        assert_eq!(err_code(&mut eng, "SELECT - (-32768::smallint)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT - (-2147483648::int)"), "22003");
+        // Unknown-literal path preserved: fails at evaluation like PG.
+        assert_eq!(err_code(&mut eng, "SELECT -'2026-01-01'"), "22P02");
     }
 
     // v0.16: cursor_window positioning semantics (Postgres rules).
@@ -25923,6 +26056,7 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         }
         Expr::Not(a) => rename_col_in_expr(a, old, new),
         Expr::BitNot(a) => rename_col_in_expr(a, old, new),
+        Expr::Neg(a) => rename_col_in_expr(a, old, new),
         Expr::Like { expr, pattern, .. } => {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(pattern, old, new);
