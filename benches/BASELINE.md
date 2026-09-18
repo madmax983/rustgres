@@ -2,6 +2,101 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `coerce_regclass_cmp` runs `expr_is_regclass` on every comparison — baseline — 2026-09-18
+
+**Workload**: `benches/profile_join.py` (existing, from the equi-join/
+`coerce_text_numeric` Bolt rounds), default scaled-down shape — an exact
+**100** iterations of
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+(`--users 200 --orders 2000 --filter 20`, the script's own defaults —
+chosen so a callgrind run finishes in a reasonable time; the full
+`--users 2000 --orders 20000 --filter 200` shape used by earlier rounds
+in this file did not finish a 5-iteration callgrind run within 600s on
+this session's machine, so this round uses the smaller, still-realistic
+shape) over the real wire protocol. Every equi-join comparison
+(`u.id = o.uid`) and WHERE filter comparison (`u.id < 20`) in the whole
+workload runs through `Expr::Cmp` in `exec::eval_expr`, so this exercises
+`coerce_regclass_cmp` for real, not against a synthetic slice of it alone.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | head -40
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged): 9,478,577,165
+total instructions over the 100-iteration run. Top `rustgres::exec`
+self-costs:
+
+| function | Ir | % of total |
+|---|---|---|
+| `eval_expr` (both monomorphizations) | 1,557,160,000 | 16.43% |
+| `eval_cmp_vals` | 507,560,000 | 5.35% |
+| `build_source` | 488,576,500 | 5.15% |
+| `coerce_regclass_cmp` | 430,360,000 | **4.54%** |
+| `expr_is_regclass` | 380,980,000 | **4.02%** |
+| `cmp_ordering` | 292,320,000 | 3.08% |
+| `expr_is_regclass::{{closure}}` (its `resolve_col`/scope-walk closure) | 146,100,000 | **1.54%** |
+| `coerce_text_numeric` | 138,040,000 | 1.46% |
+
+**Target**: `exec::coerce_regclass_cmp` (`src/exec.rs`), called from
+`eval_expr`'s `Expr::Cmp` arm (and `eval_grouped`'s) on **every single
+comparison in the entire query** — the join's `ON` condition and the
+`WHERE u.id < 20` filter alike — to check whether either side is
+statically typed `regclass` (PG's binary-coercible regclass/oid
+comparison). It does this by calling `expr_is_regclass(scopes, left)` and
+`expr_is_regclass(scopes, right)` unconditionally, each of which walks the
+scope chain and looks up the referenced column's declared type. regclass
+is an exceedingly rare type in real workloads (a `::regclass` cast or a
+`REGCLASS`-typed column) — this workload's `bench_u`/`bench_o` tables are
+plain `INT`/`TEXT` — yet the check runs on every comparison regardless.
+Combined self-cost of `coerce_regclass_cmp` + `expr_is_regclass` +
+`expr_is_regclass::{{closure}}` is **10.10%** of this profile, on top of
+`eval_expr` (16.43%) whose self-cost includes driving these calls; far
+above the 5%-of-profile relevance bar.
+
+**Mechanism**: `expr_is_regclass` requires a scope/schema walk
+(`resolve_col` for `Expr::Column`, or an `Option::and_then`/`map` chain
+for the already-resolved `Expr::ResolvedCol`) to answer a question that,
+for the overwhelmingly common case of an int-vs-int comparison (join
+keys, id filters), is answerable for free from information already in
+hand: `eval_regclass_cast` — the only producer of a regclass value in
+this codebase — always returns `Value::text(regclass_display(..))` (see
+its doc comment at `src/exec.rs:14012`), and assigning a value into a
+`REGCLASS`-typed column goes through the same Text-only path
+(`coerce_int_lit`/`coerce_value` reject an int literal assigned to a
+regclass column outright). So a regclass-typed expression can never
+evaluate to an int-variant `Value`, which means an **int-valued operand's
+expression can never itself be regclass-typed** — `is_int(&va)` being
+true already proves `expr_is_regclass(scopes, left)` is `false`, without
+needing to call it. `eval_expr`'s comparisons are overwhelmingly
+int-vs-int, so this fast fact skips the scope walk entirely in the common
+case.
+
+**Baseline numbers** (this commit, `coerce_regclass_cmp` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind total instructions (`Ir`), 100-iteration 20x2000 join+filter+GROUP BY | 9,478,577,165 |
+| `coerce_regclass_cmp` self `Ir` | 430,360,000 (4.54%) |
+| `expr_is_regclass` self `Ir` | 380,980,000 (4.02%) |
+| `expr_is_regclass::{{closure}}` self `Ir` | 146,100,000 (1.54%) |
+| combined | 957,440,000 (10.10%) |
+
+Fix follows in the next commit.
+
 ## Bolt: `IndexKey::cmp` builds a Zip iterator for single-column keys — fix — 2026-09-17
 
 Fixes the target identified in the baseline entry immediately below this
