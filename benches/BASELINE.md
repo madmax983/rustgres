@@ -2,6 +2,123 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Compiled::find_at` reallocates its capture/backtrack scratch buffers per attempted start position — fix — 2026-09-19
+
+Fixes the target identified in the baseline entry immediately below this
+one. `Compiled::find_at` (`src/regex.rs`) allocated a fresh `caps` Vec
+(`vec![None; self.groups + 1]`) and a fresh backtrack `stack` Vec on
+every iteration of its `for st in start..=s.len()` retry loop — one pair
+of allocations per attempted start position, discarded and reallocated
+identically for the next attempt. The fix hoists both allocations above
+the loop and resets their *contents* between attempts instead of their
+*allocations*:
+
+```rust
+pub fn find_at(&self, s: &[char], start: usize) -> Option<(usize, usize, Captures)> {
+    let mut caps = vec![None; self.groups + 1];
+    let mut stack = Vec::new();
+    for st in start..=s.len() {
+        caps.fill(None);
+        caps[0] = Some((st, st));
+        stack.clear();
+        // ... budget calculation and self.run(...) call unchanged ...
+    }
+    None
+}
+```
+
+**Why this is exact, not approximate**: `run` always overwrites
+`caps[0]` with `Some((st, st))` at the top of every attempt before
+reading it, so `caps[0]`'s prior contents never matter. For every slot
+`caps[1..]`: `SaveStart(g)`/`SaveEnd(g)` (the only instructions that
+write to `caps[g]` for `g >= 1`) only exist in the compiled program for
+groups the pattern's `Ast::Group` nodes actually declared, and every
+capturing attempt starts a fresh capture (there is no PostgreSQL regex
+construct that carries a captured span across a failed backtrack
+attempt into the next one) — so `caps.fill(None)` before each attempt
+puts every slot into exactly the state a freshly-allocated
+`vec![None; groups + 1]` would have had, byte for byte. `stack.clear()`
+drops every backtrack frame `Insn::Split` pushed during the previous
+(failed) attempt — the same "starts empty" invariant `Vec::new()` gives,
+without paying for a new heap allocation each time. Neither change
+touches `run`'s VM logic, `Insn::Split`'s own `caps.clone()` push, or
+any instruction semantics — the fix is confined to `find_at`'s retry
+loop.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_regexp.py --rows 2000
+--count 20`, same workload as the baseline entry below, same machine,
+this session; two runs each side to confirm determinism — before-runs
+agree to within 0.0004%, after-runs to within 0.0004%):
+
+| | Ir |
+|---|---|
+| before (HEAD, baseline entry below), run 1 | 10,424,910,079 |
+| before, run 2 | 10,424,953,680 |
+| before (average) | 10,424,931,879.5 |
+| after, run 1 | 9,447,286,537 |
+| after, run 2 | 9,447,325,592 |
+| after (average) | 9,447,306,064.5 |
+
+**Delta: -9.38%** total instructions — well above the ≥5%-of-profile
+impact floor (the target's own self-cost, `Compiled::run` +
+`Compiled::find_at`, was 6.43% of the baseline profile, before counting
+the allocator machinery it drove).
+
+**DHAT** (same workload, same machine):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| total heap allocations (blocks) | 6,467,937 | 3,973,457 | **-38.57%** |
+| total bytes allocated | 375,845,560 | 315,978,004 | **-15.93%** |
+
+Both clear the ≥10%-reduction allocation floor independently of the Ir
+floor. The `find_at`-line allocation site (43.78% of all blocks in the
+baseline) is gone from the after-profile entirely, and the allocator
+functions that were in the baseline's top-10 self-cost list (`malloc`,
+`RawVecInner::try_allocate_in`, `RawVecInner::with_capacity_in`,
+`RawVecInner::deallocate`) drop out of it after the fix.
+
+**Behavior**: unchanged. `cargo test --all-features` — 184 passed, 0
+failed, identical pass count to the pre-change tree. `cargo fmt --all --
+--check` is clean. `cargo clippy --all-targets --all-features -- -D
+warnings` fails to compile with 283 pre-existing errors on both the
+pre-change and post-change tree (confirmed via `git stash`) — the same
+toolchain/lint-version mismatch noted in the `coerce_regclass_cmp` round
+below (`useless_vec` in `toast.rs`, etc.); the 5 clippy findings that
+land inside `src/regex.rs` are at the same 5 source constructs before
+and after (only their line numbers shift, by the exact size of this
+change's added doc comment) — no new clippy findings from this change.
+All 8 regexp/SIMILAR-TO-related protocol suites pass unchanged:
+`protocol_test19.py` 27/27, `protocol_test24.py` 89/89,
+`protocol_test27.py` 6/6, `protocol_test31.py` 22/22,
+`protocol_test32.py` 27/27, `protocol_test34.py` 12/12,
+`protocol_test38.py` 27/27, `protocol_test43.py` 44/44.
+`tests/conformance/regress_runner.py --tests strings` (PostgreSQL
+regression-suite subset, semantic comparison) scores identically to the
+count recorded in the `coerce_regclass_cmp` round below: PASS=565
+EXPECTED-FAIL=12 SKIP=3, **REAL-FAIL=0**.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_regexp.py --rows 2000 --count 20 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+For DHAT, swap `--tool=callgrind --callgrind-out-file=...
+--collect-jumps=yes --cache-sim=yes` for `--tool=dhat
+--dhat-out-file=/tmp/dhat.out`, run the same workload, then sum the
+`"tbk"`/`"tb"` fields across `dhat.out`'s `"pps"` array.
+
+Compare against the baseline commit (`src/regex.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
 ## Bolt: `Compiled::find_at` reallocates its capture/backtrack scratch buffers per attempted start position — baseline — 2026-09-19
 
 **Workload**: `benches/profile_regexp.py` (new), an exact **20** iterations of

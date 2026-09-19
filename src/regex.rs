@@ -560,11 +560,27 @@ impl Compiled {
     }
 
     /// Leftmost match at or after `start` (char indices).
+    ///
+    /// Perf: `caps` and `stack` are allocated once and reused across every
+    /// attempted start position, instead of a fresh `vec![None; ..]` (and a
+    /// fresh backtrack stack) per attempt. A non-anchored search against a
+    /// string with no match anywhere retries at every character position,
+    /// so before this the retry loop allocated `s.len() + 1` times for a
+    /// single `find_at` call; now it allocates the scratch buffers once and
+    /// only resets their contents (`fill(None)` / `clear()`) between
+    /// attempts. `caps[1..]` is always reset to `None` and `caps[0]` is
+    /// always overwritten with `Some((st, st))` before `run` reads it, and
+    /// `stack` is cleared (dropping any leftover backtrack frames from the
+    /// previous, failed attempt) before `run` pushes onto it — so each
+    /// attempt starts from the exact same state as a freshly allocated
+    /// buffer would have, just without paying for the allocation again.
     pub fn find_at(&self, s: &[char], start: usize) -> Option<(usize, usize, Captures)> {
+        let mut caps = vec![None; self.groups + 1];
+        let mut stack = Vec::new();
         for st in start..=s.len() {
-            let mut caps = vec![None; self.groups + 1];
+            caps.fill(None);
             caps[0] = Some((st, st));
-            let mut stack = Vec::new();
+            stack.clear();
             // Step budget: bounds the backtracking VM so a pathological
             // pattern (e.g. nested quantifiers over nullable bodies) degrades
             // to "no match" instead of hanging the backend. Scales with input
