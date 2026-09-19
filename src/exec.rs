@@ -12956,62 +12956,218 @@ fn set_random_seed(seed: f64) {
 
 /// v0.18: width_bucket(op, b1, b2, count) and width_bucket(op, thresholds).
 /// Returns integer bucket number (0..count+1, or 1-based index into thresholds).
-fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, ExecError> {
-    let to_f = |v: &Value| -> Result<f64, ExecError> {
-        match v {
-            Value::SmallInt(i) => Ok(*i as f64),
-            Value::Int(i) => Ok(*i as f64),
-            Value::BigInt(i) => Ok(*i as f64),
-            Value::Numeric(n) => Ok(n.to_f64()),
-            Value::Float4(f) => Ok(*f as f64),
-            Value::Float(f) => Ok(*f),
-            // v0.25: untyped literals coerce through numeric's input.
-            Value::Text(s) => crate::storage::Numeric::parse(s)
-                .map(|n| n.to_f64())
-                .map_err(|_| func_arg_err(name, v)),
-            _ => Err(func_arg_err(name, v)),
+/// v0.56: one width_bucket argument in PG19-exact form.
+#[derive(Clone)]
+enum WbArg {
+    /// Finite value as an exact decimal.
+    Dec(crate::storage::BigDec),
+    /// NaN (float or numeric).
+    Nan,
+    /// Infinite; the bool is `is_positive`.
+    Inf(bool),
+}
+
+/// v0.56: exact form of a float8/float4 argument. NaN/infinity stay
+/// special; finite values use the shortest round-trip decimal spelling
+/// (what PG's float8out feeds numeric_in), parsed exactly. The
+/// regression tests prove the float8 variant is not naive float64
+/// arithmetic: width_bucket(0, -1e100::float8, 1, 10) = 10, where
+/// float64 would round 1e100/(1e100+1) to 1.0 and yield 11.
+fn wb_float_arg(x: f64) -> WbArg {
+    use crate::storage::{BigDec, Numeric};
+    if x.is_nan() {
+        WbArg::Nan
+    } else if x.is_infinite() {
+        WbArg::Inf(x > 0.0)
+    } else {
+        // {:e} is shortest-round-trip like {} but always carries an
+        // exponent, so 1e100 never overflows Numeric's i128 unscaled.
+        // Infallible for finite x; the fallback is defensive.
+        match Numeric::parse(&format!("{:e}", x))
+            .ok()
+            .and_then(|n| BigDec::from_numeric(&n))
+        {
+            Some(d) => WbArg::Dec(d),
+            None => WbArg::Dec(BigDec::zero()),
         }
+    }
+}
+
+/// v0.56: exact form of a numeric argument.
+fn wb_numeric_arg(n: &crate::storage::Numeric) -> WbArg {
+    use crate::storage::{BigDec, NumericSpecial};
+    match n.special {
+        NumericSpecial::NaN => WbArg::Nan,
+        NumericSpecial::PosInf => WbArg::Inf(true),
+        NumericSpecial::NegInf => WbArg::Inf(false),
+        NumericSpecial::Finite => WbArg::Dec(BigDec::from_numeric(n).unwrap_or_else(BigDec::zero)),
+    }
+}
+
+/// v0.56: convert one width_bucket operand/bound to its exact form.
+/// Integers are exact; numerics keep their value; floats go through
+/// their shortest decimal spelling; untyped literals coerce through
+/// numeric's input function (with an exact fallback for literals too
+/// huge for Numeric's i128).
+fn wb_arg(name: &str, v: &Value) -> Result<WbArg, ExecError> {
+    use crate::storage::{BigDec, DecimalParseError, Numeric};
+    match v {
+        Value::Float4(f) => Ok(wb_float_arg(*f as f64)),
+        Value::Float(f) => Ok(wb_float_arg(*f)),
+        Value::SmallInt(i) => Ok(WbArg::Dec(BigDec::from_i64(*i as i64))),
+        Value::Int(i) => Ok(WbArg::Dec(BigDec::from_i64(*i))),
+        Value::BigInt(i) => Ok(WbArg::Dec(BigDec::from_i64(*i))),
+        Value::Numeric(n) => Ok(wb_numeric_arg(n)),
+        Value::Text(s) => match Numeric::parse(s) {
+            Ok(n) => Ok(wb_numeric_arg(&n)),
+            Err(_) => match BigDec::parse_decimal(s) {
+                Ok(d) => Ok(WbArg::Dec(d)),
+                Err(DecimalParseError::TooBig) => {
+                    Err(exec_err("22003", "value overflows numeric format"))
+                }
+                Err(DecimalParseError::Syntax) => Err(exec_err(
+                    "22P02",
+                    format!("invalid input syntax for type numeric: {s}"),
+                )),
+            },
+        },
+        // NULL is handled by the caller (strict); anything else cannot
+        // appear in a numeric argument position.
+        other => Err(func_arg_err(name, other)),
+    }
+}
+
+/// v0.56: exact in-range bucket, floor(lower/upper * count) + 1, where
+/// lower and upper are non-negative finite decimals and upper > 0.
+/// Errors 22003 when the bucket exceeds int4 range.
+fn wb_bucket_in_range(
+    lower: &crate::storage::BigDec,
+    upper: &crate::storage::BigDec,
+    count: u64,
+) -> Result<u64, ExecError> {
+    use crate::storage::BigUint;
+    use std::cmp::Ordering;
+    debug_assert!(lower.cmp(&crate::storage::BigDec::zero()) != Ordering::Less);
+    debug_assert!(upper.cmp(&crate::storage::BigDec::zero()) == Ordering::Greater);
+    // Align the decimal scales; then everything is integer arithmetic:
+    // floor((lower_mag * count) / upper_mag).
+    let (mut a, mut b) = (lower.mag().clone(), upper.mag().clone());
+    let pad = |from: i32, to: i32| {
+        u32::try_from(to as i64 - from as i64)
+            .map_err(|_| exec_err("22003", "value overflows numeric format"))
     };
-    if vals.len() == 4 {
-        // width_bucket(op, b1, b2, count)
-        let operand = to_f(op)?;
-        let b1 = to_f(&vals[1])?;
-        let b2 = to_f(&vals[2])?;
-        let count = match &vals[3] {
-            Value::SmallInt(i) => *i as i64,
-            Value::Int(i) => *i,
-            Value::BigInt(i) => *i,
-            Value::Numeric(n) => n.to_i64().ok_or_else(|| func_arg_err(name, &vals[3]))?,
-            _ => return Err(func_arg_err(name, &vals[3])),
-        };
-        if count <= 0 {
-            return Err(exec_err("2201F", "count must be greater than zero"));
-        }
-        // v0.25: PG treats NaN as larger than any bound (NaN operand or
-        // NaN bound yields count+1 for ascending, 0 for descending).
-        let bucket = if operand.is_nan() || b1.is_nan() || b2.is_nan() {
-            count + 1
-        } else if operand < b1.min(b2) {
-            0
-        } else if operand >= b1.max(b2) {
-            count + 1
-        } else {
-            // PG: bucket = floor((op - b1) / (b2 - b1) * count) + 1
-            let b = ((operand - b1) / (b2 - b1) * count as f64).floor() as i64 + 1;
-            b.max(1).min(count)
-        };
-        // PG swaps for b1 > b2 (descending).
-        let result = if b1 > b2 { count + 1 - bucket } else { bucket };
-        Ok(Value::Int(result))
-    } else if vals.len() == 3 {
-        // width_bucket(op, thresholds[]): thresholds is an array; we don't have
-        // arrays, so accept a comma-separated string or fail gracefully.
+    match lower.scale().cmp(&upper.scale()) {
+        // lower = a*10^-sl, upper = b*10^-su, so lower/upper =
+        // (a*10^(su-sl))/b: scale up the numerator's magnitude when
+        // su > sl, the denominator's when sl > su.
+        Ordering::Less => a.mul_pow10_assign(pad(lower.scale(), upper.scale())?),
+        Ordering::Greater => b.mul_pow10_assign(pad(upper.scale(), lower.scale())?),
+        Ordering::Equal => {}
+    }
+    a.mul_small_assign(count);
+    match BigUint::floor_div_bounded(&a, &b) {
+        // floor_div_bounded caps the quotient below 2^31, so this fits.
+        Some(q) => Ok(q.to_u64().expect("bounded quotient fits u64") + 1),
+        None => Err(exec_err("22003", "integer out of range")),
+    }
+}
+
+fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, ExecError> {
+    use std::cmp::Ordering;
+    // The 3-argument array-bounds form needs arrays, which rustgres lacks.
+    if vals.len() == 3 {
         return Err(exec_err(
             "42883",
             "width_bucket with array thresholds is not supported",
         ));
-    } else {
-        Err(func_arg_err(name, op))
+    }
+    if vals.len() != 4 {
+        return Err(func_arg_err(name, op));
+    }
+    // PG's width_bucket is strict: any NULL argument yields NULL (this
+    // also covers vals[2]/vals[3], which eval_math_func's NULL check
+    // does not see).
+    if matches!(op, Value::Null) || vals[1..4].iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    // count is int4 in PG; rustgres also accepts wider integer kinds.
+    let count: i64 = match &vals[3] {
+        Value::SmallInt(i) => *i as i64,
+        Value::Int(i) => *i,
+        Value::BigInt(i) => *i,
+        other => return Err(func_arg_err(name, other)),
+    };
+    // v0.56: PG19 reports 22023 here (was 2201F).
+    if count <= 0 {
+        return Err(exec_err("22023", "count must be greater than zero"));
+    }
+
+    let operand = wb_arg(name, op)?;
+    let b1 = wb_arg(name, &vals[1])?;
+    let b2 = wb_arg(name, &vals[2])?;
+
+    // Bound validation in PG's order: NaN, then infinite, then equal.
+    // v0.56: NaN/infinite bounds are errors (22003); only a NaN
+    // *operand* yields count+1. Equal bounds are 22023 (the old code
+    // silently returned count+1).
+    for b in [&b1, &b2] {
+        if matches!(b, WbArg::Nan) {
+            return Err(exec_err("22003", "lower and upper bounds cannot be NaN"));
+        }
+        if matches!(b, WbArg::Inf(_)) {
+            return Err(exec_err("22003", "lower and upper bounds must be finite"));
+        }
+    }
+    let (b1d, b2d) = match (&b1, &b2) {
+        (WbArg::Dec(a), WbArg::Dec(b)) => (a, b),
+        _ => unreachable!("bounds validated finite above"),
+    };
+    if b1d.cmp(b2d) == Ordering::Equal {
+        return Err(exec_err("22023", "lower bound cannot equal upper bound"));
+    }
+    let ascending = b1d.cmp(b2d) == Ordering::Less;
+
+    // PG returns int4, so any bucket above i32::MAX is 22003
+    // "integer out of range".
+    let int_result = |bucket: u64| -> Result<Value, ExecError> {
+        if bucket > i32::MAX as u64 {
+            Err(exec_err("22003", "integer out of range"))
+        } else {
+            Ok(Value::Int(bucket as i64))
+        }
+    };
+    let count_u = count as u64;
+
+    match operand {
+        // A NaN operand is above every bound: count+1 either way.
+        WbArg::Nan => int_result(count_u + 1),
+        WbArg::Inf(positive) => {
+            // An infinite operand is beyond the bounds on its side:
+            // above the range -> count+1 ascending, 0 descending;
+            // below the range -> 0 ascending, count+1 descending.
+            int_result(match (positive, ascending) {
+                (true, true) | (false, false) => count_u + 1,
+                _ => 0,
+            })
+        }
+        WbArg::Dec(ref d) => {
+            let bucket = if ascending {
+                if d.cmp(b1d) == Ordering::Less {
+                    0
+                } else if d.cmp(b2d) == Ordering::Greater {
+                    count_u + 1
+                } else {
+                    wb_bucket_in_range(&d.sub(b1d), &b2d.sub(b1d), count_u)?
+                }
+            } else if d.cmp(b1d) == Ordering::Greater {
+                0
+            } else if d.cmp(b2d) == Ordering::Less {
+                count_u + 1
+            } else {
+                wb_bucket_in_range(&b1d.sub(d), &b1d.sub(b2d), count_u)?
+            };
+            int_result(bucket)
+        }
     }
 }
 
@@ -15143,7 +15299,9 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.21: float8 transcendental functions.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
         | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd" | "tand"
-        | "cotd" | "asind" | "acosd" | "atand" | "trunc" | "log10" | "float8send" => n == 1,
+        | "cotd" | "asind" | "acosd" | "atand" | "log10" | "float8send" => n == 1,
+        // v0.56: trunc(x) and trunc(x, s) (PG's trunc(numeric, int)).
+        "trunc" => n == 1 || n == 2,
         "atan2" | "atan2d" => n == 2,
         "setseed" => n == 1,
         "gcd" | "lcm" => n == 2,
@@ -19246,11 +19404,22 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             // v0.22: overloaded like Postgres — numeric in -> exact
             // numeric out (trunc_to_scale(0), so trunc('1e200') is
             // exactly 1e+200); float in -> float out.
-            match v {
-                Value::Numeric(n) => Ok(Value::Numeric(n.trunc_to_scale(0))),
-                _ => {
-                    let x = float_math_arg(name, v)?;
-                    Ok(Value::Float(x.trunc()))
+            // v0.56: two-argument form trunc(x, s), PG's
+            // trunc(numeric, int) -> numeric. Like round's two-argument
+            // form, a float input goes through numeric.
+            if vals.len() == 2 {
+                let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+                let s = int_arg(name, &vals[1])?.unwrap_or(0);
+                let s32 =
+                    i32::try_from(s).map_err(|_| exec_err("22003", "numeric field overflow"))?;
+                Ok(Value::Numeric(n.trunc_to_scale(s32)))
+            } else {
+                match v {
+                    Value::Numeric(n) => Ok(Value::Numeric(n.trunc_to_scale(0))),
+                    _ => {
+                        let x = float_math_arg(name, v)?;
+                        Ok(Value::Float(x.trunc()))
+                    }
                 }
             }
         }
@@ -19966,7 +20135,13 @@ fn func_result_type(
         "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" => Ok(ColType::Numeric),
         // v0.22: trunc is overloaded like Postgres — numeric in ->
         // numeric out, float in -> float out (mirrors eval_math_func).
+        // v0.56: the two-argument form is PG's trunc(numeric, int) ->
+        // numeric (a float input goes through numeric, like round's
+        // two-argument form).
         "trunc" => {
+            if args.len() == 2 {
+                return Ok(ColType::Numeric);
+            }
             for a in args {
                 match expr_type(eng, snap, own, session, schemas, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
@@ -23757,6 +23932,156 @@ mod tests {
         assert_eq!(
             rows_of(run(&mut eng, "SELECT power('inf'::float8, -2)").unwrap())[0][0],
             "0"
+        );
+    }
+
+    // ====================================================================
+    // v0.56: width_bucket PG19 hardening + two-argument trunc.
+    // ====================================================================
+
+    #[test]
+    fn width_bucket_exact_and_errors() {
+        let mut eng = engine();
+        // Grounded on PG19 numeric.out. v0.55 returned 1 for both.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(0, -1e100::numeric, 1, 10)").unwrap())[0],
+            vec!["10"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(1, 1e100::numeric, 0, 10)").unwrap())[0],
+            vec!["10"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(0, -1e100::float8, 1, 10)").unwrap())[0],
+            vec!["10"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(1, 1e100::float8, 0, 10)").unwrap())[0],
+            vec!["10"]
+        );
+        // Bucket numbering from the vendored 19-row table.
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT width_bucket(-5.2, 0, 10, 5), width_bucket(-5.2, 10, 0, 5)"
+                )
+                .unwrap()
+            )[0],
+            vec!["0", "6"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(10.0000000000001, 0, 10, 5), width_bucket(10.0000000000001, 10, 0, 5)").unwrap())[0],
+            vec!["6", "0"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(4.5, 2, 8, 4), width_bucket(5, 5.0, 5.5, 20), width_bucket(5.5, 5.0, 5.5, 20)").unwrap())[0],
+            vec!["2", "1", "21"]
+        );
+        // PG19 validation.
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(5.0, 3.0, 4.0, 0)"),
+            "22023"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(5.0, 3.0, 4.0, -5)"),
+            "22023"
+        );
+        // v0.55 returned 889; PG errors.
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(3.5, 3.0, 3.0, 888)"),
+            "22023"
+        );
+        // NaN operand -> count+1; NaN bounds -> error.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket('NaN', 3.0, 4.0, 888)").unwrap())[0],
+            vec!["889"]
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(0, 'NaN', 4.0, 888)"),
+            "22003"
+        );
+        // Infinite bounds rejected; infinite operands allowed.
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(2.0, 3.0, '-inf', 888)"),
+            "22003"
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket('Infinity'::float8, 1, 10, 10), width_bucket('-Infinity'::float8, 1, 10, 10), width_bucket('-Infinity'::float8, 10, 1, 10)").unwrap())[0],
+            vec!["11", "0", "11"]
+        );
+        // float8 overflow/underflow rows from numeric.out.
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT width_bucket(10.5::float8, -1.797e308::float8, 1.797e308::float8, 2)"
+                )
+                .unwrap()
+            )[0],
+            vec!["2"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(4.4925e307::float8, -8.985e307::float8, 8.985e307::float8, 10)").unwrap())[0],
+            vec!["8"]
+        );
+        // v0.56 note: `5e-324::float8` underflows to 0 at literal-parse
+        // time (pre-existing engine limitation, out of scope); the
+        // numeric path exercises the same exact-decimal code exactly.
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT width_bucket(0, 0, 5e-324, 4), width_bucket(5e-324, 0, 5e-324, 4)"
+                )
+                .unwrap()
+            )[0],
+            vec!["1", "5"]
+        );
+        // Result beyond int32 errors (PG: integer out of range).
+        assert_eq!(
+            err_code(&mut eng, "SELECT width_bucket(1::float8, 0, 1, 2147483647)"),
+            "22003"
+        );
+        // NULL is strict on all four arguments.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT width_bucket(NULL, 0, 10, 5), width_bucket(1, 0, NULL, 5), width_bucket(1, 0, 10, NULL)").unwrap())[0],
+            vec!["NULL", "NULL", "NULL"]
+        );
+    }
+
+    #[test]
+    fn trunc_two_arg() {
+        let mut eng = engine();
+        // v0.55 raised 42883 for the two-argument form.
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT trunc(19.99, 1), trunc(19.99, -1), trunc(1.99999, 3), trunc(-19.99, 1)"
+                )
+                .unwrap()
+            )[0],
+            vec!["19.9", "10", "1.999", "-19.9"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT trunc(19.99::float8, 1)").unwrap())[0],
+            vec!["19.9"]
+        );
+        // Huge negative scale must not overflow (old code panicked in debug).
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT trunc(1.5, -2147483648)").unwrap())[0],
+            vec!["0"]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT trunc(1.5, NULL)").unwrap())[0],
+            vec!["NULL"]
+        );
+        assert_eq!(err_code(&mut eng, "SELECT trunc(1.5, 1, 2)"), "42883");
+        // One-argument behavior unchanged.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT trunc(19.99), trunc(9.9::float8)").unwrap())[0],
+            vec!["19", "9"]
         );
     }
 

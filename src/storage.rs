@@ -1536,6 +1536,11 @@ impl Numeric {
     /// v0.18: Truncate toward zero to `new_scale` (no rounding).
     /// v0.22: `new_scale` is signed. If the divisor would overflow i128
     /// the truncated value is necessarily zero (|unscaled| < divisor).
+    /// v0.56: use i64 arithmetic for the scale difference — with a very
+    /// negative `new_scale` (e.g. `trunc(x, -2147483648)`) the i32
+    /// subtraction `self.scale - new_scale` could overflow and panic in
+    /// debug builds. |unscaled| < 10^39, so a divisor of 10^39 or more
+    /// always truncates to zero.
     pub fn trunc_to_scale(&self, new_scale: i32) -> Numeric {
         if self.special != NumericSpecial::Finite {
             return self.clone();
@@ -1543,10 +1548,11 @@ impl Numeric {
         if new_scale >= self.scale {
             return self.clone();
         }
-        let div = match 10i128.checked_pow((self.scale - new_scale) as u32) {
-            Some(d) => d,
-            None => return Numeric::new(0, new_scale),
-        };
+        let diff = self.scale as i64 - new_scale as i64;
+        if diff >= 39 {
+            return Numeric::new(0, new_scale);
+        }
+        let div = 10i128.pow(diff as u32);
         Numeric::new(self.unscaled / div, new_scale)
     }
 
@@ -1663,6 +1669,484 @@ impl PartialOrd for Numeric {
 impl Ord for Numeric {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         Numeric::cmp(self, other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.56: exact decimal arithmetic for `width_bucket` (PG19 semantics).
+//
+// PG's width_bucket computes the in-range bucket as
+// floor((op - b1) / (b2 - b1) * count) + 1 exactly: the regression tests
+// prove the float8 variant is not naive float64 arithmetic (e.g.
+// width_bucket(0, -1e100::float8, 1, 10) = 10, where float64 would round
+// 1e100/(1e100+1) to 1.0 and yield 11). Doing it in f64 also collapses
+// huge numerics to infinity and i128 is too small for 1e100-scale
+// values, so this section provides the minimal exact machinery: a
+// base-1e9 unsigned bignum (`BigUint`) and a signed decimal (`BigDec`:
+// sign + magnitude + decimal scale), with comparison, add/sub, small
+// multiplication, multiply-by-10^k, schoolbook big multiplication, and
+// exact floor division with a 2^31 quotient cap (width_bucket returns
+// int4, so a larger quotient is PG's "integer out of range" anyway).
+// The width_bucket orchestration itself lives in exec.rs.
+// ---------------------------------------------------------------------------
+
+/// v0.56: why `BigDec::parse_decimal` refused a literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecimalParseError {
+    /// Not a decimal literal at all.
+    Syntax,
+    /// Syntactically valid but beyond the supported digit caps (PG also
+    /// rejects these: "value overflows numeric format").
+    TooBig,
+}
+
+/// v0.56: unsigned arbitrary-precision integer, base-1e9 limbs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BigUint {
+    /// Little-endian base-1_000_000_000 limbs; canonical form has no
+    /// leading zero limbs (zero is the empty vector).
+    limbs: Vec<u32>,
+}
+
+impl BigUint {
+    /// The value zero.
+    pub(crate) fn zero() -> Self {
+        BigUint { limbs: Vec::new() }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.limbs.is_empty()
+    }
+
+    fn normalize(&mut self) {
+        while self.limbs.last() == Some(&0) {
+            self.limbs.pop();
+        }
+    }
+
+    pub(crate) fn from_u64(mut v: u64) -> Self {
+        let mut out = BigUint::zero();
+        while v > 0 {
+            out.limbs.push((v % 1_000_000_000) as u32);
+            v /= 1_000_000_000;
+        }
+        out
+    }
+
+    pub(crate) fn from_u128(mut v: u128) -> Self {
+        let mut out = BigUint::zero();
+        while v > 0 {
+            out.limbs.push((v % 1_000_000_000) as u32);
+            v /= 1_000_000_000;
+        }
+        out
+    }
+
+    /// Parse an all-digit string (no sign, point, or exponent); leading
+    /// zeros are fine. Linear time: each 9-digit chunk taken from the
+    /// right end is exactly one limb.
+    pub(crate) fn from_decimal_str(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        let mut limbs = Vec::new();
+        let mut end = bytes.len();
+        while end > 0 {
+            let start = end.saturating_sub(9);
+            let mut v: u32 = 0;
+            for &b in &bytes[start..end] {
+                v = v * 10 + (b - b'0') as u32;
+            }
+            limbs.push(v);
+            end = start;
+        }
+        let mut out = BigUint { limbs };
+        out.normalize();
+        out
+    }
+
+    pub(crate) fn cmp(&self, other: &BigUint) -> std::cmp::Ordering {
+        if self.limbs.len() != other.limbs.len() {
+            return self.limbs.len().cmp(&other.limbs.len());
+        }
+        for (a, b) in self.limbs.iter().rev().zip(other.limbs.iter().rev()) {
+            if a != b {
+                return a.cmp(b);
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// self += other.
+    pub(crate) fn add_assign(&mut self, other: &BigUint) {
+        if other.is_zero() {
+            return;
+        }
+        if self.limbs.len() < other.limbs.len() {
+            self.limbs.resize(other.limbs.len(), 0);
+        }
+        let mut carry: u64 = 0;
+        for (i, &o) in other.limbs.iter().enumerate() {
+            let cur = self.limbs[i] as u64 + o as u64 + carry;
+            self.limbs[i] = (cur % 1_000_000_000) as u32;
+            carry = cur / 1_000_000_000;
+        }
+        let mut i = other.limbs.len();
+        while carry > 0 {
+            if i == self.limbs.len() {
+                self.limbs.push(0);
+            }
+            let cur = self.limbs[i] as u64 + carry;
+            self.limbs[i] = (cur % 1_000_000_000) as u32;
+            carry = cur / 1_000_000_000;
+            i += 1;
+        }
+    }
+
+    /// self -= other; requires self >= other.
+    pub(crate) fn sub_assign(&mut self, other: &BigUint) {
+        debug_assert!(self.cmp(other) != std::cmp::Ordering::Less);
+        let mut borrow: i64 = 0;
+        for i in 0..self.limbs.len() {
+            let o = if i < other.limbs.len() {
+                other.limbs[i] as i64
+            } else {
+                0
+            };
+            let cur = self.limbs[i] as i64 - o - borrow;
+            if cur < 0 {
+                self.limbs[i] = (cur + 1_000_000_000) as u32;
+                borrow = 1;
+            } else {
+                self.limbs[i] = cur as u32;
+                borrow = 0;
+            }
+        }
+        debug_assert!(borrow == 0);
+        self.normalize();
+    }
+
+    /// self *= m.
+    pub(crate) fn mul_small_assign(&mut self, m: u64) {
+        if m == 0 || self.is_zero() {
+            self.limbs.clear();
+            return;
+        }
+        if m == 1 {
+            return;
+        }
+        let mut carry: u128 = 0;
+        for limb in self.limbs.iter_mut() {
+            let cur = *limb as u128 * m as u128 + carry;
+            *limb = (cur % 1_000_000_000) as u32;
+            carry = cur / 1_000_000_000;
+        }
+        while carry > 0 {
+            self.limbs.push((carry % 1_000_000_000) as u32);
+            carry /= 1_000_000_000;
+        }
+    }
+
+    /// self *= 10^k.
+    pub(crate) fn mul_pow10_assign(&mut self, k: u32) {
+        if self.is_zero() || k == 0 {
+            return;
+        }
+        let r = k % 9;
+        if r > 0 {
+            self.mul_small_assign(10u64.pow(r));
+        }
+        // A base-1e9 limb shift multiplies by 10^(9q).
+        let q = (k / 9) as usize;
+        if q > 0 {
+            let mut limbs = vec![0u32; q];
+            limbs.append(&mut self.limbs);
+            self.limbs = limbs;
+        }
+    }
+
+    /// self /= d, rounding down (d <= 1_000_000_000).
+    pub(crate) fn div_small_assign(&mut self, d: u32) {
+        debug_assert!(d > 0 && d <= 1_000_000_000);
+        let mut rem: u64 = 0;
+        for i in (0..self.limbs.len()).rev() {
+            let cur = rem * 1_000_000_000 + self.limbs[i] as u64;
+            self.limbs[i] = (cur / d as u64) as u32;
+            rem = cur % d as u64;
+        }
+        self.normalize();
+    }
+
+    /// Full product (schoolbook O(n*m)). The u128 accumulator is far
+    /// wider than any entry can reach: each entry sums at most
+    /// min(len) products below 1e18 plus carries.
+    pub(crate) fn mul(&self, other: &BigUint) -> BigUint {
+        if self.is_zero() || other.is_zero() {
+            return BigUint::zero();
+        }
+        let mut acc = vec![0u128; self.limbs.len() + other.limbs.len()];
+        for (i, &a) in self.limbs.iter().enumerate() {
+            for (j, &b) in other.limbs.iter().enumerate() {
+                acc[i + j] += a as u128 * b as u128;
+            }
+        }
+        let mut limbs = Vec::with_capacity(acc.len() + 1);
+        let mut carry: u128 = 0;
+        for v in acc {
+            let cur = v + carry;
+            limbs.push((cur % 1_000_000_000) as u32);
+            carry = cur / 1_000_000_000;
+        }
+        while carry > 0 {
+            limbs.push((carry % 1_000_000_000) as u32);
+            carry /= 1_000_000_000;
+        }
+        let mut out = BigUint { limbs };
+        out.normalize();
+        out
+    }
+
+    /// Exact floor(self / other); requires other > 0. Returns None when
+    /// the quotient reaches 2^31 — width_bucket returns int4, so the
+    /// caller reports PG's "integer out of range" instead. At most 31
+    /// halving steps, each one schoolbook multiply plus a comparison.
+    pub(crate) fn floor_div_bounded(&self, other: &BigUint) -> Option<BigUint> {
+        debug_assert!(!other.is_zero());
+        // quotient >= 2^31  <=>  self >= other * 2^31.
+        let mut limit = other.clone();
+        limit.mul_small_assign(1u64 << 31);
+        if self.cmp(&limit) != std::cmp::Ordering::Less {
+            return None;
+        }
+        let mut lo = BigUint::zero();
+        let mut hi = BigUint::from_u64(1u64 << 31);
+        // Invariant: lo*other <= self < hi*other.
+        for _ in 0..31 {
+            let mut mid = lo.clone();
+            mid.add_assign(&hi);
+            mid.div_small_assign(2);
+            if mid.mul(other).cmp(self) != std::cmp::Ordering::Greater {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo)
+    }
+
+    /// Value as u64; None when it does not fit (only used on bounded
+    /// quotients, which always fit).
+    pub(crate) fn to_u64(&self) -> Option<u64> {
+        let mut v: u64 = 0;
+        for &limb in self.limbs.iter().rev() {
+            v = v.checked_mul(1_000_000_000)?.checked_add(limb as u64)?;
+        }
+        Some(v)
+    }
+}
+
+/// v0.56: exact signed decimal: value = (-1)^neg * mag * 10^(-scale).
+/// Zero is always non-negative with an empty magnitude.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BigDec {
+    neg: bool,
+    mag: BigUint,
+    scale: i32,
+}
+
+impl BigDec {
+    /// Digit caps for `parse_decimal`, mirroring `Numeric::parse`'s
+    /// 131072-digit / 200000-scale limits so adversarial literals stay
+    /// cheap (PG rejects them with "value overflows numeric format").
+    const MAX_DIGITS: usize = 200_000;
+    const MAX_SCALE: i32 = 200_000;
+
+    pub(crate) fn zero() -> Self {
+        BigDec {
+            neg: false,
+            mag: BigUint::zero(),
+            scale: 0,
+        }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.mag.is_zero()
+    }
+
+    /// Canonicalize (-0 becomes +0).
+    fn normalize(mut self) -> Self {
+        if self.mag.is_zero() {
+            self.neg = false;
+        }
+        self
+    }
+
+    /// |self.scale - other.scale| as u32 for limb padding. All
+    /// constructors cap |scale| (parse: 200000, f64: 1074), so this
+    /// cannot overflow in practice; the expect documents the invariant.
+    fn scale_pad(a: i32, b: i32) -> u32 {
+        let d = (a as i64 - b as i64).unsigned_abs();
+        u32::try_from(d).expect("width_bucket scale difference is bounded")
+    }
+
+    /// Exact conversion from i64.
+    pub(crate) fn from_i64(v: i64) -> Self {
+        BigDec {
+            neg: v < 0,
+            mag: BigUint::from_u64(v.unsigned_abs()),
+            scale: 0,
+        }
+        .normalize()
+    }
+
+    /// Exact conversion from a finite Numeric; None for NaN/infinity.
+    pub(crate) fn from_numeric(n: &Numeric) -> Option<Self> {
+        if n.special != NumericSpecial::Finite {
+            return None;
+        }
+        Some(
+            BigDec {
+                neg: n.unscaled < 0,
+                mag: BigUint::from_u128(n.unscaled.unsigned_abs()),
+                scale: n.scale,
+            }
+            .normalize(),
+        )
+    }
+
+    /// Parse `[+-]?digits[.digits][e[+-]digits]`. Fallback for literals
+    /// `Numeric::parse` rejects with Overflow (huge digit counts); PG
+    /// caps such inputs too, so anything beyond the caps is TooBig.
+    pub(crate) fn parse_decimal(s: &str) -> Result<Self, DecimalParseError> {
+        let s = s.trim();
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (mant_raw, exp_raw) = match s.find(['e', 'E']) {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        };
+        // v0.25-style `_` digit separators (PG 16+), validated per part
+        // exactly like Numeric::parse.
+        let exp_clean;
+        let exp_str = match exp_raw {
+            Some(e) => {
+                exp_clean = strip_underscores(e).ok_or(DecimalParseError::Syntax)?;
+                Some(exp_clean.as_str())
+            }
+            None => None,
+        };
+        let (int_raw, frac_raw) = match mant_raw.find('.') {
+            Some(i) => (&mant_raw[..i], &mant_raw[i + 1..]),
+            None => (mant_raw, ""),
+        };
+        let int_clean = strip_underscores_opt(int_raw).ok_or(DecimalParseError::Syntax)?;
+        let frac_clean = strip_underscores_opt(frac_raw).ok_or(DecimalParseError::Syntax)?;
+        let (int_part, frac_part) = (int_clean.as_str(), frac_clean.as_str());
+        let exp: i32 = match exp_str {
+            Some(e) => e.parse().map_err(|_| DecimalParseError::Syntax)?,
+            None => 0,
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(DecimalParseError::Syntax);
+        }
+        if int_part.len() + frac_part.len() > Self::MAX_DIGITS {
+            return Err(DecimalParseError::TooBig);
+        }
+        // value = digits * 10^(exp - frac_len)
+        let scale = frac_part.len() as i64 - exp as i64;
+        if scale.abs() > Self::MAX_SCALE as i64 {
+            return Err(DecimalParseError::TooBig);
+        }
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        let mut mag = BigUint::from_decimal_str(&digits);
+        let scale = if scale < 0 {
+            mag.mul_pow10_assign((-scale) as u32);
+            0
+        } else {
+            scale as i32
+        };
+        Ok(BigDec { neg, mag, scale }.normalize())
+    }
+
+    /// Signed comparison.
+    pub(crate) fn cmp(&self, other: &BigDec) -> std::cmp::Ordering {
+        if self.is_zero() && other.is_zero() {
+            return std::cmp::Ordering::Equal;
+        }
+        if self.neg != other.neg {
+            return if self.neg {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        let ord = if self.scale == other.scale {
+            self.mag.cmp(&other.mag)
+        } else if self.scale > other.scale {
+            let mut padded = other.mag.clone();
+            padded.mul_pow10_assign(Self::scale_pad(self.scale, other.scale));
+            self.mag.cmp(&padded)
+        } else {
+            let mut padded = self.mag.clone();
+            padded.mul_pow10_assign(Self::scale_pad(other.scale, self.scale));
+            padded.cmp(&other.mag)
+        };
+        if self.neg { ord.reverse() } else { ord }
+    }
+
+    /// Signed subtraction.
+    pub(crate) fn sub(&self, other: &BigDec) -> BigDec {
+        let (mut ma, mut mb) = (self.mag.clone(), other.mag.clone());
+        let scale = if self.scale >= other.scale {
+            mb.mul_pow10_assign(Self::scale_pad(self.scale, other.scale));
+            self.scale
+        } else {
+            ma.mul_pow10_assign(Self::scale_pad(other.scale, self.scale));
+            other.scale
+        };
+        if self.neg == other.neg {
+            match ma.cmp(&mb) {
+                std::cmp::Ordering::Equal => BigDec::zero(),
+                std::cmp::Ordering::Greater => {
+                    ma.sub_assign(&mb);
+                    BigDec {
+                        neg: self.neg,
+                        mag: ma,
+                        scale,
+                    }
+                    .normalize()
+                }
+                std::cmp::Ordering::Less => {
+                    mb.sub_assign(&ma);
+                    BigDec {
+                        neg: !self.neg,
+                        mag: mb,
+                        scale,
+                    }
+                    .normalize()
+                }
+            }
+        } else {
+            ma.add_assign(&mb);
+            BigDec {
+                neg: self.neg,
+                mag: ma,
+                scale,
+            }
+            .normalize()
+        }
+    }
+
+    /// Magnitude accessor for the bucket computation in exec.rs.
+    pub(crate) fn mag(&self) -> &BigUint {
+        &self.mag
+    }
+
+    /// Scale accessor for the bucket computation in exec.rs.
+    pub(crate) fn scale(&self) -> i32 {
+        self.scale
     }
 }
 
@@ -4459,5 +4943,78 @@ mod tests {
         assert!(one < inf);
         assert!(inf < nan);
         assert!(neg_inf < nan);
+    }
+
+    /// v0.56: exact-decimal support behind width_bucket. The classic
+    /// hazard is 1e100/(1e100+1) rounding to 1.0 in float64, so the
+    /// bucket math must be exact on 300+ digit integers.
+    #[test]
+    fn biguint_exact_arithmetic() {
+        use std::cmp::Ordering;
+        // 10^100 + 1, then back down: add/sub round-trip.
+        let a = BigUint::from_decimal_str(&format!("1{}", "0".repeat(100)));
+        let mut b = a.clone();
+        b.add_assign(&BigUint::from_u64(1));
+        assert_eq!(b.cmp(&a), Ordering::Greater);
+        b.sub_assign(&BigUint::from_u64(1));
+        assert_eq!(b.cmp(&a), Ordering::Equal);
+        // Bounded floor division: floor(10 * 1e100 / (1e100+1)) = 9,
+        // the bucket-quotient heart of width_bucket.
+        let mut num = a.clone();
+        num.mul_small_assign(10);
+        let mut den = a.clone();
+        den.add_assign(&BigUint::from_u64(1));
+        let q = BigUint::floor_div_bounded(&num, &den).expect("quotient < 2^31");
+        assert_eq!(q.to_u64(), Some(9));
+        // A quotient at or above 2^31 is reported as None, not wrapped.
+        let big = BigUint::from_decimal_str("4294967296");
+        assert!(BigUint::floor_div_bounded(&big, &BigUint::from_u64(1)).is_none());
+        // Schoolbook mul: 10^18 * 10^18 = 10^36 exactly.
+        let e18 = BigUint::from_decimal_str(&format!("1{}", "0".repeat(18)));
+        let e36 = e18.mul(&e18);
+        let want36 = BigUint::from_decimal_str(&format!("1{}", "0".repeat(36)));
+        assert_eq!(e36.cmp(&want36), Ordering::Equal);
+    }
+
+    #[test]
+    fn bigdec_parse_compare_sub() {
+        use std::cmp::Ordering;
+        let n = Numeric::parse("123.450").unwrap();
+        let d = BigDec::from_numeric(&n).unwrap();
+        assert_eq!(
+            d.cmp(&BigDec::parse_decimal("123.450").unwrap()),
+            Ordering::Equal
+        );
+        assert_eq!(
+            d.cmp(&BigDec::parse_decimal("123.45").unwrap()),
+            Ordering::Equal
+        );
+        // Underscore separators validate like the numeric parser.
+        assert!(BigDec::parse_decimal("1_0.5").is_ok());
+        assert!(BigDec::parse_decimal("1__0").is_err());
+        assert!(BigDec::parse_decimal("1.5_").is_err());
+        assert!(BigDec::parse_decimal("abc").is_err());
+        // Comparison across scales: -1e100 < 1.
+        let lo = BigDec::parse_decimal(&format!("-1{}", "0".repeat(100))).unwrap();
+        let one = BigDec::parse_decimal("1").unwrap();
+        assert_eq!(lo.cmp(&one), Ordering::Less);
+        // 1 - (-1e100) = 1e100 + 1 exactly: magnitude has 101 digits.
+        let hi = one.sub(&lo);
+        assert!(!hi.is_zero());
+        let mut want = BigUint::from_decimal_str(&format!("1{}", "0".repeat(100)));
+        want.add_assign(&BigUint::from_u64(1));
+        assert_eq!(hi.mag().cmp(&want), Ordering::Equal);
+        assert_eq!(hi.scale(), 0);
+        // from_i64 extremes order sanely.
+        assert_eq!(
+            BigDec::from_i64(i64::MIN).cmp(&BigDec::from_i64(-1)),
+            Ordering::Less
+        );
+        // Scale alignment in sub: 5.0000000000001 - 5 = 1e-13.
+        let a = BigDec::parse_decimal("5.0000000000001").unwrap();
+        let b = BigDec::parse_decimal("5").unwrap();
+        let diff = a.sub(&b);
+        let tiny = BigDec::parse_decimal("0.0000000000001").unwrap();
+        assert_eq!(diff.cmp(&tiny), Ordering::Equal);
     }
 }
