@@ -811,9 +811,9 @@ impl Literal {
             Literal::SmallInt(_) => ColType::SmallInt,
             Literal::Float(_) => ColType::Float,
             // v0.18: decimal literals are numeric, like PostgreSQL.
-            Literal::Decimal(_) => ColType::Numeric,
+            Literal::Decimal(_) => ColType::Numeric(None),
             Literal::Real(_) => ColType::Float4,
-            Literal::Numeric(_) => ColType::Numeric,
+            Literal::Numeric(_) => ColType::Numeric(None),
             Literal::Text(_) => ColType::Text,
             Literal::Bool(_) => ColType::Bool,
             Literal::Date(_) => ColType::Date,
@@ -3027,38 +3027,62 @@ impl Parser {
                 Ok(ColType::Float)
             }
             "numeric" | "decimal" => {
-                // Optional (p[, s]); parsed and ignored.
+                // v0.60: optional (p[, s]) typmod, stored on the type
+                // like PG19's numerictypmodin: precision 1..1000, scale
+                // -1000..1000 (22023 otherwise). Negative scales are
+                // allowed since PG15 (e.g. numeric(3,-6)).
+                let mut typmod: Option<(u32, i32)> = None;
                 if *self.peek() == Token::LParen {
                     self.next();
-                    match self.next() {
-                        Token::Number(_) => {}
+                    let precision: i64 = match self.next() {
+                        Token::Number(n) => n.parse().map_err(|_| {
+                            err(format!("syntax error: bad numeric precision {:?}", n))
+                        })?,
                         other => {
                             return Err(err(format!(
                                 "syntax error: expected numeric precision, found {:?}",
                                 other
                             )));
                         }
+                    };
+                    if precision < 1 || precision > 1000 {
+                        return Err(err_typmod(format!(
+                            "precision {} must be between 1 and 1000",
+                            precision
+                        )));
                     }
+                    let mut scale: i64 = 0;
                     if *self.peek() == Token::Comma {
                         self.next();
-                        // v0.59: PG19 allows a negative scale in
-                        // numeric(p, s) typmods (e.g. numeric(3,-6)).
-                        if *self.peek() == Token::Minus {
+                        let neg = if *self.peek() == Token::Minus {
                             self.next();
-                        }
-                        match self.next() {
-                            Token::Number(_) => {}
+                            true
+                        } else {
+                            false
+                        };
+                        let mag: i64 = match self.next() {
+                            Token::Number(n) => n.parse().map_err(|_| {
+                                err(format!("syntax error: bad numeric scale {:?}", n))
+                            })?,
                             other => {
                                 return Err(err(format!(
                                     "syntax error: expected numeric scale, found {:?}",
                                     other
                                 )));
                             }
+                        };
+                        scale = if neg { -mag } else { mag };
+                        if scale < -1000 || scale > 1000 {
+                            return Err(err_typmod(format!(
+                                "scale {} must be between -1000 and 1000",
+                                scale
+                            )));
                         }
                     }
                     self.expect(Token::RParen, "')'")?;
+                    typmod = Some((precision as u32, scale as i32));
                 }
-                Ok(ColType::Numeric)
+                Ok(ColType::Numeric(typmod))
             }
             "bool" | "boolean" => Ok(ColType::Bool),
             "text" => Ok(ColType::Text),
@@ -4999,7 +5023,10 @@ impl Parser {
             // so high-precision decimals don't round-trip through f64.
             // (Postgres parses decimal literals as numeric in the first
             // place; v0.7 keeps float8 for expressions but not for this.)
-            if let (Expr::Literal(Literal::Decimal(s)), crate::storage::ColType::Numeric) =
+            // v0.60: only fold for unconstrained `numeric`; a
+            // `numeric(p,s)` target must go through the cast so the
+            // typmod is applied.
+            if let (Expr::Literal(Literal::Decimal(s)), crate::storage::ColType::Numeric(None)) =
                 (&expr, &to)
             {
                 if let Ok(n) = crate::storage::Numeric::parse(s) {
@@ -8644,7 +8671,7 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "smallint" | "int2" => ColType::SmallInt,
         "double precision" | "float8" | "float" => ColType::Float,
         "real" | "float4" => ColType::Float4,
-        "numeric" | "decimal" => ColType::Numeric,
+        "numeric" | "decimal" => ColType::Numeric(None),
         "text" | "varchar" | "character varying" => ColType::Text,
         "boolean" | "bool" => ColType::Bool,
         "date" => ColType::Date,

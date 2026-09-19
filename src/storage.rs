@@ -31,13 +31,14 @@ use crate::sql::{CheckDef, DefaultExpr, FkDef, TableDef, UniqueDef};
 /// Column data types supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
-    Int,      // INT4, OID 23
-    BigInt,   // INT8, OID 20 (v0.7)
-    SmallInt, // INT2, OID 21 (v0.7)
-    Float,    // FLOAT8, OID 701
-    Float4,   // FLOAT4, OID 700 (v0.7)
-    Numeric,  // NUMERIC, OID 1700 (v0.7)
-    Text,     // OID 25
+    Int,                         // INT4, OID 23
+    BigInt,                      // INT8, OID 20 (v0.7)
+    SmallInt,                    // INT2, OID 21 (v0.7)
+    Float,                       // FLOAT8, OID 701
+    Float4,                      // FLOAT4, OID 700 (v0.7)
+    Numeric(Option<(u32, i32)>), // NUMERIC, OID 1700 (v0.7); v0.60: optional
+    // (precision, scale) typmod, like PG19 `numeric(p,s)`.
+    Text, // OID 25
     // v0.35: SQL character types with typmod (PG19 bpchar/varchar).
     // Char(Some(n)) is blank-padded `character(n)`; Char(None) is
     // `character`/`bpchar` with typmod -1 (no padding, no limit).
@@ -80,7 +81,7 @@ impl ColType {
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
-            ColType::Numeric => 1700,     // NUMERIC
+            ColType::Numeric(..) => 1700, // NUMERIC
             ColType::Date => 1082,        // DATE
             ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
@@ -98,7 +99,7 @@ impl ColType {
             ColType::SmallInt => "smallint",
             ColType::Float => "double precision",
             ColType::Float4 => "real",
-            ColType::Numeric => "numeric",
+            ColType::Numeric(..) => "numeric",
             ColType::Text => "text",
             // v0.35: PG's format_type() shows the typmod; the harness and
             // wire column names only need the base name.
@@ -126,7 +127,7 @@ impl ColType {
             ColType::SmallInt => "int2",
             ColType::Float => "float8",
             ColType::Float4 => "float4",
-            ColType::Numeric => "numeric",
+            ColType::Numeric(..) => "numeric",
             ColType::Text => "text",
             // v0.35: PG names `CAST(x AS char(n))` output columns `bpchar`
             // and `CAST(x AS varchar(n))` ones `varchar`.
@@ -154,6 +155,9 @@ impl ColType {
             ColType::Char(None) => "character".to_string(),
             ColType::Varchar(Some(n)) => format!("character varying({})", n),
             ColType::Varchar(None) => "character varying".to_string(),
+            // v0.60: PG19's format_type shows the numeric typmod too.
+            ColType::Numeric(Some((p, s))) => format!("numeric({},{})", p, s),
+            ColType::Numeric(None) => "numeric".to_string(),
             other => other.sql_name().to_string(),
         }
     }
@@ -168,7 +172,7 @@ impl ColType {
                 | ColType::Char(_)
                 | ColType::Varchar(_)
                 | ColType::Bytea
-                | ColType::Numeric
+                | ColType::Numeric(..)
         )
     }
 
@@ -180,7 +184,7 @@ impl ColType {
             return toast_storage::PLAIN;
         }
         match self {
-            ColType::Numeric => toast_storage::MAIN,
+            ColType::Numeric(..) => toast_storage::MAIN,
             _ => toast_storage::EXTENDED,
         }
     }
@@ -335,6 +339,20 @@ pub enum NumericSpecial {
     NaN,
     PosInf,
     NegInf,
+}
+
+/// Outcome of [`Numeric::apply_typmod`]: PG19 raises
+/// `ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE` (22003, "numeric field
+/// overflow") in both cases, with a DETAIL naming the typmod.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypmodError {
+    /// +/-Infinity cannot be stored in a typmod-constrained column
+    /// (PG19: "cannot hold an infinite value").
+    Infinite,
+    /// The value rounded to `scale` needs more than
+    /// `precision - scale` digits left of the decimal point
+    /// (PG19: "must round to an absolute value less than ...").
+    Overflow,
 }
 
 impl Numeric {
@@ -1039,6 +1057,65 @@ impl Numeric {
             return None;
         }
         Some(r)
+    }
+
+    /// v0.60: PG19 `apply_typmod` for `numeric(p, s)` assignment
+    /// (src/backend/utils/adt/numeric.c): NaN passes through
+    /// unchanged; infinities error; otherwise the value is rounded
+    /// to `s` fractional digits (ties away from zero, like
+    /// [`Numeric::round_to`]) and errors when the integer digits
+    /// exceed `p - s`. Negative scales are allowed since PG15: the
+    /// value rounds left of the decimal point.
+    ///
+    /// The stored result keeps a non-negative display scale: PG's
+    /// own regression suite shows `scale()` returning 0 for values
+    /// in a `numeric(3,-6)` column, and values print as plain
+    /// integers.
+    pub fn apply_typmod(&self, precision: u32, scale: i32) -> Result<Numeric, TypmodError> {
+        if self.is_nan() {
+            return Ok(self.clone());
+        }
+        if self.special != NumericSpecial::Finite {
+            return Err(TypmodError::Infinite);
+        }
+        let rounded = self.round_to(scale).ok_or(TypmodError::Overflow)?;
+        // PG's rule (numeric.out: "must round to an absolute value less
+        // than 10^(precision-scale)"): overflow iff
+        // |rounded| >= 10^(precision-scale). In unscaled terms with the
+        // rounded value at scale rs, that is
+        // |unscaled| >= 10^(precision - scale + rs).
+        let limit_pow = precision as i64 - scale as i64 + rounded.scale as i64;
+        let overflows = if rounded.unscaled == 0 {
+            false
+        } else if limit_pow <= 0 {
+            // 10^limit_pow <= 1 <= |unscaled|: any nonzero value overflows.
+            true
+        } else {
+            match 10i128.checked_pow(limit_pow as u32) {
+                Some(limit) => rounded.unscaled.unsigned_abs() >= limit as u128,
+                // 10^limit_pow exceeds i128: |unscaled| cannot reach it.
+                None => false,
+            }
+        };
+        if overflows {
+            return Err(TypmodError::Overflow);
+        }
+        // Clamp a negative display scale up to 0: the value is an
+        // exact integer multiple of 10^-scale by construction, so
+        // shifting the point is value-identical. Checked multiply;
+        // on overflow (absurd magnitudes only) the negative scale
+        // is kept and the value stays numerically correct.
+        let mut r = rounded;
+        while r.scale < 0 {
+            match r.unscaled.checked_mul(10) {
+                Some(m) => {
+                    r.unscaled = m;
+                    r.scale += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(r)
     }
 
     /// v0.18: specials are fixed points of floor/ceil.
@@ -2529,7 +2606,7 @@ impl Value {
             Value::BigInt(_) => ColType::BigInt,
             Value::Float4(_) => ColType::Float4,
             Value::Float(_) => ColType::Float,
-            Value::Numeric(_) => ColType::Numeric,
+            Value::Numeric(_) => ColType::Numeric(None),
             Value::Text(_) => ColType::Text,
             // v0.35: the value alone doesn't record the typmod; Char(None)
             // is the honest fallback (bare `character`).
@@ -5396,6 +5473,47 @@ mod v059_division_tests {
         assert_eq!(num("2.5").round_to(0).unwrap().to_text(), "3");
         assert_eq!(num("-2.5").round_to(0).unwrap().to_text(), "-3");
         assert_eq!(num("2.4").round_to(0).unwrap().to_text(), "2");
+    }
+
+    #[test]
+    fn numeric_typmod_pg19() {
+        // v0.60: PG19 `apply_typmod` for numeric(p,s) assignment
+        // (bundled PG19 numeric.out cases).
+        let t = |s: &str, p: u32, sc: i32| num(s).apply_typmod(p, sc);
+        // numeric(4,4): round to scale, then overflow.
+        assert_eq!(t("0.99994", 4, 4).unwrap().to_text(), "0.9999");
+        assert_eq!(t("0.00017", 4, 4).unwrap().to_text(), "0.0002");
+        assert_eq!(t("1.0", 4, 4), Err(TypmodError::Overflow));
+        assert_eq!(t("0.99995", 4, 4), Err(TypmodError::Overflow));
+        // +/-Infinity rejected, NaN allowed.
+        assert_eq!(t("Infinity", 4, 4), Err(TypmodError::Infinite));
+        assert_eq!(t("-Infinity", 4, 4), Err(TypmodError::Infinite));
+        assert!(t("NaN", 4, 4).unwrap().is_nan());
+        // numeric(3,-6): round left of the point, keep scale 0.
+        assert_eq!(t("123456", 3, -6).unwrap().to_text(), "0");
+        assert_eq!(t("654321", 3, -6).unwrap().to_text(), "1000000");
+        assert_eq!(t("999500000", 3, -6), Err(TypmodError::Overflow));
+        assert_eq!(t("999499999", 3, -6).unwrap().to_text(), "999000000");
+        // numeric(3,3) keeps the value; (3,0) rounds fractions.
+        assert_eq!(t("0.123", 3, 3).unwrap().to_text(), "0.123");
+        assert_eq!(t("3.7", 3, 0).unwrap().to_text(), "4");
+        assert_eq!(t("999", 3, 0).unwrap().to_text(), "999");
+        assert_eq!(t("1000", 3, 0), Err(TypmodError::Overflow));
+        // Ties round away from zero, like PG.
+        assert_eq!(t("0.5", 3, 0).unwrap().to_text(), "1");
+        assert_eq!(t("-0.5", 3, 0).unwrap().to_text(), "-1");
+        // Zero (and values that round to zero) always fit, even when
+        // precision - scale is negative (PG stores 0.000000 in
+        // numeric(3,6)). But a nonzero value must be strictly less than
+        // 10^(precision-scale): PG rejects 0.0009995 (rounds to 0.001)
+        // and 0.5 in numeric(3,6).
+        assert_eq!(t("0.000000123", 3, 6).unwrap().to_text(), "0");
+        assert_eq!(t("0.0009994", 3, 6).unwrap().to_text(), "0.000999");
+        assert_eq!(t("0.0009995", 3, 6), Err(TypmodError::Overflow));
+        assert_eq!(t("0.5", 3, 6), Err(TypmodError::Overflow));
+        assert_eq!(t("5.0", 3, 6), Err(TypmodError::Overflow));
+        // Unconstrained-equivalent typmods are value-preserving.
+        assert_eq!(t("123.456", 10, 5).unwrap().to_text(), "123.456");
     }
 
     #[test]

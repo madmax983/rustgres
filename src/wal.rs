@@ -671,7 +671,18 @@ impl Enc {
             ColType::SmallInt => 4,
             ColType::BigInt => 5,
             ColType::Float4 => 6,
-            ColType::Numeric => 7,
+            // v0.60: numeric carries an optional (precision, scale)
+            // typmod. Tag 7 keeps its v0.7 meaning (unconstrained) for
+            // old WALs; tag 18 appends after v0.57's with the typmod.
+            ColType::Numeric(tm) => match tm {
+                None => 7,
+                Some((p, s)) => {
+                    self.u8(18);
+                    self.i32(*p as i32);
+                    self.i32(*s);
+                    return;
+                }
+            },
             ColType::Date => 8,
             ColType::Timestamp => 9,
             ColType::Timestamptz => 10,
@@ -1218,7 +1229,7 @@ impl<'a> Dec<'a> {
             4 => Ok(ColType::SmallInt),
             5 => Ok(ColType::BigInt),
             6 => Ok(ColType::Float4),
-            7 => Ok(ColType::Numeric),
+            7 => Ok(ColType::Numeric(None)),
             8 => Ok(ColType::Date),
             9 => Ok(ColType::Timestamp),
             10 => Ok(ColType::Timestamptz),
@@ -1239,6 +1250,12 @@ impl<'a> Dec<'a> {
             16 => Ok(ColType::Regclass),
             // v0.57: name.
             17 => Ok(ColType::Name),
+            // v0.60: numeric with typmod (precision, scale).
+            18 => {
+                let p = self.i32()?;
+                let s = self.i32()?;
+                Ok(ColType::Numeric(Some((p as u32, s))))
+            }
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }
@@ -4243,5 +4260,23 @@ mod tests {
         let id3 = load_or_create_system_id(&dir).unwrap();
         assert_ne!(id3, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v060_numeric_typmod_coltype_roundtrip() {
+        // v0.60: constrained numeric(p,s) survives the WAL coltype
+        // codec (tag 18); unconstrained keeps the legacy tag 7.
+        for tm in [
+            ColType::Numeric(None),
+            ColType::Numeric(Some((10, 2))),
+            ColType::Numeric(Some((3, 6))),
+            ColType::Numeric(Some((5, -2))),
+        ] {
+            let mut e = Enc::new();
+            e.col_type(&tm);
+            let mut d = Dec::new(&e.buf);
+            assert_eq!(d.col_type().unwrap(), tm);
+            d.end().unwrap();
+        }
     }
 }

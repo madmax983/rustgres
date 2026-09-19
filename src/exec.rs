@@ -1413,14 +1413,17 @@ fn coerce_literal(lit: &Literal, col_type: &ColType, col_name: &str) -> Result<V
         // Decimal literal text: parse exactly for numeric targets so
         // high-precision decimals don't round-trip through f64.
         Literal::Decimal(s) => match col_type {
-            ColType::Numeric => crate::storage::Numeric::parse(s)
-                .map(Value::Numeric)
+            // v0.60: a numeric(p,s) target applies PG19's typmod
+            // (round to scale, overflow check).
+            ColType::Numeric(tm) => crate::storage::Numeric::parse(s)
                 .map_err(|_| {
                     exec_err(
                         "22P02",
                         format!("invalid input syntax for type numeric: {:?}", s),
                     )
-                }),
+                })
+                .and_then(|n| apply_numeric_typmod(n, *tm))
+                .map(Value::Numeric),
             ColType::Float4 => s
                 .parse::<f64>()
                 .map(|f| Value::Float4(f as f32))
@@ -1506,18 +1509,50 @@ fn coerce_float_lit(
             Ok(Value::Float4(f as f32))
         }
         ColType::Float => Ok(Value::Float(f)),
-        ColType::Numeric => Numeric::from_f64(f)
-            .map(Value::Numeric)
-            .map_err(|_| exec_err("22003", "value out of range for type numeric")),
+        ColType::Numeric(tm) => Numeric::from_f64(f)
+            .map_err(|_| exec_err("22003", "value out of range for type numeric"))
+            .and_then(|n| apply_numeric_typmod(n, *tm))
+            .map(Value::Numeric),
         ColType::Text => Ok(Value::text(Value::Float(f).to_text().unwrap_or_default())),
         _ => Err(assign_err(col_name, col_type, from)),
     }
 }
 
+/// v0.60: PG19 `apply_typmod` for assignment to `numeric(p,s)`
+/// (src/backend/utils/adt/numeric.c): round to the declared scale,
+/// then error 22003 ("numeric field overflow") when the value needs
+/// more than precision - scale digits left of the decimal point.
+fn apply_numeric_typmod(n: Numeric, tm: Option<(u32, i32)>) -> Result<Numeric, ExecError> {
+    let (p, s) = match tm {
+        None => return Ok(n),
+        Some(t) => t,
+    };
+    n.apply_typmod(p, s).map_err(|e| {
+        let detail = match e {
+            crate::storage::TypmodError::Infinite => format!(
+                "a field with precision {}, scale {} cannot hold an infinite value",
+                p, s
+            ),
+            crate::storage::TypmodError::Overflow => {
+                let bound = if (p as i64) - (s as i64) > 0 {
+                    format!("10^{}", (p as i64) - (s as i64))
+                } else {
+                    "1".to_string()
+                };
+                format!(
+                    "a field with precision {}, scale {} must round to an absolute value less than {}",
+                    p, s, bound
+                )
+            }
+        };
+        exec_err("22003", format!("numeric field overflow: {}", detail))
+    })
+}
+
 /// Numeric literal (unknown type, only via params) to a column.
 fn coerce_numeric_lit(n: &Numeric, col_type: &ColType, col_name: &str) -> Result<Value, ExecError> {
     match col_type {
-        ColType::Numeric => Ok(Value::Numeric(n.clone())),
+        ColType::Numeric(tm) => apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric),
         ColType::Float4 => Ok(Value::Float4(n.to_f64() as f32)),
         ColType::Float => Ok(Value::Float(n.to_f64())),
         ColType::Text => Ok(Value::text(n.to_text())),
@@ -1537,25 +1572,32 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
         (Value::SmallInt(i), ColType::BigInt) => Some(Value::BigInt(*i as i64)),
         (Value::SmallInt(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
         (Value::SmallInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
-        (Value::SmallInt(i), ColType::Numeric) => {
+        (Value::SmallInt(i), ColType::Numeric(_)) => {
             Some(Value::Numeric(Numeric::from_i64(*i as i64)))
         }
         (Value::Int(i), ColType::BigInt) => Some(Value::BigInt(*i)),
         (Value::Int(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
         (Value::Int(i), ColType::Float) => Some(Value::Float(*i as f64)),
-        (Value::Int(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i))),
+        (Value::Int(i), ColType::Numeric(_)) => Some(Value::Numeric(Numeric::from_i64(*i))),
         (Value::BigInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
-        (Value::BigInt(i), ColType::Numeric) => Some(Value::Numeric(Numeric::from_i64(*i))),
+        (Value::BigInt(i), ColType::Numeric(_)) => Some(Value::Numeric(Numeric::from_i64(*i))),
         (Value::Float4(f), ColType::Float) => Some(Value::Float(*f as f64)),
-        (Value::Float4(f), ColType::Numeric) => {
+        (Value::Float4(f), ColType::Numeric(_)) => {
             Numeric::from_f64(*f as f64).ok().map(Value::Numeric)
         }
-        (Value::Float(f), ColType::Numeric) => Numeric::from_f64(*f).ok().map(Value::Numeric),
+        (Value::Float(f), ColType::Numeric(_)) => Numeric::from_f64(*f).ok().map(Value::Numeric),
+        // v0.60: assigning a numeric value to numeric(p,s) applies PG19's typmod.
+        (Value::Numeric(n), ColType::Numeric(_)) => Some(Value::Numeric(n.clone())),
         (Value::Numeric(n), ColType::Float4) => Some(Value::Float4(n.to_f64() as f32)),
         (Value::Numeric(n), ColType::Float) => Some(Value::Float(n.to_f64())),
         _ => None,
     };
     if let Some(w) = widened {
+        // v0.60: assignment to numeric(p,s) applies PG19's typmod
+        // (round to scale, then check precision).
+        if let (Value::Numeric(n), ColType::Numeric(tm)) = (&w, col_type) {
+            return apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric);
+        }
         return Ok(w);
     }
     // Text goes through the type's input function (assignment cast).
@@ -2468,7 +2510,20 @@ fn exec_insert(
                 let mut explicit = vec![false; ncols];
                 for (j, v) in cells.iter().enumerate() {
                     let ti = targets[j];
-                    values[ti] = v.clone();
+                    let (_, ctype) = &meta.columns[ti];
+                    // v0.60: INSERT...SELECT applies the numeric(p,s)
+                    // typmod like any other assignment (PG's
+                    // apply_typmod); the SELECT's rows are Values, not
+                    // pre-coerced to the target type.
+                    values[ti] = match ctype {
+                        ColType::Numeric(tm) => match v {
+                            Value::Numeric(n) => {
+                                apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric)?
+                            }
+                            _ => v.clone(),
+                        },
+                        _ => v.clone(),
+                    };
                     explicit[ti] = true;
                 }
                 // Fill defaults, check constraints (same as VALUES path).
@@ -5077,7 +5132,7 @@ fn type_rank(t: &ColType) -> u8 {
         ColType::SmallInt => 1,
         ColType::Int => 2,
         ColType::BigInt => 3,
-        ColType::Numeric => 4,
+        ColType::Numeric(..) => 4,
         ColType::Float4 => 5,
         ColType::Float => 6,
         _ => 0,
@@ -5090,7 +5145,7 @@ fn value_coltype(v: &Value) -> ColType {
         Value::BigInt(_) => ColType::BigInt,
         Value::Float4(_) => ColType::Float4,
         Value::Float(_) => ColType::Float,
-        Value::Numeric(_) => ColType::Numeric,
+        Value::Numeric(_) => ColType::Numeric(None),
         Value::Text(_) => ColType::Text,
         Value::BpChar(_) => ColType::Char(None),     // v0.35
         Value::SingleChar(_) => ColType::SingleChar, // v0.36
@@ -6192,7 +6247,7 @@ const fn setop_numeric_rank(t: ColType) -> Option<u8> {
         ColType::BigInt => Some(2),
         ColType::Float4 => Some(3),
         ColType::Float => Some(4),
-        ColType::Numeric => Some(5),
+        ColType::Numeric(..) => Some(5),
         _ => None,
     }
 }
@@ -6226,7 +6281,7 @@ fn common_supertype(op_name: &str, a: &ColType, b: &ColType) -> Result<ColType, 
             2 => ColType::BigInt,
             3 => ColType::Float4,
             4 => ColType::Float,
-            _ => ColType::Numeric,
+            _ => ColType::Numeric(None),
         });
     }
     if setop_is_char_family(*a) && setop_is_char_family(*b) {
@@ -9446,7 +9501,7 @@ fn table_function_col_types(name: &str, vals: &[Value]) -> Result<Vec<ColType>, 
             // int4/int8 mixes to int8 (implicit casts); all-NULL (strict,
             // zero rows) defaults to int4, like PG's unknown literals.
             let ty = if vals.iter().any(|v| matches!(v, Value::Numeric(_))) {
-                ColType::Numeric
+                ColType::Numeric(None)
             } else if vals.iter().any(|v| matches!(v, Value::BigInt(_))) {
                 ColType::BigInt
             } else {
@@ -9580,8 +9635,8 @@ fn lateral_function_schema(
         for a in args {
             tys.push(expr_type(eng, snap, own, session, &schemas, &[], a)?);
         }
-        let ty = if tys.iter().any(|t| matches!(t, ColType::Numeric)) {
-            ColType::Numeric
+        let ty = if tys.iter().any(|t| matches!(t, ColType::Numeric(..))) {
+            ColType::Numeric(None)
         } else if tys.iter().any(|t| matches!(t, ColType::BigInt)) {
             ColType::BigInt
         } else {
@@ -12909,7 +12964,7 @@ fn num_col_type(v: &Value) -> Option<ColType> {
         Value::BigInt(_) => Some(ColType::BigInt),
         Value::Float4(_) => Some(ColType::Float4),
         Value::Float(_) => Some(ColType::Float),
-        Value::Numeric(_) => Some(ColType::Numeric),
+        Value::Numeric(_) => Some(ColType::Numeric(None)),
         _ => None,
     }
 }
@@ -14713,7 +14768,10 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             _ => narrow_to_f32(cast_to_f64(v)?).map(Value::Float4),
         },
         ColType::Float => cast_to_f64(v).map(Value::Float),
-        ColType::Numeric => cast_to_numeric(v).map(Value::Numeric),
+        // v0.60: numeric(p,s) casts apply PG19's typmod.
+        ColType::Numeric(tm) => cast_to_numeric(v)
+            .and_then(|n| apply_numeric_typmod(n, tm))
+            .map(Value::Numeric),
         ColType::Date => match v {
             Value::Text(s) => crate::datetime::parse_date(s)
                 .map(Value::Date)
@@ -20274,11 +20332,11 @@ fn func_result_type(
             Ok(ColType::Int)
         }
         "abs" | "sign" => arg0(),
-        "round" | "mod" => Ok(ColType::Numeric),
+        "round" | "mod" => Ok(ColType::Numeric(None)),
         "floor" | "ceil" | "ceiling" => match arg0()? {
             ColType::Float4 => Ok(ColType::Float4),
             ColType::Float => Ok(ColType::Float),
-            _ => Ok(ColType::Numeric),
+            _ => Ok(ColType::Numeric(None)),
         },
         // Any float argument -> Float, else Numeric (documented:
         // Postgres returns numeric for sqrt(real)).
@@ -20289,7 +20347,7 @@ fn func_result_type(
                     _ => {}
                 }
             }
-            Ok(ColType::Numeric)
+            Ok(ColType::Numeric(None))
         }
         // v0.18: exp/ln/log return numeric (or float if any arg is float).
         "exp" | "ln" | "log" => {
@@ -20299,7 +20357,7 @@ fn func_result_type(
                     _ => {}
                 }
             }
-            Ok(ColType::Numeric)
+            Ok(ColType::Numeric(None))
         }
         // v0.18: numeric function batch. These must mirror eval_math_func's
         // actual return types exactly: without them, type resolution raises
@@ -20311,10 +20369,10 @@ fn func_result_type(
                     _ => {}
                 }
             }
-            Ok(ColType::Numeric)
+            Ok(ColType::Numeric(None))
         }
         "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" | "numeric_inc" => {
-            Ok(ColType::Numeric)
+            Ok(ColType::Numeric(None))
         }
         // v0.22: trunc is overloaded like Postgres — numeric in ->
         // numeric out, float in -> float out (mirrors eval_math_func).
@@ -20323,7 +20381,7 @@ fn func_result_type(
         // two-argument form).
         "trunc" => {
             if args.len() == 2 {
-                return Ok(ColType::Numeric);
+                return Ok(ColType::Numeric(None));
             }
             for a in args {
                 match expr_type(eng, snap, own, session, schemas, ctes, a)? {
@@ -20331,7 +20389,7 @@ fn func_result_type(
                     _ => {}
                 }
             }
-            Ok(ColType::Numeric)
+            Ok(ColType::Numeric(None))
         }
         "scale" | "min_scale" | "width_bucket" => Ok(ColType::Int),
         "random" => Ok(ColType::Float),
@@ -20361,12 +20419,12 @@ fn func_result_type(
             _ => Ok(ColType::Timestamp),
         },
         // v0.17: date/time built-in batch.
-        "date_part" => Ok(ColType::Numeric),
+        "date_part" => Ok(ColType::Numeric(None)),
         "to_date" | "make_date" => Ok(ColType::Date),
         "to_timestamp" => Ok(ColType::Timestamptz),
         "to_char" => Ok(ColType::Text),
         // v0.26: to_number(text, text) returns numeric.
-        "to_number" => Ok(ColType::Numeric),
+        "to_number" => Ok(ColType::Numeric(None)),
         // v0.17: version() returns text.
         "version" => Ok(ColType::Text),
         "make_timestamp" => Ok(ColType::Timestamp),
@@ -20399,7 +20457,7 @@ fn func_result_type(
             let mut ty = ColType::Int;
             for a in args {
                 match expr_type(eng, snap, own, session, schemas, ctes, a)? {
-                    ColType::Numeric => return Ok(ColType::Numeric),
+                    n @ ColType::Numeric(..) => return Ok(n),
                     ColType::BigInt => ty = ColType::BigInt,
                     _ => {}
                 }
@@ -21183,7 +21241,7 @@ fn expr_type(
                 | ColType::BigInt
                 | ColType::Float4
                 | ColType::Float
-                | ColType::Numeric) => Ok(t),
+                | ColType::Numeric(..)) => Ok(t),
                 ColType::Text => Ok(ColType::Int),
                 t => Err(exec_err(
                     "42883",
@@ -21238,7 +21296,7 @@ fn expr_type(
         Expr::Func { name, args } => {
             func_result_type(name, args, eng, snap, own, session, schemas, ctes)
         }
-        Expr::Extract { .. } => Ok(ColType::Numeric),
+        Expr::Extract { .. } => Ok(ColType::Numeric(None)),
         Expr::Agg {
             func,
             arg,
@@ -21389,7 +21447,7 @@ fn numeric_rank(t: &ColType) -> Option<u8> {
         ColType::SmallInt => Some(0),
         ColType::Int => Some(1),
         ColType::BigInt => Some(2),
-        ColType::Numeric => Some(3),
+        ColType::Numeric(..) => Some(3),
         ColType::Float4 => Some(4),
         ColType::Float => Some(5),
         _ => None,
@@ -21401,7 +21459,7 @@ fn rank_type(rank: u8) -> ColType {
         0 => ColType::SmallInt,
         1 => ColType::Int,
         2 => ColType::BigInt,
-        3 => ColType::Numeric,
+        3 => ColType::Numeric(None),
         4 => ColType::Float4,
         _ => ColType::Float,
     }
@@ -21481,7 +21539,7 @@ fn combine_arith_types(
                             return Ok(if rx.max(ry) >= 4 {
                                 ColType::Float
                             } else {
-                                ColType::Numeric
+                                ColType::Numeric(None)
                             });
                         }
                         if op == ArithOp::Mod && matches!(rx.max(ry), 4 | 5) {
@@ -21507,7 +21565,7 @@ fn numeric_agg_arg(func: &str, t: &ColType) -> Result<(), ExecError> {
         | ColType::BigInt
         | ColType::Float4
         | ColType::Float
-        | ColType::Numeric => Ok(()),
+        | ColType::Numeric(..) => Ok(()),
         _ => Err(exec_err(
             "42883",
             format!("function {}({}) does not exist", func, t.sql_name()),
@@ -21638,7 +21696,7 @@ fn hint_type(
         )
         .ok(),
         Expr::Concat(..) => Some(ColType::Text),
-        Expr::Extract { .. } => Some(ColType::Numeric),
+        Expr::Extract { .. } => Some(ColType::Numeric(None)),
         Expr::Func { name, args } => {
             func_result_type(name, args, eng, snap, own, session, schemas, &[]).ok()
         }
@@ -22289,7 +22347,7 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::Float4)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
-        ColType::Numeric => {
+        ColType::Numeric(..) => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             crate::storage::Numeric::parse(s.trim())
                 .map(Value::Numeric)
@@ -22626,7 +22684,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::BigInt => Value::BigInt(0),
         ColType::Float4 => Value::Float4(0.0),
         ColType::Float => Value::Float(0.0),
-        ColType::Numeric => Value::Numeric(Numeric::zero()),
+        ColType::Numeric(..) => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::text(""),
         ColType::Char(_) => Value::bpchar(""),       // v0.35
         ColType::Varchar(_) => Value::text(""),      // v0.35
@@ -22764,6 +22822,46 @@ mod tests {
             ExecResult::Command { tag } => vec![vec![tag]],
             ExecResult::Dml { tag, .. } => vec![vec![tag]],
         }
+    }
+
+    /// v0.60: PG19 numeric(p,s) assignment typmod (round to scale,
+    /// then 22003 on overflow), grounded in the bundled PG19
+    /// numeric.out `fract_only` / `num_typemod_test` cases.
+    #[test]
+    fn v60_numeric_typmod_assignment() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE fract_only(x numeric(4,4))").unwrap();
+        run(&mut eng, "INSERT INTO fract_only VALUES (0.99994)").unwrap();
+        run(&mut eng, "INSERT INTO fract_only VALUES (0.00017)").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT x FROM fract_only").unwrap()),
+            vec![vec!["0.9999".to_string()], vec!["0.0002".to_string()]]
+        );
+        let e = run(&mut eng, "INSERT INTO fract_only VALUES (1.0)").unwrap_err();
+        assert_eq!(e.code, "22003");
+        let e = run(&mut eng, "INSERT INTO fract_only VALUES (0.99995)").unwrap_err();
+        assert_eq!(e.code, "22003");
+
+        run(&mut eng, "CREATE TABLE neg_scale(x numeric(3,-6))").unwrap();
+        run(&mut eng, "INSERT INTO neg_scale VALUES (123456)").unwrap();
+        run(&mut eng, "INSERT INTO neg_scale VALUES (654321)").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT x FROM neg_scale").unwrap()),
+            vec![vec!["0".to_string()], vec!["1000000".to_string()]]
+        );
+        let e = run(&mut eng, "INSERT INTO neg_scale VALUES (999500000)").unwrap_err();
+        assert_eq!(e.code, "22003");
+
+        // CAST applies the typmod too.
+        let r = run(&mut eng, "SELECT CAST(0.99994 AS numeric(4,4))").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["0.9999".to_string()]]);
+        let e = run(&mut eng, "SELECT CAST(2.0 AS numeric(4,4))").unwrap_err();
+        assert_eq!(e.code, "22003");
+
+        // Invalid typmods are rejected at parse time (the test harness
+        // remaps all parse errors to 42601, so check the message).
+        let e = run(&mut eng, "CREATE TABLE bad(x numeric(0,1))").unwrap_err();
+        assert!(e.message.contains("precision"), "got: {}", e.message);
     }
 
     /// A sequential scan must return the stored row. It must not return
@@ -25096,7 +25194,7 @@ mod tests {
         );
         let r = run(&mut eng, "SELECT generate_series(1.5, 2.5)").unwrap();
         match &r {
-            ExecResult::Select { columns, .. } => assert_eq!(columns[0].1, ColType::Numeric),
+            ExecResult::Select { columns, .. } => assert_eq!(columns[0].1, ColType::Numeric(None)),
             _ => panic!("expected select"),
         }
         let err = run(&mut eng, "SELECT generate_series(1, 3, 0)").unwrap_err();
