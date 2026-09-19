@@ -3041,6 +3041,11 @@ impl Parser {
                     }
                     if *self.peek() == Token::Comma {
                         self.next();
+                        // v0.59: PG19 allows a negative scale in
+                        // numeric(p, s) typmods (e.g. numeric(3,-6)).
+                        if *self.peek() == Token::Minus {
+                            self.next();
+                        }
                         match self.next() {
                             Token::Number(_) => {}
                             other => {
@@ -4252,15 +4257,21 @@ impl Parser {
     /// v0.10: one CTE body. A recursive CTE may be
     /// `non_recursive UNION [ALL] recursive`.
     fn parse_cte_body(&mut self, recursive: bool) -> Result<CteBody, SqlError> {
-        // The body must start with SELECT.
-        match self.next() {
-            Token::Ident(kw) if kw == "select" => {}
+        // The body must start with SELECT (or VALUES in a non-recursive
+        // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
+        let is_values = match self.next() {
+            Token::Ident(kw) if kw == "select" => false,
+            Token::Ident(kw) if kw == "values" && !recursive => true,
             other => {
                 return Err(err(format!(
                     "syntax error: expected SELECT in CTE body, found {:?}",
                     other
                 )));
             }
+        };
+        if is_values {
+            // parse_values_query builds the SelectStmt for a VALUES list.
+            return Ok(CteBody::Simple(self.parse_values_query()?));
         }
         // v0.44: a non-recursive CTE body may be a general set operation
         // (`WITH x AS (SELECT ... UNION ...)`, parsed by

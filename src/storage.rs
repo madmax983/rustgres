@@ -556,19 +556,22 @@ impl Numeric {
         let exp: i32 = if exp_raw.is_empty() {
             0
         } else {
-            strip_underscores(exp_raw)
+            // v0.59: PG19 requires the exponent's first char (after an
+            // optional sign) to be a digit; `1.2e_34` is invalid.
+            strip_underscores_strict(exp_raw)
                 .ok_or(NumericParseError::Syntax)?
                 .parse()
                 .map_err(|_| NumericParseError::Syntax)?
         };
         // Split the mantissa on '.', then strip underscores from each
-        // part (empty parts are fine: `.5`, `5.`).
+        // part (empty parts are fine: `.5`, `5.`). v0.59: PG19 rules —
+        // `_123` and `123._456` are invalid syntax.
         let (int_raw, frac_raw) = match mant_raw.find('.') {
             Some(i) => (&mant_raw[..i], &mant_raw[i + 1..]),
             None => (mant_raw, ""),
         };
-        let int_part = strip_underscores_opt(int_raw).ok_or(NumericParseError::Syntax)?;
-        let frac_part = strip_underscores_opt(frac_raw).ok_or(NumericParseError::Syntax)?;
+        let int_part = strip_underscores_opt_strict(int_raw).ok_or(NumericParseError::Syntax)?;
+        let frac_part = strip_underscores_opt_strict(frac_raw).ok_or(NumericParseError::Syntax)?;
         let (int_part, frac_part) = (int_part.as_str(), frac_part.as_str());
         if int_part.is_empty() && frac_part.is_empty() {
             return Err(NumericParseError::Syntax);
@@ -750,6 +753,148 @@ impl Numeric {
     /// `is_zero` flag distinguishable by the caller via `other.is_zero()`.
     /// v0.18: NaN propagates; `finite / Inf` is 0; `Inf / Inf` is NaN;
     /// `Inf / finite` is a signed infinity; division by zero stays None.
+    /// v0.59: exact decimal division with PostgreSQL 19 display-scale and
+    /// rounding semantics.
+    ///
+    /// Result scale (`rscale` fractional digits) follows PG19
+    /// `select_div_scale()`: `rscale = max(max(16 - qweight * 4, max(dscale
+    /// of either input)), 0)`, clamped to `NUMERIC_MAX_RESULT_SCALE`
+    /// (1000). The quotient weight `qweight` is the normalized
+    /// base-10000 weight of the quotient: `weight1 - weight2`, minus one
+    /// when the dividend's leading digit group does not exceed the
+    /// divisor's (exactly PG19's rule, in decimal-digit form).
+    ///
+    /// The quotient is computed exactly with `BigUint` long division at
+    /// one guard digit past `rscale`; when `round` is true the guard digit
+    /// rounds half-away-from-zero (PG's `div_var`), when false it is
+    /// truncated (PG's `div()` SQL function calls the divider directly at
+    /// rscale 0 with no rounding).
+    fn div_impl(&self, other: &Numeric, rscale: i32, round: bool) -> Option<Numeric> {
+        debug_assert!(self.special == NumericSpecial::Finite);
+        debug_assert!(other.special == NumericSpecial::Finite);
+        debug_assert!(!other.is_zero());
+        // Signed unscaled magnitudes as BigUints.
+        let a_mag = BigUint::from_u128(self.unscaled.unsigned_abs() as u128);
+        let a_neg = self.unscaled < 0;
+        let b_mag = BigUint::from_u128(other.unscaled.unsigned_abs() as u128);
+        let b_neg = other.unscaled < 0;
+        let neg = a_neg != b_neg;
+        // rscale follows select_div_scale for the `/` operator; the SQL
+        // div() function passes rscale 0 explicitly.
+        let rscale = if round {
+            Self::select_div_scale(self, other)
+        } else {
+            rscale
+        };
+        // Quotient digits at rscale + 1 (guard) fractional digits, exact.
+        // a/b = (a_mag/b_mag) * 10^(b.scale - a.scale), so to land the
+        // quotient at scale rscale+1 we shift the numerator by
+        // (b.scale - a.scale) + rscale + 1. When that shift is negative
+        // we must scale the *denominator* up, never pre-truncate the
+        // numerator: pre-truncation would discard the guard digit that
+        // rounding needs.
+        let shift = (other.scale - self.scale + rscale + 1) as i64;
+        let (num, den) = if shift >= 0 {
+            let mut n = a_mag;
+            n.mul_pow10_assign(shift as u32);
+            (n, b_mag)
+        } else {
+            let mut d = b_mag;
+            d.mul_pow10_assign((-shift) as u32);
+            (a_mag, d)
+        };
+        let (q, _rem) = num.div_rem(&den);
+        // Drop the guard digit: exact division by 10. The guard digit
+        // (q mod 10) decides rounding half away from zero; when
+        // truncating it is simply discarded.
+        let ten = BigUint::from_u64(10);
+        let (mut q, guard) = q.div_rem(&ten);
+        if round {
+            let g = guard.to_u64().unwrap_or(0);
+            if g >= 5 {
+                q.add_small_assign(1);
+            }
+        }
+        let mut mant: i128 = q.to_i128()?;
+        if neg {
+            mant = mant.checked_neg()?;
+        }
+        // Numeric::new strips trailing zeros (the runner compares
+        // numerics, so display scale is irrelevant here).
+        Some(Numeric::new(mant, rscale))
+    }
+
+    /// v0.59: PG19 `select_div_scale()` faithfully, in decimal-digit
+    /// form. PG works in base-10000 digits: for each operand it takes
+    /// the normalized weight (base-10000 exponent of the leading digit
+    /// group) and the leading group itself (`firstdigit`); then
+    /// `qweight = weight1 - weight2 - (firstdigit1 <= firstdigit2)`,
+    /// `rscale = max(16 - qweight*4, dscale1, dscale2, 0)`, clamped to
+    /// 1000. Here weight = floor((int_digits-1)/4) and the leading group
+    /// is the first 1-4 significant decimal digits (zero-padded on the
+    /// right when the value is fractional).
+    fn select_div_scale(a: &Numeric, b: &Numeric) -> i32 {
+        const NUMERIC_MIN_SIG_DIGITS: i32 = 16;
+        const NUMERIC_MAX_DISPLAY_SCALE: i32 = 1000;
+        /// (normalized base-10000 weight, leading digit group) of a
+        /// nonzero finite Numeric.
+        fn weight_firstdigit(n: &Numeric) -> (i32, u32) {
+            if n.is_zero() {
+                return (0, 0);
+            }
+            let abs = n.unscaled.unsigned_abs();
+            let digits = abs.to_string();
+            let d = digits.len() as i32;
+            // Integer digits of the value (may be <= 0 for fractions).
+            let int_d = d - n.scale;
+            let weight = (int_d - 1).div_euclid(4);
+            let k = ((int_d - 1).rem_euclid(4) + 1) as usize; // 1..=4
+            let mut g = digits[..digits.len().min(k)].to_string();
+            while g.len() < k {
+                g.push('0');
+            }
+            (weight, g.parse::<u32>().unwrap_or(0))
+        }
+        let (w1, fd1) = weight_firstdigit(a);
+        let (w2, fd2) = weight_firstdigit(b);
+        let mut qweight = w1 - w2;
+        if fd1 <= fd2 {
+            qweight -= 1;
+        }
+        let rscale = NUMERIC_MIN_SIG_DIGITS - qweight * 4;
+        let rscale = rscale.max(a.scale.max(b.scale)).max(0);
+        rscale.min(NUMERIC_MAX_DISPLAY_SCALE)
+    }
+
+    /// SQL `div(y, x)` integer division toward zero: exact quotient at
+    /// rscale 0 with truncation, like PG19 (which calls `div_var` with
+    /// rscale 0 and no rounding).
+    pub(crate) fn div_trunc(&self, other: &Numeric) -> Option<Numeric> {
+        use NumericSpecial::*;
+        match (self.special, other.special) {
+            (NaN, _) | (_, NaN) => Some(Numeric::nan()),
+            (_, Finite) if other.unscaled == 0 => None,
+            (Finite, PosInf) | (Finite, NegInf) => Some(Numeric::zero()),
+            (PosInf, Finite) | (NegInf, Finite) => {
+                let neg = (self.special == NegInf) != (other.unscaled < 0);
+                Some(if neg {
+                    Numeric::neg_infinity()
+                } else {
+                    Numeric::infinity()
+                })
+            }
+            (PosInf, PosInf) | (PosInf, NegInf) | (NegInf, PosInf) | (NegInf, NegInf) => {
+                Some(Numeric::nan())
+            }
+            (Finite, Finite) => {
+                if self.is_zero() {
+                    return Some(Numeric::zero());
+                }
+                self.div_impl(other, 0, false)
+            }
+        }
+    }
+
     pub fn checked_div(&self, other: &Numeric) -> Option<Numeric> {
         use NumericSpecial::*;
         match (self.special, other.special) {
@@ -768,16 +913,12 @@ impl Numeric {
                 Some(Numeric::nan())
             }
             (Finite, Finite) => {
-                // a/b = (ua * 10^(sb+10)) / (ub * 10^sa), scale 10.
-                // v0.22: scales are signed; a negative power is out of
-                // range for this fixed-scale path (None -> 22003).
-                let num = self
-                    .unscaled
-                    .checked_mul(10i128.checked_pow(u32::try_from(other.scale + 10).ok()?)?)?;
-                let den = other
-                    .unscaled
-                    .checked_mul(10i128.checked_pow(u32::try_from(self.scale).ok()?)?)?;
-                Some(Numeric::new(num.checked_div(den)?, 10))
+                if self.is_zero() {
+                    return Some(Numeric::zero());
+                }
+                // v0.59: exact PG19 division (select_div_scale + exact
+                // BigUint long division, rounded half away from zero).
+                self.div_impl(other, 0, true)
             }
         }
     }
@@ -873,16 +1014,12 @@ impl Numeric {
             return Some(self.clone());
         }
         if scale >= self.scale {
-            if scale == self.scale {
-                return Some(self.clone());
-            }
-            let mul = 10i128.checked_pow((scale - self.scale) as u32);
-            match mul {
-                Some(m) => {
-                    return Some(Numeric::new(self.unscaled.checked_mul(m)?, scale));
-                }
-                None => return Some(self.clone()),
-            }
+            // v0.59: widening the scale (or a no-op) is value-identical;
+            // PostgreSQL pads trailing zeros in the display scale, but
+            // the value is unchanged. Never 22003 on zero-padding
+            // (e.g. round(3.14, 40)): the old zero-pad multiply could
+            // overflow i128 and wrongly error.
+            return Some(self.clone());
         }
         let drop = (self.scale - scale) as u32;
         // v0.22: if 10^drop overflows i128, then |unscaled| < 10^39/2 <=
@@ -1160,20 +1297,13 @@ pub enum NumericParseError {
     Overflow,
 }
 
-/// v0.25: like `strip_underscores`, but an empty part (as in `.5` or
-/// `5.`) is allowed.
-fn strip_underscores_opt(s: &str) -> Option<String> {
-    if s.is_empty() {
-        return Some(String::new());
-    }
-    strip_underscores(s)
-}
-
-/// v0.25: validate and remove `_` digit separators (PG 16+). Underscores
-/// must sit between digits; a single leading underscore is allowed (the
-/// caller strips a base prefix first, so it means the underscore followed
-/// the prefix). Returns the cleaned string, preserving a leading sign.
-fn strip_underscores(s: &str) -> Option<String> {
+/// v0.59: validate and remove `_` digit separators with PostgreSQL 19
+/// rules. The first character after an optional sign must be a digit, so
+/// `_123`, `123._456`, and `1.2e_34` are invalid syntax, while `1_2`,
+/// `1.2_5`, and `1e1_2` are fine. (Based literals like `0x_1F` are
+/// handled separately in `parse_based`, which keeps PG's rule allowing
+/// one underscore right after the base prefix.)
+fn strip_underscores_strict(s: &str) -> Option<String> {
     let (neg, digits) = match s.strip_prefix('-') {
         Some(d) => (true, d),
         None => match s.strip_prefix('+') {
@@ -1181,8 +1311,6 @@ fn strip_underscores(s: &str) -> Option<String> {
             None => (false, s),
         },
     };
-    // PG allows one underscore right after a stripped base prefix.
-    let digits = digits.strip_prefix('_').unwrap_or(digits);
     let mut out = String::with_capacity(digits.len());
     let mut saw_digit = false;
     let mut need_digit = true; // leading underscore rejected
@@ -1207,6 +1335,15 @@ fn strip_underscores(s: &str) -> Option<String> {
         out.insert(0, '-');
     }
     Some(out)
+}
+
+/// v0.59: `strip_underscores_strict`, but an empty part (as in `.5` or
+/// `5.`) is allowed instead of rejected.
+fn strip_underscores_opt_strict(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return Some(String::new());
+    }
+    strip_underscores_strict(s)
 }
 
 /// v0.18: fixed scale-18 decimal for transcendental series evaluation.
@@ -1950,6 +2087,68 @@ impl BigUint {
         }
         Some(v)
     }
+
+    /// Value as i128; None when it does not fit.
+    pub(crate) fn to_i128(&self) -> Option<i128> {
+        let mut v: i128 = 0;
+        for &limb in self.limbs.iter().rev() {
+            v = v.checked_mul(1_000_000_000)?.checked_add(limb as i128)?;
+        }
+        Some(v)
+    }
+
+    /// self += v for a small v < 1_000_000_000.
+    fn add_small_assign(&mut self, v: u32) {
+        debug_assert!(v < 1_000_000_000);
+        if v == 0 {
+            return;
+        }
+        let mut carry = v as u64;
+        let mut i = 0;
+        while carry > 0 {
+            if i == self.limbs.len() {
+                self.limbs.push(0);
+            }
+            let cur = self.limbs[i] as u64 + carry;
+            self.limbs[i] = (cur % 1_000_000_000) as u32;
+            carry = cur / 1_000_000_000;
+            i += 1;
+        }
+    }
+
+    /// Quotient and remainder; requires other > 0. Binary long division:
+    /// the dividend's bits are extracted MSB-first by repeated halving
+    /// (base-1e9 limbs are not bit-addressable, so no per-bit indexing),
+    /// then the classic shift-subtract loop runs on whole-BigUint
+    /// doubling. O(bits^2) limb ops; dividends here are at most a few
+    /// thousand bits.
+    pub(crate) fn div_rem(&self, other: &BigUint) -> (BigUint, BigUint) {
+        debug_assert!(!other.is_zero());
+        if self.cmp(other) == std::cmp::Ordering::Less {
+            return (BigUint::zero(), self.clone());
+        }
+        // Dividend bits, LSB-first: bit = limbs[0] & 1, then halve.
+        let mut tmp = self.clone();
+        let mut bits_lsb = Vec::new();
+        while !tmp.is_zero() {
+            bits_lsb.push(tmp.limbs[0] & 1 == 1);
+            tmp.div_small_assign(2);
+        }
+        let mut q = BigUint::zero();
+        let mut r = BigUint::zero();
+        for &b in bits_lsb.iter().rev() {
+            r.mul_small_assign(2);
+            if b {
+                r.add_small_assign(1);
+            }
+            q.mul_small_assign(2);
+            if r.cmp(other) != std::cmp::Ordering::Less {
+                r.sub_assign(other);
+                q.add_small_assign(1);
+            }
+        }
+        (q, r)
+    }
 }
 
 /// v0.56: exact signed decimal: value = (-1)^neg * mag * 10^(-scale).
@@ -2039,7 +2238,8 @@ impl BigDec {
         let exp_clean;
         let exp_str = match exp_raw {
             Some(e) => {
-                exp_clean = strip_underscores(e).ok_or(DecimalParseError::Syntax)?;
+                // v0.59: PG19 underscore rules, like Numeric::parse.
+                exp_clean = strip_underscores_strict(e).ok_or(DecimalParseError::Syntax)?;
                 Some(exp_clean.as_str())
             }
             None => None,
@@ -2048,8 +2248,8 @@ impl BigDec {
             Some(i) => (&mant_raw[..i], &mant_raw[i + 1..]),
             None => (mant_raw, ""),
         };
-        let int_clean = strip_underscores_opt(int_raw).ok_or(DecimalParseError::Syntax)?;
-        let frac_clean = strip_underscores_opt(frac_raw).ok_or(DecimalParseError::Syntax)?;
+        let int_clean = strip_underscores_opt_strict(int_raw).ok_or(DecimalParseError::Syntax)?;
+        let frac_clean = strip_underscores_opt_strict(frac_raw).ok_or(DecimalParseError::Syntax)?;
         let (int_part, frac_part) = (int_clean.as_str(), frac_clean.as_str());
         let exp: i32 = match exp_str {
             Some(e) => e.parse().map_err(|_| DecimalParseError::Syntax)?,
@@ -5067,5 +5267,149 @@ mod tests {
         let diff = a.sub(&b);
         let tiny = BigDec::parse_decimal("0.0000000000001").unwrap();
         assert_eq!(diff.cmp(&tiny), Ordering::Equal);
+    }
+}
+
+#[cfg(test)]
+mod v059_division_tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn num(s: &str) -> Numeric {
+        Numeric::parse(s).unwrap()
+    }
+
+    fn div_text(a: &str, b: &str) -> String {
+        num(a).checked_div(&num(b)).unwrap().to_text()
+    }
+
+    fn big(s: &str) -> BigUint {
+        BigUint::from_decimal_str(s)
+    }
+
+    #[test]
+    fn biguint_div_rem_basic() {
+        let (q, r) = big("100").div_rem(&big("3"));
+        assert_eq!(q.cmp(&big("33")), Ordering::Equal);
+        assert_eq!(r.cmp(&big("1")), Ordering::Equal);
+        // Exact division.
+        let (q, r) = big("1000").div_rem(&big("8"));
+        assert_eq!(q.cmp(&big("125")), Ordering::Equal);
+        assert!(r.is_zero());
+        // Dividend smaller than divisor.
+        let (q, r) = big("7").div_rem(&big("1000"));
+        assert!(q.is_zero());
+        assert_eq!(r.cmp(&big("7")), Ordering::Equal);
+        // Zero dividend.
+        let (q, r) = big("0").div_rem(&big("12345"));
+        assert!(q.is_zero());
+        assert!(r.is_zero());
+        // Large multi-limb dividend: q*divisor + rem == dividend.
+        let dvd = big("123456789012345678901234567890");
+        let (q, r) = dvd.div_rem(&big("123"));
+        assert_eq!(q.cmp(&big("1003713731807688446351500551")), Ordering::Equal);
+        assert_eq!(r.cmp(&big("117")), Ordering::Equal);
+        let mut back = q.mul(&big("123"));
+        back.add_assign(&r);
+        assert_eq!(back.cmp(&dvd), Ordering::Equal);
+        // Power-of-ten-heavy limbs (base-1e9 packing edge).
+        let (q, r) = big("1000000000000000000000000").div_rem(&big("1000000000"));
+        assert_eq!(q.cmp(&big("1000000000000000")), Ordering::Equal);
+        assert!(r.is_zero());
+    }
+
+    #[test]
+    fn pg19_division_regression_cases() {
+        // The v0.58 failures, now exact per PG19 select_div_scale.
+        assert_eq!(
+            div_text("999999999999999999999", "1000000000000000000000"),
+            "1"
+        );
+        assert_eq!(
+            div_text("12345678901234567890", "123"),
+            "100371373180768845"
+        );
+        assert_eq!(div_text("1", "3"), "0.33333333333333333333");
+        assert_eq!(div_text("2", "3"), "0.66666666666666666667");
+        assert_eq!(div_text("22", "7"), "3.1428571428571429");
+        assert_eq!(div_text("1", "6"), "0.16666666666666666667");
+        assert_eq!(div_text("10", "3"), "3.3333333333333333");
+    }
+
+    #[test]
+    fn division_unequal_scales() {
+        // 1.2 / 3 = 0.4 (rscale covers the input display scale).
+        assert_eq!(div_text("1.2", "3"), "0.4");
+        // 12 / 0.3 = 40.
+        assert_eq!(div_text("12", "0.3"), "40");
+        // 1000 / 0.001 = 1000000.
+        assert_eq!(div_text("1e3", "0.001"), "1000000");
+        // 0.001 / 1000 = 0.000001.
+        assert_eq!(div_text("0.001", "1e3"), "0.000001");
+        // Exact small quotients.
+        assert_eq!(div_text("5", "4"), "1.25");
+        assert_eq!(div_text("1", "8"), "0.125");
+        assert_eq!(div_text("2.5", "1"), "2.5");
+    }
+
+    #[test]
+    fn division_signs_and_specials() {
+        assert_eq!(div_text("-7", "2"), "-3.5");
+        assert_eq!(div_text("7", "-2"), "-3.5");
+        assert_eq!(div_text("-7", "-2"), "3.5");
+        // NaN propagates.
+        let r = num("nan").checked_div(&num("1")).unwrap();
+        assert!(r.is_nan());
+        // Infinity / finite keeps the sign.
+        let r = num("inf").checked_div(&num("2")).unwrap();
+        assert_eq!(r.special, NumericSpecial::PosInf);
+        let r = num("-inf").checked_div(&num("2")).unwrap();
+        assert_eq!(r.special, NumericSpecial::NegInf);
+        // Finite / Infinity = 0.
+        let r = num("5").checked_div(&num("inf")).unwrap();
+        assert!(r.is_zero());
+        // Division by zero is None (caller raises 22012).
+        assert!(num("1").checked_div(&num("0")).is_none());
+        assert!(num("0").checked_div(&num("0")).is_none());
+    }
+
+    #[test]
+    fn div_trunc_matches_pg() {
+        // div() truncates toward zero at scale 0, never rounds.
+        let t = |a: &str, b: &str| num(a).div_trunc(&num(b)).unwrap().to_text();
+        assert_eq!(t("7", "2"), "3");
+        assert_eq!(t("-7", "2"), "-3");
+        assert_eq!(t("7", "-2"), "-3");
+        assert_eq!(t("-7", "-2"), "3");
+        assert_eq!(t("5", "2"), "2");
+        assert_eq!(t("1", "2"), "0");
+        assert_eq!(t("0", "5"), "0");
+    }
+
+    #[test]
+    fn round_widening_is_noop() {
+        // v0.59: round(x, s) with s >= scale(x) keeps the value, even when
+        // zero-padding would overflow i128.
+        assert_eq!(num("3.14").round_to(40).unwrap().to_text(), "3.14");
+        assert_eq!(num("1.5").round_to(1).unwrap().to_text(), "1.5");
+        // Narrowing still rounds half away from zero.
+        assert_eq!(num("2.5").round_to(0).unwrap().to_text(), "3");
+        assert_eq!(num("-2.5").round_to(0).unwrap().to_text(), "-3");
+        assert_eq!(num("2.4").round_to(0).unwrap().to_text(), "2");
+    }
+
+    #[test]
+    fn underscore_input_rules() {
+        // PG19 set_var_from_str: leading/trailing/doubled/adjacent
+        // underscores are rejected.
+        assert!(Numeric::parse("_123").is_err());
+        assert!(Numeric::parse("123_").is_err());
+        assert!(Numeric::parse("123._456").is_err());
+        assert!(Numeric::parse("1.2e_34").is_err());
+        assert!(Numeric::parse("1__2").is_err());
+        assert!(Numeric::parse("1_.2").is_err());
+        // Interior underscores are fine.
+        assert_eq!(num("1_2").to_text(), "12");
+        assert_eq!(num("1_2.5_6").to_text(), "12.56");
     }
 }

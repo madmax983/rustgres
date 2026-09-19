@@ -578,6 +578,11 @@ def values_equal(oid, a, b):
         if math.isnan(a) and math.isnan(b):
             return True
         return math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-12)
+    # v0.59: numeric NaN is not equal to itself under Decimal (IEEE
+    # semantics), but PostgreSQL's numeric_eq treats NaN = NaN as true.
+    if oid == OID_NUMERIC and isinstance(a, Decimal) and isinstance(b, Decimal):
+        if a.is_nan() and b.is_nan():
+            return True
     return a == b
 
 

@@ -10031,11 +10031,24 @@ fn build_source(
                 .collect();
             let rows = eval_rows
                 .into_iter()
-                .map(|cells| QRow {
-                    cells: Row::new(cells),
-                    prov: Vec::new(),
+                .map(|cells| {
+                    // v0.59: coerce every cell to the resolved column
+                    // type, like PG's VALUES type resolution: unknown
+                    // (text) literals take the resolved type ('1' ->
+                    // numeric when another row is numeric), and genuinely
+                    // incompatible values raise instead of flowing
+                    // through untyped.
+                    let cells = cells
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| coerce_value(c, &schema[i].ty, &schema[i].name))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(QRow {
+                        cells: Row::new(cells),
+                        prov: Vec::new(),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             Ok((schema, rows))
         }
         FromItem::Join {
@@ -13251,18 +13264,17 @@ fn eval_log_base(
     _name: &str,
 ) -> Result<Value, ExecError> {
     use crate::storage::{Numeric, NumericSpecial};
-    // Handle specials per PG semantics (simplified).
+    // Handle specials per PG19 numeric_log: NaN anywhere -> NaN; negative
+    // (including -Inf) -> 2201E "negative"; zero -> 2201E "zero";
+    // log(+Inf, +Inf) = NaN, log(+Inf, finite) = 0, log(finite, +Inf) = +Inf.
     if b.is_nan() || x.is_nan() {
         return Ok(Value::Numeric(Numeric::nan()));
     }
-    // ln(b) and ln(x) must be defined.
-    if b.unscaled <= 0 || b.special != NumericSpecial::Finite {
-        return Err(exec_err(
-            "2201E",
-            "cannot take logarithm of a negative number",
-        ));
-    }
-    if x.unscaled <= 0 || x.special != NumericSpecial::Finite {
+    let b_neg = b.special == NumericSpecial::NegInf
+        || (b.special == NumericSpecial::Finite && b.unscaled < 0);
+    let x_neg = x.special == NumericSpecial::NegInf
+        || (x.special == NumericSpecial::Finite && x.unscaled < 0);
+    if b_neg || x_neg {
         return Err(exec_err(
             "2201E",
             "cannot take logarithm of a negative number",
@@ -13270,6 +13282,18 @@ fn eval_log_base(
     }
     if b.is_zero() || x.is_zero() {
         return Err(exec_err("2201E", "cannot take logarithm of zero"));
+    }
+    if b.special == NumericSpecial::PosInf {
+        // log(+Inf, +Inf) reduces to Inf/Inf -> NaN.
+        if x.special == NumericSpecial::PosInf {
+            return Ok(Value::Numeric(Numeric::nan()));
+        }
+        // log(+Inf, finite-positive) is zero (no underflow throw).
+        return Ok(Value::Numeric(Numeric::new(0, 0)));
+    }
+    if x.special == NumericSpecial::PosInf {
+        // log(finite-positive, +Inf) is +Inf.
+        return Ok(Value::Numeric(Numeric::infinity()));
     }
     let out_scale = (b.scale.max(x.scale) + 8).min(30).max(16);
     match (b.ln_hp(), x.ln_hp()) {
@@ -14073,9 +14097,10 @@ fn parse_numeric_typmod(t: &str) -> Option<(i32, i32)> {
     if parts.next().is_some() {
         return None;
     }
-    // PG numeric typmod bounds: 1..=1000 for precision (PG 18+),
-    // 0..=precision for scale.
-    if !(1..=1000).contains(&precision) || scale < 0 || scale > precision {
+    // PG19 numeric typmod bounds: 1..=1000 for precision; scale may be
+    // negative (down to -1000), per make_numeric_typmod's
+    // "scale is constrained to the range [-1000, 1000]".
+    if !(1..=1000).contains(&precision) || !(-1000..=1000).contains(&scale) {
         return None;
     }
     Some((precision, scale))
@@ -15378,7 +15403,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
         "exp" | "ln" => n == 1,
         "log" => n == 1 || n == 2,
-        "cbrt" | "factorial" => n == 1,
+        "cbrt" | "factorial" | "numeric_inc" => n == 1,
         "scale" | "trim_scale" => n == 1,
         "min_scale" => n == 1,
         "pi" | "random" => n == 0,
@@ -15571,7 +15596,8 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         }
         // v0.18: numeric functions.
         "exp" | "ln" | "log" | "cbrt" | "factorial" | "gcd" | "lcm" | "pi" | "degrees"
-        | "radians" | "scale" | "min_scale" | "trim_scale" | "div" | "width_bucket" => {
+        | "radians" | "scale" | "min_scale" | "trim_scale" | "div" | "width_bucket"
+        | "numeric_inc" => {
             eval_math_func(name, vals)
         }
         // v0.21: float8 transcendental functions.
@@ -19575,6 +19601,19 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ])))
         }
+        "numeric_inc" => {
+            // v0.59: numeric_inc(numeric) -> numeric. PG19 numeric_inc:
+            // NaN and both infinities are fixed points, otherwise x + 1.
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if n.is_nan() || n.special != crate::storage::NumericSpecial::Finite {
+                return Ok(Value::Numeric(n));
+            }
+            let one = Numeric::new(1, 0);
+            match n.checked_add(&one) {
+                Some(r) => Ok(Value::Numeric(r)),
+                None => Err(exec_err("22003", "value overflows numeric format")),
+            }
+        }
         "factorial" => {
             // factorial(numeric) -> numeric. PG: 0! = 1, negative errors.
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
@@ -19739,6 +19778,10 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "scale" => {
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             // scale(numeric) -> integer (the stored scale).
+            // v0.59: PG19's numeric_scale returns NULL for NaN/Infinity.
+            if n.special != crate::storage::NumericSpecial::Finite {
+                return Ok(Value::Null);
+            }
             Ok(Value::Int(n.scale as i64))
         }
         "min_scale" => {
@@ -19754,7 +19797,9 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 unscaled /= 10;
                 scale -= 1;
             }
-            Ok(Value::Int(scale as i64))
+            // v0.59: PG's get_min_scale clamps to zero when there are no
+            // digits after the decimal point (e.g. min_scale(1e100) = 0).
+            Ok(Value::Int(scale.max(0) as i64))
         }
         "trim_scale" => {
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
@@ -19783,13 +19828,15 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             if b.is_zero() {
                 return Err(exec_err("22012", "division by zero"));
             }
-            // Truncate toward zero.
-            match a.checked_div(&b) {
-                Some(q) => {
-                    // Truncate to integer (scale 0).
-                    let truncated = q.trunc_to_scale(0);
-                    Ok(Value::Numeric(truncated))
-                }
+            if b.is_zero() {
+                return Err(exec_err("22012", "division by zero"));
+            }
+            // v0.59: PG19 calls div_var with rscale 0 and no rounding
+            // (truncation): the quotient is computed directly at scale 0,
+            // not rounded at higher precision then truncated. div_trunc
+            // keeps the NaN behavior above (NaN in -> NaN out).
+            match a.div_trunc(&b) {
+                Some(q) => Ok(Value::Numeric(q)),
                 None => Err(exec_err("22003", "value overflows numeric format")),
             }
         }
@@ -20266,7 +20313,9 @@ fn func_result_type(
             }
             Ok(ColType::Numeric)
         }
-        "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" => Ok(ColType::Numeric),
+        "factorial" | "gcd" | "lcm" | "pi" | "trim_scale" | "div" | "numeric_inc" => {
+            Ok(ColType::Numeric)
+        }
         // v0.22: trunc is overloaded like Postgres — numeric in ->
         // numeric out, float in -> float out (mirrors eval_math_func).
         // v0.56: the two-argument form is PG's trunc(numeric, int) ->
