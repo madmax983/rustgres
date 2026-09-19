@@ -17,7 +17,8 @@ REL_19_STABLE gram.y and the executor's doNegate:
   `qual_Op a_expr %prec Op` — the loosest precedence in the grammar —
   so their operand is a full comparison-level expression: `~ 1 + 1`
   is `~(1 + 1)` = -3 (was -1), `@ 5 - 10` is `@(5 - 10)` = 5
-  (was -5), `|/ 2 + 7` is `|/(2 + 7)` = 3, `||/ 35 - 8` is
+  (was -5), `|/ 2 + 7` is `|/(2 + 7)` = 3.000000000000000
+  (v0.62: PG19 sqrt dscale 15), `||/ 35 - 8` is
   `||/(35 - 8)` = 3. `~ 5::int2` is `~(5::int2)`: integer -6
   (was smallint -6 — PG has no int2 `~`, the int4 promotion is
   correct). `~ NULL` is NULL::int (was 42883).
@@ -161,11 +162,11 @@ def main():
              [["5"]], None, None, None, [23], None,
              "@ binds loosest: @(5-10) = 5 (v0.52 gave -5)"),
             ("SELECT |/ 2 + 7",
-             [["3"]], None, None, None, [1700], None,
-             "|/ binds loosest: |/(2+7) = 3"),
-            ("SELECT ||/ 35 - 8",
              [["3.000000000000000"]], None, None, None, [1700], None,
-             "||/ binds loosest: ||/(35-8) = 3 (v0.61: PG cbrt dscale 15)"),
+             "|/ binds loosest: |/(2+7) = 3.000000000000000 (v0.62: PG19 sqrt dscale 15)"),
+            ("SELECT ||/ 35 - 8",
+             [["3"]], None, None, None, [1700], None,
+             "||/ binds loosest: ||/(35-8) = 3 (v0.62 fix: PG has no numeric cbrt, formatting scale stripped)"),
             # --- Expr::Neg: type-preserving doNegate ---
             ("SELECT - (-32768::smallint)",
              None, None, "22003", "smallint out of range", None, None,

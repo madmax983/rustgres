@@ -131,7 +131,7 @@ def main():
     # --- v0.25: numeric input with underscores and base prefixes ---
     check("numeric underscore", *sql(s, rd, "SELECT '12_000_000_000'::numeric"), expect_rows=[["12000000000"]])
     check("numeric underscore frac", *sql(s, rd, "SELECT '12_000.123_456'::numeric"), expect_rows=[["12000.123456"]])
-    check("numeric underscore exp", *sql(s, rd, "SELECT '23_000_000_000e-1_0'::numeric"), expect_rows=[["2.3"]])
+    check("numeric underscore exp", *sql(s, rd, "SELECT '23_000_000_000e-1_0'::numeric"), expect_rows=[["2.3000000000"]])  # v0.62 fix: PG19 numeric.out shows 2.3000000000 (exponent-derived dscale 10)
     check("numeric 0b", *sql(s, rd, "SELECT '0b101'::numeric"), expect_rows=[["5"]])
     check("numeric 0x", *sql(s, rd, "SELECT '0xFF'::numeric"), expect_rows=[["255"]])
     check("numeric +NaN rejected", *sql(s, rd, "SELECT '+NaN'::numeric"), expect_code="22P02")
@@ -167,15 +167,17 @@ def main():
     check("sqrt inf", *sql(s, rd, "SELECT sqrt('inf'::numeric)"), expect_rows=[["Infinity"]])
     check("sqrt nan", *sql(s, rd, "SELECT sqrt('nan'::numeric)"), expect_rows=[["NaN"]])
     check("power text args", *sql(s, rd, "SELECT power('-1'::numeric, 'inf')"), expect_rows=[["1"]])
-    check("power neg base", *sql(s, rd, "SELECT power('-2'::numeric, '3')"), expect_rows=[["-8"]])
+    check("power neg base", *sql(s, rd, "SELECT power('-2'::numeric, '3')"), expect_rows=[["-8.0000000000000000"]])  # v0.62 fix: PG19 numeric.out pads integer-exponent power to 16 decimals
     check("lcm overflow", *sql(s, rd, "SELECT lcm(9999 * (10::numeric)^131068 + (10::numeric^131068 - 1), 2)"), expect_code="22003")
     check("gcd int4 overflow", *sql(s, rd, "SELECT gcd((-2147483648)::int4, 0::int4)"), expect_code="22003")
     check("lcm int4 overflow", *sql(s, rd, "SELECT lcm(2147483647::int4, 2147483646::int4)"), expect_code="22003")
 
     # --- v0.25: int2 arithmetic promotes to integer; float rounding ---
-    # PG: (-32768)::int2 * (-1)::int2 = 32768 :: integer (no overflow).
-    check("int2 mul promotes", *sql(s, rd, "SELECT (-32768)::int2 * (-1)::int2"), expect_rows=[["32768"]])
-    check("int2 div promotes", *sql(s, rd, "SELECT (-32768)::int2 / (-1)::int2"), expect_rows=[["32768"]])
+    # v0.62 fix: the old comment's PG claim was wrong — PG's int2mul/int2div
+    # check overflow against int2 and raise "smallint out of range" (v0.50
+    # made this PG-exact: 22003, no promotion to integer).
+    check("int2 mul promotes", *sql(s, rd, "SELECT (-32768)::int2 * (-1)::int2"), expect_code="22003")
+    check("int2 div promotes", *sql(s, rd, "SELECT (-32768)::int2 / (-1)::int2"), expect_code="22003")
     check("float to int2 bankers", *sql(s, rd, "SELECT (2.5::float8)::int2"), expect_rows=[["2"]])
     check("float to int2 bankers neg", *sql(s, rd, "SELECT (-2.5::float8)::int2"), expect_rows=[["-2"]])
     check("float to int4 bankers", *sql(s, rd, "SELECT (1.5::float8)::int4"), expect_rows=[["2"]])

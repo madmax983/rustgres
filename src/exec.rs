@@ -13350,13 +13350,14 @@ fn eval_log_base(
         // log(finite-positive, +Inf) is +Inf.
         return Ok(Value::Numeric(Numeric::infinity()));
     }
-    let out_scale = (b.scale.max(x.scale) + 8).min(30).max(16);
-    match (b.ln_hp(), x.ln_hp()) {
-        (Some(ln_b), Some(ln_x)) => match ln_x.div_at_scale(&ln_b, out_scale) {
-            Some(r) => Ok(Value::Numeric(r)),
-            None => Err(exec_err("22003", "value overflows numeric format")),
-        },
-        _ => Err(exec_err("22003", "value overflows numeric format")),
+    // v0.62: PG19 log_var — two separately-scaled natural logarithms,
+    // divided (handles result-scale selection itself).
+    match crate::storage::Numeric::log_pg(b, x) {
+        Ok(r) => Ok(Value::Numeric(r)),
+        Err(crate::storage::LogError::DivisionByZero) => Err(exec_err("22012", "division by zero")),
+        Err(crate::storage::LogError::Overflow) => {
+            Err(exec_err("22003", "value overflows numeric format"))
+        }
     }
 }
 
@@ -18882,9 +18883,10 @@ fn eval_power_op(
         (NumericSpecial::Finite, NumericSpecial::Finite) => {}
     }
     // v0.61: PG19 dispatches an integral exponent that fits int32 to
-    // power_var_int (exact, adaptive precision); anything else goes
-    // through the f64 transcendental path. PG checks the SQL-level
-    // 2201F "zero raised to a negative power" here, before power_var.
+    // power_var_int (exact, adaptive precision); v0.62 routes anything
+    // else through power_var_frac (exp(exp * ln(|base|))). PG checks
+    // the SQL-level 2201F "zero raised to a negative power" here,
+    // before power_var.
     if base.unscaled == 0 && exp.unscaled < 0 {
         return Err(exec_err(
             "2201F",
@@ -18899,19 +18901,20 @@ fn eval_power_op(
             }
         }
     }
-    let f = base.to_f64().powf(exp.to_f64());
-    if f.is_nan() {
-        return Err(exec_err(
+    // v0.62: PG19 power_var for non-int32 exponents —
+    // exp(exp * ln(|base|)) with adaptive precision. 2201F for a
+    // negative base to a non-integer exponent; 22003 when the true
+    // result cannot be represented.
+    match crate::storage::power_var_frac(&base, &exp) {
+        Ok(n) => Ok(Value::Numeric(n)),
+        Err(crate::storage::PowerFracError::NegativeBase) => Err(exec_err(
             "2201F",
-            "a negative number raised to a non-integer power yields a non-real result",
-        ));
+            "a negative number raised to a non-integer power yields a complex result",
+        )),
+        Err(crate::storage::PowerFracError::Overflow) => {
+            Err(exec_err("22003", "value overflows numeric format"))
+        }
     }
-    if f.is_infinite() {
-        return Err(exec_err("22003", "value out of range for type numeric"));
-    }
-    Numeric::from_f64(f)
-        .map(Value::Numeric)
-        .map_err(|_| exec_err("22003", "value out of range for type numeric"))
 }
 
 // ---------------------------------------------------------------------------
@@ -19332,13 +19335,23 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 return Ok(Value::Float(x.sqrt()));
             }
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
-            match n.sqrt() {
-                Some(r) => Ok(Value::Numeric(r)),
+            // v0.62: PG19 numeric_sqrt — adaptive result scale. NaN and
+            // +Inf duplicate; -Inf and negatives are 2201F.
+            if n.is_nan() || n.special == crate::storage::NumericSpecial::PosInf {
+                return Ok(Value::Numeric(n));
+            }
+            if n.special == crate::storage::NumericSpecial::NegInf
+                || (n.special == crate::storage::NumericSpecial::Finite && n.unscaled < 0)
+            {
                 // Postgres numeric.c: ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION.
-                None => Err(exec_err(
+                return Err(exec_err(
                     "2201F",
                     "cannot take square root of a negative number",
-                )),
+                ));
+            }
+            match n.sqrt_pg() {
+                Some(r) => Ok(Value::Numeric(r)),
+                None => Err(exec_err("22003", "value overflows numeric format")),
             }
         }
         "exp" => {
@@ -19368,14 +19381,9 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             if n.special == crate::storage::NumericSpecial::NegInf {
                 return Ok(Value::Numeric(Numeric::zero()));
             }
-            // Scale: match PG's behavior (roughly input scale + 8, min 8).
-            let out_scale = (n.scale + 8).min(30).max(16);
-            match n.exp_sci() {
-                Some((m, e10)) => match Numeric::from_sci(&m, e10, out_scale) {
-                    Some(r) => Ok(Value::Numeric(r)),
-                    None => Err(exec_err("22003", "value overflows numeric format")),
-                },
-                // Overflow: PG raises 22003.
+            // v0.62: PG19 numeric_exp — adaptive result scale.
+            match n.exp_pg() {
+                Some(r) => Ok(Value::Numeric(r)),
                 None => Err(exec_err("22003", "value overflows numeric format")),
             }
         }
@@ -19405,12 +19413,9 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             if n.is_zero() {
                 return Err(exec_err("2201E", "cannot take logarithm of zero"));
             }
-            let out_scale = (n.scale + 8).min(30).max(16);
-            match n.ln_hp() {
-                Some(r) => match r.rescale(out_scale) {
-                    Some(rescaled) => Ok(Value::Numeric(rescaled)),
-                    None => Err(exec_err("22003", "value overflows numeric format")),
-                },
+            // v0.62: PG19 numeric_ln — adaptive result scale.
+            match n.ln_pg() {
+                Some(r) => Ok(Value::Numeric(r)),
                 None => Err(exec_err("22003", "value overflows numeric format")),
             }
         }
@@ -19439,37 +19444,8 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 // log(b, x) = ln(x)/ln(b).
                 return eval_log_base(&n, &x, name);
             }
-            // log(x) = ln(x)/ln(10).
-            if n.is_nan() {
-                return Ok(Value::Numeric(Numeric::nan()));
-            }
-            if n.special == crate::storage::NumericSpecial::PosInf {
-                return Ok(Value::Numeric(Numeric::infinity()));
-            }
-            if n.special == crate::storage::NumericSpecial::NegInf || n.unscaled <= 0 {
-                return Err(exec_err(
-                    "2201E",
-                    "cannot take logarithm of a negative number",
-                ));
-            }
-            if n.is_zero() {
-                return Err(exec_err("2201E", "cannot take logarithm of zero"));
-            }
-            let out_scale = (n.scale + 8).min(30).max(16);
-            match n.ln_hp() {
-                Some(ln_x) => {
-                    // Divide by ln(10) at high precision using div_at_scale.
-                    let ln10 = match Numeric::parse("2.302585092994045684017991454684364207") {
-                        Ok(v) => v,
-                        Err(_) => return Err(exec_err("22003", "value overflows numeric format")),
-                    };
-                    match ln_x.div_at_scale(&ln10, out_scale) {
-                        Some(r) => Ok(Value::Numeric(r)),
-                        None => Err(exec_err("22003", "value overflows numeric format")),
-                    }
-                }
-                None => Err(exec_err("22003", "value overflows numeric format")),
-            }
+            // v0.62: PG defines log(x) as log(10, x) (system_functions.sql).
+            return eval_log_base(&Numeric::from_i64(10), &n, name);
         }
         "power" => eval_power_op(v, &vals[1], |w| func_arg_err(name, w)),
         // v0.18: numeric functions.
@@ -19485,7 +19461,15 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let f = n.to_f64().cbrt();
             // Convert back to numeric.
             match Numeric::parse(&format!("{:.15}", f)) {
-                Ok(r) => Ok(Value::Numeric(r)),
+                Ok(mut r) => {
+                    // v0.62 fix: PG has no numeric cbrt — cbrt() is
+                    // float8-only (`cbrt(64.0)` -> `4`) — so there is no
+                    // PG numeric dscale to inherit. Strip the formatting
+                    // scale so perfect cubes display as PG's float8
+                    // cbrt does (`cbrt(8)` -> "2", not "2.000000000000000").
+                    r.dscale = r.scale.max(0);
+                    Ok(Value::Numeric(r))
+                }
                 Err(_) => Ok(Value::Float(f)),
             }
         }
@@ -23888,8 +23872,8 @@ mod tests {
         // Prefix operators bind loosest: operand is a full expression.
         assert_eq!(one(&mut eng, "SELECT ~ 1 + 1"), "-3"); // ~(1+1)
         assert_eq!(one(&mut eng, "SELECT @ 5 - 10"), "5"); // @(5-10)
-        assert_eq!(one(&mut eng, "SELECT |/ 2 + 7"), "3"); // |/(2+7)
-        assert_eq!(one(&mut eng, "SELECT ||/ 35 - 8"), "3.000000000000000"); // ||/(35-8); v0.61: PG cbrt dscale 15
+        assert_eq!(one(&mut eng, "SELECT |/ 2 + 7"), "3.000000000000000"); // |/(2+7); v0.62: PG19 sqrt dscale 15
+        assert_eq!(one(&mut eng, "SELECT ||/ 35 - 8"), "3"); // ||/(35-8); v0.62 fix: PG has no numeric cbrt (float8-only), so the formatting scale is stripped
         assert_eq!(one(&mut eng, "SELECT ~ 5::int2"), "-6"); // ~(5::int2)
         assert_eq!(one(&mut eng, "SELECT ~ 7::bigint"), "-8");
         assert_eq!(one(&mut eng, "SELECT ~ NULL"), "NULL");
@@ -24355,11 +24339,14 @@ mod tests {
             .unwrap(),
         )[0]
         .clone();
-        // v0.61: PG's numeric cbrt displays with dscale 15
-        // (2.000000000000000), matching numeric.out.
+        // v0.62 fix: PG has no numeric cbrt (cbrt() is float8-only, and
+        // PG's float8 cbrt(8) displays "2"), so the numeric cbrt strips
+        // its formatting scale: ||/8 is "2".
+        // v0.62: PG19 numeric_sqrt gives >= 16 significant digits, so
+        // |/4 is 2.000000000000000 (was "2" under the old f64 sqrt).
         assert_eq!(
             rows,
-            vec!["3", "-3", "3", "5", "5", "2", "2.000000000000000", "5.5"]
+            vec!["3", "-3", "3", "5", "5", "2.000000000000000", "2", "5.5"]
         );
         // v0.21: text-vs-numeric coercion in arithmetic and comparison.
         // ('1.5' + 1 would coerce the text to integer and fail, like PG.)

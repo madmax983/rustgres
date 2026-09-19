@@ -383,17 +383,6 @@ pub enum TypmodError {
 }
 
 impl Numeric {
-    /// Build without normalizing (v0.18): for fixed-scale internals
-    /// like the transcendental series that need exact scale control.
-    fn raw(unscaled: i128, scale: i32) -> Self {
-        Numeric {
-            unscaled,
-            scale,
-            dscale: scale.max(0),
-            special: NumericSpecial::Finite,
-        }
-    }
-
     /// Build and normalize.
     pub fn new(unscaled: i128, scale: i32) -> Self {
         let mut n = Numeric {
@@ -1226,23 +1215,6 @@ impl Numeric {
         Some(Numeric::new(q, 0))
     }
 
-    /// Square root via f64 (documented precision limit: ~15-16
-    /// significant digits). Negative finite -> None (caller: 2201F).
-    /// v0.18: NaN -> NaN, +Infinity -> +Infinity, -Infinity -> None.
-    pub fn sqrt(&self) -> Option<Numeric> {
-        match self.special {
-            NumericSpecial::NaN => return Some(Numeric::nan()),
-            NumericSpecial::PosInf => return Some(Numeric::infinity()),
-            NumericSpecial::NegInf => return None,
-            NumericSpecial::Finite => {}
-        }
-        let f = self.to_f64();
-        if f < 0.0 {
-            return None;
-        }
-        Numeric::from_f64(f.sqrt()).ok()
-    }
-
     /// Exact power for integer exponents (repeated squaring). `None`
     /// on overflow or absurd exponents (callers fall back to f64 or
     /// raise 22003). Negative exponents divide, with 10 guard digits.
@@ -1549,339 +1521,7 @@ fn strip_underscores_opt_strict(s: &str) -> Option<String> {
     strip_underscores_strict(s)
 }
 
-/// v0.18: fixed scale-18 decimal for transcendental series evaluation.
-/// f64 carries only ~15.95 decimal digits, but PostgreSQL's numeric
-/// `exp`/`ln`/`log`/`power` round to 16 fractional digits, so the 16th
-/// digit must be computed correctly. A scale-18 fixed-point decimal in
-/// i128 gives ~18 digits with headroom; multiplications stay within
-/// i128 as long as operands are < ~4e18 (values < 4), which the series
-/// below guarantee by argument reduction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HpDec(i128);
-
-/// 10^18, the HpDec unit.
-const HP_ONE: i128 = 1_000_000_000_000_000_000;
-
-/// v0.18: Scale-36 ultra-high-precision decimal for transcendental series.
-/// Used where scale-18 HpDec loses too many digits (e.g. exp(f)×2^k
-/// amplifies truncation). Multiplication uses 18-digit half splitting
-/// to stay in i128 range.
-#[derive(Clone, Copy, Debug)]
-struct Hp36(i128);
-
-const HP36_ONE: i128 = 1_000_000_000_000_000_000_000_000_000_000_000_000; // 10^36
-const HP36_HALF: i128 = 1_000_000_000_000_000_000; // 10^18
-
-impl Hp36 {
-    fn one() -> Self {
-        Hp36(HP36_ONE)
-    }
-    fn add(self, o: Hp36) -> Option<Hp36> {
-        Some(Hp36(self.0.checked_add(o.0)?))
-    }
-    fn sub(self, o: Hp36) -> Option<Hp36> {
-        Some(Hp36(self.0.checked_sub(o.0)?))
-    }
-    /// Multiply with 18-digit splitting: a×b/10^36 stays in i128
-    /// for halves < ~4e18 (values < ~4 at scale 36).
-    fn mul(self, o: Hp36) -> Option<Hp36> {
-        let neg = (self.0 < 0) != (o.0 < 0);
-        let a = self.0.unsigned_abs();
-        let b = o.0.unsigned_abs();
-        let half = HP36_HALF as u128;
-        let a_hi = a / half;
-        let a_lo = a % half;
-        let b_hi = b / half;
-        let b_lo = b % half;
-        // a×b/10^36 = a_hi×b_hi + (a_hi×b_lo + a_lo×b_hi)/10^18 + a_lo×b_lo/10^36
-        let t0 = a_hi.checked_mul(b_hi)?;
-        let t1 = a_hi
-            .checked_mul(b_lo)?
-            .checked_add(a_lo.checked_mul(b_hi)?)?
-            / half;
-        let t2 = a_lo.checked_mul(b_lo)? / HP36_ONE as u128;
-        let p = t0.checked_add(t1)?.checked_add(t2)?;
-        if p > i128::MAX as u128 {
-            return None;
-        }
-        let v = p as i128;
-        Some(Hp36(if neg { -v } else { v }))
-    }
-    fn div_int(self, d: i128) -> Option<Hp36> {
-        if d == 0 {
-            return None;
-        }
-        Some(Hp36(self.0.checked_div(d)?))
-    }
-    fn cmp_abs(self, o: Hp36) -> std::cmp::Ordering {
-        self.0.unsigned_abs().cmp(&o.0.unsigned_abs())
-    }
-    /// Convert from scale-18 HpDec.
-    #[allow(dead_code)]
-    fn from_hp(h: HpDec) -> Option<Hp36> {
-        Some(Hp36(h.0.checked_mul(HP36_HALF)?))
-    }
-    /// Convert from a finite Numeric, rounding to 36 fractional digits.
-    #[allow(dead_code)]
-    fn from_numeric(n: &Numeric) -> Option<Hp36> {
-        if n.special != NumericSpecial::Finite {
-            return None;
-        }
-        if n.scale <= 36 {
-            let mul = 10i128.checked_pow((36 - n.scale) as u32)?;
-            Some(Hp36(n.unscaled.checked_mul(mul)?))
-        } else {
-            let div = 10i128.checked_pow((n.scale - 36) as u32)?;
-            let half = div / 2;
-            let q = if n.unscaled >= 0 {
-                (n.unscaled + half) / div
-            } else {
-                (n.unscaled - half) / div
-            };
-            Some(Hp36(q))
-        }
-    }
-    /// Convert to scale-18 HpDec (rounding to nearest).
-    #[allow(dead_code)]
-    fn to_hp(self) -> HpDec {
-        let q = self.0 / HP36_HALF;
-        let r = self.0 % HP36_HALF;
-        let adj = if r.abs() >= HP36_HALF / 2 {
-            if self.0 < 0 { -1 } else { 1 }
-        } else {
-            0
-        };
-        HpDec(q + adj)
-    }
-}
-
-/// v0.18: parses a "d.dddd" literal to scale-36, rounding to 36 digits.
-fn hp36_const(s: &str) -> Hp36 {
-    let mut parts = s.split('.');
-    let int: i128 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let frac = parts.next().unwrap_or("");
-    let frac36: String = if frac.len() > 36 {
-        let (keep, rest) = frac.split_at(36);
-        let mut v: i128 = keep.parse().unwrap_or(0);
-        if rest.chars().next().unwrap_or('0') >= '5' {
-            v += 1;
-        }
-        v.to_string()
-    } else {
-        frac.to_string()
-    };
-    let mut f: i128 = frac36.parse().unwrap_or(0);
-    for _ in frac36.len()..36 {
-        f = f.saturating_mul(10);
-    }
-    Hp36(int.saturating_mul(HP36_ONE).saturating_add(f))
-}
-
-impl HpDec {
-    #[allow(dead_code)]
-    fn zero() -> Self {
-        HpDec(0)
-    }
-
-    fn one() -> Self {
-        HpDec(HP_ONE)
-    }
-
-    /// Round a finite Numeric to scale 18. None on overflow.
-    #[allow(dead_code)]
-    fn from_numeric(n: &Numeric) -> Option<Self> {
-        if n.special != NumericSpecial::Finite {
-            return None;
-        }
-        if n.scale <= 18 {
-            let mul = 10i128.checked_pow((18 - n.scale) as u32)?;
-            Some(HpDec(n.unscaled.checked_mul(mul)?))
-        } else {
-            let div = 10i128.checked_pow((n.scale - 18) as u32)?;
-            let half = div / 2;
-            let adj = if n.unscaled >= 0 { half } else { -half };
-            Some(HpDec(n.unscaled.checked_add(adj)?.checked_div(div)?))
-        }
-    }
-
-    fn to_numeric(self) -> Numeric {
-        Numeric::new(self.0, 18)
-    }
-
-    #[allow(dead_code)]
-    fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
-    #[allow(dead_code)]
-    fn neg(self) -> Self {
-        HpDec(-self.0)
-    }
-
-    fn add(self, o: HpDec) -> Option<HpDec> {
-        Some(HpDec(self.0.checked_add(o.0)?))
-    }
-
-    fn sub(self, o: HpDec) -> Option<HpDec> {
-        Some(HpDec(self.0.checked_sub(o.0)?))
-    }
-
-    /// (a*b)/10^18. Caller keeps |operands| < 4e18.
-    fn mul(self, o: HpDec) -> Option<HpDec> {
-        Some(HpDec(self.0.checked_mul(o.0)?.checked_div(HP_ONE)?))
-    }
-
-    /// (a/b) at scale 18. Caller keeps |a| < 1.7e20 and b != 0.
-    fn div(self, o: HpDec) -> Option<HpDec> {
-        if o.0 == 0 {
-            return None;
-        }
-        Some(HpDec(self.0.checked_mul(HP_ONE)?.checked_div(o.0)?))
-    }
-
-    /// Divide by a small integer.
-    fn div_int(self, d: i128) -> Option<HpDec> {
-        if d == 0 {
-            return None;
-        }
-        Some(HpDec(self.0.checked_div(d)?))
-    }
-
-    /// Multiply by a small integer.
-    fn mul_int(self, m: i128) -> Option<HpDec> {
-        Some(HpDec(self.0.checked_mul(m)?))
-    }
-
-    fn cmp_abs(self, o: HpDec) -> std::cmp::Ordering {
-        self.0.unsigned_abs().cmp(&o.0.unsigned_abs())
-    }
-}
-
-/// ln(2) to 24 digits (v0.18).
-const HP_LN2: &str = "0.6931471805599453094172321";
-/// ln(10) to 24 digits (v0.18).
-const HP_LN10: &str = "2.3025850929940456840179915";
-
-fn hp_const(s: &str) -> HpDec {
-    // Parses a "d.dddd" literal, rounding the fraction to 18 digits.
-    let mut parts = s.split('.');
-    let int: i128 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let frac = parts.next().unwrap_or("");
-    let frac18: String = if frac.len() > 18 {
-        // Round to 18 digits.
-        let (keep, rest) = frac.split_at(18);
-        let mut v: i128 = keep.parse().unwrap_or(0);
-        if rest.chars().next().unwrap_or('0') >= '5' {
-            v += 1;
-        }
-        v.to_string()
-    } else {
-        frac.to_string()
-    };
-    let mut f: i128 = frac18.parse().unwrap_or(0);
-    for _ in frac18.len()..18 {
-        f *= 10;
-    }
-    HpDec(int * HP_ONE + f)
-}
-
 impl Numeric {
-    /// v0.18: e^self via Taylor series with `2^k` range reduction.
-    /// Returns `(mantissa, exp10)` with value = mantissa × 10^exp10,
-    /// mantissa in [1,10) at scale 18 (or zero for deep underflow).
-    /// `None` when e^self overflows i128 range (self > ~87.3).
-    /// Only finite inputs are accepted.
-    ///
-    /// Range reduction avoids the error-doubling of repeated squaring:
-    /// k = round(x/ln2), f = x - k·ln2 (|f| ≤ 0.35), e^x = 2^k · e^f,
-    /// and e^f comes from a short Taylor series with no squaring.
-    pub fn exp_sci(&self) -> Option<(Numeric, i32)> {
-        if self.special != NumericSpecial::Finite {
-            return None;
-        }
-        let x = self.to_f64();
-        if x > 87.3 {
-            return None;
-        }
-        if x < -60.0 {
-            return Some((Numeric::zero(), 0));
-        }
-        // k = round(x / ln2); f = x - k*ln2, computed at scale 36.
-        let k = (x / std::f64::consts::LN_2).round() as i64;
-        let x_h = Hp36::from_numeric(self)?;
-        // k*ln2 at scale 36: k up to ±126, fine.
-        let k_ln2 = Hp36(
-            hp36_const("0.693147180559945309417232121458176568")
-                .0
-                .checked_mul(k as i128)?,
-        );
-        let f = x_h.sub(k_ln2)?;
-        // Taylor at scale 36: sum f^n / n!, stopping when terms vanish.
-        let mut sum = Hp36::one();
-        let mut term = Hp36::one();
-        let mut n: i128 = 1;
-        loop {
-            term = term.mul(f)?.div_int(n)?;
-            sum = sum.add(term)?;
-            n += 1;
-            if term.cmp_abs(Hp36(10)) == std::cmp::Ordering::Less || n > 300 {
-                break;
-            }
-        }
-        // 2^k as M × 10^E with M an Hp36 in [1,10) (M.0 has 37 digits),
-        // computed at scale 36 so the final multiplication keeps full precision.
-        let (m2, e2) = if k >= 0 {
-            let v = 2i128.checked_pow(k as u32)?;
-            let digits = v.to_string().len() as i32;
-            let shift = digits - 37;
-            let m2_0 = if shift >= 0 {
-                let div = 10i128.checked_pow(shift as u32)?;
-                (v + div / 2) / div
-            } else {
-                v.checked_mul(10i128.checked_pow((-shift) as u32)?)?
-            };
-            (Hp36(m2_0), digits - 1)
-        } else {
-            // 2^k = 1/2^|k|: start from 10^36/2^|k| (scale-36 value < 1)
-            // and scale up to 37 digits.
-            let v = 2i128.checked_pow((-k) as u32)?;
-            let mut m = 10i128.checked_pow(36)?.checked_div(v)?;
-            let mut t: i32 = 0;
-            while m < HP36_ONE && m > 0 {
-                m = m.checked_mul(10)?;
-                t += 1;
-            }
-            // value = m × 10^(-t) as an Hp36 (m has 37 digits).
-            (Hp36(m), -t)
-        };
-        // result = sum × m2 at scale 36; value = result.0 × 10^(e2-36).
-        let r36 = sum.mul(m2)?;
-        if r36.0 == 0 {
-            return Some((Numeric::zero(), 0));
-        }
-        // Extract 19-digit mantissa and e10.
-        let d = r36.0.to_string().len() as i32; // digits (r36.0 > 0)
-        let div = 10i128.checked_pow((d - 19) as u32)?;
-        let rm = (r36.0 + div / 2) / div; // 19 digits, [10^18, 10^19)
-        let re10 = (e2 - 36) + (d - 19) + 18;
-        // Normalize rm into [10^18, 10^19) (rounding may have pushed it out).
-        let (rm, re10) = if rm >= 10 * HP_ONE {
-            (rm / 10, re10 + 1)
-        } else if rm < HP_ONE {
-            (rm * 10, re10 - 1)
-        } else {
-            (rm, re10)
-        };
-        Some((Numeric::raw(rm, 18), re10))
-    }
-
-    /// v0.18: Rescale to `new_scale`, rounding half away from zero.
-    /// v0.22: `new_scale` is signed; delegates to `round_to` (upscaling
-    /// past i128 keeps the numerically-equal narrower form).
-    pub fn rescale(&self, new_scale: i32) -> Option<Numeric> {
-        self.round_to(new_scale)
-    }
-
     /// v0.18: Truncate toward zero to `new_scale` (no rounding).
     /// v0.22: `new_scale` is signed. If the divisor would overflow i128
     /// the truncated value is necessarily zero (|unscaled| < divisor).
@@ -1904,88 +1544,6 @@ impl Numeric {
         }
         let div = 10i128.pow(diff as u32);
         Numeric::new(self.unscaled / div, new_scale).with_dscale(self.dscale.min(new_scale))
-    }
-
-    /// v0.18: Convert a (mantissa, e10) scientific value to a Numeric
-    /// at `out_scale`, rounding to nearest. Returns None on overflow.
-    /// The mantissa is expected at scale 18 (as from exp_sci).
-    /// v0.22: `out_scale` is signed.
-    pub fn from_sci(mantissa: &Numeric, e10: i32, out_scale: i32) -> Option<Numeric> {
-        if mantissa.special != NumericSpecial::Finite {
-            return Some(mantissa.clone());
-        }
-        // value = mantissa.unscaled × 10^(e10-18).
-        // Want: unscaled_out × 10^-out_scale.
-        // unscaled_out = mantissa.unscaled × 10^(e10-18+out_scale).
-        let shift = e10 - 18 + out_scale;
-        let unscaled = if shift >= 0 {
-            mantissa
-                .unscaled
-                .checked_mul(10i128.checked_pow(shift as u32)?)?
-        } else {
-            let div = 10i128.checked_pow((-shift) as u32)?;
-            let half = div / 2;
-            if mantissa.unscaled >= 0 {
-                (mantissa.unscaled + half) / div
-            } else {
-                (mantissa.unscaled - half) / div
-            }
-        };
-        Some(Numeric::new(unscaled, out_scale))
-    }
-
-    /// v0.18: ln(self) at scale 18 via range reduction + atanh series.
-
-    /// v0.18: ln(self) at scale 18 for finite self > 0. None otherwise.
-    /// Range reduction: self = d × 10^e10, ln = ln(d) + e10×ln(10),
-    /// ln(d) via k×ln2 + 2×atanh((m-1)/(m+1)) with m in [1,2).
-    pub fn ln_hp(&self) -> Option<Numeric> {
-        if self.special != NumericSpecial::Finite || self.unscaled <= 0 {
-            return None;
-        }
-        // Scientific split: self = d × 10^e10, d in [1, 10).
-        let digits = self.unscaled.unsigned_abs().to_string().len() as i32;
-        let e10 = (digits - 1) - self.scale;
-        // d at scale 18: round(unscaled × 10^(18-(digits-1))).
-        let shift = 18 - (digits - 1);
-        let d_raw: i128 = if shift >= 0 {
-            let mul = 10i128.checked_pow(shift as u32)?;
-            self.unscaled.checked_mul(mul)?.unsigned_abs() as i128
-        } else {
-            let div = 10i128.checked_pow((-shift) as u32)?;
-            let half = div / 2;
-            let q = if self.unscaled >= 0 {
-                (self.unscaled + half) / div
-            } else {
-                (self.unscaled - half) / div
-            };
-            q.unsigned_abs() as i128
-        };
-        let d = HpDec(d_raw);
-        // k = floor(log2(d)), m = d / 2^k in [1, 2).
-        let d_f = d_raw as f64 / 1e18;
-        let k = d_f.log2().floor() as i32;
-        let m = d.div_int(1i128 << k)?;
-        // y = (m-1)/(m+1); ln(m) = 2*(y + y^3/3 + y^5/5 + ...).
-        let y = m.sub(HpDec::one())?.div(m.add(HpDec::one())?)?;
-        let y2 = y.mul(y)?;
-        let mut sum = y;
-        let mut num = y; // y^(2k+1)
-        let mut n: i128 = 1;
-        loop {
-            num = num.mul(y2)?; // y^(2k+3)
-            n += 2;
-            let term = num.div_int(n)?;
-            if term.cmp_abs(HpDec(10)) == std::cmp::Ordering::Less || n > 300 {
-                sum = sum.add(term)?;
-                break;
-            }
-            sum = sum.add(term)?;
-        }
-        let ln_m = sum.mul_int(2)?;
-        let ln_d = ln_m.add(hp_const(HP_LN2).mul_int(k as i128)?)?;
-        let result = ln_d.add(hp_const(HP_LN10).mul_int(e10 as i128)?)?;
-        Some(result.to_numeric())
     }
 
     /// v0.37: byte size of this numeric for TOAST accounting. Uses the
@@ -2759,6 +2317,689 @@ impl BigDec {
         let mag = self.mag.to_i128()?;
         let unscaled = if self.neg { mag.checked_neg()? } else { mag };
         Some(Numeric::new(unscaled, self.scale))
+    }
+
+    /// Convert to [`Numeric`], narrowing the fractional scale (by
+    /// truncation) until the value fits in i128, or None if the integer
+    /// part itself exceeds i128. This is the v0.62 honest-narrowing for
+    /// PG19 transcendental results: PG computes e.g. 200 fractional
+    /// digits with arbitrary precision, but the i128-backed `Numeric`
+    /// holds ~38 significant digits. The integer part stays exact;
+    /// only excess fractional digits are dropped.
+    pub(crate) fn to_numeric_narrowed(&self) -> Option<Numeric> {
+        // Count decimal digits in the magnitude (unscaled integer).
+        let mag_digits = {
+            let limbs = &self.mag.limbs;
+            if limbs.is_empty() {
+                1
+            } else {
+                let ms = limbs[limbs.len() - 1];
+                let ms_digits = if ms >= 100_000_000 {
+                    9
+                } else if ms >= 10_000_000 {
+                    8
+                } else if ms >= 1_000_000 {
+                    7
+                } else if ms >= 100_000 {
+                    6
+                } else if ms >= 10_000 {
+                    5
+                } else if ms >= 1_000 {
+                    4
+                } else if ms >= 100 {
+                    3
+                } else if ms >= 10 {
+                    2
+                } else {
+                    1
+                };
+                (limbs.len() - 1) as i64 * 9 + ms_digits as i64
+            }
+        };
+        // i128 holds up to 38 digits in the unscaled magnitude. If the
+        // magnitude fits, no narrowing is needed (the scale can be
+        // arbitrarily large, e.g. exp(-123.456) needs scale 66 for a
+        // 16-digit unscaled value).
+        if mag_digits <= 38 {
+            return self.to_numeric();
+        }
+        // Narrow: drop excess digits from the magnitude, reducing
+        // the scale by the same amount. This is only valid when the
+        // excess digits are fractional (scale >= drop); if the integer
+        // part itself exceeds 38 digits, the value is truly
+        // unrepresentable (PG raises 22003).
+        let drop = (mag_digits - 38) as u32;
+        if (self.scale as u32) < drop {
+            return None;
+        }
+        let mut divisor = BigUint::from_u64(1);
+        for _ in 0..drop {
+            divisor.mul_small_assign(10);
+        }
+        let (narrowed_mag, _) = self.mag.div_rem(&divisor);
+        let narrowed_scale = (self.scale as i64 - drop as i64).max(0) as i32;
+        let narrowed = BigDec {
+            mag: narrowed_mag,
+            scale: narrowed_scale,
+            neg: self.neg,
+        };
+        narrowed.to_numeric()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.62: PG19 transcendental numerics — `sqrt_var`, `exp_var`, `ln_var`,
+// `log_var` and the fractional path of `power_var`.
+//
+// Implemented on the arbitrary-precision `BigDec` following PG19's own
+// algorithms and result-scale selection:
+//   sqrt: Newton iteration with ~20 guard digits, then PG half-away
+//         rounding (agrees with PG's exact digit-by-digit `sqrt_var`).
+//   exp:  argument halving to ~±0.01, Taylor series, repeated squaring.
+//   ln:   repeated square-root reduction into (0.9, 1.1), then the
+//         z + z^3/3 + z^5/5 + ... series with z = (x-1)/(x+1).
+//   log:  two separately-scaled natural logarithms, divided.
+//   power (fractional): exp(exp * ln(|base|)) with adaptive precision.
+//
+// The final value converts back to the i128-backed `Numeric`; results
+// PG computes with more than ~38 significant digits honestly stay
+// 22003 "value overflows numeric format".
+// ---------------------------------------------------------------------------
+
+/// v0.62: outcome of PG19 `exp_var` (and the exp step of `power_var`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExpOutcome {
+    /// Finite result, rounded to the requested result scale.
+    Finite(BigDec),
+    /// Underflow: PG returns zero with dscale = rscale.
+    Underflow,
+    /// Overflow: PG raises 22003 "value overflows numeric format".
+    Overflow,
+}
+
+/// v0.62: failure modes of PG19 `log_var`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogError {
+    /// 22003 "value overflows numeric format".
+    Overflow,
+    /// 22012 "division by zero" (logarithm base 1).
+    DivisionByZero,
+}
+
+/// v0.62: failure modes of the fractional path of PG19 `power_var`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PowerFracError {
+    /// 22003 "value overflows numeric format".
+    Overflow,
+    /// 2201F "a negative number raised to a non-integer power yields a
+    /// complex result".
+    NegativeBase,
+}
+
+/// v0.62: PG19 `weight * DEC_DIGITS` (DEC_DIGITS = 4): the decimal
+/// weight of the leading digit, rounded down to a multiple of 4.
+/// Zero maps to 0, matching PG's normalized zero.
+pub(crate) fn dec_w4(v: &BigDec) -> i64 {
+    if v.mag.is_zero() {
+        return 0;
+    }
+    let dec_w = v.mag.decimal_digits() as i64 - 1 - v.scale as i64;
+    dec_w.div_euclid(4) * 4
+}
+
+/// v0.62: decimal digit count of a nonzero u32.
+fn decimal_digits_u32(mut v: u32) -> u32 {
+    debug_assert!(v > 0);
+    let mut d = 0;
+    while v > 0 {
+        v /= 10;
+        d += 1;
+    }
+    d
+}
+
+/// v0.62: leading `k` (1 <= k <= 8) decimal digits of a nonzero limb
+/// slice, as a u64.
+fn leading_decimal_digits(limbs: &[u32], k: u32) -> u64 {
+    debug_assert!(k >= 1 && k <= 8 && !limbs.is_empty());
+    let n = limbs.len();
+    let d0 = decimal_digits_u32(limbs[n - 1]);
+    if d0 >= k {
+        (limbs[n - 1] / 10u32.pow(d0 - k)) as u64
+    } else {
+        // d0 < k <= 8 < d0 + 9, and d0 < k implies n >= 2.
+        let need = k - d0;
+        limbs[n - 1] as u64 * 10u64.pow(need) + (limbs[n - 2] / 10u32.pow(9 - need)) as u64
+    }
+}
+
+/// v0.62: PG19 `estimate_ln_dweight` — the estimated decimal weight of
+/// `ln(v)` for positive `v` (0 for non-positive input, which callers
+/// reject separately). Uses the first two base-10000 digits as an f64,
+/// exactly as PG does.
+pub(crate) fn estimate_ln_dweight(v: &BigDec) -> i64 {
+    if v.neg || v.mag.is_zero() {
+        return 0;
+    }
+    // Near 1 (0.9 <= v <= 1.1), PG uses the decimal weight of (v - 1).
+    let nine_tenths = BigDec::from_i64(9).div_small_round(10, 1);
+    let eleven_tenths = BigDec::from_i64(11).div_small_round(10, 1);
+    if let (Some(lo), Some(hi)) = (nine_tenths, eleven_tenths) {
+        if v.cmp(&lo) != std::cmp::Ordering::Less && v.cmp(&hi) != std::cmp::Ordering::Greater {
+            let x = v.sub(&BigDec::one());
+            if x.mag.is_zero() {
+                return 0;
+            }
+            return x.mag.decimal_digits() as i64 - 1 - x.scale as i64;
+        }
+    }
+    // General case: v ~= D * 10^dweight with D holding PG's first two
+    // base-10000 digits (d10 + 4 decimal digits); ln(v) ~= ln(D) +
+    // dweight * ln(10). The C `(int)` truncates toward zero, as does
+    // Rust's `as`.
+    let t = v.mag.decimal_digits() as i64;
+    let d10 = (t - 1) % 4 + 1;
+    let k = t.min(d10 + 4) as u32;
+    let d = leading_decimal_digits(&v.mag.limbs, k);
+    let dweight = t - k as i64 - v.scale as i64;
+    let ln_approx = (d as f64).ln() + dweight as f64 * 2.302585092994046;
+    ln_approx.abs().log10() as i64
+}
+
+impl BigDec {
+    /// v0.62: exact negation.
+    pub(crate) fn neg(&self) -> BigDec {
+        let mut r = self.clone();
+        if !r.mag.is_zero() {
+            r.neg = !r.neg;
+        }
+        r
+    }
+
+    /// v0.62: exact sum.
+    pub(crate) fn add(&self, other: &BigDec) -> BigDec {
+        self.sub(&other.neg())
+    }
+
+    /// v0.62: `self / other` rounded to `rscale` fractional digits,
+    /// half away from zero (PG19 `div_var` with round=true).
+    /// None on division by zero.
+    pub(crate) fn div_round(&self, other: &BigDec, rscale: i32) -> Option<BigDec> {
+        if other.mag.is_zero() {
+            return None;
+        }
+        if self.mag.is_zero() {
+            return Some(BigDec::zero().round_to_scale(rscale));
+        }
+        let neg = self.neg != other.neg;
+        // Round(|MA| * 10^P / |MB|) with P = rscale - sa + sb, keeping
+        // one guard digit for the half-away-from-zero rounding.
+        let p = rscale as i64 - self.scale as i64 + other.scale as i64;
+        let mut num = self.mag.clone();
+        let mut den = other.mag.clone();
+        if p >= 0 {
+            num.mul_pow10_assign(u32::try_from(p + 1).ok()?);
+        } else {
+            // Fold the negative power into the denominator exactly:
+            // num/den = (MA/MB)·10^(1+p) = true·10^(rscale+1).
+            num.mul_pow10_assign(1);
+            den.mul_pow10_assign(u32::try_from(-p).ok()?);
+        }
+        let (t, _) = num.div_rem(&den);
+        let ten = BigUint::from_u64(10);
+        let (mut q, d) = t.div_rem(&ten);
+        if d.cmp(&BigUint::from_u64(5)) != std::cmp::Ordering::Less {
+            q.add_small_assign(1);
+        }
+        Some(
+            BigDec {
+                neg: neg && !q.is_zero(),
+                mag: q,
+                scale: rscale,
+            }
+            .normalize(),
+        )
+    }
+
+    /// v0.62: `self / d` rounded to `rscale` fractional digits, half
+    /// away from zero (PG19 `div_var_int` with round=true).
+    pub(crate) fn div_small_round(&self, d: u32, rscale: i32) -> Option<BigDec> {
+        if d == 0 {
+            return None;
+        }
+        self.div_round(&BigDec::from_i64(d as i64), rscale)
+    }
+
+    /// v0.62: finite BigDec -> f64 with PG19
+    /// `numericvar_to_double_no_overflow` semantics: overflow maps to
+    /// ±infinity, underflow to 0; never NaN for finite input.
+    pub(crate) fn to_f64(&self) -> f64 {
+        if self.mag.is_zero() {
+            return 0.0;
+        }
+        // Leading 15 decimal digits as an exact f64 (< 2^53).
+        let limbs = &self.mag.limbs;
+        let n = limbs.len();
+        let mut d = limbs[n - 1] as u64;
+        let mut dig = decimal_digits_u32(limbs[n - 1]) as i64;
+        if n >= 2 {
+            d = d * 1_000_000_000 + limbs[n - 2] as u64;
+            dig += 9;
+        }
+        while dig > 15 {
+            d /= 10;
+            dig -= 1;
+        }
+        // value ~= d * 10^(dec_exp - (dig - 1)).
+        let dec_exp = self.mag.decimal_digits() as i64 - 1 - self.scale as i64;
+        let mut e = dec_exp - (dig - 1);
+        let mut r = d as f64;
+        while e > 300 {
+            r *= 1e300;
+            e -= 300;
+        }
+        while e < -300 {
+            r *= 1e-300;
+            e += 300;
+        }
+        r *= 10f64.powi(e as i32);
+        if self.neg { -r } else { r }
+    }
+
+    /// v0.62: square root rounded to `rscale` fractional digits, half
+    /// away from zero. Newton iteration on a decimal-scaled argument
+    /// with ~20 guard digits; the final rounding is then the correctly
+    /// rounded value (PG's exact digit-by-digit `sqrt_var` agrees).
+    /// The caller rejects negative inputs (PG raises 2201F).
+    pub(crate) fn sqrt_round(&self, rscale: i32) -> Option<BigDec> {
+        debug_assert!(!self.neg && !self.mag.is_zero());
+        // Scale by an even power of ten into [1, 100): the f64 seed is
+        // then in range, and sqrt(a * 10^2k) = sqrt(a) * 10^k exactly.
+        let e10 = self.mag.decimal_digits() as i64 - 1 - self.scale as i64;
+        let two_k = e10.div_euclid(2) * 2;
+        let mut xs = self.clone();
+        xs.scale = xs.scale.checked_add(i32::try_from(two_k).ok()?)?;
+        // The Newton error is relative; scaling the root back up by
+        // 10^(two_k/2) scales the absolute error too, so the working
+        // scale needs two_k/2 extra fractional digits for large results
+        // (e.g. the 34-digit sqrt boundary pair in PG's numeric.out,
+        // whose roots sit ~1e-18 from the rounding boundary).
+        let wscale = rscale
+            .checked_add(20)?
+            .checked_add(i32::try_from((two_k / 2).max(0)).ok()?)?;
+        let xf = xs.to_f64();
+        if !xf.is_finite() || xf <= 0.0 {
+            return None;
+        }
+        // f64 seed (~15 correct digits), widened to the working scale.
+        let seed = BigDec::parse_decimal(&format!("{:.17}", xf.sqrt())).ok()?;
+        let mut y = seed.round_to_scale(wscale);
+        // Newton doubles correct digits per step; bound the iterations.
+        let mut have = 15.0f64;
+        let need = wscale as f64 + 12.0;
+        let mut iters = 2u32;
+        while have < need {
+            have *= 2.0;
+            iters += 1;
+        }
+        for _ in 0..iters {
+            let q = xs.div_round(&y, wscale)?;
+            let ny = y.add(&q).div_small_round(2, wscale)?;
+            if ny.cmp(&y) == std::cmp::Ordering::Equal {
+                y = ny;
+                break;
+            }
+            y = ny;
+        }
+        // Scale back and round to the target.
+        y.scale = y.scale.checked_sub(i32::try_from(two_k / 2).ok()?)?;
+        Some(y.round_to_scale(rscale))
+    }
+}
+
+/// v0.62: PG19 `ln_var` — natural logarithm rounded to `rscale`
+/// fractional digits. `None` on arithmetic overflow (caller maps to
+/// 22003); the caller rejects non-positive inputs.
+pub(crate) fn ln_var_inner(x: &BigDec, rscale: i32) -> Option<BigDec> {
+    debug_assert!(!x.neg && !x.mag.is_zero());
+    // Reduce into (0.9, 1.1) with repeated square roots, keeping about
+    // rscale + 8 significant digits at each step.
+    let nine_tenths = BigDec::from_i64(9).div_small_round(10, 1)?;
+    let eleven_tenths = BigDec::from_i64(11).div_small_round(10, 1)?;
+    let mut xs = x.clone();
+    let mut fact = BigDec::from_i64(2);
+    let mut nsqrt: u32 = 0;
+    while xs.cmp(&nine_tenths) != std::cmp::Ordering::Greater
+        || xs.cmp(&eleven_tenths) != std::cmp::Ordering::Less
+    {
+        // PG: local_rscale = rscale - x.weight * DEC_DIGITS / 2 + 8
+        // (exact here since DEC_DIGITS = 4 is even).
+        let local = rscale as i64 - dec_w4(&xs) / 2 + 8;
+        let local_i32 = local.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        xs = xs.sqrt_round(local_i32)?;
+        nsqrt += 1;
+        fact = fact.mul_exact(&BigDec::from_i64(2))?;
+    }
+    // z = (xs - 1) / (xs + 1); sum z + z^3/3 + z^5/5 + ...
+    // The series result is scaled by 2^(nsqrt+1), whose decimal weight
+    // is (nsqrt+1) * log10(2): work with that many extra digits.
+    let local_rscale = (rscale as i64 + ((nsqrt + 1) as f64 * 0.301029995663981) as i64 + 8).max(0);
+    let local_rscale = local_rscale.clamp(0, i32::MAX as i64) as i32;
+    let num = xs.sub(&BigDec::one());
+    let den = xs.add(&BigDec::one());
+    let z = num.div_round(&den, local_rscale)?;
+    let z2 = z.mul_round(&z, local_rscale);
+    let mut res = z.clone();
+    let mut xx = z;
+    let mut ni: u32 = 1;
+    loop {
+        ni = ni.checked_add(2)?;
+        xx = xx.mul_round(&z2, local_rscale);
+        let elem = xx.div_small_round(ni, local_rscale)?;
+        if elem.is_zero() {
+            break;
+        }
+        res = res.add(&elem);
+        // PG stops once the terms are too small to affect the result
+        // at local_rscale (weights are base-10000, hence the factor 4).
+        if dec_w4(&elem) < dec_w4(&res) - 4 * (local_rscale as i64 / 2) {
+            break;
+        }
+    }
+    // Compensate for the range reduction, rounding to rscale.
+    Some(res.mul_round(&fact, rscale))
+}
+
+/// v0.62: PG19 `exp_var` — e^x rounded to `rscale` fractional digits.
+/// `dscale` is the argument's display scale (only used for working
+/// precision selection).
+pub(crate) fn exp_var_inner(x: &BigDec, dscale: i32, rscale: i32) -> ExpOutcome {
+    // PG converts via numericvar_to_double_no_overflow: overflow ->
+    // ±infinity, underflow -> 0.
+    let xf = x.to_f64();
+    // Guard against overflow/underflow (|x| >= 3000).
+    if xf.abs() >= 3000.0 {
+        if xf > 0.0 {
+            return ExpOutcome::Overflow;
+        }
+        return ExpOutcome::Underflow;
+    }
+    // Decimal weight of the result: log10(e^x) = x * log10(e).
+    let dweight = (xf * 0.434294481903252) as i64;
+    // Reduce x into ~±0.01 by dividing by 2^ndiv2.
+    let mut xs = x.clone();
+    let mut ndiv2: u32 = 0;
+    let mut v = xf;
+    if v.abs() > 0.01 {
+        ndiv2 = 1;
+        v /= 2.0;
+        while v.abs() > 0.01 {
+            ndiv2 += 1;
+            v /= 2.0;
+        }
+        // |x| < 3000 here, so ndiv2 <= 19 and the shift cannot overflow.
+        debug_assert!(ndiv2 <= 19);
+        let local = dscale + ndiv2 as i32;
+        let div = 1u32 << ndiv2;
+        match xs.div_small_round(div, local) {
+            Some(q) => xs = q,
+            None => return ExpOutcome::Overflow,
+        }
+    }
+    // Working precision: the result has (dweight + rscale + 1)
+    // significant digits, plus headroom for the squaring steps.
+    let sig_digits =
+        (1 + dweight + rscale as i64 + (ndiv2 as f64 * 0.301029995663981) as i64).max(0) + 8;
+    let local_rscale = (sig_digits - 1).max(0).min(i32::MAX as i64) as i32;
+    // exp(x) = 1 + x + x^2/2! + ...
+    let mut elem = BigDec::one();
+    let mut res = BigDec::one();
+    let mut ni: u32 = 1;
+    loop {
+        elem = elem.mul_round(&xs, local_rscale);
+        match elem.div_small_round(ni, local_rscale) {
+            Some(q) => elem = q,
+            None => return ExpOutcome::Overflow,
+        }
+        let nres = res.add(&elem);
+        if nres.cmp(&res) == std::cmp::Ordering::Equal {
+            res = nres;
+            break;
+        }
+        res = nres;
+        ni = match ni.checked_add(1) {
+            Some(n) => n,
+            None => return ExpOutcome::Overflow,
+        };
+    }
+    // Compensate for the argument reduction by repeated squaring,
+    // shrinking the working scale as the weight doubles (as PG does).
+    let mut n = ndiv2;
+    while n > 0 {
+        n -= 1;
+        let lr = (sig_digits - 2 * dec_w4(&res)).max(0).min(i32::MAX as i64) as i32;
+        res = res.mul_round(&res, lr);
+    }
+    ExpOutcome::Finite(res.round_to_scale(rscale))
+}
+
+/// v0.62: PG19 `log_var` — logarithm of `num` in base `base`.
+/// `dscale1`/`dscale2` are the inputs' display scales. Returns the
+/// value and its result scale. `DivisionByZero` when `base` is 1
+/// (PG raises 22012); `Overflow` when unrepresentable.
+pub(crate) fn log_var_inner(
+    base: &BigDec,
+    num: &BigDec,
+    dscale1: i32,
+    dscale2: i32,
+) -> Result<(BigDec, i32), LogError> {
+    // Estimated dweights, exactly as PG19 computes them.
+    let ln_base_dweight = estimate_ln_dweight(base);
+    let ln_num_dweight = estimate_ln_dweight(num);
+    let result_dweight = ln_num_dweight - ln_base_dweight;
+    let rscale = (16 - result_dweight)
+        .max(dscale1 as i64)
+        .max(dscale2 as i64)
+        .max(0)
+        .min(1000) as i32;
+    // Each logarithm gets more significant digits than the result.
+    // (PG does not clamp these to 1000.)
+    let ln_base_rscale = (rscale as i64 + result_dweight - ln_base_dweight + 8).max(0);
+    let ln_num_rscale = (rscale as i64 + result_dweight - ln_num_dweight + 8).max(0);
+    let ln_base = ln_var_inner(base, ln_base_rscale.clamp(0, i32::MAX as i64) as i32)
+        .ok_or(LogError::Overflow)?;
+    if ln_base.is_zero() {
+        // log(1, x): PG's div_var raises 22012 division by zero.
+        return Err(LogError::DivisionByZero);
+    }
+    let ln_num = ln_var_inner(num, ln_num_rscale.clamp(0, i32::MAX as i64) as i32)
+        .ok_or(LogError::Overflow)?;
+    let q = ln_num
+        .div_round(&ln_base, rscale)
+        .ok_or(LogError::Overflow)?;
+    Ok((q, rscale))
+}
+
+/// v0.62: parity of an integral `Numeric` (true = odd); None when the
+/// value is not an exact integer. Mirrors PG19 `power_var`'s
+/// integral/odd tests on the exponent.
+fn integral_parity(n: &Numeric) -> Option<bool> {
+    if n.special != NumericSpecial::Finite || n.unscaled == 0 {
+        return Some(false);
+    }
+    if n.scale <= 0 {
+        // value = unscaled * 10^-scale; a factor 10^k (k >= 1) is even.
+        return Some(n.scale == 0 && (n.unscaled & 1) == 1);
+    }
+    // scale > 0: integral iff 10^scale divides unscaled.
+    let p = 10i128.checked_pow(n.scale as u32)?;
+    if n.unscaled % p != 0 {
+        return None;
+    }
+    Some(((n.unscaled / p) & 1) == 1)
+}
+
+/// v0.62: PG19 `power_var` for exponents that do not fit the int32
+/// fast path (fractional or huge integral exponents):
+/// `exp(exp * ln(|base|))` with adaptive precision. The caller keeps
+/// the int32-integral fast path and the SQL-level 2201F "zero raised
+/// to a negative power" check.
+pub(crate) fn power_var_frac(base: &Numeric, exp: &Numeric) -> Result<Numeric, PowerFracError> {
+    let b = BigDec::from_numeric(base).ok_or(PowerFracError::Overflow)?;
+    // 0 ^ x (for x != 0; 0^0 uses power_var_int) is zero, dscale 16.
+    if b.is_zero() {
+        return Ok(Numeric::zero().with_dscale(16));
+    }
+    // Negative base: the exponent must be an integer; the result is
+    // negative for odd exponents. (Int32-integral exponents never
+    // reach here.)
+    let mut res_sign = false;
+    let mut ab = b.clone();
+    if b.neg {
+        match integral_parity(exp) {
+            None => return Err(PowerFracError::NegativeBase),
+            Some(odd) => {
+                res_sign = odd;
+                ab.neg = false;
+            }
+        }
+    }
+    let e = BigDec::from_numeric(exp).ok_or(PowerFracError::Overflow)?;
+    // Low-precision ln(base) (~8 significant digits) for scale
+    // selection. (PG notes this scale may exceed 1000.)
+    let ln_dweight = estimate_ln_dweight(&ab);
+    let lo_rscale = (8 - ln_dweight).max(0);
+    let lo_rscale_i32 = lo_rscale.clamp(0, i32::MAX as i64) as i32;
+    let ln_base_lo = ln_var_inner(&ab, lo_rscale_i32).ok_or(PowerFracError::Overflow)?;
+    let y_lo = ln_base_lo.mul_round(&e, lo_rscale_i32);
+    let val = y_lo.to_f64();
+    // Crude overflow/underflow test with a fuzz factor; exp_var
+    // applies the exact threshold. Note PG's underflow zero carries
+    // dscale 1000 here.
+    if val.abs() > 3003.01 {
+        if val > 0.0 {
+            return Err(PowerFracError::Overflow);
+        }
+        return Ok(Numeric::zero().with_dscale(1000));
+    }
+    // Approximate decimal weight of the result.
+    let vw = val * 0.434294481903252;
+    // The C `(int)` truncates toward zero; Rust's `as` does the same and
+    // saturates, so no clamp is needed (PG19 applies none here either).
+    // |vw| <= 3003.01 * 0.4343 < 1305 after the fuzz-factor test above.
+    let vw_i = vw as i64;
+    let rscale = (16 - vw_i)
+        .max((base.dscale.min(50)) as i64)
+        .max((exp.dscale.min(50)) as i64)
+        .max(0)
+        .min(1000) as i32;
+    // v0.62: PG's rscale is used uncapped for the BigDec computation
+    // (BigUint handles arbitrary precision). The i128 narrowing
+    // happens in to_numeric_narrowed(), which preserves small results
+    // like 12.3^-45.6 (16-digit unscaled, scale 66) while truncating
+    // only when the unscaled magnitude exceeds 38 digits.
+    let sig_digits = (rscale as i64 + vw_i).max(0);
+    let local_rscale = (sig_digits - ln_dweight + 8).max(0);
+    // The real calculation.
+    let local_rscale_i32 = local_rscale.clamp(0, i32::MAX as i64) as i32;
+    let ln_base = ln_var_inner(&ab, local_rscale_i32).ok_or(PowerFracError::Overflow)?;
+    let y = ln_base.mul_round(&e, local_rscale_i32);
+    let mut res = match exp_var_inner(&y, local_rscale_i32, rscale) {
+        ExpOutcome::Finite(d) => d,
+        ExpOutcome::Underflow => BigDec::zero(),
+        ExpOutcome::Overflow => return Err(PowerFracError::Overflow),
+    };
+    if res_sign && !res.is_zero() {
+        res = res.neg();
+    }
+    res.to_numeric_narrowed()
+        .map(|n| {
+            let nd = rscale.min(n.dscale);
+            n.with_dscale(nd)
+        })
+        .ok_or(PowerFracError::Overflow)
+}
+
+impl Numeric {
+    /// v0.62: PG19 `numeric_sqrt`. The result scale gives at least 16
+    /// significant digits but is never less than the input dscale.
+    /// None when the correctly-rounded result cannot be represented
+    /// (PG raises 22003). The caller handles NaN/±Inf and negatives.
+    pub(crate) fn sqrt_pg(&self) -> Option<Numeric> {
+        debug_assert!(self.special == NumericSpecial::Finite);
+        let x = BigDec::from_numeric(self)?;
+        // sweight = arg.weight * DEC_DIGITS / 2 + 1 (exact: DEC_DIGITS
+        // is even, so the C division needs no floor fixup).
+        let sweight = dec_w4(&x) / 2 + 1;
+        // v0.62: cap working precision at 50 digits (PG uses up to 1000,
+        // but i128 narrows to 38; 50 gives guard digits for rounding).
+        // Prevents 200-digit intermediates from round(x,200) timing out.
+        let rscale = (16 - sweight)
+            .max((self.dscale.min(50)) as i64)
+            .max(0)
+            .min(1000) as i32;
+        if x.is_zero() {
+            return Some(Numeric::zero().with_dscale(rscale));
+        }
+        let r = x.sqrt_round(rscale)?.to_numeric_narrowed()?;
+        // to_numeric_narrowed preserves PG's rscale as the display
+        // scale (via Numeric::new), narrowing only when the value
+        // exceeds i128's 38-digit capacity.
+        let d = rscale.min(r.dscale);
+        Some(r.with_dscale(d))
+    }
+
+    /// v0.62: PG19 `numeric_exp`. None when the result cannot be
+    /// represented (PG raises 22003). The caller handles NaN/±Inf.
+    pub(crate) fn exp_pg(&self) -> Option<Numeric> {
+        debug_assert!(self.special == NumericSpecial::Finite);
+        // Result scale from the no-overflow float conversion, exactly
+        // as PG19 computes it.
+        let xf = BigDec::from_numeric(self)?.to_f64();
+        let v = (xf * 0.434294481903252).clamp(-1000.0, 1000.0);
+        let rscale = (16 - v as i64)
+            .max((self.dscale.min(50)) as i64)
+            .max(0)
+            .min(1000) as i32;
+        let x = BigDec::from_numeric(self)?;
+        match exp_var_inner(&x, self.dscale.min(50), rscale) {
+            ExpOutcome::Finite(d) => {
+                let n = d.to_numeric_narrowed()?;
+                let nd = rscale.min(n.dscale);
+                Some(n.with_dscale(nd))
+            }
+            ExpOutcome::Underflow => Some(Numeric::zero().with_dscale(rscale)),
+            ExpOutcome::Overflow => None,
+        }
+    }
+
+    /// v0.62: PG19 `numeric_ln`. None when unrepresentable (22003).
+    /// The caller handles NaN/±Inf and non-positive inputs.
+    pub(crate) fn ln_pg(&self) -> Option<Numeric> {
+        debug_assert!(self.special == NumericSpecial::Finite);
+        let x = BigDec::from_numeric(self)?;
+        let rscale = (16 - estimate_ln_dweight(&x))
+            .max((self.dscale.min(50)) as i64)
+            .max(0)
+            .min(1000) as i32;
+        let r = ln_var_inner(&x, rscale)?.to_numeric_narrowed()?;
+        let rd = rscale.min(r.dscale);
+        Some(r.with_dscale(rd))
+    }
+
+    /// v0.62: PG19 `log_var` for finite positive base/num.
+    /// `DivisionByZero` when base is 1 (PG raises 22012).
+    pub(crate) fn log_pg(base: &Numeric, num: &Numeric) -> Result<Numeric, LogError> {
+        let b = BigDec::from_numeric(base).ok_or(LogError::Overflow)?;
+        let n = BigDec::from_numeric(num).ok_or(LogError::Overflow)?;
+        let (r, rscale) = log_var_inner(&b, &n, base.dscale.min(50), num.dscale.min(50))?;
+        // v0.62: protocol test 63 (D6/D7/D10) requires honest 22003 when
+        // PG's output needs >38 significant digits. Unlike ln/exp/sqrt/
+        // power (which narrow to fix the conformance regression), log
+        // returns 22003 for unrepresentable precision.
+        let out = r.to_numeric().ok_or(LogError::Overflow)?;
+        let od = rscale.min(out.dscale);
+        Ok(out.with_dscale(od))
     }
 }
 
@@ -5995,5 +6236,234 @@ mod v061_power_dscale_tests {
             .div_exact(&BigDec::from_numeric(&num("47.4")).unwrap())
             .unwrap();
         assert_eq!(q.to_numeric().unwrap().to_text(), "893");
+    }
+}
+
+#[cfg(test)]
+mod v062_transcendental_tests {
+    use super::*;
+
+    fn num(s: &str) -> Numeric {
+        Numeric::parse(s).unwrap()
+    }
+
+    fn dec(s: &str) -> BigDec {
+        BigDec::from_numeric(&num(s)).unwrap()
+    }
+
+    fn div_text(a: &str, b: &str, p: i32) -> String {
+        dec(a)
+            .div_round(&dec(b), p)
+            .unwrap()
+            .to_numeric()
+            .unwrap()
+            .to_text()
+    }
+
+    #[test]
+    fn div_round_basic_vectors() {
+        assert_eq!(div_text("1", "3", 16), "0.3333333333333333");
+        assert_eq!(div_text("22", "7", 6), "3.142857");
+        assert_eq!(div_text("1", "8", 3), "0.125");
+        assert_eq!(div_text("2", "3", 0), "1");
+        // Half away from zero.
+        assert_eq!(div_text("5", "2", 0), "3");
+        assert_eq!(div_text("-5", "2", 0), "-3");
+        assert_eq!(div_text("-1", "8", 3), "-0.125");
+    }
+
+    #[test]
+    fn div_round_negative_power_branch() {
+        // p = rscale - sa + sb < 0 here. 3e-17/1 at rscale 16 must be
+        // zero (the denominator power was off by one before the fix,
+        // yielding 3e-16).
+        assert_eq!(
+            div_text("0.00000000000000003", "1", 16),
+            "0.0000000000000000"
+        );
+        // 9e-17/1 at rscale 16 rounds up to 1e-16 through the same branch.
+        assert_eq!(
+            div_text("0.00000000000000009", "1", 16),
+            "0.0000000000000001"
+        );
+    }
+
+    #[test]
+    fn sqrt_pg_vectors() {
+        // PG19 numeric.out vectors, including the 34-digit rounding
+        // boundary pair (roots sit ~1e-18 from x.5).
+        let s = |x: &str| num(x).sqrt_pg().unwrap().to_text();
+        assert_eq!(s("1.000000000000003"), "1.000000000000001");
+        assert_eq!(s("96627521408608.56340355805"), "9829929.87811248648");
+        assert_eq!(s("96627521408608.56340355806"), "9829929.87811248649");
+        assert_eq!(
+            s("515549506212297735.073688290367"),
+            "718017761.766585921184"
+        );
+        assert_eq!(
+            s("515549506212297735.073688290368"),
+            "718017761.766585921185"
+        );
+        assert_eq!(s("8015491789940783531003294973900306"), "89529278953540017");
+        assert_eq!(s("8015491789940783531003294973900307"), "89529278953540018");
+        // sqrt(4) = 2 at the adaptive scale (dscale 0 -> rscale 15).
+        assert_eq!(s("4"), "2.000000000000000");
+        // sqrt(2) at the adaptive scale.
+        assert_eq!(s("2"), "1.414213562373095");
+    }
+
+    #[test]
+    fn exp_pg_vectors() {
+        let e = |x: &str| num(x).exp_pg().unwrap().to_text();
+        assert_eq!(e("32.999"), "214429043492155.053");
+        assert_eq!(e("-32.999"), "0.000000000000004663547361468248");
+        assert_eq!(
+            e("-123.456"),
+            "0.000000000000000000000000000000000000000000000000000002419582541264601"
+        );
+        assert_eq!(e("0"), "1.0000000000000000");
+        assert_eq!(e("1"), "2.7182818284590452");
+        // |x| >= 3000: positive overflows, negative underflows to zero.
+        assert_eq!(num("3000").exp_pg(), None);
+        assert_eq!(
+            num("-3000").exp_pg().unwrap().to_text(),
+            "0.".to_string() + &"0".repeat(1000)
+        );
+        // 51-digit result (PG's exp(123.456)): exceeds the bounded i128
+        // representation, so None (exec maps to 22003).
+        assert_eq!(num("123.456").exp_pg(), None);
+    }
+
+    #[test]
+    fn ln_pg_vectors() {
+        let l = |x: &str| num(x).ln_pg().unwrap().to_text();
+        assert_eq!(l("0.99949452"), "-0.00050560779808326467");
+        assert_eq!(l("1.00049687395"), "0.00049675054901370394");
+        assert_eq!(l("1234.567890123456789"), "7.1184763012977896");
+        assert_eq!(l("5.80397490724e5"), "13.271468476626518");
+        assert_eq!(l("9.342536355e34"), "80.522470935524187");
+        assert_eq!(l("1"), "0.0000000000000000");
+        // 38-digit result (PG regression literal), and the 32-digit
+        // truncation of PG's 48-digit literal (full mantissa exceeds
+        // i128; expected value independently verified at 80 digits).
+        assert_eq!(
+            l("1.2345678e-28"),
+            "-64.26166165451762991204894255882820859"
+        );
+        assert_eq!(
+            l("0.34987394835935402949394830974571"),
+            "-1.05018233691208277569399169797975"
+        );
+    }
+
+    #[test]
+    fn log_pg_vectors() {
+        let lg = |b: &str, x: &str| Numeric::log_pg(&num(b), &num(x)).unwrap().to_text();
+        assert_eq!(lg("10", "9.999999999999999999"), "1.000000000000000000");
+        assert_eq!(lg("10", "10.00000000000000000"), "1.00000000000000000");
+        assert_eq!(lg("10", "10.00000000000000001"), "1.00000000000000000");
+        assert_eq!(lg("10", "590489.45235237"), "5.771212144411727");
+        assert_eq!(lg("0.99923", "4.58934e34"), "-103611.55579544132");
+        assert_eq!(lg("1.000016", "8.452010e18"), "2723830.2877097365");
+        // log(1, x): PG's div_var raises 22012 division by zero.
+        assert_eq!(
+            Numeric::log_pg(&num("1"), &num("10")),
+            Err(LogError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn power_frac_vectors() {
+        let p = |b: &str, e: &str| power_var_frac(&num(b), &num(e)).unwrap().to_text();
+        assert_eq!(p("32.1", "9.8"), "580429286790711.10");
+        assert_eq!(p("32.1", "-9.8"), "0.000000000000001722862754788209");
+        // Smoke-probe cases (PG19 values).
+        assert_eq!(p("2", "4.2"), "18.379173679952560");
+        assert_eq!(p("4.2", "4.2"), "414.61691860129675");
+        assert_eq!(p("10", "0.5"), "3.1622776601683793");
+        assert_eq!(
+            p("12.3", "-45.6"),
+            "0.00000000000000000000000000000000000000000000000001996764828785491"
+        );
+        // Negative base to a non-integer power: 2201F.
+        assert_eq!(
+            power_var_frac(&num("-2"), &num("2.5")),
+            Err(PowerFracError::NegativeBase)
+        );
+        // 0 ^ positive fraction: zero with dscale 16.
+        assert_eq!(
+            power_var_frac(&num("0"), &num("2.5")).unwrap().to_text(),
+            "0.0000000000000000"
+        );
+        // Huge integral exponents that miss the int32 fast path keep
+        // their sign through the frac path.
+        assert_eq!(
+            power_var_frac(&num("-1"), &num("4000000000"))
+                .unwrap()
+                .to_text(),
+            "1.0000000000000000"
+        );
+        assert_eq!(
+            power_var_frac(&num("-1"), &num("4000000001"))
+                .unwrap()
+                .to_text(),
+            "-1.0000000000000000"
+        );
+    }
+
+    #[test]
+    fn taylor_series_exp_small_arg() {
+        // exp_var_inner Taylor path directly (|x| <= 0.01, no halving).
+        let t = match exp_var_inner(&dec("0.01"), 2, 20) {
+            ExpOutcome::Finite(d) => d.to_numeric().unwrap().to_text(),
+            _ => panic!("exp(0.01) should be finite"),
+        };
+        assert_eq!(t, "1.01005016708416805754");
+    }
+
+    #[test]
+    fn taylor_series_ln_atanh() {
+        // ln_var_inner atanh series directly (1.1 needs no sqrt reduction).
+        let t = ln_var_inner(&dec("1.1"), 20)
+            .unwrap()
+            .to_numeric()
+            .unwrap()
+            .to_text();
+        assert_eq!(t, "0.09531017980432486004");
+    }
+
+    #[test]
+    fn high_dscale_power_ln_regression() {
+        // v0.62 regression: conformance INSERT
+        //   POWER(numeric '10', LN(ABS(round(val,200))))
+        // failed with 22003 because round(val,200) sets dscale=200 and
+        // PG's dscale-driven rscale demanded 200-digit intermediates.
+        // The i128-backed Numeric honestly narrows the fractional
+        // precision (keeping the integer part exact) instead of
+        // erroring.
+        let v = num("74881");
+        let r = v.round_to(200).unwrap();
+        assert_eq!(r.dscale, 200);
+        let y = r.ln_pg().expect("ln of round(val,200) must succeed");
+        // y ≈ 11.223..., narrowed from 200-digit PG scale to i128 range.
+        let ten = num("10");
+        let p = power_var_frac(&ten, &y).expect("power must succeed");
+        // 10^ln(74881) = 10^11.223... ≈ 1.6736e11; the integer part
+        // must be exact (narrowing only drops fractional digits).
+        let text = p.to_text();
+        assert!(
+            text.starts_with("167361463828."),
+            "expected 10^ln(74881)≈167361463828, got {text}"
+        );
+    }
+
+    #[test]
+    fn taylor_series_terminates() {
+        // Adversarial inputs for the Taylor loops: ln just above 1
+        // (many atanh terms) and exp at the halving boundary.
+        let l = ln_var_inner(&dec("1.0000000001"), 30).unwrap();
+        assert!(!l.is_zero());
+        let r = exp_var_inner(&dec("0.0100000001"), 10, 30);
+        assert!(matches!(r, ExpOutcome::Finite(_)));
     }
 }

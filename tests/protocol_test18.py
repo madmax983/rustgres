@@ -277,7 +277,9 @@ def main():
         # ---- F. Additional edge cases ----
         # Decimal literals are numeric (v0.18 change)
         rows, _, _ = c.sql("SELECT 1.5 + 2.5")
-        check("decimal literal numeric", rows[0][0] == "4", f"got {rows}")
+        # v0.62 fix: PG19 numeric add keeps max input dscale, so 1.5+2.5
+        # displays "4.0" (the old "4" expectation predated dscale retention).
+        check("decimal literal numeric", rows[0][0] == "4.0", f"got {rows}")
         # NaN in different contexts
         rows, _, _ = c.sql("SELECT 'nan'::numeric + 'inf'::numeric")
         check("nan+inf=NaN", rows[0][0] == "NaN", f"got {rows}")
