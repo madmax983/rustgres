@@ -15386,7 +15386,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.21: float8 transcendental functions.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
         | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd" | "tand"
-        | "cotd" | "asind" | "acosd" | "atand" | "log10" | "float8send" => n == 1,
+        | "cotd" | "asind" | "acosd" | "atand" | "log10" | "float8send" | "float4send"
+        | "float4recv" | "float8recv" => n == 1,
         // v0.56: trunc(x) and trunc(x, s) (PG's trunc(numeric, int)).
         "trunc" => n == 1 || n == 2,
         "atan2" | "atan2d" => n == 2,
@@ -15577,7 +15578,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
         | "asinh" | "acosh" | "atanh" | "erf" | "erfc" | "gamma" | "lgamma" | "sind" | "cosd"
         | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" | "trunc" | "log10"
-        | "float8send" => eval_math_func(name, vals),
+        | "float8send" | "float4send" | "float4recv" | "float8recv" => eval_math_func(name, vals),
         // v0.26: to_number(text, text) -> numeric. Parses text with a
         // numeric format picture (PG's numeric_to_number).
         "to_number" => {
@@ -19528,6 +19529,52 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let x = float_math_arg(name, v)?;
             Ok(Value::Bytea(x.to_be_bytes().to_vec()))
         }
+        "float4send" => {
+            // v0.58: float4send(float4) -> bytea: the 4-byte big-endian
+            // IEEE 754 binary representation, like PG's float4send
+            // (REL_19_STABLE float.c: pq_sendfloat4 writes htonl of the
+            // bit pattern). float4 -> float8 -> float4 is an exact
+            // round-trip, so routing through float_math_arg (f64) and
+            // narrowing with `as f32` is bit-identical to PG's send;
+            // for non-float4 inputs this matches PG's implicit
+            // float8 -> float4 coercion at the function boundary.
+            // (Input parsing is correctly rounded via parse_f32_checked,
+            // matching PG 19's float4in: PG's own float4 regression
+            // expected values — e.g. '7038531e-32' -> 0x15ae43fd —
+            // prove single correct rounding, where naive f64-then-narrow
+            // double rounding would give 0x15ae43fe.)
+            let x = float_math_arg(name, v)? as f32;
+            Ok(Value::Bytea(x.to_be_bytes().to_vec()))
+        }
+        "float4recv" => {
+            // v0.58: float4recv(bytea) -> float4, like PG's float4recv
+            // (pq_getmsgfloat4): 4-byte big-endian IEEE 754; fewer than
+            // 4 bytes is 22P03 "insufficient data left in message";
+            // trailing bytes are ignored, as in PG.
+            let b = match v {
+                Value::Bytea(b) => b,
+                _ => return Err(func_arg_err(name, v)),
+            };
+            if b.len() < 4 {
+                return Err(exec_err("22P03", "insufficient data left in message"));
+            }
+            Ok(Value::Float4(f32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+        }
+        "float8recv" => {
+            // v0.58: float8recv(bytea) -> float8, like PG's float8recv
+            // (pq_getmsgfloat8): 8-byte big-endian IEEE 754; fewer than
+            // 8 bytes is 22P03; trailing bytes ignored.
+            let b = match v {
+                Value::Bytea(b) => b,
+                _ => return Err(func_arg_err(name, v)),
+            };
+            if b.len() < 8 {
+                return Err(exec_err("22P03", "insufficient data left in message"));
+            }
+            Ok(Value::Float(f64::from_be_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ])))
+        }
         "factorial" => {
             // factorial(numeric) -> numeric. PG: 0! = 1, negative errors.
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
@@ -20245,6 +20292,11 @@ fn func_result_type(
         | "tand" | "cotd" | "asind" | "acosd" | "atand" | "atan2d" | "log10" => Ok(ColType::Float),
         // v0.21: float8send returns bytea.
         "float8send" => Ok(ColType::Bytea),
+        // v0.58: float4send returns bytea; float4recv returns float4;
+        // float8recv returns float8.
+        "float4send" => Ok(ColType::Bytea),
+        "float4recv" => Ok(ColType::Float4),
+        "float8recv" => Ok(ColType::Float),
         // setseed() returns void in Postgres (OID 2278); rustgres has no void
         // ColType and the implementation always returns NULL, so declare Text
         // like the NULL literal type inference does (see Value::Null arm).
@@ -23511,6 +23563,95 @@ mod tests {
             "42883"
         );
         assert_eq!(err_code(&mut eng, "SELECT justify_days(now())"), "42883");
+    }
+
+    // v0.58: PG19 binary float I/O — float4send / float4recv / float8recv.
+    // Byte-exact against PG 19's float4 regression expectations.
+    #[test]
+    fn v58_float_send_recv() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| -> String {
+            rows_of(run(eng, sql).unwrap())[0][0].clone()
+        };
+        let err_code =
+            |eng: &mut Engine, sql: &str| -> &'static str { run(eng, sql).unwrap_err().code };
+        // PG19 float4 regression-exact send bytes (big-endian IEEE-754).
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('5e-20'::float4)"),
+            "\\x1f6c1e4a"
+        );
+        // Double-rounding trap: naive f64-then-narrow gives 0x15ae43fe.
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('7038531e-32'::float4)"),
+            "\\x15ae43fd"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('1.17549435e-38'::float4)"),
+            "\\x00800000"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('nan'::float4)"),
+            "\\x7fc00000"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('inf'::float4)"),
+            "\\x7f800000"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('-inf'::float4)"),
+            "\\xff800000"
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('0'::float4)"),
+            "\\x00000000"
+        );
+        // Strict NULL through the math-function path.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT float4send(NULL::float4)").unwrap())[0][0],
+            "NULL"
+        );
+        // Non-float4 inputs coerce like PG's implicit float8 -> float4.
+        assert_eq!(
+            one(&mut eng, "SELECT float4send('2.5'::float8)"),
+            "\\x40200000"
+        );
+        // Round trips.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT float4recv(float4send('3.14'::float4)) = '3.14'::float4"
+            ),
+            "t"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT float8recv(float8send('2.5'::float8)) = '2.5'::float8"
+            ),
+            "t"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT float4recv('\\x3f800000'::bytea) = '1'::float4"
+            ),
+            "t"
+        );
+        // Short input: PG's 22P03 "insufficient data left in message".
+        assert_eq!(
+            err_code(&mut eng, "SELECT float4recv('\\x0102'::bytea)"),
+            "22P03"
+        );
+        assert_eq!(
+            err_code(&mut eng, "SELECT float8recv('\\x01020304050607'::bytea)"),
+            "22P03"
+        );
+        // Wrong arity / non-bytea input.
+        assert_eq!(
+            err_code(&mut eng, "SELECT float4send('1'::float4, '2'::float4)"),
+            "42883"
+        );
+        assert_eq!(err_code(&mut eng, "SELECT float4recv(123)"), "42883");
     }
 
     // v0.53: unary minus as first-class Expr::Neg (PG19 doNegate, UMINUS
