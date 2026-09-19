@@ -699,6 +699,11 @@ impl Enc {
                 self.u8(16);
                 return;
             }
+            // v0.57: name; tag appends after v0.37's.
+            ColType::Name => {
+                self.u8(17);
+                return;
+            }
         });
     }
 
@@ -1232,6 +1237,8 @@ impl<'a> Dec<'a> {
             15 => Ok(ColType::SingleChar),
             // v0.37: regclass.
             16 => Ok(ColType::Regclass),
+            // v0.57: name.
+            17 => Ok(ColType::Name),
             t => Err(self.err(&format!("unknown column type {}", t))),
         }
     }

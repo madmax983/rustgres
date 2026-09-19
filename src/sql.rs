@@ -3015,9 +3015,10 @@ impl Parser {
                     Ok(ColType::Char(n.or(Some(1))))
                 }
             }
-            // v0.14: `name` (PostgreSQL internal identifier type) behaves
-            // like text here; the 63-byte truncation is not enforced.
-            "name" => Ok(ColType::Text),
+            // v0.57: `name` (PostgreSQL internal identifier type, OID 19)
+            // is its own type now: values truncate at 63 bytes on input
+            // (PG19 namein) instead of behaving like text.
+            "name" => Ok(ColType::Name),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".

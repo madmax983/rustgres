@@ -6198,10 +6198,16 @@ const fn setop_numeric_rank(t: ColType) -> Option<u8> {
 }
 
 /// v0.44: character-family check for set-operation type resolution.
+/// v0.57: `name` joins the family — PG's select_common_type(name, text)
+/// is text (name+name is handled by the a == b fast path above).
 const fn setop_is_char_family(t: ColType) -> bool {
     matches!(
         t,
-        ColType::Text | ColType::Char(_) | ColType::Varchar(_) | ColType::SingleChar
+        ColType::Text
+            | ColType::Char(_)
+            | ColType::Varchar(_)
+            | ColType::SingleChar
+            | ColType::Name
     )
 }
 
@@ -11304,6 +11310,8 @@ fn eval_grouped(
             let mut chained: Vec<Scope> = outer.to_vec();
             chained.push(gsc);
             let (va, vb) = coerce_regclass_cmp(q, &chained, left, right, va, vb)?;
+            // v0.57: name-vs-unknown-literal truncation (PG19 namein).
+            let (va, vb) = coerce_name_cmp(&chained, left, right, va, vb);
             eval_cmp_vals(*op, &va, &vb)
         }
         Expr::And(a, b) => {
@@ -12152,6 +12160,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let vb = eval_expr(q, scopes, right)?;
             // v0.38: regclass/oid binary coercion (below).
             let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
+            // v0.57: name-vs-unknown-literal truncation (PG19 namein).
+            let (va, vb) = coerce_name_cmp(scopes, left, right, va, vb);
             eval_cmp_vals(*op, &va, &vb)
         }
         Expr::And(a, b) => {
@@ -12423,6 +12433,69 @@ fn expr_is_regclass(scopes: &[Scope], e: &Expr) -> bool {
             .map(|c| c.ty == ColType::Regclass)
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+/// v0.57: whether an expression is `name`-typed (PG19 OID 19), for
+/// comparison coercion. Mirrors `expr_is_regclass`.
+fn expr_is_name(scopes: &[Scope], e: &Expr) -> bool {
+    match e {
+        Expr::Cast { to, .. } => *to == ColType::Name,
+        Expr::Column { table, name } => resolve_col(scopes, table.as_deref(), name)
+            .map(|(si, ci)| scopes[si].schema[ci].ty == ColType::Name)
+            .unwrap_or(false),
+        Expr::ResolvedCol { frame, idx } => scopes
+            .get(*frame)
+            .and_then(|s| s.schema.get(*idx))
+            .map(|c| c.ty == ColType::Name)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// v0.57: PG19 `name` comparison coercion (name.c). A `name` value is
+/// always stored truncated at 63 bytes (see `truncate_name`), but an
+/// unknown-type (text) literal on the other side of the comparison is
+/// not — PG coerces it through namein, truncating it too, before the
+/// strncmp comparison. So when exactly one side of `=`/`<>`/`<`/etc.
+/// is name-typed and the other side is a text/bpchar value, truncate
+/// the text side to 63 bytes first.
+///
+/// Perf: the scope/schema walk is skipped unless at least one side is
+/// text-like — int-vs-int join keys (the hot path) never pay for it.
+fn coerce_name_cmp(
+    scopes: &[Scope],
+    left: &Expr,
+    right: &Expr,
+    va: Value,
+    vb: Value,
+) -> (Value, Value) {
+    fn is_textual(v: &Value) -> bool {
+        matches!(v, Value::Text(_) | Value::BpChar(_))
+    }
+    if matches!(va, Value::Null) || matches!(vb, Value::Null) {
+        return (va, vb);
+    }
+    let a_text = is_textual(&va);
+    let b_text = is_textual(&vb);
+    if !a_text && !b_text {
+        return (va, vb);
+    }
+    // Only the non-name side gets truncated; a name-typed side is
+    // already truncated at input. Truncation is idempotent anyway.
+    let l_name = b_text && expr_is_name(scopes, left);
+    let r_name = a_text && expr_is_name(scopes, right);
+    let trunc = |v: Value| -> Value {
+        match v {
+            Value::Text(s) => Value::text(crate::storage::truncate_name(&s)),
+            Value::BpChar(s) => Value::text(crate::storage::truncate_name(&s)),
+            other => other,
+        }
+    };
+    match (l_name, r_name) {
+        (true, false) => (va, trunc(vb)),
+        (false, true) => (trunc(va), vb),
+        _ => (va, vb),
     }
 }
 
@@ -14689,6 +14762,20 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // v0.37: regclass is handled in eval_expr (needs catalog access).
         // This arm is unreachable but required for exhaustiveness.
         ColType::Regclass => Err(cast_err(v, "regclass")),
+        // v0.57: casts to `name` go through namein (name.c, PG19):
+        // text/bpchar input is silently truncated at 63 bytes; any
+        // other source goes through its text form first. Total: never
+        // errors.
+        ColType::Name => match v {
+            Value::Text(s) | Value::BpChar(s) => Ok(Value::text(crate::storage::truncate_name(s))),
+            _ => {
+                let t = text_value_of(&[v]);
+                match &t {
+                    Value::Text(s) => Ok(Value::text(crate::storage::truncate_name(s))),
+                    _ => Ok(t),
+                }
+            }
+        },
     }
 }
 
@@ -22059,6 +22146,13 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::SingleChar(crate::storage::char_in(s)))
         }
+        // v0.57: parameter input for `name` goes through namein:
+        // silent truncation at 63 bytes (NAMEDATALEN-1).
+        ColType::Name => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            Ok(Value::text(crate::storage::truncate_name(s)))
+        }
         ColType::Int => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
@@ -22443,6 +22537,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Bytea => Value::Bytea(Vec::new()),
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::Regclass => Value::Text("".into()),
+        ColType::Name => Value::text(""), // v0.57
     }
 }
 

@@ -58,6 +58,12 @@ pub enum ColType {
     // v0.37: PG's regclass type (OID 2205) — an OID that displays as
     // the relation name. Used for pg_class.reltoastrelid::regclass.
     Regclass, // OID 2205
+    // v0.57: PG's `name` internal identifier type (OID 19,
+    // NAMEDATALEN-1 = 63 bytes). Values are stored as text truncated
+    // to 63 bytes on input (PG19 namein); comparison is plain byte
+    // order on the truncated values, which is exactly PG's
+    // strncmp(..., NAMEDATALEN) semantics since names hold no NULs.
+    Name, // OID 19
 }
 
 impl ColType {
@@ -81,6 +87,7 @@ impl ColType {
             ColType::Bytea => 17,         // BYTEA
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
+            ColType::Name => 19,          // NAME (v0.57)
         }
     }
 
@@ -106,6 +113,7 @@ impl ColType {
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
             ColType::Regclass => "regclass",
+            ColType::Name => "name",
         }
     }
 
@@ -134,6 +142,7 @@ impl ColType {
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
             ColType::Regclass => "regclass",
+            ColType::Name => "name",
         }
     }
 
@@ -2411,6 +2420,23 @@ pub(crate) fn char_in(s: &str) -> u8 {
     }
 }
 
+/// v0.57: PG19's `namein` truncation (name.c): inputs to the `name`
+/// type are silently truncated at NAMEDATALEN-1 = 63 *bytes*. PG cuts
+/// raw bytes (it can split a multibyte character); we cut at the last
+/// UTF-8 char boundary at or below 63 bytes so the result stays valid
+/// UTF-8 — identical to PG for all ASCII input, and never panics.
+pub(crate) fn truncate_name(s: &str) -> &str {
+    const MAX: usize = 63; // NAMEDATALEN - 1
+    if s.len() <= MAX {
+        return s;
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// v0.29: PG bytea `escape` output format (docs Table 8.8): printable ASCII
 /// as-is, backslash doubled, others as `\ooo` octal.
 pub(crate) fn bytea_escape(data: &[u8]) -> String {
@@ -4672,6 +4698,31 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.57: `namein` truncates at 63 bytes (NAMEDATALEN-1) without
+    /// error, staying on a UTF-8 char boundary.
+    #[test]
+    fn truncate_name_at_63_bytes() {
+        assert_eq!(truncate_name("abc"), "abc");
+        assert_eq!(truncate_name(""), "");
+        let s63: String = "x".repeat(63);
+        assert_eq!(truncate_name(&s63), s63);
+        let s64: String = "y".repeat(64);
+        assert_eq!(truncate_name(&s64).len(), 63);
+        // Multibyte: 32 two-byte chars = 64 bytes -> cut to 31 chars (62
+        // bytes), not a split UTF-8 sequence.
+        let mb: String = "é".repeat(32);
+        let t = truncate_name(&mb);
+        assert_eq!(t.chars().count(), 31);
+        assert_eq!(t.len(), 62);
+        // 63 ASCII + one multibyte char = 65 bytes -> keep the 63 ASCII.
+        let mixed = format!("{}é", "z".repeat(63));
+        assert_eq!(truncate_name(&mixed), "z".repeat(63));
+        // 62 ASCII + multibyte char: the char starts at byte 62, adding
+        // it would exceed 63, so it is dropped.
+        let mixed2 = format!("{}é", "z".repeat(62));
+        assert_eq!(truncate_name(&mixed2), "z".repeat(62));
+    }
 
     /// A clone of a `Value::Text` must share the text bytes. It must not
     /// copy them. See issue #8.
