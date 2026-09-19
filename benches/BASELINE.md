@@ -2,6 +2,108 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Compiled::find_at` reallocates its capture/backtrack scratch buffers per attempted start position — baseline — 2026-09-19
+
+**Workload**: `benches/profile_regexp.py` (new), an exact **20** iterations of
+
+```sql
+SELECT regexp_replace(s, '[0-9]+', '#', 'g'),
+       regexp_like(s, '[0-9]{3,}'),
+       regexp_count(s, '[0-9]+')
+FROM bench_re
+```
+
+over a 2000-row text table (`--rows 2000 --count 20`, the script's
+defaults), sent over the real wire protocol. `bench_re.s` is generated so
+roughly 6/7 rows contain a digit run (`order-00042-ref item42 qty456
+pending`) and 1/7 contain none (`order-ref-noref item0 pending`) — a
+mixed-content column like a real order-reference/log-line table, not a
+string chosen to make the target look bad. Each of the three regexp
+functions is evaluated once per row per query, so the workload exercises
+`crate::regex::compile_opts` + `Compiled::find_at`/`run` for real, through
+the same SQL functions (`regexp_replace`, `regexp_like`, `regexp_count`)
+a bulk text-cleaning/validation query would use.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_regexp.py --rows 2000 --count 20 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | head -40
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged; two runs agree
+to within 0.0004%): **10,424,931,879.5** total instructions (average of
+10,424,910,079 and 10,424,953,680) over the 20-iteration, 2000-row run.
+DHAT over the same workload: **6,467,937** total heap allocations,
+375,845,560 bytes allocated.
+
+**Hypothesis considered and rejected first** (measure-first, not
+"looks slow"): the obvious suspicion for a from-scratch backtracking
+regex engine with no pattern cache is that `compile_opts` — parsing the
+pattern into an AST and compiling it to an instruction list — is the
+bottleneck, since it reruns on every single row instead of being cached
+across rows/executions. Measured instead: `Parser::*` + `Compiler::*` +
+`compile_opts` self-costs sum to **~1.8%** of this profile — the patterns
+here (`[0-9]+`, `[0-9]{3,}`) are small enough that compiling them is
+cheap. Below the 5%-of-profile relevance bar; **no caching work was
+done**, and this is recorded here so nobody re-derives it from a code
+smell alone.
+
+**What the profile actually shows**: DHAT's top allocation site by a
+wide margin is `Compiled::find_at`, `src/regex.rs:565`
+(`let mut caps = vec![None; self.groups + 1];`, run fresh on every
+attempted start position):
+
+| allocation site | blocks | % of total blocks | bytes |
+|---|---|---|---|
+| `find_at`'s per-attempt `vec![None; groups+1]` | 2,831,600 | **43.78%** | 67,958,400 |
+| `Insn::Split`'s `caps.clone()` (backtracking) | 927,560 | 14.34% | 22,261,440 |
+| backtrack `stack`'s `Vec::push` growth | 325,380 | 5.03% | 63,030,400 |
+
+**Target**: `Compiled::find_at` (`src/regex.rs`) tries successive start
+positions with a `for st in start..=s.len()` loop (standard unanchored
+"leftmost match" search), and on **every** iteration of that loop —
+i.e. every character position tried before a match is found, or all of
+them if there is no match anywhere in the string — it allocates a brand
+new `caps` Vec (`vec![None; self.groups + 1]`) and a brand new backtrack
+`stack` Vec (`Vec::new()`, then grown via `push` inside `run`), even
+though both are discarded at the end of the failed attempt and an
+identically-shaped pair is allocated again for the next `st`. For our
+`[0-9]+`/`[0-9]{3,}` patterns (zero capture groups, so `caps` is a
+1-element Vec) matched against text where the first several characters
+never match (`"order-..."`, `"qty..."` before the digits), `find_at`
+retries at nearly every character position in the row before finding the
+digit run, and (for the ~1/7 of rows with no digits) retries at *every*
+position and finds nothing. Combined self-cost of `Compiled::run` +
+`Compiled::find_at` is 4.07% + 2.36% = **6.43%** of this profile, and the
+allocator machinery it drives (`malloc`, `_int_malloc`, `_int_free`,
+`free`, `RawVecInner::try_allocate_in`, `RawVecInner::with_capacity_in`,
+`RawVecInner::deallocate`, `Vec::from_elem`) adds several more percent on
+top — comfortably above the 5%-of-profile bar, and the 43.78%-of-allocations
+single line is the largest allocation site in the entire workload by a
+factor of 3 over the next-largest.
+
+**Mechanism**: allocate `caps` and `stack` **once**, before the `for st`
+loop, and reuse the same buffers across every attempted start position —
+resetting their *contents* (`caps.fill(None)`, `stack.clear()`) instead
+of reallocating them. This is provably behavior-preserving: `run` always
+overwrites `caps[0]` with `Some((st, st))` before reading it and (for a
+zero-group pattern) never touches `caps[1..]` at all; for a pattern with
+groups, `SaveStart`/`SaveEnd` only ever write group slots that a prior
+`Ast::Group` compiled into the program, so `caps.fill(None)` puts every
+slot into exactly the state a fresh `vec![None; groups + 1]` would have
+had. `stack.clear()` drops any backtrack frames left over from the
+previous (failed) attempt before `run` pushes its own — the same "start
+empty" invariant a fresh `Vec::new()` gives, just without paying for a
+new heap allocation to get there.
+
+Fix follows in the next commit.
+
 ## Bolt: `coerce_regclass_cmp` runs `expr_is_regclass` on every comparison — fix — 2026-09-18
 
 Fixes the target identified in the baseline entry immediately below this
