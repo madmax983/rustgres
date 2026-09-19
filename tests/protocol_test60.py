@@ -142,8 +142,8 @@ def main():
         cases = [
             # --- PG19 division: select_div_scale + exact rounding ---
             ("SELECT 999999999999999999999::numeric / 1000000000000000000000::numeric;",
-             [["1"]], None, None, None, [1700], None,
-             "21-nines / 1e21 rounds to 1 at scale 20 (was 0.9999999999)"),
+             [["1.00000000000000000000"]], None, None, None, [1700], None,
+             "21-nines / 1e21 rounds to 1 at scale 20 (v0.61: PG displays rscale)"),
             ("SELECT 12345678901234567890::numeric / 123::numeric;",
              [["100371373180768845"]], None, None, None, [1700], None,
              "big quotient at scale 0 rounds half away (was ...844.6341463414)"),
@@ -168,8 +168,8 @@ def main():
              "div(5,2) = 2 (truncates, never rounds up)"),
             # --- round() widening is a no-op, not 22003 ---
             ("SELECT round(3.14::numeric, 40);",
-             [["3.14"]], None, None, None, [1700], None,
-             "round(3.14, 40) keeps the value (was 22003)"),
+             [["3.14" + "0" * 38]], None, None, None, [1700], None,
+             "round(3.14, 40) pads to dscale 40 (v0.61: PG display scale)"),
             # --- CTE VALUES bodies ---
             ("WITH v(x) AS (VALUES (1), (2), (3)) SELECT sum(x) FROM v;",
              [["6"]], None, None, None, [23], None,

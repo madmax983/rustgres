@@ -475,6 +475,8 @@ fn shift_decimal(n: &Numeric, places: i32) -> Option<Numeric> {
     Some(Numeric {
         unscaled: n.unscaled,
         scale: n.scale - places,
+        // v0.61: shifting the point preserves the declared display scale.
+        dscale: n.dscale,
         special: NumericSpecial::Finite,
     })
 }
@@ -490,6 +492,8 @@ fn scale_up(n: &Numeric, places: i32) -> Option<Numeric> {
     Some(Numeric {
         unscaled: n.unscaled.checked_mul(factor)?,
         scale: n.scale + places,
+        // v0.61: widening shows more fractional digits.
+        dscale: n.dscale + places,
         special: NumericSpecial::Finite,
     })
 }

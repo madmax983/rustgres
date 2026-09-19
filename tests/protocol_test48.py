@@ -177,7 +177,7 @@ def main():
              [["1.5"], ["2.5"]], None, [1700], None,
              "numeric SRF, OID 1700"),
             ("SELECT generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)",
-             [["0.1"], ["1.4"], ["2.7"], ["4"]], None, [1700], None,
+             [["0.1"], ["1.4"], ["2.7"], ["4.0"]], None, [1700], None,
              "numeric series, minimal-scale rendering"),
             # --- errors
             ("SELECT generate_series(1,3,0)",

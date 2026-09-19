@@ -757,6 +757,8 @@ mod tests {
         let n = Numeric {
             unscaled: val.parse::<i128>().unwrap(),
             scale,
+            // v0.61: the test wants the full declared scale displayed.
+            dscale: scale.max(0),
             special: super::super::storage::NumericSpecial::Finite,
         };
         let d = parse_numfmt(picture).unwrap();

@@ -18705,6 +18705,34 @@ fn bytea_unescape(s: &str) -> Option<Vec<u8>> {
 /// Shared `power(a, b)` / `a ^ b` implementation. `bad` builds the
 /// type-mismatch error (42883), which differs between the function and
 /// operator spellings.
+
+// ---------------------------------------------------------------------------
+// v0.61: PG19 `numeric_is_integral` plus the int32 range check that
+// gates the `power_var_int` dispatch: the exponent must be integral
+// (no fractional digits) and fit in int32, else the exponent falls
+// through to the f64 transcendental path.
+fn numeric_integral_i32(n: &crate::storage::Numeric) -> Option<i32> {
+    if n.special != crate::storage::NumericSpecial::Finite {
+        return None;
+    }
+    let v = if n.scale <= 0 {
+        // value = unscaled * 10^-scale; integral but may not fit i32.
+        let mul = 10i128.checked_pow((-n.scale) as u32)?;
+        n.unscaled.checked_mul(mul)?
+    } else if n.unscaled == 0 {
+        0
+    } else {
+        // scale > 38: 10^scale exceeds i128, so |unscaled| < 10^scale
+        // and a non-zero unscaled is fractional.
+        let p = 10i128.checked_pow(n.scale as u32)?;
+        if n.unscaled % p != 0 {
+            return None;
+        }
+        n.unscaled / p
+    };
+    i32::try_from(v).ok()
+}
+
 fn eval_power_op(
     a: &Value,
     b: &Value,
@@ -18746,6 +18774,22 @@ fn eval_power_op(
     //     power('-2','inf')=Inf, power('inf','inf')=Inf, etc.
     use crate::storage::NumericSpecial;
     match (base.special, exp.special) {
+        // v0.61: PG19 follows the POSIX pow(3) spec here: NaN ^ 0 = 1
+        // and 1 ^ NaN = 1 (the base compares equal to one, so 1.00
+        // counts); every other NaN combination yields NaN.
+        (NumericSpecial::NaN, NumericSpecial::Finite) if exp.unscaled == 0 => {
+            return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+        }
+        (NumericSpecial::Finite, NumericSpecial::NaN) => {
+            let is_one = base.scale >= 0
+                && 10i128
+                    .checked_pow(base.scale as u32)
+                    .is_some_and(|p| base.unscaled == p);
+            if is_one {
+                return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            }
+            return Ok(Value::Numeric(crate::storage::Numeric::nan()));
+        }
         (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => {
             return Ok(Value::Numeric(crate::storage::Numeric::nan()));
         }
@@ -18814,7 +18858,9 @@ fn eval_power_op(
             }
         }
         (NumericSpecial::Finite, NumericSpecial::NegInf) => {
-            // x ^ -inf: |x|>1 -> 0, |x|<1 -> inf, |x|=1 -> 1
+            // x ^ -inf: |x|>1 -> 0, |x|<1 -> inf, |x|=1 -> 1.
+            // v0.61: PG19 raises 2201F "zero raised to a negative power
+            // is undefined" for 0 ^ -inf (checked before the inf rules).
             let abs_base = base.abs();
             let one = crate::storage::Numeric::from_i64(1);
             if abs_base == one {
@@ -18822,7 +18868,10 @@ fn eval_power_op(
             }
             let zero = crate::storage::Numeric::from_i64(0);
             if base == zero {
-                return Err(exec_err("22003", "value out of range for type numeric"));
+                return Err(exec_err(
+                    "2201F",
+                    "zero raised to a negative power is undefined",
+                ));
             }
             if abs_base > one {
                 return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
@@ -18832,12 +18881,21 @@ fn eval_power_op(
         }
         (NumericSpecial::Finite, NumericSpecial::Finite) => {}
     }
-    // Integer exponents are exact (like Postgres' numeric
-    // power); anything else goes through f64.
-    if exp.scale == 0 {
-        if let Ok(e) = i64::try_from(exp.unscaled) {
-            if let Some(n) = base.pow(e) {
-                return Ok(Value::Numeric(n));
+    // v0.61: PG19 dispatches an integral exponent that fits int32 to
+    // power_var_int (exact, adaptive precision); anything else goes
+    // through the f64 transcendental path. PG checks the SQL-level
+    // 2201F "zero raised to a negative power" here, before power_var.
+    if base.unscaled == 0 && exp.unscaled < 0 {
+        return Err(exec_err(
+            "2201F",
+            "zero raised to a negative power is undefined",
+        ));
+    }
+    if let Some(e) = numeric_integral_i32(&exp) {
+        match base.power_int(e as i64, exp.dscale) {
+            Ok(n) => return Ok(Value::Numeric(n)),
+            Err(crate::storage::PowerError::Overflow) => {
+                return Err(exec_err("22003", "value overflows numeric format"));
             }
         }
     }
@@ -19747,42 +19805,56 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             }
             let a = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             let b = to_numeric_opt(&vals[1]).ok_or_else(|| func_arg_err(name, &vals[1]))?;
-            // v0.25: values that don't fit in i64 are a numeric overflow
-            // (22003), not a type error — e.g. lcm(10^131068, 2).
-            let ai = a
-                .to_i64()
-                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
-            let bi = b
-                .to_i64()
-                .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
-            // Euclidean algorithm in u128: ai.abs() would panic on i64::MIN
-            // (negation overflow); unsigned_abs is exact for all i64 inputs.
-            let mut x = (ai as i128).unsigned_abs();
-            let mut y = (bi as i128).unsigned_abs();
-            while y != 0 {
-                let t = x % y;
-                x = y;
-                y = t;
+            // v0.61: PG19 numeric_gcd/numeric_lcm — any NaN or infinite
+            // input yields NaN; otherwise the Euclidean algorithm runs
+            // over the exact decimal values (fractionals included, e.g.
+            // gcd(43312.5, 4637.5) = 87.5), the result is non-negative,
+            // and the display scale is max(dscale(a), dscale(b)).
+            use crate::storage::NumericSpecial;
+            if a.special != NumericSpecial::Finite || b.special != NumericSpecial::Finite {
+                return Ok(Value::Numeric(crate::storage::Numeric::nan()));
             }
-            let g = x; // gcd (always >= 0), as u128
+            let da = crate::storage::BigDec::from_numeric(&a.abs()).expect("finite");
+            let db = crate::storage::BigDec::from_numeric(&b.abs()).expect("finite");
+            let dscale = a.dscale.max(b.dscale);
+            // Euclidean algorithm on absolute values.
+            let mut x = da;
+            let mut y = db;
+            while !y.is_zero() {
+                let r = x.rem(&y);
+                x = y;
+                y = r;
+            }
+            // x is now gcd(|a|, |b|) >= 0.
             if name == "gcd" {
-                // PG's gcd returns bigint: a result of exactly 2^63 (possible
-                // only when an input is i64::MIN) is out of range -> 22003.
-                if g > i64::MAX as u128 {
-                    return Err(exec_err("22003", "bigint out of range"));
-                }
-                Ok(Value::Numeric(Numeric::new(g as i128, 0)))
+                let mut n = x
+                    .to_numeric()
+                    .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+                n.dscale = dscale;
+                Ok(Value::Numeric(n))
             } else {
-                // lcm(a,b) = |a*b|/gcd. lcm(0,0) = 0.
-                if g == 0 {
-                    Ok(Value::Numeric(Numeric::zero()))
-                } else {
-                    let l = (ai as i128).unsigned_abs() / g * (bi as i128).unsigned_abs();
-                    if l > i64::MAX as u128 {
-                        return Err(exec_err("22003", "bigint out of range"));
-                    }
-                    Ok(Value::Numeric(Numeric::new(l as i128, 0)))
+                // lcm(x, y) = |x / gcd * y|; zero when either input is
+                // zero (PG computes the division exactly, then rounds
+                // the product to y's dscale — a no-op here — and reports
+                // max(dscale(x), dscale(y))).
+                if x.is_zero() {
+                    return Ok(Value::Numeric(
+                        crate::storage::Numeric::zero().with_dscale(dscale),
+                    ));
                 }
+                let ax = crate::storage::BigDec::from_numeric(&a.abs()).expect("finite");
+                let bx = crate::storage::BigDec::from_numeric(&b.abs()).expect("finite");
+                let q = ax
+                    .div_exact(&x)
+                    .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+                let l = q
+                    .mul_exact(&bx)
+                    .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+                let mut n = l
+                    .to_numeric()
+                    .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
+                n.dscale = dscale;
+                Ok(Value::Numeric(n))
             }
         }
         "degrees" => {
@@ -19835,12 +19907,13 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         }
         "scale" => {
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
-            // scale(numeric) -> integer (the stored scale).
-            // v0.59: PG19's numeric_scale returns NULL for NaN/Infinity.
+            // v0.61: PG19's numeric_scale returns the *display* scale
+            // (NUMERIC_DSCALE): the declared scale of a literal
+            // (scale('1.50') = 2), NULL for NaN/Infinity.
             if n.special != crate::storage::NumericSpecial::Finite {
                 return Ok(Value::Null);
             }
-            Ok(Value::Int(n.scale as i64))
+            Ok(Value::Int(n.dscale as i64))
         }
         "min_scale" => {
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
@@ -23816,12 +23889,13 @@ mod tests {
         assert_eq!(one(&mut eng, "SELECT ~ 1 + 1"), "-3"); // ~(1+1)
         assert_eq!(one(&mut eng, "SELECT @ 5 - 10"), "5"); // @(5-10)
         assert_eq!(one(&mut eng, "SELECT |/ 2 + 7"), "3"); // |/(2+7)
-        assert_eq!(one(&mut eng, "SELECT ||/ 35 - 8"), "3"); // ||/(35-8)
+        assert_eq!(one(&mut eng, "SELECT ||/ 35 - 8"), "3.000000000000000"); // ||/(35-8); v0.61: PG cbrt dscale 15
         assert_eq!(one(&mut eng, "SELECT ~ 5::int2"), "-6"); // ~(5::int2)
         assert_eq!(one(&mut eng, "SELECT ~ 7::bigint"), "-8");
         assert_eq!(one(&mut eng, "SELECT ~ NULL"), "NULL");
         // UMINUS: tighter than ^, looser than ::.
-        assert_eq!(one(&mut eng, "SELECT - 2 ^ 2"), "4"); // (-2)^2
+        // v0.61: PG's power_var_int gives (-2)^2 rscale 16.
+        assert_eq!(one(&mut eng, "SELECT - 2 ^ 2"), "4.0000000000000000"); // (-2)^2
         assert_eq!(one(&mut eng, "SELECT - -5"), "5");
         assert_eq!(one(&mut eng, "SELECT -(3+4)"), "-7");
         assert_eq!(one(&mut eng, "SELECT - 30000::smallint"), "-30000");
@@ -24281,7 +24355,12 @@ mod tests {
             .unwrap(),
         )[0]
         .clone();
-        assert_eq!(rows, vec!["3", "-3", "3", "5", "5", "2", "2", "5.5"]);
+        // v0.61: PG's numeric cbrt displays with dscale 15
+        // (2.000000000000000), matching numeric.out.
+        assert_eq!(
+            rows,
+            vec!["3", "-3", "3", "5", "5", "2", "2.000000000000000", "5.5"]
+        );
         // v0.21: text-vs-numeric coercion in arithmetic and comparison.
         // ('1.5' + 1 would coerce the text to integer and fail, like PG.)
         let rows = rows_of(run(&mut eng, "SELECT '2' + 1.5, 1.5 = '1.5', '1.5' = 1.5").unwrap())[0]

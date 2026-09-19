@@ -154,7 +154,7 @@ def main():
              "int4 max endpoint (successor would overflow)"),
             # --- numeric series
             ("SELECT * FROM generate_series(0.1::numeric, 4.0::numeric, 1.3::numeric)",
-             [["0.1"], ["1.4"], ["2.7"], ["4"]], None, [1700],
+             [["0.1"], ["1.4"], ["2.7"], ["4.0"]], None, [1700],
              "numeric series, OID 1700"),
             ("SELECT * FROM generate_series(1.5, 3.5)",
              [["1.5"], ["2.5"], ["3.5"]], None, [1700],

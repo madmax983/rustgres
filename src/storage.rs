@@ -324,11 +324,38 @@ pub mod toast_consts {
 /// overflowing the i128 mantissa. Normalization still only strips
 /// trailing zeros while `scale > 0`, so `new(1000, 0)` keeps scale 0
 /// and prints as `1000`, never `1e+3`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// v0.61: equality is by *value* only — `dscale` is deliberately
+/// ignored so `1.50 = 1.5` still holds. (`unscaled`/`scale` are kept
+/// canonical by normalization, so field comparison is exact.)
+#[derive(Clone, Debug)]
 pub struct Numeric {
     pub unscaled: i128,
     pub scale: i32,
+    /// v0.61: PG19 `NUMERIC_DSCALE` — the display/declared scale, kept
+    /// separate from `scale` (the stored minimal scale). PG retains the
+    /// literal's declared fractional digits (`select 21.00` -> dscale 2)
+    /// and pads output (`to_text`) with trailing zeros to `dscale`.
+    /// Arithmetic propagates it per PG19's rules (add/sub: max;
+    /// mul: sum; div/power: rscale; round: target scale). Always >= 0.
+    pub dscale: i32,
     pub special: NumericSpecial,
+}
+
+impl PartialEq for Numeric {
+    fn eq(&self, other: &Self) -> bool {
+        self.unscaled == other.unscaled
+            && self.scale == other.scale
+            && self.special == other.special
+    }
+}
+impl Eq for Numeric {}
+
+/// v0.61: failure mode of [`Numeric::power_int`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerError {
+    /// PG19 SQLSTATE 22003 "value overflows numeric format".
+    Overflow,
 }
 
 /// Non-finite numeric kinds (v0.18), mirroring PostgreSQL's
@@ -362,6 +389,7 @@ impl Numeric {
         Numeric {
             unscaled,
             scale,
+            dscale: scale.max(0),
             special: NumericSpecial::Finite,
         }
     }
@@ -371,10 +399,22 @@ impl Numeric {
         let mut n = Numeric {
             unscaled,
             scale,
+            // v0.61: the display scale is the declared (pre-normalization)
+            // scale — PG's dscale survives trailing-zero stripping, so
+            // `new(150, 2)` ("1.50") keeps dscale 2 while storing (15, 1).
+            dscale: scale.max(0),
             special: NumericSpecial::Finite,
         };
         n.normalize();
         n
+    }
+
+    /// v0.61: like [`Numeric::new`], but the display scale is set
+    /// explicitly (PG19 operators that fix the result's display scale,
+    /// e.g. `round(x, s)` -> dscale `s`, `x / y` -> rscale).
+    pub fn with_dscale(mut self, dscale: i32) -> Self {
+        self.dscale = dscale.max(0);
+        self
     }
 
     /// NaN (v0.18).
@@ -382,6 +422,7 @@ impl Numeric {
         Numeric {
             unscaled: 0,
             scale: 0,
+            dscale: 0,
             special: NumericSpecial::NaN,
         }
     }
@@ -391,6 +432,7 @@ impl Numeric {
         Numeric {
             unscaled: 0,
             scale: 0,
+            dscale: 0,
             special: NumericSpecial::PosInf,
         }
     }
@@ -400,6 +442,7 @@ impl Numeric {
         Numeric {
             unscaled: 0,
             scale: 0,
+            dscale: 0,
             special: NumericSpecial::NegInf,
         }
     }
@@ -443,7 +486,8 @@ impl Numeric {
             NumericSpecial::Finite => {
                 // `i128::MIN` is unreachable: parse() rejects magnitudes
                 // that large and arithmetic is overflow-checked.
-                Numeric::new(self.unscaled.saturating_neg(), self.scale)
+                // v0.61: negation preserves the display scale.
+                Numeric::new(self.unscaled.saturating_neg(), self.scale).with_dscale(self.dscale)
             }
         }
     }
@@ -468,6 +512,7 @@ impl Numeric {
         Numeric {
             unscaled: 0,
             scale: 0,
+            dscale: 0,
             special: NumericSpecial::Finite,
         }
     }
@@ -718,7 +763,9 @@ impl Numeric {
             (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
             (NumericSpecial::Finite, NumericSpecial::Finite) => {
                 let (a, b, scale) = self.aligned(other)?;
-                Some(Numeric::new(a.checked_add(b)?, scale))
+                // v0.61: PG's add_var keeps res_dscale = max(d1, d2).
+                let dscale = self.dscale.max(other.dscale);
+                Some(Numeric::new(a.checked_add(b)?, scale).with_dscale(dscale))
             }
             (a, b) => {
                 if (a == NumericSpecial::PosInf && b == NumericSpecial::NegInf)
@@ -748,10 +795,14 @@ impl Numeric {
     pub fn checked_mul(&self, other: &Numeric) -> Option<Numeric> {
         match (self.special, other.special) {
             (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
-            (NumericSpecial::Finite, NumericSpecial::Finite) => Some(Numeric::new(
-                self.unscaled.checked_mul(other.unscaled)?,
-                self.scale.checked_add(other.scale)?,
-            )),
+            (NumericSpecial::Finite, NumericSpecial::Finite) => Some(
+                Numeric::new(
+                    self.unscaled.checked_mul(other.unscaled)?,
+                    self.scale.checked_add(other.scale)?,
+                )
+                // v0.61: PG's mul_var keeps res_dscale = d1 + d2.
+                .with_dscale(self.dscale.saturating_add(other.dscale)),
+            ),
             _ => {
                 if self.is_zero() || other.is_zero() {
                     return Some(Numeric::nan());
@@ -837,9 +888,10 @@ impl Numeric {
         if neg {
             mant = mant.checked_neg()?;
         }
-        // Numeric::new strips trailing zeros (the runner compares
-        // numerics, so display scale is irrelevant here).
-        Some(Numeric::new(mant, rscale))
+        // v0.61: PG's div_var sets the display scale to rscale
+        // (the runner compares numerics, so trailing-zero padding is
+        // harmless there but required for e.g. 10.0 ^ -2147483648).
+        Some(Numeric::new(mant, rscale).with_dscale(rscale))
     }
 
     /// v0.59: PG19 `select_div_scale()` faithfully, in decimal-digit
@@ -984,7 +1036,9 @@ impl Numeric {
             (_, Finite) if other.unscaled == 0 => None,
             (Finite, Finite) => {
                 let (a, b, scale) = self.aligned(other)?;
-                Some(Numeric::new(a.checked_rem(b)?, scale))
+                // v0.61: PG's mod_var keeps res_dscale = max(d1, d2).
+                let dscale = self.dscale.max(other.dscale);
+                Some(Numeric::new(a.checked_rem(b)?, scale).with_dscale(dscale))
             }
             _ => Some(Numeric::nan()),
         }
@@ -997,7 +1051,8 @@ impl Numeric {
             NumericSpecial::NegInf => Numeric::infinity(),
             _ => {
                 if self.special == NumericSpecial::Finite {
-                    Numeric::new(self.unscaled.abs(), self.scale)
+                    // v0.61: abs preserves the display scale.
+                    Numeric::new(self.unscaled.abs(), self.scale).with_dscale(self.dscale)
                 } else {
                     Numeric::infinity()
                 }
@@ -1037,14 +1092,18 @@ impl Numeric {
             // the value is unchanged. Never 22003 on zero-padding
             // (e.g. round(3.14, 40)): the old zero-pad multiply could
             // overflow i128 and wrongly error.
-            return Some(self.clone());
+            // v0.61: PG's round_var sets the display scale to the target
+            // (round(3.14, 40) prints 40 fractional digits).
+            let mut n = self.clone();
+            n.dscale = scale.max(0);
+            return Some(n);
         }
         let drop = (self.scale - scale) as u32;
         // v0.22: if 10^drop overflows i128, then |unscaled| < 10^39/2 <=
         // div/2, so the value rounds to zero at any target scale.
         let div = match 10i128.checked_pow(drop) {
             Some(d) => d,
-            None => return Some(Numeric::zero()),
+            None => return Some(Numeric::zero().with_dscale(scale)),
         };
         let half = div / 2;
         let adj = if self.unscaled >= 0 { half } else { -half };
@@ -1056,7 +1115,8 @@ impl Numeric {
         if r.int_digits() > 131072 {
             return None;
         }
-        Some(r)
+        // v0.61: the rounded value carries the target display scale.
+        Some(r.with_dscale(scale))
     }
 
     /// v0.60: PG19 `apply_typmod` for `numeric(p, s)` assignment
@@ -1188,64 +1248,111 @@ impl Numeric {
     /// raise 22003). Negative exponents divide, with 10 guard digits.
     /// v0.18: NaN base -> NaN; infinite base follows PG's sign rules;
     /// `0^0` is 1 (PostgreSQL).
-    pub fn pow(&self, exp: i64) -> Option<Numeric> {
-        match self.special {
-            NumericSpecial::NaN => return Some(Numeric::nan()),
-            NumericSpecial::PosInf => {
-                return Some(if exp == 0 {
-                    Numeric::new(1, 0)
-                } else if exp > 0 {
-                    Numeric::infinity()
-                } else {
-                    Numeric::zero()
-                });
-            }
-            NumericSpecial::NegInf => {
-                return Some(if exp == 0 {
-                    Numeric::new(1, 0)
-                } else if exp > 0 {
-                    if exp % 2 == 0 {
-                        Numeric::infinity()
-                    } else {
-                        Numeric::neg_infinity()
-                    }
-                } else {
-                    Numeric::zero()
-                });
-            }
-            NumericSpecial::Finite => {}
+    /// v0.61: PG19 `power_var_int` — exact integer-exponent power with
+    /// PG's adaptive working precision (`src/backend/utils/adt/numeric.c`,
+    /// REL_19_STABLE). `exp` is the integer exponent value and
+    /// `exp_dscale` the exponent literal's declared display scale (PG
+    /// feeds `exp->dscale` into the result-scale computation).
+    ///
+    /// The caller handles specials, the `0 ^ negative` 2201F rule, and
+    /// non-integral exponents; `self` is finite here.
+    ///
+    /// Result display scale follows PG19 exactly:
+    /// `rscale = min(max(max(16 - int(f), base.dscale, exp.dscale), 0),
+    /// 1000)` where `f = exp * log10(|base|)`.
+    ///
+    /// Overflow (`Err(PowerError::Overflow)`, SQLSTATE 22003) when `f`
+    /// exceeds what our i128 mantissa can represent (PG's own bound is
+    /// `f > 524288` for its wider storage; past ~10^45 no i128-based
+    /// value can hold the result, so both agree on 22003).
+    pub fn power_int(&self, exp: i64, exp_dscale: i32) -> Result<Numeric, PowerError> {
+        debug_assert!(self.special == NumericSpecial::Finite);
+        // PG: f = exp * (log10(leading digits) + weight*4); the
+        // decimal-digit form is exp * log10(|unscaled| * 10^-scale).
+        let f = if self.unscaled == 0 {
+            0.0
+        } else {
+            exp as f64 * ((self.unscaled.unsigned_abs() as f64).log10() - self.scale as f64)
+        };
+        if f > 45.0 {
+            // PG raises 22003 past f > 524288 ((NUMERIC_WEIGHT_MAX+1)*4);
+            // our i128 mantissa cannot represent anything past ~10^45,
+            // so the answer is 22003 either way.
+            return Err(PowerError::Overflow);
         }
+        if f + 1.0 < -1000.0 {
+            // PG: the true result is below 10^-1000, so it is zero at
+            // the maximum display scale.
+            return Ok(Numeric::zero().with_dscale(1000));
+        }
+        // PG: rscale = Max(16 - (int) f, Max(base->dscale, exp->dscale));
+        // then clamped to [0, 1000]. Rust's `as` truncates toward zero
+        // exactly like C's `(int)` cast for this range.
+        let mut rscale = 16 - f as i32;
+        rscale = rscale.max(self.dscale).max(exp_dscale).max(0).min(1000);
         if exp == 0 {
-            return Some(Numeric::new(1, 0));
+            // PG: result is exactly 1 with dscale rscale (no rounding).
+            return Ok(Numeric::new(1, 0).with_dscale(rscale));
         }
-        if self.is_zero() && exp < 0 {
-            // 0 raised to a negative power: division by zero.
-            return None;
+        if exp == 1 {
+            // PG: round_var(base, rscale).
+            return self.round_to(rscale).ok_or(PowerError::Overflow);
         }
-        if exp.unsigned_abs() > 10_000 {
-            return None;
+        if self.unscaled == 0 {
+            // exp < 0 is rejected by the caller with 2201F
+            // ("zero raised to a negative power is undefined").
+            debug_assert!(exp > 0);
+            return Ok(Numeric::zero().with_dscale(rscale));
         }
         let neg = exp < 0;
-        let mut e = exp.unsigned_abs();
-        let mut base = self.clone();
-        let mut acc = Numeric::new(1, 0);
-        while e > 0 {
-            if e & 1 == 1 {
-                acc = acc.checked_mul(&base)?;
-            }
-            e >>= 1;
-            if e > 0 {
-                base = base.checked_mul(&base)?;
-            }
-        }
-        if neg {
-            if acc.is_zero() {
-                return None;
-            }
-            Numeric::new(1, 0).checked_div(&acc)
+        let mut mask: u64 = exp.unsigned_abs();
+        // PG: sig_digits = 1 + rscale + (int) f
+        //     + (int) log10(abs(exp)) + 8 — the working precision that
+        // keeps every intermediate at enough significant digits.
+        let sig_digits = 1i64 + rscale as i64 + f as i64 + (mask as f64).log10() as i64 + 8;
+        let mut base_prod = BigDec::from_numeric(self).expect("power_int: finite base");
+        let mut result = if mask & 1 == 1 {
+            base_prod.clone()
         } else {
-            Some(acc)
+            BigDec::one()
+        };
+        mask >>= 1;
+        while mask > 0 {
+            // PG: local_rscale = Min(2*base_prod->dscale,
+            //     sig_digits - 2*(int_digits(base_prod))), at least 0.
+            let local = (sig_digits - 2 * base_prod.int_digits())
+                .min(2 * base_prod.scale() as i64)
+                .max(0)
+                .min(i32::MAX as i64) as i32;
+            base_prod = base_prod.mul_round(&base_prod, local);
+            if mask & 1 == 1 {
+                let local2 = (sig_digits - (base_prod.int_digits() + result.int_digits()))
+                    .min((base_prod.scale() + result.scale()) as i64)
+                    .max(0)
+                    .min(i32::MAX as i64) as i32;
+                result = base_prod.mul_round(&result, local2);
+            }
+            // PG: weight past NUMERIC_WEIGHT_MAX (131071 base-10000
+            // digits = 524284 decimal digits) overflows, unless the
+            // exponent is negative, in which case the result is zero.
+            if base_prod.int_digits() > 524_284 || result.int_digits() > 524_284 {
+                if !neg {
+                    return Err(PowerError::Overflow);
+                }
+                return Ok(Numeric::zero().with_dscale(rscale));
+            }
+            mask >>= 1;
         }
+        let dec = if neg {
+            // PG: div_var(&const_one, result, result, rscale, true).
+            result.recip_round(rscale).ok_or(PowerError::Overflow)?
+        } else {
+            // PG: round_var(result, rscale).
+            result.round_to_scale(rscale)
+        };
+        let mut n = dec.to_numeric().ok_or(PowerError::Overflow)?;
+        n.dscale = rscale;
+        Ok(n)
     }
 
     /// Total order with PostgreSQL's non-finite rules (v0.18):
@@ -1319,6 +1426,15 @@ impl Numeric {
             NumericSpecial::Finite => {}
         }
         if self.unscaled == 0 {
+            // v0.61: PG pads zero to the display scale
+            // (e.g. 10.0 ^ -2147483648 -> 0.000...0 with 1000 digits).
+            if self.dscale > 0 {
+                let mut out = String::from("0.");
+                for _ in 0..self.dscale {
+                    out.push('0');
+                }
+                return out;
+            }
             return "0".to_string();
         }
         let neg = self.unscaled < 0;
@@ -1363,6 +1479,16 @@ impl Numeric {
                 out.push('0');
             }
             out.push_str(&digits);
+        }
+        // v0.61: pad trailing zeros to the display scale (PG's dscale),
+        // e.g. numeric '1.50' prints "1.50", not "1.5".
+        if self.dscale > self.scale {
+            if self.scale <= 0 {
+                out.push('.');
+            }
+            for _ in self.scale.max(0)..self.dscale {
+                out.push('0');
+            }
         }
         out
     }
@@ -1773,10 +1899,11 @@ impl Numeric {
         }
         let diff = self.scale as i64 - new_scale as i64;
         if diff >= 39 {
-            return Numeric::new(0, new_scale);
+            // v0.61: PG's trunc_var keeps dscale = min(dscale, rscale).
+            return Numeric::new(0, new_scale).with_dscale(self.dscale.min(new_scale));
         }
         let div = 10i128.pow(diff as u32);
-        Numeric::new(self.unscaled / div, new_scale)
+        Numeric::new(self.unscaled / div, new_scale).with_dscale(self.dscale.min(new_scale))
     }
 
     /// v0.18: Convert a (mantissa, e10) scientific value to a Numeric
@@ -2174,6 +2301,27 @@ impl BigUint {
         Some(v)
     }
 
+    /// v0.61: decimal digit count of the value (0 for zero).
+    pub(crate) fn decimal_digits(&self) -> u32 {
+        let mut top_idx: Option<usize> = None;
+        for (i, &l) in self.limbs.iter().enumerate() {
+            if l != 0 {
+                top_idx = Some(i);
+            }
+        }
+        let i = match top_idx {
+            Some(i) => i,
+            None => return 0,
+        };
+        let mut d = 0u32;
+        let mut t = self.limbs[i];
+        while t > 0 {
+            d += 1;
+            t /= 10;
+        }
+        d + 9 * i as u32
+    }
+
     /// self += v for a small v < 1_000_000_000.
     fn add_small_assign(&mut self, v: u32) {
         debug_assert!(v < 1_000_000_000);
@@ -2433,6 +2581,184 @@ impl BigDec {
     /// Scale accessor for the bucket computation in exec.rs.
     pub(crate) fn scale(&self) -> i32 {
         self.scale
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.61: BigDec helpers for PG19 `power_var_int` (exact integer-exponent
+// power with adaptive working precision) and the numeric gcd/lcm
+// Euclidean algorithm.
+// ---------------------------------------------------------------------------
+
+impl BigDec {
+    /// The value one.
+    pub(crate) fn one() -> Self {
+        BigDec::from_i64(1)
+    }
+
+    /// Decimal-digit count of the integer part (`digits(mag) - scale`),
+    /// mirroring PG's `weight * 4 + 4` bound in `power_var_int`.
+    pub(crate) fn int_digits(&self) -> i64 {
+        self.mag.decimal_digits() as i64 - self.scale as i64
+    }
+
+    /// Round to `rscale` fractional digits, half away from zero
+    /// (PG's `round_var`). Widening (`rscale >= scale`) zero-pads and
+    /// never fails.
+    pub(crate) fn round_to_scale(mut self, rscale: i32) -> BigDec {
+        if rscale >= self.scale {
+            let pad = (rscale - self.scale) as u32;
+            self.mag.mul_pow10_assign(pad);
+            self.scale = rscale;
+            return self.normalize();
+        }
+        let drop = self.scale as i64 - rscale as i64;
+        // Defensive: a drop this large always rounds to zero at any
+        // non-negative rscale; avoids building a gigantic 10^drop.
+        if drop > 1_000_000 {
+            return BigDec::zero();
+        }
+        let mut pow10 = BigUint::from_u64(1);
+        pow10.mul_pow10_assign(drop as u32);
+        let (mut q, r) = self.mag.div_rem(&pow10);
+        // Half away from zero: 2*r >= pow10 rounds up.
+        let mut twice = r.clone();
+        twice.add_assign(&r);
+        if twice.cmp(&pow10) != std::cmp::Ordering::Less {
+            q.add_small_assign(1);
+        }
+        BigDec {
+            neg: self.neg,
+            mag: q,
+            scale: rscale,
+        }
+        .normalize()
+    }
+
+    /// Exact product, then [`BigDec::round_to_scale`] to `rscale`
+    /// (PG's `mul_var(..., rscale)`).
+    pub(crate) fn mul_round(&self, other: &BigDec, rscale: i32) -> BigDec {
+        let mag = self.mag.mul(&other.mag);
+        let scale =
+            (self.scale as i64 + other.scale as i64).clamp(i32::MIN as i64, i32::MAX as i64);
+        BigDec {
+            neg: self.neg != other.neg,
+            mag,
+            scale: scale as i32,
+        }
+        .normalize()
+        .round_to_scale(rscale)
+    }
+
+    /// Exact product (no rounding).
+    pub(crate) fn mul_exact(&self, other: &BigDec) -> Option<BigDec> {
+        let mag = self.mag.mul(&other.mag);
+        let scale =
+            (self.scale as i64 + other.scale as i64).clamp(i32::MIN as i64, i32::MAX as i64);
+        Some(
+            BigDec {
+                neg: self.neg != other.neg,
+                mag,
+                scale: scale as i32,
+            }
+            .normalize(),
+        )
+    }
+
+    /// `1/self` rounded to `rscale` fractional digits, half away from
+    /// zero (PG's `div_var(&const_one, x, rscale)`). None for zero.
+    pub(crate) fn recip_round(&self, rscale: i32) -> Option<BigDec> {
+        if self.mag.is_zero() {
+            return None;
+        }
+        // Normalize a negative scale away: 1/(mag*10^-scale).
+        let mut mag = self.mag.clone();
+        let mut scale = self.scale;
+        if scale < 0 {
+            mag.mul_pow10_assign((-scale) as u32);
+            scale = 0;
+        }
+        // 1/x = 10^scale / mag; want round(10^(scale+rscale) / mag).
+        // Compute one extra digit, then round half away from zero.
+        let t = scale as i64 + rscale as i64 + 1;
+        debug_assert!(t >= 1);
+        if t > 1_000_000 {
+            return None;
+        }
+        let mut num = BigUint::from_u64(1);
+        num.mul_pow10_assign(t as u32);
+        let (q, _r) = num.div_rem(&mag);
+        let ten = BigUint::from_u64(10);
+        let (mut qi, digit) = q.div_rem(&ten);
+        if digit.to_u64().unwrap_or(0) >= 5 {
+            qi.add_small_assign(1);
+        }
+        Some(
+            BigDec {
+                neg: self.neg,
+                mag: qi,
+                scale: rscale,
+            }
+            .normalize(),
+        )
+    }
+
+    /// Exact remainder (`self mod other`), result scale
+    /// `max(self.scale, other.scale)` like PG's `mod_var`. The caller
+    /// guarantees `other` is non-zero.
+    pub(crate) fn rem(&self, other: &BigDec) -> BigDec {
+        debug_assert!(!other.mag.is_zero());
+        let s = self.scale.max(other.scale);
+        let mut a = self.mag.clone();
+        a.mul_pow10_assign((s - self.scale) as u32);
+        let mut b = other.mag.clone();
+        b.mul_pow10_assign((s - other.scale) as u32);
+        let (_, r) = a.div_rem(&b);
+        BigDec {
+            neg: self.neg,
+            mag: r,
+            scale: s,
+        }
+        .normalize()
+    }
+
+    /// Exact division; the caller guarantees `other` divides `self`
+    /// (PG's `div_var(x, gcd, 0, exact=true)` in `numeric_lcm`).
+    /// None on a zero divisor or an inexact result.
+    pub(crate) fn div_exact(&self, other: &BigDec) -> Option<BigDec> {
+        if other.mag.is_zero() {
+            return None;
+        }
+        // self/other = (ma/mb) * 10^(sb-sa).
+        let (num, den) = if other.scale >= self.scale {
+            let mut num = self.mag.clone();
+            num.mul_pow10_assign((other.scale - self.scale) as u32);
+            (num, other.mag.clone())
+        } else {
+            let mut den = other.mag.clone();
+            den.mul_pow10_assign((self.scale - other.scale) as u32);
+            (self.mag.clone(), den)
+        };
+        let (q, r) = num.div_rem(&den);
+        if !r.is_zero() {
+            return None;
+        }
+        Some(
+            BigDec {
+                neg: self.neg != other.neg,
+                mag: q,
+                scale: 0,
+            }
+            .normalize(),
+        )
+    }
+
+    /// Convert to [`Numeric`]; None when the magnitude exceeds i128
+    /// (PG raises 22003 "value overflows numeric format").
+    pub(crate) fn to_numeric(&self) -> Option<Numeric> {
+        let mag = self.mag.to_i128()?;
+        let unscaled = if self.neg { mag.checked_neg()? } else { mag };
+        Some(Numeric::new(unscaled, self.scale))
     }
 }
 
@@ -5398,9 +5724,11 @@ mod v059_division_tests {
     #[test]
     fn pg19_division_regression_cases() {
         // The v0.58 failures, now exact per PG19 select_div_scale.
+        // v0.61: 0.999999999999999999999 rounds to 1 at rscale 20,
+        // and PG displays the full rscale.
         assert_eq!(
             div_text("999999999999999999999", "1000000000000000000000"),
-            "1"
+            "1.00000000000000000000"
         );
         assert_eq!(
             div_text("12345678901234567890", "123"),
@@ -5415,25 +5743,24 @@ mod v059_division_tests {
 
     #[test]
     fn division_unequal_scales() {
-        // 1.2 / 3 = 0.4 (rscale covers the input display scale).
-        assert_eq!(div_text("1.2", "3"), "0.4");
-        // 12 / 0.3 = 40.
-        assert_eq!(div_text("12", "0.3"), "40");
-        // 1000 / 0.001 = 1000000.
-        assert_eq!(div_text("1e3", "0.001"), "1000000");
-        // 0.001 / 1000 = 0.000001.
-        assert_eq!(div_text("0.001", "1e3"), "0.000001");
-        // Exact small quotients.
-        assert_eq!(div_text("5", "4"), "1.25");
-        assert_eq!(div_text("1", "8"), "0.125");
-        assert_eq!(div_text("2.5", "1"), "2.5");
+        // v0.61: PG19 select_div_scale rscales (qweight-aware):
+        // 1.2/3 -> rscale 20, 12/0.3 -> 12, 1e3/0.001 -> 12,
+        // 0.001/1e3 -> 24, 5/4 and 2.5/1 -> 16, 1/8 -> 20.
+        assert_eq!(div_text("1.2", "3"), "0.40000000000000000000");
+        assert_eq!(div_text("12", "0.3"), "40.0000000000000000");
+        assert_eq!(div_text("1e3", "0.001"), "1000000.000000000000");
+        assert_eq!(div_text("0.001", "1e3"), "0.000001000000000000000000");
+        assert_eq!(div_text("5", "4"), "1.2500000000000000");
+        assert_eq!(div_text("1", "8"), "0.12500000000000000000");
+        assert_eq!(div_text("2.5", "1"), "2.5000000000000000");
     }
 
     #[test]
     fn division_signs_and_specials() {
-        assert_eq!(div_text("-7", "2"), "-3.5");
-        assert_eq!(div_text("7", "-2"), "-3.5");
-        assert_eq!(div_text("-7", "-2"), "3.5");
+        // v0.61: rscale 16 per PG19 select_div_scale.
+        assert_eq!(div_text("-7", "2"), "-3.5000000000000000");
+        assert_eq!(div_text("7", "-2"), "-3.5000000000000000");
+        assert_eq!(div_text("-7", "-2"), "3.5000000000000000");
         // NaN propagates.
         let r = num("nan").checked_div(&num("1")).unwrap();
         assert!(r.is_nan());
@@ -5465,9 +5792,13 @@ mod v059_division_tests {
 
     #[test]
     fn round_widening_is_noop() {
-        // v0.59: round(x, s) with s >= scale(x) keeps the value, even when
-        // zero-padding would overflow i128.
-        assert_eq!(num("3.14").round_to(40).unwrap().to_text(), "3.14");
+        // v0.61: PG's round(x, s) sets the display scale to s (pads with
+        // zeros); widening never overflows i128 because the stored value
+        // is unchanged.
+        assert_eq!(
+            num("3.14").round_to(40).unwrap().to_text(),
+            "3.14".to_string() + &"0".repeat(38)
+        );
         assert_eq!(num("1.5").round_to(1).unwrap().to_text(), "1.5");
         // Narrowing still rounds half away from zero.
         assert_eq!(num("2.5").round_to(0).unwrap().to_text(), "3");
@@ -5507,13 +5838,16 @@ mod v059_division_tests {
         // numeric(3,6)). But a nonzero value must be strictly less than
         // 10^(precision-scale): PG rejects 0.0009995 (rounds to 0.001)
         // and 0.5 in numeric(3,6).
-        assert_eq!(t("0.000000123", 3, 6).unwrap().to_text(), "0");
+        // v0.61: PG pads typmod-coerced results to the declared scale:
+        // 0.000000123::numeric(3,6) displays as 0.000000.
+        assert_eq!(t("0.000000123", 3, 6).unwrap().to_text(), "0.000000");
         assert_eq!(t("0.0009994", 3, 6).unwrap().to_text(), "0.000999");
         assert_eq!(t("0.0009995", 3, 6), Err(TypmodError::Overflow));
         assert_eq!(t("0.5", 3, 6), Err(TypmodError::Overflow));
         assert_eq!(t("5.0", 3, 6), Err(TypmodError::Overflow));
-        // Unconstrained-equivalent typmods are value-preserving.
-        assert_eq!(t("123.456", 10, 5).unwrap().to_text(), "123.456");
+        // Unconstrained-equivalent typmods are value-preserving;
+        // v0.61: PG pads to the declared scale on output.
+        assert_eq!(t("123.456", 10, 5).unwrap().to_text(), "123.45600");
     }
 
     #[test]
@@ -5529,5 +5863,137 @@ mod v059_division_tests {
         // Interior underscores are fine.
         assert_eq!(num("1_2").to_text(), "12");
         assert_eq!(num("1_2.5_6").to_text(), "12.56");
+    }
+}
+
+#[cfg(test)]
+mod v061_power_dscale_tests {
+    use super::*;
+
+    fn num(s: &str) -> Numeric {
+        Numeric::parse(s).unwrap()
+    }
+
+    fn pow_text(base: &str, exp: i64, exp_dscale: i32) -> String {
+        num(base).power_int(exp, exp_dscale).unwrap().to_text()
+    }
+
+    #[test]
+    fn power_var_int_pg_vectors() {
+        // PG19 regression vectors (numeric.out).
+        assert_eq!(pow_text("3.789", 21, 16), "1409343026052.8716016316022141");
+        assert_eq!(
+            pow_text("3.789", 35, 16),
+            "177158169650516670809.3820586142670135"
+        );
+        assert_eq!(pow_text("1.2", 345, 0), "2077446682327378559843444695.6");
+        assert_eq!(pow_text("0.12", -20, 0), "2608405330458882702.55");
+        assert_eq!(pow_text("0.12", -25, 0), "104825960103961013959336.50");
+        assert_eq!(pow_text("0.5678", -85, 0), "782333637740774446257.7719");
+        assert_eq!(
+            pow_text("1.000000000123", -2147483648, 0),
+            "0.7678656556403084"
+        );
+    }
+
+    #[test]
+    fn power_underflow_zero_at_dscale_1000() {
+        let z = num("10.0").power_int(-2147483648, 0).unwrap();
+        assert_eq!(z.to_text(), "0.".to_string() + &"0".repeat(1000));
+        let z2 = num("10.0").power_int(-2147483647, 0).unwrap();
+        assert_eq!(z2.to_text(), "0.".to_string() + &"0".repeat(1000));
+    }
+
+    #[test]
+    fn power_overflow_and_identities() {
+        // f = 5678*log10(1.234) ~ 518: past the i128 wall -> 22003.
+        assert_eq!(num("1.234").power_int(5678, 0), Err(PowerError::Overflow));
+        // exp == 0 -> exactly 1 with dscale rscale.
+        let one = num("3.789").power_int(0, 16).unwrap();
+        assert_eq!(one.to_text(), "1.0000000000000000");
+        // exp == 1 -> round(base, rscale).
+        let id = num("3.789").power_int(1, 16).unwrap();
+        assert_eq!(id.to_text(), "3.7890000000000000");
+        // 2^100 fits i128 exactly (the old i128 path gave up here).
+        assert_eq!(pow_text("2", 100, 0), "1267650600228229401496703205376");
+        // negative base, odd/even exponents keep the sign; PG's rscale
+        // is max(16 - int(f), ...): (-2)^3 has f=0.9 -> 16 digits,
+        // (-2)^4 has f=1.2 -> 15 digits.
+        assert_eq!(pow_text("-2", 3, 0), "-8.0000000000000000");
+        assert_eq!(pow_text("-2", 4, 0), "16.000000000000000");
+    }
+
+    #[test]
+    fn dscale_parse_and_display() {
+        // Declared scale survives normalization.
+        assert_eq!(num("1.50").dscale, 2);
+        assert_eq!(num("1.50").to_text(), "1.50");
+        assert_eq!(num("0.00").dscale, 2);
+        assert_eq!(num("0.00").to_text(), "0.00");
+        assert_eq!(num("-13.000000000000000").dscale, 15);
+        assert_eq!(num("21.00").to_text(), "21.00");
+        assert_eq!(num("1e200").dscale, 0);
+        // Negative-scale magnitudes print in scientific notation
+        // (pre-existing to_text behavior, unchanged by v0.61).
+        assert_eq!(num("1e200").to_text(), "1e+200");
+        // Equality is by value, not by display scale.
+        assert_eq!(num("1.50"), num("1.5"));
+    }
+
+    #[test]
+    fn dscale_arithmetic_propagation() {
+        // add/sub: max; mul: sum; div: rscale; round: target.
+        let s = num("1.50").checked_add(&num("2.5")).unwrap();
+        assert_eq!(s.dscale, 2);
+        assert_eq!(s.to_text(), "4.00");
+        let m = num("1.50").checked_mul(&num("2.0")).unwrap();
+        assert_eq!(m.dscale, 3);
+        assert_eq!(m.to_text(), "3.000");
+        let d = num("1").checked_div(&num("3")).unwrap();
+        // PG19 select_div_scale: 1/3 has rscale 20.
+        assert_eq!(d.dscale, 20);
+        assert_eq!(d.to_text(), "0.33333333333333333333");
+        let r = num("3.14").round_to(4).unwrap();
+        assert_eq!(r.dscale, 4);
+        assert_eq!(r.to_text(), "3.1400");
+        // neg/abs preserve.
+        assert_eq!(num("1.50").neg().to_text(), "-1.50");
+        assert_eq!(num("-1.50").abs().to_text(), "1.50");
+    }
+
+    #[test]
+    fn bigdec_round_trip_helpers() {
+        // round_to_scale half away from zero.
+        let b = BigDec::from_numeric(&num("2.5")).unwrap().round_to_scale(0);
+        assert_eq!(b.to_numeric().unwrap().to_text(), "3");
+        let b = BigDec::from_numeric(&num("-2.5"))
+            .unwrap()
+            .round_to_scale(0);
+        assert_eq!(b.to_numeric().unwrap().to_text(), "-3");
+        // recip_round: 1/8 = 0.125.
+        let r = BigDec::from_numeric(&num("8"))
+            .unwrap()
+            .recip_round(3)
+            .unwrap();
+        assert_eq!(r.to_numeric().unwrap().to_text(), "0.125");
+        // rem drives the Euclidean algorithm.
+        let a = BigDec::from_numeric(&num("43312.5")).unwrap();
+        let c = BigDec::from_numeric(&num("4637.5")).unwrap();
+        let g = {
+            let (mut x, mut y) = (a, c);
+            while !y.is_zero() {
+                let t = x.rem(&y);
+                x = y;
+                y = t;
+            }
+            x
+        };
+        assert_eq!(g.to_numeric().unwrap().to_text(), "87.5");
+        // div_exact: 42328.2 / 47.4 = 893 exactly.
+        let q = BigDec::from_numeric(&num("42328.2"))
+            .unwrap()
+            .div_exact(&BigDec::from_numeric(&num("47.4")).unwrap())
+            .unwrap();
+        assert_eq!(q.to_numeric().unwrap().to_text(), "893");
     }
 }

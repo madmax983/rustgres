@@ -164,8 +164,8 @@ def main():
              [["3"]], None, None, None, [1700], None,
              "|/ binds loosest: |/(2+7) = 3"),
             ("SELECT ||/ 35 - 8",
-             [["3"]], None, None, None, [1700], None,
-             "||/ binds loosest: ||/(35-8) = 3"),
+             [["3.000000000000000"]], None, None, None, [1700], None,
+             "||/ binds loosest: ||/(35-8) = 3 (v0.61: PG cbrt dscale 15)"),
             # --- Expr::Neg: type-preserving doNegate ---
             ("SELECT - (-32768::smallint)",
              None, None, "22003", "smallint out of range", None, None,
@@ -185,8 +185,8 @@ def main():
              "~ NULL is NULL::int (v0.52 raised 42883)"),
             # --- preserved behavior (pass on both) ---
             ("SELECT - 2 ^ 2",
-             [["4"]], None, None, None, [1700], None,
-             "UMINUS tighter than ^: (-2)^2 = 4"),
+             [["4.0000000000000000"]], None, None, None, [1700], None,
+             "UMINUS tighter than ^: (-2)^2 = 4 (v0.61: PG power rscale 16)"),
             ("SELECT - NULL",
              [[None]], None, None, None, [23], None,
              "- NULL is NULL"),

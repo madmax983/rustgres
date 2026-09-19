@@ -369,7 +369,9 @@ def main():
         check("radians(180)~pi", err is None and rows[0][0].startswith("3.141592653"),
               f"got {rows} err={err}")
         rows, _, _ = c.sql("SELECT scale(1.50)")
-        check("scale(1.50)=1", rows[0][0] == "1", f"got {rows}")
+        # v0.61: PG19's numeric_scale returns the display scale
+        # (NUMERIC_DSCALE), so scale('1.50') = 2, not 1.
+        check("scale(1.50)=2", rows[0][0] == "2", f"got {rows}")
         rows, _, _ = c.sql("SELECT trim_scale(1.500)")
         check("trim_scale(1.500)=1.5", rows[0][0] == "1.5", f"got {rows}")
         rows, _, _ = c.sql("SELECT min_scale(1.50)")
