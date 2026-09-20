@@ -2,6 +2,118 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Expr::Cmp` always runs both the regclass and name coercion cascades, even for int-vs-int comparisons — fix — 2026-09-20
+
+Fixes the target identified in the baseline entry immediately below this
+one. `eval_expr`'s `Expr::Cmp` arm (`src/exec.rs`) called
+`coerce_regclass_cmp(q, scopes, left, right, va, vb)` and then
+`coerce_name_cmp(scopes, left, right, va, vb)` on **every** comparison,
+unconditionally, even though both functions already fast-path to a no-op
+when the relevant operand can't be regclass-/name-typed. The fix adds one
+check *before* either call, using a helper (`is_exact_int_value`, hoisted
+out of `coerce_regclass_cmp`'s previously-local `is_int`) that both
+functions' own fast paths already rely on:
+
+```rust
+Expr::Cmp { op, left, right } => {
+    let va = eval_expr(q, scopes, left)?;
+    let vb = eval_expr(q, scopes, right)?;
+    if is_exact_int_value(&va) && is_exact_int_value(&vb) {
+        return eval_cmp_vals(*op, &va, &vb);
+    }
+    let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
+    let (va, vb) = coerce_name_cmp(scopes, left, right, va, vb);
+    eval_cmp_vals(*op, &va, &vb)
+}
+```
+
+**Why this is exact, not approximate**: this doesn't change *what*
+either coercion function decides — it proves the decision in advance for
+the one case both functions already special-case internally.
+`coerce_regclass_cmp`'s own doc comment establishes that an int-valued
+operand can never be regclass-typed (the only regclass-value producer,
+`eval_regclass_cast`, always returns `Value::text(..)`), so its
+`l_rc = !a_int && expr_is_regclass(..)` already evaluates to `false`
+without calling `expr_is_regclass` when `a_int` is true — this fix just
+moves that same true/false answer one call frame earlier when *both*
+sides are int-valued, so the whole function isn't entered at all.
+Symmetrically, `coerce_name_cmp` starts with
+`if !is_textual(&va) && !is_textual(&vb) { return (va, vb); }`, and no
+`Value::SmallInt`/`Int`/`BigInt` is ever textual, so it too always
+returns its inputs unchanged for an int-vs-int pair. Both functions'
+behavior for every other input combination (either or both sides
+NULL, text, regclass, name, float, numeric, ...) is untouched — the
+`if` only intercepts the specific case both functions already proved a
+no-op internally, and takes the identical `eval_cmp_vals(*op, &va, &vb)`
+path either branch would have reached.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_join.py --count 100`,
+same 20×2000 join+filter+GROUP BY workload as the baseline entry below,
+same machine, this session; two runs each side to confirm determinism —
+before-runs agree to within 0.00027%, after-runs to within 0.0049%):
+
+| | Ir |
+|---|---|
+| before (HEAD, baseline entry below), run 1 | 8,187,554,897 |
+| before, run 2 | 8,187,577,080 |
+| before (average) | 8,187,565,988.5 |
+| after, run 1 | 6,291,333,371 |
+| after, run 2 | 6,291,644,524 |
+| after (average) | 6,291,488,947.5 |
+
+**Delta: -23.16%** total instructions — over 4x the ≥5%-of-profile
+impact floor (the combined target, `coerce_regclass_cmp` +
+`coerce_regclass_cmp::is_int` + `coerce_name_cmp` +
+`coerce_name_cmp::is_textual`, was measured at 14.73% of the baseline
+profile below). The win is larger than that 14.73% because it also
+removes two function-call boundaries' worth of by-value `Value`
+moves/returns per comparison (`Value` is a ~40-byte enum carrying a
+`Numeric { i128, i32, i32, enum }`, which this unoptimized build passes
+via `memcpy` rather than registers) — the standalone
+`__memcpy_avx_unaligned_erms` line drops from 566,867,373 Ir (6.92%) in
+the baseline to 371,984,348 Ir (5.91% of the smaller post-fix total,
+194,883,025 fewer instructions) with no other change to how rows are
+read or materialized. `coerce_regclass_cmp`, `coerce_name_cmp`,
+`expr_is_regclass`, and `coerce_name_cmp::is_textual` are gone from the
+after-profile's top-cost listing entirely; `is_exact_int_value` (the
+hoisted, still-inlined-at-one-call-site check) costs exactly
+113,680,000 Ir — bit-for-bit the same cost the baseline's
+`coerce_regclass_cmp::is_int` line already paid, confirming the check
+itself is unchanged, only which call sites reach it.
+
+**Behavior**: unchanged. `cargo test --all-features` — 204 passed, 0
+failed, identical to the pre-change tree (confirmed via `git stash`).
+`cargo fmt --all -- --check` is clean. `cargo clippy --all-targets
+--all-features -- -D warnings` fails to compile with the same 294
+pre-existing errors on both the pre-change and post-change tree
+(confirmed via `git stash` — the same toolchain/lint-version mismatch
+noted in every prior Bolt round in this file: `collapsible_if` in
+`main.rs`, `useless_vec` in `toast.rs`, etc.) — no new clippy findings.
+`tests/protocol_test.py` (40/40), `protocol_test2.py` (91/91), and the
+regclass-specific suites `protocol_test37-41.py` (60/27/25/17/31, all
+passed) are unchanged. `tests/conformance/regress_runner.py --tests
+join,insert` (PostgreSQL regression-suite subset, semantic comparison)
+scores identically before and after (confirmed via `git stash`): `join`
+EXPECTED-FAIL=476 PASS=450 REAL-FAIL=48, `insert` EXPECTED-FAIL=297
+PASS=50 REAL-FAIL=39 SKIP=14 — same REAL-FAIL set on both trees, none
+involving comparisons, regclass, or the `name` type.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
 ## Bolt: `Expr::Cmp` always runs both the regclass and name coercion cascades, even for int-vs-int comparisons — baseline — 2026-09-20
 
 **Workload**: `benches/profile_join.py` (existing, from the equi-join/
