@@ -2,6 +2,213 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Expr::Cmp` always runs both the regclass and name coercion cascades, even for int-vs-int comparisons — fix — 2026-09-20
+
+Fixes the target identified in the baseline entry immediately below this
+one. `eval_expr`'s `Expr::Cmp` arm (`src/exec.rs`) called
+`coerce_regclass_cmp(q, scopes, left, right, va, vb)` and then
+`coerce_name_cmp(scopes, left, right, va, vb)` on **every** comparison,
+unconditionally, even though both functions already fast-path to a no-op
+when the relevant operand can't be regclass-/name-typed. The fix adds one
+check *before* either call, using a helper (`is_exact_int_value`, hoisted
+out of `coerce_regclass_cmp`'s previously-local `is_int`) that both
+functions' own fast paths already rely on:
+
+```rust
+Expr::Cmp { op, left, right } => {
+    let va = eval_expr(q, scopes, left)?;
+    let vb = eval_expr(q, scopes, right)?;
+    if is_exact_int_value(&va) && is_exact_int_value(&vb) {
+        return eval_cmp_vals(*op, &va, &vb);
+    }
+    let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
+    let (va, vb) = coerce_name_cmp(scopes, left, right, va, vb);
+    eval_cmp_vals(*op, &va, &vb)
+}
+```
+
+**Why this is exact, not approximate**: this doesn't change *what*
+either coercion function decides — it proves the decision in advance for
+the one case both functions already special-case internally.
+`coerce_regclass_cmp`'s own doc comment establishes that an int-valued
+operand can never be regclass-typed (the only regclass-value producer,
+`eval_regclass_cast`, always returns `Value::text(..)`), so its
+`l_rc = !a_int && expr_is_regclass(..)` already evaluates to `false`
+without calling `expr_is_regclass` when `a_int` is true — this fix just
+moves that same true/false answer one call frame earlier when *both*
+sides are int-valued, so the whole function isn't entered at all.
+Symmetrically, `coerce_name_cmp` starts with
+`if !is_textual(&va) && !is_textual(&vb) { return (va, vb); }`, and no
+`Value::SmallInt`/`Int`/`BigInt` is ever textual, so it too always
+returns its inputs unchanged for an int-vs-int pair. Both functions'
+behavior for every other input combination (either or both sides
+NULL, text, regclass, name, float, numeric, ...) is untouched — the
+`if` only intercepts the specific case both functions already proved a
+no-op internally, and takes the identical `eval_cmp_vals(*op, &va, &vb)`
+path either branch would have reached.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_join.py --count 100`,
+same 20×2000 join+filter+GROUP BY workload as the baseline entry below,
+same machine, this session; two runs each side to confirm determinism —
+before-runs agree to within 0.00027%, after-runs to within 0.0049%):
+
+| | Ir |
+|---|---|
+| before (HEAD, baseline entry below), run 1 | 8,187,554,897 |
+| before, run 2 | 8,187,577,080 |
+| before (average) | 8,187,565,988.5 |
+| after, run 1 | 6,291,333,371 |
+| after, run 2 | 6,291,644,524 |
+| after (average) | 6,291,488,947.5 |
+
+**Delta: -23.16%** total instructions — over 4x the ≥5%-of-profile
+impact floor (the combined target, `coerce_regclass_cmp` +
+`coerce_regclass_cmp::is_int` + `coerce_name_cmp` +
+`coerce_name_cmp::is_textual`, was measured at 14.73% of the baseline
+profile below). The win is larger than that 14.73% because it also
+removes two function-call boundaries' worth of by-value `Value`
+moves/returns per comparison (`Value` is a ~40-byte enum carrying a
+`Numeric { i128, i32, i32, enum }`, which this unoptimized build passes
+via `memcpy` rather than registers) — the standalone
+`__memcpy_avx_unaligned_erms` line drops from 566,867,373 Ir (6.92%) in
+the baseline to 371,984,348 Ir (5.91% of the smaller post-fix total,
+194,883,025 fewer instructions) with no other change to how rows are
+read or materialized. `coerce_regclass_cmp`, `coerce_name_cmp`,
+`expr_is_regclass`, and `coerce_name_cmp::is_textual` are gone from the
+after-profile's top-cost listing entirely; `is_exact_int_value` (the
+hoisted, still-inlined-at-one-call-site check) costs exactly
+113,680,000 Ir — bit-for-bit the same cost the baseline's
+`coerce_regclass_cmp::is_int` line already paid, confirming the check
+itself is unchanged, only which call sites reach it.
+
+**Behavior**: unchanged. `cargo test --all-features` — 204 passed, 0
+failed, identical to the pre-change tree (confirmed via `git stash`).
+`cargo fmt --all -- --check` is clean. `cargo clippy --all-targets
+--all-features -- -D warnings` fails to compile with the same 294
+pre-existing errors on both the pre-change and post-change tree
+(confirmed via `git stash` — the same toolchain/lint-version mismatch
+noted in every prior Bolt round in this file: `collapsible_if` in
+`main.rs`, `useless_vec` in `toast.rs`, etc.) — no new clippy findings.
+`tests/protocol_test.py` (40/40), `protocol_test2.py` (91/91), and the
+regclass-specific suites `protocol_test37-41.py` (60/27/25/17/31, all
+passed) are unchanged. `tests/conformance/regress_runner.py --tests
+join,insert` (PostgreSQL regression-suite subset, semantic comparison)
+scores identically before and after (confirmed via `git stash`): `join`
+EXPECTED-FAIL=476 PASS=450 REAL-FAIL=48, `insert` EXPECTED-FAIL=297
+PASS=50 REAL-FAIL=39 SKIP=14 — same REAL-FAIL set on both trees, none
+involving comparisons, regclass, or the `name` type.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers.
+
+## Bolt: `Expr::Cmp` always runs both the regclass and name coercion cascades, even for int-vs-int comparisons — baseline — 2026-09-20
+
+**Workload**: `benches/profile_join.py` (existing, from the equi-join/
+`coerce_regclass_cmp` Bolt rounds), default scaled-down shape — an exact
+**100** iterations of
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+(`--users 200 --orders 2000 --filter 20`) over the real wire protocol.
+Every equi-join comparison (`u.id = o.uid`) and WHERE filter comparison
+(`u.id < 20`) in the workload runs through `Expr::Cmp` in
+`exec::eval_expr`, so this exercises the full comparison-coercion
+cascade for real, not a synthetic slice of it.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/callgrind.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 500
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/callgrind.out | head -30
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged; two runs agree
+to within 0.00027%): **8,187,565,988.5** total instructions (average of
+8,187,554,897 and 8,187,577,080) over the 100-iteration run. Top
+`rustgres::exec` self-costs:
+
+| function | Ir | % of total |
+|---|---|---|
+| `eval_expr` (both monomorphizations) | 1,837,720,000 | 22.44% |
+| `eval_cmp_vals` | 572,520,000 | 6.99% |
+| `coerce_regclass_cmp` | 552,160,000 | **6.74%** |
+| `build_source` | 456,576,500 | 5.58% |
+| `coerce_name_cmp` | 401,940,000 | **4.91%** |
+| `cmp_ordering` | 349,160,000 | 4.26% |
+| `coerce_name_cmp::is_textual` | 138,040,000 | **1.69%** |
+| `coerce_regclass_cmp::is_int` | 113,680,000 | **1.39%** |
+
+DHAT over the same workload: 206,912 total heap allocations, 40,116,139
+bytes allocated (recorded for completeness; this fix does not target
+allocations — see "Mechanism" below — so DHAT is not the gating counter
+for this round).
+
+**Target**: `coerce_regclass_cmp` + `coerce_regclass_cmp::is_int` +
+`coerce_name_cmp` + `coerce_name_cmp::is_textual` together cost
+1,205,820,000 Ir, **14.73% of this profile** — comfortably above the
+5%-of-profile relevance bar — for a workload (`u.id = o.uid`,
+`u.id < 20`) where every single comparison is int-vs-int, the exact case
+both functions already have an internal fast path for (see the
+`coerce_regclass_cmp`/`coerce_name_cmp` doc comments and the prior
+"`coerce_regclass_cmp` skips `expr_is_regclass` for int operands" Bolt
+round, already merged). The residual cost is not the scope walks those
+fast paths already skip — it's the two function calls themselves and
+the `Value` moves that go with each one (a `Value` carries a 32-byte
+`Numeric { unscaled: i128, scale: i32, dscale: i32, special: enum }` in
+one variant, so passing it by value through a call and back through a
+returned tuple is a real, measurable `memcpy` in this unoptimized
+build): `eval_expr`'s `Expr::Cmp` arm calls `coerce_regclass_cmp(..,
+va, vb)` then `coerce_name_cmp(.., va, vb)` unconditionally, moving
+both operands through two extra call frames before ever reaching
+`eval_cmp_vals`, even when both calls are guaranteed (by the invariants
+their own doc comments already establish) to hand back exactly the
+`(va, vb)` they were given.
+
+**Mechanism**: hoist the int-vs-int check both functions already make
+internally (`coerce_regclass_cmp`'s local `is_int`, matching
+`coerce_name_cmp`'s `is_textual` returning `false` for every int
+variant) to the `Expr::Cmp` call site, and skip calling either function
+at all when both operands are already known to be int-valued. This is
+provably identical to calling through both functions and observing
+their fast paths trigger — it just answers the same question once,
+before the two calls, instead of once inside each of them.
+
+**Baseline numbers** (this commit, `eval_expr`'s `Expr::Cmp` arm
+unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind total instructions (`Ir`), 100-iteration 20×2000 join+filter+GROUP BY | 8,187,565,988.5 |
+| `coerce_regclass_cmp` self `Ir` | 552,160,000 (6.74%) |
+| `coerce_regclass_cmp::is_int` self `Ir` | 113,680,000 (1.39%) |
+| `coerce_name_cmp` self `Ir` | 401,940,000 (4.91%) |
+| `coerce_name_cmp::is_textual` self `Ir` | 138,040,000 (1.69%) |
+| combined | 1,205,820,000 (14.73%) |
+
+Fix follows in the next commit.
+
 ## Bolt: `Compiled::find_at` reallocates its capture/backtrack scratch buffers per attempted start position — fix — 2026-09-19
 
 Fixes the target identified in the baseline entry immediately below this

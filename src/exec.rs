@@ -12226,6 +12226,15 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         Expr::Cmp { op, left, right } => {
             let va = eval_expr(q, scopes, left)?;
             let vb = eval_expr(q, scopes, right)?;
+            // v0.63 perf: an int-valued operand can never be regclass- or
+            // name-typed (see `coerce_regclass_cmp`/`coerce_name_cmp`), so
+            // when both sides are already int-valued (the common case for
+            // join keys and id filters), both coercion cascades below are
+            // provably no-ops — skip calling them, and the extra by-value
+            // `Value` moves that come with each call, entirely.
+            if is_exact_int_value(&va) && is_exact_int_value(&vb) {
+                return eval_cmp_vals(*op, &va, &vb);
+            }
             // v0.38: regclass/oid binary coercion (below).
             let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
             // v0.57: name-vs-unknown-literal truncation (PG19 namein).
@@ -12601,6 +12610,17 @@ fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError> {
     }
 }
 
+/// v0.63 perf: true for the three exact-integer `Value` variants. An
+/// int-valued operand can never be regclass- or name-typed (see
+/// `coerce_regclass_cmp`/`coerce_name_cmp`'s doc comments), so
+/// `Expr::Cmp`'s evaluator uses this to skip both coercion cascades
+/// entirely when both operands are already int-valued, without calling
+/// into either function.
+#[inline]
+fn is_exact_int_value(v: &Value) -> bool {
+    matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+}
+
 /// v0.38: PG's binary-coercible regclass/oid comparison. When one side
 /// of a comparison is statically typed regclass and the other side is
 /// integer-typed (or both sides are regclass), resolve the regclass
@@ -12619,11 +12639,8 @@ fn coerce_regclass_cmp(
     if matches!(va, Value::Null) || matches!(vb, Value::Null) {
         return Ok((va, vb));
     }
-    fn is_int(v: &Value) -> bool {
-        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
-    }
-    let a_int = is_int(&va);
-    let b_int = is_int(&vb);
+    let a_int = is_exact_int_value(&va);
+    let b_int = is_exact_int_value(&vb);
     // A regclass-typed expression only ever evaluates to `Value::Text`:
     // `eval_regclass_cast` (the only producer of a regclass value) always
     // returns `Value::text(..)` (see its doc comment), and column
