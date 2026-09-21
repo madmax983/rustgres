@@ -8514,6 +8514,55 @@ fn compute_window_values(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<V
     Ok(result)
 }
 
+/// v0.63: true when `resolve_frame` is guaranteed to return `s == 0`
+/// for *every* row of this partition (so the frame only ever grows as
+/// the row position increases, never shrinks — what makes an
+/// incremental, append-only accumulator safe in `compute_partition`).
+///
+/// `WindowFrame::Default` always qualifies: its effective start is
+/// `UNBOUNDED PRECEDING` whether or not there's an ORDER BY, and its
+/// bounds never carry a numeric offset. For an explicit `ROWS` frame,
+/// `rows_bound(UnboundedPreceding, ..)` is `0` regardless of the end
+/// bound (it's a pure position computation). For an explicit `RANGE`
+/// frame, the same holds *unless* there's an ORDER BY and the end bound
+/// has a numeric offset (`resolve_frame`'s "RANGE with offsets" branch
+/// finds `s` by scanning for the first row whose order key clears the
+/// offset interval, which can be > 0, or even skip past a leading NULL
+/// order key — not a guaranteed `0`).
+fn frame_start_is_unbounded_preceding(spec: &ExecWindow) -> bool {
+    match &spec.frame {
+        WindowFrame::Default => true,
+        WindowFrame::Rows { start, .. } => matches!(start, FrameBound::UnboundedPreceding),
+        WindowFrame::Range { start, end } => {
+            matches!(start, FrameBound::UnboundedPreceding)
+                && (spec.order_by.is_empty() || !has_offset_bound(end))
+        }
+    }
+}
+
+/// v0.63: the single `NumCat` every non-NULL value of the partition's
+/// `sum()` argument belongs to, if and only if they're all exact
+/// integers (`SmallInt`/`Int`/`BigInt` — never `Numeric`/`Float4`/
+/// `Float`, whose incremental-sum arithmetic isn't attempted here).
+/// A `sum_vals` fold over any sub-range of a partition this returns
+/// `Some` for always picks the same result category (`sum_vals`'s `cat`
+/// is a `max()` over exactly the exact-integer variants), so an `i128`
+/// running accumulator reproduces it exactly, row by row.
+fn partition_sum_int_cat(input: &WindowInput, idxs: &[usize]) -> Option<NumCat> {
+    let mut cat: Option<NumCat> = None;
+    for &i in idxs {
+        let c = match input.arg_vals[i].first()? {
+            Value::Null => continue,
+            Value::SmallInt(_) => NumCat::Small,
+            Value::Int(_) => NumCat::Int,
+            Value::BigInt(_) => NumCat::Big,
+            _ => return None,
+        };
+        cat = Some(cat.map_or(c, |prev| prev.max(c)));
+    }
+    cat
+}
+
 /// v0.10: compute a window function over one ordered partition.
 /// `idxs` are input-row indices in partition order; returns one value
 /// per position.
@@ -8657,18 +8706,81 @@ fn compute_partition(
             // count(*) counts rows (NULLs included); other aggregates
             // skip NULL inputs, like their grouped counterparts.
             let count_star = *f == AggFunc::Count && spec.args.is_empty();
-            for j in 0..n {
-                let (s, e) = resolve_frame(spec, input, idxs, j)?;
-                let mut vals: Vec<Value> = Vec::new();
-                if s <= e {
-                    for p in s..=e {
-                        let v = arg(p, 0);
-                        if count_star || !matches!(v, Value::Null) {
-                            vals.push(v);
+            // v0.63: `resolve_frame` proves `s` is always 0 whenever the
+            // frame's start bound is UNBOUNDED PRECEDING (the implicit
+            // default frame an ORDER BY window gets, and the most common
+            // real one) — the frame then only ever grows as `j`
+            // increases, so count(*)/count(x)/sum(exact int) can be
+            // accumulated once instead of re-scanned from position 0 on
+            // every row (was O(n) per row, O(n^2) per partition).
+            let cumulative = frame_start_is_unbounded_preceding(spec);
+            let sum_int_cat = if cumulative && *f == AggFunc::Sum && spec.args.len() == 1 {
+                partition_sum_int_cat(input, idxs)
+            } else {
+                None
+            };
+            if count_star {
+                // Closed form: the frame's size needs no row data.
+                for j in 0..n {
+                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    out[j] = Value::BigInt(if s <= e { (e - s + 1) as i64 } else { 0 });
+                }
+            } else if cumulative && *f == AggFunc::Count {
+                let mut count: i64 = 0;
+                let mut next = 0usize;
+                for j in 0..n {
+                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    debug_assert_eq!(s, 0);
+                    while next <= e {
+                        if !matches!(arg(next, 0), Value::Null) {
+                            count += 1;
+                        }
+                        next += 1;
+                    }
+                    out[j] = Value::BigInt(count);
+                }
+            } else if let Some(cat) = sum_int_cat {
+                let icat = if cat == NumCat::Small {
+                    NumCat::Int
+                } else {
+                    cat
+                };
+                let mut acc: i128 = 0;
+                let mut any = false;
+                let mut next = 0usize;
+                for j in 0..n {
+                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    debug_assert_eq!(s, 0);
+                    while next <= e {
+                        let v = arg(next, 0);
+                        if !matches!(v, Value::Null) {
+                            any = true;
+                            acc = acc
+                                .checked_add(to_i128(&v))
+                                .ok_or_else(|| exec_err("22003", "integer out of range"))?;
+                        }
+                        next += 1;
+                    }
+                    out[j] = if any {
+                        fit_int_result(icat, acc)?
+                    } else {
+                        Value::Null
+                    };
+                }
+            } else {
+                for j in 0..n {
+                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    let mut vals: Vec<Value> = Vec::new();
+                    if s <= e {
+                        for p in s..=e {
+                            let v = arg(p, 0);
+                            if !matches!(v, Value::Null) {
+                                vals.push(v);
+                            }
                         }
                     }
+                    out[j] = eval_window_agg(*f, &vals)?;
                 }
-                out[j] = eval_window_agg(*f, &vals)?;
             }
         }
     }
