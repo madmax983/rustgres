@@ -2,6 +2,136 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compute_partition`'s windowed-aggregate frame is re-scanned from scratch on every row of a cumulative window — baseline — 2026-09-21
+
+**Workload**: new driver `benches/profile_window.py` — loads a fixed
+number of rows into `bench_win(id INT, dept INT, val INT)`, then sends an
+exact `--count` of
+
+```sql
+SELECT dept, id,
+       sum(val) OVER (PARTITION BY dept ORDER BY id) AS running_sum,
+       count(*) OVER (PARTITION BY dept ORDER BY id) AS running_count,
+       count(val) OVER (PARTITION BY dept ORDER BY id) AS running_nonnull
+FROM bench_win
+```
+
+over the real wire protocol. This is a "running balance / running count"
+report — the single most common real-world use of window functions, and
+exactly the pattern Postgres gives you by default: an `OVER (... ORDER BY
+...)` with no explicit frame clause is `RANGE UNBOUNDED PRECEDING AND
+CURRENT ROW` (PG19 semantics, matched by `resolve_frame`'s
+`WindowFrame::Default` arm in `src/exec.rs`). `--rows 300 --partitions 3`
+(100 rows/partition, distinct `id` per row so `RANGE`'s peer-group walk
+never spans more than one row) x `--count 3` repeats, run twice to check
+determinism.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg_window.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_window.py --rows 300 --partitions 3 --count 3
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg_window.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+**Profile** (Callgrind `Ir`; two runs agree to within 0.0027%):
+**181,486,694** total instructions (average of 181,484,209 and
+181,489,179) for the 3-iteration, 300-row/3-partition run.
+
+The debug build doesn't inline `compute_partition`'s per-row loop body,
+so its cost is smeared across many small named frames instead of one big
+one (`compute_partition` itself 3.60%, its closures 3.08% + 1.13%,
+`sum_vals` 1.79%, plus the generic machinery those closures drive on
+every call — `Option::unwrap_or`/`and_then`/`cloned`, `RangeInclusive`
+iteration, slice indexing, `Value::clone`/`drop_in_place<Value>`,
+`__memcpy_avx_unaligned_erms`, and `malloc`/`free` for each row's
+freshly-allocated `vals: Vec<Value>`) — no single named function clears
+the 5%-of-profile bar on its own. So the target is isolated by
+comparison instead: the same table and row count, profiled the same way,
+running the **same `SELECT dept, id, val FROM bench_win`** with no window
+functions at all totals **40,106,395** Ir (table creation + 3 inserts +
+3 plain `SELECT`s — the fixed cost the window query pays too, for
+everything that isn't window evaluation). The difference,
+**141,377,814 Ir, is 77.9% of the window query's total profile** — the
+window aggregation is not a minor contributor here, it dominates.
+
+**Target mechanism** — `compute_partition` (`src/exec.rs`), the
+`WindowFunc::Agg(f)` arm:
+
+```rust
+WindowFunc::Agg(f) => {
+    let count_star = *f == AggFunc::Count && spec.args.is_empty();
+    for j in 0..n {
+        let (s, e) = resolve_frame(spec, input, idxs, j)?;
+        let mut vals: Vec<Value> = Vec::new();
+        if s <= e {
+            for p in s..=e {
+                let v = arg(p, 0);
+                if count_star || !matches!(v, Value::Null) {
+                    vals.push(v);
+                }
+            }
+        }
+        out[j] = eval_window_agg(*f, &vals)?;
+    }
+}
+```
+
+For every row `j` in the partition, this rebuilds a fresh `Vec<Value>`
+by rescanning the *entire* frame `[s, e]` from position 0 and re-folds
+it in `eval_window_agg`/`sum_vals`. `resolve_frame`'s own logic
+(`rows_bound`, and `bound_pos`'s peer walk in the `RANGE` branch) proves
+`s` and `e` are each monotonically non-decreasing in `j` — every
+`FrameBound` variant maps to a function of `pos` that only ever stays
+the same or grows as `pos` increases. For the default/`UNBOUNDED
+PRECEDING` frame this benchmark exercises, `s` is *always* `0`: the
+frame only ever grows on the right as `j` increases, so summing/counting
+it fresh on every row does `1 + 2 + ... + n` = **O(n²)** work per
+partition instead of the O(n) a running accumulator would need. This is
+an algorithmic-complexity finding, not a constant-factor one — the
+"asymptotic argument" category (see `--rows 100/200/400`, single
+partition, below), corroborated by the direct 77.9%-of-profile Callgrind
+share above.
+
+**Scaling evidence** (Callgrind `Ir`, single partition so partition size
+== row count, `--count 1`, no window-function subset needed — same
+query as above):
+
+| rows | Ir | ratio vs. previous |
+|---|---|---|
+| 100 | 28,240,506 | — |
+| 200 | 67,946,259 | 2.41x for 2x rows |
+| 400 | 194,593,978 | 2.86x for 2x rows |
+
+The per-doubling ratio climbing toward 4x (rather than sitting at ~2x,
+which a linear-in-n cost would show) as fixed per-query overhead becomes
+a smaller share of the total is the expected signature of an O(n²) cost
+starting to dominate.
+
+**Hypothesis**: replace the per-row full-frame rescan with an
+incremental running accumulator for the frames where it's provably safe
+and lossless — specifically frames whose start bound is `UNBOUNDED
+PRECEDING` (so the frame position `s` is always `0` and there is never
+anything to *remove* from the accumulator, only append to, in the same
+left-to-right order `sum_vals`/the count already process each row's
+frame in) — for `count(*)` (closed-form frame size, no data dependency
+at all), `count(x)` (running non-null count), and `sum(x)` restricted to
+a column whose values are a single exact-integer `NumCat` throughout the
+partition (`SmallInt`/`Int`/`BigInt` — the `i128` `checked_add`
+accumulator `sum_vals` already uses for that category, so this is
+bit-for-bit the same arithmetic, just performed once per new element
+instead of refolded from scratch every row). `min`/`max`/`avg` and
+`sum` over `NUMERIC`/float columns, and every frame whose start bound
+can move (sliding `ROWS`/`RANGE` windows), are unaffected — this targets
+the specific case this benchmark's query represents, not every window
+frame, per "smallest change that moves the counter."
+
+Fix and after-measurement follow in the next entry.
+
 ## Bolt: `Expr::Cmp` always runs both the regclass and name coercion cascades, even for int-vs-int comparisons — fix — 2026-09-20
 
 Fixes the target identified in the baseline entry immediately below this
