@@ -131,7 +131,7 @@ const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK08";
 /// v0.41: version 8 adds per-column compression methods and method
 /// codes in TOAST metadata. v7 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
-const CHKPT_VERSION: u32 = 8;
+const CHKPT_VERSION: u32 = 9;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -545,6 +545,8 @@ pub struct WalSequence {
     /// v0.11: owning role and explicit USAGE grants.
     pub owner: String,
     pub acl: Vec<WalAcl>,
+    /// v0.65: serial ownership (table, column, temp_session).
+    pub owned_by: Option<(String, String, Option<u64>)>,
 }
 
 impl WalSequence {
@@ -561,6 +563,7 @@ impl WalSequence {
             is_called: s.is_called,
             owner: s.owner.clone(),
             acl: s.acl.iter().map(WalAcl::of).collect(),
+            owned_by: s.owned_by.clone(),
         }
     }
 
@@ -582,6 +585,7 @@ impl WalSequence {
             dropped_xmax: 0,
             owner: self.owner,
             acl: self.acl.into_iter().map(WalAcl::into_entry).collect(),
+            owned_by: self.owned_by,
         }
     }
 }
@@ -1140,6 +1144,22 @@ impl Enc {
         // v0.11
         self.str(&s.owner);
         self.acl_list(&s.acl);
+        // v0.65: serial ownership.
+        match &s.owned_by {
+            None => self.u8(0),
+            Some((t, c, sess)) => {
+                self.u8(1);
+                self.str(t);
+                self.str(c);
+                match sess {
+                    None => self.u8(0),
+                    Some(v) => {
+                        self.u8(1);
+                        self.u64(*v);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1635,19 +1655,44 @@ impl<'a> Dec<'a> {
     }
 
     fn sequence(&mut self) -> Result<WalSequence, String> {
+        let name = self.str()?;
+        let start = self.i64()?;
+        let increment = self.i64()?;
+        let min_value = self.i64()?;
+        let max_value = self.i64()?;
+        let cycle = self.u8()? != 0;
+        let current = self.i64()?;
+        let current_is_set = self.u8()? != 0;
+        let is_called = self.u8()? != 0;
+        // v0.11
+        let owner = self.str()?;
+        let acl = self.acl_list()?;
+        // v0.65: serial ownership (written last by the encoder).
+        let owned_by = if self.u8()? != 0 {
+            let t = self.str()?;
+            let c = self.str()?;
+            let sess = if self.u8()? != 0 {
+                Some(self.u64()?)
+            } else {
+                None
+            };
+            Some((t, c, sess))
+        } else {
+            None
+        };
         Ok(WalSequence {
-            name: self.str()?,
-            start: self.i64()?,
-            increment: self.i64()?,
-            min_value: self.i64()?,
-            max_value: self.i64()?,
-            cycle: self.u8()? != 0,
-            current: self.i64()?,
-            current_is_set: self.u8()? != 0,
-            is_called: self.u8()? != 0,
-            // v0.11
-            owner: self.str()?,
-            acl: self.acl_list()?,
+            name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+            current,
+            current_is_set,
+            is_called,
+            owner,
+            acl,
+            owned_by,
         })
     }
 

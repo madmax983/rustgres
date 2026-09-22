@@ -4401,6 +4401,13 @@ pub struct Sequence {
     pub owner: String,
     /// v0.11: explicit GRANT entries for USAGE (owner/superuser bypass).
     pub acl: Vec<AclEntry>,
+    /// v0.65: serial ownership, PG's DEPENDENCY_AUTO. `Some((table,
+    /// column, temp_session))` for a serial column's backing sequence:
+    /// DROP TABLE drops it. `temp_session` is `Some` for temp-table
+    /// sequences (session-local namespace isolation), `None` for
+    /// permanent tables. `None` = ordinary user sequence, which survives
+    /// DROP TABLE even when referenced by `DEFAULT nextval(...)`.
+    pub owned_by: Option<(String, String, Option<u64>)>,
 }
 
 impl Sequence {
@@ -4426,6 +4433,9 @@ impl Sequence {
             dropped_xmax: 0,
             owner: "postgres".to_string(),
             acl: Vec::new(),
+            // v0.65: set by create_serial_sequence for serial backing
+            // sequences; None = ordinary user sequence.
+            owned_by: None,
         }
     }
 }

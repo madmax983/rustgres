@@ -1347,6 +1347,23 @@ pub enum DefaultExpr {
     Expr(Expr),
 }
 
+/// v0.65: which serial pseudo-type a column was declared with. PG's
+/// serial/smallserial/bigserial are not true types: each one creates a
+/// backing sequence `<table>_<column>_seq` (type-specific MAXVALUE per
+/// PG19 sequence.c: 32767 / 2147483647 / 9223372036854775807), marks the
+/// column NOT NULL, and defaults it to `nextval('<table>_<column>_seq')`.
+/// An explicit DEFAULT is a 42601 parse-time error in PG19
+/// ("multiple default values specified"), not an override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialKind {
+    /// `serial` -> integer.
+    Serial,
+    /// `smallserial` -> smallint.
+    SmallSerial,
+    /// `bigserial` -> bigint.
+    BigSerial,
+}
+
 /// v0.9: a CHECK constraint (name + parsed expression).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckDef {
@@ -1389,6 +1406,11 @@ pub struct TableDef {
     pub columns: Vec<(String, ColType)>,
     pub not_null: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
+    /// v0.65: per-column serial pseudo-type marker (parallel to
+    /// `columns`). Exec creates the backing sequence (type-specific
+    /// MAXVALUE, PG19 sequence.c) and wires `DEFAULT nextval(...)` for
+    /// marked columns; an explicit DEFAULT is rejected with 42601.
+    pub serial: Vec<Option<SerialKind>>,
     /// v0.41: raw `COMPRESSION` option per column, parallel to
     /// `columns` (`None` = not specified). Validated in exec.
     pub compression: Vec<Option<String>>,
@@ -1406,6 +1428,11 @@ pub enum AlterAction {
         col_type: ColType,
         not_null: bool,
         default: Option<DefaultExpr>,
+        /// v0.65: serial pseudo-type marker; exec creates the backing
+        /// sequence (type-specific MAXVALUE) and wires DEFAULT
+        /// nextval(). An explicit DEFAULT is PG19's 42601
+        /// ("multiple default values specified").
+        serial: Option<SerialKind>,
         /// v0.41: raw `COMPRESSION` option (`None` = not specified).
         compression: Option<String>,
         checks: Vec<CheckDef>,
@@ -1505,6 +1532,9 @@ enum TableItem {
 struct ParsedColDef {
     name: String,
     col_type: ColType,
+    /// v0.65: serial pseudo-type marker, detected from the raw type
+    /// name before it is resolved to a ColType.
+    serial: Option<SerialKind>,
     /// v0.41: PG19 `opt_column_compression`: `COMPRESSION method` /
     /// `COMPRESSION DEFAULT` right after the type name. Raw name;
     /// validated in exec (`default` = no explicit method).
@@ -1565,6 +1595,7 @@ impl TableDef {
             columns: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
+            serial: Vec::new(),
             compression: Vec::new(),
             checks: Vec::new(),
             uniques: Vec::new(),
@@ -1715,6 +1746,9 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
             def.columns.push((c.name.clone(), c.col_type.clone()));
             def.not_null.push(false);
             def.defaults.push(None);
+            // v0.65: serial marker (with kind) travels to exec for
+            // sequence creation.
+            def.serial.push(c.serial);
             // v0.41: raw COMPRESSION option travels with the column.
             def.compression.push(c.compression.clone());
         }
@@ -1729,10 +1763,23 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
         match item {
             TableItem::Col(c) => {
                 let i = def.columns.iter().position(|(n, _)| n == &c.name).unwrap();
+                // v0.65: a serial column is implicitly NOT NULL (PG's
+                // transformColumnDefinition). An explicit NULL conflicts.
+                if c.serial.is_some() {
+                    def.not_null[i] = true;
+                }
                 for con in &c.cons {
                     match con {
                         ColCon::NotNull => def.not_null[i] = true,
-                        ColCon::Null => def.not_null[i] = false,
+                        ColCon::Null => {
+                            if c.serial.is_some() {
+                                return Err(err(format!(
+                                    "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{}\"",
+                                    c.name, table
+                                )));
+                            }
+                            def.not_null[i] = false
+                        }
                         ColCon::Unique(n) => def_add_unique(
                             table,
                             &mut def,
@@ -2098,6 +2145,9 @@ pub enum Stmt {
     },
     Delete {
         table: String,
+        /// v0.65: optional table alias (`DELETE FROM t AS dt`); the
+        /// alias is the qualifier visible in WHERE/RETURNING, like PG.
+        alias: Option<String>,
         /// v0.22: full predicate expression (was `Vec<WhereCond>`).
         where_: Option<Expr>,
         /// v0.10: `RETURNING ...`.
@@ -2996,10 +3046,16 @@ impl Parser {
             "int4" => Ok(ColType::Int),
             "bigint" | "int8" => Ok(ColType::BigInt),
             "smallint" | "int2" => Ok(ColType::SmallInt),
-            // v0.14: `serial` is accepted as an integer alias for casts and
-            // column definitions. Unlike PostgreSQL we do not auto-create a
-            // backing sequence or DEFAULT nextval(); documented in README.
+            // v0.14: `serial` accepted as an integer alias for casts.
+            // v0.65: in column definitions all three serial pseudo-types
+            // now create a real backing sequence (`<table>_<column>_seq`),
+            // force NOT NULL, and default to nextval() — like PostgreSQL.
             "serial" => Ok(ColType::Int),
+            // v0.65: smallserial/bigserial complete the pseudo-type
+            // family (real backing sequences are created for all three
+            // in column definitions; casts keep the plain mapping).
+            "smallserial" => Ok(ColType::SmallInt),
+            "bigserial" => Ok(ColType::BigInt),
             // v0.35: character types carry their typmod, like PG19
             // (anychar_typmodin): a single positive length; anything else
             // is 22023. `varchar` without a length is unlimited (None);
@@ -3160,6 +3216,8 @@ impl Parser {
                 | "smallint"
                 | "int2"
                 | "serial"
+                | "smallserial"
+                | "bigserial"
                 | "real"
                 | "float4"
                 | "float8"
@@ -3426,6 +3484,18 @@ impl Parser {
     /// `name type [column constraints...]`.
     fn parse_column_def(&mut self) -> Result<ParsedColDef, SqlError> {
         let name = self.expect_ident()?;
+        // v0.65: detect the serial pseudo-types from the raw type name
+        // before it resolves to a plain ColType (the marker drives
+        // backing-sequence creation in exec).
+        let serial = match self.peek() {
+            Token::Ident(s) | Token::QIdent(s) => match s.as_str() {
+                "serial" => Some(SerialKind::Serial),
+                "smallserial" => Some(SerialKind::SmallSerial),
+                "bigserial" => Some(SerialKind::BigSerial),
+                _ => None,
+            },
+            _ => None,
+        };
         let col_type = self.parse_col_type()?;
         // v0.41: PG19 `opt_column_compression` sits between the type
         // name and the column constraints.
@@ -3476,6 +3546,7 @@ impl Parser {
         Ok(ParsedColDef {
             name,
             col_type,
+            serial,
             compression,
             cons,
         })
@@ -3648,10 +3719,23 @@ impl Parser {
             let mut uniques = Vec::new();
             let mut pkey = None;
             let mut fks = Vec::new();
+            // v0.65: serial implies NOT NULL (an explicit NULL conflicts,
+            // like PG's 42601).
+            if col.serial.is_some() {
+                not_null = true;
+            }
             for con in col.cons {
                 match con {
                     ColCon::NotNull => not_null = true,
-                    ColCon::Null => not_null = false,
+                    ColCon::Null => {
+                        if col.serial.is_some() {
+                            return Err(err(format!(
+                                "conflicting NULL/NOT NULL declarations for column \"{}\"",
+                                col.name
+                            )));
+                        }
+                        not_null = false
+                    }
                     ColCon::Unique(n) => uniques.push(UniqueDef {
                         name: n.unwrap_or_else(|| format!("{}_key", col.name)),
                         cols: vec![col.name.clone()],
@@ -3683,6 +3767,7 @@ impl Parser {
                 col_type: col.col_type,
                 not_null,
                 default,
+                serial: col.serial,
                 compression: col.compression,
                 checks,
                 uniques,
@@ -6113,10 +6198,14 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("from")?;
         let table = self.expect_ident()?;
+        // v0.65: `DELETE FROM t AS dt` / `DELETE FROM t dt` (PG's alias
+        // clause; the alias becomes the visible qualifier).
+        let alias = self.parse_alias_opt()?;
         let where_ = self.parse_where_expr_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Delete {
             table,
+            alias,
             where_,
             returning,
             with: Vec::new(),

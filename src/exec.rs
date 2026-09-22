@@ -40,9 +40,9 @@ use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertValue, IsolationLevel,
-    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SetOpKind,
-    SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
-    collect_table_refs, parse_statement, validate_constraint_expr,
+    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SerialKind,
+    SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc,
+    collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
     BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row, RowVersion,
@@ -413,10 +413,11 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         } => exec_update(eng, ctx, table, sets, where_, with, returning),
         Stmt::Delete {
             table,
+            alias,
             where_,
             with,
             returning,
-        } => exec_delete(eng, ctx, table, where_, with, returning),
+        } => exec_delete(eng, ctx, table, alias, where_, with, returning),
         // v0.16: TRUNCATE is executor-level (transactional row removal).
         Stmt::Truncate {
             tables,
@@ -508,6 +509,95 @@ fn exec_create(
 /// catalog, TOAST backing is created eagerly. FK validation runs here
 /// (a CTAS definition never carries constraints, so it is a no-op
 /// there); backing unique indexes stay with plain CREATE TABLE above.
+/// v0.65: create the backing sequence for a serial column, PG-style
+/// (`<table>_<column>_seq`, suffixed on collision like ChooseRelationName).
+/// Returns the sequence name. PG19 sequences are NO CYCLE, START 1,
+/// MINVALUE 1, and MAXVALUE follows the sequence data type (PG19
+/// sequence.c init_params, via the AS clause generateSerialExtraStmts
+/// injects): smallserial -> 32767, serial -> 2147483647,
+/// bigserial -> 9223372036854775807. The create is a transactional
+/// write op, so ROLLBACK drops the sequence with the table.
+fn create_serial_sequence(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    col: &str,
+    kind: SerialKind,
+    temp_session: Option<u64>,
+) -> Result<String, ExecError> {
+    let base = format!("{}_{}_seq", table, col);
+    let mut name = base.clone();
+    let mut n = 1u32;
+    while eng.db.find_sequence(&name, ctx.snap, ctx.own).is_some()
+        || eng
+            .db
+            .find_table(&name, ctx.snap, ctx.own, ctx.session)
+            .is_some()
+        || eng.db.find_view(&name, ctx.snap, ctx.own).is_some()
+    {
+        name = format!("{}{}", base, n);
+        n += 1;
+    }
+    let mut seq = Sequence::new(
+        name.clone(),
+        1, // start
+        1, // increment
+        1, // min_value
+        match kind {
+            SerialKind::SmallSerial => i64::from(i16::MAX),
+            SerialKind::Serial => i64::from(i32::MAX),
+            SerialKind::BigSerial => i64::MAX,
+        },
+        false, // cycle
+        ctx.own,
+    );
+    // v0.65: explicit serial ownership (PG's DEPENDENCY_AUTO via OWNED
+    // BY). DROP TABLE consults this, never the nextval default text.
+    // temp_session isolates temp-table sequences by session.
+    seq.owned_by = Some((table.to_string(), col.to_string(), temp_session));
+    // v0.11: the creating role owns the sequence.
+    seq.owner = ctx.role.to_string();
+    eng.db.sequences.entry(name.clone()).or_default().push(seq);
+    ctx.writes
+        .push(WriteOp::CreateSequence { name: name.clone() });
+    Ok(name)
+}
+
+/// v0.65: wire serial defaults into a freshly built table: for every
+/// serial column, set `DEFAULT nextval('<seq>')`. An explicit DEFAULT
+/// on a serial column is PG19's 42601 ("multiple default values
+/// specified", parse_utilcmd.c transformColumnDefinition) — checked up
+/// front so no sequence is created before the error.
+fn wire_serial_defaults(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    t: &mut Table,
+    serial: &[Option<SerialKind>],
+    temp_session: Option<u64>,
+) -> Result<(), ExecError> {
+    for (i, kind) in serial.iter().enumerate() {
+        if kind.is_some() && t.defaults[i].is_some() {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "multiple default values specified for column \"{}\" of table \"{}\"",
+                    t.columns[i].0, table
+                ),
+            ));
+        }
+    }
+    for (i, kind) in serial.iter().enumerate() {
+        let Some(kind) = kind else { continue };
+        let cname = t.columns[i].0.clone();
+        let seq_name = create_serial_sequence(eng, ctx, table, &cname, *kind, temp_session)?;
+        if t.defaults[i].is_none() {
+            t.defaults[i] = Some(DefaultExpr::Nextval(seq_name));
+        }
+    }
+    Ok(())
+}
+
 fn create_table_from_def(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -520,8 +610,14 @@ fn create_table_from_def(
     // the same name *only within this session* (PostgreSQL semantics).
     // The permanent table is never touched.
     if temp {
-        let tmps = eng.db.temp_tables.entry(ctx.session).or_default();
-        if tmps.contains_key(name) {
+        // Existence check first so a duplicate name fails before any
+        // serial sequences are created (statement-atomic either way).
+        if eng
+            .db
+            .temp_tables
+            .get(&ctx.session)
+            .is_some_and(|m| m.contains_key(name))
+        {
             return Err(exec_err(
                 "42P07",
                 format!("relation \"{}\" already exists", name),
@@ -538,6 +634,12 @@ fn create_table_from_def(
             .zip(def.compression.iter())
             .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
             .collect::<Result<Vec<_>, _>>()?;
+        // v0.65: serial backing sequences for temp tables too (PG
+        // creates them in pg_temp_N; ours live in the global sequence
+        // namespace under the same <table>_<column>_seq naming).
+        // Runs before the temp_tables borrow below.
+        wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, Some(ctx.session))?;
+        let tmps = eng.db.temp_tables.entry(ctx.session).or_default();
         tmps.insert(name.to_string(), t);
         ctx.writes.push(WriteOp::CreateTempTable {
             session: ctx.session,
@@ -588,6 +690,8 @@ fn create_table_from_def(
     // has toastable columns, so pg_class.reltoastrelid is set from the
     // start (not lazily on first toast).
     ensure_toast_table_eager(eng, ctx, name, &mut t);
+    // v0.65: real SERIAL — backing sequences + nextval defaults.
+    wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, None)?;
     eng.db.tables.entry(name.to_string()).or_default().push(t);
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
@@ -1567,6 +1671,27 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
     if v == Value::Null || v.col_type() == *col_type {
         return Ok(v);
     }
+    // v0.65: narrowing integer assignments (PG's assignment casts, e.g.
+    // nextval()'s bigint into a serial integer column). Overflow is
+    // PG19's 22003, not a type mismatch.
+    match (&v, col_type) {
+        (Value::BigInt(i), ColType::SmallInt) => {
+            return i16::try_from(*i)
+                .map(Value::SmallInt)
+                .map_err(|_| exec_err("22003", "smallint out of range"));
+        }
+        (Value::BigInt(i), ColType::Int) => {
+            return i32::try_from(*i)
+                .map(|x| Value::Int(x as i64))
+                .map_err(|_| exec_err("22003", "integer out of range"));
+        }
+        (Value::Int(i), ColType::SmallInt) => {
+            return i16::try_from(*i)
+                .map(Value::SmallInt)
+                .map_err(|_| exec_err("22003", "smallint out of range"));
+        }
+        _ => {}
+    }
     let widened = match (&v, col_type) {
         (Value::SmallInt(i), ColType::Int) => Some(Value::Int(*i as i64)),
         (Value::SmallInt(i), ColType::BigInt) => Some(Value::BigInt(*i as i64)),
@@ -1645,13 +1770,16 @@ fn materialize_dml_ctes(
 }
 
 /// v0.10: output column names/types for a RETURNING list, resolved
-/// against the target table's columns.
+/// against the target table's columns. `qual` is the visible qualifier
+/// for column references; it differs from `table` only when DELETE
+/// carries an alias (v0.65).
 fn describe_returning(
     eng: &Engine,
     snap: &Snapshot,
     own: u64,
     session: u64,
     table: &str,
+    qual: &str,
     returning: &[SelectItem],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     let t = eng
@@ -1662,7 +1790,7 @@ fn describe_returning(
         t.columns
             .iter()
             .map(|(n, ty)| QCol {
-                qual: table.to_string(),
+                qual: qual.to_string(),
                 name: n.clone(),
                 ty: *ty,
 
@@ -2370,6 +2498,7 @@ fn exec_create_table_as(
         columns,
         not_null: vec![false; ncols],
         defaults: vec![None; ncols],
+        serial: vec![None; ncols],
         compression: vec![None; ncols],
         checks: Vec::new(),
         uniques: Vec::new(),
@@ -2470,6 +2599,11 @@ fn exec_insert(
                 })?;
             TableMeta::of(t)
         };
+        let ncols = meta.columns.len();
+        // v0.65: PG's first-N rule (INSERT reference): with no column
+        // list, a row shorter than the table targets the first N
+        // columns; the rest take defaults. More expressions than
+        // columns is still 42601.
         let targets: Vec<usize> = match columns {
             Some(names) => names
                 .iter()
@@ -2488,23 +2622,42 @@ fn exec_insert(
                         })
                 })
                 .collect::<Result<_, _>>()?,
-            None => (0..meta.columns.len()).collect(),
+            // v0.65: PG's first-N rule (INSERT reference): with no column
+            // list, a row shorter than the table targets the first N
+            // columns; the rest take defaults. More expressions than
+            // columns is still 42601.
+            None => {
+                let width = if let Some(srows) = &select_rows {
+                    srows.first().map(|r| r.len()).unwrap_or(0)
+                } else {
+                    rows.first().map(|r| r.len()).unwrap_or(0)
+                };
+                if width > ncols {
+                    return Err(exec_err(
+                        "42601",
+                        "INSERT has more expressions than target columns".to_string(),
+                    ));
+                }
+                (0..width).collect()
+            }
         };
-        let ncols = meta.columns.len();
         let mut built: Vec<Row> = Vec::new();
         // v0.10: INSERT...SELECT: validate column count and use the
         // SELECT's rows directly (already Values).
         if let Some(srows) = select_rows {
             for cells in srows {
                 if cells.len() != targets.len() {
-                    return Err(exec_err(
-                        "42601",
+                    // v0.65: same width rule as VALUES above.
+                    let msg = if columns.is_some() {
                         format!(
                             "INSERT has {} expressions but {} target columns",
                             cells.len(),
                             targets.len(),
-                        ),
-                    ));
+                        )
+                    } else {
+                        "VALUES lists must all be the same length".to_string()
+                    };
+                    return Err(exec_err("42601", msg));
                 }
                 let mut values = vec![Value::Null; ncols];
                 let mut explicit = vec![false; ncols];
@@ -2576,14 +2729,20 @@ fn exec_insert(
             built = Vec::with_capacity(rows.len());
             for row in rows {
                 if row.len() != targets.len() {
-                    return Err(exec_err(
-                        "42601",
+                    // v0.65: explicit lists need the exact count; with no
+                    // list the first row set the width, so a mismatch means
+                    // ragged VALUES lists (PG: 42601 "VALUES lists must all
+                    // be the same length").
+                    let msg = if columns.is_some() {
                         format!(
                             "INSERT has {} expressions but {} target columns",
                             row.len(),
                             targets.len()
-                        ),
-                    ));
+                        )
+                    } else {
+                        "VALUES lists must all be the same length".to_string()
+                    };
+                    return Err(exec_err("42601", msg));
                 }
                 let mut values = vec![Value::Null; ncols];
                 let mut explicit = vec![false; ncols];
@@ -2936,7 +3095,8 @@ fn exec_insert(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols = describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, returning)?;
+        let cols =
+            describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, table, returning)?;
         let schema: Vec<QCol> = meta_for_upsert
             .columns
             .iter()
@@ -3297,7 +3457,8 @@ fn exec_update(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols = describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, returning)?;
+        let cols =
+            describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, table, returning)?;
         let schema: Vec<QCol> = {
             let t = eng
                 .db
@@ -3342,12 +3503,16 @@ fn exec_delete(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    alias: &Option<String>,
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
     // v0.11: DELETE needs DELETE privilege on the table.
     require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
+    // v0.65: an alias makes it the visible qualifier in WHERE/RETURNING
+    // (PG's alias clause); storage and privileges use the real name.
+    let qual = alias.as_deref().unwrap_or(table);
     // v0.10: WITH materialization (validated; plain DELETE cannot reference
     // the CTEs, but the RETURNING list can via subqueries).
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
@@ -3369,7 +3534,7 @@ fn exec_delete(
             .columns
             .iter()
             .map(|(n, ty)| QCol {
-                qual: table.to_string(),
+                qual: qual.to_string(),
                 name: n.clone(),
                 ty: *ty,
 
@@ -3468,7 +3633,7 @@ fn exec_delete(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols = describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, returning)?;
+        let cols = describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, qual, returning)?;
         let schema: Vec<QCol> = {
             let t = eng
                 .db
@@ -3477,7 +3642,7 @@ fn exec_delete(
             t.columns
                 .iter()
                 .map(|(n, ty)| QCol {
-                    qual: table.to_string(),
+                    qual: qual.to_string(),
                     name: n.clone(),
                     ty: *ty,
 
@@ -3634,6 +3799,59 @@ fn exec_drop(
     })
 }
 
+/// v0.65: drop a serial backing sequence when its table is dropped
+/// (PG's OWNED BY / DEPENDENCY_AUTO behavior). Owned sequences are
+/// dropped unconditionally with their table, like PG — even if another
+/// table's DEFAULT references the sequence (that default simply breaks,
+/// as in PG). No-op when already gone.
+fn drop_serial_sequence(eng: &mut Engine, ctx: &mut StmtCtx, seq: &str) -> Result<(), ExecError> {
+    if eng.db.find_sequence(seq, ctx.snap, ctx.own).is_none() {
+        return Ok(());
+    }
+    // Same drop mechanics as exec_drop_sequence (no separate ownership
+    // check: the sequence was created with the table by the same role).
+    let versions = eng.db.sequences.get_mut(seq).expect("visible above");
+    let cur = versions
+        .iter_mut()
+        .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+        .expect("visible above");
+    let prev = cur.clone();
+    cur.dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropSequence {
+        name: seq.to_string(),
+        seq: prev,
+    });
+    Ok(())
+}
+
+/// v0.65: collect the names of sequences explicitly owned by a table's
+/// serial columns (PG's DEPENDENCY_AUTO). Never infers from nextval()
+/// default text: user sequences referenced by explicit DEFAULT
+/// nextval() have `owned_by = None` and survive DROP TABLE.
+/// `temp_session` isolates temp-table sequences by session.
+fn owned_seqs_of(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    temp_session: Option<u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, versions) in &eng.db.sequences {
+        if let Some(s) = versions
+            .iter()
+            .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+        {
+            if let Some((t, _, sess)) = &s.owned_by {
+                if t == table && *sess == temp_session {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Drop a single table with dependency handling.
 fn drop_one_table(
     eng: &mut Engine,
@@ -3662,11 +3880,17 @@ fn drop_one_table(
         {
             eng.db.temp_tables.remove(&ctx.session);
         }
+        // v0.65: drop the temp table's explicitly-owned serial
+        // sequences (session-isolated via owned_by).
+        let serial_seqs = owned_seqs_of(eng, ctx, name, Some(ctx.session));
         ctx.writes.push(WriteOp::DropTempTable {
             session: ctx.session,
             name: name.to_string(),
             prev: Some(prev),
         });
+        for seq_name in &serial_seqs {
+            drop_serial_sequence(eng, ctx, seq_name)?;
+        }
         // Drop the temp table's indexes with it (statement-atomic via
         // their own write ops, like the permanent path below).
         // v0.22: temp tables never own global indexes (their constraints
@@ -3756,6 +3980,10 @@ fn drop_one_table(
             alter_drop_constraint_internal(eng, ctx, tname, fk_name)?;
         }
     }
+    // v0.65: collect explicitly-owned serial sequences first (PG's
+    // DEPENDENCY_AUTO; never inferred from defaults). Done before the
+    // mutable table borrow below.
+    let serial_seqs = owned_seqs_of(eng, ctx, name, None);
     let t = eng
         .db
         .find_table_mut(name, ctx.snap, ctx.own, ctx.session)
@@ -3767,6 +3995,10 @@ fn drop_one_table(
         name: name.to_string(),
         prev_xmax,
     });
+    // v0.65: dropping a table drops its owned serial sequences.
+    for seq_name in &serial_seqs {
+        drop_serial_sequence(eng, ctx, seq_name)?;
+    }
     if toast_relid != 0 {
         // Find the toast table's name by OID (visible version).
         if let Some(tn) = toast_table_name_by_oid(eng, toast_relid, ctx.snap, ctx.own) {
@@ -22761,20 +22993,23 @@ pub fn infer_param_types(
         }
         Stmt::Delete {
             table,
+            alias,
             where_,
             with,
             returning,
             ..
         } => {
             // v0.22: WHERE is a full expression; infer its params against
-            // the target table's schema.
+            // the target table's schema. v0.65: the alias (if any) is
+            // the visible qualifier.
+            let qual = alias.as_deref().unwrap_or(table);
             if let Some(w) = where_ {
                 if let Some(t) = eng.db.find_table(table, snap, own, session) {
                     let schemas: Vec<Vec<QCol>> = vec![
                         t.columns
                             .iter()
                             .map(|(n, ty)| QCol {
-                                qual: table.clone(),
+                                qual: qual.to_string(),
                                 name: n.clone(),
                                 ty: *ty,
 
@@ -23440,15 +23675,33 @@ pub fn describe_columns(
         }
         | Stmt::Update {
             table, returning, ..
-        }
-        | Stmt::Delete {
-            table, returning, ..
         } => {
             if returning.is_empty() {
                 Ok(None)
             } else {
                 Ok(Some(describe_returning(
-                    eng, snap, own, session, table, returning,
+                    eng, snap, own, session, table, table, returning,
+                )?))
+            }
+        }
+        // v0.65: DELETE's alias (if any) is the visible qualifier.
+        Stmt::Delete {
+            table,
+            alias,
+            returning,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref().unwrap_or(table),
+                    returning,
                 )?))
             }
         }
@@ -26610,6 +26863,8 @@ fn exec_alter_sequence(
     // v0.11: ALTER SEQUENCE preserves owner and grants.
     next.owner = prev.owner.clone();
     next.acl = prev.acl.clone();
+    // v0.65: ALTER SEQUENCE preserves serial ownership.
+    next.owned_by = prev.owned_by.clone();
     if let Some(r) = restart {
         // RESTART is setval(r, true): the next nextval advances past r.
         next.current = Some(r);
@@ -28083,6 +28338,7 @@ fn exec_alter(
             col_type,
             not_null,
             default,
+            serial,
             compression,
             checks,
             uniques,
@@ -28096,6 +28352,7 @@ fn exec_alter(
             col_type,
             *not_null,
             default,
+            *serial,
             compression,
             checks,
             uniques,
@@ -28142,6 +28399,7 @@ fn alter_add_column(
     col_type: &ColType,
     not_null: bool,
     default: &Option<DefaultExpr>,
+    serial: Option<SerialKind>,
     compression: &Option<String>,
     checks: &[CheckDef],
     uniques: &[UniqueDef],
@@ -28185,7 +28443,23 @@ fn alter_add_column(
     }
     next.col_compression.push(method);
     next.not_null.push(not_null);
-    next.defaults.push(default.clone());
+    // v0.65: ALTER TABLE ... ADD COLUMN <serial> creates the backing
+    // sequence (PG19 supports this via generateSerialExtraStmts). An
+    // explicit DEFAULT is 42601 ("multiple default values specified"),
+    // like CREATE TABLE. The create runs after `t`'s last use below
+    // (it needs `&mut eng`).
+    if serial.is_some() && default.is_some() {
+        return Err(exec_err(
+            "42601",
+            format!(
+                "multiple default values specified for column \"{}\" of table \"{}\"",
+                col, name
+            ),
+        ));
+    }
+    let default = default.clone();
+    let serial_kind = serial.filter(|_| default.is_none());
+    next.defaults.push(default);
     next.checks.extend(checks.iter().cloned());
     next.uniques.extend(uniques.iter().cloned());
     if let Some(pk) = pkey {
@@ -28214,6 +28488,15 @@ fn alter_add_column(
         .filter(|r| row_visible(r, ctx.snap, ctx.own))
         .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
+    // v0.65: create the serial backing sequence now that `t`'s borrow
+    // has ended, and point the new column's default at it.
+    if let Some(kind) = serial_kind {
+        let seq_name = create_serial_sequence(eng, ctx, name, col, kind, None)?;
+        *next
+            .defaults
+            .last_mut()
+            .expect("new column default just pushed") = Some(DefaultExpr::Nextval(seq_name));
+    }
     // v0.42: a rewrite must mint fresh row ids. Reusing the old ids
     // violates the "globally unique, never reused" invariant: the old
     // table version still holds rows with those ids, so UPDATE/DELETE
@@ -28222,8 +28505,9 @@ fn alter_add_column(
     let new_ids: Vec<u64> = (0..old_rows.len()).map(|_| eng.alloc_row_id()).collect();
     let mut new_rows = Vec::with_capacity(old_rows.len());
     for ((old_id, values, old_toast), new_id) in old_rows.into_iter().zip(new_ids) {
-        let dv = match default {
-            Some(d) => eval_default(
+        // v0.65: the new column's default is the one just pushed.
+        let dv = match next.defaults.last() {
+            Some(Some(d)) => eval_default(
                 eng,
                 ctx.snap,
                 ctx.own,
@@ -28233,7 +28517,7 @@ fn alter_add_column(
                 col_type,
                 col,
             )?,
-            None => Value::Null,
+            _ => Value::Null,
         };
         let mut nv = Vec::with_capacity(old_cols + 1);
         nv.extend_from_slice(&values);
