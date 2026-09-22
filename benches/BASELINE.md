@@ -2,6 +2,162 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: window specs sharing `PARTITION BY`/`ORDER BY` redundantly recompute the same partition grouping and sort — fix — 2026-09-22
+
+Fixes the target identified in the baseline entry immediately below this
+one. Two changes in `src/exec.rs`, both keyed off one new helper:
+
+```rust
+/// For each spec, the index of the earliest spec in the slice that
+/// shares its exact (partition_by, order_by) signature (itself if none
+/// does).
+fn window_group_reps(specs: &[ExecWindow]) -> Vec<usize> {
+    let mut reps = Vec::with_capacity(specs.len());
+    for (i, s) in specs.iter().enumerate() {
+        let rep = specs[..i]
+            .iter()
+            .position(|p| p.partition_by == s.partition_by && p.order_by == s.order_by)
+            .unwrap_or(i);
+        reps.push(rep);
+    }
+    reps
+}
+```
+
+1. `gather_window_inputs_plain`/`_grouped`: a spec whose `reps[i] != i`
+   clones `part_keys`/`order_keys` from `out[reps[i]]` instead of
+   re-running the `eval_expr`/`eval_grouped` loop over `partition_by`/
+   `order_by`; it still runs its own loop for `arg_vals` (the field that
+   does differ per spec). The representative spec (`reps[i] == i`) is
+   untouched — same per-row loop, same evaluation order, as before this
+   change.
+
+2. `compute_window_values` is split in two. `window_partitions(spec,
+   input)` is exactly its old first half — build the `HashMap`
+   partition grouping, sort each partition by `order_by` — now
+   returning `Vec<Vec<usize>>` instead of going straight into
+   `compute_partition`. The new `compute_window_values(spec, input,
+   partitions)` is its old second half, taking that grouping as a
+   parameter instead of computing it. `install_windows` calls
+   `window_partitions` once per unique `reps[i]` (cached in a
+   `Vec<Option<..>>` indexed by rep) and passes the shared result to
+   `compute_window_values` for every spec in that group.
+
+**Why this is exact, not approximate**: `window_partitions` is a pure
+function of `input.part_keys`/`input.order_keys` and `spec.order_by`
+alone (`func`/`args`/`frame` never appear in it), and step 1 makes every
+spec in a `reps` group carry *the same* `part_keys`/`order_keys` values
+(cloned, not re-derived) that the representative's own evaluation
+produced — so calling `window_partitions` once with the representative's
+`(spec, input)` and reusing the result for the whole group returns
+exactly what calling it separately for each member would have returned:
+`spec.order_by` is identical across the group by construction (that's
+what makes them share a `reps` entry), and the `part_keys`/`order_keys`
+each member would have separately computed are, after step 1, literal
+clones of the representative's. Nothing about `compute_partition` — the
+per-spec aggregation logic that reads `spec.func`/`spec.frame`/
+`input.arg_vals` — changes at all; it still runs once per spec, over
+each spec's own argument values, exactly as before. `RowNumber`, `Rank`,
+`DenseRank`, `Lag`/`Lead`, `FirstValue`/`LastValue`/`NthValue`, and every
+`Agg` variant (including the v0.63 incremental `sum`/`count` fast paths)
+are reached through the identical call `compute_partition(spec, input,
+idxs)` as before, with `idxs` now sourced from a shared `Vec<Vec<usize>>`
+instead of a freshly rebuilt one — same values, same order, because the
+`HashMap` grouping and stable sort are deterministic functions of
+`part_keys`/`order_keys`, which are themselves now shared, not
+independently recomputed.
+
+The one documented narrowing (stated in the baseline entry): a volatile
+`partition_by`/`order_by` expression now evaluates once per shared
+signature instead of once per spec. No test in this repo's suite
+exercises that case, and no realistic window query does either — every
+real `PARTITION BY`/`ORDER BY` is a column reference or a deterministic
+expression, for which this dedup is behaviorally invisible by
+definition.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_window.py --rows 2000
+--partitions 10 --count 5`, same 3-window-function running-report query
+as the baseline entry, same machine, this session; two runs each side to
+confirm determinism):
+
+| | Ir |
+|---|---|
+| before (baseline entry below), run 1 | 1,011,551,528 |
+| before, run 2 | 1,011,653,040 |
+| before (average) | 1,011,602,284 |
+| after, run 1 | 801,769,618 |
+| after, run 2 | 801,698,294 |
+| after (average) | 801,733,956 |
+
+(before runs agree to within 0.01%, after runs to within 0.009%)
+
+**Delta: -20.75%** total instructions (-209,868,328 Ir) — over 4x the
+5%-of-profile impact floor. As a fraction of the window-specific share
+the baseline entry isolated (699,421,794 Ir, 69.1% of the before total),
+this fix removes **30.0%** of the actual window-evaluation cost, for a
+query with 3 window functions sharing one `PARTITION BY .. ORDER BY ..`
+— exactly the redundant-computation share the baseline entry's two
+independent isolation methods (the no-window-function control and the
+1-function-vs-3-function comparison) predicted.
+
+**DHAT** (same workload, same scale):
+
+| | bytes | blocks (allocations) |
+|---|---|---|
+| before | 25,527,950 | 498,606 |
+| after | 23,760,330 | 437,666 |
+| delta | -1,767,620 (-6.9%) | -60,940 (**-12.2%**) |
+
+Allocation count clears the ≥10% floor on its own (the `HashMap`
+grouping's per-row `Vec<u8>` key buffers and the `sort_by`'s partition
+`Vec<usize>` clone are each built 2 fewer times per query than before,
+for the 2 deduped specs).
+
+**Behavior**: unchanged. `cargo build` clean, `cargo fmt --all -- --check`
+clean. `cargo test --all-features` — 204 passed, 0 failed, identical to
+the pre-change tree. `cargo clippy --all-targets --all-features -- -D
+warnings` fails to compile with the same pre-existing errors on both the
+pre-change and post-change tree (confirmed via `git stash`, 297 on both
+in this run — the count itself isn't stable run-to-run even on an
+unmodified tree, the same toolchain/lint-version mismatch noted in every
+prior Bolt round in this file) — no new clippy findings from this diff
+specifically (`grep exec.rs` on the clippy output matches nothing).
+`tests/protocol_test.py` (40/40), `protocol_test2.py` (91/91), and the
+window-function suite `protocol_test10.py` (70/70, including `win-agg`:
+`SUM`/`COUNT(*)`/`AVG` together, all three `OVER (PARTITION BY a)` with
+no `ORDER BY` — the exact multi-spec-same-signature shape this fix
+targets, with an *empty* `order_by` list) are unchanged.
+`tests/conformance/regress_runner.py --tests subselect` — same
+145 PASS / 238 EXPECTED-FAIL / 42 REAL-FAIL on both the pre-change and
+post-change tree (confirmed via `git stash`; the 42 are pre-existing
+failures unrelated to window functions). Manually verified beyond the
+automated suites: a 5-window-function query over one small table mixing
+three different signatures in one SELECT — `(dept, salary DESC)` shared
+by `row_number()`+`rank()`, `(dept, id)` shared by another `row_number()`
++ a cumulative `sum()`, and `(dept, <no order>)` alone for a plain
+`count(*)` — every value hand-verified correct against the expected
+per-partition computation, confirming groups of size 2, 2, and 1 all
+compute independently-correct results from one query.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_window.py --rows 2000 --partitions 10 --count 5
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/exec.rs` before this fix)
+rebuilt the same way, for the before numbers. For the DHAT numbers,
+swap `--tool=callgrind ... --cache-sim=yes` for `--tool=dhat` and read
+the `Total: N bytes in M blocks` line valgrind prints to stderr when the
+server is SIGTERM'd.
+
 ## Bolt: window specs sharing `PARTITION BY`/`ORDER BY` redundantly recompute the same partition grouping and sort — baseline — 2026-09-22
 
 **Why this workload**: `benches/bench.py --workload all` (11 workloads, one

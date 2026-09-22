@@ -8334,6 +8334,26 @@ fn resolve_frame(
     Ok((s, e))
 }
 
+/// v0.64: for each spec, the index of the earliest spec in the slice
+/// that shares its exact `(partition_by, order_by)` signature (its own
+/// index if none does). `func`/`args`/`frame` play no part in either a
+/// window's row-partitioning or its within-partition ordering, so every
+/// window function built on the same `PARTITION BY .. ORDER BY ..` —
+/// e.g. `row_number()`/`sum()`/`count(*)` all `OVER (PARTITION BY dept
+/// ORDER BY id)` in one SELECT list, the common "running report" shape —
+/// shares one signature and needs that grouping computed exactly once.
+fn window_group_reps(specs: &[ExecWindow]) -> Vec<usize> {
+    let mut reps = Vec::with_capacity(specs.len());
+    for (i, s) in specs.iter().enumerate() {
+        let rep = specs[..i]
+            .iter()
+            .position(|p| p.partition_by == s.partition_by && p.order_by == s.order_by)
+            .unwrap_or(i);
+        reps.push(rep);
+    }
+    reps
+}
+
 /// v0.10: gather window inputs (partition keys, order keys, argument
 /// values) for the non-aggregated case: one entry per filtered row.
 fn gather_window_inputs_plain(
@@ -8343,8 +8363,42 @@ fn gather_window_inputs_plain(
     rows: &[QRow],
     specs: &[ExecWindow],
 ) -> Result<Vec<WindowInput>, ExecError> {
-    let mut out = Vec::with_capacity(specs.len());
-    for spec in specs {
+    let reps = window_group_reps(specs);
+    let mut out: Vec<WindowInput> = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        if reps[i] != i {
+            // v0.64: this spec's (partition_by, order_by) is exactly
+            // `specs[reps[i]]`'s — that earlier `WindowInput` already
+            // holds the identical per-row values (same exprs, same
+            // rows, same row order), so only this spec's own argument
+            // values need evaluating here.
+            let part_keys = out[reps[i]].part_keys.clone();
+            let order_keys = out[reps[i]].order_keys.clone();
+            let mut arg_vals = Vec::with_capacity(rows.len());
+            for r in rows {
+                let frame = Scope {
+                    schema,
+                    row: &r.cells,
+                    prov: None,
+                };
+                let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(frame);
+                let mut av = Vec::with_capacity(spec.args.len());
+                for a in &spec.args {
+                    av.push(eval_expr(q, &scopes, a)?);
+                }
+                arg_vals.push(av);
+            }
+            out.push(WindowInput {
+                part_keys,
+                order_keys,
+                arg_vals,
+            });
+            continue;
+        }
+        // Original per-row evaluation order, unchanged: partition keys,
+        // then order keys, then argument values, for every row in turn.
         let mut part_keys = Vec::with_capacity(rows.len());
         let mut order_keys = Vec::with_capacity(rows.len());
         let mut arg_vals = Vec::with_capacity(rows.len());
@@ -8399,8 +8453,40 @@ fn gather_window_inputs_grouped(
     group_by: &[Expr],
     specs: &[ExecWindow],
 ) -> Result<Vec<WindowInput>, ExecError> {
-    let mut out = Vec::with_capacity(specs.len());
-    for spec in specs {
+    let reps = window_group_reps(specs);
+    let mut out: Vec<WindowInput> = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        if reps[i] != i {
+            // v0.64: see the identical dedup in gather_window_inputs_plain.
+            let part_keys = out[reps[i]].part_keys.clone();
+            let order_keys = out[reps[i]].order_keys.clone();
+            let mut arg_vals = Vec::with_capacity(surviving.len());
+            for &gi in surviving {
+                let (key_vals, idxs) = &groups[gi];
+                let first: &[Value] = match idxs.first() {
+                    Some(&i) => &rows[i].cells,
+                    None => &[],
+                };
+                let gscope = Scope {
+                    schema,
+                    row: first,
+                    prov: None,
+                };
+                let mut av = Vec::with_capacity(spec.args.len());
+                for a in &spec.args {
+                    av.push(eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, a,
+                    )?);
+                }
+                arg_vals.push(av);
+            }
+            out.push(WindowInput {
+                part_keys,
+                order_keys,
+                arg_vals,
+            });
+            continue;
+        }
         let mut part_keys = Vec::with_capacity(surviving.len());
         let mut order_keys = Vec::with_capacity(surviving.len());
         let mut arg_vals = Vec::with_capacity(surviving.len());
@@ -8453,20 +8539,39 @@ fn install_windows(
     specs: &[ExecWindow],
     inputs: &[WindowInput],
 ) -> Result<(), ExecError> {
+    let reps = window_group_reps(specs);
+    // v0.64: the partition/order grouping (`window_partitions`) is a
+    // pure function of `input.part_keys`/`input.order_keys` and
+    // `spec.order_by` — identical for every spec sharing a rep, so it's
+    // computed once per rep and reused, cached by rep index.
+    let mut partitions_cache: Vec<Option<Vec<Vec<usize>>>> = vec![None; specs.len()];
     let mut values = Vec::with_capacity(specs.len());
-    for (spec, input) in specs.iter().zip(inputs.iter()) {
-        values.push(compute_window_values(spec, input)?);
+    for (i, (spec, input)) in specs.iter().zip(inputs.iter()).enumerate() {
+        let rep = reps[i];
+        if partitions_cache[rep].is_none() {
+            partitions_cache[rep] = Some(window_partitions(&specs[rep], &inputs[rep])?);
+        }
+        let partitions = partitions_cache[rep].as_ref().unwrap();
+        values.push(compute_window_values(spec, input, partitions)?);
     }
     q.wctx = Some(WindowCtx { values, row: 0 });
     Ok(())
 }
 
-/// v0.10: compute one window's value for every input row.
-fn compute_window_values(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<Value>, ExecError> {
-    let nrows = input.arg_vals.len();
-    let mut result = vec![Value::Null; nrows];
+/// v0.64: partition `input`'s rows by `spec.partition_by` and, within
+/// each partition, order them by `spec.order_by` (stable: ties keep
+/// input order). Returns each partition's row indices, in that order.
+///
+/// A pure function of `input.part_keys`/`input.order_keys` and
+/// `spec.order_by` alone — `func`/`args`/`frame` never enter into it —
+/// so `install_windows` computes it once per distinct `(partition_by,
+/// order_by)` signature and shares the result across every window spec
+/// built on that signature, instead of rebuilding the same `HashMap`
+/// grouping and re-running the same partition sort once per spec.
+fn window_partitions(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<Vec<usize>>, ExecError> {
+    let nrows = input.part_keys.len();
     if nrows == 0 {
-        return Ok(result);
+        return Ok(Vec::new());
     }
     // Partition rows by partition-key.
     let mut parts: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
@@ -8481,6 +8586,7 @@ fn compute_window_values(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<V
         }
         parts.entry(k).or_default().push(i);
     }
+    let mut partitions = Vec::with_capacity(part_order.len());
     for pk in &part_order {
         let mut idxs = parts[pk].clone();
         // Order within the partition (stable: ties keep input order).
@@ -8506,7 +8612,22 @@ fn compute_window_values(spec: &ExecWindow, input: &WindowInput) -> Result<Vec<V
                 return Err(e);
             }
         }
-        let vals = compute_partition(spec, input, &idxs)?;
+        partitions.push(idxs);
+    }
+    Ok(partitions)
+}
+
+/// v0.10: compute one window's value for every input row, given its
+/// (possibly shared — see `window_partitions`) partitioning.
+fn compute_window_values(
+    spec: &ExecWindow,
+    input: &WindowInput,
+    partitions: &[Vec<usize>],
+) -> Result<Vec<Value>, ExecError> {
+    let nrows = input.arg_vals.len();
+    let mut result = vec![Value::Null; nrows];
+    for idxs in partitions {
+        let vals = compute_partition(spec, input, idxs)?;
         for (j, &row_idx) in idxs.iter().enumerate() {
             result[row_idx] = vals[j].clone();
         }
