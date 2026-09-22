@@ -1816,6 +1816,51 @@ fn stmt_set_guc(
                 tag: "SET".to_string(),
             })
         }
+        // v0.64: parallel-planner GUCs are accepted as no-ops (we have
+        // no cost-based planner or parallel scan to tune, but PG
+        // accepts them and regression tests SET them). Values are
+        // validated like PG's where cheap: costs are non-negative
+        // numbers, worker counts are non-negative integers.
+        "parallel_setup_cost" | "parallel_tuple_cost" => match value {
+            SetValue::Default => Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            }),
+            SetValue::Str(s) => {
+                let ok = s.parse::<f64>().map(|f| f >= 0.0).unwrap_or(false);
+                if ok {
+                    Ok(ExecResult::Command {
+                        tag: "SET".to_string(),
+                    })
+                } else {
+                    Err(ExecError {
+                        code: "22023",
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                    })
+                }
+            }
+        },
+        "max_parallel_workers_per_gather"
+        | "max_parallel_workers"
+        | "max_worker_processes"
+        | "min_parallel_table_scan_size"
+        | "min_parallel_index_scan_size" => match value {
+            SetValue::Default => Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            }),
+            SetValue::Str(s) => {
+                let ok = s.parse::<i64>().map(|i| i >= 0).unwrap_or(false);
+                if ok {
+                    Ok(ExecResult::Command {
+                        tag: "SET".to_string(),
+                    })
+                } else {
+                    Err(ExecError {
+                        code: "22023",
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                    })
+                }
+            }
+        },
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),

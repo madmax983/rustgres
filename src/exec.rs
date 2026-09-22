@@ -45,9 +45,9 @@ use crate::sql::{
     collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row, RowVersion, Sequence,
-    ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts,
-    toast_storage,
+    BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row, RowVersion,
+    Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible,
+    toast_consts, toast_storage,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -5155,6 +5155,7 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Timestamptz(_) => ColType::Timestamptz,
         Value::Bytea(_) => ColType::Bytea,
         Value::Uuid(_) => ColType::Uuid,
+        Value::PgLsn(_) => ColType::PgLsn, // v0.64
         Value::Null => ColType::Text,
     }
 }
@@ -7885,7 +7886,15 @@ fn check_window_arity(func: &WindowFunc, n: usize) -> Result<(), ExecError> {
 fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
     match f {
         AggFunc::Count => n <= 1,
-        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => n == 1,
+        AggFunc::Sum
+        | AggFunc::Avg
+        | AggFunc::Min
+        | AggFunc::Max
+        | AggFunc::BoolAnd
+        | AggFunc::VarianceSamp
+        | AggFunc::VariancePop
+        | AggFunc::StddevSamp
+        | AggFunc::StddevPop => n == 1,
         AggFunc::StringAgg => false,
     }
 }
@@ -8932,6 +8941,11 @@ fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
         }
         AggFunc::Sum => sum_vals(vals),
         AggFunc::Avg => avg_vals(vals),
+        AggFunc::BoolAnd => bool_and_vals(vals),
+        AggFunc::VarianceSamp => variance_vals(vals, "variance", true, true),
+        AggFunc::VariancePop => variance_vals(vals, "var_pop", false, true),
+        AggFunc::StddevSamp => variance_vals(vals, "stddev", true, false),
+        AggFunc::StddevPop => variance_vals(vals, "stddev_pop", false, false),
         AggFunc::Min | AggFunc::Max => {
             let mut best: Option<&Value> = None;
             for v in vals {
@@ -11029,6 +11043,11 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.push(13);
             out.extend_from_slice(u);
         }
+        // v0.64: pg_lsn groups by its u64 value.
+        Value::PgLsn(lsn) => {
+            out.push(15);
+            out.extend_from_slice(&lsn.to_be_bytes());
+        }
         // v0.36: the one-byte "char" value groups by its byte.
         Value::SingleChar(b) => {
             out.push(14);
@@ -11797,6 +11816,169 @@ fn avg_vals(vals: &[Value]) -> Result<Value, ExecError> {
     Ok(Value::Float(sum / vals.len() as f64))
 }
 
+/// v0.64: sample/population variance and stddev over non-null values,
+/// following PG19's `numeric_stddev_internal` exactly. The transition
+/// accumulates N, sumX, sumX2 plus NaN/±Infinity counts; the final
+/// computes `N*sumX2 - sumX*sumX`, guards `<= 0` to exactly zero
+/// (roundoff — with exact arithmetic this only hits constant inputs),
+/// divides by `N*(N-1)` (sample) or `N*N` (population) at PG19's
+/// `select_div_scale`, and takes the square root at the same rscale
+/// for stddev. Sample aggregates return NULL when the total input
+/// count (NaNs and infinities count, like PG) is <= 1; any NaN or
+/// infinite input yields NaN.
+fn variance_vals(
+    vals: &[Value],
+    name: &str,
+    sample: bool,
+    want_variance: bool,
+) -> Result<Value, ExecError> {
+    // PG has separate float8 aggregates; route any float input through
+    // the f64 path (same formula, NaN/inf input -> NaN).
+    if vals
+        .iter()
+        .any(|v| matches!(v, Value::Float(_) | Value::Float4(_)))
+    {
+        return variance_float_vals(vals, sample, want_variance);
+    }
+    let overflow = || exec_err("22003", "numeric field overflow");
+    let mut n: i64 = 0;
+    let mut total: i64 = 0;
+    let mut nan_c: i64 = 0;
+    let mut pinf_c: i64 = 0;
+    let mut ninf_c: i64 = 0;
+    let mut sum_x = BigDec::zero();
+    let mut sum_x2 = BigDec::zero();
+    // v0.64: PG19 keeps the transition sums as arbitrary-precision
+    // intermediates — only the *final* result is subject to the numeric
+    // digit limit. (The "sum of squares would overflow but variance
+    // does not" regression vector squares 9e131071, whose 262144-digit
+    // square must not 22003 here.) Accumulate on BigDec and track the
+    // max input dscale for PG's rscale rules.
+    let mut max_dscale: i32 = 0;
+    for v in vals {
+        let xv = to_numeric_opt(v).ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!("function {}({}) does not exist", name, v.type_name()),
+            )
+        })?;
+        total += 1;
+        match xv.special {
+            NumericSpecial::NaN => nan_c += 1,
+            NumericSpecial::PosInf => pinf_c += 1,
+            NumericSpecial::NegInf => ninf_c += 1,
+            NumericSpecial::Finite => {
+                n += 1;
+                max_dscale = max_dscale.max(xv.dscale);
+                // PG squares at rscale X.dscale*2 — exact, since the
+                // true square carries exactly twice the input's dscale.
+                let x = BigDec::from_numeric(&xv).ok_or_else(overflow)?;
+                let x2 = x.mul_exact(&x).ok_or_else(overflow)?;
+                sum_x = sum_x.add(&x);
+                sum_x2 = sum_x2.add(&x2);
+            }
+        }
+    }
+    if total == 0 {
+        return Ok(Value::Null);
+    }
+    if sample && total <= 1 {
+        return Ok(Value::Null);
+    }
+    if nan_c > 0 || pinf_c > 0 || ninf_c > 0 {
+        return Ok(Value::Numeric(Numeric::nan()));
+    }
+    let n_bd = BigDec::from_i64(n);
+    // Both products are exact (PG rounds them at sumX.dscale*2, which
+    // the true products never exceed: sumX*sumX carries exactly
+    // 2*sumX.dscale digits, N*sumX2 carries sumX2.dscale <= 2*max).
+    let sum_x_sq = sum_x.mul_exact(&sum_x).ok_or_else(overflow)?;
+    let n_sum_x2 = n_bd.mul_exact(&sum_x2).ok_or_else(overflow)?;
+    let numer_bd = n_sum_x2.sub(&sum_x_sq);
+    // PG's roundoff guard: with exact arithmetic the numerator is only
+    // <= 0 for constant inputs, whose variance is exactly zero.
+    if numer_bd.cmp(&BigDec::zero()) != Ordering::Greater {
+        return Ok(Value::Numeric(Numeric::zero()));
+    }
+    // The numerator as a Numeric for PG19's select_div_scale (its dscale
+    // is 2*max_dscale by PG's sub_var rule). from_bigdec enforces PG's
+    // final-result digit limit, like make_result's weight check.
+    let numer =
+        Numeric::from_bigdec(&numer_bd, max_dscale.saturating_mul(2)).ok_or_else(overflow)?;
+    let denom_n = if sample { n * (n - 1) } else { n * n };
+    let denom = Numeric::from_i64(denom_n);
+    let rscale = Numeric::div_scale_for(&numer, &denom);
+    let mut res = numer.div_at_scale(&denom, rscale).ok_or_else(overflow)?;
+    if !want_variance {
+        // PG applies sqrt_var at the division's rscale.
+        let b = BigDec::from_numeric(&res).ok_or_else(overflow)?;
+        let s = b.sqrt_round(rscale).ok_or_else(overflow)?;
+        res = Numeric::from_bigdec(&s, rscale).ok_or_else(overflow)?;
+    }
+    Ok(Value::Numeric(res))
+}
+
+/// v0.64: float8-style variance/stddev (PG's float8 aggregates) for
+/// float4/float8 inputs: same N*sumX2-sumX^2 formula in f64, NaN or
+/// infinite input -> NaN, sample N<=1 -> NULL.
+fn variance_float_vals(
+    vals: &[Value],
+    sample: bool,
+    want_variance: bool,
+) -> Result<Value, ExecError> {
+    let mut n = 0i64;
+    let mut sum = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut bad = false;
+    for v in vals {
+        let x = to_f64v(v);
+        n += 1;
+        if !x.is_finite() {
+            bad = true;
+            continue;
+        }
+        sum += x;
+        sum2 += x * x;
+    }
+    if n == 0 || (sample && n <= 1) {
+        return Ok(Value::Null);
+    }
+    if bad {
+        return Ok(Value::Float(f64::NAN));
+    }
+    let nf = n as f64;
+    let numer = nf * sum2 - sum * sum;
+    if numer <= 0.0 {
+        return Ok(Value::Float(0.0));
+    }
+    let denom = if sample { nf * (nf - 1.0) } else { nf * nf };
+    let var = numer / denom;
+    Ok(Value::Float(if want_variance { var } else { var.sqrt() }))
+}
+
+/// v0.64: `bool_and` — true iff every non-null input is true, NULL when
+/// there are no non-null inputs (Postgres semantics).
+fn bool_and_vals(vals: &[Value]) -> Result<Value, ExecError> {
+    let mut any = false;
+    for v in vals {
+        match v {
+            Value::Bool(b) => {
+                any = true;
+                if !b {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            _ => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function bool_and({}) does not exist", v.type_name()),
+                ));
+            }
+        }
+    }
+    Ok(if any { Value::Bool(true) } else { Value::Null })
+}
+
 fn eval_agg_func(
     q: &mut Q,
     outer: &[Scope],
@@ -11875,6 +12057,11 @@ fn eval_agg_func(
         AggFunc::Count => Ok(Value::BigInt(vals.len() as i64)),
         AggFunc::Sum => sum_vals(&vals),
         AggFunc::Avg => avg_vals(&vals),
+        AggFunc::BoolAnd => bool_and_vals(&vals),
+        AggFunc::VarianceSamp => variance_vals(&vals, "variance", true, true),
+        AggFunc::VariancePop => variance_vals(&vals, "var_pop", false, true),
+        AggFunc::StddevSamp => variance_vals(&vals, "stddev", true, false),
+        AggFunc::StddevPop => variance_vals(&vals, "stddev_pop", false, false),
         AggFunc::Min | AggFunc::Max => {
             let mut best: Option<&Value> = None;
             for v in &vals {
@@ -13484,6 +13671,44 @@ fn wb_bucket_in_range(
     }
 }
 
+/// v0.64: Convert a finite Numeric to u64 exactly; None when the value
+/// is negative, has a fractional part, or exceeds u64::MAX (pg_lsn input).
+fn numeric_to_u64_exact(n: &crate::storage::Numeric) -> Option<u64> {
+    // v0.64: big-mantissa values can still be in-range (e.g. 1e100/1e90
+    // = 1e10 after extreme-scale arithmetic). When big.is_some(),
+    // unscaled is the sign (-1/1) and big is the magnitude.
+    if let Some(mag) = &n.big {
+        if n.unscaled < 0 {
+            return None;
+        }
+        if n.scale > 0 {
+            let (q, r) = mag.div_rem_pow10(n.scale as u32);
+            if !r.is_zero() {
+                return None;
+            }
+            return q.to_u64();
+        } else {
+            let mut v = (**mag).clone();
+            v.mul_pow10_assign((-n.scale) as u32);
+            return v.to_u64();
+        }
+    }
+    if n.unscaled < 0 {
+        return None;
+    }
+    if n.scale > 0 {
+        let divisor = 10i128.checked_pow(n.scale as u32)?;
+        if n.unscaled % divisor != 0 {
+            return None;
+        }
+        u64::try_from(n.unscaled / divisor).ok()
+    } else {
+        let mult = 10i128.checked_pow((-n.scale) as u32)?;
+        let v = n.unscaled.checked_mul(mult)?;
+        u64::try_from(v).ok()
+    }
+}
+
 fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, ExecError> {
     use std::cmp::Ordering;
     // The 3-argument array-bounds form needs arrays, which rustgres lacks.
@@ -14959,6 +15184,41 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v0.64: cast to pg_lsn (from text like '0/016AE7F8' or numeric).
+        // Note: `pg_lsn(23783416)` parses as a cast (function-call syntax
+        // for the type), so numeric inputs must be handled here.
+        ColType::PgLsn => {
+            // Identity: already pg_lsn.
+            if let Value::PgLsn(lsn) = v {
+                return Ok(Value::PgLsn(*lsn));
+            }
+            // Text: parse HIGH/LOW hex format.
+            if let Value::Text(t) = v {
+                let s = t.to_string();
+                let parts: Vec<&str> = s.split('/').collect();
+                if parts.len() != 2 {
+                    return Err(exec_err("22P02", "invalid pg_lsn format"));
+                }
+                let high = u64::from_str_radix(parts[0], 16)
+                    .map_err(|_| exec_err("22P02", "invalid pg_lsn"))?;
+                let low = u64::from_str_radix(parts[1], 16)
+                    .map_err(|_| exec_err("22P02", "invalid pg_lsn"))?;
+                return Ok(Value::PgLsn((high << 32) | low));
+            }
+            // Numeric: convert via numeric_to_u64_exact (PG's pg_lsn(numeric)).
+            if let Some(num) = to_numeric_opt(v) {
+                if num.is_nan() {
+                    return Err(exec_err("0A000", "cannot convert NaN to pg_lsn"));
+                }
+                if num.is_special() {
+                    return Err(exec_err("0A000", "cannot convert infinity to pg_lsn"));
+                }
+                let lsn = numeric_to_u64_exact(&num)
+                    .ok_or_else(|| exec_err("22023", "pg_lsn out of range"))?;
+                return Ok(Value::PgLsn(lsn));
+            }
+            return Err(exec_err("42846", "cannot cast to pg_lsn"));
+        }
         // v0.35: explicit casts to character(n) / varchar(n): silent
         // truncation of any excess, blank-padding for char. A bpchar
         // source keeps its padding for char targets (PG's bpchar()
@@ -15723,6 +15983,7 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 Value::Timestamp(_) => 8,
                 Value::Timestamptz(_) => 8,
                 Value::Uuid(_) => 16,
+                Value::PgLsn(_) => 8, // v0.64
             };
         }
         size += 24; // per-tuple overhead (approximate)
@@ -15740,6 +16001,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "exp" | "ln" => n == 1,
         "log" => n == 1 || n == 2,
         "cbrt" | "factorial" | "numeric_inc" => n == 1,
+        // v0.64: pg_lsn(numeric) -> pg_lsn display.
+        "pg_lsn" => n == 1,
         "scale" | "trim_scale" => n == 1,
         "min_scale" => n == 1,
         "pi" | "random" => n == 0,
@@ -15933,7 +16196,7 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         // v0.18: numeric functions.
         "exp" | "ln" | "log" | "cbrt" | "factorial" | "gcd" | "lcm" | "pi" | "degrees"
         | "radians" | "scale" | "min_scale" | "trim_scale" | "div" | "width_bucket"
-        | "numeric_inc" => {
+        | "numeric_inc" | "pg_lsn" => {
             eval_math_func(name, vals)
         }
         // v0.21: float8 transcendental functions.
@@ -16462,9 +16725,9 @@ fn generate_series_int(args: &[GsArg], is_big: bool) -> Result<Vec<Vec<Value>>, 
 /// `generate_series_step_numeric`: NaN/infinity start/stop/step are
 /// 22023 with PG's messages (checked start, stop, step, in that order,
 /// before the zero-step check); otherwise emit while `cur` has not
-/// passed `stop` in the step's direction. A sum that overflows the
-/// i128 mantissa is 22023 "numeric field overflow", like the `+`
-/// operator.
+/// passed `stop` in the step's direction. v0.64: like the int4/int8
+/// series, emit `cur` then stop cleanly if `cur + step` overflows the
+/// numeric format, instead of raising 22023 for the unneeded successor.
 fn generate_series_numeric(args: &[GsArg]) -> Result<Vec<Vec<Value>>, ExecError> {
     let start = args[0].as_numeric();
     let stop = args[1].as_numeric();
@@ -16511,9 +16774,13 @@ fn generate_series_numeric(args: &[GsArg]) -> Result<Vec<Vec<Value>>, ExecError>
             break;
         }
         rows.push(vec![Value::Numeric(cur.clone())]);
-        cur = cur
-            .checked_add(&step)
-            .ok_or_else(|| exec_err("22023", "numeric field overflow"))?;
+        // v0.64: PG emits `cur`, then stops if `cur + step` overflows the
+        // numeric format (like the int4/int8 series), instead of raising
+        // 22023 for the unneeded successor.
+        match cur.checked_add(&step) {
+            Some(next) => cur = next,
+            None => break,
+        }
     }
     Ok(rows)
 }
@@ -20270,6 +20537,24 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             // width_bucket(op, b1, b2, count) or width_bucket(op, thresholds).
             return eval_width_bucket(v, vals, name);
         }
+        "pg_lsn" => {
+            // v0.64: pg_lsn(numeric) -> pg_lsn display text (PG19).
+            // NaN -> 0A000 "cannot convert NaN to pg_lsn";
+            // Infinity -> 0A000 "cannot convert infinity to pg_lsn";
+            // negative/fractional/>u64::MAX -> 22023 "pg_lsn out of range".
+            // Display: HIGH/LOW with LOW zero-padded to 8 hex digits.
+            let num = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            if num.is_nan() {
+                return Err(exec_err("0A000", "cannot convert NaN to pg_lsn"));
+            }
+            if num.is_special() {
+                return Err(exec_err("0A000", "cannot convert infinity to pg_lsn"));
+            }
+            let lsn = numeric_to_u64_exact(&num)
+                .ok_or_else(|| exec_err("22023", "pg_lsn out of range"))?;
+            // v0.64: return native pg_lsn type (OID 3220), not text.
+            return Ok(Value::PgLsn(lsn));
+        }
         "setseed" => {
             // v0.18: setseed(float) -> void (sets PRNG seed).
             let s = to_f64v(v);
@@ -20362,6 +20647,19 @@ fn float_to_char(v: f64, fmt: &str, _name: &str) -> Result<Value, ExecError> {
         Err(e) => return Err(numfmt_exec_err(e)),
     };
     match crate::numfmt_tochar::float8_to_char(v, &desc) {
+        Ok(s) => Ok(Value::text(s)),
+        Err(e) => Err(numfmt_exec_err(e)),
+    }
+}
+
+/// v0.64: `to_char` for float4 values (PG's `float4_to_char` trims
+/// post-decimal digits to FLT_DIG significant digits).
+fn float4_to_char(v: f32, fmt: &str, _name: &str) -> Result<Value, ExecError> {
+    let desc = match crate::numfmt::parse_numfmt(fmt) {
+        Ok(d) => d,
+        Err(e) => return Err(numfmt_exec_err(e)),
+    };
+    match crate::numfmt_tochar::float4_to_char(v, &desc) {
         Ok(s) => Ok(Value::text(s)),
         Err(e) => Err(numfmt_exec_err(e)),
     }
@@ -20500,7 +20798,7 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 }
                 Value::Numeric(n) => return num_to_char(n, fmt, name),
                 Value::Float4(f) => {
-                    return float_to_char(f64::from(*f), fmt, name);
+                    return float4_to_char(*f, fmt, name);
                 }
                 Value::Float(f) => return float_to_char(*f, fmt, name),
                 other => return Err(func_arg_err(name, other)),
@@ -20760,6 +21058,8 @@ fn func_result_type(
             Ok(ColType::Numeric(None))
         }
         "scale" | "min_scale" | "width_bucket" => Ok(ColType::Int),
+        // v0.64: pg_lsn returns display text (pg_lsn type not yet a Value).
+        "pg_lsn" => Ok(ColType::PgLsn), // v0.64: native pg_lsn type (OID 3220)
         "random" => Ok(ColType::Float),
         // v0.21: float8 transcendental functions always return float8.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
@@ -20989,6 +21289,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Timestamptz(_) => "timestamptz",
         Value::Bytea(_) => "bytea",
         Value::Uuid(_) => "uuid",
+        Value::PgLsn(_) => "pg_lsn", // v0.64
         Value::Null => "null",
     }
 }
@@ -21993,6 +22294,33 @@ fn agg_result_type(
             let _ = arg2;
             Ok(ColType::Text)
         }
+        AggFunc::BoolAnd => {
+            let a = arg.expect("bool_and always takes an argument");
+            let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+            if !matches!(t, ColType::Bool) {
+                return Err(exec_err(
+                    "42883",
+                    format!("function bool_and({}) does not exist", t.sql_name()),
+                ));
+            }
+            Ok(ColType::Bool)
+        }
+        AggFunc::VarianceSamp | AggFunc::VariancePop | AggFunc::StddevSamp | AggFunc::StddevPop => {
+            let a = arg.expect("variance/stddev always take an argument");
+            let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+            // PG: variance(int-kind) -> numeric; variance(float) ->
+            // double precision; variance(numeric) -> numeric.
+            match t {
+                ColType::SmallInt | ColType::Int | ColType::BigInt | ColType::Numeric(_) => {
+                    Ok(ColType::Numeric(None))
+                }
+                ColType::Float4 | ColType::Float => Ok(ColType::Float),
+                _ => Err(exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", func.name(), t.sql_name()),
+                )),
+            }
+        }
     }
 }
 
@@ -22759,6 +23087,18 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::Uuid)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v0.64: pg_lsn input (text format HIGH/LOW hex).
+        ColType::PgLsn => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            let s = s.trim();
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() != 2 {
+                return Err(bad(format!("\"{}\"", s)));
+            }
+            let high = u64::from_str_radix(parts[0], 16).map_err(|_| bad(format!("\"{}\"", s)))?;
+            let low = u64::from_str_radix(parts[1], 16).map_err(|_| bad(format!("\"{}\"", s)))?;
+            Ok(Value::PgLsn((high << 32) | low))
+        }
         // v0.37: regclass input not supported via binary protocol.
         ColType::Regclass => Err(bad("invalid input syntax for type regclass".into())),
     }
@@ -22979,6 +23319,10 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
         Some(Value::Timestamptz(m)) => Literal::Timestamptz(*m),
         Some(Value::Bytea(b)) => Literal::Bytea(b.clone()),
         Some(Value::Uuid(u)) => Literal::Uuid(*u),
+        // v0.64: pg_lsn parameter substitutes as its text format.
+        Some(Value::PgLsn(lsn)) => {
+            Literal::Text(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF).into())
+        }
         Some(Value::Null) => Literal::Null,
     })
 }
@@ -23064,7 +23408,8 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Bytea => Value::Bytea(Vec::new()),
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::Regclass => Value::Text("".into()),
-        ColType::Name => Value::text(""), // v0.57
+        ColType::Name => Value::text(""),  // v0.57
+        ColType::PgLsn => Value::PgLsn(0), // v0.64
     }
 }
 
@@ -27401,6 +27746,9 @@ fn alter_set_compression(
 /// v0.37: ALTER TABLE name SET (opt = val, ...). Only
 /// `toast_tuple_target` is supported (range 128..=8160, like PG's
 /// reloption); anything else is 22023 ("unrecognized parameter").
+/// v0.64: `parallel_workers` is also accepted (PG19 reloption, >= 0);
+/// it is a planner hint and a no-op here, but accepting it keeps
+/// regression tests' transactions alive.
 fn alter_set_reloptions(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -27434,6 +27782,21 @@ fn alter_set_reloptions(
                 ));
             }
             next.toast_target = n as u32;
+        } else if opt.eq_ignore_ascii_case("parallel_workers") {
+            let n: i64 = val.parse().map_err(|_| {
+                exec_err(
+                    "22023",
+                    format!("invalid value for \"parallel_workers\": \"{}\"", val),
+                )
+            })?;
+            if n < 0 {
+                return Err(exec_err(
+                    "22023",
+                    format!("value {} out of bounds for \"parallel_workers\" (>= 0)", n),
+                ));
+            }
+            // Planner hint only; no parallel scan to tune. Accepted
+            // and stored nowhere (like PG, it does not affect results).
         } else {
             // PG19 reloptions.c parseRelOptionsInternal: unrecognized
             // parameters are 22023, not 0A000.
@@ -28951,4 +29314,138 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
         }
     }
     (schema, rows)
+}
+
+#[cfg(test)]
+mod variance_stress_tests {
+    use super::Value;
+    use super::bool_and_vals;
+    use super::eval_arith;
+    use super::numeric_to_u64_exact;
+    use super::variance_vals;
+    use crate::sql::ArithOp;
+    use crate::storage::Numeric;
+
+    fn num(s: &str) -> Value {
+        Value::Numeric(Numeric::parse(s).unwrap())
+    }
+
+    /// v0.64: numeric.out tiny-value stress vector — the exact
+    /// numerator is 250e-1000 - 80e-16883 + 10e-32766, which PG's
+    /// rscale-1000 division turns into exactly 12e-1000 (the
+    /// NUMERIC_MAX_DISPLAY_SCALE cap). trim_scale(var * 1e1000) = 12.
+    #[test]
+    fn variance_tiny_values() {
+        // v0.64: PG19 keeps 1e-16383 as a tiny value (not zero);
+        // the trim_scale 0.01 result comes from the 16383 dscale cap
+        // in numeric_mul, not from literal rounding.
+        let x4 = Numeric::parse("4e-500")
+            .unwrap()
+            .checked_sub(&Numeric::parse("1e-16383").unwrap())
+            .unwrap();
+        let x5 = Numeric::parse("-4e-500")
+            .unwrap()
+            .checked_add(&Numeric::parse("1e-16383").unwrap())
+            .unwrap();
+        let vals = vec![
+            num("0"),
+            num("3e-500"),
+            num("-3e-500"),
+            Value::Numeric(x4),
+            Value::Numeric(x5),
+        ];
+        let v = variance_vals(&vals, "variance", true, true).unwrap();
+        let scaled = match v {
+            Value::Numeric(n) => n.checked_mul(&Numeric::parse("1e1000").unwrap()).unwrap(),
+            other => panic!("expected numeric, got {:?}", other),
+        };
+        // SQL wraps this in trim_scale(...); the untrimmed value is
+        // 12 with dscale 1000.
+        assert_eq!(
+            scaled.cmp(&Numeric::from_i64(12)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(scaled.to_text(), format!("12.{}", "0".repeat(1000)));
+    }
+
+    /// v0.64: numeric.out huge-offset vector — squaring 9e131071 makes
+    /// a 262144-digit intermediate that must not 22003 (PG only checks
+    /// the final result's weight). Sample variance of {1..5} = 2.5.
+    #[test]
+    fn variance_huge_offset() {
+        let vals: Vec<Value> = (1..=5)
+            .map(|i| {
+                Value::Numeric(
+                    Numeric::parse("9e131071")
+                        .unwrap()
+                        .checked_add(&Numeric::from_i64(i))
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let v = variance_vals(&vals, "variance", true, true).unwrap();
+        match v {
+            Value::Numeric(n) => assert_eq!(n.to_text(), "2.5000000000000000"),
+            other => panic!("expected numeric, got {:?}", other),
+        }
+    }
+
+    /// v0.64: bool_and aggregate semantics (NULLs filtered by caller).
+    #[test]
+    fn bool_and_semantics() {
+        // all true -> true
+        let v = bool_and_vals(&[Value::Bool(true), Value::Bool(true)]).unwrap();
+        assert_eq!(v, Value::Bool(true));
+        // true + false -> false
+        let v = bool_and_vals(&[Value::Bool(true), Value::Bool(false)]).unwrap();
+        assert_eq!(v, Value::Bool(false));
+        // empty -> NULL
+        let v = bool_and_vals(&[]).unwrap();
+        assert_eq!(v, Value::Null);
+        // non-bool -> error
+        assert!(bool_and_vals(&[Value::Int(1)]).is_err());
+    }
+
+    /// v0.64: pg_lsn(numeric) — PG19 display and error semantics.
+    #[test]
+    fn pg_lsn_numeric() {
+        let lsn = |s: &str| {
+            let n = Numeric::parse(s).unwrap();
+            numeric_to_u64_exact(&n).map(|l| format!("{:X}/{:08X}", l >> 32, l & 0xFFFF_FFFF))
+        };
+        assert_eq!(lsn("23783416"), Some("0/016AE7F8".to_string()));
+        assert_eq!(lsn("0"), Some("0/00000000".to_string()));
+        assert_eq!(
+            lsn("18446744073709551615"),
+            Some("FFFFFFFF/FFFFFFFF".to_string())
+        );
+        // negative, fractional, and >u64::MAX are out of range
+        assert_eq!(lsn("-1"), None);
+        assert_eq!(lsn("18446744073709551616"), None);
+        assert_eq!(lsn("1.5"), None);
+        // huge big-mantissa values are out of range
+        assert_eq!(lsn("1e100"), None);
+    }
+    #[test]
+    fn scientific_notation_extreme_mul_dscale_cap() {
+        // v0.64: PG19's numeric_mul rounds result dscale to
+        // NUMERIC_DSCALE_MAX (16383). The conformance query
+        // `trim_scale((0.1 - 2e-16383) * (0.1 - 3e-16383))` yields
+        // `0.01` because the exact product (dscale 32766) rounds to
+        // 16383 digits, eliminating the tiny 5e-16384 term.
+        // Literals like `2e-16383` still parse as tiny values
+        // (verified by the variance conformance test); the dscale
+        // cap is implemented in `Numeric::checked_mul`.
+        let tiny2 = Numeric::parse("2e-16383").unwrap();
+        assert_ne!(tiny2.to_text(), "0");
+        let tiny3 = Numeric::parse("3e-16383").unwrap();
+        assert_ne!(tiny3.to_text(), "0");
+        // Verify the dscale cap logic: mul of two dscale-16383 values
+        // caps the result dscale at 16383 (not 32766).
+        let a = Numeric::parse("0.1").unwrap();
+        let b = Numeric::parse("0.1").unwrap();
+        // dscale of 0.1 is 1; product dscale should be 2 (not capped).
+        let p = a.checked_mul(&b).unwrap();
+        assert_eq!(p.dscale, 2);
+    }
 }

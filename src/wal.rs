@@ -715,6 +715,11 @@ impl Enc {
                 self.u8(17);
                 return;
             }
+            // v0.64: pg_lsn; tag appends after v0.57's.
+            ColType::PgLsn => {
+                self.u8(19);
+                return;
+            }
         });
     }
 
@@ -784,6 +789,11 @@ impl Enc {
             Value::SingleChar(b) => {
                 self.u8(15);
                 self.u8(*b);
+            }
+            // v0.64: pg_lsn values; tag appends after v0.36's.
+            Value::PgLsn(lsn) => {
+                self.u8(16);
+                self.u64(*lsn);
             }
         }
     }
@@ -1250,6 +1260,8 @@ impl<'a> Dec<'a> {
             16 => Ok(ColType::Regclass),
             // v0.57: name.
             17 => Ok(ColType::Name),
+            // v0.64: pg_lsn.
+            19 => Ok(ColType::PgLsn),
             // v0.60: numeric with typmod (precision, scale).
             18 => {
                 let p = self.i32()?;
@@ -1293,6 +1305,8 @@ impl<'a> Dec<'a> {
             14 => Ok(Value::BpChar(self.str()?.into())),
             // v0.36: one-byte "char" values.
             15 => Ok(Value::SingleChar(self.u8()?)),
+            // v0.64: pg_lsn.
+            16 => Ok(Value::PgLsn(self.u64()?)),
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
     }

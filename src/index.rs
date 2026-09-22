@@ -142,6 +142,8 @@ fn type_tag(v: &Value) -> u8 {
         Value::Uuid(_) => 13,
         // v0.36: "char" gets its own tag after v0.35's (append-only).
         Value::SingleChar(_) => 14,
+        // v0.64: pg_lsn gets its own tag (append-only).
+        Value::PgLsn(_) => 15,
     }
 }
 

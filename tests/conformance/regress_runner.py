@@ -175,6 +175,45 @@ class Conn:
                     "tag": tag,
                 }
 
+    def copy_stdin(self, sql, data_lines):
+        """COPY ... FROM stdin with inline data via the COPY protocol.
+
+        Returns dict(err_codes, tag) like q() but for the COPY flow:
+        Query -> CopyInResponse -> CopyData* -> CopyDone ->
+        CommandComplete -> ReadyForQuery.
+        """
+        self.s.sendall(msg(b"Q", cstr(sql)))
+        codes, tag = [], ""
+        # Expect CopyInResponse ('G').
+        t, p = self._read_msg()
+        if t == b"E":
+            fields, pos = {}, 0
+            while p[pos] != 0:
+                e = p.index(b"\x00", pos + 1)
+                fields[chr(p[pos])] = p[pos + 1 : e].decode()
+                pos = e + 1
+            codes.append(fields.get("C", "?"))
+            self._drain_until_ready()
+            return {"err_codes": codes, "tag": tag, "rows": []}
+        if t != b"G":
+            raise WireError("expected CopyInResponse, got %r" % t)
+        for line in data_lines:
+            self.s.sendall(msg(b"d", line.encode() + b"\n"))
+        self.s.sendall(msg(b"c", b""))
+        while True:
+            t, p = self._read_msg()
+            if t == b"E":
+                fields, pos = {}, 0
+                while p[pos] != 0:
+                    e = p.index(b"\x00", pos + 1)
+                    fields[chr(p[pos])] = p[pos + 1 : e].decode()
+                    pos = e + 1
+                codes.append(fields.get("C", "?"))
+            elif t == b"C":
+                tag = p[:-1].decode()
+            elif t == b"Z":
+                return {"err_codes": codes, "tag": tag, "rows": []}
+
     def close(self):
         try:
             self.s.sendall(msg(b"X", b""))
@@ -235,19 +274,34 @@ def split_statements(text):
     items = []
     i, n = 0, len(text)
     buf = []  # current statement chars
-    in_copy = [False]  # set after COPY ... FROM stdin/stdout: skip lines till \.
+    in_copy = [False]  # set after COPY ... FROM stdin: collect lines till \.
+    # v0.64: COPY ... FROM stdin inline data is executed via the COPY
+    # protocol (previously skipped, leaving tables empty). Pending COPY
+    # state: [sql_text, table, columns, [data lines]].
+    copy_pending = [None]
 
     def flush():
         s = "".join(buf).strip()
         buf.clear()
         if s:
-            # COPY FROM stdin/stdout: inline data follows; unsupported here.
-            m = re.match(r"(?is)^\s*copy\s+\S+\s+from\s+(stdin|stdout)\b", s)
+            # COPY FROM stdin: inline data follows; capture for protocol.
+            m = re.match(
+                r"(?is)^\s*copy\s+(\S+?)(?:\s*\(([^)]*)\))?\s+from\s+stdin\b", s
+            )
             if m:
-                items.append(
-                    ("skip", "COPY FROM %s: inline data unsupported" % m.group(1))
+                table = m.group(1)
+                cols = (
+                    [c.strip() for c in m.group(2).split(",")]
+                    if m.group(2)
+                    else None
                 )
+                copy_pending[0] = [s, table, cols, []]
                 in_copy[0] = True
+                return
+            # COPY FROM stdout: still unsupported.
+            m2 = re.match(r"(?is)^\s*copy\s+\S+\s+from\s+stdout\b", s)
+            if m2:
+                items.append(("skip", "COPY FROM stdout: unsupported"))
                 return
             items.append(("sql", s))
 
@@ -260,12 +314,18 @@ def split_statements(text):
         c = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
 
-        # COPY inline data: skip whole lines until a line that is exactly \.
+        # COPY inline data: collect whole lines until a line that is exactly \.
         if state == "normal" and in_copy[0] and line_start:
             j = text.find("\n", i)
             line = text[i : j if j != -1 else n]
             if line.strip() == "\\.":
                 in_copy[0] = False
+                # Emit the captured COPY as a protocol item.
+                if copy_pending[0] is not None:
+                    items.append(("copy_stdin", copy_pending[0]))
+                    copy_pending[0] = None
+            elif copy_pending[0] is not None:
+                copy_pending[0][3].append(line)
             i = n if j == -1 else j + 1
             line_start = True
             continue
@@ -1026,6 +1086,40 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
             if m:
                 null_display = m.group(1)
             results.append(("<meta: %s>" % text[:40], Verdict("SKIP", "psql meta-command")))
+            continue
+        if kind == "copy_stdin":
+            # v0.64: COPY ... FROM stdin with inline data, executed via
+            # the COPY protocol. text = [sql, table, cols, data_lines].
+            sql, _table, _cols, data_lines = text
+            stmt = sql
+            idx = out_text.find(stmt, pos)
+            if idx == -1:
+                results.append((stmt, Verdict("SKIP", "statement echo not found in .out")))
+                continue
+            pos = idx + len(stmt)
+            line_pos = out_text.count("\n", 0, pos) + 1
+            expected, new_line_pos = parse_expected_block(out_lines, line_pos, null_display)
+            pos = sum(len(l) + 1 for l in out_lines[:new_line_pos])
+            try:
+                actual = conn.copy_stdin(sql, data_lines)
+            except socket.timeout as e:
+                raise ServerWedged(stmt, "ran past %ds timeout" % STMT_TIMEOUT)
+            except (WireError, OSError) as e:
+                raise ServerWedged(stmt, "connection died during execution: %r" % e)
+            if actual["err_codes"]:
+                v = Verdict("REAL-FAIL", "COPY error %s" % actual["err_codes"])
+            elif expected.kind == "error":
+                v = Verdict("REAL-FAIL", "expected error, COPY succeeded")
+            else:
+                # pg_regress omits the COPY tag; success (no error) is a pass.
+                # Sanity: the tag should be "COPY <n>".
+                if not actual["tag"].startswith("COPY "):
+                    v = Verdict("REAL-FAIL", "bad COPY tag %r" % actual["tag"])
+                else:
+                    v = Verdict("PASS", "")
+            results.append((stmt, v))
+            if verbose and v.status != "PASS":
+                print("    [%s] %s -- %s" % (v.status, stmt[:70].replace("\n", " "), v.detail))
             continue
         stmt = text
         # locate echo in expected output

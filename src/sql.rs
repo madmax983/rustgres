@@ -890,6 +890,14 @@ pub enum AggFunc {
     Min,
     Max,
     StringAgg, // v0.7: string_agg(x, delim)
+    BoolAnd,   // v0.64: bool_and(x)
+    // v0.64: variance/stddev. PG's `variance`/`stddev` are the sample
+    // forms; `var_samp`/`stddev_samp` are coherent aliases and the
+    // `_pop` forms are the population variants.
+    VarianceSamp,
+    VariancePop,
+    StddevSamp,
+    StddevPop,
 }
 
 impl AggFunc {
@@ -901,6 +909,11 @@ impl AggFunc {
             AggFunc::Min => "min",
             AggFunc::Max => "max",
             AggFunc::StringAgg => "string_agg",
+            AggFunc::BoolAnd => "bool_and",
+            AggFunc::VarianceSamp => "variance",
+            AggFunc::VariancePop => "var_pop",
+            AggFunc::StddevSamp => "stddev",
+            AggFunc::StddevPop => "stddev_pop",
         }
     }
 }
@@ -3104,6 +3117,7 @@ impl Parser {
             "bytea" => Ok(ColType::Bytea),
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
+            "pg_lsn" => Ok(ColType::PgLsn), // v0.64
             _ => Err(err(format!("syntax error: unknown type \"{}\"", name))),
         }
     }
@@ -3167,6 +3181,7 @@ impl Parser {
                 | "bytea"
                 | "uuid"
                 | "regclass"
+                | "pg_lsn" // v0.64
         )
     }
 
@@ -5444,6 +5459,11 @@ impl Parser {
             "min" => Some(AggFunc::Min),
             "max" => Some(AggFunc::Max),
             "string_agg" => Some(AggFunc::StringAgg),
+            "bool_and" => Some(AggFunc::BoolAnd),
+            "variance" | "var_samp" => Some(AggFunc::VarianceSamp),
+            "var_pop" => Some(AggFunc::VariancePop),
+            "stddev" | "stddev_samp" => Some(AggFunc::StddevSamp),
+            "stddev_pop" => Some(AggFunc::StddevPop),
             _ => None,
         };
         if let Some(func) = agg {
@@ -5978,7 +5998,13 @@ impl Parser {
                 deferrable,
             });
         }
-        // SET name = value | SET name TO value | SET name TO DEFAULT
+        // SET [ SESSION | LOCAL ] name = value | SET name TO value |
+        // SET name TO DEFAULT. v0.64: the scope keyword is accepted
+        // (PG's `SET LOCAL`/`SET SESSION`); the GUCs it applies to here
+        // are all no-ops, so the scope is not distinguished.
+        if self.eat_keyword("session") || self.eat_keyword("local") {
+            // consumed scope
+        }
         let name = self.expect_ident()?;
         if self.eat_keyword("to") {
             // consumed TO

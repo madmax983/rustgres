@@ -65,6 +65,10 @@ pub enum ColType {
     // order on the truncated values, which is exactly PG's
     // strncmp(..., NAMEDATALEN) semantics since names hold no NULs.
     Name, // OID 19
+    // v0.64: PG's `pg_lsn` type (OID 3220) — a 64-bit Log Sequence
+    // Number displayed as HIGH/LOW in uppercase hex, LOW zero-padded
+    // to 8 digits (e.g. `0/016AE7F8`).
+    PgLsn, // OID 3220
 }
 
 impl ColType {
@@ -78,6 +82,7 @@ impl ColType {
             ColType::Char(_) => 1042,     // BPCHAR (v0.35)
             ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
             ColType::SingleChar => 18,    // "char" (v0.36)
+            ColType::PgLsn => 3220,       // PG_LSN (v0.64)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -113,6 +118,7 @@ impl ColType {
             ColType::Timestamptz => "timestamp with time zone",
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
+            ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Regclass => "regclass",
             ColType::Name => "name",
         }
@@ -142,6 +148,7 @@ impl ColType {
             ColType::Timestamptz => "timestamptz",
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
+            ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Regclass => "regclass",
             ColType::Name => "name",
         }
@@ -787,6 +794,7 @@ impl Numeric {
         if int_digits > 131072 || scale > 200_000 || scale < -200_000 {
             return Err(NumericParseError::Overflow);
         }
+
         if overflowed {
             // v0.63: magnitude past i128's 38 digits — parse exactly via
             // BigDec and keep the big mantissa (PG19 accepts up to
@@ -890,19 +898,11 @@ impl Numeric {
             n.unscaled
                 .checked_mul(10i128.checked_pow((scale - n.scale) as u32)?)
         };
-        if let (Some(a), Some(b)) = (up(self), up(other)) {
-            return Some((a, b, scale));
-        }
-        // v0.22: the scales differ by more than i128 can bridge (one
-        // operand is a huge multiple of a power of ten). Align at the
-        // coarser scale instead, rounding the finer operand half away
-        // from zero. The dropped fraction is unrepresentable in i128
-        // anyway; this keeps e.g. `0 - 1e308` = `-1e308` instead of
-        // erroring with 22003.
-        let coarse = self.scale.min(other.scale);
-        let a = self.round_to(coarse)?.unscaled;
-        let b = other.round_to(coarse)?.unscaled;
-        Some((a, b, coarse))
+        // v0.64: None when the scales differ by more than i128 can
+        // bridge — callers fall back to the exact BigDec path. (The old
+        // lossy "coarse alignment" rounded e.g. 1.5e-1000 to zero in
+        // `1 - 1.5e-1000`.)
+        Some((up(self)?, up(other)?, scale))
     }
 
     /// Addition with PostgreSQL's non-finite semantics (v0.18): NaN
@@ -920,7 +920,17 @@ impl Numeric {
                     let b = BigDec::from_numeric(other)?;
                     return Self::from_bigdec(&a.add(&b), dscale);
                 }
-                let (a, b, scale) = self.aligned(other)?;
+                let (a, b, scale) = match self.aligned(other) {
+                    Some(t) => t,
+                    // v0.64: scales differ by more than i128 can bridge
+                    // (e.g. `1 - 1.5e-1000`) — exact BigDec add instead
+                    // of erroring or rounding an operand away.
+                    None => {
+                        let x = BigDec::from_numeric(self)?;
+                        let y = BigDec::from_numeric(other)?;
+                        return Self::from_bigdec(&x.add(&y), dscale);
+                    }
+                };
                 match a.checked_add(b) {
                     Some(s) => Some(Numeric::new(s, scale).with_dscale(dscale)),
                     None => {
@@ -964,13 +974,24 @@ impl Numeric {
             (NumericSpecial::Finite, NumericSpecial::Finite) => {
                 // v0.61: PG's mul_var keeps res_dscale = d1 + d2.
                 let dscale = self.dscale.saturating_add(other.dscale);
+                // v0.64: PG19's numeric_mul rounds result dscale to
+                // NUMERIC_DSCALE_MAX (16383) if it exceeds it. This is
+                // what makes `trim_scale((0.1 - 2e-16383) *
+                // (0.1 - 3e-16383))` yield `0.01`: the exact product
+                // has dscale 32766, rounding to 16383 eliminates the
+                // tiny 5e-16384 term.
+                let dscale_capped = dscale.min(16383);
+                let do_round = dscale > 16383;
                 if self.big.is_some() || other.big.is_some() {
                     let a = BigDec::from_numeric(self)?;
                     let b = BigDec::from_numeric(other)?;
-                    return a.mul_exact(&b).and_then(|p| Self::from_bigdec(&p, dscale));
+                    let p = a
+                        .mul_exact(&b)
+                        .and_then(|p| Self::from_bigdec(&p, dscale))?;
+                    return if do_round { p.round_to(16383) } else { Some(p) };
                 }
                 let scale = self.scale.checked_add(other.scale)?;
-                match self.unscaled.checked_mul(other.unscaled) {
+                let result = match self.unscaled.checked_mul(other.unscaled) {
                     Some(p) => Some(Numeric::new(p, scale).with_dscale(dscale)),
                     None => {
                         // i128 overflow on the fast path: exact multiply.
@@ -978,7 +999,14 @@ impl Numeric {
                         let b = BigDec::from_numeric(other)?;
                         a.mul_exact(&b).and_then(|p| Self::from_bigdec(&p, dscale))
                     }
-                }
+                }?;
+                Some(if do_round {
+                    // Round value to 16383 fractional digits; keep
+                    // display dscale capped as well.
+                    result.round_to(16383)?.with_dscale(dscale_capped)
+                } else {
+                    result
+                })
             }
             _ => {
                 if self.is_zero() || other.is_zero() {
@@ -1033,6 +1061,20 @@ impl Numeric {
         } else {
             rscale
         };
+        // v0.64: an exact power-of-10 divisor makes the quotient an
+        // exact scale shift — skip the O(bits^2) bitwise long division
+        // below, which never finishes for 10^131071-class divisors
+        // (the huge-`generate_series` test divides by exactly that).
+        if let Some(k) = b_mag.as_pow10() {
+            let exact = BigDec {
+                neg,
+                mag: a_mag,
+                scale: self.scale - other.scale,
+            };
+            let dec = exact.div_pow10(k, rscale, round)?;
+            let dscale = rscale;
+            return Self::from_bigdec(&dec, dscale);
+        };
         // Quotient digits at rscale + 1 (guard) fractional digits, exact.
         // a/b = (a_mag/b_mag) * 10^(b.scale - a.scale), so to land the
         // quotient at scale rscale+1 we shift the numerator by
@@ -1085,6 +1127,11 @@ impl Numeric {
     /// 1000. Here weight = floor((int_digits-1)/4) and the leading group
     /// is the first 1-4 significant decimal digits (zero-padded on the
     /// right when the value is fractional).
+    /// v0.64: PG19 takes the max with the operands' *display* scales
+    /// (`var->dscale`), not the normalized value scales — e.g. the
+    /// variance numerator (dscale 20) over N*(N-1) must divide at rscale
+    /// 20. (The old code used `scale`; the two agree unless trailing
+    /// zeros were stripped by normalization.)
     fn select_div_scale(a: &Numeric, b: &Numeric) -> i32 {
         const NUMERIC_MIN_SIG_DIGITS: i32 = 16;
         const NUMERIC_MAX_DISPLAY_SCALE: i32 = 1000;
@@ -1117,8 +1164,15 @@ impl Numeric {
             qweight -= 1;
         }
         let rscale = NUMERIC_MIN_SIG_DIGITS - qweight * 4;
-        let rscale = rscale.max(a.scale.max(b.scale)).max(0);
+        let rscale = rscale.max(a.dscale.max(b.dscale)).max(0);
         rscale.min(NUMERIC_MAX_DISPLAY_SCALE)
+    }
+
+    /// v0.64: PG19's division scale selection as a crate-visible helper
+    /// for the variance/stddev aggregates (`numeric_stddev_internal`
+    /// divides the numerator by N*(N-1) at `select_div_scale`).
+    pub(crate) fn div_scale_for(a: &Numeric, b: &Numeric) -> i32 {
+        Self::select_div_scale(a, b)
     }
 
     /// SQL `div(y, x)` integer division toward zero: exact quotient at
@@ -1219,6 +1273,8 @@ impl Numeric {
         match (self.special, other.special) {
             (NaN, _) | (_, NaN) => Some(Numeric::nan()),
             (_, Finite) if other.unscaled == 0 => None,
+            // v0.64: PG's mod_var: finite x % ±Infinity is x itself.
+            (Finite, PosInf) | (Finite, NegInf) => Some(self.clone()),
             (Finite, Finite) => {
                 // v0.61: PG's mod_var keeps res_dscale = max(d1, d2).
                 let dscale = self.dscale.max(other.dscale);
@@ -1230,7 +1286,16 @@ impl Numeric {
                     let b = BigDec::from_numeric(other)?;
                     return Self::from_bigdec(&a.rem(&b), dscale);
                 }
-                let (a, b, scale) = self.aligned(other)?;
+                let (a, b, scale) = match self.aligned(other) {
+                    Some(t) => t,
+                    // v0.64: scales differ by more than i128 can bridge
+                    // — exact BigDec remainder (sign follows dividend).
+                    None => {
+                        let a = BigDec::from_numeric(self)?;
+                        let b = BigDec::from_numeric(other)?;
+                        return Self::from_bigdec(&a.rem(&b), dscale);
+                    }
+                };
                 Some(Numeric::new(a.checked_rem(b)?, scale).with_dscale(dscale))
             }
             _ => Some(Numeric::nan()),
@@ -1588,6 +1653,40 @@ impl Numeric {
             return Ok(Numeric::zero().with_dscale(rscale));
         }
         let neg = exp < 0;
+        // v0.64: exact power-of-10 fast path. Binary exponentiation
+        // would do ~17 ever-larger O(n^2) schoolbook squarings for
+        // 10^131071 (minutes in debug); (10^k)^exp is just a shifted
+        // 1. The f checks above already bound |e| (f == e exactly for
+        // a power-of-10 base), so the u32/i32 casts below cannot
+        // overflow. The tail is identical to the slow path's.
+        let pow10_k: Option<u32> = match &self.big {
+            Some(mag) => mag.as_pow10(),
+            None => BigUint::from_u128(self.unscaled.unsigned_abs()).as_pow10(),
+        };
+        if let Some(k) = pow10_k {
+            let e = (k as i64 - self.scale as i64) * exp;
+            // (-10^k)^exp takes the sign of (-1)^exp.
+            let neg_res = self.unscaled < 0 && exp.unsigned_abs() & 1 == 1;
+            let dec = if e >= 0 {
+                let mut mag = BigUint::from_u64(1);
+                mag.mul_pow10_assign(e as u32);
+                BigDec {
+                    neg: neg_res,
+                    mag,
+                    scale: 0,
+                }
+            } else {
+                BigDec {
+                    neg: neg_res,
+                    mag: BigUint::from_u64(1),
+                    scale: (-e) as i32,
+                }
+            };
+            let dec = dec.round_to_scale(rscale);
+            let mut n = Self::from_bigdec(&dec, rscale).ok_or(PowerError::Overflow)?;
+            n.dscale = rscale;
+            return Ok(n);
+        }
         let mut mask: u64 = exp.unsigned_abs();
         // PG: sig_digits = 1 + rscale + (int) f
         //     + (int) log10(abs(exp)) + 8 — the working precision that
@@ -1668,6 +1767,23 @@ impl Numeric {
                 Ordering::Greater
             };
         }
+        // v0.64: exactly one side is zero — decide by the other's sign.
+        // (The magnitude shortcut below assigned zero a bogus magnitude
+        // of `-scale`, so `0.5 > 0` compared false.)
+        if self.unscaled == 0 {
+            return if neg_b {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        if other.unscaled == 0 {
+            return if neg_a {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
         // Compare by magnitude: digits(unscaled) - scale.
         // v0.63: big-mantissa aware via the exact digit count.
         let mag = |n: &Numeric| -> i64 {
@@ -1700,10 +1816,16 @@ impl Numeric {
         } else {
             match self.aligned(other) {
                 Some((a, b, _)) => a.cmp(&b),
-                None => self
-                    .to_f64()
-                    .partial_cmp(&other.to_f64())
-                    .unwrap_or(Ordering::Equal),
+                // v0.64: scales differ by more than i128 can bridge —
+                // exact BigDec compare instead of the lossy f64 fallback
+                // (which called e.g. 1 and 1+1e-100 apart "equal").
+                None => {
+                    let (a, b) = (
+                        BigDec::from_numeric(self).expect("cmp: finite"),
+                        BigDec::from_numeric(other).expect("cmp: finite"),
+                    );
+                    a.cmp(&b)
+                }
             }
         };
         ord
@@ -1715,10 +1837,9 @@ impl Numeric {
     /// v0.22: a negative scale (integer multiple of a power of ten)
     /// prints in plain notation while the integer part stays short,
     /// and switches to scientific notation for very large magnitudes
-    /// (PostgreSQL prints `round(1.2345678901234e200)` as
-    /// `1.2345678901234e+200`). The plain/scientific cutoff is an
-    /// internal approximation; PostgreSQL's exact threshold is not
-    /// publicly documented.
+    /// v0.64: huge integer magnitudes (negative scale) always render
+    /// in plain decimal notation, matching PostgreSQL (`1e340` prints
+    /// all 341 digits).
     pub fn to_text(&self) -> String {
         match self.special {
             NumericSpecial::NaN => return "NaN".to_string(),
@@ -1749,25 +1870,15 @@ impl Numeric {
             out.push('-');
         }
         if self.scale < 0 {
-            // Integer multiple of 10^-scale.
-            let int_digits = digits.len() as i64 - self.scale as i64;
-            if int_digits <= 39 {
-                out.push_str(&digits);
-                for _ in 0..-self.scale {
-                    out.push('0');
-                }
-            } else {
-                out.push_str(&digits[..1]);
-                if digits.len() > 1 {
-                    out.push('.');
-                    out.push_str(&digits[1..]);
-                }
-                let exp = digits.len() as i64 - 1 - self.scale as i64;
-                out.push('e');
-                if exp >= 0 {
-                    out.push('+');
-                }
-                out.push_str(&exp.to_string());
+            // Integer multiple of 10^-scale. v0.64: PostgreSQL's
+            // numeric output always uses plain decimal notation here
+            // (e.g. 1e340 renders as all 341 digits) — the old
+            // scientific branch (for > 39 integer digits) was wrong;
+            // the "1.2345678901234e+200" spelling it cited is float8
+            // output, not numeric.
+            out.push_str(&digits);
+            for _ in 0..-self.scale {
+                out.push('0');
             }
             return out;
         }
@@ -2153,26 +2264,90 @@ impl BigUint {
         if self.is_zero() {
             return "0".to_string();
         }
-        let mut tmp = self.clone();
-        let mut groups: Vec<u32> = Vec::new();
-        while !tmp.is_zero() {
-            // Short division by 1e9, capturing the remainder.
-            let mut rem: u64 = 0;
-            for i in (0..tmp.limbs.len()).rev() {
-                let cur = rem * 1_000_000_000 + tmp.limbs[i] as u64;
-                tmp.limbs[i] = (cur / 1_000_000_000) as u32;
-                rem = cur % 1_000_000_000;
-            }
-            tmp.normalize();
-            groups.push(rem as u32);
-        }
+        // v0.64: limbs are already base-1e9, so decimal rendering is a
+        // direct per-limb format (O(limbs)); the old repeated-division
+        // loop was O(limbs^2) and took seconds for 10^131071-class
+        // values.
         let mut out = String::new();
-        let mut it = groups.iter().rev();
+        let mut it = self.limbs.iter().rev();
         out.push_str(&it.next().unwrap_or(&0).to_string());
-        for g in it {
-            out.push_str(&format!("{:09}", g));
+        for l in it {
+            out.push_str(&format!("{:09}", l));
         }
         out
+    }
+
+    /// If self is an exact power of 10, return k with self == 10^k.
+    /// Zero is not a power of 10. Base-1e9 limbs make this O(limbs):
+    /// a power of 10 has exactly one nonzero limb, itself 10^r.
+    /// v0.64: feeds `power_int`'s fast path for 10^131071-class inputs.
+    pub(crate) fn as_pow10(&self) -> Option<u32> {
+        let mut k = 0u32;
+        let mut seen = false;
+        for &l in &self.limbs {
+            if l == 0 {
+                k += 9;
+                continue;
+            }
+            if seen {
+                return None;
+            }
+            seen = true;
+            k += match l {
+                1 => 0,
+                10 => 1,
+                100 => 2,
+                1000 => 3,
+                10000 => 4,
+                100000 => 5,
+                1000000 => 6,
+                10000000 => 7,
+                100000000 => 8,
+                _ => return None,
+            };
+        }
+        if seen { Some(k) } else { None }
+    }
+
+    /// Divide by 10^k, returning (quotient, remainder), in O(limbs).
+    /// v0.64: the bitwise `div_rem` never finishes for 10^131071-class
+    /// divisors (the huge-`generate_series` test divides by exactly
+    /// 10^131071); dividing by a power of ten is a digit shift.
+    pub(crate) fn div_rem_pow10(&self, k: u32) -> (BigUint, BigUint) {
+        if self.is_zero() || k == 0 {
+            return (self.clone(), BigUint::zero());
+        }
+        let full = (k / 9) as usize;
+        let part = k % 9;
+        // Step 1: divide by 10^part with one exact top-down limb pass.
+        let mut q = self.clone();
+        let mut rem: u64 = 0;
+        if part > 0 {
+            let d = 10u32.pow(part);
+            for i in (0..q.limbs.len()).rev() {
+                let cur = rem * 1_000_000_000 + q.limbs[i] as u64;
+                q.limbs[i] = (cur / d as u64) as u32;
+                rem = cur % d as u64;
+            }
+            q.normalize();
+        }
+        // Step 2: split q's limbs at `full`; the low limbs are the
+        // high part of the remainder, scaled back by 10^part.
+        let (q_limbs, r_lo) = if full >= q.limbs.len() {
+            (Vec::new(), q.limbs.clone())
+        } else {
+            (q.limbs[full..].to_vec(), q.limbs[..full].to_vec())
+        };
+        // remainder = r_lo * 10^part + rem
+        let mut r_out = BigUint { limbs: r_lo };
+        if part > 0 {
+            r_out.mul_small_assign(10u32.pow(part) as u64);
+        }
+        if rem > 0 {
+            r_out.add_small_assign(rem as u32);
+        }
+        r_out.normalize();
+        (BigUint { limbs: q_limbs }, r_out)
     }
 
     /// Full product (schoolbook O(n*m)). The u128 accumulator is far
@@ -2852,6 +3027,41 @@ impl BigDec {
     /// v0.62: `self / other` rounded to `rscale` fractional digits,
     /// half away from zero (PG19 `div_var` with round=true).
     /// None on division by zero.
+    /// v0.64: divide by the exact power of ten 10^k, rounding the
+    /// quotient to `rscale` fractional digits (half away from zero),
+    /// in O(limbs). `round=false` selects PG div()'s truncation toward
+    /// zero instead. Avoids the O(bits^2) bitwise long division that
+    /// never finishes for 10^131071-class divisors.
+    pub(crate) fn div_pow10(&self, k: u32, rscale: i32, round: bool) -> Option<BigDec> {
+        // quotient = mag * 10^shift at scale rscale.
+        let shift = rscale as i64 - self.scale as i64 - k as i64;
+        let mut q = self.mag.clone();
+        if shift >= 0 {
+            q.mul_pow10_assign(u32::try_from(shift).ok()?);
+        } else {
+            let d = u32::try_from(-shift).ok()?;
+            let (qq, r) = q.div_rem_pow10(d);
+            q = qq;
+            if round && !r.is_zero() {
+                // Half away from zero: round up iff 2r >= 10^d,
+                // i.e. r >= 5 * 10^(d-1); d >= 1 on this branch.
+                let mut half = BigUint::from_u64(5);
+                half.mul_pow10_assign(d - 1);
+                if r.cmp(&half) != std::cmp::Ordering::Less {
+                    q.add_small_assign(1);
+                }
+            }
+        }
+        Some(
+            BigDec {
+                neg: self.neg && !q.is_zero(),
+                mag: q,
+                scale: rscale,
+            }
+            .normalize(),
+        )
+    }
+
     pub(crate) fn div_round(&self, other: &BigDec, rscale: i32) -> Option<BigDec> {
         if other.mag.is_zero() {
             return None;
@@ -2860,6 +3070,15 @@ impl BigDec {
             return Some(BigDec::zero().round_to_scale(rscale));
         }
         let neg = self.neg != other.neg;
+        // v0.64: exact power-of-10 divisor — O(limbs) scale shift.
+        if let Some(k) = other.mag.as_pow10() {
+            let me = BigDec {
+                neg,
+                mag: self.mag.clone(),
+                scale: self.scale - other.scale,
+            };
+            return me.div_pow10(k, rscale, true);
+        }
         // Round(|MA| * 10^P / |MB|) with P = rscale - sa + sb, keeping
         // one guard digit for the half-away-from-zero rounding.
         let p = rscale as i64 - self.scale as i64 + other.scale as i64;
@@ -3367,6 +3586,9 @@ pub enum Value {
     Timestamptz(i64), // v0.7: micros since epoch, UTC
     Bytea(Vec<u8>),   // v0.7
     Uuid([u8; 16]),   // v0.7
+    // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
+    // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
+    PgLsn(u64),
     Null,
 }
 
@@ -3411,6 +3633,9 @@ impl Value {
             Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
             Value::Bytea(b) => Some(bytea_text(b)),
             Value::Uuid(u) => Some(uuid_text(u)),
+            // v0.64: pg_lsn displays as HIGH/LOW uppercase hex, LOW
+            // zero-padded to 8 digits (e.g. `0/016AE7F8`).
+            Value::PgLsn(lsn) => Some(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF)),
             Value::Null => None,
         }
     }
@@ -3498,6 +3723,7 @@ impl Value {
             Value::Timestamptz(_) => "timestamp with time zone",
             Value::Bytea(_) => "bytea",
             Value::Uuid(_) => "uuid",
+            Value::PgLsn(_) => "pg_lsn", // v0.64
             Value::Null => "unknown",
         }
     }
@@ -3522,6 +3748,7 @@ impl Value {
             Value::Timestamptz(_) => ColType::Timestamptz,
             Value::Bytea(_) => ColType::Bytea,
             Value::Uuid(_) => ColType::Uuid,
+            Value::PgLsn(_) => ColType::PgLsn, // v0.64
             Value::Null => ColType::Text,
         }
     }
@@ -6508,6 +6735,147 @@ mod v061_power_dscale_tests {
     }
 
     #[test]
+    fn cmp_subunit_against_zero() {
+        // v0.64: comparing |x| < 1 against zero used the magnitude
+        // shortcut, which assigned zero a bogus magnitude of `-scale`
+        // — so `0.5 > 0` was false and `0.5 < 0` was true.
+        use std::cmp::Ordering::*;
+        let z = Numeric::zero();
+        assert_eq!(num("0.5").cmp(&z), Greater);
+        assert_eq!(z.cmp(&num("0.5")), Less);
+        assert_eq!(num("-0.5").cmp(&z), Less);
+        assert_eq!(z.cmp(&num("-0.5")), Greater);
+        assert_eq!(num("3e-500").cmp(&z), Greater);
+        assert_eq!(num("-3e-500").cmp(&z), Less);
+        assert_eq!(z.cmp(&z), Equal);
+        assert_eq!(num("0.0").cmp(&z), Equal);
+        // Sanity: non-subunit comparisons still work.
+        assert_eq!(num("5").cmp(&z), Greater);
+        assert_eq!(num("-5").cmp(&z), Less);
+        assert_eq!(num("1e340").cmp(&z), Greater);
+    }
+
+    #[test]
+    fn cmp_huge_magnitudes_order() {
+        // v0.64: the numeric.out 13-row ORDER BY vector — specials,
+        // big-mantissa 1e340, and plain small values sort exactly as
+        // PostgreSQL orders them.
+        let mut v = vec![
+            num("0"),
+            num("1"),
+            num("-1"),
+            num("4.2"),
+            num("-7.777"),
+            num("1e340"),
+            num("-1e340"),
+            Numeric::neg_infinity(),
+            Numeric::nan(),
+            Numeric::infinity(),
+            Numeric::neg_infinity(),
+            Numeric::infinity(),
+            Numeric::nan(),
+        ];
+        v.sort_by(|a, b| a.cmp(b));
+        let texts: Vec<String> = v.iter().map(|n| n.to_text()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "-Infinity".to_string(),
+                "-Infinity".to_string(),
+                format!("-1{}", "0".repeat(340)),
+                "-7.777".to_string(),
+                "-1".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "4.2".to_string(),
+                format!("1{}", "0".repeat(340)),
+                "Infinity".to_string(),
+                "Infinity".to_string(),
+                "NaN".to_string(),
+                "NaN".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_sub_extreme_scale_gap() {
+        // v0.64: scales differing by more than i128 can bridge take the
+        // exact BigDec path — the old coarse alignment rounded the
+        // small operand to zero (`1 - 1.5e-1000` came out as exactly 1,
+        // breaking the extreme-power regression vector).
+        let d = num("1").checked_sub(&num("1.500012345678e-1000")).unwrap();
+        let t = d.to_text();
+        assert!(t.starts_with("0.999"), "got {t}");
+        assert!(t.ends_with("8499987654322"), "got {t}");
+        assert_eq!(t.len(), 2 + 1012, "got {t}");
+        // The reverse direction.
+        let s = num("1.5e-1000").checked_add(&num("1")).unwrap().to_text();
+        assert!(s.starts_with("1.000"), "got {s}");
+        assert!(s.ends_with("00015"), "got {s}");
+        // The tiny-operand remainder is the tiny operand, not zero.
+        assert_eq!(
+            num("1.5e-1000").checked_rem(&num("1")).unwrap(),
+            num("1.5e-1000")
+        );
+        // Ordering still distinguishes values f64 cannot.
+        assert!(num("1") < num("1.0000000000000000000000001"));
+        // Huge exact sums keep working.
+        let big = num("1e308").checked_add(&num("1")).unwrap().to_text();
+        assert!(big.starts_with("100000000000000000000"), "got {big}");
+        assert!(big.ends_with("00001"), "got {big}");
+        assert_eq!(big.len(), 309, "got {big}");
+    }
+
+    #[test]
+    fn power_frac_extreme_vector() {
+        // v0.64: regression — `1 - 1.500012345678e-1000` used to lose
+        // the tiny term (coarse alignment rounded it to zero), making
+        // ln(base) = 0 and the power come out as 1.
+        let base = num("1").checked_sub(&num("1.500012345678e-1000")).unwrap();
+        let exp = num("1.45e1003");
+        let r = power_var_frac(&base, &exp).unwrap();
+        let scaled = r.checked_mul(&num("1e1000")).unwrap();
+        let rounded = scaled.round_to(0).unwrap();
+        assert_eq!(
+            rounded.to_text(),
+            "25218976308958387188077465658068501556514992509509282366"
+        );
+    }
+
+    #[test]
+    fn power_int_pow10_fast_path() {
+        // v0.64: exact power-of-10 bases take the O(n) fast path;
+        // outputs are byte-identical to the binary-exponentiation path
+        // (same round_to_scale(rscale) + dscale tail).
+        assert_eq!(pow_text("10", 3, 0), "1000.0000000000000");
+        assert_eq!(pow_text("-10", 3, 0), "-1000.0000000000000");
+        assert_eq!(pow_text("-10", 2, 0), "100.00000000000000");
+        assert_eq!(pow_text("10", -3, 0), "0.0010000000000000000");
+        assert_eq!(pow_text("0.1", 3, 0), "0.0010000000000000000");
+        assert_eq!(pow_text("-0.1", 3, 0), "-0.0010000000000000000");
+        // Big-mantissa power of 10: exact digits, no rounding loss.
+        let big = num("10").power_int(200, 0).unwrap();
+        let t = big.to_text();
+        assert_eq!(t.len(), 201);
+        assert!(t.starts_with('1'));
+        assert!(t[1..].chars().all(|c| c == '0'));
+        // as_pow10 unit checks.
+        assert_eq!(BigUint::from_u64(1000).as_pow10(), Some(3));
+        assert_eq!(BigUint::from_u64(1).as_pow10(), Some(0));
+        assert_eq!(BigUint::from_u64(999).as_pow10(), None);
+        assert_eq!(BigUint::zero().as_pow10(), None);
+        let mut b = BigUint::from_u64(1);
+        b.mul_pow10_assign(131071);
+        assert_eq!(b.as_pow10(), Some(131071));
+        assert_eq!(b.to_decimal_string().len(), 131072);
+        // to_decimal_string fast path agrees with limb structure.
+        assert_eq!(
+            BigUint::from_u64(1000000007).to_decimal_string(),
+            "1000000007"
+        );
+    }
+
+    #[test]
     fn dscale_parse_and_display() {
         // Declared scale survives normalization.
         assert_eq!(num("1.50").dscale, 2);
@@ -6517,9 +6885,11 @@ mod v061_power_dscale_tests {
         assert_eq!(num("-13.000000000000000").dscale, 15);
         assert_eq!(num("21.00").to_text(), "21.00");
         assert_eq!(num("1e200").dscale, 0);
-        // Negative-scale magnitudes print in scientific notation
-        // (pre-existing to_text behavior, unchanged by v0.61).
-        assert_eq!(num("1e200").to_text(), "1e+200");
+        // v0.64: negative-scale magnitudes print in plain decimal
+        // notation, matching PostgreSQL (`1e340` renders as all 341
+        // digits); the old "1e+200" scientific spelling was wrong.
+        assert_eq!(num("1e200").to_text(), format!("1{}", "0".repeat(200)));
+        assert_eq!(num("1e340").to_text(), format!("1{}", "0".repeat(340)));
         // Equality is by value, not by display scale.
         assert_eq!(num("1.50"), num("1.5"));
     }
@@ -6629,6 +6999,81 @@ mod v062_transcendental_tests {
             div_text("0.00000000000000009", "1", 16),
             "0.0000000000000001"
         );
+    }
+
+    #[test]
+    fn div_rem_pow10_vectors() {
+        // v0.64: O(limbs) power-of-10 division used by the div fast paths.
+        fn big(s: &str) -> BigUint {
+            BigUint::from_decimal_str(s)
+        }
+        let t = |s: &str, k: u32| {
+            let (q, r) = big(s).div_rem_pow10(k);
+            (q.to_decimal_string(), r.to_decimal_string())
+        };
+        assert_eq!(t("123456789", 4), ("12345".into(), "6789".into()));
+        assert_eq!(t("123456789", 9), ("0".into(), "123456789".into()));
+        assert_eq!(t("123456789", 10), ("0".into(), "123456789".into()));
+        assert_eq!(t("100000000000000000000", 18), ("100".into(), "0".into()));
+        assert_eq!(t("100000000000000000000", 19), ("10".into(), "0".into()));
+        assert_eq!(t("999", 0), ("999".into(), "0".into()));
+        assert_eq!(t("0", 100), ("0".into(), "0".into()));
+        // Cross-checked against schoolbook div_rem on random-ish values.
+        for (s, k) in [
+            ("123456789012345678901234567890", 7),
+            ("99999999999999999999999999999", 13),
+            ("1000000000000000000000000000000", 30),
+            ("3141592653589793238462643383279", 25),
+        ] {
+            let v = big(s);
+            let (q, r) = v.div_rem_pow10(k);
+            let ten = BigUint::from_u64(10);
+            let mut pw = BigUint::from_u64(1);
+            for _ in 0..k {
+                pw = pw.mul(&ten);
+            }
+            let (qe, re) = v.div_rem(&pw);
+            assert_eq!(
+                (q.to_decimal_string(), r.to_decimal_string()),
+                (qe.to_decimal_string(), re.to_decimal_string()),
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn div_pow10_fast_path_vectors() {
+        // v0.64: exact power-of-10 divisors take the O(limbs) path in
+        // both div_impl (`/`, div()) and div_round; outputs match the
+        // long-division path digit-for-digit.
+        assert_eq!(div_text("15", "1000", 2), "0.02"); // rounds up (guard 5)
+        assert_eq!(div_text("14", "1000", 2), "0.01"); // rounds down
+        assert_eq!(div_text("-15", "1000", 2), "-0.02");
+        assert_eq!(div_text("7", "100", 20), "0.07000000000000000000");
+        assert_eq!(div_text("1", "1000000000000", 3), "0.000");
+        // Huge divisor: exact, instant.
+        let q = dec("600000000000000000000000000000000000000")
+            .div_pow10(38, 2, true)
+            .unwrap()
+            .to_numeric()
+            .unwrap()
+            .to_text();
+        assert_eq!(q, "6.00");
+        // Truncation variant (div()).
+        let t = dec("1999")
+            .div_pow10(3, 0, false)
+            .unwrap()
+            .to_numeric()
+            .unwrap()
+            .to_text();
+        assert_eq!(t, "1");
+        let t = dec("-1999")
+            .div_pow10(3, 0, false)
+            .unwrap()
+            .to_numeric()
+            .unwrap()
+            .to_text();
+        assert_eq!(t, "-1");
     }
 
     #[test]
@@ -6860,6 +7305,43 @@ mod v063_big_mantissa_tests {
                 .unwrap()
                 .to_text(),
             "-2"
+        );
+        // v0.64: PG's mod_var special matrix: finite % ±Infinity is the
+        // dividend; infinite dividend (or NaN anywhere) is NaN.
+        assert_eq!(
+            num("4.2")
+                .checked_rem(&Numeric::infinity())
+                .unwrap()
+                .to_text(),
+            "4.2"
+        );
+        assert_eq!(
+            num("-1")
+                .checked_rem(&Numeric::neg_infinity())
+                .unwrap()
+                .to_text(),
+            "-1"
+        );
+        assert_eq!(
+            Numeric::infinity()
+                .checked_rem(&num("2"))
+                .unwrap()
+                .to_text(),
+            "NaN"
+        );
+        assert_eq!(
+            Numeric::infinity()
+                .checked_rem(&Numeric::infinity())
+                .unwrap()
+                .to_text(),
+            "NaN"
+        );
+        assert_eq!(
+            Numeric::nan()
+                .checked_rem(&Numeric::infinity())
+                .unwrap()
+                .to_text(),
+            "NaN"
         );
         // Big division at scale (10^39 is big; 10^38 still fits i128).
         assert_eq!(

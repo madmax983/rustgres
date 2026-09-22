@@ -672,7 +672,11 @@ pub fn numeric_to_char(n: &Numeric, fmt: &NumFmt) -> Result<String, NumFmtError>
 }
 
 /// Format an `f64` with a numeric format picture: PG's `float8_to_char`.
-pub fn float8_to_char(v: f64, fmt: &NumFmt) -> Result<String, NumFmtError> {
+///
+/// `max_digits` is PG's `DBL_DIG` (15) for float8 and `FLT_DIG` (6) for
+/// float4: the plain path trims post-decimal digits so the total
+/// significant digits fit.
+fn float_to_char_impl(v: f64, fmt: &NumFmt, max_digits: i32) -> Result<String, NumFmtError> {
     let mut desc = fmt.clone();
 
     if desc.roman {
@@ -697,56 +701,79 @@ pub fn float8_to_char(v: f64, fmt: &NumFmt) -> Result<String, NumFmtError> {
             }
             vv
         } else {
-            // "%+.*e" with a leading '+' swapped for ' '.
-            let s = format!("{v:+.prec$e}", prec = desc.post.max(0) as usize);
-            s.replacen('+', " ", 1).chars().collect()
+            // PG's "%+.*e": one digit before '.', `post` digits after,
+            // exponent as 'e' + sign + at least two digits, and a leading
+            // '+' swapped for ' '. Rust's {:e} omits the exponent '+' and
+            // the zero pad, so rebuild the exponent explicitly.
+            let raw = format!("{v:+.prec$e}", prec = desc.post.max(0) as usize);
+            let epos = raw.find('e').unwrap_or(raw.len());
+            let (mant, exp) = raw.split_at(epos);
+            let mant = mant.replacen('+', " ", 1);
+            let exp_s = if exp.len() > 1 {
+                let ev: i32 = exp[1..].parse().unwrap_or(0);
+                format!("e{ev:+03}")
+            } else {
+                String::new()
+            };
+            format!("{mant}{exp_s}").chars().collect()
         };
         return Ok(run_processor(desc, input, '+', 0));
     }
 
-    // Plain path.
-    if v.is_nan() || v.is_infinite() {
-        // C printf renders these as "nan"/"inf"/"-inf".
-        let (neg, word) = if v.is_nan() {
-            (false, "nan")
-        } else if v.is_sign_negative() {
-            (true, "inf")
-        } else {
-            (false, "inf")
-        };
-        let chars: Vec<char> = word.chars().collect();
-        let (numstr, out_pre_spaces) = plain_layout(&desc, &chars);
-        return Ok(run_processor(
-            desc,
-            numstr,
-            if neg { '-' } else { '+' },
-            out_pre_spaces,
-        ));
-    }
+    // Plain path. PG spells NaN/Inf "NaN"/"Infinity" (like numeric, not
+    // the C-printf "nan"/"inf" used by float output), and the spelled word
+    // feeds the integer-digit probe below -- so float4 Infinity (8 chars)
+    // trims post to FLT_DIG exactly like a long integer part would.
+    let (special_word, special_neg) = if v.is_nan() {
+        (Some("NaN"), false)
+    } else if v.is_infinite() {
+        (Some("Infinity"), v.is_sign_negative())
+    } else {
+        (None, false)
+    };
 
-    // V (multi) shift first, like PG.
+    // V (multi) shift first, like PG (no-op for specials).
     let mut val = v;
     if desc.multi != 0 {
         val *= 10f64.powi(desc.multi);
         desc.pre += desc.multi;
     }
     // "%.0f" of |v| to count integer digits, then limit post to
-    // DBL_DIG (15) significant digits.
-    let int_probe = format!("{:.0}", val.abs());
-    let pre_len = int_probe.len() as i32;
-    if pre_len >= 15 {
+    // max_digits significant digits (DBL_DIG/FLT_DIG). Special values
+    // probe with their spelled word instead.
+    let pre_len = match special_word {
+        Some(w) => w.len() as i32,
+        None => format!("{:.0}", val.abs()).len() as i32,
+    };
+    if pre_len >= max_digits {
         desc.post = 0;
-    } else if pre_len + desc.post > 15 {
-        desc.post = 15 - pre_len;
+    } else if pre_len + desc.post > max_digits {
+        desc.post = max_digits - pre_len;
     }
-    let orgnum = format!("{:.prec$}", val, prec = desc.post.max(0) as usize);
-    let (sign, digits) = match orgnum.strip_prefix('-') {
-        Some(rest) => ('-', rest.to_string()),
-        None => ('+', orgnum),
+    let (sign, digits) = match special_word {
+        Some(w) => (if special_neg { '-' } else { '+' }, w.to_string()),
+        None => {
+            let orgnum = format!("{:.prec$}", val, prec = desc.post.max(0) as usize);
+            match orgnum.strip_prefix('-') {
+                Some(rest) => ('-', rest.to_string()),
+                None => ('+', orgnum),
+            }
+        }
     };
     let numstr: Vec<char> = digits.chars().collect();
     let (numstr, out_pre_spaces) = plain_layout(&desc, &numstr);
     Ok(run_processor(desc, numstr, sign, out_pre_spaces))
+}
+
+/// PG's `float8_to_char`.
+pub fn float8_to_char(v: f64, fmt: &NumFmt) -> Result<String, NumFmtError> {
+    float_to_char_impl(v, fmt, 15)
+}
+
+/// PG's `float4_to_char`: identical except post-decimal digits are
+/// trimmed to `FLT_DIG` (6) significant digits.
+pub fn float4_to_char(v: f32, fmt: &NumFmt) -> Result<String, NumFmtError> {
+    float_to_char_impl(f64::from(v), fmt, 6)
 }
 
 #[cfg(test)]
@@ -820,5 +847,62 @@ mod tests {
         assert_eq!(fmt_to_char("1", 0, "99th"), "  1st");
         assert_eq!(fmt_to_char("23", 0, "99th"), " 23rd");
         assert_eq!(fmt_to_char("13", 0, "99th"), " 13th");
+    }
+
+    fn f8_to_char(v: f64, picture: &str) -> String {
+        let d = parse_numfmt(picture).unwrap();
+        float8_to_char(v, &d).unwrap()
+    }
+
+    fn f4_to_char(v: f32, picture: &str) -> String {
+        let d = parse_numfmt(picture).unwrap();
+        float4_to_char(v, &d).unwrap()
+    }
+
+    #[test]
+    fn float_special_spelling() {
+        // v0.64: PG spells these "NaN"/"Infinity" in to_char, like numeric.
+        assert_eq!(f8_to_char(f64::INFINITY, "MI9999999999.99"), "   Infinity");
+        assert_eq!(
+            f8_to_char(f64::NEG_INFINITY, "MI9999999999.99"),
+            "-  Infinity"
+        );
+        assert_eq!(f8_to_char(f64::NAN, "MI9999999999.99"), "        NaN");
+        assert_eq!(f4_to_char(f32::INFINITY, "MI9999999999.99"), "   Infinity");
+        assert_eq!(f4_to_char(f32::NAN, "MI9999999999.99"), "        NaN");
+        assert_eq!(f4_to_char(f32::NAN, "MI9999999999.99"), "        NaN");
+    }
+
+    #[test]
+    fn float_special_overflow() {
+        // v0.64: the spelled word feeds the digit-count probe, so float4
+        // Infinity (8 chars) trims post to FLT_DIG -> "##.", while NaN (3)
+        // keeps post -> "##.##". float8 keeps DBL_DIG -> "##.##".
+        assert_eq!(f8_to_char(f64::INFINITY, "MI99.99"), " ##.##");
+        assert_eq!(f8_to_char(f64::NEG_INFINITY, "MI99.99"), "-##.##");
+        assert_eq!(f8_to_char(f64::NAN, "MI99.99"), " ##.##");
+        assert_eq!(f4_to_char(f32::INFINITY, "MI99.99"), " ##.");
+        assert_eq!(f4_to_char(f32::NEG_INFINITY, "MI99.99"), "-##.");
+        assert_eq!(f4_to_char(f32::NAN, "MI99.99"), " ##.##");
+    }
+
+    #[test]
+    fn float4_trims_to_flt_dig() {
+        // v0.64: PG's float4_to_char trims post to FLT_DIG (6) significant
+        // digits, so 4.2e9 overflows 'MI99.99' as "##." not "##.##".
+        assert_eq!(f4_to_char(4.2e9f32, "MI99.99"), " ##.");
+        assert_eq!(f8_to_char(4.2e9, "MI99.99"), " ##.##");
+        assert_eq!(f4_to_char(4.2e9f32, "MI9999999999.99"), " 4200000000");
+    }
+
+    #[test]
+    fn float_eeee_exponent_format() {
+        // v0.64: PG's "%+.*e" renders the exponent with sign + at least
+        // two digits.
+        assert_eq!(f8_to_char(0.0, "9.999EEEE"), " 0.000e+00");
+        assert_eq!(f8_to_char(-4.2, "9.999EEEE"), "-4.200e+00");
+        assert_eq!(f8_to_char(1.2e-5, "9.999EEEE"), " 1.200e-05");
+        assert_eq!(f4_to_char(4.2e9f32, "9.999EEEE"), " 4.200e+09");
+        assert_eq!(f8_to_char(f64::INFINITY, "9.999EEEE"), " #.#######");
     }
 }
