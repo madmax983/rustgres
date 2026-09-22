@@ -159,15 +159,17 @@ check("D4 log(10.00000000000000000)",
 check("D5 log(3.4634998359873254962349856073435545)",
       val("select log(3.4634998359873254962349856073435545::numeric)")
       == "0.5395151714070134409152404011959981")
-# D6/D7/D10: PG returns 103-105 significant digits here, which cannot
-# fit the engine's bounded i128 numeric representation. The honest
-# answer is 22003 (v0.61 returned silently wrong f64-rounded values).
-check("D6 log(1.234567e-89) bounded 22003",
-      err_of("select log(1.234567e-89::numeric)") == "22003")
-check("D7 log(1.23e-89, 6.4689e45) bounded 22003",
-      err_of("select log(1.23e-89::numeric, 6.4689e45::numeric)") == "22003")
-check("D10 log(3.1954752e47, 9.4792021e-73) bounded 22003",
-      err_of("select log(3.1954752e47::numeric, 9.4792021e-73::numeric)") == "22003")
+# D6/D7/D10: v0.63 big-mantissa extension — PG19's exact 80-95 digit
+# results now return in full (v0.62 honestly returned 22003 here).
+check("D6 log(1.234567e-89) exact 95 digits",
+      val("select log(1.234567e-89::numeric)")
+      == "-88.90848533591373725637496492944925187293052336306443143312825869985819779294142441287021741054275")
+check("D7 log(1.23e-89, 6.4689e45) exact 91 digits",
+      val("select log(1.23e-89::numeric, 6.4689e45::numeric)")
+      == "-0.5152489207781856983977054971756484879653568168479201885425588841094788842469115325262329756")
+check("D10 log(3.1954752e47, 9.4792021e-73) exact 80 digits",
+      val("select log(3.1954752e47::numeric, 9.4792021e-73::numeric)")
+      == "-1.51613372350688302142917386143459361608600157692779164475351842333265418126982165")
 check("D8 log(0.99923, 4.58934e34)",
       val("select log(0.99923::numeric, 4.58934e34::numeric)") == "-103611.55579544132")
 check("D9 log(1.000016, 8.452010e18)",

@@ -6360,15 +6360,29 @@ fn setop_row_key(row: &Row) -> Vec<u8> {
     for v in row.iter() {
         match v {
             Value::Numeric(n) if n.special == crate::storage::NumericSpecial::Finite => {
-                let mut unscaled = n.unscaled;
-                let mut scale = n.scale;
-                while scale > 0 && unscaled % 10 == 0 {
-                    unscaled /= 10;
-                    scale -= 1;
-                }
+                // v0.63: big-mantissa aware — the key is the normalized
+                // (sign, scale, magnitude bytes).
+                let (unscaled, scale) = if n.is_big() {
+                    (n.unscaled, n.scale)
+                } else {
+                    let mut unscaled = n.unscaled;
+                    let mut scale = n.scale;
+                    while scale > 0 && unscaled % 10 == 0 {
+                        unscaled /= 10;
+                        scale -= 1;
+                    }
+                    (unscaled, scale)
+                };
                 out.push(8);
                 out.extend_from_slice(&unscaled.to_be_bytes());
                 out.extend_from_slice(&scale.to_be_bytes());
+                if n.is_big() {
+                    // Big values are already normalized; unscaled holds
+                    // the sign, so append the exact magnitude bytes.
+                    let mag = n.mag();
+                    out.extend_from_slice(&(mag.decimal_digits()).to_be_bytes());
+                    out.extend_from_slice(mag.to_decimal_string().as_bytes());
+                }
             }
             _ => value_key(v, &mut out),
         }
@@ -10836,9 +10850,16 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&0u32.to_be_bytes());
         }
         Value::Numeric(n) => {
+            // v0.63: big-mantissa aware — unscaled holds the sign for
+            // big values, so the exact magnitude bytes disambiguate.
             out.push(8);
             out.extend_from_slice(&n.unscaled.to_be_bytes());
             out.extend_from_slice(&n.scale.to_be_bytes());
+            if n.is_big() {
+                let mag = n.mag();
+                out.extend_from_slice(&mag.decimal_digits().to_be_bytes());
+                out.extend_from_slice(mag.to_decimal_string().as_bytes());
+            }
         }
         Value::Float4(f) => {
             out.push(2);
@@ -14295,6 +14316,12 @@ fn parse_numeric_typmod(t: &str) -> Option<(i32, i32)> {
 /// unscaled * 10^-scale. `None` only if 10^scale overflows i128, which
 /// cannot happen for a parsed value at a legal scale.
 fn numeric_integer_digits(rounded: &crate::storage::Numeric) -> Option<i32> {
+    // v0.63: big-mantissa aware via the exact digit count.
+    if rounded.is_big() {
+        let mag = rounded.mag();
+        let d = mag.decimal_digits() as i64 - rounded.scale as i64;
+        return Some(d.max(1) as i32);
+    }
     let divisor = 10i128.checked_pow(rounded.scale as u32)?;
     let int_part = rounded.unscaled.abs() / divisor;
     if int_part == 0 {
@@ -18845,6 +18872,12 @@ fn numeric_integral_i32(n: &crate::storage::Numeric) -> Option<i32> {
     if n.special != crate::storage::NumericSpecial::Finite {
         return None;
     }
+    // v0.63: a big-mantissa value never fits i32 — with scale > 0 it is
+    // never integral (normalized: no trailing zeros), and with
+    // scale <= 0 its magnitude exceeds 10^38.
+    if n.is_big() {
+        return None;
+    }
     let v = if n.scale <= 0 {
         // value = unscaled * 10^-scale; integral but may not fit i32.
         let mul = 10i128.checked_pow((-n.scale) as u32)?;
@@ -18949,6 +18982,29 @@ fn eval_power_op(
             // (-inf) ^ x: needs integer check for sign
             if exp.unscaled == 0 {
                 return Ok(Value::Numeric(crate::storage::Numeric::from_i64(1)));
+            }
+            // v0.63: big exponents use magnitude parity (`unscaled` is
+            // sign-only there); small exponents keep the exact v0.62
+            // i64 gate.
+            if exp.is_big() {
+                match crate::storage::integral_parity(&exp) {
+                    Some(odd) => {
+                        if exp.unscaled > 0 {
+                            return Ok(Value::Numeric(if odd {
+                                crate::storage::Numeric::neg_infinity()
+                            } else {
+                                crate::storage::Numeric::infinity()
+                            }));
+                        }
+                        return Ok(Value::Numeric(crate::storage::Numeric::from_i64(0)));
+                    }
+                    None => {
+                        return Err(exec_err(
+                            "2201F",
+                            "a negative number raised to a non-integer power yields a non-real result",
+                        ));
+                    }
+                }
             }
             // For non-integer, PG errors; for integer, sign depends on parity
             if exp.scale == 0 {
@@ -20049,6 +20105,11 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
             // trim_scale: remove trailing zeros.
             if n.special != crate::storage::NumericSpecial::Finite {
+                return Ok(Value::Numeric(n.clone()));
+            }
+            // v0.63: big-mantissa values are already normalized (no
+            // trailing zeros while scale > 0), so this is a no-op.
+            if n.is_big() {
                 return Ok(Value::Numeric(n.clone()));
             }
             let mut unscaled = n.unscaled;

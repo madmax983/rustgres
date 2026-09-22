@@ -118,7 +118,11 @@ fn round_digits(int_d: &str, frac_d: &str, post: i32) -> (String, String) {
 /// expanding scientific notation from huge negative scales.
 fn numeric_digits(n: &Numeric) -> (bool, String, String) {
     let neg = n.unscaled < 0;
-    let mut digits = n.unscaled.unsigned_abs().to_string();
+    // v0.63: big-mantissa aware — render the exact magnitude.
+    let mut digits = match &n.big {
+        Some(mag) => mag.to_decimal_string(),
+        None => n.unscaled.unsigned_abs().to_string(),
+    };
     let scale = n.scale;
     if scale < 0 {
         digits.push_str(&"0".repeat((-scale) as usize));
@@ -760,6 +764,8 @@ mod tests {
             // v0.61: the test wants the full declared scale displayed.
             dscale: scale.max(0),
             special: super::super::storage::NumericSpecial::Finite,
+            // v0.63: test-only i128 value; big stays None.
+            big: None,
         };
         let d = parse_numfmt(picture).unwrap();
         numeric_to_char(&n, &d).unwrap()

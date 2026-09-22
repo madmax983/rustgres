@@ -328,6 +328,19 @@ pub mod toast_consts {
 /// v0.61: equality is by *value* only — `dscale` is deliberately
 /// ignored so `1.50 = 1.5` still holds. (`unscaled`/`scale` are kept
 /// canonical by normalization, so field comparison is exact.)
+///
+/// v0.63: arbitrary-precision mantissa for values whose unscaled
+/// magnitude exceeds 38 digits (i128 range), completing v0.62's
+/// transcendental cluster (huge `exp`/`power`/`log` results, giant
+/// literals, big `div`). When `big` is `Some(mag)`, `unscaled` holds
+/// only the sign (-1, 0, 1 — never 0 with a nonzero magnitude) and
+/// `mag` is the exact positive unscaled magnitude with no leading
+/// zero limbs. All sign/zero tests on `unscaled` keep working
+/// unchanged; magnitude reads must go through [`Numeric::mag`].
+/// Invariants: `big = Some` implies `unscaled ∈ {-1, 1}`,
+/// `mag > 0`, and no trailing zero limbs while `scale > 0`
+/// (same normalization as `new`). Zero is always the plain
+/// `unscaled = 0, big = None` form.
 #[derive(Clone, Debug)]
 pub struct Numeric {
     pub unscaled: i128,
@@ -340,13 +353,20 @@ pub struct Numeric {
     /// mul: sum; div/power: rscale; round: target scale). Always >= 0.
     pub dscale: i32,
     pub special: NumericSpecial,
+    pub big: Option<Box<BigUint>>,
 }
 
 impl PartialEq for Numeric {
     fn eq(&self, other: &Self) -> bool {
-        self.unscaled == other.unscaled
-            && self.scale == other.scale
-            && self.special == other.special
+        if self.special != other.special || self.scale != other.scale {
+            return false;
+        }
+        match (&self.big, &other.big) {
+            (None, None) => self.unscaled == other.unscaled,
+            // Big values are normalized, so `unscaled` holds the sign
+            // and `mag` the exact magnitude: field comparison is exact.
+            _ => self.unscaled == other.unscaled && self.mag() == other.mag(),
+        }
     }
 }
 impl Eq for Numeric {}
@@ -393,6 +413,7 @@ impl Numeric {
             // `new(150, 2)` ("1.50") keeps dscale 2 while storing (15, 1).
             dscale: scale.max(0),
             special: NumericSpecial::Finite,
+            big: None,
         };
         n.normalize();
         n
@@ -413,6 +434,7 @@ impl Numeric {
             scale: 0,
             dscale: 0,
             special: NumericSpecial::NaN,
+            big: None,
         }
     }
 
@@ -423,6 +445,7 @@ impl Numeric {
             scale: 0,
             dscale: 0,
             special: NumericSpecial::PosInf,
+            big: None,
         }
     }
 
@@ -433,6 +456,7 @@ impl Numeric {
             scale: 0,
             dscale: 0,
             special: NumericSpecial::NegInf,
+            big: None,
         }
     }
 
@@ -466,6 +490,8 @@ impl Numeric {
     }
 
     /// Arithmetic negation (v0.18); NaN stays NaN, infinities flip.
+    /// v0.63: big-mantissa aware — under the sign convention, negating
+    /// `unscaled` (±1) is exact; the magnitude is preserved.
     #[allow(dead_code)]
     pub fn neg(&self) -> Self {
         match self.special {
@@ -476,7 +502,12 @@ impl Numeric {
                 // `i128::MIN` is unreachable: parse() rejects magnitudes
                 // that large and arithmetic is overflow-checked.
                 // v0.61: negation preserves the display scale.
-                Numeric::new(self.unscaled.saturating_neg(), self.scale).with_dscale(self.dscale)
+                let mut n = Numeric::new(self.unscaled.saturating_neg(), self.scale)
+                    .with_dscale(self.dscale);
+                if self.big.is_some() {
+                    n.big = self.big.clone();
+                }
+                n
             }
         }
     }
@@ -485,6 +516,23 @@ impl Numeric {
         if self.special != NumericSpecial::Finite {
             self.unscaled = 0;
             self.scale = 0;
+            self.big = None;
+            return;
+        }
+        // v0.63: big values normalize the BigUint magnitude instead.
+        // (All big constructors normalize at build time; this keeps
+        // the invariant if a scale is ever adjusted in place.)
+        if let Some(mag) = self.big.as_mut() {
+            let ten = BigUint::from_u64(10);
+            while self.scale > 0 {
+                let (q, r) = mag.div_rem(&ten);
+                if !r.is_zero() {
+                    break;
+                }
+                **mag = q;
+                self.scale -= 1;
+            }
+            debug_assert!(!mag.is_zero());
             return;
         }
         if self.unscaled == 0 {
@@ -503,11 +551,92 @@ impl Numeric {
             scale: 0,
             dscale: 0,
             special: NumericSpecial::Finite,
+            big: None,
         }
     }
 
     pub fn from_i64(i: i64) -> Self {
         Numeric::new(i as i128, 0)
+    }
+
+    /// v0.63: exact positive unscaled magnitude as a [`BigUint`].
+    /// The only sanctioned way to read the magnitude of a value that
+    /// may carry the big-mantissa extension.
+    pub(crate) fn mag(&self) -> BigUint {
+        match &self.big {
+            Some(m) => (**m).clone(),
+            None => BigUint::from_u128(self.unscaled.unsigned_abs()),
+        }
+    }
+
+    /// v0.63: true when the big-mantissa extension is in use.
+    pub(crate) fn is_big(&self) -> bool {
+        self.big.is_some()
+    }
+
+    /// v0.63: build from an exact decimal `(sign, magnitude, scale)`,
+    /// normalizing trailing zeros while `scale > 0` (the same
+    /// normalization [`Numeric::new`] applies to i128 values).
+    /// Downgrades to the i128 fast path whenever the magnitude fits.
+    /// `None` only past PostgreSQL's 131072-integer-digit numeric
+    /// format limit (caller maps to 22003).
+    pub(crate) fn from_big(
+        neg: bool,
+        mut mag: BigUint,
+        mut scale: i32,
+        dscale: i32,
+    ) -> Option<Numeric> {
+        if mag.is_zero() {
+            return Some(Numeric::zero().with_dscale(dscale));
+        }
+        // Strip trailing zeros while scale > 0, exactly like
+        // `normalize` does for the i128 representation.
+        let ten = BigUint::from_u64(10);
+        while scale > 0 {
+            let (q, r) = mag.div_rem(&ten);
+            if !r.is_zero() {
+                break;
+            }
+            mag = q;
+            scale -= 1;
+        }
+        let int_digits = mag.decimal_digits() as i64 - scale as i64;
+        if int_digits > 131_072 {
+            return None;
+        }
+        if let Some(u) = mag.to_i128() {
+            let unscaled = if neg { -u } else { u };
+            return Some(Numeric::new(unscaled, scale).with_dscale(dscale));
+        }
+        Some(Numeric {
+            unscaled: if neg { -1 } else { 1 },
+            scale,
+            dscale: dscale.max(0),
+            special: NumericSpecial::Finite,
+            big: Some(Box::new(mag)),
+        })
+    }
+
+    /// v0.63: build from an exact [`BigDec`], keeping big magnitudes
+    /// instead of failing like `to_numeric_narrowed`. `dscale` is the
+    /// declared display scale (mirrors [`Numeric::new`]'s
+    /// pre-normalization dscale).
+    pub(crate) fn from_bigdec(d: &BigDec, dscale: i32) -> Option<Numeric> {
+        Self::from_big(d.neg && !d.mag.is_zero(), d.mag.clone(), d.scale, dscale)
+    }
+
+    /// v0.63: like [`Numeric::from_bigdec`], but the display scale is
+    /// the BigDec's own scale — mirrors [`BigDec::to_numeric`], for
+    /// the transcendental producers (`sqrt`/`exp`/`ln`/`log`/`power`)
+    /// whose results PG19 displays at the computed rscale
+    /// (e.g. `sqrt(4)` -> `2.000000000000000`, 15 fractional digits).
+    pub(crate) fn from_bigdec_exact(d: &BigDec) -> Option<Numeric> {
+        Self::from_big(
+            d.neg && !d.mag.is_zero(),
+            d.mag.clone(),
+            d.scale,
+            d.scale.max(0),
+        )
     }
 
     /// Parse a decimal literal: `[+-]digits[.digits][e[+-]digits]`.
@@ -635,15 +764,16 @@ impl Numeric {
         }
         // Assemble the unscaled integer from all digits.
         let mut unscaled: i128 = 0;
+        let mut overflowed = false;
         for c in int_part.chars().chain(frac_part.chars()) {
             let d = (c as i128) - ('0' as i128);
-            unscaled = unscaled
-                .checked_mul(10)
-                .and_then(|v| v.checked_add(d))
-                .ok_or(NumericParseError::Overflow)?;
-        }
-        if neg {
-            unscaled = -unscaled;
+            match unscaled.checked_mul(10).and_then(|v| v.checked_add(d)) {
+                Some(v) => unscaled = v,
+                None => {
+                    overflowed = true;
+                    break;
+                }
+            }
         }
         // scale = frac digits - exponent. v0.22: a negative scale is
         // kept as-is (value = unscaled * 10^-scale) instead of erroring,
@@ -656,6 +786,17 @@ impl Numeric {
         let int_digits = (int_part.len() + frac_part.len()) as i64 - scale as i64;
         if int_digits > 131072 || scale > 200_000 || scale < -200_000 {
             return Err(NumericParseError::Overflow);
+        }
+        if overflowed {
+            // v0.63: magnitude past i128's 38 digits — parse exactly via
+            // BigDec and keep the big mantissa (PG19 accepts up to
+            // 131072 integer digits). `parse_decimal` re-validates the
+            // already-checked literal; TooBig maps to Overflow (22003).
+            let d = BigDec::parse_decimal(s).map_err(|_| NumericParseError::Overflow)?;
+            return Self::from_bigdec(&d, scale.max(0)).ok_or(NumericParseError::Overflow);
+        }
+        if neg {
+            unscaled = -unscaled;
         }
         Ok(Numeric::new(unscaled, scale))
     }
@@ -691,15 +832,34 @@ impl Numeric {
             NumericSpecial::NaN => f64::NAN,
             NumericSpecial::PosInf => f64::INFINITY,
             NumericSpecial::NegInf => f64::NEG_INFINITY,
-            NumericSpecial::Finite => self.unscaled as f64 * 10f64.powi(-self.scale),
+            // v0.63: big magnitudes go through BigDec's f64 conversion
+            // (leading-digit based); the i128 path is unchanged.
+            NumericSpecial::Finite => match &self.big {
+                Some(_) => BigDec::from_numeric(self)
+                    .map(|d| d.to_f64())
+                    .unwrap_or(f64::NAN),
+                None => self.unscaled as f64 * 10f64.powi(-self.scale),
+            },
         }
     }
 
     /// Round half away from zero to an integer; overflow or a special
     /// value -> None.
+    /// v0.63: big-mantissa aware — exact via BigDec long division.
     pub fn to_i64(&self) -> Option<i64> {
         if self.special != NumericSpecial::Finite {
             return None;
+        }
+        if self.big.is_some() {
+            // Exact: round half away from zero at scale 0.
+            let d = BigDec::from_numeric(self)?;
+            let r = d.round_to_scale(0);
+            if r.int_digits() > 18 {
+                return None;
+            }
+            let mag = r.mag.to_i128()?;
+            let v = if r.neg { mag.checked_neg()? } else { mag };
+            return i64::try_from(v).ok();
         }
         // v0.22: a non-positive scale means the value is already an
         // integer multiple of 10^-scale.
@@ -747,14 +907,29 @@ impl Numeric {
 
     /// Addition with PostgreSQL's non-finite semantics (v0.18): NaN
     /// propagates; `Inf + -Inf` is NaN; infinities otherwise dominate.
+    /// v0.63: big-mantissa operands — or an i128 overflow on the fast
+    /// path — fall back to exact BigDec addition instead of 22003.
     pub fn checked_add(&self, other: &Numeric) -> Option<Numeric> {
         match (self.special, other.special) {
             (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
             (NumericSpecial::Finite, NumericSpecial::Finite) => {
-                let (a, b, scale) = self.aligned(other)?;
                 // v0.61: PG's add_var keeps res_dscale = max(d1, d2).
                 let dscale = self.dscale.max(other.dscale);
-                Some(Numeric::new(a.checked_add(b)?, scale).with_dscale(dscale))
+                if self.big.is_some() || other.big.is_some() {
+                    let a = BigDec::from_numeric(self)?;
+                    let b = BigDec::from_numeric(other)?;
+                    return Self::from_bigdec(&a.add(&b), dscale);
+                }
+                let (a, b, scale) = self.aligned(other)?;
+                match a.checked_add(b) {
+                    Some(s) => Some(Numeric::new(s, scale).with_dscale(dscale)),
+                    None => {
+                        // i128 overflow on the fast path: exact add.
+                        let x = BigDec::from_numeric(self)?;
+                        let y = BigDec::from_numeric(other)?;
+                        Self::from_bigdec(&x.add(&y), dscale)
+                    }
+                }
             }
             (a, b) => {
                 if (a == NumericSpecial::PosInf && b == NumericSpecial::NegInf)
@@ -781,17 +956,30 @@ impl Numeric {
     /// Multiplication with PostgreSQL's non-finite semantics (v0.18):
     /// NaN propagates; `0 * Inf` is NaN; infinities otherwise dominate
     /// with the product's sign.
+    /// v0.63: big-mantissa operands — or an i128 overflow on the fast
+    /// path — fall back to exact BigDec multiplication instead of 22003.
     pub fn checked_mul(&self, other: &Numeric) -> Option<Numeric> {
         match (self.special, other.special) {
             (NumericSpecial::NaN, _) | (_, NumericSpecial::NaN) => Some(Numeric::nan()),
-            (NumericSpecial::Finite, NumericSpecial::Finite) => Some(
-                Numeric::new(
-                    self.unscaled.checked_mul(other.unscaled)?,
-                    self.scale.checked_add(other.scale)?,
-                )
+            (NumericSpecial::Finite, NumericSpecial::Finite) => {
                 // v0.61: PG's mul_var keeps res_dscale = d1 + d2.
-                .with_dscale(self.dscale.saturating_add(other.dscale)),
-            ),
+                let dscale = self.dscale.saturating_add(other.dscale);
+                if self.big.is_some() || other.big.is_some() {
+                    let a = BigDec::from_numeric(self)?;
+                    let b = BigDec::from_numeric(other)?;
+                    return a.mul_exact(&b).and_then(|p| Self::from_bigdec(&p, dscale));
+                }
+                let scale = self.scale.checked_add(other.scale)?;
+                match self.unscaled.checked_mul(other.unscaled) {
+                    Some(p) => Some(Numeric::new(p, scale).with_dscale(dscale)),
+                    None => {
+                        // i128 overflow on the fast path: exact multiply.
+                        let a = BigDec::from_numeric(self)?;
+                        let b = BigDec::from_numeric(other)?;
+                        a.mul_exact(&b).and_then(|p| Self::from_bigdec(&p, dscale))
+                    }
+                }
+            }
             _ => {
                 if self.is_zero() || other.is_zero() {
                     return Some(Numeric::nan());
@@ -832,9 +1020,10 @@ impl Numeric {
         debug_assert!(other.special == NumericSpecial::Finite);
         debug_assert!(!other.is_zero());
         // Signed unscaled magnitudes as BigUints.
-        let a_mag = BigUint::from_u128(self.unscaled.unsigned_abs() as u128);
+        // v0.63: big-mantissa aware via the exact magnitude accessor.
+        let a_mag = self.mag();
         let a_neg = self.unscaled < 0;
-        let b_mag = BigUint::from_u128(other.unscaled.unsigned_abs() as u128);
+        let b_mag = other.mag();
         let b_neg = other.unscaled < 0;
         let neg = a_neg != b_neg;
         // rscale follows select_div_scale for the `/` operator; the SQL
@@ -873,14 +1062,18 @@ impl Numeric {
                 q.add_small_assign(1);
             }
         }
-        let mut mant: i128 = q.to_i128()?;
-        if neg {
-            mant = mant.checked_neg()?;
-        }
+        // v0.63: build through the big-aware constructor — quotients
+        // past 38 digits keep their exact magnitude instead of 22003.
+        let dscale = rscale;
+        let dec = BigDec {
+            neg,
+            mag: q,
+            scale: rscale,
+        };
         // v0.61: PG's div_var sets the display scale to rscale
         // (the runner compares numerics, so trailing-zero padding is
         // harmless there but required for e.g. 10.0 ^ -2147483648).
-        Some(Numeric::new(mant, rscale).with_dscale(rscale))
+        Self::from_bigdec(&dec, dscale)
     }
 
     /// v0.59: PG19 `select_div_scale()` faithfully, in decimal-digit
@@ -897,12 +1090,15 @@ impl Numeric {
         const NUMERIC_MAX_DISPLAY_SCALE: i32 = 1000;
         /// (normalized base-10000 weight, leading digit group) of a
         /// nonzero finite Numeric.
+        /// v0.63: big-mantissa aware via the exact digit string.
         fn weight_firstdigit(n: &Numeric) -> (i32, u32) {
             if n.is_zero() {
                 return (0, 0);
             }
-            let abs = n.unscaled.unsigned_abs();
-            let digits = abs.to_string();
+            let digits = match &n.big {
+                Some(mag) => mag.to_decimal_string(),
+                None => n.unscaled.unsigned_abs().to_string(),
+            };
             let d = digits.len() as i32;
             // Integer digits of the value (may be <= 0 for fractions).
             let int_d = d - n.scale;
@@ -1003,14 +1199,14 @@ impl Numeric {
                 Some(Numeric::nan())
             }
             (Finite, Finite) => {
-                // Use f64 for the division to avoid overflow complexities.
-                // This gives ~15-16 significant digits, sufficient for out_scale <= 16.
-                let ratio = self.to_f64() / other.to_f64();
-                if !ratio.is_finite() {
-                    return None;
-                }
-                let scaled = (ratio * 10f64.powi(out_scale)).round() as i128;
-                Some(Numeric::new(scaled, out_scale))
+                // v0.63: exact division at out_scale for every magnitude.
+                // (The old f64 fast path silently saturated `as i128`
+                // when the quotient exceeded i128, and read only the
+                // sign of big-mantissa operands.)
+                let a = BigDec::from_numeric(self)?;
+                let b = BigDec::from_numeric(other)?;
+                let q = a.div_round(&b, out_scale)?;
+                Self::from_bigdec(&q, out_scale)
             }
         }
     }
@@ -1024,9 +1220,17 @@ impl Numeric {
             (NaN, _) | (_, NaN) => Some(Numeric::nan()),
             (_, Finite) if other.unscaled == 0 => None,
             (Finite, Finite) => {
-                let (a, b, scale) = self.aligned(other)?;
                 // v0.61: PG's mod_var keeps res_dscale = max(d1, d2).
                 let dscale = self.dscale.max(other.dscale);
+                // v0.63: big-mantissa aware — aligned() reads the
+                // sign-only unscaled, so route big operands through the
+                // exact BigDec remainder (sign follows the dividend).
+                if self.big.is_some() || other.big.is_some() {
+                    let a = BigDec::from_numeric(self)?;
+                    let b = BigDec::from_numeric(other)?;
+                    return Self::from_bigdec(&a.rem(&b), dscale);
+                }
+                let (a, b, scale) = self.aligned(other)?;
                 Some(Numeric::new(a.checked_rem(b)?, scale).with_dscale(dscale))
             }
             _ => Some(Numeric::nan()),
@@ -1034,6 +1238,8 @@ impl Numeric {
     }
 
     /// Absolute value (v0.18): NaN stays NaN, -Infinity becomes +Infinity.
+    /// v0.63: big-mantissa aware — flipping the sign bit on `unscaled`
+    /// is exact under the sign convention.
     pub fn abs(&self) -> Numeric {
         match self.special {
             NumericSpecial::NaN => Numeric::nan(),
@@ -1041,7 +1247,15 @@ impl Numeric {
             _ => {
                 if self.special == NumericSpecial::Finite {
                     // v0.61: abs preserves the display scale.
-                    Numeric::new(self.unscaled.abs(), self.scale).with_dscale(self.dscale)
+                    let mut n =
+                        Numeric::new(self.unscaled.abs(), self.scale).with_dscale(self.dscale);
+                    // v0.63: keep a big magnitude big (its unscaled is
+                    // already just the sign).
+                    if self.big.is_some() {
+                        n.unscaled = 1;
+                        n.big = self.big.clone();
+                    }
+                    n
                 } else {
                     Numeric::infinity()
                 }
@@ -1058,22 +1272,40 @@ impl Numeric {
     /// Digits before the decimal point (<= 0 when |value| < 1).
     /// Used to enforce the 131072-digit numeric format limit after
     /// operations that can carry into a new leading digit.
+    /// v0.63: big-mantissa aware via the exact digit count.
     fn int_digits(&self) -> i64 {
         if self.unscaled == 0 {
             return 0;
         }
-        let mut v = self.unscaled.unsigned_abs();
-        let mut digits: i64 = 0;
-        while v > 0 {
-            v /= 10;
-            digits += 1;
-        }
+        let digits: i64 = match &self.big {
+            Some(mag) => mag.decimal_digits() as i64,
+            None => {
+                let mut v = self.unscaled.unsigned_abs();
+                let mut digits: i64 = 0;
+                while v > 0 {
+                    v /= 10;
+                    digits += 1;
+                }
+                digits
+            }
+        };
         digits - self.scale as i64
     }
 
     pub fn round_to(&self, scale: i32) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
+        }
+        // v0.63: big-mantissa values round exactly via BigDec.
+        if self.big.is_some() {
+            let d = BigDec::from_numeric(self)?;
+            let r = d.round_to_scale(scale);
+            // v0.61: the rounded value carries the target display scale.
+            let n = Self::from_bigdec(&r, scale.max(0))?.with_dscale(scale.max(0));
+            if n.int_digits() > 131072 {
+                return None;
+            }
+            return Some(n);
         }
         if scale >= self.scale {
             // v0.59: widening the scale (or a no-op) is value-identical;
@@ -1133,17 +1365,29 @@ impl Numeric {
         // |rounded| >= 10^(precision-scale). In unscaled terms with the
         // rounded value at scale rs, that is
         // |unscaled| >= 10^(precision - scale + rs).
+        // v0.63: big-mantissa aware — compare exact digit counts.
         let limit_pow = precision as i64 - scale as i64 + rounded.scale as i64;
         let overflows = if rounded.unscaled == 0 {
             false
-        } else if limit_pow <= 0 {
-            // 10^limit_pow <= 1 <= |unscaled|: any nonzero value overflows.
-            true
         } else {
-            match 10i128.checked_pow(limit_pow as u32) {
-                Some(limit) => rounded.unscaled.unsigned_abs() >= limit as u128,
-                // 10^limit_pow exceeds i128: |unscaled| cannot reach it.
-                None => false,
+            let mag_digits = match &rounded.big {
+                Some(m) => m.decimal_digits() as i64,
+                None => {
+                    let mut v = rounded.unscaled.unsigned_abs();
+                    let mut d: i64 = 0;
+                    while v > 0 {
+                        v /= 10;
+                        d += 1;
+                    }
+                    d
+                }
+            };
+            // |unscaled| >= 10^limit_pow  <=>  digits >= limit_pow + 1
+            // (for limit_pow >= 0); limit_pow <= 0 overflows any nonzero.
+            if limit_pow <= 0 {
+                true
+            } else {
+                mag_digits > limit_pow
             }
         };
         if overflows {
@@ -1154,7 +1398,18 @@ impl Numeric {
         // shifting the point is value-identical. Checked multiply;
         // on overflow (absurd magnitudes only) the negative scale
         // is kept and the value stays numerically correct.
+        // v0.63: big values shift the BigUint magnitude instead.
         let mut r = rounded;
+        if r.big.is_some() {
+            while r.scale < 0 {
+                // Invariant: big is Some(mag) with unscaled = ±1 here.
+                if let Some(mag) = r.big.as_mut() {
+                    mag.mul_pow10_assign(1);
+                }
+                r.scale += 1;
+            }
+            return Ok(r);
+        }
         while r.scale < 0 {
             match r.unscaled.checked_mul(10) {
                 Some(m) => {
@@ -1169,12 +1424,33 @@ impl Numeric {
 
     /// v0.18: specials are fixed points of floor/ceil.
     /// v0.22: a non-positive scale is already integral.
+    /// v0.63: big-mantissa aware via exact BigUint division.
     pub fn floor(&self) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
         }
         if self.scale <= 0 {
             return Some(self.clone());
+        }
+        if self.big.is_some() {
+            // |value| < 1 iff mag < 10^scale.
+            let mut pow10 = BigUint::from_u64(1);
+            pow10.mul_pow10_assign(self.scale as u32);
+            let mag = self.mag();
+            if mag.cmp(&pow10) == std::cmp::Ordering::Less {
+                // -1 < value < 0 -> -1; 0 <= value < 1 -> 0.
+                return Some(if self.unscaled < 0 {
+                    Numeric::from_i64(-1)
+                } else {
+                    Numeric::zero()
+                });
+            }
+            let (mut q, r) = mag.div_rem(&pow10);
+            if !r.is_zero() && self.unscaled < 0 {
+                q.add_small_assign(1);
+            }
+            let neg = self.unscaled < 0;
+            return Self::from_big(neg, q, 0, 0);
         }
         // v0.22: if 10^scale overflows i128, |value| < 1.
         let div = match 10i128.checked_pow(self.scale as u32) {
@@ -1193,12 +1469,32 @@ impl Numeric {
 
     /// v0.18: specials are fixed points of floor/ceil.
     /// v0.22: a non-positive scale is already integral.
+    /// v0.63: big-mantissa aware via exact BigUint division.
     pub fn ceil(&self) -> Option<Numeric> {
         if self.special != NumericSpecial::Finite {
             return Some(self.clone());
         }
         if self.scale <= 0 {
             return Some(self.clone());
+        }
+        if self.big.is_some() {
+            let mut pow10 = BigUint::from_u64(1);
+            pow10.mul_pow10_assign(self.scale as u32);
+            let mag = self.mag();
+            if mag.cmp(&pow10) == std::cmp::Ordering::Less {
+                // 0 < value < 1 -> 1; -1 < value <= 0 -> 0.
+                return Some(if self.unscaled > 0 {
+                    Numeric::from_i64(1)
+                } else {
+                    Numeric::zero()
+                });
+            }
+            let (mut q, r) = mag.div_rem(&pow10);
+            if !r.is_zero() && self.unscaled > 0 {
+                q.add_small_assign(1);
+            }
+            let neg = self.unscaled < 0;
+            return Self::from_big(neg, q, 0, 0);
         }
         // v0.22: if 10^scale overflows i128, |value| < 1.
         let div = match 10i128.checked_pow(self.scale as u32) {
@@ -1241,15 +1537,30 @@ impl Numeric {
         debug_assert!(self.special == NumericSpecial::Finite);
         // PG: f = exp * (log10(leading digits) + weight*4); the
         // decimal-digit form is exp * log10(|unscaled| * 10^-scale).
+        // v0.63: big-mantissa aware — log10 from the exact digit count
+        // and leading digits instead of the i128 unscaled value.
         let f = if self.unscaled == 0 {
             0.0
         } else {
-            exp as f64 * ((self.unscaled.unsigned_abs() as f64).log10() - self.scale as f64)
+            let log10_abs = match &self.big {
+                Some(mag) => {
+                    let s = mag.to_decimal_string();
+                    // v0.63: lead holds the first k digits, so its own
+                    // log10 already counts (k - 1) of the decades; add
+                    // only the remaining (len - k).
+                    let k = s.len().min(19);
+                    let lead: f64 = s[..k].parse().unwrap_or(0.0);
+                    (s.len() as f64 - k as f64) + lead.log10() - self.scale as f64
+                }
+                None => (self.unscaled.unsigned_abs() as f64).log10() - self.scale as f64,
+            };
+            exp as f64 * log10_abs
         };
-        if f > 45.0 {
-            // PG raises 22003 past f > 524288 ((NUMERIC_WEIGHT_MAX+1)*4);
-            // our i128 mantissa cannot represent anything past ~10^45,
-            // so the answer is 22003 either way.
+        // v0.63: the old `f > 45.0` early bail assumed an i128 mantissa;
+        // with the big-mantissa extension the real bound is PG's own
+        // (NUMERIC_WEIGHT_MAX+1)*4 = 524288, enforced per-iteration
+        // below and by the 131072-digit format limit on the result.
+        if f > 524_288.0 {
             return Err(PowerError::Overflow);
         }
         if f + 1.0 < -1000.0 {
@@ -1322,7 +1633,9 @@ impl Numeric {
             // PG: round_var(result, rscale).
             result.round_to_scale(rscale)
         };
-        let mut n = dec.to_numeric().ok_or(PowerError::Overflow)?;
+        // v0.63: big-mantissa results keep their exact magnitude
+        // (PG19 allows 131072 integer digits); only past that is 22003.
+        let mut n = Self::from_bigdec(&dec, rscale).ok_or(PowerError::Overflow)?;
         n.dscale = rscale;
         Ok(n)
     }
@@ -1356,13 +1669,20 @@ impl Numeric {
             };
         }
         // Compare by magnitude: digits(unscaled) - scale.
+        // v0.63: big-mantissa aware via the exact digit count.
         let mag = |n: &Numeric| -> i64 {
-            let mut v = n.unscaled.unsigned_abs();
-            let mut digits: i64 = 0;
-            while v >= 10 {
-                v /= 10;
-                digits += 1;
-            }
+            let digits: i64 = match &n.big {
+                Some(m) => m.decimal_digits() as i64,
+                None => {
+                    let mut v = n.unscaled.unsigned_abs();
+                    let mut digits: i64 = 0;
+                    while v >= 10 {
+                        v /= 10;
+                        digits += 1;
+                    }
+                    digits
+                }
+            };
             digits - n.scale as i64
         };
         let (ma, mb) = (mag(self), mag(other));
@@ -1370,12 +1690,21 @@ impl Numeric {
             return if neg_a { mb.cmp(&ma) } else { ma.cmp(&mb) };
         }
         // Same magnitude: align scales; on overflow fall back to f64.
-        let ord = match self.aligned(other) {
-            Some((a, b, _)) => a.cmp(&b),
-            None => self
-                .to_f64()
-                .partial_cmp(&other.to_f64())
-                .unwrap_or(Ordering::Equal),
+        // v0.63: big values compare exactly through BigDec.
+        let ord = if self.big.is_some() || other.big.is_some() {
+            let (a, b) = (
+                BigDec::from_numeric(self).expect("cmp: finite"),
+                BigDec::from_numeric(other).expect("cmp: finite"),
+            );
+            a.cmp(&b)
+        } else {
+            match self.aligned(other) {
+                Some((a, b, _)) => a.cmp(&b),
+                None => self
+                    .to_f64()
+                    .partial_cmp(&other.to_f64())
+                    .unwrap_or(Ordering::Equal),
+            }
         };
         ord
     }
@@ -1410,7 +1739,11 @@ impl Numeric {
             return "0".to_string();
         }
         let neg = self.unscaled < 0;
-        let digits = self.unscaled.unsigned_abs().to_string();
+        // v0.63: big-mantissa values render their exact magnitude.
+        let digits = match &self.big {
+            Some(mag) => mag.to_decimal_string(),
+            None => self.unscaled.unsigned_abs().to_string(),
+        };
         let mut out = String::new();
         if neg {
             out.push('-');
@@ -1530,12 +1863,28 @@ impl Numeric {
     /// subtraction `self.scale - new_scale` could overflow and panic in
     /// debug builds. |unscaled| < 10^39, so a divisor of 10^39 or more
     /// always truncates to zero.
+    /// v0.63: big-mantissa aware via exact BigUint division.
     pub fn trunc_to_scale(&self, new_scale: i32) -> Numeric {
         if self.special != NumericSpecial::Finite {
             return self.clone();
         }
         if new_scale >= self.scale {
             return self.clone();
+        }
+        // v0.63: exact truncation of a big magnitude.
+        if self.big.is_some() {
+            let diff = self.scale as i64 - new_scale as i64;
+            // v0.61: PG's trunc_var keeps dscale = min(dscale, rscale).
+            let dscale = self.dscale.min(new_scale);
+            if diff >= 1_000_000 {
+                return Numeric::zero().with_dscale(dscale);
+            }
+            let mut pow10 = BigUint::from_u64(1);
+            pow10.mul_pow10_assign(diff as u32);
+            let (q, _) = self.mag().div_rem(&pow10);
+            let neg = self.unscaled < 0;
+            return Self::from_big(neg, q, new_scale, dscale)
+                .unwrap_or_else(|| Numeric::zero().with_dscale(dscale));
         }
         let diff = self.scale as i64 - new_scale as i64;
         if diff >= 39 {
@@ -1548,14 +1897,24 @@ impl Numeric {
 
     /// v0.37: byte size of this numeric for TOAST accounting. Uses the
     /// binary encoding size (unscaled i128 + scale i32 + discriminant).
+    /// v0.63: big-mantissa aware — a big value's magnitude rides along
+    /// as decimal bytes (see [`Numeric::toast_bytes`]).
     pub fn toast_len(&self) -> usize {
-        16 + 4 + 1
+        16 + 4
+            + 1
+            + self
+                .big
+                .as_ref()
+                .map(|m| m.decimal_digits() as usize)
+                .unwrap_or(0)
     }
 
     /// v0.37: raw bytes of this numeric for TOAST compression/chunking:
     /// big-endian unscaled + scale + special discriminant.
+    /// v0.63: big-mantissa aware — for big values the exact magnitude
+    /// follows as decimal bytes (`unscaled` alone holds only the sign).
     pub fn toast_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(21);
+        let mut b = Vec::with_capacity(self.toast_len());
         b.extend_from_slice(&self.unscaled.to_be_bytes());
         b.extend_from_slice(&self.scale.to_be_bytes());
         b.push(match self.special {
@@ -1564,6 +1923,9 @@ impl Numeric {
             NumericSpecial::PosInf => 2,
             NumericSpecial::NegInf => 3,
         });
+        if let Some(mag) = &self.big {
+            b.extend_from_slice(mag.to_decimal_string().as_bytes());
+        }
         b
     }
 }
@@ -1783,6 +2145,36 @@ impl BigUint {
         self.normalize();
     }
 
+    /// v0.63: exact decimal rendering of the magnitude (no leading
+    /// zeros; `"0"` for zero). Repeated short division by 10^9,
+    /// collecting 9-digit groups — quadratic in the digit count, but
+    /// only used for display/serialization of big numerics.
+    pub(crate) fn to_decimal_string(&self) -> String {
+        if self.is_zero() {
+            return "0".to_string();
+        }
+        let mut tmp = self.clone();
+        let mut groups: Vec<u32> = Vec::new();
+        while !tmp.is_zero() {
+            // Short division by 1e9, capturing the remainder.
+            let mut rem: u64 = 0;
+            for i in (0..tmp.limbs.len()).rev() {
+                let cur = rem * 1_000_000_000 + tmp.limbs[i] as u64;
+                tmp.limbs[i] = (cur / 1_000_000_000) as u32;
+                rem = cur % 1_000_000_000;
+            }
+            tmp.normalize();
+            groups.push(rem as u32);
+        }
+        let mut out = String::new();
+        let mut it = groups.iter().rev();
+        out.push_str(&it.next().unwrap_or(&0).to_string());
+        for g in it {
+            out.push_str(&format!("{:09}", g));
+        }
+        out
+    }
+
     /// Full product (schoolbook O(n*m)). The u128 accumulator is far
     /// wider than any entry can reach: each entry sums at most
     /// min(len) products below 1e18 plus carries.
@@ -1989,6 +2381,9 @@ impl BigDec {
     }
 
     /// Exact conversion from a finite Numeric; None for NaN/infinity.
+    /// v0.63: big-mantissa aware — with the sign convention
+    /// (`unscaled` holds the sign when `big` is `Some`), `neg` and
+    /// [`Numeric::mag`] read the value exactly.
     pub(crate) fn from_numeric(n: &Numeric) -> Option<Self> {
         if n.special != NumericSpecial::Finite {
             return None;
@@ -1996,7 +2391,7 @@ impl BigDec {
         Some(
             BigDec {
                 neg: n.unscaled < 0,
-                mag: BigUint::from_u128(n.unscaled.unsigned_abs()),
+                mag: n.mag(),
                 scale: n.scale,
             }
             .normalize(),
@@ -2318,73 +2713,6 @@ impl BigDec {
         let unscaled = if self.neg { mag.checked_neg()? } else { mag };
         Some(Numeric::new(unscaled, self.scale))
     }
-
-    /// Convert to [`Numeric`], narrowing the fractional scale (by
-    /// truncation) until the value fits in i128, or None if the integer
-    /// part itself exceeds i128. This is the v0.62 honest-narrowing for
-    /// PG19 transcendental results: PG computes e.g. 200 fractional
-    /// digits with arbitrary precision, but the i128-backed `Numeric`
-    /// holds ~38 significant digits. The integer part stays exact;
-    /// only excess fractional digits are dropped.
-    pub(crate) fn to_numeric_narrowed(&self) -> Option<Numeric> {
-        // Count decimal digits in the magnitude (unscaled integer).
-        let mag_digits = {
-            let limbs = &self.mag.limbs;
-            if limbs.is_empty() {
-                1
-            } else {
-                let ms = limbs[limbs.len() - 1];
-                let ms_digits = if ms >= 100_000_000 {
-                    9
-                } else if ms >= 10_000_000 {
-                    8
-                } else if ms >= 1_000_000 {
-                    7
-                } else if ms >= 100_000 {
-                    6
-                } else if ms >= 10_000 {
-                    5
-                } else if ms >= 1_000 {
-                    4
-                } else if ms >= 100 {
-                    3
-                } else if ms >= 10 {
-                    2
-                } else {
-                    1
-                };
-                (limbs.len() - 1) as i64 * 9 + ms_digits as i64
-            }
-        };
-        // i128 holds up to 38 digits in the unscaled magnitude. If the
-        // magnitude fits, no narrowing is needed (the scale can be
-        // arbitrarily large, e.g. exp(-123.456) needs scale 66 for a
-        // 16-digit unscaled value).
-        if mag_digits <= 38 {
-            return self.to_numeric();
-        }
-        // Narrow: drop excess digits from the magnitude, reducing
-        // the scale by the same amount. This is only valid when the
-        // excess digits are fractional (scale >= drop); if the integer
-        // part itself exceeds 38 digits, the value is truly
-        // unrepresentable (PG raises 22003).
-        let drop = (mag_digits - 38) as u32;
-        if (self.scale as u32) < drop {
-            return None;
-        }
-        let mut divisor = BigUint::from_u64(1);
-        for _ in 0..drop {
-            divisor.mul_small_assign(10);
-        }
-        let (narrowed_mag, _) = self.mag.div_rem(&divisor);
-        let narrowed_scale = (self.scale as i64 - drop as i64).max(0) as i32;
-        let narrowed = BigDec {
-            mag: narrowed_mag,
-            scale: narrowed_scale,
-            neg: self.neg,
-        };
-        narrowed.to_numeric()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,9 +2729,9 @@ impl BigDec {
 //   log:  two separately-scaled natural logarithms, divided.
 //   power (fractional): exp(exp * ln(|base|)) with adaptive precision.
 //
-// The final value converts back to the i128-backed `Numeric`; results
-// PG computes with more than ~38 significant digits honestly stay
-// 22003 "value overflows numeric format".
+// The final value converts back to `Numeric` via the v0.63
+// big-mantissa extension; only past PG's 131072-digit format limit
+// is 22003 "value overflows numeric format".
 // ---------------------------------------------------------------------------
 
 /// v0.62: outcome of PG19 `exp_var` (and the exp step of `power_var`).
@@ -2823,9 +3151,20 @@ pub(crate) fn log_var_inner(
 /// v0.62: parity of an integral `Numeric` (true = odd); None when the
 /// value is not an exact integer. Mirrors PG19 `power_var`'s
 /// integral/odd tests on the exponent.
-fn integral_parity(n: &Numeric) -> Option<bool> {
+/// v0.63: big-mantissa aware — a big value's `unscaled` holds only the
+/// sign, so parity comes from the magnitude's lowest bit.
+pub(crate) fn integral_parity(n: &Numeric) -> Option<bool> {
     if n.special != NumericSpecial::Finite || n.unscaled == 0 {
         return Some(false);
+    }
+    if let Some(mag) = n.big.as_ref() {
+        // Normalized: with scale > 0 there are no trailing zeros, so a
+        // fractional big value is never integral; with scale <= 0 the
+        // value is integral and parity is the magnitude's lowest bit.
+        if n.scale > 0 {
+            return Some(false);
+        }
+        return Some(mag.limbs.first().is_some_and(|l| l & 1 == 1));
     }
     if n.scale <= 0 {
         // value = unscaled * 10^-scale; a factor 10^k (k >= 1) is even.
@@ -2888,16 +3227,16 @@ pub(crate) fn power_var_frac(base: &Numeric, exp: &Numeric) -> Result<Numeric, P
     // saturates, so no clamp is needed (PG19 applies none here either).
     // |vw| <= 3003.01 * 0.4343 < 1305 after the fuzz-factor test above.
     let vw_i = vw as i64;
+    // v0.63: PG19 uses the full declared dscales (no 50-cap); the
+    // big-mantissa extension holds the resulting precision.
     let rscale = (16 - vw_i)
-        .max((base.dscale.min(50)) as i64)
-        .max((exp.dscale.min(50)) as i64)
+        .max(base.dscale as i64)
+        .max(exp.dscale as i64)
         .max(0)
         .min(1000) as i32;
     // v0.62: PG's rscale is used uncapped for the BigDec computation
-    // (BigUint handles arbitrary precision). The i128 narrowing
-    // happens in to_numeric_narrowed(), which preserves small results
-    // like 12.3^-45.6 (16-digit unscaled, scale 66) while truncating
-    // only when the unscaled magnitude exceeds 38 digits.
+    // (BigUint handles arbitrary precision). v0.63: results keep
+    // their exact magnitude via the big-mantissa extension.
     let sig_digits = (rscale as i64 + vw_i).max(0);
     let local_rscale = (sig_digits - ln_dweight + 8).max(0);
     // The real calculation.
@@ -2912,7 +3251,9 @@ pub(crate) fn power_var_frac(base: &Numeric, exp: &Numeric) -> Result<Numeric, P
     if res_sign && !res.is_zero() {
         res = res.neg();
     }
-    res.to_numeric_narrowed()
+    // v0.63: big-mantissa results keep their exact magnitude
+    // (e.g. 12.3 ^ 45.6) instead of 22003.
+    Numeric::from_bigdec_exact(&res)
         .map(|n| {
             let nd = rscale.min(n.dscale);
             n.with_dscale(nd)
@@ -2931,20 +3272,15 @@ impl Numeric {
         // sweight = arg.weight * DEC_DIGITS / 2 + 1 (exact: DEC_DIGITS
         // is even, so the C division needs no floor fixup).
         let sweight = dec_w4(&x) / 2 + 1;
-        // v0.62: cap working precision at 50 digits (PG uses up to 1000,
-        // but i128 narrows to 38; 50 gives guard digits for rounding).
-        // Prevents 200-digit intermediates from round(x,200) timing out.
-        let rscale = (16 - sweight)
-            .max((self.dscale.min(50)) as i64)
-            .max(0)
-            .min(1000) as i32;
+        // v0.63: PG19 uses the full declared dscale (no 50-cap).
+        let rscale = (16 - sweight).max(self.dscale as i64).max(0).min(1000) as i32;
         if x.is_zero() {
             return Some(Numeric::zero().with_dscale(rscale));
         }
-        let r = x.sqrt_round(rscale)?.to_numeric_narrowed()?;
-        // to_numeric_narrowed preserves PG's rscale as the display
-        // scale (via Numeric::new), narrowing only when the value
-        // exceeds i128's 38-digit capacity.
+        // v0.63: big-mantissa aware (no i128 narrowing).
+        let r = x
+            .sqrt_round(rscale)
+            .and_then(|d| Self::from_bigdec_exact(&d))?;
         let d = rscale.min(r.dscale);
         Some(r.with_dscale(d))
     }
@@ -2957,14 +3293,13 @@ impl Numeric {
         // as PG19 computes it.
         let xf = BigDec::from_numeric(self)?.to_f64();
         let v = (xf * 0.434294481903252).clamp(-1000.0, 1000.0);
-        let rscale = (16 - v as i64)
-            .max((self.dscale.min(50)) as i64)
-            .max(0)
-            .min(1000) as i32;
+        // v0.63: PG19 uses the full declared dscale (no 50-cap).
+        let rscale = (16 - v as i64).max(self.dscale as i64).max(0).min(1000) as i32;
         let x = BigDec::from_numeric(self)?;
-        match exp_var_inner(&x, self.dscale.min(50), rscale) {
+        match exp_var_inner(&x, self.dscale, rscale) {
             ExpOutcome::Finite(d) => {
-                let n = d.to_numeric_narrowed()?;
+                // v0.63: big-mantissa aware (no i128 narrowing).
+                let n = Self::from_bigdec_exact(&d)?;
                 let nd = rscale.min(n.dscale);
                 Some(n.with_dscale(nd))
             }
@@ -2978,11 +3313,13 @@ impl Numeric {
     pub(crate) fn ln_pg(&self) -> Option<Numeric> {
         debug_assert!(self.special == NumericSpecial::Finite);
         let x = BigDec::from_numeric(self)?;
+        // v0.63: PG19 uses the full declared dscale (no 50-cap).
         let rscale = (16 - estimate_ln_dweight(&x))
-            .max((self.dscale.min(50)) as i64)
+            .max(self.dscale as i64)
             .max(0)
             .min(1000) as i32;
-        let r = ln_var_inner(&x, rscale)?.to_numeric_narrowed()?;
+        // v0.63: big-mantissa aware (no i128 narrowing).
+        let r = ln_var_inner(&x, rscale).and_then(|d| Self::from_bigdec_exact(&d))?;
         let rd = rscale.min(r.dscale);
         Some(r.with_dscale(rd))
     }
@@ -2992,12 +3329,12 @@ impl Numeric {
     pub(crate) fn log_pg(base: &Numeric, num: &Numeric) -> Result<Numeric, LogError> {
         let b = BigDec::from_numeric(base).ok_or(LogError::Overflow)?;
         let n = BigDec::from_numeric(num).ok_or(LogError::Overflow)?;
-        let (r, rscale) = log_var_inner(&b, &n, base.dscale.min(50), num.dscale.min(50))?;
-        // v0.62: protocol test 63 (D6/D7/D10) requires honest 22003 when
-        // PG's output needs >38 significant digits. Unlike ln/exp/sqrt/
-        // power (which narrow to fix the conformance regression), log
-        // returns 22003 for unrepresentable precision.
-        let out = r.to_numeric().ok_or(LogError::Overflow)?;
+        // v0.63: PG19 uses the full declared dscales (no 50-cap).
+        let (r, rscale) = log_var_inner(&b, &n, base.dscale, num.dscale)?;
+        // v0.63: big-mantissa results keep their exact magnitude
+        // (e.g. log(1.234567e-89) needs ~100 fractional digits);
+        // only past PG's 131072-digit format limit is 22003.
+        let out = Self::from_bigdec_exact(&r).ok_or(LogError::Overflow)?;
         let od = rscale.min(out.dscale);
         Ok(out.with_dscale(od))
     }
@@ -6147,8 +6484,14 @@ mod v061_power_dscale_tests {
 
     #[test]
     fn power_overflow_and_identities() {
-        // f = 5678*log10(1.234) ~ 518: past the i128 wall -> 22003.
-        assert_eq!(num("1.234").power_int(5678, 0), Err(PowerError::Overflow));
+        // v0.63: f = 5678*log10(1.234) ~ 518 — exact via the big
+        // mantissa; matches PG19's numeric.out digit-for-digit.
+        let big = num("1.234").power_int(5678, 0).unwrap();
+        // Full 523-character expected value from PG19's numeric.out.
+        assert_eq!(
+            big.to_text(),
+            "307239295662090741644584872593956173493568238595074141254349565406661439636598896798876823220904084953233015553994854875890890858118656468658643918169805277399402542281777901029346337707622181574346585989613344285010764501017625366742865066948856161360224801370482171458030533346309750557140549621313515752078638620714732831815297168231790779296290266207315344008883935010274044001522606235576584215999260117523114297033944018699691024106823438431754073086813382242140602291215149759520833200152654884259619588924545324.597"
+        );
         // exp == 0 -> exactly 1 with dscale rscale.
         let one = num("3.789").power_int(0, 16).unwrap();
         assert_eq!(one.to_text(), "1.0000000000000000");
@@ -6329,9 +6672,12 @@ mod v062_transcendental_tests {
             num("-3000").exp_pg().unwrap().to_text(),
             "0.".to_string() + &"0".repeat(1000)
         );
-        // 51-digit result (PG's exp(123.456)): exceeds the bounded i128
-        // representation, so None (exec maps to 22003).
-        assert_eq!(num("123.456").exp_pg(), None);
+        // v0.63: 51-digit result (PG's exp(123.456)) — exact via the
+        // big mantissa; matches PG19's numeric.out digit-for-digit.
+        assert_eq!(
+            e("123.456"),
+            "413294435277809344957685441227343146614594393746575438.725"
+        );
     }
 
     #[test]
@@ -6465,5 +6811,149 @@ mod v062_transcendental_tests {
         assert!(!l.is_zero());
         let r = exp_var_inner(&dec("0.0100000001"), 10, 30);
         assert!(matches!(r, ExpOutcome::Finite(_)));
+    }
+}
+
+#[cfg(test)]
+mod v063_big_mantissa_tests {
+    use super::*;
+
+    fn num(s: &str) -> Numeric {
+        Numeric::parse(s).unwrap()
+    }
+
+    #[test]
+    fn big_parse_and_render_roundtrip() {
+        let n = num("12345678901234567890123456789012345678901234567890");
+        assert!(n.is_big());
+        assert_eq!(
+            n.to_text(),
+            "12345678901234567890123456789012345678901234567890"
+        );
+        // WAL roundtrip: to_text -> parse is exact.
+        assert_eq!(Numeric::parse(&n.to_text()).unwrap(), n);
+        // Negative big.
+        let m = num("-99999999999999999999999999999999999999999");
+        assert!(m.is_big());
+        assert!(m.unscaled < 0);
+        assert_eq!(m.to_text(), "-99999999999999999999999999999999999999999");
+    }
+
+    #[test]
+    fn big_arithmetic_exact() {
+        let a = num("99999999999999999999999999999999999999");
+        let b = num("99999999999999999999999999999999999999");
+        assert_eq!(
+            a.checked_mul(&b).unwrap().to_text(),
+            "9999999999999999999999999999999999999800000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            num("100000000000000000000000000000000000000")
+                .checked_rem(&num("3"))
+                .unwrap()
+                .to_text(),
+            "1"
+        );
+        assert_eq!(
+            num("-100000000000000000000000000000000000007")
+                .checked_rem(&num("3"))
+                .unwrap()
+                .to_text(),
+            "-2"
+        );
+        // Big division at scale (10^39 is big; 10^38 still fits i128).
+        assert_eq!(
+            num("1000000000000000000000000000000000000000")
+                .div_at_scale(&num("3"), 2)
+                .unwrap()
+                .to_text(),
+            "333333333333333333333333333333333333333.33"
+        );
+        // Small-huge quotient no longer saturates (exact division).
+        assert_eq!(
+            num("100000000000000000000000000000000000000")
+                .div_at_scale(&num("3"), 2)
+                .unwrap()
+                .to_text(),
+            "33333333333333333333333333333333333333.33"
+        );
+    }
+
+    #[test]
+    fn big_ordering_and_equality() {
+        let big = num("100000000000000000000000000000000000000");
+        let small = num("1");
+        assert!(big > small);
+        assert!(small < big);
+        assert_eq!(big, num("100000000000000000000000000000000000000"));
+        assert_ne!(big, num("99999999999999999999999999999999999999"));
+        // Big vs zero.
+        assert!(big > Numeric::zero());
+        assert!(Numeric::zero() < big);
+        // Negative big.
+        let neg = num("-100000000000000000000000000000000000000");
+        assert!(neg < small);
+        assert!(neg < big);
+    }
+
+    #[test]
+    fn big_integral_parity() {
+        // 10^39 is even; 10^39+1 is odd.
+        assert_eq!(
+            integral_parity(&num("1000000000000000000000000000000000000000")),
+            Some(false)
+        );
+        assert_eq!(
+            integral_parity(&num("1000000000000000000000000000000000000001")),
+            Some(true)
+        );
+        // Fractional big is not integral.
+        assert_eq!(
+            integral_parity(&num("1000000000000000000000000000000000000000.5")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn big_toast_bytes_carry_magnitude() {
+        let n = num("12345678901234567890123456789012345678901234567890");
+        let b = n.toast_bytes();
+        assert_eq!(b.len(), n.toast_len());
+        assert!(b.len() > 21);
+        // Magnitude rides along as decimal bytes after the header.
+        assert!(b.ends_with(b"12345678901234567890123456789012345678901234567890"));
+        // Small values keep the 21-byte encoding.
+        let s = num("1.5");
+        assert_eq!(s.toast_len(), 21);
+        assert_eq!(s.toast_bytes().len(), 21);
+    }
+
+    #[test]
+    fn big_power_int_exact() {
+        // (10^40)^2 = 10^80 exactly (big base, integer exponent).
+        let base = num("10000000000000000000000000000000000000000");
+        assert!(base.is_big());
+        let p = base.power_int(2, 0).unwrap();
+        assert_eq!(p.to_text(), "1".to_string() + &"0".repeat(80));
+        // (10^40)^-1 = 10^-40.
+        let q = base.power_int(-1, 0).unwrap();
+        assert!(
+            q.to_text()
+                .starts_with("0.0000000000000000000000000000000000000001")
+        );
+    }
+
+    #[test]
+    fn numeric_limits_still_enforced() {
+        // Beyond 131072 integer digits -> None (exec maps to 22003).
+        assert!(
+            Numeric::from_big(false, BigUint::from_decimal_str(&"9".repeat(131073)), 0, 0)
+                .is_none()
+        );
+        // Exactly at the limit is fine.
+        assert!(
+            Numeric::from_big(false, BigUint::from_decimal_str(&"9".repeat(131072)), 0, 0)
+                .is_some()
+        );
     }
 }

@@ -478,6 +478,9 @@ fn shift_decimal(n: &Numeric, places: i32) -> Option<Numeric> {
         // v0.61: shifting the point preserves the declared display scale.
         dscale: n.dscale,
         special: NumericSpecial::Finite,
+        // v0.63: shift_decimal only re-points the decimal; a big
+        // magnitude stays big (unscaled still holds the sign).
+        big: n.big.clone(),
     })
 }
 
@@ -488,6 +491,13 @@ fn scale_up(n: &Numeric, places: i32) -> Option<Numeric> {
     if n.special != NumericSpecial::Finite {
         return Some(n.clone());
     }
+    // v0.63: big-mantissa aware — widen via the exact magnitude, not
+    // the sign-only `unscaled`.
+    if n.is_big() {
+        let mut mag = n.mag();
+        mag.mul_pow10_assign(places as u32);
+        return Numeric::from_big(n.unscaled < 0, mag, n.scale + places, n.dscale + places);
+    }
     let factor = 10i128.checked_pow(places as u32)?;
     Some(Numeric {
         unscaled: n.unscaled.checked_mul(factor)?,
@@ -495,5 +505,6 @@ fn scale_up(n: &Numeric, places: i32) -> Option<Numeric> {
         // v0.61: widening shows more fractional digits.
         dscale: n.dscale + places,
         special: NumericSpecial::Finite,
+        big: None,
     })
 }
