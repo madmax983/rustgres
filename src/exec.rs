@@ -45,9 +45,9 @@ use crate::sql::{
     collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row, RowVersion,
-    Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible,
-    toast_consts, toast_storage,
+    ArrayElem, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row,
+    RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp,
+    row_visible, toast_consts, toast_storage,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -7690,6 +7690,32 @@ fn est_index_rows(
     (rel * sel).round().max(1.0) as u64
 }
 
+/// v0.78: plan a CTE body for EXPLAIN. `visible` holds the CTEs the body
+/// may reference (outer levels ++ earlier siblings, in definition
+/// order). UNION bodies (recursive CTEs) are estimated, not planned.
+fn plan_cte_body(
+    eng: &Engine,
+    cte: &CteDef,
+    visible: &[CteDef],
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Result<PlanNode, ExecError> {
+    match &cte.body {
+        CteBody::Simple(sel) => plan_select(eng, sel, snap, own, session, visible),
+        CteBody::Union { left, right, all } => {
+            let l = plan_select(eng, left, snap, own, session, visible)?;
+            let r = plan_select(eng, right, snap, own, session, visible)?;
+            let rows = if *all {
+                l.rows().saturating_add(r.rows())
+            } else {
+                l.rows().max(r.rows())
+            };
+            Ok(PlanNode::Values { rows })
+        }
+    }
+}
+
 fn plan_from_item(
     eng: &Engine,
     item: &FromItem,
@@ -7697,9 +7723,34 @@ fn plan_from_item(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    // v0.78: effective CTE list (outer ++ this level's, in definition
+    // order) so EXPLAIN can resolve CTE references like the executor.
+    ctes: &[CteDef],
 ) -> Result<PlanNode, ExecError> {
     match item {
         FromItem::Table { name, alias, .. } => {
+            // v0.78: CTEs shadow everything (like Postgres and the
+            // executor's build_source). Plan the CTE body as a subquery
+            // scan; the body only sees CTEs defined before it (plus
+            // outer ones), matching materialization order.
+            if let Some(pos) = ctes.iter().rposition(|c| c.name == *name) {
+                let cte = &ctes[pos];
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                // Recursive CTEs reference themselves: planning the body
+                // would recurse forever, so use a nominal estimate (the
+                // executor iterates to a fixpoint instead).
+                let child = if cte.recursive {
+                    PlanNode::Values { rows: 100 }
+                } else {
+                    plan_cte_body(eng, cte, &ctes[..pos], snap, own, session)?
+                };
+                let rows = child.rows();
+                return Ok(PlanNode::SubqueryScan {
+                    alias: qual,
+                    rows,
+                    child: Box::new(child),
+                });
+            }
             // v0.9: information_schema virtual tables plan as scans.
             if name == "information_schema.tables" || name == "information_schema.columns" {
                 return Ok(PlanNode::SeqScan {
@@ -7802,7 +7853,9 @@ fn plan_from_item(
             }
         }
         FromItem::Derived { sub, alias, .. } => {
-            let child = plan_select(eng, sub, snap, own, session)?;
+            // v0.78: derived tables see the enclosing CTEs (like the
+            // executor's shared CTE bindings).
+            let child = plan_select(eng, sub, snap, own, session, ctes)?;
             let rows = child.rows();
             Ok(PlanNode::SubqueryScan {
                 alias: alias.clone(),
@@ -7820,8 +7873,8 @@ fn plan_from_item(
         // The executor runs joins as nested loops; the filter attaches to
         // the outermost Nested Loop node at the top level.
         FromItem::Join { left, right, .. } => {
-            let outer = plan_from_item(eng, left, None, snap, own, session)?;
-            let inner = plan_from_item(eng, right, None, snap, own, session)?;
+            let outer = plan_from_item(eng, left, None, snap, own, session, ctes)?;
+            let inner = plan_from_item(eng, right, None, snap, own, session, ctes)?;
             let rows = outer.rows().saturating_mul(inner.rows());
             Ok(PlanNode::NestedLoop {
                 filter: None,
@@ -7839,7 +7892,14 @@ fn plan_select(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    // v0.78: CTEs from enclosing query levels (definition order).
+    outer_ctes: &[CteDef],
 ) -> Result<PlanNode, ExecError> {
+    // v0.78: effective CTE list = outer ++ this level's WITH. Later
+    // entries shadow earlier ones on name lookup (rposition).
+    let mut eff: Vec<CteDef> = outer_ctes.to_vec();
+    eff.extend(stmt.with.iter().cloned());
+    let ctes: &[CteDef] = &eff;
     // 1. FROM → access paths. A single base table with a usable
     // ORDER BY ... LIMIT hint becomes an index-order scan.
     let mut ordered = false;
@@ -7868,10 +7928,26 @@ fn plan_select(
                         .join(", "),
                 }
             } else {
-                plan_from_item(eng, &stmt.from[0], stmt.where_.as_ref(), snap, own, session)?
+                plan_from_item(
+                    eng,
+                    &stmt.from[0],
+                    stmt.where_.as_ref(),
+                    snap,
+                    own,
+                    session,
+                    ctes,
+                )?
             }
         } else {
-            plan_from_item(eng, &stmt.from[0], stmt.where_.as_ref(), snap, own, session)?
+            plan_from_item(
+                eng,
+                &stmt.from[0],
+                stmt.where_.as_ref(),
+                snap,
+                own,
+                session,
+                ctes,
+            )?
         }
     } else {
         let mut items = stmt.from.iter();
@@ -7882,9 +7958,10 @@ fn plan_select(
             snap,
             own,
             session,
+            ctes,
         )?;
         for item in items {
-            let inner = plan_from_item(eng, item, stmt.where_.as_ref(), snap, own, session)?;
+            let inner = plan_from_item(eng, item, stmt.where_.as_ref(), snap, own, session, ctes)?;
             let rows = node.rows().saturating_mul(inner.rows());
             node = PlanNode::NestedLoop {
                 filter: None,
@@ -8086,7 +8163,7 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
         }
     };
     // Planning only inspects definitions and statistics — nothing runs.
-    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session)?;
+    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session, &[])?;
     let mut lines = Vec::new();
     render_plan(&plan, 0, &mut lines);
     Ok(ExecResult::Explain {
@@ -8925,7 +9002,7 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
         SelectItem::Expr { expr, .. } => expr_uses(expr),
         _ => false,
     }) || stmt.where_.as_ref().is_some_and(expr_uses)
-        || stmt.group_by.iter().any(expr_uses)
+        || stmt.group_by.iter().flatten().any(expr_uses)
         || stmt.having.as_ref().is_some_and(expr_uses)
         || stmt.order_by.iter().any(|o| expr_uses(&o.expr))
         // v0.52: DISTINCT ON expressions can call it too.
@@ -9854,7 +9931,7 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
     if let Some(w) = &stmt.where_ {
         crate::sql::collect_col_refs(w, &mut refs);
     }
-    for g in &stmt.group_by {
+    for g in stmt.group_by.iter().flatten() {
         crate::sql::collect_col_refs(g, &mut refs);
     }
     if let Some(h) = &stmt.having {
@@ -10506,7 +10583,7 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
         }
         validate_expr(w)?;
     }
-    for g in &stmt.group_by {
+    for g in stmt.group_by.iter().flatten() {
         if contains_agg(g) {
             return Err(exec_err("42803", "aggregates are not allowed in GROUP BY"));
         }
@@ -12581,7 +12658,7 @@ fn collect_stmt_refs(s: &SelectStmt, out: &mut Vec<(Option<String>, String)>) {
     if let Some(w) = &s.where_ {
         collect_column_refs(w, out);
     }
-    for g in &s.group_by {
+    for g in s.group_by.iter().flatten() {
         collect_column_refs(g, out);
     }
     if let Some(h) = &s.having {
@@ -14360,39 +14437,51 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
 /// With no GROUP BY and no input rows there is still exactly one (empty)
 /// group, so `SELECT count(*)` returns 0 rather than no rows — like
 /// Postgres. FOR UPDATE never reaches here (rejected in validation).
-/// v0.47: resolve GROUP BY ordinals to select-list expressions. PG19's
-/// parse analysis treats an integer literal in GROUP BY as an ordinal
-/// reference to the select list (`GROUP BY 1` groups by the first select
-/// item), never as a constant. Out-of-range ordinals — and ordinals
-/// pointing at `*` items, whose star expansion is unsupported in grouping
-/// keys — are 42803 ("GROUP BY position N is not in select list").
-fn resolve_group_ordinals(stmt: &SelectStmt) -> Result<Vec<Expr>, ExecError> {
-    let mut out = Vec::with_capacity(stmt.group_by.len());
-    for g in &stmt.group_by {
-        let ordinal = match g {
-            Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) => usize::try_from(*n).ok(),
-            _ => None,
-        };
-        match ordinal {
-            Some(n) if n >= 1 => match stmt.items.get(n - 1) {
-                Some(SelectItem::Expr { expr, .. }) => out.push(expr.clone()),
-                _ => {
+/// v0.78: resolve GROUP BY ordinals to select-list expressions, per
+/// grouping set. PG19's parse analysis treats an integer literal in
+/// GROUP BY as an ordinal reference to the select list (`GROUP BY 1`
+/// groups by the first select item), never as a constant. Out-of-range
+/// ordinals — and ordinals pointing at `*` items, whose star expansion
+/// is unsupported in grouping keys — are 42803 ("GROUP BY position N
+/// is not in select list"). With no GROUP BY at all there is a single
+/// empty set (the v0.47 grand-total behavior).
+fn resolve_grouping_sets(stmt: &SelectStmt) -> Result<Vec<Vec<Expr>>, ExecError> {
+    fn resolve_one(stmt: &SelectStmt, set: &[Expr]) -> Result<Vec<Expr>, ExecError> {
+        let mut out = Vec::with_capacity(set.len());
+        for g in set {
+            let ordinal = match g {
+                Expr::Literal(Literal::Int(n) | Literal::BigInt(n)) => usize::try_from(*n).ok(),
+                _ => None,
+            };
+            match ordinal {
+                Some(n) if n >= 1 => match stmt.items.get(n - 1) {
+                    Some(SelectItem::Expr { expr, .. }) => out.push(expr.clone()),
+                    _ => {
+                        return Err(exec_err(
+                            "42803",
+                            format!("GROUP BY position {n} is not in select list"),
+                        ));
+                    }
+                },
+                Some(n) => {
                     return Err(exec_err(
                         "42803",
                         format!("GROUP BY position {n} is not in select list"),
                     ));
                 }
-            },
-            Some(n) => {
-                return Err(exec_err(
-                    "42803",
-                    format!("GROUP BY position {n} is not in select list"),
-                ));
+                None => out.push(g.clone()),
             }
-            None => out.push(g.clone()),
         }
+        Ok(out)
     }
-    Ok(out)
+
+    if stmt.group_by.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    stmt.group_by
+        .iter()
+        .map(|set| resolve_one(stmt, set))
+        .collect()
 }
 
 /// v0.47: evaluate one GROUP BY key expression for a single input row,
@@ -14416,6 +14505,12 @@ fn eval_group_key_expanded(
     Ok(vec![eval_expr(q, scopes, key)?])
 }
 
+/// v0.78: dispatcher for grouped aggregation. Plain `GROUP BY` (or no
+/// GROUP BY) keeps the exact legacy single-set path; grouping-set
+/// syntax (`()`, `ROLLUP`, `CUBE`, `GROUPING SETS`, `DISTINCT`) runs one
+/// aggregation per set, with bare select-list columns not in the current
+/// set evaluating to NULL (PG19 semantics). Non-trivial expressions over
+/// unbound columns still raise 42803, like PG.
 fn exec_agg(
     q: &mut Q,
     outer: &[Scope],
@@ -14426,10 +14521,134 @@ fn exec_agg(
     // v0.10: deduplicated window specs for this query level.
     windows: &[ExecWindow],
 ) -> Result<Vec<OutRow>, ExecError> {
+    let sets = resolve_grouping_sets(stmt)?;
+    if !stmt.group_by_sets {
+        debug_assert!(sets.len() <= 1);
+        let set = sets.into_iter().next().unwrap_or_default();
+        return exec_agg_one(q, outer, stmt, &set, schema, rows, out_cols, windows, None);
+    }
+    let mut out = Vec::new();
+    for set in &sets {
+        let null_items = unbound_bare_columns(stmt, schema, set);
+        out.extend(exec_agg_one(
+            q,
+            outer,
+            stmt,
+            set,
+            schema,
+            rows,
+            out_cols,
+            windows,
+            Some(&null_items),
+        )?);
+    }
+    Ok(out)
+}
+
+/// v0.78: whether a bare column reference (qual, name) is bound by one
+/// of the grouping key expressions — the binding half of
+/// `grouped_col_value`, without the 42803 error. Column resolution is
+/// schema-only, so a dummy scope with an empty row suffices.
+fn is_group_bound(group_keys: &[Expr], schema: &[QCol], qual: &str, name: &str) -> bool {
+    let gscope = Scope {
+        schema,
+        row: &[],
+        prov: None,
+    };
+    let qual_opt = if qual.is_empty() { None } else { Some(qual) };
+    let Ok((rsi, rci)) = resolve_col(&[gscope], qual_opt, name) else {
+        return false;
+    };
+    for g in group_keys {
+        match g {
+            Expr::Column {
+                table: gq,
+                name: gn,
+            } => {
+                if let Ok((gsi, gci)) = resolve_col(&[gscope], gq.as_deref(), gn) {
+                    if gsi == rsi && gci == rci {
+                        return true;
+                    }
+                }
+            }
+            _ => {
+                let probe = Expr::Column {
+                    table: qual_opt.map(|s| s.to_string()),
+                    name: name.to_string(),
+                };
+                if *g == probe {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// v0.78: select-item indices whose bare-column projection must yield
+/// NULL for the given grouping set (PG19: grouping-set queries show
+/// unbound columns as NULL). Only top-level `SelectItem::Expr` with a
+/// bare `Expr::Column`, and the individual columns of `*` / `qual.*`
+/// expansions, qualify; non-trivial expressions keep the 42803 check.
+/// `SelectItem::Expr` entries are keyed by item index; `*`/`qual.*` by
+/// `usize::MAX - schema_index` (disjoint from item indices).
+fn unbound_bare_columns(
+    stmt: &SelectStmt,
+    schema: &[QCol],
+    group_keys: &[Expr],
+) -> std::collections::HashSet<usize> {
+    let mut null_items = std::collections::HashSet::new();
+    for (i, item) in stmt.items.iter().enumerate() {
+        match item {
+            SelectItem::Expr { expr, .. } => {
+                if let Expr::Column { table, name } = expr {
+                    if !is_group_bound(group_keys, schema, table.as_deref().unwrap_or(""), name) {
+                        null_items.insert(i);
+                    }
+                }
+            }
+            SelectItem::All => {
+                for (ci, c) in schema.iter().enumerate() {
+                    if c.hidden {
+                        continue;
+                    }
+                    if !is_group_bound(group_keys, schema, &c.qual, &c.name) {
+                        null_items.insert(usize::MAX - ci);
+                    }
+                }
+            }
+            SelectItem::AllOf(qual) => {
+                for i in qual_star_order(schema, qual) {
+                    let c = &schema[i];
+                    if !is_group_bound(group_keys, schema, qual, &c.name) {
+                        null_items.insert(usize::MAX - i);
+                    }
+                }
+            }
+        }
+    }
+    null_items
+}
+
+fn exec_agg_one(
+    q: &mut Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    // v0.78: the grouping key expressions for this one grouping set.
+    group_keys: &[Expr],
+    schema: &[QCol],
+    rows: &[QRow],
+    out_cols: &[(String, ColType)],
+    // v0.10: deduplicated window specs for this query level.
+    windows: &[ExecWindow],
+    // v0.78: `Some` only for grouping-set queries: select-item indices
+    // (and star columns) that must project NULL instead of 42803.
+    null_items: Option<&std::collections::HashSet<usize>>,
+) -> Result<Vec<OutRow>, ExecError> {
     // Group rows by their GROUP BY key, remembering first-seen order.
     // v0.47: GROUP BY ordinals resolve to select-list expressions (PG19
-    // parse analysis: `GROUP BY 1` groups by the first select item).
-    let group_keys = resolve_group_ordinals(stmt)?;
+    // parse analysis: `GROUP BY 1` groups by the first select item);
+    // v0.78: resolved per grouping set by the caller.
     // v0.47: positions of top-level SRF calls in the grouping keys. When
     // non-empty, input rows fan out per PG19's ProjectSet-below-Aggregate
     // before grouping, and aggregates fold the expanded rows.
@@ -14468,7 +14687,7 @@ fn exec_agg(
         if !has_srf_keys {
             // GROUP BY exprs cannot contain aggregates (validated).
             let mut key_vals = Vec::with_capacity(group_keys.len());
-            for g in &group_keys {
+            for g in group_keys {
                 key_vals.push(eval_expr(q, scopes, g)?);
             }
             xkeys.push(key_vals);
@@ -14540,15 +14759,7 @@ fn exec_agg(
         let keep = match &stmt.having {
             None => true,
             Some(h) => eval_grouped_bool(
-                q,
-                outer,
-                gscope,
-                schema,
-                rows_eff,
-                idxs,
-                key_vals,
-                &group_keys,
-                h,
+                q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, h,
             )?,
         };
         if keep {
@@ -14559,14 +14770,7 @@ fn exec_agg(
     // input row per group).
     if !windows.is_empty() {
         let inputs = gather_window_inputs_grouped(
-            q,
-            outer,
-            schema,
-            rows_eff,
-            &groups,
-            &surviving,
-            &group_keys,
-            windows,
+            q, outer, schema, rows_eff, &groups, &surviving, group_keys, windows,
         )?;
         install_windows(q, windows, &inputs)?;
     }
@@ -14608,18 +14812,27 @@ fn exec_agg(
             prov: first_prov,
         };
         let mut cells = Vec::new();
-        for item in &stmt.items {
+        // v0.78: grouping-set NULL substitution. `null_items` holds the
+        // select-item indices (and `usize::MAX - ci` for star columns)
+        // whose bare columns are not in this grouping set: PG projects
+        // them as NULL instead of raising 42803.
+        let is_null_item = |key: usize| -> bool { null_items.is_some_and(|s| s.contains(&key)) };
+        for (ii, item) in stmt.items.iter().enumerate() {
             match item {
                 SelectItem::All => {
                     // v0.23: hidden columns are skipped by `*`.
-                    for c in schema.iter().filter(|c| !c.hidden) {
-                        cells.push(grouped_col_value(
-                            gscope,
-                            &group_keys,
-                            key_vals,
-                            c.qual.as_str(),
-                            &c.name,
-                        )?);
+                    for (ci, c) in schema.iter().enumerate().filter(|(_, c)| !c.hidden) {
+                        if is_null_item(usize::MAX - ci) {
+                            cells.push(Value::Null);
+                        } else {
+                            cells.push(grouped_col_value(
+                                gscope,
+                                group_keys,
+                                key_vals,
+                                c.qual.as_str(),
+                                &c.name,
+                            )?);
+                        }
                     }
                 }
                 SelectItem::AllOf(qual) => {
@@ -14633,26 +14846,28 @@ fn exec_agg(
                     }
                     for i in idx {
                         let c = &schema[i];
-                        cells.push(grouped_col_value(
-                            gscope,
-                            &group_keys,
-                            key_vals,
-                            qual.as_str(),
-                            &c.name,
+                        if is_null_item(usize::MAX - i) {
+                            cells.push(Value::Null);
+                        } else {
+                            cells.push(grouped_col_value(
+                                gscope,
+                                group_keys,
+                                key_vals,
+                                qual.as_str(),
+                                &c.name,
+                            )?);
+                        }
+                    }
+                }
+                SelectItem::Expr { expr, .. } => {
+                    if is_null_item(ii) {
+                        cells.push(Value::Null);
+                    } else {
+                        cells.push(eval_grouped(
+                            q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, expr,
                         )?);
                     }
                 }
-                SelectItem::Expr { expr, .. } => cells.push(eval_grouped(
-                    q,
-                    outer,
-                    gscope,
-                    schema,
-                    rows_eff,
-                    idxs,
-                    key_vals,
-                    &group_keys,
-                    expr,
-                )?),
             }
         }
         let sort_keys = if stmt.order_by.is_empty() {
@@ -14660,15 +14875,7 @@ fn exec_agg(
         } else {
             let mut fallback = |e: &Expr| {
                 eval_grouped(
-                    q,
-                    outer,
-                    gscope,
-                    schema,
-                    rows_eff,
-                    idxs,
-                    key_vals,
-                    &group_keys,
-                    e,
+                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, e,
                 )
             };
             let mut keys = Vec::with_capacity(stmt.order_by.len());
@@ -18835,6 +19042,14 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
             Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
             other => Err(cast_err(other, "json")),
+        },
+        // v0.78: casts to an array type take the `{...}` literal text
+        // (array_in accepts it); other inputs are a cast error, like PG.
+        // (Unreachable from the parser — type names can't name arrays —
+        // but the match must be exhaustive.)
+        ColType::Array(_) => match v {
+            Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
+            other => Err(cast_err(other, &to.sql_name())),
         },
     }
 }
@@ -25618,7 +25833,7 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::Cast { expr, to } => {
             let (inner, s) = expr_col_name_strength(expr);
             if s <= 1 {
-                (to.pg_typname().to_string(), 1)
+                (to.pg_typname(), 1)
             } else {
                 (inner, s)
             }
@@ -25832,9 +26047,24 @@ fn expr_type(
             }
             Ok(cols[0].clone().1)
         }
-        // v0.77: `array(SELECT ...)` returns a PG array literal as Text
-        // (a proper array type is future work).
-        Expr::ArraySubquery(_) => Ok(ColType::Text),
+        // v0.78: `array(SELECT ...)` — a proper array type over the
+        // subquery's (single) column type, with PG's array OID. Values
+        // are still carried as the `{...}` literal text (exactly what
+        // array_out puts on the wire); a Value::Array variant with
+        // element-wise operations is future work.
+        Expr::ArraySubquery(sub) => {
+            let mut sub_outer: Vec<&[QCol]> = Vec::with_capacity(schemas.len() + outer.len());
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            let cols = describe_select_outer(eng, snap, own, session, sub, ctes, &[], &sub_outer)?;
+            if cols.len() != 1 {
+                return Err(exec_err("42601", "subquery must return only one column"));
+            }
+            let elem = cols[0].clone().1;
+            // PG flattens nested arrays: `array(SELECT array(...))`
+            // keeps the innermost element's array OID.
+            Ok(ColType::Array(ArrayElem::of(&elem)))
+        }
         // v0.10: window function result types.
         Expr::Window { func, args, .. } => {
             window_result_type(eng, snap, own, session, schemas, outer, ctes, func, args)
@@ -26515,7 +26745,7 @@ fn infer_select(
     if let Some(w) = &s.where_ {
         infer_expr(w, eng, snap, own, session, &refs, out)?;
     }
-    for g in &s.group_by {
+    for g in s.group_by.iter().flatten() {
         infer_expr(g, eng, snap, own, session, &refs, out)?;
     }
     if let Some(h) = &s.having {
@@ -26867,7 +27097,9 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         )
     };
     match t {
-        ColType::Text => {
+        // v0.78: array parameters arrive as the `{...}` literal text —
+        // the same representation values are carried in.
+        ColType::Text | ColType::Array(_) => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::text(s))
@@ -27172,7 +27404,7 @@ fn subst_select(s: &mut SelectStmt, params: &[Option<Value>]) -> Result<(), Exec
     if let Some(w) = &mut s.where_ {
         subst_expr(w, params)?;
     }
-    for g in &mut s.group_by {
+    for g in s.group_by.iter_mut().flatten() {
         subst_expr(g, params)?;
     }
     if let Some(h) = &mut s.having {
@@ -27352,6 +27584,9 @@ fn dummy_value(t: &ColType) -> Value {
         // the empty record is the honest dummy.
         ColType::Record => Value::Record(Vec::new()),
         ColType::Json => Value::text(""),
+        // v0.78: the empty array literal is the honest dummy; values
+        // are carried as the `{...}` literal text.
+        ColType::Array(_) => Value::text("{}"),
     }
 }
 
@@ -31310,6 +31545,218 @@ mod tests {
         let rows2 =
             rows_of(run(&mut eng, "SELECT array(SELECT x FROM arr_t WHERE x > 100)").unwrap());
         assert_eq!(rows2, vec![vec!["{}".to_string()]]);
+    }
+
+    #[test]
+    fn v78_array_subquery_has_array_type() {
+        // v0.78: `array(SELECT ...)` carries a proper array type with
+        // PG's array OID (not text's 25). Values stay the `{...}`
+        // literal text, which is what array_out puts on the wire.
+        use crate::storage::ArrayElem;
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE arr_t (x int, t text)").unwrap();
+        run(&mut eng, "INSERT INTO arr_t VALUES (1, 'a'), (2, 'b')").unwrap();
+
+        let r = run(&mut eng, "SELECT array(SELECT x FROM arr_t ORDER BY x)").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].1, ColType::Array(ArrayElem::Int));
+                assert_eq!(columns[0].1.oid(), 1007); // _int4, not 25
+                assert_eq!(columns[0].1.sql_name(), "integer[]");
+                assert_eq!(columns[0].1.pg_typname(), "_int4");
+            }
+            _ => panic!("expected Select"),
+        }
+        assert_eq!(rows_of(r).concat(), vec!["{1,2}".to_string()]);
+
+        // Text element -> _text (1009).
+        let r = run(&mut eng, "SELECT array(SELECT t FROM arr_t ORDER BY t)").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns[0].1, ColType::Array(ArrayElem::Text));
+                assert_eq!(columns[0].1.oid(), 1009);
+                assert_eq!(columns[0].1.sql_name(), "text[]");
+                assert_eq!(columns[0].1.pg_typname(), "_text");
+            }
+            _ => panic!("expected Select"),
+        }
+
+        // PG flattens nested arrays: still _int4.
+        let r = run(&mut eng, "SELECT array(SELECT array(SELECT x FROM arr_t))").unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns[0].1, ColType::Array(ArrayElem::Int));
+                assert_eq!(columns[0].1.oid(), 1007);
+            }
+            _ => panic!("expected Select"),
+        }
+
+        // Element-type mapping spot checks (pg_type.dat array OIDs).
+        assert_eq!(ArrayElem::of(&ColType::Bool).array_oid(), 1000);
+        assert_eq!(ArrayElem::of(&ColType::BigInt).array_oid(), 1016);
+        assert_eq!(ArrayElem::of(&ColType::Float).array_oid(), 1022);
+        assert_eq!(ArrayElem::of(&ColType::Numeric(None)).array_oid(), 1231);
+        assert_eq!(ArrayElem::of(&ColType::Uuid).array_oid(), 2951);
+        assert_eq!(ArrayElem::of(&ColType::Timestamp).array_oid(), 1115);
+        assert_eq!(ArrayElem::of(&ColType::Date).array_oid(), 1182);
+        // Nested input flattens instead of nesting.
+        assert_eq!(
+            ArrayElem::of(&ColType::Array(ArrayElem::Int)),
+            ArrayElem::Int
+        );
+    }
+
+    #[test]
+    fn v78_explain_resolves_ctes() {
+        // v0.78: the planner resolves CTE names in FROM (including joins
+        // and derived tables), like the executor. Previously EXPLAIN of a
+        // query referencing a CTE failed with 42P01, which — now that
+        // errors abort the txn (v0.77) — poisoned explicit transactions
+        // in the conformance suite.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE cte_t (a int)").unwrap();
+        // CTE in a join (the join.sql #19560 shape).
+        let r = run(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) WITH viewer AS (SELECT 'bob' AS id) \
+             SELECT count(*) FROM cte_t LEFT JOIN viewer ON true",
+        )
+        .unwrap();
+        let plan = rows_of(r)
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Subquery Scan on viewer"),
+            "plan was:\n{plan}"
+        );
+        // Chained CTEs: inner CTE visible to later ones.
+        let r2 = run(
+            &mut eng,
+            "EXPLAIN WITH x AS (SELECT 1 AS a), y AS (SELECT a + 1 AS b FROM x) SELECT * FROM y",
+        )
+        .unwrap();
+        let plan2 = rows_of(r2)
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan2.contains("Subquery Scan on y"), "plan was:\n{plan2}");
+        assert!(plan2.contains("Subquery Scan on x"), "plan was:\n{plan2}");
+        // CTE shadowing a real table plans the CTE, like the executor.
+        let r3 = run(
+            &mut eng,
+            "EXPLAIN WITH cte_t AS (SELECT 2 AS a) SELECT * FROM cte_t",
+        )
+        .unwrap();
+        let plan3 = rows_of(r3)
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan3.contains("Subquery Scan on cte_t"),
+            "plan was:\n{plan3}"
+        );
+        // Recursive CTE: nominal estimate, no infinite recursion.
+        let r4 = run(
+            &mut eng,
+            "EXPLAIN WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+        )
+        .unwrap();
+        assert!(!rows_of(r4).is_empty());
+        // Unknown relation is still 42P01.
+        let err = run(&mut eng, "EXPLAIN SELECT * FROM no_such_rel").unwrap_err();
+        assert_eq!(err.code, "42P01");
+    }
+
+    #[test]
+    fn v78_grouping_sets() {
+        // v0.78: PG grouping-set syntax (`()`, ROLLUP, CUBE, GROUPING
+        // SETS, DISTINCT) parses and executes: one aggregation per set,
+        // bare columns not in the current set project as NULL (PG19).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE gs_u (a int, b int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO gs_u VALUES (1, 10), (1, 20), (2, 30)",
+        )
+        .unwrap();
+        // GROUPING SETS ((a), (b), ()): per-set groups plus NULLs for
+        // the columns each set does not group by.
+        let r = run(
+            &mut eng,
+            "SELECT a, b, count(*) FROM gs_u \
+             GROUP BY GROUPING SETS ((a), (b), ()) ORDER BY 1, 2, 3",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows[0],
+            vec!["1".to_string(), "NULL".to_string(), "2".to_string()]
+        );
+        assert_eq!(
+            rows[1],
+            vec!["2".to_string(), "NULL".to_string(), "1".to_string()]
+        );
+        assert_eq!(
+            rows[2],
+            vec!["NULL".to_string(), "10".to_string(), "1".to_string()]
+        );
+        assert_eq!(
+            rows[5],
+            vec!["NULL".to_string(), "NULL".to_string(), "3".to_string()]
+        );
+        // ROLLUP: (a) then the grand total.
+        let r = run(
+            &mut eng,
+            "SELECT a, count(*) FROM gs_u GROUP BY ROLLUP (a) ORDER BY 1, 2",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], vec!["NULL".to_string(), "3".to_string()]);
+        // CUBE (a) on one column: same shape as ROLLUP here.
+        let r = run(
+            &mut eng,
+            "SELECT a, count(*) FROM gs_u GROUP BY CUBE (a) ORDER BY 1, 2",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r).len(), 3);
+        // GROUP BY (): grand total only.
+        let r = run(&mut eng, "SELECT count(*) FROM gs_u GROUP BY ()").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["3".to_string()]]);
+        // DISTINCT dedups identical sets.
+        let r = run(
+            &mut eng,
+            "SELECT a, count(*) FROM gs_u \
+             GROUP BY DISTINCT GROUPING SETS ((a), (a)) ORDER BY 1, 2",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r).len(), 2);
+        // Plain GROUP BY still raises 42803 for unbound bare columns.
+        let err = run(&mut eng, "SELECT a, b FROM gs_u GROUP BY a").unwrap_err();
+        assert_eq!(err.code, "42803");
+        // Non-trivial expressions over unbound columns stay 42803 even
+        // with grouping-set syntax (only bare columns go NULL).
+        let err = run(
+            &mut eng,
+            "SELECT a + 1 FROM gs_u GROUP BY GROUPING SETS ((b))",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+        // EXPLAIN accepts grouping-set syntax (this poisoned explicit
+        // transactions in the JSS join suite before v0.78).
+        let r = run(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a, count(*) FROM gs_u \
+             GROUP BY GROUPING SETS ((), (a))",
+        )
+        .unwrap();
+        assert!(!rows_of(r).is_empty());
     }
 }
 

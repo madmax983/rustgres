@@ -78,6 +78,155 @@ pub enum ColType {
     // `row_to_json`. Values are carried as `Value::Text` holding the
     // JSON document text.
     Json, // OID 114
+    // v0.78: PG's array type — carries the element type. Arrays only
+    // flow through expression evaluation (like Record/Json); table
+    // columns cannot be arrays (no DDL support). Values are carried as
+    // `Value::Text` holding PG's `{...}` array-literal text, which is
+    // exactly what array_out produces on the wire. A `Value::Array`
+    // variant with element-wise operations (subscript, array_length,
+    // unnest) is future work. The element is a dedicated `Copy` enum
+    // (not `Box<ColType>`) so `ColType` stays `Copy`; PG flattens
+    // multidimensional arrays, so an array's element is never itself
+    // an array.
+    Array(ArrayElem),
+}
+
+/// v0.78: the scalar element type of a `ColType::Array`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayElem {
+    Bool,
+    Bytea,
+    SingleChar,
+    Name,
+    SmallInt,
+    Int,
+    Text,
+    Char,
+    Varchar,
+    BigInt,
+    Float4,
+    Float,
+    Date,
+    Timestamp,
+    Timestamptz,
+    Numeric,
+    Uuid,
+    Regclass,
+    Json,
+    Record,
+    PgLsn,
+}
+
+impl ArrayElem {
+    /// Build from a scalar `ColType`. A nested array flattens to its
+    /// element (PG semantics: `integer[][]` is still `_int4`).
+    pub fn of(ct: &ColType) -> Self {
+        match ct {
+            ColType::Array(e) => *e,
+            ColType::Bool => ArrayElem::Bool,
+            ColType::Bytea => ArrayElem::Bytea,
+            ColType::SingleChar => ArrayElem::SingleChar,
+            ColType::Name => ArrayElem::Name,
+            ColType::SmallInt => ArrayElem::SmallInt,
+            ColType::Int => ArrayElem::Int,
+            ColType::Text => ArrayElem::Text,
+            ColType::Char(_) => ArrayElem::Char,
+            ColType::Varchar(_) => ArrayElem::Varchar,
+            ColType::BigInt => ArrayElem::BigInt,
+            ColType::Float4 => ArrayElem::Float4,
+            ColType::Float => ArrayElem::Float,
+            ColType::Date => ArrayElem::Date,
+            ColType::Timestamp => ArrayElem::Timestamp,
+            ColType::Timestamptz => ArrayElem::Timestamptz,
+            ColType::Numeric(..) => ArrayElem::Numeric,
+            ColType::Uuid => ArrayElem::Uuid,
+            ColType::Regclass => ArrayElem::Regclass,
+            ColType::Json => ArrayElem::Json,
+            ColType::Record => ArrayElem::Record,
+            ColType::PgLsn => ArrayElem::PgLsn,
+        }
+    }
+
+    /// PG's `_<elem>` array OID (pg_type.dat).
+    pub fn array_oid(self) -> u32 {
+        match self {
+            ArrayElem::Bool => 1000,
+            ArrayElem::Bytea => 1001,
+            ArrayElem::SingleChar => 1002,
+            ArrayElem::Name => 1003,
+            ArrayElem::SmallInt => 1005,
+            ArrayElem::Int => 1007,
+            ArrayElem::Text => 1009,
+            ArrayElem::Char => 1014,
+            ArrayElem::Varchar => 1015,
+            ArrayElem::BigInt => 1016,
+            ArrayElem::Float4 => 1021,
+            ArrayElem::Float => 1022,
+            ArrayElem::Date => 1182,
+            ArrayElem::Timestamp => 1115,
+            ArrayElem::Timestamptz => 1185,
+            ArrayElem::Numeric => 1231,
+            ArrayElem::Uuid => 2951,
+            ArrayElem::Regclass => 2206,
+            ArrayElem::Json => 199,
+            ArrayElem::Record => 2287,
+            ArrayElem::PgLsn => 3221,
+        }
+    }
+
+    /// The element's typmod-free SQL name, e.g. `integer`.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ArrayElem::Bool => "boolean",
+            ArrayElem::Bytea => "bytea",
+            ArrayElem::SingleChar => "\"char\"",
+            ArrayElem::Name => "name",
+            ArrayElem::SmallInt => "smallint",
+            ArrayElem::Int => "integer",
+            ArrayElem::Text => "text",
+            ArrayElem::Char => "character",
+            ArrayElem::Varchar => "character varying",
+            ArrayElem::BigInt => "bigint",
+            ArrayElem::Float4 => "real",
+            ArrayElem::Float => "double precision",
+            ArrayElem::Date => "date",
+            ArrayElem::Timestamp => "timestamp without time zone",
+            ArrayElem::Timestamptz => "timestamp with time zone",
+            ArrayElem::Numeric => "numeric",
+            ArrayElem::Uuid => "uuid",
+            ArrayElem::Regclass => "regclass",
+            ArrayElem::Json => "json",
+            ArrayElem::Record => "record",
+            ArrayElem::PgLsn => "pg_lsn",
+        }
+    }
+
+    /// The element's `pg_type.typname`, e.g. `int4`.
+    pub fn pg_typname(self) -> &'static str {
+        match self {
+            ArrayElem::Bool => "bool",
+            ArrayElem::Bytea => "bytea",
+            ArrayElem::SingleChar => "char",
+            ArrayElem::Name => "name",
+            ArrayElem::SmallInt => "int2",
+            ArrayElem::Int => "int4",
+            ArrayElem::Text => "text",
+            ArrayElem::Char => "bpchar",
+            ArrayElem::Varchar => "varchar",
+            ArrayElem::BigInt => "int8",
+            ArrayElem::Float4 => "float4",
+            ArrayElem::Float => "float8",
+            ArrayElem::Date => "date",
+            ArrayElem::Timestamp => "timestamp",
+            ArrayElem::Timestamptz => "timestamptz",
+            ArrayElem::Numeric => "numeric",
+            ArrayElem::Uuid => "uuid",
+            ArrayElem::Regclass => "regclass",
+            ArrayElem::Json => "json",
+            ArrayElem::Record => "record",
+            ArrayElem::PgLsn => "pg_lsn",
+        }
+    }
 }
 
 impl ColType {
@@ -105,10 +254,17 @@ impl ColType {
             ColType::Name => 19,          // NAME (v0.57)
             ColType::Record => 2249,      // RECORD (v0.73)
             ColType::Json => 114,         // JSON (v0.73)
+            // v0.78: PG's _<elem> array OIDs (pg_type.dat).
+            ColType::Array(e) => e.array_oid() as i32,
         }
     }
 
-    pub fn sql_name(&self) -> &'static str {
+    pub fn sql_name(&self) -> String {
+        // v0.78: arrays render like PG's format_type (`integer[]`), so
+        // this returns an owned String now.
+        if let ColType::Array(elem) = self {
+            return format!("{}[]", elem.sql_name());
+        }
         match self {
             ColType::Int => "integer",
             ColType::BigInt => "bigint",
@@ -134,12 +290,18 @@ impl ColType {
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             ColType::Json => "json",     // v0.73
+            ColType::Array(_) => unreachable!("arrays return early above"),
         }
+        .to_string()
     }
 
     /// PostgreSQL `pg_type.typname` (v0.14): used as the default column
     /// name for a bare `SELECT expr::type` cast, like Postgres.
-    pub fn pg_typname(&self) -> &'static str {
+    /// v0.78: returns an owned String; arrays are PG's `_<elem>` names.
+    pub fn pg_typname(&self) -> String {
+        if let ColType::Array(elem) = self {
+            return format!("_{}", elem.pg_typname());
+        }
         match self {
             ColType::Int => "int4",
             ColType::BigInt => "int8",
@@ -166,7 +328,9 @@ impl ColType {
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             ColType::Json => "json",     // v0.73
+            ColType::Array(_) => unreachable!("arrays return early above"),
         }
+        .to_string()
     }
 
     /// v0.35: human-readable type with typmod, e.g. `character(4)` or
@@ -180,7 +344,7 @@ impl ColType {
             // v0.60: PG19's format_type shows the numeric typmod too.
             ColType::Numeric(Some((p, s))) => format!("numeric({},{})", p, s),
             ColType::Numeric(None) => "numeric".to_string(),
-            other => other.sql_name().to_string(),
+            other => other.sql_name(),
         }
     }
 

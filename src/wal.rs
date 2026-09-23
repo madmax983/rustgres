@@ -123,7 +123,7 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{Index, IndexDef};
 use crate::sql::{ArithOp, Expr, Literal};
-use crate::storage::{ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
+use crate::storage::{ArrayElem, ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
 
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
@@ -1090,6 +1090,15 @@ impl Enc {
                 self.u8(21);
                 return;
             }
+            // v0.78: array; tag appends after v0.73's, then the PG array
+            // OID (which identifies the element type). Arrays never
+            // appear as table columns — no DDL support — but the codec
+            // must stay exhaustive.
+            ColType::Array(elem) => {
+                self.u8(22);
+                self.u32(elem.array_oid());
+                return;
+            }
         });
     }
 
@@ -1654,6 +1663,35 @@ impl<'a> Dec<'a> {
             // v0.73: record, json.
             20 => Ok(ColType::Record),
             21 => Ok(ColType::Json),
+            // v0.78: array, then the PG array OID identifying the
+            // element type.
+            22 => {
+                let elem = match self.u32()? {
+                    1000 => ArrayElem::Bool,
+                    1001 => ArrayElem::Bytea,
+                    1002 => ArrayElem::SingleChar,
+                    1003 => ArrayElem::Name,
+                    1005 => ArrayElem::SmallInt,
+                    1007 => ArrayElem::Int,
+                    1009 => ArrayElem::Text,
+                    1014 => ArrayElem::Char,
+                    1015 => ArrayElem::Varchar,
+                    1016 => ArrayElem::BigInt,
+                    1021 => ArrayElem::Float4,
+                    1022 => ArrayElem::Float,
+                    1182 => ArrayElem::Date,
+                    1115 => ArrayElem::Timestamp,
+                    1185 => ArrayElem::Timestamptz,
+                    1231 => ArrayElem::Numeric,
+                    2951 => ArrayElem::Uuid,
+                    2206 => ArrayElem::Regclass,
+                    199 => ArrayElem::Json,
+                    2287 => ArrayElem::Record,
+                    3221 => ArrayElem::PgLsn,
+                    t => return Err(self.err(&format!("unknown array element OID {}", t))),
+                };
+                Ok(ColType::Array(elem))
+            }
             // v0.60: numeric with typmod (precision, scale).
             18 => {
                 let p = self.i32()?;
@@ -4925,6 +4963,29 @@ mod tests {
             e.col_type(&tm);
             let mut d = Dec::new(&e.buf);
             assert_eq!(d.col_type().unwrap(), tm);
+            d.end().unwrap();
+        }
+    }
+
+    #[test]
+    fn v078_array_coltype_roundtrip() {
+        // v0.78: array column types survive the WAL codec (tag 22 +
+        // the PG array OID identifying the element type).
+        use crate::storage::ArrayElem;
+        for elem in [
+            ArrayElem::Bool,
+            ArrayElem::Int,
+            ArrayElem::Text,
+            ArrayElem::Numeric,
+            ArrayElem::Timestamp,
+            ArrayElem::Uuid,
+            ArrayElem::Json,
+        ] {
+            let t = ColType::Array(elem);
+            let mut e = Enc::new();
+            e.col_type(&t);
+            let mut d = Dec::new(&e.buf);
+            assert_eq!(d.col_type().unwrap(), t);
             d.end().unwrap();
         }
     }

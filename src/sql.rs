@@ -1253,7 +1253,16 @@ pub struct SelectStmt {
     pub items: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub where_: Option<Expr>,
-    pub group_by: Vec<Expr>,
+    // v0.78: GROUP BY as a list of grouping sets (PG's grouping-set
+    // syntax: `GROUP BY ()`, `ROLLUP`, `CUBE`, `GROUPING SETS`). A
+    // plain `GROUP BY a, b` is one set `[[a, b]]`; empty when there is
+    // no GROUP BY at all.
+    pub group_by: Vec<Vec<Expr>>,
+    // v0.78: true when the GROUP BY used grouping-set syntax (one of
+    // `()`, `ROLLUP`, `CUBE`, `GROUPING SETS`, or `DISTINCT`). PG then
+    // evaluates bare columns that are not in the current grouping set
+    // as NULL; a plain GROUP BY instead raises 42803 for them.
+    pub group_by_sets: bool,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<i64>,
@@ -1286,6 +1295,7 @@ fn empty_select() -> SelectStmt {
         from: Vec::new(),
         where_: None,
         group_by: Vec::new(),
+        group_by_sets: false,
         having: None,
         order_by: Vec::new(),
         limit: None,
@@ -2756,7 +2766,7 @@ fn max_param_select(s: &SelectStmt) -> usize {
     if let Some(e) = &s.where_ {
         m = m.max(max_param_expr(e));
     }
-    for e in &s.group_by {
+    for e in s.group_by.iter().flatten() {
         m = m.max(max_param_expr(e));
     }
     if let Some(e) = &s.having {
@@ -7695,20 +7705,11 @@ impl Parser {
         } else {
             None
         };
-        let group_by = if self.eat_keyword("group") {
+        let (group_by, group_by_sets) = if self.eat_keyword("group") {
             self.expect_keyword("by")?;
-            let mut groups = Vec::new();
-            loop {
-                groups.push(self.parse_or()?);
-                if *self.peek() == Token::Comma {
-                    self.next();
-                    continue;
-                }
-                break;
-            }
-            groups
+            self.parse_group_by()?
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         let having = if self.eat_keyword("having") {
             Some(self.parse_or()?)
@@ -7723,6 +7724,7 @@ impl Parser {
             from,
             where_,
             group_by,
+            group_by_sets,
             having,
             order_by: Vec::new(),
             limit: None,
@@ -7849,6 +7851,149 @@ impl Parser {
         sel.offset = offset;
         sel.for_update = for_update;
         Ok(())
+    }
+
+    /// v0.78: `GROUP BY` with PG's grouping-element syntax: `()`,
+    /// `ROLLUP (...)`, `CUBE (...)`, `GROUPING SETS (...)` (nestable),
+    /// and `DISTINCT`. Returns the grouping sets — the cross product of
+    /// the top-level elements — plus whether grouping-set syntax was
+    /// used (which switches unbound bare columns from 42803 to NULL,
+    /// like PG).
+    fn parse_group_by(&mut self) -> Result<(Vec<Vec<Expr>>, bool), SqlError> {
+        // PG allows `GROUP BY DISTINCT ...` (dedups identical sets).
+        let distinct = self.eat_keyword("distinct");
+        let mut sets: Vec<Vec<Expr>> = vec![Vec::new()];
+        let mut is_sets = distinct;
+        loop {
+            let (elem_sets, elem_is_sets) = self.parse_grouping_element()?;
+            is_sets = is_sets || elem_is_sets;
+            let mut next = Vec::with_capacity(sets.len() * elem_sets.len());
+            for prefix in &sets {
+                for elem in &elem_sets {
+                    let mut combined = prefix.clone();
+                    combined.extend(elem.iter().cloned());
+                    next.push(combined);
+                }
+            }
+            sets = next;
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        if distinct {
+            sets = Self::dedup_grouping_sets(sets);
+        }
+        Ok((sets, is_sets))
+    }
+
+    /// v0.78: one grouping element → its grouping sets plus whether it
+    /// used grouping-set syntax. `()` is the empty set; `ROLLUP`/`CUBE`
+    /// expand; `GROUPING SETS` flattens (nesting included); anything else
+    /// is one plain expression.
+    fn parse_grouping_element(&mut self) -> Result<(Vec<Vec<Expr>>, bool), SqlError> {
+        // v0.78: only treat ROLLUP/CUBE/GROUPING as grouping-set syntax
+        // when followed by `(` (resp. the SETS keyword); otherwise they
+        // are ordinary column names.
+        let is_rollup = matches!(self.peek(), Token::Ident(s) if s == "rollup")
+            && *self.peek2() == Token::LParen;
+        let is_cube =
+            matches!(self.peek(), Token::Ident(s) if s == "cube") && *self.peek2() == Token::LParen;
+        let is_grouping_sets = matches!(self.peek(), Token::Ident(s) if s == "grouping")
+            && matches!(self.peek2(), Token::Ident(s) if s == "sets");
+        if is_rollup {
+            self.next(); // rollup
+            self.expect(Token::LParen, "'('")?;
+            let mut exprs = Vec::new();
+            loop {
+                exprs.push(self.parse_or()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, ")")?;
+            // ROLLUP (a, b) -> (a,b), (a), ().
+            let mut sets = Vec::with_capacity(exprs.len() + 1);
+            for k in (0..=exprs.len()).rev() {
+                sets.push(exprs[..k].to_vec());
+            }
+            return Ok((sets, true));
+        }
+        if is_cube {
+            self.next(); // cube
+            self.expect(Token::LParen, "(")?;
+            let mut exprs = Vec::new();
+            loop {
+                exprs.push(self.parse_or()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, ")")?;
+            // CUBE (a, b) -> (a,b), (a), (b), ().
+            // v0.78: cap at 16 elements (65536 sets); beyond that the
+            // exponential expansion is a footgun, so fail loudly rather
+            // than silently dropping columns.
+            if exprs.len() > 16 {
+                return Err(err(
+                    "syntax error: CUBE with more than 16 elements is not supported",
+                ));
+            }
+            let n = exprs.len();
+            let mut sets = Vec::with_capacity(1 << n);
+            for mask in (0..(1u32 << n)).rev() {
+                let mut set = Vec::new();
+                for (i, e) in exprs.iter().enumerate().take(n) {
+                    if mask & (1 << (n - 1 - i)) != 0 {
+                        set.push(e.clone());
+                    }
+                }
+                sets.push(set);
+            }
+            return Ok((sets, true));
+        }
+        if is_grouping_sets {
+            self.next(); // grouping
+            self.expect_keyword("sets")?;
+            self.expect(Token::LParen, "(")?;
+            let mut sets = Vec::new();
+            loop {
+                let (elem_sets, _) = self.parse_grouping_element()?;
+                sets.extend(elem_sets);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, ")")?;
+            return Ok((sets, true));
+        }
+        if *self.peek() == Token::LParen && *self.peek2() == Token::RParen {
+            // The empty `()` grouping set.
+            self.next(); // '('
+            self.next(); // ')'
+            return Ok((vec![Vec::new()], true));
+        }
+        Ok((vec![vec![self.parse_or()?]], false))
+    }
+
+    /// v0.78: deduplicate identical grouping sets, preserving first-seen
+    /// order (PG's `GROUP BY DISTINCT ...`). Set equality is structural
+    /// on the expressions.
+    fn dedup_grouping_sets(sets: Vec<Vec<Expr>>) -> Vec<Vec<Expr>> {
+        let mut out: Vec<Vec<Expr>> = Vec::with_capacity(sets.len());
+        for s in sets {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     /// The pre-v0.44 `parse_select_rest`: a simple SELECT with no
