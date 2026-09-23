@@ -1447,6 +1447,53 @@ pub struct TableDef {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v0.69: declarative partitioning (`None` = ordinary table).
+    pub partition: Option<PartitionDef>,
+}
+
+/// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionDef {
+    /// Partitioning method.
+    pub method: crate::storage::PartMethod,
+    /// Partition key: column names or expressions, in order.
+    pub keys: Vec<PartitionKeyDef>,
+    /// For `PARTITION OF`: the parent table name.
+    pub parent: Option<String>,
+    /// For `PARTITION OF` / `ATTACH`: the bound (`None` for a
+    /// partitioned root, or when the bound comes from ATTACH).
+    pub bound: Option<PartBoundDef>,
+}
+
+/// v0.69: one `PARTITION BY` key: a column or a parenthesized expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartitionKeyDef {
+    Column(String),
+    Expr(Expr),
+}
+
+/// v0.69: `FOR VALUES` bound as parsed (values still `Expr`s; exec
+/// coerces them to the parent key column types).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartBoundDef {
+    List(Vec<Expr>),
+    Range {
+        lower: Vec<RangeBoundDef>,
+        upper: Vec<RangeBoundDef>,
+    },
+    Hash {
+        modulus: u32,
+        remainder: u32,
+    },
+    Default,
+}
+
+/// v0.69: one RANGE bound endpoint as parsed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RangeBoundDef {
+    Min,
+    Max,
+    Val(Expr),
 }
 
 /// v0.9: ALTER TABLE actions.
@@ -1520,6 +1567,11 @@ pub enum AlterAction {
     /// `toast_tuple_target` is supported; anything else is 0A000.
     SetRelOptions {
         options: Vec<(String, String)>,
+    },
+    /// v0.69: `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`.
+    AttachPartition {
+        child: String,
+        bound: PartBoundDef,
     },
 }
 
@@ -1630,6 +1682,7 @@ impl TableDef {
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
+            partition: None,
         }
     }
 }
@@ -2865,6 +2918,22 @@ impl Parser {
         }
     }
 
+    /// v0.69: expect an unsigned integer literal (for MODULUS/REMAINDER).
+    fn expect_u32(&mut self) -> Result<u32, SqlError> {
+        match self.next() {
+            Token::Number(s) => s.parse::<u32>().map_err(|_| {
+                err(format!(
+                    "syntax error: expected unsigned integer, found {}",
+                    s
+                ))
+            }),
+            other => Err(err(format!(
+                "syntax error: expected unsigned integer, found {:?}",
+                other
+            ))),
+        }
+    }
+
     /// v0.37: read a reloption value (`SET (opt = val, ...)`). Accepts an
     /// identifier, number, or string literal; returns the raw text.
     fn expect_reloption_value(&mut self) -> Result<String, SqlError> {
@@ -3370,6 +3439,18 @@ impl Parser {
             false
         };
         let name = self.expect_ident()?;
+        // v0.69: `CREATE TABLE name PARTITION OF parent ...` (no column list).
+        if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            // Distinguish `PARTITION OF` from `PARTITION BY`: only OF
+            // appears directly after the table name.
+            let save = self.pos;
+            self.next(); // 'partition'
+            let is_of = matches!(self.peek(), Token::Ident(s) if s == "of");
+            self.pos = save;
+            if is_of {
+                return self.parse_create_partition_of(name, temp);
+            }
+        }
         // v0.48: `CREATE TABLE name AS <query>` (CTAS) versus the
         // column-definition list. A parenthesized group after the name
         // is the CTAS column-*alias* list only when `AS` follows its
@@ -3398,7 +3479,53 @@ impl Parser {
                 }
             }
         }
-        let def = build_table_def(&name, items)?;
+        let mut def = build_table_def(&name, items)?;
+        // v0.69: `PARTITION BY ...` after the column list.
+        if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            let (method, keys) = self.parse_partition_by()?;
+            def.partition = Some(PartitionDef {
+                method,
+                keys,
+                parent: None,
+                bound: None,
+            });
+        }
+        Ok(Stmt::CreateTable { name, def, temp })
+    }
+
+    /// v0.69: `CREATE TABLE name PARTITION OF parent FOR VALUES ...`
+    /// (no column list). Called from `parse_create` when `PARTITION`
+    /// follows the table name.
+    fn parse_create_partition_of(&mut self, name: String, temp: bool) -> Result<Stmt, SqlError> {
+        let (parent, bound, sub) = self.parse_partition_of()?;
+        // The child inherits the parent's method and key; a trailing
+        // `PARTITION BY` makes it a sub-partitioned intermediate.
+        let (method, keys) = match sub {
+            Some((m, k)) => (m, k),
+            None => {
+                // Placeholder: exec resolves the parent's method/key.
+                // We mark it via a sentinel — exec will fill it in.
+                // (Parser doesn't have catalog access.)
+                (crate::storage::PartMethod::List, Vec::new())
+            }
+        };
+        let def = TableDef {
+            columns: Vec::new(), // inherited from parent at exec
+            not_null: Vec::new(),
+            defaults: Vec::new(),
+            serial: Vec::new(),
+            compression: Vec::new(),
+            checks: Vec::new(),
+            uniques: Vec::new(),
+            pkey: None,
+            fks: Vec::new(),
+            partition: Some(PartitionDef {
+                method,
+                keys,
+                parent: Some(parent),
+                bound: Some(bound),
+            }),
+        };
         Ok(Stmt::CreateTable { name, def, temp })
     }
 
@@ -3716,7 +3843,195 @@ impl Parser {
         Ok(Stmt::AlterTable { name, action })
     }
 
+    // ------------------------------------------------------------------
+    // v0.69: declarative partitioning (PG19 partdef.c).
+    // ------------------------------------------------------------------
+
+    /// Parse `PARTITION BY RANGE|LIST|HASH (key [, ...])`. Each key is a
+    /// column name, a parenthesized expression, or a column with an
+    /// (ignored) operator class name.
+    fn parse_partition_by(
+        &mut self,
+    ) -> Result<(crate::storage::PartMethod, Vec<PartitionKeyDef>), SqlError> {
+        use crate::storage::PartMethod;
+        self.expect_keyword("partition")?;
+        self.expect_keyword("by")?;
+        let method = if self.eat_keyword("range") {
+            PartMethod::Range
+        } else if self.eat_keyword("list") {
+            PartMethod::List
+        } else if self.eat_keyword("hash") {
+            PartMethod::Hash
+        } else {
+            return Err(err(format!(
+                "syntax error: expected RANGE, LIST or HASH after PARTITION BY, found {:?}",
+                self.peek()
+            )));
+        };
+        self.expect(Token::LParen, "'('")?;
+        let mut keys = Vec::new();
+        loop {
+            if *self.peek() == Token::LParen {
+                // Parenthesized expression key, e.g. `(a+0)`.
+                self.next(); // '('
+                let e = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                keys.push(PartitionKeyDef::Expr(e));
+            } else {
+                let col = self.expect_ident()?;
+                // Optional operator class (e.g. `a part_test_int4_ops`):
+                // parsed and ignored (PG19 uses it for hash opclasses;
+                // our hash uses the value directly).
+                if matches!(self.peek(), Token::Ident(s) if s != "collate") {
+                    // Peek: is it followed by ',' or ')'? If so it's an
+                    // opclass name, not the next key. We can't easily
+                    // lookahead two tokens, so consume it only if the
+                    // next token after it is ',' or ')'.
+                    let save = self.pos;
+                    let _opclass = self.expect_ident()?;
+                    match self.peek() {
+                        Token::Comma | Token::RParen => {}
+                        _ => {
+                            // Not an opclass — rewind (it was the next key,
+                            // but keys are comma-separated so this means
+                            // a syntax error; let the ','/' )' check fail).
+                            self.pos = save;
+                        }
+                    }
+                }
+                keys.push(PartitionKeyDef::Column(col));
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in PARTITION BY, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Err(err(
+                "syntax error: PARTITION BY requires at least one key".to_string()
+            ));
+        }
+        Ok((method, keys))
+    }
+
+    /// Parse `FOR VALUES IN (...) | FROM (..) TO (..) | WITH (...) |
+    /// DEFAULT` (the `DEFAULT` keyword alone, without FOR VALUES).
+    fn parse_partition_bound(&mut self) -> Result<PartBoundDef, SqlError> {
+        if self.eat_keyword("default") {
+            return Ok(PartBoundDef::Default);
+        }
+        self.expect_keyword("for")?;
+        self.expect_keyword("values")?;
+        if self.eat_keyword("in") {
+            self.expect(Token::LParen, "'('")?;
+            let mut vals = Vec::new();
+            loop {
+                // NULL is allowed in the list (means "null partition").
+                if matches!(self.peek(), Token::Ident(s) if s == "null") {
+                    self.next();
+                    vals.push(Expr::Literal(Literal::Null));
+                } else {
+                    vals.push(self.parse_or()?);
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in FOR VALUES IN, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            return Ok(PartBoundDef::List(vals));
+        }
+        if self.eat_keyword("from") {
+            let lower = self.parse_range_bound_list()?;
+            self.expect_keyword("to")?;
+            let upper = self.parse_range_bound_list()?;
+            return Ok(PartBoundDef::Range { lower, upper });
+        }
+        if self.eat_keyword("with") {
+            self.expect(Token::LParen, "'('")?;
+            self.expect_keyword("modulus")?;
+            let modulus = self.expect_u32()?;
+            self.expect(Token::Comma, "','")?;
+            self.expect_keyword("remainder")?;
+            let remainder = self.expect_u32()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(PartBoundDef::Hash { modulus, remainder });
+        }
+        Err(err(format!(
+            "syntax error: expected IN, FROM, WITH or DEFAULT after FOR VALUES, found {:?}",
+            self.peek()
+        )))
+    }
+
+    /// Parse `(MINVALUE | MAXVALUE | expr [, ...])` for a RANGE endpoint.
+    fn parse_range_bound_list(&mut self) -> Result<Vec<RangeBoundDef>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_keyword("minvalue") {
+                out.push(RangeBoundDef::Min);
+            } else if self.eat_keyword("maxvalue") {
+                out.push(RangeBoundDef::Max);
+            } else {
+                out.push(RangeBoundDef::Val(self.parse_or()?));
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in range bound, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse `PARTITION OF parent FOR VALUES ... [PARTITION BY ...]`.
+    fn parse_partition_of(
+        &mut self,
+    ) -> Result<
+        (
+            String,
+            PartBoundDef,
+            Option<(crate::storage::PartMethod, Vec<PartitionKeyDef>)>,
+        ),
+        SqlError,
+    > {
+        self.expect_keyword("partition")?;
+        self.expect_keyword("of")?;
+        let parent = self.expect_ident()?;
+        let bound = self.parse_partition_bound()?;
+        // Optional sub-partitioning: `PARTITION BY ...`.
+        let sub = if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            Some(self.parse_partition_by()?)
+        } else {
+            None
+        };
+        Ok((parent, bound, sub))
+    }
+
     fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        // v0.69: ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...
+        if self.eat_keyword("attach") {
+            self.expect_keyword("partition")?;
+            let child = self.expect_ident()?;
+            let bound = self.parse_partition_bound()?;
+            return Ok(AlterAction::AttachPartition { child, bound });
+        }
         // v0.11: ALTER TABLE name OWNER TO role
         if self.eat_keyword("owner") {
             self.expect_keyword("to")?;

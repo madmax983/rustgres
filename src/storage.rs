@@ -3622,6 +3622,69 @@ impl Numeric {
     }
 }
 
+// ------------------------------------------------------------------
+// v0.69: declarative partitioning (PG19 partdef.c / partitioning.sgml).
+// ------------------------------------------------------------------
+
+/// Partitioning method (`PARTITION BY RANGE | LIST | HASH`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartMethod {
+    Range,
+    List,
+    Hash,
+}
+
+/// One endpoint of a RANGE partition bound: `MINVALUE` (-infinity),
+/// `MAXVALUE` (+infinity), or a concrete value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RangeBound {
+    Min,
+    Max,
+    Val(Value),
+}
+
+/// The bound of a single partition relative to its parent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartBound {
+    /// `FOR VALUES IN (...)`: the value set. `has_null` tracks an
+    /// explicit `NULL` in the list (PG stores it separately because
+    /// NULL never equals anything, not even itself).
+    List { values: Vec<Value>, has_null: bool },
+    /// `FOR VALUES FROM (lo) TO (hi)`: half-open `[lower, upper)`.
+    Range {
+        lower: Vec<RangeBound>,
+        upper: Vec<RangeBound>,
+    },
+    /// `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
+    Hash { modulus: u32, remainder: u32 },
+}
+
+/// One partition-key position: either a plain column or an expression
+/// (e.g. `(a+0)`, `lower(a)`). `col` is the column index for a plain
+/// key; for an expression key it is unused (usize::MAX).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartKey {
+    pub col: usize,
+    pub expr: Option<crate::sql::Expr>,
+}
+
+/// Partition metadata for a table. A partitioned parent has `method` +
+/// `key` + `children` and `bound: None`; a leaf partition has `parent` +
+/// `bound`; an intermediate (sub-partitioned) table has both.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionInfo {
+    pub method: PartMethod,
+    pub key: Vec<PartKey>,
+    /// Bound relative to the parent (`None` for a partition root).
+    pub bound: Option<PartBound>,
+    /// True for a `DEFAULT` partition.
+    pub is_default: bool,
+    /// Parent table name (`None` for a partition root).
+    pub parent: Option<String>,
+    /// Direct child (partition) names, in creation/attach order.
+    pub children: Vec<String>,
+}
+
 /// A single cell value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -4239,6 +4302,8 @@ pub struct Table {
     /// Next toast value id to assign in this table (starts at 1; 0
     /// means "not toasted" in `RowVersion::toast`).
     pub next_value_id: u32,
+    /// v0.69: declarative partitioning metadata (`None` = not partitioned).
+    pub partition: Option<PartitionInfo>,
 }
 
 impl Table {
@@ -4274,6 +4339,8 @@ impl Table {
             col_compression: vec![None; n],
             toast_info: HashMap::new(),
             next_value_id: 1,
+            // v0.69: not partitioned by default.
+            partition: None,
         }
     }
 
