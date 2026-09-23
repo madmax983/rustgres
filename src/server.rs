@@ -136,6 +136,91 @@ struct Txn {
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
+    /// v0.66: GUC change stack for SET / SET LOCAL / RESET transaction
+    /// semantics (PG19 guc.c: GUC_ACTION_SET persists at commit but
+    /// reverts on abort; GUC_ACTION_LOCAL reverts at commit AND abort).
+    /// Each entry records the value in effect when the change was made.
+    guc_stack: Vec<GucStackEntry>,
+    /// v0.66: `guc_stack` lengths in lockstep with `savepoints` — a
+    /// ROLLBACK TO SAVEPOINT cancels SET/SET LOCAL effects made after
+    /// the savepoint, like Postgres.
+    guc_marks: Vec<usize>,
+}
+
+/// v0.66: snapshot of one stateful GUC's session value, for the
+/// transaction GUC stack.
+#[derive(Clone, Copy)]
+enum SavedGuc {
+    ReadOnly(Option<bool>),
+    ByteaOutput(crate::storage::ByteaOutput),
+    Toast(crate::storage::ToastCompression),
+}
+
+/// v0.66: one in-transaction GUC change.
+struct GucStackEntry {
+    /// GUC name (a string literal; only stateful GUCs push entries).
+    name: &'static str,
+    /// true = SET LOCAL (reverts at commit and abort);
+    /// false = SET/RESET (persists at commit, reverts on abort).
+    is_local: bool,
+    /// Value in effect when this entry was pushed.
+    saved: SavedGuc,
+}
+
+/// v0.66: read the current session value of a stateful GUC. None for
+/// accepted no-op GUCs (no state to save or restore).
+fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
+    match name {
+        "default_transaction_read_only" => Some(SavedGuc::ReadOnly(session.default_txn_read_only)),
+        "bytea_output" => Some(SavedGuc::ByteaOutput(session.bytea_output)),
+        "default_toast_compression" => Some(SavedGuc::Toast(session.default_toast_compression)),
+        _ => None,
+    }
+}
+
+/// v0.66: write a saved GUC value back into the session.
+fn restore_saved_guc(session: &mut Session, name: &str, saved: SavedGuc) {
+    match (name, saved) {
+        ("default_transaction_read_only", SavedGuc::ReadOnly(v)) => {
+            session.default_txn_read_only = v;
+        }
+        ("bytea_output", SavedGuc::ByteaOutput(v)) => {
+            session.bytea_output = v;
+        }
+        ("default_toast_compression", SavedGuc::Toast(v)) => {
+            session.default_toast_compression = v;
+        }
+        _ => {}
+    }
+}
+
+/// v0.66: record the pre-change value of a stateful GUC on the
+/// transaction's GUC stack. No-op in autocommit (nothing to revert).
+fn push_guc_entry(session: &mut Session, name: &'static str, is_local: bool) {
+    let saved = match guc_saved_value(session, name) {
+        Some(s) => s,
+        None => return,
+    };
+    if let Some(t) = session.txn.as_mut() {
+        t.guc_stack.push(GucStackEntry {
+            name,
+            is_local,
+            saved,
+        });
+    }
+}
+
+/// v0.66: transaction end. On abort (`commit=false`) every stacked
+/// change reverts (PG: SET/SET LOCAL effects disappear with a
+/// rollback). On commit, only SET LOCAL entries revert; SET/RESET
+/// persist for the session.
+fn revert_guc_stack(session: &mut Session, stack: Vec<GucStackEntry>, commit: bool) {
+    for e in stack.into_iter().rev() {
+        if commit && !e.is_local {
+            continue;
+        }
+        restore_saved_guc(session, e.name, e.saved);
+    }
 }
 
 impl Session {
@@ -1759,11 +1844,23 @@ fn parse_bool_guc(s: &str) -> Option<bool> {
 /// v0.17: `SET name = value`. Only `default_transaction_read_only` is
 /// honored; unknown parameters are 42704 (undefined_object), like PG.
 /// v0.29: `bytea_output` (hex|escape) added.
+/// v0.66: `local` (from `SET LOCAL`) makes the change
+/// transaction-scoped: it reverts when the transaction ends, whether
+/// committed or aborted (PG19 guc.c semantics). `SET LOCAL` outside a
+/// transaction block is a 25001 error, like PG.
 fn stmt_set_guc(
     session: &mut Session,
     name: &str,
     value: &SetValue,
+    local: bool,
 ) -> Result<ExecResult, ExecError> {
+    // PG19 utility.c: "SET LOCAL can only be used within a transaction
+    // block".
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
     match name {
         "default_transaction_read_only" => {
             let ro = match value {
@@ -1773,6 +1870,7 @@ fn stmt_set_guc(
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?,
             };
+            push_guc_entry(session, "default_transaction_read_only", local);
             session.default_txn_read_only = Some(ro);
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
@@ -1792,6 +1890,7 @@ fn stmt_set_guc(
                     }
                 },
             };
+            push_guc_entry(session, "bytea_output", local);
             session.bytea_output = v;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
@@ -1811,6 +1910,7 @@ fn stmt_set_guc(
                     })?
                 }
             };
+            push_guc_entry(session, "default_toast_compression", local);
             session.default_toast_compression = v;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
@@ -1888,9 +1988,18 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 /// v0.29: `bytea_output` resets to hex.
 /// v0.41: `default_toast_compression` resets to the compiled default
 /// (lz4, like a PG19 LZ4 build).
+/// v0.66: RESET inside a transaction pushes a stack entry, like SET —
+/// a RESET in an aborted transaction reverts to the pre-transaction
+/// value (PG19).
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
         "all" => {
+            // PG's RESET ALL is a session-scoped reset of every GUC to
+            // its default; record each stateful GUC so an abort
+            // restores the pre-transaction values.
+            push_guc_entry(session, "default_transaction_read_only", false);
+            push_guc_entry(session, "bytea_output", false);
+            push_guc_entry(session, "default_toast_compression", false);
             session.default_txn_read_only = None;
             session.bytea_output = crate::storage::ByteaOutput::Hex;
             session.default_toast_compression = crate::storage::ToastCompression::default();
@@ -1899,12 +2008,14 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             })
         }
         "default_transaction_read_only" => {
+            push_guc_entry(session, "default_transaction_read_only", false);
             session.default_txn_read_only = None;
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
         }
         "bytea_output" => {
+            push_guc_entry(session, "bytea_output", false);
             session.bytea_output = crate::storage::ByteaOutput::Hex;
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
@@ -1913,6 +2024,7 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         // v0.41: `default_toast_compression` resets to the compiled
         // default (pglz), like PG.
         "default_toast_compression" => {
+            push_guc_entry(session, "default_toast_compression", false);
             session.default_toast_compression = crate::storage::ToastCompression::default();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
@@ -2039,7 +2151,7 @@ fn run_statement(
                 tag: "SET".to_string(),
             })
         }
-        Stmt::Set { name, value } => stmt_set_guc(session, name, value),
+        Stmt::Set { name, value, local } => stmt_set_guc(session, name, value, *local),
         Stmt::Show { name } => stmt_show_guc(session, name),
         Stmt::Reset { name } => stmt_reset_guc(session, name),
         _ => {
@@ -2321,6 +2433,9 @@ fn txn_begin(
         savepoints: Vec::new(),
         cursor_marks: Vec::new(),
         failed: false,
+        // v0.66: fresh GUC stack per transaction.
+        guc_stack: Vec::new(),
+        guc_marks: Vec::new(),
     });
     Ok(cmd("BEGIN"))
 }
@@ -2355,6 +2470,9 @@ fn txn_commit(
         // v0.16: every cursor dies with the aborted transaction
         // (even WITH HOLD ones — there is no committed data to hold).
         session.cursors.clear();
+        // v0.66: an aborted transaction reverts every in-transaction
+        // GUC change (SET and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
         if chain {
             // AND CHAIN: new transaction with the same characteristics.
             return txn_begin(engine, session, level, read_only, deferrable);
@@ -2396,6 +2514,9 @@ fn txn_commit(
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
     session.cursors.retain(|_, c| c.with_hold);
+    // v0.66: SET LOCAL effects end with the transaction (commit or
+    // not); plain SET/RESET persist for the session, like PG19.
+    revert_guc_stack(session, t.guc_stack, true);
     if chain {
         // AND CHAIN: immediately start a new transaction with the same
         // characteristics as the just-committed one (SQL standard). The
@@ -2529,6 +2650,9 @@ fn txn_rollback(
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
+        // v0.66: rollback reverts every in-transaction GUC change (SET
+        // and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
         Some(chained)
     } else {
         None
@@ -2559,6 +2683,9 @@ fn txn_savepoint(
             let xid = t.xid;
             let locks = lock_engine(engine).txn_lock_count(xid);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
+            // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
+            // effects made after the savepoint (PG19).
+            t.guc_marks.push(t.guc_stack.len());
             // v0.16: also snapshot cursor positions and the cursor set.
             t.cursor_marks.push(CursorMark {
                 positions: session
@@ -2614,6 +2741,17 @@ fn txn_rollback_to(
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
     t.failed = false;
+    // v0.66: SET/SET LOCAL effects after the savepoint are canceled,
+    // newest first (PG19). The marks established after the named
+    // savepoint die with it; the named mark stays valid.
+    let guc_to = t.guc_marks[idx];
+    let undone: Vec<GucStackEntry> = t.guc_stack.drain(guc_to..).rev().collect();
+    t.guc_marks.truncate(idx + 1);
+    // The GUC borrow ends here (`t` is dead); restore the canceled
+    // effects newest-first, like a mini-abort of the savepoint tail.
+    for e in undone {
+        restore_saved_guc(session, e.name, e.saved);
+    }
     // v0.16: rewind cursor positions to the savepoint and close cursors
     // created after it — like Postgres. (NLL: `t` is dead after this.)
     let mark = session
@@ -2655,6 +2793,10 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
     t.savepoints.truncate(idx);
     // v0.16: cursor marks die with their savepoints.
     t.cursor_marks.truncate(idx);
+    // v0.66: the GUC marks die with their savepoints too, but the
+    // stacked GUC changes are NOT canceled by RELEASE (PG >= 8.3):
+    // they still revert at transaction end.
+    t.guc_marks.truncate(idx);
     Ok(cmd("RELEASE"))
 }
 
@@ -3255,6 +3397,8 @@ mod tests {
                 savepoints: Vec::new(),
                 cursor_marks: Vec::new(),
                 failed: false,
+                guc_stack: Vec::new(),
+                guc_marks: Vec::new(),
             }),
         };
         (engine, session)
@@ -3401,5 +3545,214 @@ mod tests {
             let _g = lock_wal(&wal);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.66: SET / SET LOCAL / RESET transaction semantics (PG19 guc.c).
+    // ------------------------------------------------------------------
+
+    /// Session with no open transaction (autocommit).
+    fn session_no_txn() -> Session {
+        Session {
+            sid: 4243,
+            role: "postgres".to_string(),
+            stmts: HashMap::new(),
+            portals: HashMap::new(),
+            in_error: false,
+            txn: None,
+            cursors: HashMap::new(),
+            default_txn_level: None,
+            default_txn_read_only: None,
+            default_txn_deferrable: None,
+            next_txn_level: None,
+            next_txn_read_only: None,
+            next_txn_deferrable: None,
+            bytea_output: crate::storage::ByteaOutput::default(),
+            default_toast_compression: crate::storage::ToastCompression::default(),
+        }
+    }
+
+    fn scratch_wal(name: &str) -> Arc<Mutex<Wal>> {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_eng, wal_inner) = crate::wal::Wal::open(&dir).expect("wal open");
+        Arc::new(Mutex::new(wal_inner))
+    }
+
+    fn show_text(session: &Session, name: &str) -> String {
+        match stmt_show_guc(session, name).unwrap() {
+            ExecResult::Select { rows, .. } => rows[0][0].to_text().unwrap(),
+            other => panic!("SHOW returned {:?}", other),
+        }
+    }
+
+    fn set(session: &mut Session, name: &str, val: &str, local: bool) {
+        stmt_set_guc(session, name, &SetValue::Str(val.to_string()), local).unwrap();
+    }
+
+    #[test]
+    fn v66_set_local_requires_transaction() {
+        let mut session = session_no_txn();
+        let err = stmt_set_guc(
+            &mut session,
+            "bytea_output",
+            &SetValue::Str("escape".to_string()),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "25001");
+        assert_eq!(
+            err.message,
+            "SET LOCAL can only be used within a transaction block"
+        );
+        // The value is untouched.
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+    }
+
+    #[test]
+    fn v66_set_local_reverts_on_commit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg66-guc-commit");
+        let mut session = session_no_txn();
+        // A session SET persists across transactions (PG).
+        set(&mut session, "bytea_output", "escape", false);
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        set(&mut session, "bytea_output", "hex", true);
+        // SHOW sees the local value inside the transaction.
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+        txn_commit(&engine, &wal, &mut session, false).unwrap();
+        // The LOCAL value is gone; the session SET survives.
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg66-guc-commit"));
+    }
+
+    #[test]
+    fn v66_set_local_reverts_on_rollback() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        set(&mut session, "bytea_output", "escape", true);
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        txn_rollback(&engine, &mut session, false).unwrap();
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+    }
+
+    #[test]
+    fn v66_set_then_set_local_commit_keeps_set() {
+        // PG docs: "A special case is SET followed by SET LOCAL within a
+        // single transaction: ... afterwards (if the transaction is
+        // committed) the SET value will take effect."
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg66-guc-setlocal");
+        let mut session = session_no_txn();
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        set(&mut session, "bytea_output", "escape", false);
+        set(&mut session, "bytea_output", "hex", true);
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+        txn_commit(&engine, &wal, &mut session, false).unwrap();
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg66-guc-setlocal"));
+    }
+
+    #[test]
+    fn v66_set_in_aborted_txn_reverts() {
+        // PG docs: "If SET ... is issued within a transaction that is
+        // later aborted, the effects of the SET command disappear."
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        set(&mut session, "bytea_output", "escape", false);
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        txn_rollback(&engine, &mut session, false).unwrap();
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+    }
+
+    #[test]
+    fn v66_rollback_to_savepoint_cancels_set_local() {
+        // PG docs: "The effects of SET or SET LOCAL are also canceled
+        // by rolling back to a savepoint that is earlier than the
+        // command."
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg66-guc-savepoint");
+        let mut session = session_no_txn();
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        set(&mut session, "bytea_output", "escape", true);
+        txn_savepoint(&engine, &mut session, "sp1").unwrap();
+        set(&mut session, "bytea_output", "hex", true);
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+        txn_rollback_to(&engine, &mut session, "sp1").unwrap();
+        // The post-savepoint SET LOCAL is canceled; the earlier one
+        // is still in effect.
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        txn_commit(&engine, &wal, &mut session, false).unwrap();
+        // At commit the surviving SET LOCAL reverts too.
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg66-guc-savepoint"));
+    }
+
+    #[test]
+    fn v66_reset_all_in_txn_reverts_on_abort() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        set(&mut session, "bytea_output", "escape", false);
+        set(&mut session, "default_toast_compression", "lz4", false);
+
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        stmt_reset_guc(&mut session, "all").unwrap();
+        assert_eq!(show_text(&session, "bytea_output"), "hex");
+        assert_eq!(show_text(&session, "default_toast_compression"), "pglz");
+        txn_rollback(&engine, &mut session, false).unwrap();
+        // The pre-transaction session values are restored.
+        assert_eq!(show_text(&session, "bytea_output"), "escape");
+        assert_eq!(show_text(&session, "default_toast_compression"), "lz4");
     }
 }

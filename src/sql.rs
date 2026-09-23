@@ -2264,12 +2264,13 @@ pub enum Stmt {
         read_only: Option<bool>,
         deferrable: Option<bool>,
     },
-    /// `SET name = value` / `SET name TO value` — session GUC.
-    /// Only `default_transaction_read_only` is honored; anything else
-    /// is 42704 (the GUC surface is intentionally small, documented).
+    /// `SET name = value` / `SET name TO value` / `SET LOCAL ...` —
+    /// session GUC. `local` is true for `SET LOCAL`, which is
+    /// transaction-scoped: the value reverts at transaction end (PG19).
     Set {
         name: String,
         value: SetValue,
+        local: bool,
     },
     /// `SHOW name`.
     Show {
@@ -6084,11 +6085,14 @@ impl Parser {
             });
         }
         // SET [ SESSION | LOCAL ] name = value | SET name TO value |
-        // SET name TO DEFAULT. v0.64: the scope keyword is accepted
-        // (PG's `SET LOCAL`/`SET SESSION`); the GUCs it applies to here
-        // are all no-ops, so the scope is not distinguished.
-        if self.eat_keyword("session") || self.eat_keyword("local") {
-            // consumed scope
+        // SET name TO DEFAULT. v0.66: `SET LOCAL` is distinguished from
+        // `SET`/`SET SESSION`: it is transaction-scoped (the value
+        // reverts when the transaction ends, whether committed or not,
+        // like PG19). `SET LOCAL` outside a transaction block is a
+        // 25001 error, raised at execution time.
+        let local = self.eat_keyword("local");
+        if !local {
+            self.eat_keyword("session");
         }
         let name = self.expect_ident()?;
         if self.eat_keyword("to") {
@@ -6124,7 +6128,7 @@ impl Parser {
                 )));
             }
         };
-        Ok(Stmt::Set { name, value })
+        Ok(Stmt::Set { name, value, local })
     }
 
     fn parse_isolation_level(&mut self) -> Result<IsolationLevel, SqlError> {

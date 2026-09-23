@@ -492,7 +492,9 @@ def test_sequences():
         t, r, e = c.q("ALTER SEQUENCE s RESTART WITH 1000")
         check("alter restart", t == ["ALTER SEQUENCE"], f"{t} {e}")
         t, r, e = c.q("SELECT nextval('s')")
-        check("restart value", r == [["1005"]], f"{r} {e}")
+        # v0.66: RESTART is setval(r, false) — the next nextval RETURNS
+        # r (PG19 ALTER SEQUENCE docs), not r + increment.
+        check("restart value", r == [["1000"]], f"{r} {e}")
 
         # DROP SEQUENCE.
         t, r, e = c.q("DROP SEQUENCE s")

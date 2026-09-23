@@ -23848,6 +23848,27 @@ mod tests {
         );
     }
 
+    /// v0.66: ALTER SEQUENCE RESTART is setval(r, false) — the next
+    /// nextval RETURNS r (PG19 ALTER SEQUENCE docs: "equivalent to
+    /// calling the setval function with is_called = false"), not
+    /// r + increment.
+    #[test]
+    fn v66_alter_sequence_restart_returns_restart_value() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s").unwrap();
+        let r = run(&mut eng, "SELECT nextval('s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+        run(&mut eng, "ALTER SEQUENCE s RESTART WITH 100").unwrap();
+        let r = run(&mut eng, "SELECT nextval('s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        let r = run(&mut eng, "SELECT nextval('s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["101".to_string()]]);
+        // Bare RESTART resets to the recorded start value (1).
+        run(&mut eng, "ALTER SEQUENCE s RESTART").unwrap();
+        let r = run(&mut eng, "SELECT nextval('s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
     /// An index scan must share the stored row, like a sequential scan.
     #[test]
     fn index_scan_shares_table_row_storage() {
@@ -26866,9 +26887,11 @@ fn exec_alter_sequence(
     // v0.65: ALTER SEQUENCE preserves serial ownership.
     next.owned_by = prev.owned_by.clone();
     if let Some(r) = restart {
-        // RESTART is setval(r, true): the next nextval advances past r.
+        // v0.66: RESTART is setval(r, false): the next nextval RETURNS r
+        // (PG19 ALTER SEQUENCE docs: "equivalent to calling the setval
+        // function with is_called = false").
         next.current = Some(r);
-        next.is_called = true;
+        next.is_called = false;
         // A RESTART counts as an advance for WAL purposes.
         if !eng.seq_advanced.contains(&name.to_string()) {
             eng.seq_advanced.push(name.to_string());
