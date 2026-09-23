@@ -486,15 +486,18 @@ fn exec_create(
     def: &TableDef,
     temp: bool,
 ) -> Result<ExecResult, ExecError> {
-    create_table_from_def(eng, ctx, name, def, temp)?;
+    // v0.70: use the effective definition (PARTITION OF inherits the
+    // parent's constraints into the cloned def) for the backing indexes,
+    // so inherited PRIMARY KEY / UNIQUE constraints get their indexes.
+    let eff_def = create_table_from_def(eng, ctx, name, def, temp)?;
     // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
     // table is empty, so no duplicate check is needed. (v0.22: temp
     // tables get none — the global index map cannot represent them.)
     if !temp {
-        if let Some(pk) = &def.pkey {
+        if let Some(pk) = &eff_def.pkey {
             create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
         }
-        for u in &def.uniques {
+        for u in &eff_def.uniques {
             create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
         }
     }
@@ -645,9 +648,46 @@ fn build_partition_info(
         let bound = convert_part_bound(eng, ctx, bound_def, parent, &pinfo)?;
         // Validate the bound against siblings (no overlap).
         check_bound_no_overlap(eng, ctx, parent_name, &pinfo, &bound, name)?;
+        // v0.70: a trailing `PARTITION BY` makes this child a
+        // sub-partitioned intermediate with its own method/key (the bound
+        // above is still relative to the *parent's* key). Without it, the
+        // child is a plain leaf inheriting the parent's method/key.
+        // (The parser leaves `keys` empty when there is no trailing
+        // `PARTITION BY`.)
+        let (method, key) = if def.keys.is_empty() {
+            (pinfo.method, pinfo.key.clone())
+        } else {
+            let mut key = Vec::new();
+            for kd in &def.keys {
+                match kd {
+                    PartitionKeyDef::Column(col) => {
+                        let idx = columns.iter().position(|(n, _)| n == col).ok_or_else(|| {
+                            exec_err(
+                                "42703",
+                                format!(
+                                    "column \"{}\" of relation \"{}\" does not exist",
+                                    col, name
+                                ),
+                            )
+                        })?;
+                        key.push(PartKey {
+                            col: idx,
+                            expr: None,
+                        });
+                    }
+                    PartitionKeyDef::Expr(e) => {
+                        key.push(PartKey {
+                            col: usize::MAX,
+                            expr: Some(e.clone()),
+                        });
+                    }
+                }
+            }
+            (def.method, key)
+        };
         let info = PartitionInfo {
-            method: pinfo.method,
-            key: pinfo.key.clone(),
+            method,
+            key,
             bound: Some(bound),
             is_default: matches!(bound_def, PartBoundDef::Default),
             parent: Some(parent_name.clone()),
@@ -1085,6 +1125,71 @@ fn compare_partition_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> 
     }
 }
 
+/// v0.70: commit a modified table clone as a new version owned by this
+/// transaction (the same copy-on-write pattern every other ALTER uses)
+/// and log the `AlterTable` undo op. The caller's `next` must already
+/// carry the desired mutations; this hides the old live version from
+/// this transaction, moves its rows over, and records `prev` for
+/// rollback.
+fn commit_table_version(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    prev: Table,
+    mut next: Table,
+) {
+    next.created_xmin = ctx.own;
+    next.dropped_xmax = 0;
+    let versions = eng.db.tables.get_mut(name).expect("table still visible");
+    let old_live = versions
+        .iter_mut()
+        .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+        .expect("table still visible");
+    old_live.dropped_xmax = ctx.own;
+    next.rows = std::mem::take(&mut old_live.rows);
+    next.rebuild_row_index();
+    old_live.rebuild_row_index();
+    versions.push(next);
+    ctx.writes.push(WriteOp::AlterTable {
+        name: name.to_string(),
+        prev,
+        renamed_to: None,
+        rewrite_rows: false,
+    });
+}
+
+/// v0.70: add (`link=true`) or remove (`link=false`) a child from a
+/// partitioned parent's `children` list, transactionally: the parent is
+/// versioned via [`commit_table_version`], so ROLLBACK restores the
+/// previous link set. (v0.69 mutated the live version in place, which
+/// silently defeated the `AlterTable` undo — an `ATTACH PARTITION`
+/// survived ROLLBACK.)
+fn parent_link_child(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    parent_name: &str,
+    child_name: &str,
+    link: bool,
+) {
+    let prev = eng
+        .db
+        .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+        .expect("parent still visible")
+        .clone();
+    let mut next = prev.clone();
+    {
+        let pi = next.partition.as_mut().expect("parent is partitioned");
+        if link {
+            if !pi.children.iter().any(|c| c == child_name) {
+                pi.children.push(child_name.to_string());
+            }
+        } else {
+            pi.children.retain(|c| c != child_name);
+        }
+    }
+    commit_table_version(eng, ctx, parent_name, prev, next);
+}
+
 /// v0.69: `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`.
 fn attach_partition(
     eng: &mut Engine,
@@ -1114,8 +1219,10 @@ fn attach_partition(
         })?;
         (pinfo, parent.columns.clone())
     };
-    // Resolve child (must exist, must not already be a partition).
-    let child_cols = {
+    // Resolve child (must exist, must not already be a partition *of
+    // something else* — PG allows attaching an already-partitioned
+    // table, which becomes a sub-partitioned intermediate).
+    let (child_cols, child_pinfo) = {
         let child = eng
             .db
             .find_table(child_name, ctx.snap, ctx.own, ctx.session)
@@ -1125,13 +1232,13 @@ fn attach_partition(
                     format!("relation \"{}\" does not exist", child_name),
                 )
             })?;
-        if child.partition.is_some() {
+        if child.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
             return Err(exec_err(
                 "42601",
                 format!("relation \"{}\" is already a partition", child_name),
             ));
         }
-        child.columns.clone()
+        (child.columns.clone(), child.partition.clone())
     };
     // Validate column compatibility by name (PG: same names, binary-
     // coercible types; we require exact type equality for simplicity,
@@ -1172,28 +1279,26 @@ fn attach_partition(
     check_bound_no_overlap(eng, ctx, parent_name, &pinfo, &bound, child_name)?;
     // Existing rows must satisfy the bound (PG checks this).
     {
-        let child = eng
-            .db
-            .find_table(child_name, ctx.snap, ctx.own, ctx.session)
-            .expect("child still visible");
-        for rv in &child.rows {
-            if !row_visible(rv, ctx.snap, ctx.own) {
-                continue;
-            }
-            // Map child row to parent column order, then check bound.
-            let prow = remap_row_to_parent(&child_cols, &parent_cols, &rv.values);
-            // Extract key values.
-            let key: Vec<Value> = pinfo
-                .key
+        // Copy the rows out; the borrow ends before key evaluation,
+        // which needs `&mut eng`.
+        let rows: Vec<Row> = {
+            let child = eng
+                .db
+                .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                .expect("child still visible");
+            child
+                .rows
                 .iter()
-                .map(|k| {
-                    if k.expr.is_some() {
-                        Value::Null
-                    } else {
-                        prow[k.col].clone()
-                    }
-                })
-                .collect();
+                .filter(|rv| row_visible(rv, ctx.snap, ctx.own))
+                .map(|rv| rv.values.clone())
+                .collect()
+        };
+        for values in &rows {
+            // Map child row to parent column order, then check bound.
+            // v0.70: expression partition keys are evaluated for real
+            // (was NULL), via the shared key evaluator.
+            let prow = remap_row_to_parent(&child_cols, &parent_cols, values);
+            let key = eval_table_part_key(eng, ctx, parent_name, &pinfo, &parent_cols, &prow)?;
             if !bound_contains(&pinfo.method, &bound, &key) {
                 return Err(exec_err(
                     "23514",
@@ -1205,43 +1310,39 @@ fn attach_partition(
             }
         }
     }
-    // Set the child's partition info.
+    // Set the child's partition info — versioned, so ROLLBACK undoes it.
+    // v0.70: an already-partitioned child keeps its own method, key,
+    // and children (it becomes a sub-partitioned intermediate); only
+    // the bound, parent link, and default flag are set by the attach.
     let is_default = matches!(bound_def, PartBoundDef::Default);
-    let cinfo = PartitionInfo {
-        method: pinfo.method,
-        key: pinfo.key.clone(),
-        bound: Some(bound),
-        is_default,
-        parent: Some(parent_name.to_string()),
-        children: Vec::new(),
+    let cinfo = match child_pinfo {
+        Some(cp) => PartitionInfo {
+            method: cp.method,
+            key: cp.key,
+            bound: Some(bound),
+            is_default,
+            parent: Some(parent_name.to_string()),
+            children: cp.children,
+        },
+        None => PartitionInfo {
+            method: pinfo.method,
+            key: pinfo.key.clone(),
+            bound: Some(bound),
+            is_default,
+            parent: Some(parent_name.to_string()),
+            children: Vec::new(),
+        },
     };
-    // Capture prev for undo.
     let prev = eng
         .db
         .find_table(child_name, ctx.snap, ctx.own, ctx.session)
         .expect("child still visible")
         .clone();
-    if let Some(child) = eng
-        .db
-        .find_table_mut(child_name, ctx.snap, ctx.own, ctx.session)
-    {
-        child.partition = Some(cinfo);
-    }
-    // Link into parent's children.
-    if let Some(parent) = eng
-        .db
-        .find_table_mut(parent_name, ctx.snap, ctx.own, ctx.session)
-    {
-        if let Some(pi) = parent.partition.as_mut() {
-            pi.children.push(child_name.to_string());
-        }
-    }
-    ctx.writes.push(WriteOp::AlterTable {
-        name: child_name.to_string(),
-        prev,
-        renamed_to: None,
-        rewrite_rows: false,
-    });
+    let mut next = prev.clone();
+    next.partition = Some(cinfo);
+    commit_table_version(eng, ctx, child_name, prev, next);
+    // Link into the parent's children — versioned, so ROLLBACK undoes it.
+    parent_link_child(eng, ctx, parent_name, child_name, true);
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
@@ -1390,51 +1491,25 @@ fn route_partition_inserts(
         }
     };
     if pinfo.bound.is_some() {
-        // Direct insert into a leaf: validate the bound (and ancestors).
-        let mut groups: Vec<(u64, Row)> = Vec::new();
-        for (id, row) in inserts {
+        // Direct insert: validate the bound (and all ancestors).
+        for (_id, row) in inserts {
             check_leaf_bound(eng, ctx, table, &pinfo, &table_cols, &row[..])?;
-            groups.push((*id, row.clone()));
         }
-        return Ok(vec![(table.to_string(), groups)]);
+        if pinfo.children.is_empty() {
+            // Leaf: rows land here.
+            return Ok(vec![(table.to_string(), inserts.to_vec())]);
+        }
+        // v0.70: sub-partitioned intermediate (the corpus inserts into
+        // mlparted1 directly): the bound is validated above, then rows
+        // route to descendant leaves. Fall through.
     }
     // Parent: route each row to a leaf.
     let mut by_leaf: std::collections::HashMap<String, Vec<(u64, Row)>> =
         std::collections::HashMap::new();
-    // Build QCols for key expression evaluation.
-    let schema: Vec<QCol> = table_cols
-        .iter()
-        .enumerate()
-        .map(|(i, (n, ty))| QCol {
-            qual: table.to_string(),
-            name: n.clone(),
-            ty: *ty,
-            hidden: false,
-            src_ord: i as u32,
-        })
-        .collect();
     for (id, row) in inserts {
-        // Compute key values.
-        let mut key = Vec::with_capacity(pinfo.key.len());
-        for k in &pinfo.key {
-            if let Some(e) = &k.expr {
-                let v = eval_partition_key_expr(
-                    eng,
-                    ctx.snap,
-                    ctx.own,
-                    ctx.session,
-                    ctx.role,
-                    &schema,
-                    &row[..],
-                    e,
-                )?;
-                key.push(v);
-            } else {
-                key.push(row[k.col].clone());
-            }
-        }
-        // Find the leaf.
-        let leaf_name = find_partition_leaf(eng, ctx, table, &pinfo, &key)?;
+        // Find the leaf. Each level evaluates its own partition key
+        // against the row (v0.70: multilevel routing).
+        let leaf_name = find_partition_leaf(eng, ctx, table, &pinfo, &table_cols, &row[..])?;
         // Remap to leaf column order.
         let leaf_cols = {
             let lt = eng
@@ -1494,45 +1569,133 @@ fn eval_partition_key_expr(
     eval_expr(&mut q, &[scope], expr)
 }
 
-/// v0.69: find the leaf partition for a key (recursive for multilevel).
-fn find_partition_leaf(
+/// v0.70: evaluate a partitioned table's key against a row given in
+/// that table's own column order. Each recursion level of
+/// [`find_partition_leaf`] recomputes the key with the *current*
+/// table's definition (v0.69 wrongly reused the root key all the way
+/// down, so multilevel routing compared the wrong values).
+fn eval_table_part_key(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table_name: &str,
+    pinfo: &PartitionInfo,
+    table_cols: &[(String, ColType)],
+    row: &[Value],
+) -> Result<Vec<Value>, ExecError> {
+    let schema: Vec<QCol> = table_cols
+        .iter()
+        .enumerate()
+        .map(|(i, (n, ty))| QCol {
+            qual: table_name.to_string(),
+            name: n.clone(),
+            ty: *ty,
+            hidden: false,
+            src_ord: i as u32,
+        })
+        .collect();
+    let mut key = Vec::with_capacity(pinfo.key.len());
+    for k in &pinfo.key {
+        if let Some(e) = &k.expr {
+            key.push(eval_partition_key_expr(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &schema,
+                row,
+                e,
+            )?);
+        } else {
+            key.push(row[k.col].clone());
+        }
+    }
+    Ok(key)
+}
+
+/// v0.70: does any explicit (non-default) child of `pinfo` accept `key`?
+/// The DEFAULT partition receives only rows no explicit sibling accepts
+/// (PG19 semantics); used by both routing and direct-insert validation.
+fn explicit_sibling_accepts(
     eng: &Engine,
     ctx: &StmtCtx,
-    table: &str,
     pinfo: &PartitionInfo,
+    except: &str,
     key: &[Value],
-) -> Result<String, ExecError> {
-    // First, try non-default children.
+) -> Result<bool, ExecError> {
     for child_name in &pinfo.children {
-        let child = eng
+        if child_name == except {
+            continue;
+        }
+        let Some(child) = eng
             .db
             .find_table(child_name, ctx.snap, ctx.own, ctx.session)
-            .expect("child still visible");
-        let cinfo = child.partition.as_ref().expect("child is partitioned");
+        else {
+            // v0.70: tolerate stale links (a rolled-back CREATE can leave
+            // a dangling child name behind).
+            continue;
+        };
+        let Some(cinfo) = child.partition.as_ref() else {
+            continue;
+        };
         if cinfo.is_default {
             continue;
         }
         let cbound = cinfo.bound.as_ref().expect("child has bound");
         if bound_contains(&pinfo.method, cbound, key) {
-            // Recurse if the child is itself partitioned.
-            if !cinfo.children.is_empty() {
-                return find_partition_leaf(eng, ctx, child_name, cinfo, key);
-            }
-            return Ok(child_name.clone());
+            return Ok(true);
         }
     }
-    // Then, the default partition.
-    for child_name in &pinfo.children {
-        let child = eng
-            .db
-            .find_table(child_name, ctx.snap, ctx.own, ctx.session)
-            .expect("child still visible");
-        let cinfo = child.partition.as_ref().expect("child is partitioned");
-        if cinfo.is_default {
-            if !cinfo.children.is_empty() {
-                return find_partition_leaf(eng, ctx, child_name, cinfo, key);
+    Ok(false)
+}
+
+/// v0.70: find the leaf partition for a row (recursive for multilevel).
+/// The row is carried in each level's own column order; the key is
+/// re-evaluated per level with that table's key definition.
+fn find_partition_leaf(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    pinfo: &PartitionInfo,
+    table_cols: &[(String, ColType)],
+    row: &[Value],
+) -> Result<String, ExecError> {
+    let key = eval_table_part_key(eng, ctx, table, pinfo, table_cols, row)?;
+    // Non-default children first, then the default partition (PG19:
+    // the default only receives rows no explicit sibling accepts).
+    for default_pass in [false, true] {
+        for child_name in &pinfo.children {
+            let (cinfo, child_cols) = {
+                let Some(child) = eng
+                    .db
+                    .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                else {
+                    continue;
+                };
+                let Some(cinfo) = child.partition.clone() else {
+                    continue;
+                };
+                (cinfo, child.columns.clone())
+            };
+            if cinfo.is_default != default_pass {
+                continue;
             }
-            return Ok(child_name.clone());
+            let cbound = cinfo.bound.as_ref().expect("child has bound");
+            let matches = if cinfo.is_default {
+                !explicit_sibling_accepts(eng, ctx, pinfo, child_name, &key)?
+            } else {
+                bound_contains(&pinfo.method, cbound, &key)
+            };
+            if !matches {
+                continue;
+            }
+            if cinfo.children.is_empty() {
+                return Ok(child_name.clone());
+            }
+            // Recurse: remap the row to the child's column order and
+            // evaluate the *child's* key there.
+            let crow = remap_row_to_parent(table_cols, &child_cols, row);
+            return find_partition_leaf(eng, ctx, child_name, &cinfo, &child_cols, &crow);
         }
     }
     // No partition found.
@@ -1542,8 +1705,12 @@ fn find_partition_leaf(
     ))
 }
 
-/// v0.69: validate that a row directly inserted into a leaf satisfies
-/// the leaf's bound and all ancestor bounds.
+/// v0.70: validate that a row directly inserted into a leaf satisfies
+/// the leaf's bound and *every* ancestor bound (v0.69 stopped at the
+/// immediate parent). The row is carried up the chain, remapped to each
+/// ancestor's column order; a DEFAULT bound is satisfied only when no
+/// explicit sibling bound accepts the key (v0.69 rejected every direct
+/// DEFAULT insert outright).
 fn check_leaf_bound(
     eng: &mut Engine,
     ctx: &StmtCtx,
@@ -1552,88 +1719,49 @@ fn check_leaf_bound(
     leaf_cols: &[(String, ColType)],
     values: &[Value],
 ) -> Result<(), ExecError> {
-    // Map leaf row to the parent's column order for key extraction.
-    // (For a direct leaf insert, the key columns are the leaf's own;
-    // we need the parent's key definition which uses parent column
-    // indexes. Since columns are inherited by name, and the leaf may
-    // have a different physical order, we map by name.)
-    let parent_name = pinfo.parent.as_ref().expect("leaf has parent");
-    let (parent_cols, parent_pinfo) = {
-        let parent = eng
-            .db
-            .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
-            .expect("parent still visible");
-        (
-            parent.columns.clone(),
-            parent.partition.clone().expect("parent is partitioned"),
-        )
-    };
-    // Remap to parent order.
-    let prow = remap_row_to_parent(leaf_cols, &parent_cols, values);
-    // Build schema for expression evaluation.
-    let schema: Vec<QCol> = parent_cols
-        .iter()
-        .enumerate()
-        .map(|(i, (n, ty))| QCol {
-            qual: parent_name.to_string(),
-            name: n.clone(),
-            ty: *ty,
-            hidden: false,
-            src_ord: i as u32,
-        })
-        .collect();
-    // Extract key (parent's key definition), evaluating expressions.
-    let mut key = Vec::with_capacity(parent_pinfo.key.len());
-    for k in &parent_pinfo.key {
-        if let Some(e) = &k.expr {
-            let v = eval_partition_key_expr(
-                eng,
-                ctx.snap,
-                ctx.own,
-                ctx.session,
-                ctx.role,
-                &schema,
-                &prow,
-                e,
-            )?;
-            key.push(v);
-        } else {
-            key.push(prow[k.col].clone());
-        }
-    }
-    // Check the leaf's own bound.
-    let bound = pinfo.bound.as_ref().expect("leaf has bound");
-    if !bound_contains(&parent_pinfo.method, bound, &key) {
-        return Err(exec_err(
-            "23514",
-            format!(
-                "new row for relation \"{}\" violates partition constraint",
-                leaf_name
-            ),
-        ));
-    }
-    // Check ancestors recursively.
-    if let Some(gp) = &parent_pinfo.parent {
-        let (gp_cols, gp_info) = {
-            let grandparent = eng
+    let mut cur_name = leaf_name.to_string();
+    let mut cur_cols = leaf_cols.to_vec();
+    let mut cur_row: Vec<Value> = values.to_vec();
+    let mut cur_pinfo = pinfo.clone();
+    loop {
+        let parent_name = cur_pinfo.parent.clone().expect("partition has parent");
+        let (parent_cols, parent_pinfo) = {
+            let parent = eng
                 .db
-                .find_table(gp, ctx.snap, ctx.own, ctx.session)
-                .expect("grandparent visible");
+                .find_table(&parent_name, ctx.snap, ctx.own, ctx.session)
+                .expect("parent still visible");
             (
-                grandparent.columns.clone(),
-                grandparent.partition.clone().expect("gp partitioned"),
+                parent.columns.clone(),
+                parent.partition.clone().expect("parent is partitioned"),
             )
         };
-        // For the recursive check, we need the parent's row in grandparent order.
-        // Since parent_cols == gp_cols by name (inherited), we can remap.
-        let gprow = remap_row_to_parent(&parent_cols, &gp_cols, &prow);
-        // We need a PartitionInfo for the parent as a "leaf" of the grandparent.
-        // The parent_pinfo has the bound we need to check against the grandparent.
-        // Actually, we should check if the key satisfies the parent's bound
-        // in the context of the grandparent. This is getting complex.
-        // For now, just check the immediate parent (the corpus doesn't have
-        // 3-level partitioning with direct leaf inserts).
-        let _ = (gp_cols, gp_info, gprow);
+        // Remap the row to the parent's column order, then evaluate the
+        // parent's key (the current table's bound is parent-relative).
+        let prow = remap_row_to_parent(&cur_cols, &parent_cols, &cur_row);
+        let key = eval_table_part_key(eng, ctx, &parent_name, &parent_pinfo, &parent_cols, &prow)?;
+        let bound = cur_pinfo.bound.as_ref().expect("partition has bound");
+        let ok = if cur_pinfo.is_default {
+            !explicit_sibling_accepts(eng, ctx, &parent_pinfo, &cur_name, &key)?
+        } else {
+            bound_contains(&parent_pinfo.method, bound, &key)
+        };
+        if !ok {
+            return Err(exec_err(
+                "23514",
+                format!(
+                    "new row for relation \"{}\" violates partition constraint",
+                    leaf_name
+                ),
+            ));
+        }
+        // Move up: the parent becomes the current table.
+        if parent_pinfo.parent.is_none() {
+            break;
+        }
+        cur_name = parent_name;
+        cur_cols = parent_cols;
+        cur_row = prow;
+        cur_pinfo = parent_pinfo;
     }
     Ok(())
 }
@@ -1644,7 +1772,7 @@ fn create_table_from_def(
     name: &str,
     def: &TableDef,
     temp: bool,
-) -> Result<(), ExecError> {
+) -> Result<TableDef, ExecError> {
     // v0.22: CREATE TEMP TABLE creates a session-local table in
     // `Database::temp_tables[session]`, shadowing any permanent table of
     // the same name *only within this session* (PostgreSQL semantics).
@@ -1682,6 +1810,12 @@ fn create_table_from_def(
                 def.not_null = parent.not_null.clone();
                 def.defaults = parent.defaults.clone();
                 def.checks = parent.checks.clone();
+                // v0.70: inherit the parent's constraints too (PG copies
+                // them to every partition). Backing unique indexes get
+                // per-table names via `constraint_index_name`.
+                def.uniques = parent.uniques.clone();
+                def.pkey = parent.pkey.clone();
+                def.fks = parent.fks.clone();
                 let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
                 temp_pinfo = Some(pinfo);
                 temp_parent = Some(parent_name.clone());
@@ -1710,15 +1844,22 @@ fn create_table_from_def(
         wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, Some(ctx.session))?;
         let tmps = eng.db.temp_tables.entry(ctx.session).or_default();
         tmps.insert(name.to_string(), t);
-        // v0.69: link a temp PARTITION OF child into its parent's children.
+        // v0.70: link a temp PARTITION OF child into its parent's
+        // children. A permanent parent gets a versioned, undoable link;
+        // a temp parent is session-local — mutate in place (stale links
+        // are skipped by routing).
         if let Some(parent_name) = temp_parent {
-            if let Some(pp) = eng
-                .db
-                .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
-            {
-                if let Some(pi) = pp.partition.as_mut() {
-                    pi.children.push(name.to_string());
+            if eng.db.is_temp_table(ctx.session, &parent_name) {
+                if let Some(pp) =
+                    eng.db
+                        .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+                {
+                    if let Some(pi) = pp.partition.as_mut() {
+                        pi.children.push(name.to_string());
+                    }
                 }
+            } else {
+                parent_link_child(eng, ctx, &parent_name, name, true);
             }
         }
         ctx.writes.push(WriteOp::CreateTempTable {
@@ -1737,7 +1878,7 @@ fn create_table_from_def(
         // table's indexes. PRIMARY KEY / UNIQUE constraints on temp
         // tables are recorded in the table definition and enforced by a
         // session-local scan (`Database::temp_scan_constraint`).
-        return Ok(());
+        return Ok(def);
     }
     if eng
         .db
@@ -1772,6 +1913,12 @@ fn create_table_from_def(
             def.not_null = parent.not_null.clone();
             def.defaults = parent.defaults.clone();
             def.checks = parent.checks.clone();
+            // v0.70: inherit the parent's constraints too (PG copies
+            // them to every partition). Backing unique indexes get
+            // per-table names via `constraint_index_name`.
+            def.uniques = parent.uniques.clone();
+            def.pkey = parent.pkey.clone();
+            def.fks = parent.fks.clone();
             // Build the partition info (validates the bound).
             let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
             // Stash the info for after the table is created.
@@ -1790,14 +1937,20 @@ fn create_table_from_def(
             ensure_toast_table_eager(eng, ctx, name, &mut t);
             wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, None)?;
             eng.db.tables.entry(name.to_string()).or_default().push(t);
-            // Link into the parent's children.
-            if let Some(pp) = eng
-                .db
-                .find_table_mut(parent_name, ctx.snap, ctx.own, ctx.session)
-            {
-                if let Some(pi) = pp.partition.as_mut() {
-                    pi.children.push(name.to_string());
+            // v0.70: link into the parent's children, transactionally, so
+            // ROLLBACK undoes the link. A temp parent is session-local —
+            // mutate it in place (stale links are skipped by routing).
+            if eng.db.is_temp_table(ctx.session, parent_name) {
+                if let Some(pp) = eng
+                    .db
+                    .find_table_mut(parent_name, ctx.snap, ctx.own, ctx.session)
+                {
+                    if let Some(pi) = pp.partition.as_mut() {
+                        pi.children.push(name.to_string());
+                    }
                 }
+            } else {
+                parent_link_child(eng, ctx, parent_name, name, true);
             }
             ctx.writes.push(WriteOp::CreateTable {
                 name: name.to_string(),
@@ -1805,7 +1958,7 @@ fn create_table_from_def(
             for fk in &def.fks {
                 validate_fk_def(eng, ctx, name, fk)?;
             }
-            return Ok(());
+            return Ok(def);
         }
     }
     let mut t = Table::with_def(&def, ctx.own);
@@ -1842,7 +1995,7 @@ fn create_table_from_def(
     for fk in &def.fks {
         validate_fk_def(eng, ctx, name, fk)?;
     }
-    Ok(())
+    Ok(def)
 }
 
 /// Validate a foreign-key definition: the referenced table exists, the
@@ -1940,6 +2093,19 @@ fn validate_fk_def(
 /// Build the backing unique index for a PRIMARY KEY / UNIQUE constraint
 /// (`internal` marks it as constraint-owned). Checks for duplicate keys
 /// among live row versions, like CREATE UNIQUE INDEX.
+/// v0.70: backing-index name for a UNIQUE/PKEY constraint. Partition
+/// children get a per-table name (`{table}_{constraint}` — PG names
+/// per-partition indexes after the partition, and the global index
+/// namespace can't hold one `{constraint}` index per sibling); every
+/// other table keeps the historical `{constraint}` name.
+fn constraint_index_name(table: &str, con: &str, is_partition_child: bool) -> String {
+    if is_partition_child {
+        format!("{table}_{con}")
+    } else {
+        con.to_string()
+    }
+}
+
 fn create_constraint_index(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1948,16 +2114,20 @@ fn create_constraint_index(
     cols: &[String],
     internal: bool,
 ) -> Result<(), ExecError> {
-    if eng.db.find_index(cname, ctx.snap, ctx.own).is_some() {
-        return Err(exec_err(
-            "42P07",
-            format!("relation \"{}\" already exists", cname),
-        ));
-    }
     let t = eng
         .db
         .find_table(table, ctx.snap, ctx.own, ctx.session)
         .expect("table still visible; engine lock held throughout");
+    // v0.70: per-partition index names for partition children (see
+    // `constraint_index_name`).
+    let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+    let ix_name = constraint_index_name(table, cname, is_child);
+    if eng.db.find_index(&ix_name, ctx.snap, ctx.own).is_some() {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", ix_name),
+        ));
+    }
     let mut seen = Vec::with_capacity(cols.len());
     for c in cols {
         let pos = t.column_index(c).ok_or_else(|| {
@@ -1975,7 +2145,7 @@ fn create_constraint_index(
         seen.push(pos);
     }
     let mut ix = Index::new(IndexDef {
-        name: cname.to_string(),
+        name: ix_name,
         table: table.to_string(),
         cols: seen,
         col_names: cols.to_vec(),
@@ -3646,7 +3816,8 @@ fn exec_create_table_as(
         fks: Vec::new(),
         partition: None,
     };
-    create_table_from_def(eng, ctx, name, &def, temp)?;
+    // CTAS definitions never carry constraints; the effective def is discarded.
+    let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
     let n = if with_data { out.rows.len() } else { 0 };
     if with_data {
         let mut inserts: Vec<(u64, Row)> = Vec::with_capacity(out.rows.len());
@@ -3723,6 +3894,17 @@ fn exec_insert(
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        // v0.70: ON CONFLICT against a partitioned parent is rejected.
+        // PostgreSQL arbitrates the parent's unique constraints across all
+        // partitions; this engine's upsert resolves indexes on the named
+        // table only, so DO NOTHING would silently insert duplicates and
+        // arbiter lookup would fail. A clear 0A000 beats wrong results.
+        if on_conflict.is_some() && t.partition.is_some() {
+            return Err(exec_err(
+                "0A000",
+                "ON CONFLICT on a partitioned table is not supported yet",
+            ));
+        }
         TableMeta::of(t)
     };
     let upsert: Option<UpsertPlan> = match on_conflict {
@@ -4327,6 +4509,58 @@ fn check_write_conflict(eng: &Engine, xmax: u64, level: IsolationLevel) -> Resul
     Ok(())
 }
 
+// --- v0.70: partitioned UPDATE/DELETE ---------------------------------------
+// In PostgreSQL, UPDATE/DELETE naming a partitioned table operate on every
+// partition. This engine stores rows only in leaves, so a partitioned
+// target expands to its leaf tables. Leaf rows are remapped to the parent's
+// column order for WHERE/SET/RETURNING evaluation (leaves may reorder
+// columns, e.g. ATTACH with a column list); storage, indexes, constraints
+// and FK cascades use each leaf's own order and metadata. An UPDATE that
+// changes the partition key moves the row: the old version is deleted from
+// its leaf and the new version is inserted into the routed leaf.
+
+/// Leaf tables under `root` with their column lists: every descendant
+/// with no children of its own. Built on the SELECT path's
+/// `collect_partition_leaves` traversal.
+fn partition_leaves(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    root: &str,
+) -> Vec<(String, Vec<(String, ColType)>)> {
+    collect_partition_leaves(&eng.db, root, ctx.snap, ctx.own, ctx.session)
+        .into_iter()
+        .filter_map(|name| {
+            eng.db
+                .find_table(&name, ctx.snap, ctx.own, ctx.session)
+                .map(|t| (name, t.columns.clone()))
+        })
+        .collect()
+}
+
+/// Reorder `values` from `from_cols` order into `to_cols` order, matching by
+/// column name. Missing columns become NULL (defensive; PARTITION OF
+/// children always carry the full column set).
+fn reorder_row(
+    from_cols: &[(String, ColType)],
+    to_cols: &[(String, ColType)],
+    values: &[Value],
+) -> Vec<Value> {
+    let pos: std::collections::HashMap<&str, usize> = from_cols
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (n.as_str(), i))
+        .collect();
+    to_cols
+        .iter()
+        .map(|(n, _)| {
+            pos.get(n.as_str())
+                .and_then(|&i| values.get(i))
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
 fn exec_update(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -4364,12 +4598,23 @@ fn exec_update(
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first (validate + conflict-check), mutate after: a failed
     // UPDATE leaves no trace (statement atomicity).
-    let plan: Vec<(u64, u64, Row)> = {
+    // v0.70: a partitioned target expands to its leaves. The plan holds
+    // in-place updates as (dst leaf, old id, prev xmax, new values in dst
+    // order); rows whose partition key changed are planned as moves
+    // (src leaf, old id, prev xmax, dst leaf, new values in dst order).
+    // `ret_new` carries every new row in parent order for RETURNING.
+    let (plan, moves, ret_new): (
+        Vec<(String, u64, u64, Row)>,
+        Vec<(String, u64, u64, String, Row)>,
+        Vec<Row>,
+    ) = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
+        let partitioned = t.partition.is_some();
+        let pinfo = t.partition.clone();
         let set_cols: Vec<usize> = sets
             .iter()
             .map(|(name, _)| {
@@ -4399,23 +4644,53 @@ fn exec_update(
             })
             .collect();
         // Copy the visible rows' data out; the borrow of `t` ends here so
-        // SET expressions can run against `eng` below.
-        let vis: Vec<(u64, u64, Row)> = {
-            let t = eng
-                .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
-                .expect("table still visible; engine lock held throughout");
-            t.rows
-                .iter()
-                .filter(|r| row_visible(r, ctx.snap, ctx.own))
-                .map(|r| (r.id, r.xmax, r.values.clone()))
-                .collect()
+        // SET expressions can run against `eng` below. v0.70: a
+        // partitioned target scans every leaf; rows are remapped to the
+        // parent's column order so the parent-qualified schema evaluates
+        // correctly (leaves may reorder columns).
+        let mut vis: Vec<(String, Vec<(String, ColType)>, u64, u64, Row)> = Vec::new();
+        // v0.70: the tables to scan — every leaf for a partitioned
+        // target, else the named table itself.
+        let leaves: Vec<(String, Vec<(String, ColType)>)> = if partitioned {
+            let mut ls = partition_leaves(eng, ctx, table);
+            if ls.is_empty() {
+                ls.push((table.to_string(), columns.clone()));
+            }
+            ls
+        } else {
+            vec![(table.to_string(), columns.clone())]
         };
-        let mut plan = Vec::new();
-        let mut old_vals = Vec::new();
+        // Leaf column orders, for routing and remapping below.
+        let leaf_cols_of = leaves.clone();
+        for (leaf, leaf_cols) in &leaves {
+            let lt = eng
+                .db
+                .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                .expect("leaf still visible; engine lock held throughout");
+            for r in lt.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+                let pv = if *leaf == table {
+                    r.values.clone()
+                } else {
+                    Row::new(reorder_row(leaf_cols, &columns, &r.values))
+                };
+                vis.push((leaf.clone(), leaf_cols.clone(), r.id, r.xmax, pv));
+            }
+        }
+        let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
+        let mut moves: Vec<(String, u64, u64, String, Row)> = Vec::new();
+        let mut ret_new: Vec<Row> = Vec::new();
+        // (leaf, old values in leaf order) parallel to `plan`, for the FK
+        // cascade below.
+        let mut old_leaf_vals: Vec<(String, Row)> = Vec::new();
+        // (src leaf, old values in src order) parallel to `moves`.
+        let mut move_old_vals: Vec<(String, Row)> = Vec::new();
+        // New values (with row id) per destination leaf, for
+        // self-referencing FK child checks.
+        let mut new_by_dst: std::collections::HashMap<String, Vec<(u64, Row)>> =
+            std::collections::HashMap::new();
         // SET expressions are evaluated with a scratch query context;
         // subqueries in SET correlate to the row being updated.
-        for (id, xmax, values) in &vis {
+        for (leaf, leaf_cols, id, xmax, values) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
             // v0.22: full predicate expression (was `col = literal` only).
             // NULL or false skips the row, like SELECT's WHERE.
@@ -4441,7 +4716,7 @@ fn exec_update(
             }
             // Only rows we actually write conflict with FOR UPDATE locks —
             // merely scanning a locked row is fine, like Postgres.
-            check_row_lock(eng, table, *id, ctx.own)?;
+            check_row_lock(eng, leaf, *id, ctx.own)?;
             let mut new_values = values.to_vec();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
                 let v = eval_update_expr(
@@ -4458,17 +4733,37 @@ fn exec_update(
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
-            // v0.8: UNIQUE enforcement against the indexes. The old
-            // version is excluded (it is being replaced); the check runs
-            // before any mutation, keeping the statement atomic.
-            if let Some(vname) = eng.db.unique_violation(
-                table,
-                &new_values,
-                Some(*id),
-                ctx.snap,
-                ctx.own,
-                ctx.session,
-            ) {
+            // v0.70: route the new row through the partitioned target. A
+            // changed partition key moves the row to another leaf
+            // (delete old version + insert new), like PostgreSQL.
+            let (dst, dst_cols) = if partitioned {
+                let p = pinfo.as_ref().expect("partitioned target keeps its info");
+                let dl = find_partition_leaf(eng, ctx, table, p, &columns, &new_values)?;
+                let dc = leaf_cols_of
+                    .iter()
+                    .find(|(n, _)| n == &dl)
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_else(|| columns.clone());
+                (dl, dc)
+            } else {
+                (leaf.clone(), leaf_cols.clone())
+            };
+            let new_dst = reorder_row(&columns, &dst_cols, &new_values);
+            let dst_meta = {
+                let dt = eng
+                    .db
+                    .find_table(&dst, ctx.snap, ctx.own, ctx.session)
+                    .expect("destination leaf visible; engine lock held throughout");
+                TableMeta::of(dt)
+            };
+            // v0.8: UNIQUE enforcement against the destination's indexes.
+            // The old version is excluded (it is being replaced); the
+            // check runs before any mutation, keeping the statement
+            // atomic.
+            if let Some(vname) =
+                eng.db
+                    .unique_violation(&dst, &new_dst, Some(*id), ctx.snap, ctx.own, ctx.session)
+            {
                 return Err(exec_err(
                     "23505",
                     format!(
@@ -4477,71 +4772,117 @@ fn exec_update(
                     ),
                 ));
             }
-            // v0.9: NOT NULL + CHECK on the new row.
+            // v0.9: NOT NULL + CHECK on the new row (destination metadata).
             check_row_constraints(
                 eng,
                 ctx.snap,
                 ctx.own,
                 ctx.session,
                 ctx.role,
-                &meta,
-                table,
-                &new_values,
+                &dst_meta,
+                &dst,
+                &new_dst,
             )?;
-            old_vals.push(values.clone());
-            plan.push((*id, *xmax, Row::new(new_values)));
+            new_by_dst
+                .entry(dst.clone())
+                .or_default()
+                .push((*id, Row::new(new_dst.clone())));
+            ret_new.push(Row::new(new_values.clone()));
+            let old_src = Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()));
+            if dst == *leaf {
+                old_leaf_vals.push((leaf.clone(), old_src));
+                plan.push((leaf.clone(), *id, *xmax, Row::new(new_dst)));
+            } else {
+                move_old_vals.push((leaf.clone(), old_src));
+                moves.push((leaf.clone(), *id, *xmax, dst, Row::new(new_dst)));
+            }
         }
-        // v0.9: child-side FK checks for the new rows. Self-references see
-        // the statement's own new versions; each row's old version is
-        // excluded from the parent scan.
-        {
-            let self_new: Vec<Row> = plan.iter().map(|(_, _, nv)| nv.clone()).collect();
-            for (i, (_, _, nv)) in plan.iter().enumerate() {
+        // v0.9: child-side FK checks for the new rows, per destination
+        // leaf. Self-references see the statement's own new versions;
+        // each row's old version is excluded from the parent scan.
+        for (dst, new_rows) in &new_by_dst {
+            let dst_meta = {
+                let dt = eng
+                    .db
+                    .find_table(dst, ctx.snap, ctx.own, ctx.session)
+                    .expect("destination leaf visible; engine lock held throughout");
+                TableMeta::of(dt)
+            };
+            let self_new: Vec<Row> = new_rows.iter().map(|(_, nv)| nv.clone()).collect();
+            for (rid, nv) in new_rows {
                 check_fk_child_row(
                     eng,
                     ctx.snap,
                     ctx.own,
                     ctx.session,
-                    &meta,
-                    table,
+                    &dst_meta,
+                    dst,
                     nv,
                     &self_new,
-                    Some(plan[i].0),
+                    Some(*rid),
                 )?;
             }
         }
         // v0.9: parent-side FK actions (RESTRICT / CASCADE / SET NULL /
-        // SET DEFAULT), planned before any mutation.
+        // SET DEFAULT), planned before any mutation. Grouped by the leaf
+        // holding the old version; moves plan their delete side.
         let mut cascade = FkCascade::default();
         {
-            let changed: Vec<(u64, Row, Option<Row>)> = plan
-                .iter()
-                .zip(old_vals.iter())
-                .map(|((id, _, nv), ov)| (*id, ov.clone(), Some(nv.clone())))
-                .collect();
-            plan_fk_cascade(
-                eng,
-                ctx.snap,
-                ctx.own,
-                ctx.session,
-                ctx.role,
-                ctx.level,
-                table,
-                &meta,
-                &changed,
-                0,
-                &mut cascade,
-            )?;
+            let mut by_src: std::collections::HashMap<&str, Vec<(u64, Row, Option<Row>)>> =
+                std::collections::HashMap::new();
+            for ((_, id, _, nv), (src, ov)) in plan.iter().zip(old_leaf_vals.iter()) {
+                by_src
+                    .entry(src.as_str())
+                    .or_default()
+                    .push((*id, ov.clone(), Some(nv.clone())));
+            }
+            for ((src, id, _, _, _), (_, ov)) in moves.iter().zip(move_old_vals.iter()) {
+                by_src
+                    .entry(src.as_str())
+                    .or_default()
+                    .push((*id, ov.clone(), None));
+            }
+            for (src, changed) in &by_src {
+                let src_meta = {
+                    let st = eng
+                        .db
+                        .find_table(src, ctx.snap, ctx.own, ctx.session)
+                        .expect("source leaf visible; engine lock held throughout");
+                    TableMeta::of(st)
+                };
+                plan_fk_cascade(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    ctx.level,
+                    src,
+                    &src_meta,
+                    changed,
+                    0,
+                    &mut cascade,
+                )?;
+            }
         }
         // v0.8: pairwise unique check — two rows updated to the same unique
         // key in one statement (the index still holds only old entries).
-        // v0.9: extended over cascaded updates, grouped by table.
+        // v0.9: extended over cascaded updates, grouped by table. v0.70:
+        // grouped by destination leaf, including moved rows.
         {
             let mut by_table: HashMap<&str, Vec<(u64, u64, Row)>> = HashMap::new();
-            by_table
-                .entry(table)
-                .or_default()
-                .extend(plan.iter().cloned());
+            for (dst, id, xmax, nv) in &plan {
+                by_table
+                    .entry(dst.as_str())
+                    .or_default()
+                    .push((*id, *xmax, nv.clone()));
+            }
+            for (_, id, xmax, dst, nv) in &moves {
+                by_table
+                    .entry(dst.as_str())
+                    .or_default()
+                    .push((*id, *xmax, nv.clone()));
+            }
             for (t, id, xmax, nv) in &cascade.updates {
                 by_table
                     .entry(t.as_str())
@@ -4554,52 +4895,108 @@ fn exec_update(
         }
         // Apply the cascade after the unique checks pass.
         apply_fk_cascade(eng, ctx, cascade)?;
-        plan
+        (plan, moves, ret_new)
     };
-    // Apply: UPDATE = delete old version + insert new version.
-    let n = plan.len();
-    let mut new_ids = Vec::with_capacity(n);
-    for _ in 0..n {
-        new_ids.push(eng.alloc_row_id());
-    }
-    // The table borrow ends before index maintenance (both need `eng.db`
-    // mutably); collect the new versions' keys meanwhile.
-    let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(n);
+    // Apply: UPDATE = delete old version + insert new version, per leaf.
+    // v0.70: moved rows are deleted from their source leaf and inserted
+    // into the routed destination leaf.
+    let n = plan.len() + moves.len();
     {
-        let t = eng
-            .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
-            .expect("table still visible; engine lock held throughout");
-        for ((old_id, prev_xmax, new_values), new_id) in plan.into_iter().zip(new_ids) {
-            let pos = t
-                .row_pos(old_id)
-                .expect("row version still present; engine lock held throughout");
-            // v0.13: UpdateRow carries the old values for logical decoding.
-            let old_values = t.rows[pos].values.clone();
-            t.rows[pos].xmax = ctx.own;
-            t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
-            ctx.writes.push(WriteOp::UpdateRow {
-                table: table.to_string(),
-                old_id,
-                new_id,
-                prev_xmax,
-                old_values,
-            });
-            indexed.push((new_id, new_values));
+        let mut by_leaf: std::collections::HashMap<String, Vec<(u64, u64, Row)>> =
+            std::collections::HashMap::new();
+        for (dst, old_id, prev_xmax, new_values) in plan {
+            by_leaf
+                .entry(dst)
+                .or_default()
+                .push((old_id, prev_xmax, new_values));
+        }
+        // Deterministic leaf order for the WAL log.
+        let mut leaves: Vec<String> = by_leaf.keys().cloned().collect();
+        leaves.sort_unstable();
+        for leaf in &leaves {
+            let rows = &by_leaf[leaf.as_str()];
+            let mut new_ids = Vec::with_capacity(rows.len());
+            for _ in 0..rows.len() {
+                new_ids.push(eng.alloc_row_id());
+            }
+            // The table borrow ends before index maintenance (both need
+            // `eng.db` mutably); collect the new versions' keys meanwhile.
+            let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(rows.len());
+            {
+                let t = eng
+                    .db
+                    .find_table_mut(leaf, ctx.snap, ctx.own, ctx.session)
+                    .expect("table still visible; engine lock held throughout");
+                for ((old_id, prev_xmax, new_values), new_id) in rows.iter().cloned().zip(new_ids) {
+                    let pos = t
+                        .row_pos(old_id)
+                        .expect("row version still present; engine lock held throughout");
+                    // v0.13: UpdateRow carries the old values for logical decoding.
+                    let old_values = t.rows[pos].values.clone();
+                    t.rows[pos].xmax = ctx.own;
+                    t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
+                    ctx.writes.push(WriteOp::UpdateRow {
+                        table: leaf.clone(),
+                        old_id,
+                        new_id,
+                        prev_xmax,
+                        old_values,
+                    });
+                    indexed.push((new_id, new_values));
+                }
+            }
+            // v0.37: TOAST the updated rows, like INSERT does (the new versions
+            // may hold large values even when the old ones did not).
+            for (new_id, new_values) in &indexed {
+                toast_new_row(eng, ctx, leaf, *new_id, new_values)?;
+            }
+            // v0.8: index the new versions (old versions' entries stay; the
+            // version chain's xmax makes them invisible).
+            for (new_id, new_values) in &indexed {
+                eng.db
+                    .index_insert_row(leaf, *new_id, new_values, ctx.session);
+            }
         }
     }
-    // v0.37: TOAST the updated rows, like INSERT does (the new versions
-    // may hold large values even when the old ones did not).
-    for (new_id, new_values) in &indexed {
-        toast_new_row(eng, ctx, table, *new_id, new_values)?;
+    // v0.70: moved rows — delete the old version from the source leaf,
+    // insert the new version into the routed destination leaf.
+    {
+        let mut by_src: std::collections::HashMap<String, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
+        let mut by_dst: std::collections::HashMap<String, Vec<(u64, Row)>> =
+            std::collections::HashMap::new();
+        for (src, old_id, prev_xmax, dst, new_values) in moves {
+            let new_id = eng.alloc_row_id();
+            by_src.entry(src).or_default().push((old_id, prev_xmax));
+            by_dst.entry(dst).or_default().push((new_id, new_values));
+        }
+        let mut srcs: Vec<String> = by_src.keys().cloned().collect();
+        srcs.sort_unstable();
+        for src in &srcs {
+            let t = eng
+                .db
+                .find_table_mut(src, ctx.snap, ctx.own, ctx.session)
+                .expect("source leaf visible; engine lock held throughout");
+            for (old_id, prev_xmax) in &by_src[src.as_str()] {
+                let pos = t
+                    .row_pos(*old_id)
+                    .expect("row version still present; engine lock held throughout");
+                t.rows[pos].xmax = ctx.own;
+                ctx.writes.push(WriteOp::DeleteRow {
+                    table: src.clone(),
+                    row_id: *old_id,
+                    prev_xmax: *prev_xmax,
+                });
+            }
+        }
+        let mut dsts: Vec<String> = by_dst.keys().cloned().collect();
+        dsts.sort_unstable();
+        for dst in &dsts {
+            apply_row_inserts(eng, ctx, dst, &by_dst[dst.as_str()])?;
+        }
     }
-    // v0.8: index the new versions (old versions' entries stay; the
-    // version chain's xmax makes them invisible).
-    for (new_id, new_values) in &indexed {
-        eng.db
-            .index_insert_row(table, *new_id, new_values, ctx.session);
-    }
-    // v0.10: RETURNING evaluates against the NEW row values.
+    // v0.10: RETURNING evaluates against the NEW row values. v0.70:
+    // `ret_new` holds them in parent column order (leaves may reorder).
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -4622,8 +5019,8 @@ fn exec_update(
                 })
                 .collect()
         };
-        let mut out_rows = Vec::with_capacity(indexed.len());
-        for (_, new_values) in &indexed {
+        let mut out_rows = Vec::with_capacity(ret_new.len());
+        for new_values in &ret_new {
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
@@ -4663,13 +5060,17 @@ fn exec_delete(
     // the CTEs, but the RETURNING list can via subqueries).
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
     // Plan first for statement atomicity (WHERE type errors must not
-    // leave half the rows deleted).
-    let plan: Vec<(u64, u64, Row, Vec<u32>)> = {
+    // leave half the rows deleted). v0.70: a partitioned target scans
+    // every leaf; the plan records (leaf, id, xmax, values in parent
+    // order for RETURNING, values in leaf order for FK cascades, toast).
+    let plan: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
+        let partitioned = t.partition.is_some();
+        let columns = meta.columns.clone();
         // v0.22: the WHERE clause is a full predicate expression
         // (like SELECT's). The schema carries the target table name
         // as qualifier so `tbl.col` references resolve, as in
@@ -4688,14 +5089,45 @@ fn exec_delete(
                 src_ord: 0,
             })
             .collect();
-        let vis: Vec<(u64, u64, Row, Vec<u32>)> = t
-            .rows
-            .iter()
-            .filter(|r| row_visible(r, ctx.snap, ctx.own))
-            .map(|r| (r.id, r.xmax, r.values.clone(), r.toast.clone()))
-            .collect();
+        let vis: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
+            // (leaf, id, xmax, values parent order, values leaf order, toast)
+            let mut v = Vec::new();
+            // v0.70: partitioned targets scan every leaf, remapping rows
+            // to the parent's column order for WHERE evaluation.
+            let targets: Vec<(String, Vec<(String, ColType)>)> = if partitioned {
+                let mut ls = partition_leaves(eng, ctx, table);
+                if ls.is_empty() {
+                    ls.push((table.to_string(), columns.clone()));
+                }
+                ls
+            } else {
+                vec![(table.to_string(), columns.clone())]
+            };
+            for (leaf, leaf_cols) in &targets {
+                let lt = eng
+                    .db
+                    .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                    .expect("leaf still visible; engine lock held throughout");
+                for r in lt.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+                    let pv = if *leaf == table {
+                        r.values.clone()
+                    } else {
+                        Row::new(reorder_row(leaf_cols, &columns, &r.values))
+                    };
+                    v.push((
+                        leaf.clone(),
+                        r.id,
+                        r.xmax,
+                        pv,
+                        r.values.clone(),
+                        r.toast.clone(),
+                    ));
+                }
+            }
+            v
+        };
         let mut plan = Vec::new();
-        for (id, xmax, values, _toast) in &vis {
+        for (leaf, id, xmax, values, leaf_values, _toast) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
             let row_matches = match where_ {
                 None => true,
@@ -4717,30 +5149,51 @@ fn exec_delete(
             if row_matches {
                 // Only rows we actually delete conflict with FOR UPDATE
                 // locks — merely scanning a locked row is fine.
-                check_row_lock(eng, table, *id, ctx.own)?;
-                plan.push((*id, *xmax, values.clone(), _toast.clone()));
+                check_row_lock(eng, leaf, *id, ctx.own)?;
+                plan.push((
+                    leaf.clone(),
+                    *id,
+                    *xmax,
+                    values.clone(),
+                    leaf_values.clone(),
+                    _toast.clone(),
+                ));
             }
         }
-        // v0.9: parent-side FK actions for the deleted rows.
+        // v0.9: parent-side FK actions for the deleted rows, grouped by
+        // the leaf holding each row (v0.70).
         let mut cascade = FkCascade::default();
         {
-            let changed: Vec<(u64, Row, Option<Row>)> = plan
-                .iter()
-                .map(|(id, _, values, _)| (*id, values.clone(), None))
-                .collect();
-            plan_fk_cascade(
-                eng,
-                ctx.snap,
-                ctx.own,
-                ctx.session,
-                ctx.role,
-                ctx.level,
-                table,
-                &meta,
-                &changed,
-                0,
-                &mut cascade,
-            )?;
+            let mut by_leaf: std::collections::HashMap<&str, Vec<(u64, Row, Option<Row>)>> =
+                std::collections::HashMap::new();
+            for (leaf, id, _, _, leaf_values, _) in &plan {
+                by_leaf
+                    .entry(leaf.as_str())
+                    .or_default()
+                    .push((*id, leaf_values.clone(), None));
+            }
+            for (leaf, changed) in &by_leaf {
+                let leaf_meta = {
+                    let lt = eng
+                        .db
+                        .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                        .expect("leaf visible; engine lock held throughout");
+                    TableMeta::of(lt)
+                };
+                plan_fk_cascade(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    ctx.level,
+                    leaf,
+                    &leaf_meta,
+                    changed,
+                    0,
+                    &mut cascade,
+                )?;
+            }
         }
         apply_fk_cascade(eng, ctx, cascade)?;
         plan
@@ -4748,33 +5201,57 @@ fn exec_delete(
     let n = plan.len();
     // v0.10: DELETE RETURNING evaluates against the OLD row values —
     // collect them before the plan is consumed by the apply loop.
-    let ret_vals: Vec<Row> = plan.iter().map(|(_, _, v, _)| v.clone()).collect();
+    let ret_vals: Vec<Row> = plan.iter().map(|(_, _, _, v, _, _)| v.clone()).collect();
     // v0.39: the deleted versions' toast value ids, for chunk cleanup below.
-    let deleted_vids: Vec<u32> = plan
-        .iter()
-        .flat_map(|(_, _, _, toast)| toast.iter().copied())
-        .filter(|v| *v != 0)
-        .collect();
-    let t = eng
-        .db
-        .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
-        .expect("table still visible; engine lock held throughout");
-    for (id, prev_xmax, _, _) in plan {
-        let pos = t
-            .row_pos(id)
-            .expect("row version still present; engine lock held throughout");
-        t.rows[pos].xmax = ctx.own;
-        ctx.writes.push(WriteOp::DeleteRow {
-            table: table.to_string(),
-            row_id: id,
-            prev_xmax,
-        });
+    let mut vids_by_leaf: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+    for (leaf, _, _, _, _, toast) in &plan {
+        vids_by_leaf
+            .entry(leaf.clone())
+            .or_default()
+            .extend(toast.iter().copied().filter(|v| *v != 0));
+    }
+    // v0.70: apply per leaf.
+    {
+        let mut by_leaf: std::collections::HashMap<&str, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
+        for (leaf, id, prev_xmax, _, _, _) in &plan {
+            by_leaf
+                .entry(leaf.as_str())
+                .or_default()
+                .push((*id, *prev_xmax));
+        }
+        let mut leaves: Vec<&str> = by_leaf.keys().copied().collect();
+        leaves.sort_unstable();
+        for leaf in leaves {
+            let t = eng
+                .db
+                .find_table_mut(leaf, ctx.snap, ctx.own, ctx.session)
+                .expect("table still visible; engine lock held throughout");
+            for (id, prev_xmax) in &by_leaf[leaf] {
+                let pos = t
+                    .row_pos(*id)
+                    .expect("row version still present; engine lock held throughout");
+                t.rows[pos].xmax = ctx.own;
+                ctx.writes.push(WriteOp::DeleteRow {
+                    table: leaf.to_string(),
+                    row_id: *id,
+                    prev_xmax: *prev_xmax,
+                });
+            }
+        }
     }
     // v0.39: deleting a row version deletes its out-of-line toast chunks
     // too (PG19 heap_delete calls heap_toast_delete immediately). Staged
     // as WriteOps so the chunk deletions are transactional and WAL-logged;
-    // ROLLBACK restores them via the DeleteRow undo.
-    toast_delete_chunks(eng, ctx, table, &deleted_vids)?;
+    // ROLLBACK restores them via the DeleteRow undo. v0.70: per leaf.
+    {
+        let mut leaves: Vec<String> = vids_by_leaf.keys().cloned().collect();
+        leaves.sort_unstable();
+        for leaf in &leaves {
+            toast_delete_chunks(eng, ctx, leaf, &vids_by_leaf[leaf.as_str()])?;
+        }
+    }
     // v0.10: RETURNING.
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
@@ -5056,11 +5533,29 @@ fn drop_one_table(
         // v0.65: drop the temp table's explicitly-owned serial
         // sequences (session-isolated via owned_by).
         let serial_seqs = owned_seqs_of(eng, ctx, name, Some(ctx.session));
+        // v0.70: detach a dropped temp partition child from its
+        // parent's children list (a permanent parent gets a versioned,
+        // undoable link update; a temp parent is session-local).
+        let temp_part_parent = prev.partition.as_ref().and_then(|p| p.parent.clone());
         ctx.writes.push(WriteOp::DropTempTable {
             session: ctx.session,
             name: name.to_string(),
             prev: Some(prev),
         });
+        if let Some(parent_name) = temp_part_parent {
+            if eng.db.is_temp_table(ctx.session, &parent_name) {
+                if let Some(pp) =
+                    eng.db
+                        .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+                {
+                    if let Some(pi) = pp.partition.as_mut() {
+                        pi.children.retain(|c| c != name);
+                    }
+                }
+            } else {
+                parent_link_child(eng, ctx, &parent_name, name, false);
+            }
+        }
         for seq_name in &serial_seqs {
             drop_serial_sequence(eng, ctx, seq_name)?;
         }
@@ -5163,11 +5658,31 @@ fn drop_one_table(
         .expect("table still visible; engine lock held throughout");
     // v0.37: dropping a table drops its toast table too (like PG).
     let toast_relid = t.toast_relid;
+    // v0.70: remember the partition parent (if any) so the dropped
+    // child can be detached from its children list below.
+    let part_parent = t.partition.as_ref().and_then(|p| p.parent.clone());
     t.dropped_xmax = ctx.own;
     ctx.writes.push(WriteOp::DropTable {
         name: name.to_string(),
         prev_xmax,
     });
+    // v0.70: detach a dropped partition child from its parent's
+    // children list (transactionally, so ROLLBACK re-links it). The
+    // recursive DROP above already dropped this table's own children.
+    if let Some(parent_name) = part_parent {
+        if eng.db.is_temp_table(ctx.session, &parent_name) {
+            if let Some(pp) = eng
+                .db
+                .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+            {
+                if let Some(pi) = pp.partition.as_mut() {
+                    pi.children.retain(|c| c != name);
+                }
+            }
+        } else {
+            parent_link_child(eng, ctx, &parent_name, name, false);
+        }
+    }
     // v0.65: dropping a table drops its owned serial sequences.
     for seq_name in &serial_seqs {
         drop_serial_sequence(eng, ctx, seq_name)?;
@@ -29898,9 +30413,73 @@ fn exec_alter(
             unique,
             pkey,
             fk,
-        } => alter_add_constraint(eng, ctx, name, check, unique, pkey, fk),
+        } => {
+            let res = alter_add_constraint(eng, ctx, name, check, unique, pkey, fk);
+            // v0.70: propagate ADD CONSTRAINT to partitions (PG does
+            // this). Per-child backing indexes get per-table names via
+            // `constraint_index_name`, so siblings never collide.
+            if res.is_ok() {
+                let con_name: Option<&str> = check
+                    .as_ref()
+                    .map(|c| c.name.as_str())
+                    .or(unique.as_ref().map(|u| u.name.as_str()))
+                    .or(pkey.as_ref().map(|p| p.name.as_str()))
+                    .or(fk.as_ref().map(|f| f.name.as_str()));
+                let children: Vec<String> = eng
+                    .db
+                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                for child in &children {
+                    // Skip children that already carry this constraint
+                    // (e.g. inherited at CREATE PARTITION OF time).
+                    let already = con_name.is_some_and(|n| {
+                        eng.db
+                            .find_table(child, ctx.snap, ctx.own, ctx.session)
+                            .is_some_and(|t| table_has_constraint(t, n))
+                    });
+                    if already {
+                        continue;
+                    }
+                    let child_action = AlterAction::AddConstraint {
+                        check: check.clone(),
+                        unique: unique.clone(),
+                        pkey: pkey.clone(),
+                        fk: fk.clone(),
+                    };
+                    exec_alter(eng, ctx, child, &child_action)?;
+                }
+            }
+            res
+        }
         AlterAction::DropConstraint { name: con, cascade } => {
-            alter_drop_constraint(eng, ctx, name, con, *cascade)
+            let res = alter_drop_constraint(eng, ctx, name, con, *cascade);
+            // v0.70: propagate DROP CONSTRAINT to partitions.
+            if res.is_ok() {
+                let children: Vec<String> = eng
+                    .db
+                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                for child in &children {
+                    // Skip children that don't carry this constraint.
+                    let missing = eng
+                        .db
+                        .find_table(child, ctx.snap, ctx.own, ctx.session)
+                        .is_some_and(|t| !table_has_constraint(t, con));
+                    if missing {
+                        continue;
+                    }
+                    let child_action = AlterAction::DropConstraint {
+                        name: con.clone(),
+                        cascade: *cascade,
+                    };
+                    exec_alter(eng, ctx, child, &child_action)?;
+                }
+            }
+            res
         }
         AlterAction::AlterColumnSetDefault { name: col, default } => {
             alter_set_default(eng, ctx, name, col, Some(default.clone()))
@@ -30535,20 +31114,23 @@ fn alter_drop_constraint_internal(
     let mut next = t.clone();
     let mut backing_index: Option<String> = None;
     let mut found = false;
+    // v0.70: partition children carry per-table backing index names
+    // (see `constraint_index_name`).
+    let is_child = next.partition.as_ref().is_some_and(|p| p.parent.is_some());
     if let Some(pos) = next.checks.iter().position(|c| c.name == con) {
         next.checks.remove(pos);
         found = true;
     }
     if !found {
         if let Some(pos) = next.uniques.iter().position(|u| u.name == con) {
-            backing_index = Some(next.uniques[pos].name.clone());
+            backing_index = Some(constraint_index_name(name, con, is_child));
             next.uniques.remove(pos);
             found = true;
         }
     }
     if !found {
         if next.pkey.as_ref().is_some_and(|p| p.name == con) {
-            backing_index = next.pkey.as_ref().map(|p| p.name.clone());
+            backing_index = Some(constraint_index_name(name, con, is_child));
             next.pkey = None;
             found = true;
         }

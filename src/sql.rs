@@ -3871,35 +3871,38 @@ impl Parser {
         self.expect(Token::LParen, "'('")?;
         let mut keys = Vec::new();
         loop {
-            if *self.peek() == Token::LParen {
-                // Parenthesized expression key, e.g. `(a+0)`.
-                self.next(); // '('
-                let e = self.parse_or()?;
-                self.expect(Token::RParen, "')'")?;
-                keys.push(PartitionKeyDef::Expr(e));
-            } else {
-                let col = self.expect_ident()?;
-                // Optional operator class (e.g. `a part_test_int4_ops`):
-                // parsed and ignored (PG19 uses it for hash opclasses;
-                // our hash uses the value directly).
-                if matches!(self.peek(), Token::Ident(s) if s != "collate") {
-                    // Peek: is it followed by ',' or ')'? If so it's an
-                    // opclass name, not the next key. We can't easily
-                    // lookahead two tokens, so consume it only if the
-                    // next token after it is ',' or ')'.
-                    let save = self.pos;
-                    let _opclass = self.expect_ident()?;
-                    match self.peek() {
-                        Token::Comma | Token::RParen => {}
-                        _ => {
-                            // Not an opclass — rewind (it was the next key,
-                            // but keys are comma-separated so this means
-                            // a syntax error; let the ','/' )' check fail).
-                            self.pos = save;
+            // v0.70: PG accepts any expression as a partition key, e.g.
+            // `PARTITION BY LIST (lower(a))` — not just parenthesized ones
+            // or bare columns. A bare (optionally opclass-qualified) column
+            // stays a column key; anything else becomes an expression key.
+            let e = self.parse_or()?;
+            match e {
+                Expr::Column { table: None, name } => {
+                    // Optional operator class (e.g. `a part_test_int4_ops`):
+                    // parsed and ignored (PG19 uses it for hash opclasses;
+                    // our hash uses the value directly).
+                    if matches!(self.peek(), Token::Ident(s) if s != "collate") {
+                        // Peek: is it followed by ',' or ')'? If so it's an
+                        // opclass name, not the next key. We can't easily
+                        // lookahead two tokens, so consume it only if the
+                        // next token after it is ',' or ')'.
+                        let save = self.pos;
+                        let _opclass = self.expect_ident()?;
+                        match self.peek() {
+                            Token::Comma | Token::RParen => {}
+                            _ => {
+                                // Not an opclass — rewind (it was the next key,
+                                // but keys are comma-separated so this means
+                                // a syntax error; let the ','/' )' check fail).
+                                self.pos = save;
+                            }
                         }
                     }
+                    keys.push(PartitionKeyDef::Column(name));
                 }
-                keys.push(PartitionKeyDef::Column(col));
+                other => {
+                    keys.push(PartitionKeyDef::Expr(other));
+                }
             }
             match self.next() {
                 Token::Comma => continue,
@@ -9496,4 +9499,59 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         pkey,
         fks,
     })
+}
+
+// --- v0.70: focused parser tests for PARTITION BY keys -----------------------
+#[cfg(test)]
+mod partition_by_tests {
+    use super::*;
+
+    fn part_def(sql: &str) -> PartitionDef {
+        match parse_statement(sql).expect("parses") {
+            Stmt::CreateTable { def, .. } => def.partition.expect("has partition def"),
+            other => panic!("expected CREATE TABLE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unparenthesized_expression_key() {
+        // v0.70: PG accepts any expression as a partition key —
+        // `PARTITION BY LIST (lower(a))` (v0.69 required `((lower(a)))`).
+        let p = part_def("create table t (a text) partition by list (lower(a))");
+        assert_eq!(p.keys.len(), 1);
+        match &p.keys[0] {
+            PartitionKeyDef::Expr(Expr::Func { name, .. }) => assert_eq!(name, "lower"),
+            other => panic!("expected Expr key, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_column_key() {
+        let p = part_def("create table t (a int) partition by list (a)");
+        assert_eq!(p.keys.len(), 1);
+        assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
+    }
+
+    #[test]
+    fn parenthesized_arithmetic_key() {
+        let p = part_def("create table t (a int, b int) partition by range ((a + b))");
+        assert_eq!(p.keys.len(), 1);
+        assert!(matches!(p.keys[0], PartitionKeyDef::Expr(_)));
+    }
+
+    #[test]
+    fn opclass_key() {
+        // A bare column with an operator class stays a column key.
+        let p = part_def("create table t (a int) partition by hash (a int4_ops)");
+        assert_eq!(p.keys.len(), 1);
+        assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
+    }
+
+    #[test]
+    fn multiple_keys() {
+        let p = part_def("create table t (a int, b text) partition by list (a, lower(b))");
+        assert_eq!(p.keys.len(), 2);
+        assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
+        assert!(matches!(p.keys[1], PartitionKeyDef::Expr(_)));
+    }
 }

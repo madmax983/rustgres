@@ -122,6 +122,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::index::{Index, IndexDef};
+use crate::sql::{ArithOp, Expr, Literal};
 use crate::storage::{ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
 
 const WAL_NAME: &str = "wal.log";
@@ -613,11 +614,325 @@ fn encode_range_bound(body: &mut Enc, rb: &crate::storage::RangeBound) {
 /// v0.69: parse a partition key expression from its debug format.
 /// Currently returns None (expression keys don't survive checkpoints —
 /// documented gap). The method exists so the format is versioned.
-fn parse_partition_expr(_s: &str) -> Option<crate::sql::Expr> {
-    // TODO v0.70: implement debug-format parsing for Column, Arith,
-    // Func, and Literal. For now, expression-keyed partitions lose
-    // their key expression on checkpoint load (routing will fail).
-    None
+fn parse_partition_expr(s: &str) -> Option<crate::sql::Expr> {
+    // v0.70: parse back the derived-`Debug` form written by
+    // `encode_partition_key`. v0.69 wrote `format!("{:?}", expr)` but never
+    // parsed it, so expression-keyed partitions (e.g.
+    // `PARTITION BY RANGE (lower(a))`) lost their key expression on
+    // checkpoint reload and routed every row wrong. The parser below covers
+    // the expression shapes the partition key builder accepts: `Column`,
+    // `Literal` (int/float/text/bool/date/timestamp/timestamptz/null and
+    // their small/big/decimal spellings), `Arith` and `Func`. Anything else
+    // (or malformed input) returns `None` — the checkpoint still loads, and
+    // the key degrades to the v0.69 behavior rather than refusing to start.
+    let mut p = DbgParser {
+        s: s.as_bytes(),
+        pos: 0,
+    };
+    let e = p.parse_expr()?;
+    p.skip_ws();
+    if p.pos != p.s.len() {
+        return None;
+    }
+    Some(e)
+}
+
+/// v0.70: tiny parser for Rust derived-`Debug` output. Only understands
+/// the shapes `parse_partition_expr` needs; returns `None` on any error.
+struct DbgParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DbgParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.s.len() && self.s[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        if self.peek() == Some(b) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, b: u8) -> Option<()> {
+        self.skip_ws();
+        if self.eat(b) { Some(()) } else { None }
+    }
+
+    /// Parse a bare identifier (`Column`, `Add`, `None`, ...).
+    fn ident(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.pos < self.s.len()
+            && (self.s[self.pos].is_ascii_alphanumeric() || self.s[self.pos] == b'_')
+        {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        std::str::from_utf8(&self.s[start..self.pos]).ok()
+    }
+
+    fn expect_ident(&mut self, want: &str) -> Option<()> {
+        if self.ident()? == want {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Parse `"..."` with Rust `escape_debug` escapes.
+    fn string(&mut self) -> Option<String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let b = self.peek()?;
+            match b {
+                b'"' => {
+                    self.pos += 1;
+                    return Some(out);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    match self.peek()? {
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'\\' => out.push('\\'),
+                        b'"' => out.push('"'),
+                        b'0' => out.push('\0'),
+                        b'\'' => out.push('\''),
+                        b'u' => {
+                            // \u{XXXX}
+                            self.pos += 1;
+                            self.expect(b'{')?;
+                            let start = self.pos;
+                            while self.peek()? != b'}' {
+                                self.pos += 1;
+                            }
+                            let hex = std::str::from_utf8(&self.s[start..self.pos]).ok()?;
+                            self.pos += 1; // '}'
+                            let cp = u32::from_str_radix(hex, 16).ok()?;
+                            out.push(char::from_u32(cp)?);
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                    self.pos += 1;
+                }
+                _ => {
+                    // Raw UTF-8 bytes (escape_debug leaves printable
+                    // Unicode unescaped).
+                    let rest = std::str::from_utf8(&self.s[self.pos..]).ok()?;
+                    let ch = rest.chars().next()?;
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn number(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        let start = self.pos;
+        if self.peek() == Some(b'-') || self.peek() == Some(b'+') {
+            self.pos += 1;
+        }
+        let mut any = false;
+        while self.pos < self.s.len()
+            && (self.s[self.pos].is_ascii_digit() || self.s[self.pos] == b'.')
+        {
+            any = true;
+            self.pos += 1;
+        }
+        // f64 Debug may print like `1e300`.
+        if self.pos < self.s.len() && (self.s[self.pos] == b'e' || self.s[self.pos] == b'E') {
+            self.pos += 1;
+            if self.peek() == Some(b'-') || self.peek() == Some(b'+') {
+                self.pos += 1;
+            }
+            while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
+        if !any || self.pos == start {
+            return None;
+        }
+        std::str::from_utf8(&self.s[start..self.pos]).ok()
+    }
+
+    /// `field_name :` inside a `{ ... }` struct.
+    fn field(&mut self, name: &str) -> Option<()> {
+        self.expect_ident(name)?;
+        self.expect(b':')
+    }
+
+    fn parse_expr(&mut self) -> Option<Expr> {
+        let tag = self.ident()?;
+        match tag {
+            "Column" => {
+                self.expect(b'{')?;
+                self.field("table")?;
+                self.skip_ws();
+                let table = if self.peek() == Some(b'N') {
+                    self.expect_ident("None")?;
+                    None
+                } else {
+                    self.expect_ident("Some")?;
+                    self.expect(b'(')?;
+                    let t = self.string()?;
+                    self.expect(b')')?;
+                    Some(t)
+                };
+                self.expect(b',')?;
+                self.field("name")?;
+                let name = self.string()?;
+                self.expect(b'}')?;
+                Some(Expr::Column { table, name })
+            }
+            "Literal" => {
+                self.expect(b'(')?;
+                let lit = self.parse_literal()?;
+                self.expect(b')')?;
+                Some(Expr::Literal(lit))
+            }
+            "Arith" => {
+                self.expect(b'{')?;
+                self.field("op")?;
+                let op = match self.ident()? {
+                    "Add" => ArithOp::Add,
+                    "Sub" => ArithOp::Sub,
+                    "Mul" => ArithOp::Mul,
+                    "Div" => ArithOp::Div,
+                    "Mod" => ArithOp::Mod,
+                    "Pow" => ArithOp::Pow,
+                    "BitAnd" => ArithOp::BitAnd,
+                    "BitOr" => ArithOp::BitOr,
+                    "BitXor" => ArithOp::BitXor,
+                    "Shl" => ArithOp::Shl,
+                    "Shr" => ArithOp::Shr,
+                    _ => return None,
+                };
+                self.expect(b',')?;
+                self.field("left")?;
+                let left = self.parse_expr()?;
+                self.expect(b',')?;
+                self.field("right")?;
+                let right = self.parse_expr()?;
+                self.expect(b'}')?;
+                Some(Expr::Arith {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+            "Func" => {
+                self.expect(b'{')?;
+                self.field("name")?;
+                let name = self.string()?;
+                self.expect(b',')?;
+                self.field("args")?;
+                self.expect(b'[')?;
+                let mut args = Vec::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b']') {
+                        break;
+                    }
+                    if !args.is_empty() {
+                        self.expect(b',')?;
+                    }
+                    args.push(self.parse_expr()?);
+                }
+                self.expect(b'}')?;
+                Some(Expr::Func { name, args })
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_literal(&mut self) -> Option<Literal> {
+        let tag = self.ident()?;
+        match tag {
+            "Null" => Some(Literal::Null),
+            "Bool" => {
+                self.expect(b'(')?;
+                let b = self.ident()?;
+                self.expect(b')')?;
+                match b {
+                    "true" => Some(Literal::Bool(true)),
+                    "false" => Some(Literal::Bool(false)),
+                    _ => None,
+                }
+            }
+            "Int" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Int(n))
+            }
+            "BigInt" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::BigInt(n))
+            }
+            "SmallInt" => {
+                self.expect(b'(')?;
+                let n: i16 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::SmallInt(n))
+            }
+            "Float" => {
+                self.expect(b'(')?;
+                let f: f64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Float(f))
+            }
+            "Decimal" => {
+                self.expect(b'(')?;
+                let d = self.string()?;
+                self.expect(b')')?;
+                Some(Literal::Decimal(d))
+            }
+            "Text" => {
+                self.expect(b'(')?;
+                let t = self.string()?;
+                self.expect(b')')?;
+                Some(Literal::Text(t.into()))
+            }
+            "Date" => {
+                self.expect(b'(')?;
+                let n: i32 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Date(n))
+            }
+            "Timestamp" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Timestamp(n))
+            }
+            "Timestamptz" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Timestamptz(n))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// v0.69: decode a RangeBound from a checkpoint.
@@ -4119,6 +4434,66 @@ mod tests {
         let mut b = b"hello world".to_vec();
         b[5] ^= 1;
         assert_ne!(a, crc32(&b));
+    }
+
+    /// v0.70: partition key expressions must survive the checkpoint
+    /// round-trip: the encoder writes `format!("{:?}", expr)` and
+    /// `parse_partition_expr` must read it back exactly.
+    #[test]
+    fn partition_expr_debug_roundtrip() {
+        use crate::sql::Expr;
+        let cases: Vec<Expr> = vec![
+            Expr::Column {
+                table: None,
+                name: "a".to_string(),
+            },
+            Expr::Column {
+                table: Some("t".to_string()),
+                name: "b".to_string(),
+            },
+            Expr::Literal(Literal::Int(42)),
+            Expr::Literal(Literal::BigInt(-9_000_000_000)),
+            Expr::Literal(Literal::Text("o'brien \"x\"".to_string().into())),
+            Expr::Literal(Literal::Bool(true)),
+            Expr::Literal(Literal::Null),
+            Expr::Literal(Literal::Float(1.5)),
+            Expr::Arith {
+                op: ArithOp::Add,
+                left: Box::new(Expr::Column {
+                    table: None,
+                    name: "b".to_string(),
+                }),
+                right: Box::new(Expr::Literal(Literal::Int(0))),
+            },
+            Expr::Func {
+                name: "lower".to_string(),
+                args: vec![Expr::Column {
+                    table: None,
+                    name: "a".to_string(),
+                }],
+            },
+            Expr::Func {
+                name: "abs".to_string(),
+                args: vec![Expr::Arith {
+                    op: ArithOp::Mul,
+                    left: Box::new(Expr::Column {
+                        table: None,
+                        name: "b".to_string(),
+                    }),
+                    right: Box::new(Expr::Literal(Literal::Int(-1))),
+                }],
+            },
+        ];
+        for e in &cases {
+            let s = format!("{:?}", e);
+            let back =
+                parse_partition_expr(&s).unwrap_or_else(|| panic!("failed to parse {:?}", s));
+            assert_eq!(format!("{:?}", back), s, "round-trip mismatch");
+        }
+        // Malformed input degrades to None, never panics.
+        assert!(parse_partition_expr("").is_none());
+        assert!(parse_partition_expr("Garbage { foo").is_none());
+        assert!(parse_partition_expr("Column { table: None, name: \"a\" } trailing").is_none());
     }
 
     fn roundtrip(r: &WalRecord) -> WalRecord {
