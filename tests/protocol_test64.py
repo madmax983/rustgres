@@ -131,8 +131,15 @@ check("D3 log(3.1954752e47, 9.4792021e-73) 80 digits",
 # E. Limits still enforced; small values unchanged.
 check("E1 10^131073 exceeds 131072-digit limit -> 22003",
       err_of("select 10 ^ 131073") == "22003")
-check("E2 exp(3000) still 22003",
-      err_of("select exp(3000::numeric)") == "22003")
+# v0.67: PG19's exp_var guard is |x| >= NUMERIC_MAX_RESULT_SCALE * 3 =
+# 6000, so exp(3000) is finite (1303 integer digits) and exp(6000)
+# overflows with 22003. The old "exp(3000) -> 22003" encoded the
+# stale 3000 guard.
+check("E2 exp(3000) finite (PG19 guard is 6000)",
+      val("select exp(3000::numeric)").startswith(
+          "7646200989054704889310727660502434"))
+check("E2b exp(6000) -> 22003",
+      err_of("select exp(6000::numeric)") == "22003")
 check("E3 small add unchanged", val("select 1.5 + 2.25") == "3.75")
 check("E4 small div unchanged", val("select 10 / 4") == "2")
 check("E5 small power unchanged", val("select 2 ^ 10") == "1024.0000000000000")

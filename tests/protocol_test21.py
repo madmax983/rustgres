@@ -179,8 +179,12 @@ def main():
         # --- A. float8 math functions ---
         check("trunc", one(c, "SELECT trunc(1.9::float8)") == "1")
         check("trunc neg", one(c, "SELECT trunc(-1.9::float8)") == "-1")
-        check("round", one(c, "SELECT round(2.5::float8)") == "3"
-              and one(c, "SELECT round(2.4::float8)") == "2")
+        # v0.67: PG19 round(float8) -> float8 via C rint (half to
+        # even) — round(2.5::float8) is 2, not 3. The old "3" encoded
+        # the buggy numeric-detour path.
+        check("round", one(c, "SELECT round(2.5::float8)") == "2"
+              and one(c, "SELECT round(2.4::float8)") == "2"
+              and one(c, "SELECT round(3.5::float8)") == "4")
         check("ceil", one(c, "SELECT ceil(2.1::float8)") == "3")
         check("ceiling", one(c, "SELECT ceiling(2.1::float8)") == "3")
         check("floor", one(c, "SELECT floor(2.9::float8)") == "2")
@@ -313,16 +317,18 @@ def main():
               == "-1.2345678901234e+200")
         check("round 1e-200 float8",
               one(c, "SELECT round('1.2345678901234e-200'::float8)") == "0")
+        # v0.67: PG19 numeric_out prints plain decimal (get_str_from_var),
+        # never scientific — the old "1e+200" expectations were stale.
         check("1e200 numeric literal",
-              one(c, "SELECT '1e200'::numeric") == "1e+200")
+              one(c, "SELECT '1e200'::numeric") == "1" + "0" * 200)
         check("round 1e200 numeric",
-              one(c, "SELECT round('1e200'::numeric)") == "1e+200")
+              one(c, "SELECT round('1e200'::numeric)") == "1" + "0" * 200)
         check("round(12345,-1)",
               one(c, "SELECT round(12345::numeric, -1)") == "12350")
         check("round(12345,-2)",
               one(c, "SELECT round(12345::numeric, -2)") == "12300")
         check("trunc 1e200 numeric",
-              one(c, "SELECT trunc('1e200'::numeric)") == "1e+200")
+              one(c, "SELECT trunc('1e200'::numeric)") == "1" + "0" * 200)
 
         # --- M. v0.22: TEMP table semantics ---
         c.sql("CREATE TABLE t22perm(id int)")
@@ -411,7 +417,7 @@ def main():
         check("ceil 1e-200",
               one(c, "SELECT ceil('1e-200'::numeric)") == "1")
         check("abs -1e200",
-              one(c, "SELECT abs('-1e200'::numeric)") == "1e+200")
+              one(c, "SELECT abs('-1e200'::numeric)") == "1" + "0" * 200)
 
         c.close()
     finally:

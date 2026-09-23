@@ -598,10 +598,11 @@ impl Numeric {
         }
         // Strip trailing zeros while scale > 0, exactly like
         // `normalize` does for the i128 representation.
-        let ten = BigUint::from_u64(10);
+        // v0.67: single-limb fast path (divisor 10); the bit-by-bit
+        // div_rem hangs on 100k+-digit magnitudes.
         while scale > 0 {
-            let (q, r) = mag.div_rem(&ten);
-            if !r.is_zero() {
+            let (q, r) = mag.div_rem_small(10);
+            if r != 0 {
                 break;
             }
             mag = q;
@@ -2499,6 +2500,39 @@ impl BigUint {
         }
         (q, r)
     }
+
+    /// v0.67: exact value as u32; None when it does not fit. Used to
+    /// select the O(n) single-limb division fast path.
+    pub(crate) fn to_u32(&self) -> Option<u32> {
+        if self.limbs.is_empty() {
+            return Some(0);
+        }
+        if self.limbs.len() > 1 {
+            return None;
+        }
+        Some(self.limbs[0])
+    }
+
+    /// v0.67: quotient and remainder for a small (u32) divisor; requires
+    /// `d > 0`. Single most-significant-limb-first pass, O(limbs) —
+    /// the bit-by-bit [`BigUint::div_rem`] is O(bits^2) limb ops and
+    /// hangs on 100k+-digit dividends (e.g. the numeric `lcm` path's
+    /// exact division by a tiny gcd). Results are bit-identical to
+    /// `div_rem`.
+    pub(crate) fn div_rem_small(&self, d: u32) -> (BigUint, u32) {
+        debug_assert!(d > 0);
+        let mut q_limbs = Vec::with_capacity(self.limbs.len());
+        let mut rem: u64 = 0;
+        for &limb in self.limbs.iter().rev() {
+            let cur = rem * 1_000_000_000 + limb as u64;
+            q_limbs.push((cur / d as u64) as u32);
+            rem = cur % d as u64;
+        }
+        q_limbs.reverse();
+        let mut q = BigUint { limbs: q_limbs };
+        q.normalize();
+        (q, rem as u32)
+    }
 }
 
 /// v0.56: exact signed decimal: value = (-1)^neg * mag * 10^(-scale).
@@ -2834,6 +2868,9 @@ impl BigDec {
     /// Exact remainder (`self mod other`), result scale
     /// `max(self.scale, other.scale)` like PG's `mod_var`. The caller
     /// guarantees `other` is non-zero.
+    /// v0.67: small divisors take the O(n) single-limb fast path —
+    /// the bit-by-bit `div_rem` hangs on 100k+-digit dividends (the
+    /// numeric `lcm`/`gcd` Euclidean loop hit this).
     pub(crate) fn rem(&self, other: &BigDec) -> BigDec {
         debug_assert!(!other.mag.is_zero());
         let s = self.scale.max(other.scale);
@@ -2841,7 +2878,10 @@ impl BigDec {
         a.mul_pow10_assign((s - self.scale) as u32);
         let mut b = other.mag.clone();
         b.mul_pow10_assign((s - other.scale) as u32);
-        let (_, r) = a.div_rem(&b);
+        let r = match b.to_u32() {
+            Some(d) => BigUint::from_u64(a.div_rem_small(d).1 as u64),
+            None => a.div_rem(&b).1,
+        };
         BigDec {
             neg: self.neg,
             mag: r,
@@ -2853,6 +2893,11 @@ impl BigDec {
     /// Exact division; the caller guarantees `other` divides `self`
     /// (PG's `div_var(x, gcd, 0, exact=true)` in `numeric_lcm`).
     /// None on a zero divisor or an inexact result.
+    /// v0.67: small divisors take the O(n) single-limb fast path (see
+    /// `rem`); plus an exact digit-count short-circuit — the quotient
+    /// has at most `digits(self) - digits(other) + 1` digits, so past
+    /// PG's 131072-digit numeric format limit we return None (the
+    /// caller raises 22003) without running the division at all.
     pub(crate) fn div_exact(&self, other: &BigDec) -> Option<BigDec> {
         if other.mag.is_zero() {
             return None;
@@ -2867,7 +2912,18 @@ impl BigDec {
             den.mul_pow10_assign((self.scale - other.scale) as u32);
             (self.mag.clone(), den)
         };
-        let (q, r) = num.div_rem(&den);
+        if num.decimal_digits() > den.decimal_digits() + 131_071 {
+            // The exact quotient is guaranteed past PG's 131072-digit
+            // format limit (PG19 `make_result` raises 22003 there).
+            return None;
+        }
+        let (q, r) = match den.to_u32() {
+            Some(d) => {
+                let (qq, rr) = num.div_rem_small(d);
+                (qq, BigUint::from_u64(rr as u64))
+            }
+            None => num.div_rem(&den),
+        };
         if !r.is_zero() {
             return None;
         }
@@ -2883,6 +2939,9 @@ impl BigDec {
 
     /// Convert to [`Numeric`]; None when the magnitude exceeds i128
     /// (PG raises 22003 "value overflows numeric format").
+    /// v0.67: test-only now — production paths use the 131072-digit
+    /// [`Numeric::from_bigdec_exact`] instead of the i128 narrowing.
+    #[cfg(test)]
     pub(crate) fn to_numeric(&self) -> Option<Numeric> {
         let mag = self.mag.to_i128()?;
         let unscaled = if self.neg { mag.checked_neg()? } else { mag };
@@ -3264,8 +3323,11 @@ pub(crate) fn exp_var_inner(x: &BigDec, dscale: i32, rscale: i32) -> ExpOutcome 
     // PG converts via numericvar_to_double_no_overflow: overflow ->
     // ±infinity, underflow -> 0.
     let xf = x.to_f64();
-    // Guard against overflow/underflow (|x| >= 3000).
-    if xf.abs() >= 3000.0 {
+    // v0.67: PG19's guard is |x| >= NUMERIC_MAX_RESULT_SCALE * 3 =
+    // 6000 ("If you change this limit, see also power_var()'s
+    // limit"); the old 3000 wrongly errored exp(3000..6000), which
+    // PG19 computes (e.g. exp(1000) is a 435-digit value, not 22003).
+    if xf.abs() >= 6000.0 {
         if xf > 0.0 {
             return ExpOutcome::Overflow;
         }
@@ -3284,8 +3346,9 @@ pub(crate) fn exp_var_inner(x: &BigDec, dscale: i32, rscale: i32) -> ExpOutcome 
             ndiv2 += 1;
             v /= 2.0;
         }
-        // |x| < 3000 here, so ndiv2 <= 19 and the shift cannot overflow.
-        debug_assert!(ndiv2 <= 19);
+        // |x| < 6000 here, so ndiv2 <= 20 and the shift cannot overflow
+        // (PG19's own comment: "ndiv2 <= 20").
+        debug_assert!(ndiv2 <= 20);
         let local = dscale + ndiv2 as i32;
         let div = 1u32 << ndiv2;
         match xs.div_small_round(div, local) {
@@ -7121,8 +7184,14 @@ mod v062_transcendental_tests {
         );
         assert_eq!(e("0"), "1.0000000000000000");
         assert_eq!(e("1"), "2.7182818284590452");
-        // |x| >= 3000: positive overflows, negative underflows to zero.
-        assert_eq!(num("3000").exp_pg(), None);
+        // v0.67: PG19's overflow guard is |x| >= 6000
+        // (NUMERIC_MAX_RESULT_SCALE * 3), so exp(3000) is a finite
+        // 1303-digit value, not 22003 (the old 3000 guard was wrong).
+        // Leading digits cross-checked against 1400-digit Decimal.
+        let t3000 = num("3000").exp_pg().expect("exp(3000) is finite").to_text();
+        assert_eq!(t3000.len(), 1303);
+        assert!(t3000.starts_with("7646200989054704889310727660502434"));
+        assert_eq!(num("6000").exp_pg(), None);
         assert_eq!(
             num("-3000").exp_pg().unwrap().to_text(),
             "0.".to_string() + &"0".repeat(1000)
@@ -7447,5 +7516,131 @@ mod v063_big_mantissa_tests {
             Numeric::from_big(false, BigUint::from_decimal_str(&"9".repeat(131072)), 0, 0)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod v067_numeric_edge_tests {
+    use super::*;
+
+    fn num(s: &str) -> Numeric {
+        Numeric::parse(s).unwrap()
+    }
+
+    fn dec(s: &str) -> BigDec {
+        BigDec::from_numeric(&num(s)).unwrap()
+    }
+
+    #[test]
+    fn div_rem_small_matches_div_rem() {
+        // Deterministic pseudo-random dividends against every small
+        // divisor class, incl. multi-limb and boundary values.
+        let mut x: u64 = 0x243F6A8885A308D3;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200 {
+            let limbs = (next() % 5 + 1) as usize;
+            let mut v = BigUint::zero();
+            for _ in 0..limbs {
+                v.limbs.push((next() % 1_000_000_000) as u32);
+            }
+            v.normalize();
+            let d = (next() % 1_000_000_000 + 1) as u32;
+            let (q1, r1) = v.div_rem_small(d);
+            let (q2, r2) = v.div_rem(&BigUint::from_u64(d as u64));
+            assert_eq!(q1, q2, "quotient mismatch for d={d}");
+            assert_eq!(r1, r2.to_u32().unwrap(), "remainder mismatch for d={d}");
+            // Quotient * d + r == v.
+            let mut check = q1;
+            check.mul_small_assign(d as u64);
+            check.add_assign(&BigUint::from_u64(r1 as u64));
+            assert_eq!(check, v);
+        }
+        // Zero dividend.
+        let (q, r) = BigUint::zero().div_rem_small(7);
+        assert!(q.is_zero() && r == 0);
+    }
+
+    #[test]
+    fn giant_lcm_division_paths_are_fast_and_exact() {
+        // The test25 scenario: 131072-digit dividend, tiny gcd.
+        // The old bit-by-bit div_rem hung here (>20s); the single-limb
+        // path is O(n).
+        let big = BigDec {
+            neg: false,
+            mag: BigUint::from_decimal_str(&("9".repeat(131072))),
+            scale: 0,
+        };
+        let two = BigDec {
+            neg: false,
+            mag: BigUint::from_u64(2),
+            scale: 0,
+        };
+        let one = BigDec {
+            neg: false,
+            mag: BigUint::from_u64(1),
+            scale: 0,
+        };
+        assert_eq!(big.rem(&two).mag.to_u32(), Some(1));
+        let q = big.div_exact(&one).expect("exact division by 1");
+        assert_eq!(q.mag.decimal_digits(), 131072);
+        // A 131072-digit gcd result is a legal numeric (past i128).
+        let n = Numeric::from_bigdec(&q, 0).expect("within 131072-digit limit");
+        assert_eq!(n.to_text().len(), 131072);
+    }
+
+    #[test]
+    fn div_exact_overflow_short_circuit() {
+        // Quotient guaranteed past PG's 131072-digit format limit ->
+        // None without running the division (exec maps to 22003).
+        let huge = BigDec {
+            neg: false,
+            mag: BigUint::from_decimal_str(&("9".repeat(131073))),
+            scale: 0,
+        };
+        let one = BigDec {
+            neg: false,
+            mag: BigUint::from_u64(1),
+            scale: 0,
+        };
+        assert!(huge.div_exact(&one).is_none());
+        // Exactly at the limit still divides.
+        let at_limit = BigDec {
+            neg: false,
+            mag: BigUint::from_decimal_str(&("9".repeat(131072))),
+            scale: 0,
+        };
+        assert!(at_limit.div_exact(&one).is_some());
+    }
+
+    #[test]
+    fn exp_pg19_overflow_guard_is_6000() {
+        // PG19: |x| >= NUMERIC_MAX_RESULT_SCALE * 3 = 6000 overflows;
+        // the old 3000 guard wrongly errored exp(3000..6000).
+        match exp_var_inner(&dec("3000"), 0, 0) {
+            ExpOutcome::Finite(_) => {}
+            o => panic!("exp(3000) must be finite under PG19, got {o:?}"),
+        }
+        assert!(matches!(
+            exp_var_inner(&dec("6000"), 0, 0),
+            ExpOutcome::Overflow
+        ));
+        assert!(matches!(
+            exp_var_inner(&dec("-6000"), 0, 0),
+            ExpOutcome::Underflow
+        ));
+        // The test18 case: exp(1000) is a finite 435-digit value.
+        match exp_var_inner(&dec("1000"), 0, 16) {
+            ExpOutcome::Finite(d) => {
+                let t = Numeric::from_bigdec_exact(&d).unwrap().to_text();
+                assert!(t.starts_with("1970071114017046993888879352243323125"));
+                assert_eq!(t.split('.').next().unwrap().len(), 435);
+            }
+            o => panic!("exp(1000) must be finite, got {o:?}"),
+        }
     }
 }

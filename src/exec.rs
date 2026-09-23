@@ -20097,19 +20097,29 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             other => Err(func_arg_err(name, other)),
         },
         "round" => {
-            // Postgres: round(numeric) -> numeric, round(float8) ->
-            // numeric, round(numeric, int) -> numeric.
-            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            // v0.67: PG19 overloads — round(numeric) -> numeric,
+            // round(float8) -> float8 (dround is rint, half to even),
+            // round(numeric, int) -> numeric. A float4 input coerces to
+            // float8 like PG's parser does. (The old code sent float8
+            // through numeric, wrongly returning a 200-digit numeric
+            // for round(1e200::float8) instead of float8 1.2345e+200.)
             if vals.len() == 1 {
-                n.round_to(0)
+                match v {
+                    Value::Float4(f) => return Ok(Value::Float(f64::from(*f).round_ties_even())),
+                    Value::Float(f) => return Ok(Value::Float(f.round_ties_even())),
+                    _ => {}
+                }
+                let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+                return n
+                    .round_to(0)
                     .map(Value::Numeric)
-                    .ok_or_else(|| exec_err("22003", "numeric field overflow"))
-            } else {
-                let s = int_arg(name, &vals[1])?.unwrap_or(0);
-                round_scale(&n, s)
-                    .map(Value::Numeric)
-                    .ok_or_else(|| exec_err("22003", "numeric field overflow"))
+                    .ok_or_else(|| exec_err("22003", "numeric field overflow"));
             }
+            let n = to_numeric_opt(v).ok_or_else(|| func_arg_err(name, v))?;
+            let s = int_arg(name, &vals[1])?.unwrap_or(0);
+            round_scale(&n, s)
+                .map(Value::Numeric)
+                .ok_or_else(|| exec_err("22003", "numeric field overflow"))
         }
         "floor" | "ceil" | "ceiling" => {
             let is_floor = name == "floor";
@@ -20616,8 +20626,10 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             }
             // x is now gcd(|a|, |b|) >= 0.
             if name == "gcd" {
-                let mut n = x
-                    .to_numeric()
+                // v0.67: the 131072-digit format limit (PG19
+                // `make_result`), not the i128 narrowing — a gcd past
+                // i128 is a legal numeric (e.g. gcd(10^50, 10^50)).
+                let mut n = crate::storage::Numeric::from_bigdec(&x, dscale)
                     .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
                 n.dscale = dscale;
                 Ok(Value::Numeric(n))
@@ -20639,8 +20651,10 @@ fn eval_math_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 let l = q
                     .mul_exact(&bx)
                     .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
-                let mut n = l
-                    .to_numeric()
+                // v0.67: the 131072-digit format limit (PG19
+                // `make_result`'s overflow check), not the i128
+                // narrowing — e.g. lcm(10^50, 3) is a legal numeric.
+                let mut n = crate::storage::Numeric::from_bigdec(&l, dscale)
                     .ok_or_else(|| exec_err("22003", "value overflows numeric format"))?;
                 n.dscale = dscale;
                 Ok(Value::Numeric(n))
@@ -21230,7 +21244,22 @@ fn func_result_type(
             Ok(ColType::Int)
         }
         "abs" | "sign" => arg0(),
-        "round" | "mod" => Ok(ColType::Numeric(None)),
+        // v0.67: round is overloaded like trunc — float in -> float8
+        // out (PG dround), numeric in -> numeric out (mirrors
+        // eval_math_func). The two-argument form is numeric-only.
+        "round" => {
+            if args.len() == 2 {
+                return Ok(ColType::Numeric(None));
+            }
+            for a in args {
+                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                    ColType::Float4 | ColType::Float => return Ok(ColType::Float),
+                    _ => {}
+                }
+            }
+            Ok(ColType::Numeric(None))
+        }
+        "mod" => Ok(ColType::Numeric(None)),
         "floor" | "ceil" | "ceiling" => match arg0()? {
             ColType::Float4 => Ok(ColType::Float4),
             ColType::Float => Ok(ColType::Float),
@@ -29754,5 +29783,40 @@ mod variance_stress_tests {
         // dscale of 0.1 is 1; product dscale should be 2 (not capped).
         let p = a.checked_mul(&b).unwrap();
         assert_eq!(p.dscale, 2);
+    }
+}
+
+#[cfg(test)]
+mod v067_math_tests {
+    use super::*;
+
+    #[test]
+    fn round_float8_returns_float8() {
+        // v0.67: PG19's round(float8) -> float8 (dround = rint, half
+        // to even); the old code routed float8 through numeric and
+        // returned a 200-digit numeric for round(1e200::float8).
+        match eval_math_func("round", &[Value::Float(1e200)]).unwrap() {
+            Value::Float(f) => assert_eq!(f, 1e200),
+            v => panic!("round(1e200::float8) must be Float, got {v:?}"),
+        }
+        // Half to even, like C rint.
+        match eval_math_func("round", &[Value::Float(2.5)]).unwrap() {
+            Value::Float(f) => assert_eq!(f, 2.0),
+            v => panic!("round(2.5::float8) must be Float(2.0), got {v:?}"),
+        }
+        match eval_math_func("round", &[Value::Float(3.5)]).unwrap() {
+            Value::Float(f) => assert_eq!(f, 4.0),
+            v => panic!("round(3.5::float8) must be Float(4.0), got {v:?}"),
+        }
+        // float4 coerces to float8 like PG's parser.
+        match eval_math_func("round", &[Value::Float4(2.5)]).unwrap() {
+            Value::Float(f) => assert_eq!(f, 2.0),
+            v => panic!("round(2.5::float4) must be Float(2.0), got {v:?}"),
+        }
+        // Numeric inputs are untouched.
+        match eval_math_func("round", &[Value::Numeric(Numeric::parse("2.5").unwrap())]).unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_text(), "3"),
+            v => panic!("round(2.5::numeric) must be Numeric(3), got {v:?}"),
+        }
     }
 }

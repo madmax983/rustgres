@@ -324,8 +324,14 @@ def t_promotion():
     srv = fresh_server()
     try:
         c = Conn(srv.port)
-        check("smallint+smallint->integer",
-              one(c, "SELECT 30000::smallint + 30000::smallint") == "60000")
+        # v0.67: PG19 does NOT promote smallint+smallint to integer —
+        # pg_operator.dat oid 550 (+(int2,int2)) returns int2 via
+        # int2pl, which raises 22003 "smallint out of range" on
+        # overflow (src/backend/utils/adt/int.c).
+        check("smallint+smallint overflow -> 22003 (no PG19 promotion)",
+              errcode(c, "SELECT 30000::smallint + 30000::smallint") == "22003")
+        check("smallint+smallint in range",
+              one(c, "SELECT 100::smallint + 200::smallint") == "300")
         check("int+bigint->bigint", one(c, "SELECT 1 + 2::bigint") == "3")
         check("int+real->real", one(c, "SELECT 1 + 1.5::real") == "2.5")
         check("int+double->double", one(c, "SELECT 1 + 2.5") == "3.5")

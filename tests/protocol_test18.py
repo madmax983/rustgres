@@ -229,7 +229,21 @@ def main():
         rows, _, _ = c.sql("SELECT exp('-Infinity'::numeric)")
         check("exp(-Inf)=0", rows[0][0] == "0", f"got {rows}")
         rows, _, err = c.sql("SELECT exp(1000::numeric)")
+        # v0.67: PG19 computes exp(1000) — a finite 435-digit value,
+        # NOT 22003. PG19's exp_var guard is |x| >=
+        # NUMERIC_MAX_RESULT_SCALE * 3 = 6000
+        # (src/backend/utils/adt/numeric.c); genuine overflow needs
+        # |x| >= 6000.
+        check("exp(1000) finite 435-digit (PG19 guard is 6000)",
+              err is None
+              and rows[0][0].startswith("1970071114017046993888879352243323125")
+              and len(rows[0][0]) == 435,
+              f"err={err} rows={str(rows)[:80]}")
+        rows, _, err = c.sql("SELECT exp(10000::numeric)")
         check("exp overflow 22003", err == "22003", f"err={err} rows={rows}")
+        rows, _, _ = c.sql("SELECT exp(-10000::numeric)")
+        check("exp(-10000) underflows to 0",
+              rows[0][0] == "0." + "0" * 1000, f"got {str(rows)[:80]}")
         rows, _, _ = c.sql("SELECT ln(1::numeric)")
         check("ln(1)=0", rows[0][0].startswith("0"), f"got {rows}")
         rows, _, _ = c.sql("SELECT ln(4.2::numeric)")
