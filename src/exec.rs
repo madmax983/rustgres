@@ -363,6 +363,10 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         } => exec_create_sequence(eng, ctx, name, *if_not_exists, opts),
         Stmt::AlterSequence { name, opts } => exec_alter_sequence(eng, ctx, name, opts),
         Stmt::DropSequence { names, if_exists } => exec_drop_sequence(eng, ctx, names, *if_exists),
+        // v0.75: CREATE STATISTICS is a validated no-op.
+        Stmt::CreateStatistics => Ok(ExecResult::Command {
+            tag: "CREATE STATISTICS".to_string(),
+        }),
         // --- v0.22: bounded CREATE TYPE ---
         Stmt::CreateType { name, like_base } => {
             exec_create_type(eng, ctx, name, like_base.as_deref())
@@ -2362,7 +2366,15 @@ fn validate_fk_def(
         .as_ref()
         .map(|pk| pk.cols == ref_cols)
         .unwrap_or(false)
-        || parent.uniques.iter().any(|u| u.cols == ref_cols);
+        || parent.uniques.iter().any(|u| u.cols == ref_cols)
+        // v0.75: a standalone unique index also satisfies the FK
+        // uniqueness requirement (PG allows FKs to reference unique
+        // indexes, not just constraints).
+        || eng.db.indexes.values().any(|idx| {
+            idx.def.table == fk.ref_table
+                && idx.def.unique
+                && idx.def.col_names == ref_cols
+        });
     if !is_key {
         return Err(exec_err(
             "42830",
@@ -25100,6 +25112,8 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
+        // v0.75: PG names an unaliased EXISTS output column "exists".
+        Expr::Exists { .. } => ("exists".to_string(), 2),
         _ => ("?column?".to_string(), 0),
     }
 }

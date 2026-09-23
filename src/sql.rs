@@ -2217,6 +2217,9 @@ pub enum Stmt {
         names: Vec<String>,
         if_exists: bool,
     },
+    // v0.75: CREATE STATISTICS (extended statistics). Parsed and accepted
+    // as a no-op; the statistics are not used by the planner.
+    CreateStatistics,
     // --- v0.22: CREATE TYPE (bounded shell-type support) ---
     CreateType {
         name: String,
@@ -2928,6 +2931,38 @@ impl Parser {
         self.tokens.get(self.pos + 2).unwrap_or(&Token::EOF)
     }
 
+    /// v0.75: scan ahead from the current position (which must be at a
+    /// `(` token) for a UNION/INTERSECT/EXCEPT at this paren depth, i.e.
+    /// `((SELECT ...) UNION ...)` rather than a parenthesized expression.
+    /// String tokens are opaque; paren depth is tracked structurally.
+    fn paren_has_top_level_setop(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Token::Ident(s)
+                    if depth == 1 && (s == "union" || s == "intersect" || s == "except") =>
+                {
+                    return true;
+                }
+                Token::EOF => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// v0.36: the text of a peeked identifier, whether bare (folded) or
     /// double-quoted (verbatim). Used at identifier positions where both
     /// forms are legal names; keyword checks keep matching `Ident` only.
@@ -3259,6 +3294,15 @@ impl Parser {
             return self.parse_quoted_type_name(name);
         }
         let name = self.expect_ident()?;
+        // v0.75: schema-qualified type name (`pg_catalog.int4`,
+        // `information_schema.sql_identifier`); the schema qualifier is
+        // accepted and ignored.
+        let name = if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+            self.next(); // '.'
+            self.expect_ident()?
+        } else {
+            name
+        };
         self.parse_type_name_rest(name)
     }
 
@@ -3300,6 +3344,12 @@ impl Parser {
             // is 22023. `varchar` without a length is unlimited (None);
             // bare `char` means `char(1)`.
             "varchar" => {
+                let n = self.parse_opt_typmod()?;
+                Ok(ColType::Varchar(n))
+            }
+            // v0.75: `information_schema.sql_identifier` is a domain over
+            // varchar; for casts we treat it as varchar.
+            "sql_identifier" => {
                 let n = self.parse_opt_typmod()?;
                 Ok(ColType::Varchar(n))
             }
@@ -3545,10 +3595,76 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "sequence") {
             return self.parse_create_sequence();
         }
+        // v0.75: CREATE [TEMP|TEMPORARY] SEQUENCE — accept (and ignore)
+        // the temp modifier; sequences are session-agnostic here.
+        if matches!(self.peek(), Token::Ident(s) if s == "temporary" || s == "temp")
+            && matches!(self.peek2(), Token::Ident(s) if s == "sequence")
+        {
+            self.next(); // temp / temporary
+            return self.parse_create_sequence();
+        }
         // v0.22: CREATE TYPE (bounded): the bare shell form and the
         // parenthesized completion form with LIKE = <base>.
         if matches!(self.peek(), Token::Ident(s) if s == "type") {
             return self.parse_create_type();
+        }
+        // v0.75: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
+        // cols FROM table. Accepted as a no-op (statistics are not used
+        // by the planner); the syntax is validated.
+        if matches!(self.peek(), Token::Ident(s) if s == "statistics") {
+            self.next(); // 'statistics'
+            if self.eat_keyword("if") {
+                self.expect_keyword("not")?;
+                self.expect_keyword("exists")?;
+            }
+            let _name = self.expect_ident()?;
+            // Optional `(dependencies)` / `(ndistinct)` / etc.
+            if *self.peek() == Token::LParen {
+                self.next();
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.next() {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::EOF => {
+                            return Err(err(
+                                "syntax error: unterminated CREATE STATISTICS".to_string()
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.expect_keyword("on")?;
+            // Column list: either `(a, b)` or bare `a, b`.
+            if *self.peek() == Token::LParen {
+                self.next();
+                let mut cdepth = 1;
+                while cdepth > 0 {
+                    match self.next() {
+                        Token::LParen => cdepth += 1,
+                        Token::RParen => cdepth -= 1,
+                        Token::EOF => {
+                            return Err(err(
+                                "syntax error: unterminated CREATE STATISTICS".to_string()
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                // Bare column list: `a, b, ...` until `from`.
+                loop {
+                    self.expect_ident()?;
+                    if matches!(self.peek(), Token::Ident(s) if s == "from") {
+                        break;
+                    }
+                    self.expect(Token::Comma, "','")?;
+                }
+            }
+            self.expect_keyword("from")?;
+            let _table = self.expect_ident()?;
+            return Ok(Stmt::CreateStatistics);
         }
         // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
         // v0.21: TEMP tables drop any existing table with the same name
@@ -4882,6 +4998,14 @@ impl Parser {
                 Vec::new()
             };
             self.expect_keyword("as")?;
+            // v0.75: `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTE hints
+            // (PG12+). The hint is accepted and ignored — CTEs are always
+            // evaluated per reference here.
+            if self.eat_keyword("not") {
+                self.expect_keyword("materialized")?;
+            } else {
+                let _ = self.eat_keyword("materialized");
+            }
             self.expect(Token::LParen, "'('")?;
             let body = self.parse_cte_body(recursive)?;
             self.expect(Token::RParen, "')'")?;
@@ -5840,12 +5964,26 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, SqlError> {
         match self.peek() {
             Token::LParen => {
+                // v0.75: `((SELECT ...) UNION ...)` — a parenthesized query
+                // with set operations (PG19 select_with_parens). Detect a
+                // set operator at this paren depth BEFORE consuming `(`.
+                let is_setop_paren = self.paren_has_top_level_setop();
                 self.next();
                 // `(SELECT ...)` = scalar subquery; otherwise parenthesized expr.
                 match self.peek() {
                     Token::Ident(s) if s == "select" => {
                         self.next();
                         let sub = self.parse_select_query()?;
+                        self.expect(Token::RParen, "')'")?;
+                        Ok(Expr::ScalarSub(Box::new(sub)))
+                    }
+                    _ if is_setop_paren => {
+                        // `((SELECT ...) UNION ...)` — the paren was already
+                        // consumed; parse the inner query (with its own
+                        // parens) plus the set-operation chain.
+                        let left = self.parse_select_query_not_consumed()?;
+                        let carrier = self.parse_set_chain(left, 1)?;
+                        let sub = self.finish_select_query(carrier)?;
                         self.expect(Token::RParen, "')'")?;
                         Ok(Expr::ScalarSub(Box::new(sub)))
                     }
@@ -7109,9 +7247,55 @@ impl Parser {
     }
 
     fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
-        let verbose = self.eat_keyword("verbose");
-        // v0.14: `VACUUM ANALYZE` (pg_regress conformance).
-        let analyze = self.eat_keyword("analyze");
+        // v0.75: `VACUUM (options) table` — parenthesized option list
+        // (PG12+). Options are parsed and the relevant ones (analyze,
+        // verbose) are honored; others are accepted and ignored.
+        let mut verbose = self.eat_keyword("verbose");
+        let mut analyze = self.eat_keyword("analyze");
+        if *self.peek() == Token::LParen {
+            self.next();
+            loop {
+                if self.eat_keyword("analyze") {
+                    analyze = true;
+                } else if self.eat_keyword("verbose") {
+                    verbose = true;
+                } else {
+                    // Skip unknown option: `name [value]`.
+                    let _ = self.expect_ident();
+                    // Optional value (boolean, number, or string).
+                    if matches!(self.peek(), Token::Ident(_))
+                        && !matches!(self.peek(), Token::Ident(s) if s == "analyze" || s == "verbose")
+                    {
+                        // Could be a value; peek ahead for comma or ')'.
+                        // Simpler: if next is comma or ')', it was a flag.
+                        // We already consumed the ident; check what's next.
+                    }
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    Token::Ident(_) => {
+                        // `option value` — value was an ident; expect comma or ')'.
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')', found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
         let table = match self.peek() {
             Token::Ident(_) | Token::QIdent(_) => Some(self.expect_ident()?),
             _ => None,
@@ -7801,6 +7985,49 @@ impl Parser {
                 // `(a JOIN b ...)`, `(tbl)`.
                 self.parse_join_chain()?
             };
+            // v0.75: `((query) [AS] alias [JOIN ...])` — a parenthesized
+            // derived table that is the left operand of a join, e.g.
+            // `((select ...) s LEFT JOIN t ...)`. If we consumed extra '('
+            // and the derived table's ')' is not followed by another ')',
+            // the extra '(' was the derived table's own paren, not a
+            // redundant one.
+            // Tracks whether the inner derived table already got its alias
+            // (so the outer alias becomes optional).
+            let mut inner_aliased = false;
+            if extra > 0 && matches!(item, FromItem::Derived { .. } | FromItem::Values { .. }) {
+                // Consume the derived table's ')'.
+                self.expect(Token::RParen, "')'")?;
+                extra -= 1;
+                if *self.peek() != Token::RParen {
+                    // An alias follows: `((query) alias ...)`.
+                    let inner_alias = self.parse_alias_opt()?.unwrap_or_default();
+                    let inner_cols = self.parse_col_alias_list()?;
+                    match &mut item {
+                        FromItem::Values {
+                            alias: a,
+                            col_aliases: c,
+                            ..
+                        } => {
+                            *a = inner_alias;
+                            *c = inner_cols;
+                        }
+                        FromItem::Derived {
+                            alias: a,
+                            col_aliases: c,
+                            ..
+                        } => {
+                            *a = inner_alias;
+                            *c = inner_cols;
+                        }
+                        _ => {}
+                    }
+                    inner_aliased = true;
+                    // A join may follow the aliased derived table.
+                    item = self.parse_join_rest(item)?;
+                }
+                // Else: redundant parens `((query))`; the outer alias is
+                // parsed below.
+            }
             for _ in 0..=extra {
                 self.expect(Token::RParen, "')'")?;
             }
@@ -7822,6 +8049,13 @@ impl Parser {
                     }
                     (a, c)
                 }
+                // v0.75: if the inner derived table already has its alias
+                // (`((query) alias ...)`), the outer alias is optional.
+                _ if inner_aliased => {
+                    let a = self.parse_alias_opt()?;
+                    let c = self.parse_col_alias_list()?;
+                    (a, c)
+                }
                 _ => {
                     let a = self.parse_derived_alias()?;
                     let c = self.parse_col_alias_list()?;
@@ -7834,16 +8068,28 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
-                    *a = alias.unwrap_or_default();
-                    *c = col_aliases;
+                    // v0.75: don't clobber an inner alias when the outer
+                    // alias is absent (`((query) alias)`).
+                    if alias.is_some() || !inner_aliased {
+                        *a = alias.unwrap_or_default();
+                    }
+                    if !col_aliases.is_empty() || !inner_aliased {
+                        *c = col_aliases;
+                    }
                 }
                 FromItem::Derived {
                     alias: a,
                     col_aliases: c,
                     ..
                 } => {
-                    *a = alias.unwrap_or_default();
-                    *c = col_aliases;
+                    // v0.75: don't clobber an inner alias when the outer
+                    // alias is absent (`((query) alias)`).
+                    if alias.is_some() || !inner_aliased {
+                        *a = alias.unwrap_or_default();
+                    }
+                    if !col_aliases.is_empty() || !inner_aliased {
+                        *c = col_aliases;
+                    }
                 }
                 FromItem::Join {
                     alias: a,
