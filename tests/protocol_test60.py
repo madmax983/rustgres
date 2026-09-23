@@ -172,8 +172,8 @@ def main():
              "round(3.14, 40) pads to dscale 40 (v0.61: PG display scale)"),
             # --- CTE VALUES bodies ---
             ("WITH v(x) AS (VALUES (1), (2), (3)) SELECT sum(x) FROM v;",
-             [["6"]], None, None, None, [23], None,
-             "WITH v(x) AS (VALUES ...) parses (was 42601)"),
+             [["6"]], None, None, None, [20], None,
+             "WITH v(x) AS (VALUES ...) parses (was 42601); v0.76: sum(int4)->int8 like PG19"),
             ("WITH v(x) AS (VALUES ('0'::numeric), ('1'), ('-1')) SELECT x, x + 1 FROM v ORDER BY x;",
              [["-1", "0"], ["0", "1"], ["1", "2"]], None, None, None, [1700, 1700], None,
              "VALUES unknown literals coerce to the resolved numeric type"),

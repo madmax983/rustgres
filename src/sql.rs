@@ -1403,6 +1403,20 @@ pub enum SerialKind {
 pub struct CheckDef {
     pub name: String,
     pub expr: Expr,
+    /// v0.76: whether the constraint was added NOT VALID (existing rows
+    /// were not validated at ALTER time). NOT VALID constraints are still
+    /// enforced on new/updated rows by `check_row_constraints`, like PG19;
+    /// the flag only skips the one-time existing-row scan.
+    pub not_valid: bool,
+}
+
+/// v0.76: a NOT NULL column constraint added via ALTER TABLE
+/// (`ADD CONSTRAINT name NOT NULL col [NOT VALID]`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotNullDef {
+    pub name: String,
+    pub col: String,
+    pub not_valid: bool,
 }
 
 /// v0.9: a PRIMARY KEY or UNIQUE constraint over column names.
@@ -1545,6 +1559,8 @@ pub enum AlterAction {
         unique: Option<UniqueDef>,
         pkey: Option<UniqueDef>,
         fk: Option<FkDef>,
+        // v0.76: NOT NULL column constraint.
+        notnull: Option<NotNullDef>,
     },
     DropConstraint {
         name: String,
@@ -1703,6 +1719,12 @@ enum ParsedTableCon {
         cols: Vec<String>,
         tail: ParsedFkTail,
     },
+    // v0.76: `NOT NULL col [NOT VALID]` (PG19 ALTER TABLE ADD CONSTRAINT).
+    NotNull {
+        name: Option<String>,
+        col: String,
+        not_valid: bool,
+    },
 }
 
 struct ParsedFkTail {
@@ -1842,6 +1864,7 @@ fn def_add_check(
     def.checks.push(CheckDef {
         name: cname,
         expr: e,
+        not_valid: false,
     });
     Ok(())
 }
@@ -1976,6 +1999,19 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                 }
                 ParsedTableCon::Check(n, e) => {
                     def_add_check(table, &mut def, n.clone(), e.clone(), table)?
+                }
+                // v0.76: `CONSTRAINT name NOT NULL col` in CREATE TABLE —
+                // PG doesn't allow this syntax here, but we accept it by
+                // marking the column NOT NULL (like a column constraint).
+                ParsedTableCon::NotNull { col, .. } => {
+                    if let Some(i) = def.columns.iter().position(|(n, _)| n == col) {
+                        def.not_null[i] = true;
+                    } else {
+                        return Err(err(format!(
+                            "syntax error: column \"{}\" of relation \"{}\" does not exist",
+                            col, table
+                        )));
+                    }
                 }
                 ParsedTableCon::Fk {
                     name: n,
@@ -2303,8 +2339,12 @@ pub enum Stmt {
     // --- v0.5: UPDATE / DELETE with MVCC semantics
     Update {
         table: String,
+        /// v0.76: optional table alias (`UPDATE t AS x ...`).
+        alias: Option<String>,
         /// (column, expression) assignments.
         sets: Vec<(String, Expr)>,
+        /// v0.76: `FROM` items (PG19 `UPDATE ... FROM`).
+        from: Vec<FromItem>,
         /// v0.22: full predicate expression (was `Vec<WhereCond>` limited
         /// to `col = literal`). Parsed with `parse_or`, like SELECT's
         /// WHERE and ON CONFLICT DO UPDATE's WHERE.
@@ -2586,6 +2626,7 @@ impl Stmt {
             Stmt::Explain { stmt } => stmt.max_param(),
             Stmt::Update {
                 sets,
+                from,
                 where_,
                 returning,
                 with,
@@ -2595,6 +2636,11 @@ impl Stmt {
                 for (_, e) in sets {
                     m = m.max(max_param_expr(e));
                 }
+                // v0.76: UPDATE ... FROM items may hold parameters
+                // (derived tables, functions, VALUES).
+                for f in from {
+                    m = m.max(max_param_from(f));
+                }
                 if let Some(w) = where_ {
                     m = m.max(max_param_expr(w));
                 }
@@ -2603,12 +2649,17 @@ impl Stmt {
                 m
             }
             Stmt::Delete {
+                using,
                 where_,
                 returning,
                 with,
                 ..
             } => {
                 let mut m = 0;
+                // v0.76: DELETE ... USING items may hold parameters.
+                for f in using {
+                    m = m.max(max_param_from(f));
+                }
                 if let Some(w) = where_ {
                     m = m.max(max_param_expr(w));
                 }
@@ -4066,6 +4117,24 @@ impl Parser {
                 cols,
                 tail,
             })
+        } else if self.eat_keyword("not") {
+            // v0.76: `NOT NULL col [NOT VALID]`.
+            self.expect_keyword("null")?;
+            let col = self.expect_ident()?;
+            let not_valid = if self.eat_keyword("not") {
+                self.expect_keyword("valid")?;
+                true
+            } else {
+                // Plain `NOT VALID` without NOT is not valid syntax here,
+                // but accept a bare `VALID` as a no-op for robustness.
+                let _ = self.eat_keyword("valid");
+                false
+            };
+            Ok(ParsedTableCon::NotNull {
+                name: cname,
+                col,
+                not_valid,
+            })
         } else {
             Err(err(
                 "syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string(),
@@ -4419,8 +4488,10 @@ impl Parser {
                     }
                     ColCon::Default(d) => default = Some(d),
                     ColCon::Check(n, e) => checks.push(CheckDef {
-                        name: n.unwrap_or_else(|| format!("{}_check", col.name)),
+                        name: n
+                            .unwrap_or_else(|| format!("{}_check_{}", col.name, checks.len() + 1)),
                         expr: e,
+                        not_valid: false,
                     }),
                     ColCon::References { name: n, tail } => fks.push(FkDef {
                         name: n.unwrap_or_else(|| format!("{}_fkey", col.name)),
@@ -4527,6 +4598,7 @@ impl Parser {
                 check: None,
                 unique: None,
                 fk: None,
+                notnull: None,
             }),
             ParsedTableCon::Unique(name, cols) => Ok(AlterAction::AddConstraint {
                 unique: Some(UniqueDef {
@@ -4536,15 +4608,18 @@ impl Parser {
                 check: None,
                 pkey: None,
                 fk: None,
+                notnull: None,
             }),
             ParsedTableCon::Check(name, e) => Ok(AlterAction::AddConstraint {
                 check: Some(CheckDef {
                     name: name.unwrap_or_default(),
                     expr: e,
+                    not_valid: false,
                 }),
                 unique: None,
                 pkey: None,
                 fk: None,
+                notnull: None,
             }),
             ParsedTableCon::Fk { name, cols, tail } => Ok(AlterAction::AddConstraint {
                 fk: Some(FkDef {
@@ -4558,6 +4633,22 @@ impl Parser {
                 check: None,
                 unique: None,
                 pkey: None,
+                notnull: None,
+            }),
+            ParsedTableCon::NotNull {
+                name,
+                col,
+                not_valid,
+            } => Ok(AlterAction::AddConstraint {
+                notnull: Some(NotNullDef {
+                    name: name.unwrap_or_default(),
+                    col,
+                    not_valid,
+                }),
+                check: None,
+                unique: None,
+                pkey: None,
+                fk: None,
             }),
         }
     }
@@ -4974,9 +5065,11 @@ impl Parser {
         Ok(Some(OnConflict { arbiter, action }))
     }
 
-    /// v0.10: `WITH [RECURSIVE] name [(cols)] AS (select) [, ...]` followed
-    /// by SELECT / INSERT / UPDATE / DELETE.
-    fn parse_with(&mut self) -> Result<Stmt, SqlError> {
+    /// v0.76: parse the `name [(cols)] AS [NOT MATERIALIZED] (body) [, ...]`
+    /// list of a WITH clause. Returns the CTE defs and the RECURSIVE flag.
+    /// Extracted from `parse_with` so parenthesized inner WITH clauses
+    /// (e.g. inside a recursive UNION branch) can reuse it.
+    fn parse_cte_defs(&mut self) -> Result<(Vec<CteDef>, bool), SqlError> {
         let recursive = self.eat_keyword("recursive");
         let mut ctes = Vec::new();
         loop {
@@ -5029,6 +5122,13 @@ impl Parser {
                 "syntax error: WITH requires at least one CTE".to_string()
             ));
         }
+        Ok((ctes, recursive))
+    }
+
+    /// v0.10: `WITH [RECURSIVE] name [(cols)] AS (select) [, ...]` followed
+    /// by SELECT / INSERT / UPDATE / DELETE.
+    fn parse_with(&mut self) -> Result<Stmt, SqlError> {
+        let (ctes, _recursive) = self.parse_cte_defs()?;
         let kw = match self.next() {
             Token::Ident(kw) => kw,
             other => {
@@ -5117,16 +5217,22 @@ impl Parser {
                 self.eat_keyword("distinct");
                 false
             };
-            match self.next() {
-                Token::Ident(kw) if kw == "select" => {}
-                other => {
-                    return Err(err(format!(
-                        "syntax error: expected SELECT after UNION in recursive CTE, found {:?}",
-                        other
-                    )));
+            // v0.76: the recursive term may be a parenthesized query
+            // (e.g. `(WITH z AS NOT MATERIALIZED (...) SELECT ...)`).
+            let second = if *self.peek() == Token::LParen {
+                self.parse_select_query_not_consumed()?
+            } else {
+                match self.next() {
+                    Token::Ident(kw) if kw == "select" => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected SELECT after UNION in recursive CTE, found {:?}",
+                            other
+                        )));
+                    }
                 }
-            }
-            let second = self.parse_select_rest()?;
+                self.parse_select_rest()?
+            };
             // Both sides must produce the same number of columns (when
             // statically known).
             match (cte_width(&first), cte_width(&second)) {
@@ -5602,6 +5708,17 @@ impl Parser {
         let mut expr = match op {
             Some(op) => {
                 self.next();
+                // v0.76: quantified comparisons `op ANY|ALL|SOME (...)`
+                // (PG19). The operand is a subquery or a VALUES list.
+                if matches!(self.peek(), Token::Ident(s) if s == "any" || s == "all" || s == "some")
+                {
+                    let quant = if let Token::Ident(s) = self.next() {
+                        s
+                    } else {
+                        unreachable!()
+                    };
+                    return self.parse_quantified(left, op, &quant);
+                }
                 let right = self.parse_bitor()?;
                 Expr::Cmp {
                     op,
@@ -5659,6 +5776,75 @@ impl Parser {
             }
         }
         Ok(expr)
+    }
+
+    /// v0.76: `expr op ANY|ALL|SOME (subquery | VALUES ...)` — the
+    /// quantified comparison (PG19). `ANY`/`SOME` desugar to an OR chain,
+    /// `ALL` to an AND chain, preserving PG's three-valued logic. A
+    /// `VALUES` list must hold single-column rows. `= ANY (SELECT ...)`
+    /// is `IN`, `<> ALL (SELECT ...)` is `NOT IN`; other operators over
+    /// a subquery are not supported yet.
+    fn parse_quantified(&mut self, left: Expr, op: CmpOp, quant: &str) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        // VALUES list form.
+        if matches!(self.peek(), Token::Ident(s) if s == "values") {
+            self.next();
+            let rows = self.parse_values_rows()?;
+            self.expect(Token::RParen, "')'")?;
+            let mut items = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.len() != 1 {
+                    return Err(err(format!(
+                        "syntax error: quantified comparison VALUES row has {} columns, expected 1",
+                        row.len()
+                    )));
+                }
+                items.push(row.into_iter().next().unwrap());
+            }
+            // Empty set: `= ANY` is false, `<> ALL` is true (PG semantics).
+            if items.is_empty() {
+                return Ok(Expr::Literal(Literal::Bool(quant == "all")));
+            }
+            let mut expr = Expr::Cmp {
+                op,
+                left: Box::new(left.clone()),
+                right: Box::new(items.remove(0)),
+            };
+            for item in items {
+                let cmp = Expr::Cmp {
+                    op,
+                    left: Box::new(left.clone()),
+                    right: Box::new(item),
+                };
+                expr = if quant == "all" {
+                    Expr::And(Box::new(expr), Box::new(cmp))
+                } else {
+                    Expr::Or(Box::new(expr), Box::new(cmp))
+                };
+            }
+            return Ok(expr);
+        }
+        // Subquery form: only `= ANY/SOME` and `<> ALL` desugar cleanly.
+        if !matches!(self.peek(), Token::Ident(s) if s == "select") {
+            return Err(err(
+                "syntax error: expected SELECT or VALUES after ANY/ALL/SOME".to_string(),
+            ));
+        }
+        let sub = self.parse_subquery()?;
+        self.expect(Token::RParen, "')'")?;
+        let is_eq = matches!(op, CmpOp::Eq);
+        let is_ne = matches!(op, CmpOp::Ne);
+        if (quant == "all" && is_ne) || ((quant == "any" || quant == "some") && is_eq) {
+            return Ok(Expr::InSub {
+                expr: Box::new(left),
+                sub: Box::new(sub),
+                neg: quant == "all",
+            });
+        }
+        Err(err(format!(
+            "quantified comparison with operator {:?} over a subquery is not supported",
+            op
+        )))
     }
 
     /// `SELECT ...` inside parentheses (the `SELECT` keyword not yet consumed).
@@ -6919,6 +7105,8 @@ impl Parser {
 
     fn parse_update(&mut self) -> Result<Stmt, SqlError> {
         let table = self.expect_ident()?;
+        // v0.76: `UPDATE t AS x` / `UPDATE t x` (PG's alias clause).
+        let alias = self.parse_alias_opt()?;
         self.expect_keyword("set")?;
         let mut sets = Vec::new();
         loop {
@@ -6935,11 +7123,20 @@ impl Parser {
         if sets.is_empty() {
             return Err(err("syntax error: UPDATE requires at least one assignment"));
         }
+        // v0.76: `UPDATE ... FROM <from-items>` (PG19) — extra tables the
+        // SET/WHERE/RETURNING clauses may reference, like SELECT's FROM.
+        let from = if self.eat_keyword("from") {
+            self.parse_from()?
+        } else {
+            Vec::new()
+        };
         let where_ = self.parse_where_expr_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Update {
             table,
+            alias,
             sets,
+            from,
             where_,
             returning,
             with: Vec::new(),
@@ -7594,6 +7791,15 @@ impl Parser {
             // v0.54: `(TABLE name)` — a parenthesized TABLE branch.
             self.next();
             self.parse_table_query()
+        } else if matches!(self.peek(), Token::Ident(s) if s == "with") {
+            // v0.76: `(WITH ... SELECT ...)` — a parenthesized query with
+            // its own CTEs (e.g. inside a recursive UNION branch).
+            self.next();
+            let (ctes, _recursive) = self.parse_cte_defs()?;
+            self.expect_keyword("select")?;
+            let mut sel = self.parse_select_query()?;
+            sel.with = ctes;
+            Ok(sel)
         } else {
             self.expect_keyword("select")?;
             self.parse_select_query()
@@ -7972,9 +8178,10 @@ impl Parser {
                     col_aliases: Vec::new(),
                 }
             } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
-                // `with` falls through to parse_subquery's clean
-                // "expected SELECT" error, exactly like before v0.23.
-                let sub = self.parse_subquery()?;
+                // v0.76: `(WITH ... SELECT ...)` derived tables are now
+                // supported (PG19). Parse via parse_select_query_not_consumed
+                // which handles the leading WITH.
+                let sub = self.parse_select_query_not_consumed()?;
                 FromItem::Derived {
                     sub: Box::new(sub),
                     alias: String::new(),
@@ -8820,6 +9027,10 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "sign"
         // date/time
         | "now" | "current_date" | "current_timestamp" | "date_trunc"
+        // v0.76: the other datetime functions are 0-argument builtins
+        // in PG19 (now(3) etc. are 42883); arity enforced in
+        // check_builtin_arity.
+        | "clock_timestamp" | "statement_timestamp" | "transaction_timestamp"
         // conditional
         | "coalesce" | "nullif" | "greatest" | "least"
         // v0.9: sequence functions
@@ -8837,7 +9048,14 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
     let ok = match name {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
-        "now" | "current_date" | "current_timestamp" => n == 0,
+        "current_date" => n == 0,
+        // v0.76: only CURRENT_TIMESTAMP takes the optional precision
+        // (0-6) — PG19's grammar handles it as special syntax
+        // (makeSQLValueFunction), while now()/clock_timestamp()/
+        // statement_timestamp()/transaction_timestamp() are plain
+        // 0-argument pg_proc functions (now(3) is 42883 in PG19).
+        "current_timestamp" => n <= 1,
+        "now" | "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => n == 0,
         "substring" | "substr" => n == 2 || n == 3,
         "trim" => n == 1 || n == 3,
         "position" | "power" | "mod" | "nullif" | "date_trunc" => n == 2,
@@ -9889,6 +10107,9 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         sexpr_escape(&c.name, &mut out);
         out.push(' ');
         encode_expr_inner(&c.expr, &mut out);
+        // v0.76: NOT VALID flag (older checkpoints omit it; the decoder
+        // defaults a missing flag to false).
+        out.push_str(if c.not_valid { " 1" } else { " 0" });
         out.push(')');
     }
     out.push_str(") (uniques");
@@ -10019,8 +10240,22 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         p.open()?;
         let name = p.atom()?;
         let expr = p.expr()?;
+        // v0.76: optional NOT VALID flag (pre-v0.76 checkpoints omit it).
+        let not_valid = if sexpr_is_close(&mut p) {
+            false
+        } else {
+            match p.atom()?.as_str() {
+                "1" => true,
+                "0" => false,
+                o => return Err(format!("bad check not-valid flag {}", o)),
+            }
+        };
         p.close()?;
-        checks.push(CheckDef { name, expr });
+        checks.push(CheckDef {
+            name,
+            expr,
+            not_valid,
+        });
     }
     p.close()?;
     // (uniques ...)

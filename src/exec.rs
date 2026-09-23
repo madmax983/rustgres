@@ -433,11 +433,13 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
         Stmt::Update {
             table,
+            alias,
             sets,
+            from,
             where_,
             with,
             returning,
-        } => exec_update(eng, ctx, table, sets, where_, with, returning),
+        } => exec_update(eng, ctx, table, alias, sets, from, where_, with, returning),
         Stmt::Delete {
             table,
             alias,
@@ -1967,6 +1969,7 @@ fn expand_like_clauses(
                 def.checks.push(CheckDef {
                     name: cname,
                     expr: ck.expr.clone(),
+                    not_valid: ck.not_valid,
                 });
             }
         }
@@ -2630,6 +2633,20 @@ fn check_row_constraints(
         let v = eval_expr(&mut q, &[frame], &check.expr)?;
         // Postgres CHECK passes on TRUE or NULL; only FALSE fails it.
         if matches!(v, Value::Bool(false)) {
+            // v0.76: an ALTER-added NOT NULL constraint is stored as an
+            // `IS NOT NULL` check; PG19 reports its violation as 23502
+            // (not-null violation), not 23514 (check violation).
+            if let crate::sql::Expr::IsNull { expr, neg: true } = &check.expr {
+                if let crate::sql::Expr::Column { table: None, name } = expr.as_ref() {
+                    return Err(exec_err(
+                        "23502",
+                        format!(
+                            "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                            name, table
+                        ),
+                    ));
+                }
+            }
             return Err(exec_err(
                 "23514",
                 format!(
@@ -3395,7 +3412,12 @@ fn materialize_dml_ctes(
 /// v0.10: output column names/types for a RETURNING list, resolved
 /// against the target table's columns. `qual` is the visible qualifier
 /// for column references; it differs from `table` only when DELETE
-/// carries an alias (v0.65).
+/// carries an alias (v0.65) or UPDATE carries one (v0.76). `extra` holds
+/// the UPDATE ... FROM / DELETE ... USING source schemas (v0.76, PG19:
+/// RETURNING may reference those tables); they are flattened ahead of
+/// the target schema into a single scope, exactly like the runtime's
+/// combined evaluation schemas, so ambiguity (42702) and resolution
+/// agree between Describe and execution.
 fn describe_returning(
     eng: &Engine,
     snap: &Snapshot,
@@ -3403,25 +3425,26 @@ fn describe_returning(
     session: u64,
     table: &str,
     qual: &str,
+    extra: &[Vec<QCol>],
     returning: &[SelectItem],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     let t = eng
         .db
         .find_table(table, snap, own, session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
-    let schemas: Vec<Vec<QCol>> = vec![
-        t.columns
-            .iter()
-            .map(|(n, ty)| QCol {
-                qual: qual.to_string(),
-                name: n.clone(),
-                ty: *ty,
+    let mut combined: Vec<QCol> = Vec::new();
+    for s in extra {
+        combined.extend(s.iter().cloned());
+    }
+    combined.extend(t.columns.iter().map(|(n, ty)| QCol {
+        qual: qual.to_string(),
+        name: n.clone(),
+        ty: *ty,
 
-                hidden: false,
-                src_ord: 0,
-            })
-            .collect(),
-    ];
+        hidden: false,
+        src_ord: 0,
+    }));
+    let schemas: Vec<Vec<QCol>> = vec![combined];
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
     for item in returning {
@@ -3449,8 +3472,7 @@ fn project_returning(
     own: u64,
     session: u64,
     role: &str,
-    schema: &[QCol],
-    values: &[Value],
+    scopes: &[(&[QCol], &[Value])],
     returning: &[SelectItem],
     ctes: &[Rc<CteBinding>],
 ) -> Result<Vec<Value>, ExecError> {
@@ -3458,14 +3480,7 @@ fn project_returning(
     for item in returning {
         if let SelectItem::Expr { expr, .. } = item {
             out.push(eval_dml_expr(
-                eng,
-                snap,
-                own,
-                session,
-                role,
-                &[(schema, values)],
-                expr,
-                ctes,
+                eng, snap, own, session, role, scopes, expr, ctes,
             )?);
         }
     }
@@ -5053,8 +5068,16 @@ fn exec_insert(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols =
-            describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, table, returning)?;
+        let cols = describe_returning(
+            eng,
+            ctx.snap,
+            ctx.own,
+            ctx.session,
+            table,
+            table,
+            &[],
+            returning,
+        )?;
         let schema: Vec<QCol> = meta_for_upsert
             .columns
             .iter()
@@ -5075,8 +5098,7 @@ fn exec_insert(
                 ctx.own,
                 ctx.session,
                 ctx.role,
-                &schema,
-                values,
+                &[(&schema, values)],
                 returning,
                 &ctes,
             )?));
@@ -5195,7 +5217,9 @@ fn exec_update(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    alias: &Option<String>,
     sets: &[(String, Expr)],
+    from: &[FromItem],
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
@@ -5233,10 +5257,12 @@ fn exec_update(
     // order); rows whose partition key changed are planned as moves
     // (src leaf, old id, prev xmax, dst leaf, new values in dst order).
     // `ret_new` carries every new row in parent order for RETURNING.
-    let (plan, moves, ret_new): (
+    let (plan, moves, ret_new, ret_from, from_schema): (
         Vec<(String, u64, u64, Row)>,
         Vec<(String, u64, u64, String, Row)>,
         Vec<Row>,
+        Vec<Option<Row>>,
+        Option<Vec<QCol>>,
     ) = {
         let t = eng
             .db
@@ -5262,10 +5288,12 @@ fn exec_update(
         let columns = meta.columns.clone();
         // v0.22: the target table name is the qualifier (was empty), so
         // `tbl.col` references resolve in SET and WHERE, as in PostgreSQL.
+        // v0.76: an alias makes it the visible qualifier (PG's alias clause).
+        let qual = alias.as_deref().unwrap_or(table);
         let schema: Vec<QCol> = columns
             .iter()
             .map(|(n, ty)| QCol {
-                qual: table.to_string(),
+                qual: qual.to_string(),
                 name: n.clone(),
                 ty: *ty,
 
@@ -5309,6 +5337,33 @@ fn exec_update(
         let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
         let mut moves: Vec<(String, u64, u64, String, Row)> = Vec::new();
         let mut ret_new: Vec<Row> = Vec::new();
+        // v0.76: UPDATE ... FROM — build the FROM items once (like SELECT's
+        // FROM and DELETE's USING). Each target row is tested against the
+        // cross product; SET/WHERE/RETURNING see the combined scopes with
+        // the target frame last (unqualified refs resolve to the target).
+        let from_data: Option<(Vec<QCol>, Vec<QRow>)> = if from.is_empty() {
+            None
+        } else {
+            let mut lock_ids = Vec::new();
+            let mut q = Q {
+                eng: &mut *eng,
+                snap: ctx.snap,
+                own: ctx.own,
+                session: ctx.session,
+                role: ctx.role,
+                read_only: ctx.read_only,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+                ctes: ctes.clone(),
+                wctx: None,
+                priv_scopes: Vec::new(),
+            };
+            let (fschema, frows) = build_from(&mut q, &[], from, None, false, None, None)?;
+            Some((fschema, frows))
+        };
+        // For RETURNING with FROM: the FROM row used for each updated target
+        // row, parallel to `ret_new` (None when no FROM clause).
+        let mut ret_from: Vec<Option<Row>> = Vec::new();
         // (leaf, old values in leaf order) parallel to `plan`, for the FK
         // cascade below.
         let mut old_leaf_vals: Vec<(String, Row)> = Vec::new();
@@ -5322,23 +5377,68 @@ fn exec_update(
         // subqueries in SET correlate to the row being updated.
         for (leaf, leaf_cols, id, xmax, values) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
-            // v0.22: full predicate expression (was `col = literal` only).
-            // NULL or false skips the row, like SELECT's WHERE.
-            let row_matches = match where_ {
-                None => true,
-                Some(pred) => {
-                    let v = eval_update_expr(
-                        eng,
-                        ctx.snap,
-                        ctx.own,
-                        ctx.session,
-                        ctx.role,
-                        &schema,
-                        values,
-                        pred,
-                        &ctes,
-                    )?;
-                    v == Value::Bool(true)
+            // v0.76: UPDATE ... FROM — test each target row against the
+            // FROM cross product. The SET expressions evaluate against the
+            // matching combination; if several FROM rows match, the last
+            // one wins (PG picks an arbitrary match; we take the last for
+            // determinism). Without FROM, the old single-scope logic runs.
+            let (row_matches, from_row): (bool, Option<Row>) = match &from_data {
+                None => {
+                    // v0.22: full predicate expression (was `col = literal`
+                    // only). NULL or false skips the row, like SELECT's WHERE.
+                    let m = match where_ {
+                        None => true,
+                        Some(pred) => {
+                            let v = eval_update_expr(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                &schema,
+                                values,
+                                pred,
+                                &ctes,
+                            )?;
+                            v == Value::Bool(true)
+                        }
+                    };
+                    (m, None)
+                }
+                Some((fschema, frows)) => {
+                    let mut matched = false;
+                    let mut last_frow: Option<Row> = None;
+                    for frow in frows {
+                        let m = match where_ {
+                            None => true,
+                            Some(pred) => {
+                                // v0.76: combine FROM + target into a single
+                                // schema so unqualified refs resolve to
+                                // either (FROM first, then target).
+                                let mut cschema = fschema.clone();
+                                cschema.extend(schema.iter().cloned());
+                                let mut cvalues = frow.cells.clone().into_cells();
+                                cvalues.extend(values.iter().cloned());
+                                let v = eval_update_expr(
+                                    eng,
+                                    ctx.snap,
+                                    ctx.own,
+                                    ctx.session,
+                                    ctx.role,
+                                    &cschema,
+                                    &cvalues,
+                                    pred,
+                                    &ctes,
+                                )?;
+                                v == Value::Bool(true)
+                            }
+                        };
+                        if m {
+                            matched = true;
+                            last_frow = Some(frow.cells.clone());
+                        }
+                    }
+                    (matched, last_frow)
                 }
             };
             if !row_matches {
@@ -5349,17 +5449,38 @@ fn exec_update(
             check_row_lock(eng, leaf, *id, ctx.own)?;
             let mut new_values = values.to_vec();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
-                let v = eval_update_expr(
-                    eng,
-                    ctx.snap,
-                    ctx.own,
-                    ctx.session,
-                    ctx.role,
-                    &schema,
-                    values,
-                    expr,
-                    &ctes,
-                )?;
+                let v = match &from_data {
+                    None => eval_update_expr(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        ctx.role,
+                        &schema,
+                        values,
+                        expr,
+                        &ctes,
+                    )?,
+                    Some((fschema, _)) => {
+                        let frow = from_row.as_ref().expect("matched row has FROM data");
+                        // v0.76: combined schema (FROM first, then target).
+                        let mut cschema = fschema.clone();
+                        cschema.extend(schema.iter().cloned());
+                        let mut cvalues = frow.clone().into_cells();
+                        cvalues.extend(values.iter().cloned());
+                        eval_update_expr(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &cschema,
+                            &cvalues,
+                            expr,
+                            &ctes,
+                        )?
+                    }
+                };
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
             }
@@ -5418,6 +5539,8 @@ fn exec_update(
                 .or_default()
                 .push((*id, Row::new(new_dst.clone())));
             ret_new.push(Row::new(new_values.clone()));
+            // v0.76: remember the FROM row for RETURNING (None without FROM).
+            ret_from.push(from_row.clone());
             let old_src = Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()));
             if dst == *leaf {
                 old_leaf_vals.push((leaf.clone(), old_src));
@@ -5525,7 +5648,8 @@ fn exec_update(
         }
         // Apply the cascade after the unique checks pass.
         apply_fk_cascade(eng, ctx, cascade)?;
-        (plan, moves, ret_new)
+        let from_schema = from_data.map(|(s, _)| s);
+        (plan, moves, ret_new, ret_from, from_schema)
     };
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
@@ -5630,8 +5754,25 @@ fn exec_update(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols =
-            describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, table, returning)?;
+        // v0.76: UPDATE ... FROM — RETURNING may reference the FROM tables
+        // (PG19); describe against the FROM schemas plus the target (with
+        // the alias as the visible qualifier), mirroring the runtime's
+        // combined evaluation schema below.
+        let rqual = alias.as_deref().unwrap_or(table);
+        let extra: Vec<Vec<QCol>> = from_schema
+            .as_ref()
+            .map(|s| vec![s.clone()])
+            .unwrap_or_default();
+        let cols = describe_returning(
+            eng,
+            ctx.snap,
+            ctx.own,
+            ctx.session,
+            table,
+            rqual,
+            &extra,
+            returning,
+        )?;
         let schema: Vec<QCol> = {
             let t = eng
                 .db
@@ -5640,7 +5781,7 @@ fn exec_update(
             t.columns
                 .iter()
                 .map(|(n, ty)| QCol {
-                    qual: table.to_string(),
+                    qual: rqual.to_string(),
                     name: n.clone(),
                     ty: *ty,
 
@@ -5650,15 +5791,29 @@ fn exec_update(
                 .collect()
         };
         let mut out_rows = Vec::with_capacity(ret_new.len());
-        for new_values in &ret_new {
+        for (new_values, frow_opt) in ret_new.iter().zip(ret_from.iter()) {
+            // v0.76: UPDATE ... FROM — RETURNING sees the FROM columns too.
+            // Combine into a single schema (FROM first, then target) so
+            // unqualified refs resolve.
+            let (cschema, cvalues): (Vec<QCol>, Vec<Value>) = match (from_schema.as_ref(), frow_opt)
+            {
+                (Some(fs), Some(fv)) => {
+                    let mut cs = fs.clone();
+                    cs.extend(schema.iter().cloned());
+                    let mut cv = fv.clone().into_cells();
+                    cv.extend(new_values.iter().cloned());
+                    (cs, cv)
+                }
+                _ => (schema.clone(), new_values.to_vec()),
+            };
+            let scopes: Vec<(&[QCol], &[Value])> = vec![(&cschema, &cvalues)];
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
                 ctx.own,
                 ctx.session,
                 ctx.role,
-                &schema,
-                new_values,
+                &scopes,
                 returning,
                 &ctes,
             )?));
@@ -5694,7 +5849,11 @@ fn exec_delete(
     // leave half the rows deleted). v0.70: a partitioned target scans
     // every leaf; the plan records (leaf, id, xmax, values in parent
     // order for RETURNING, values in leaf order for FK cascades, toast).
-    let plan: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
+    let (plan, ret_using, using_schema): (
+        Vec<(String, u64, u64, Row, Row, Vec<u32>)>,
+        Vec<Option<Row>>,
+        Option<Vec<QCol>>,
+    ) = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
@@ -5758,6 +5917,10 @@ fn exec_delete(
             v
         };
         let mut plan = Vec::new();
+        // v0.76: the USING row matched for each deleted target row,
+        // parallel to `plan` (None without USING) — RETURNING may
+        // reference USING columns (PG19).
+        let mut plan_using: Vec<Option<Row>> = Vec::new();
         // v0.74: DELETE ... USING — evaluate the USING from-items once
         // (like SELECT's FROM); each target row is tested against the
         // cross product, and deleted if any combination satisfies WHERE.
@@ -5783,13 +5946,22 @@ fn exec_delete(
         };
         for (leaf, id, xmax, values, leaf_values, _toast) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
-            let row_matches = match where_ {
-                None => true,
+            let (row_matches, using_row): (bool, Option<Row>) = match where_ {
+                // v0.76: without WHERE every target row is deleted (v0.74
+                // behavior) — but only when USING produced at least one
+                // row (PG19 cross-product semantics); RETURNING sees the
+                // first USING row, if any.
+                None => match using_data.as_ref() {
+                    Some((_, urows)) if urows.is_empty() => (false, None),
+                    Some((_, urows)) => (true, urows.first().map(|u| u.cells.clone())),
+                    None => (true, None),
+                },
                 Some(pred) => {
                     if let Some((uschema, urows)) = &using_data {
                         // Target frame last: unqualified refs resolve to
                         // the target table (eval_dml_expr convention).
                         let mut matched = false;
+                        let mut matched_urow: Option<Row> = None;
                         for urow in urows {
                             let v = eval_dml_expr(
                                 eng,
@@ -5803,10 +5975,14 @@ fn exec_delete(
                             )?;
                             if v == Value::Bool(true) {
                                 matched = true;
+                                // v0.76: remember the USING row for
+                                // RETURNING (first match wins here; PG
+                                // picks an arbitrary match).
+                                matched_urow = Some(urow.cells.clone());
                                 break;
                             }
                         }
-                        matched
+                        (matched, matched_urow)
                     } else {
                         let v = eval_update_expr(
                             eng,
@@ -5819,7 +5995,7 @@ fn exec_delete(
                             pred,
                             &ctes,
                         )?;
-                        v == Value::Bool(true)
+                        (v == Value::Bool(true), None)
                     }
                 }
             };
@@ -5835,6 +6011,8 @@ fn exec_delete(
                     leaf_values.clone(),
                     _toast.clone(),
                 ));
+                // v0.76: parallel USING row for RETURNING.
+                plan_using.push(using_row);
             }
         }
         // v0.9: parent-side FK actions for the deleted rows, grouped by
@@ -5873,7 +6051,9 @@ fn exec_delete(
             }
         }
         apply_fk_cascade(eng, ctx, cascade)?;
-        plan
+        // v0.76: USING schema for RETURNING (None without USING).
+        let using_schema = using_data.map(|(s, _)| s);
+        (plan, plan_using, using_schema)
     };
     let n = plan.len();
     // v0.10: DELETE RETURNING evaluates against the OLD row values —
@@ -5933,7 +6113,23 @@ fn exec_delete(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols = describe_returning(eng, ctx.snap, ctx.own, ctx.session, table, qual, returning)?;
+        // v0.76: DELETE ... USING — RETURNING may reference the USING
+        // tables (PG19); describe against the USING schemas plus the
+        // target, mirroring the runtime's combined evaluation schema.
+        let extra: Vec<Vec<QCol>> = using_schema
+            .as_ref()
+            .map(|s| vec![s.clone()])
+            .unwrap_or_default();
+        let cols = describe_returning(
+            eng,
+            ctx.snap,
+            ctx.own,
+            ctx.session,
+            table,
+            qual,
+            &extra,
+            returning,
+        )?;
         let schema: Vec<QCol> = {
             let t = eng
                 .db
@@ -5952,15 +6148,28 @@ fn exec_delete(
                 .collect()
         };
         let mut out_rows = Vec::with_capacity(ret_vals.len());
-        for values in &ret_vals {
+        for (values, urow_opt) in ret_vals.iter().zip(ret_using.iter()) {
+            // v0.76: DELETE ... USING — RETURNING sees the USING columns
+            // too. Combine into a single schema (USING first, then
+            // target), mirroring UPDATE ... FROM.
+            let (cschema, cvalues): (Vec<QCol>, Vec<Value>) =
+                match (using_schema.as_ref(), urow_opt) {
+                    (Some(us), Some(uv)) => {
+                        let mut cs = us.clone();
+                        cs.extend(schema.iter().cloned());
+                        let mut cv = uv.clone().into_cells();
+                        cv.extend(values.iter().cloned());
+                        (cs, cv)
+                    }
+                    _ => (schema.clone(), values.to_vec()),
+                };
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
                 ctx.own,
                 ctx.session,
                 ctx.role,
-                &schema,
-                values,
+                &[(&cschema, &cvalues)],
                 returning,
                 &ctes,
             )?));
@@ -8485,6 +8694,66 @@ fn row_to_json_text(fields: &[(String, Value)]) -> String {
         val(v, &mut out);
     }
     out.push('}');
+    out
+}
+
+/// v0.76: `json_array(...)` — the SQL/JSON array constructor (PG19).
+/// Elements render like json.c values (numbers bare, strings quoted,
+/// NULL as `null`), joined with ", " inside brackets.
+fn json_array_text(vals: &[Value]) -> String {
+    fn esc(s: &str, out: &mut String) {
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+    }
+    fn val(v: &Value, out: &mut String) {
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Text(s) | Value::BpChar(s) => {
+                out.push('"');
+                esc(s, out);
+                out.push('"');
+            }
+            other => match other.to_text() {
+                Some(t) => {
+                    let bare = matches!(
+                        other,
+                        Value::SmallInt(_)
+                            | Value::Int(_)
+                            | Value::BigInt(_)
+                            | Value::Float4(_)
+                            | Value::Float(_)
+                            | Value::Numeric(_)
+                    );
+                    if bare {
+                        out.push_str(&t);
+                    } else {
+                        out.push('"');
+                        esc(&t, out);
+                        out.push('"');
+                    }
+                }
+                None => out.push_str("null"),
+            },
+        }
+    }
+    let mut out = String::from("[");
+    for (i, v) in vals.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        val(v, &mut out);
+    }
+    out.push(']');
     out
 }
 
@@ -14710,8 +14979,8 @@ fn sum_vals(vals: &[Value]) -> Result<Value, ExecError> {
     if vals.is_empty() {
         return Ok(Value::Null);
     }
-    // v0.6 rule kept: sum returns the widest input kind among
-    // the rows (documented deviation: Postgres widens int->bigint).
+    // v0.76: PG19 widening — sum(smallint/int) -> bigint,
+    // sum(bigint) -> numeric. (v0.6's "widest input kind" rule is retired.)
     let mut cat = NumCat::Small;
     for v in vals {
         match num_cat(v) {
@@ -14744,19 +15013,26 @@ fn sum_vals(vals: &[Value]) -> Result<Value, ExecError> {
         } else {
             Value::Float(acc)
         })
+    } else if cat == NumCat::Big {
+        // v0.76: sum(bigint) -> numeric (PG19).
+        let mut acc = Numeric::zero();
+        for v in vals {
+            let n = to_numeric_opt(v)
+                .ok_or_else(|| exec_err("22003", "value out of range for numeric"))?;
+            acc = acc
+                .checked_add(&n)
+                .ok_or_else(|| exec_err("22003", "numeric field overflow"))?;
+        }
+        Ok(Value::Numeric(acc))
     } else {
+        // v0.76: sum(smallint/int) -> bigint (PG19).
         let mut acc: i128 = 0;
         for v in vals {
             acc = acc
                 .checked_add(to_i128(v))
                 .ok_or_else(|| exec_err("22003", "integer out of range"))?;
         }
-        let icat = if cat == NumCat::Small {
-            NumCat::Int
-        } else {
-            cat
-        };
-        fit_int_result(icat, acc)
+        fit_int_result(NumCat::Big, acc)
     }
 }
 
@@ -18791,6 +19067,8 @@ fn normalize_func_arg(name: &str, v: Value) -> Value {
             if !matches!(
                 name,
                 "octet_length" | "bit_length" | "coalesce" | "nullif" | "greatest" | "least"
+                // v0.76: pg_typeof must see the original type.
+                | "pg_typeof"
             ) =>
         {
             Value::text(crate::storage::rtrim_spaces(&s))
@@ -19143,9 +19421,17 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.33: btrim(text [, text]); btrim(bytea, bytea).
         "btrim" => n == 1 || n == 2,
         "left" | "right" => n == 2,
-        "now" | "current_date" | "current_timestamp" => n == 0,
-        // v0.17: transaction/clock timestamps.
-        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => n == 0,
+        // v0.76: PG19 allows the optional precision (0-6) only on
+        // CURRENT_TIMESTAMP (special grammar syntax); now()/
+        // clock_timestamp()/statement_timestamp()/
+        // transaction_timestamp() are 0-argument pg_proc functions.
+        "current_timestamp" => n <= 1,
+        "now" | "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => n == 0,
+        "current_date" => n == 0,
+        // v0.76: pg_typeof(any) takes exactly one argument; json_array is
+        // variadic (SQL/JSON constructor, like PG19's json_array).
+        "pg_typeof" => n == 1,
+        "json_array" => true,
         // v0.17: version() takes no arguments.
         "version" => n == 0,
         // v0.17: date/time built-in batch.
@@ -19328,6 +19614,13 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
             other => Err(func_arg_err(name, other)),
         },
+        // v0.76: pg_typeof(any) -> regtype (reported as text here). Uses
+        // the value's PG type name; NULL reports "unknown" like PG19.
+        "pg_typeof" => Ok(Value::text(vals[0].type_name())),
+        // v0.76: json_array(...) -> json (SQL/JSON constructor, PG19).
+        // Elements render per json.c: numbers bare, strings quoted,
+        // NULL as null. Carried as text typed `ColType::Json`.
+        "json_array" => Ok(Value::text(json_array_text(vals))),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -23896,9 +24189,57 @@ fn numfmt_exec_err(e: crate::numfmt::NumFmtError) -> ExecError {
     }
 }
 
+/// v0.76: PG19 AdjustTimestampForTypmod — round microseconds to `p`
+/// fractional digits (0-6); ties away from zero, symmetric for negative
+/// timestamps. `None` leaves the value untouched.
+fn round_micros_to_precision(micros: i64, precision: Option<i64>) -> i64 {
+    match precision {
+        None => micros,
+        Some(p) => {
+            let scale = 10i64.pow((6 - p) as u32);
+            let offset = scale / 2;
+            if micros >= 0 {
+                ((micros + offset) / scale) * scale
+            } else {
+                -(((-micros + offset) / scale) * scale)
+            }
+        }
+    }
+}
+
 fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // v0.76: optional precision arg (0-6) on CURRENT_TIMESTAMP, per
+    // PG19. Rounds half away from zero (PG19 AdjustTimestampForTypmod
+    // adds half the scale, symmetric for negative timestamps) — it does
+    // not truncate. now()/clock_timestamp()/statement_timestamp()/
+    // transaction_timestamp() take no arguments in PG19 (42883
+    // otherwise; enforced by check_builtin_arity).
+    let precision: Option<i64> = if name == "current_timestamp" && !vals.is_empty() {
+        match int_arg(name, &vals[0])? {
+            None => return Ok(Value::Null),
+            Some(p) if (0..=6).contains(&p) => Some(p),
+            Some(_) => {
+                return Err(exec_err(
+                    "22023",
+                    format!(
+                        "precision {} out of range for {}",
+                        vals[0].to_text().unwrap_or_default(),
+                        name
+                    ),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let apply_precision = |micros: i64| -> i64 { round_micros_to_precision(micros, precision) };
     match name {
-        "now" | "current_timestamp" => Ok(Value::Timestamptz(crate::datetime::now_micros())),
+        "now" | "current_timestamp" => Ok(Value::Timestamptz(apply_precision(
+            crate::datetime::now_micros(),
+        ))),
+        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => Ok(
+            Value::Timestamptz(apply_precision(crate::datetime::now_micros())),
+        ),
         "current_date" => Ok(Value::Date(crate::datetime::today_days())),
         "date_trunc" => {
             let field = match str_arg(name, &vals[0])? {
@@ -24106,9 +24447,8 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         // execution time, exactly like clock_timestamp() — a documented
         // deviation from Postgres, where now()/transaction_timestamp()
         // are frozen at transaction start.
-        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => {
-            Ok(Value::Timestamptz(crate::datetime::now_micros()))
-        }
+        // (v0.76: the precision-aware arms above handle these; this
+        // duplicate arm was removed.)
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -24297,6 +24637,10 @@ fn func_result_type(
         "pg_lsn" => Ok(ColType::PgLsn), // v0.64: native pg_lsn type (OID 3220)
         // v0.73: row_to_json returns json (OID 114).
         "row_to_json" => Ok(ColType::Json),
+        // v0.76: pg_typeof returns regtype (reported as text); json_array
+        // returns json (OID 114).
+        "pg_typeof" => Ok(ColType::Text),
+        "json_array" => Ok(ColType::Json),
         "random" => Ok(ColType::Float),
         // v0.21: float8 transcendental functions always return float8.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
@@ -25628,9 +25972,13 @@ fn agg_result_type(
             Some(a) => {
                 let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
                 numeric_agg_arg("sum", &t)?;
-                // v0.6 rule kept (documented): sum returns the
-                // argument type; Postgres would widen int->bigint.
-                Ok(t)
+                // v0.76: PG19 widening — sum(smallint/int) -> bigint,
+                // sum(bigint) -> numeric.
+                match t {
+                    ColType::SmallInt | ColType::Int => Ok(ColType::BigInt),
+                    ColType::BigInt => Ok(ColType::Numeric(None)),
+                    _ => Ok(t),
+                }
             }
         },
         AggFunc::Min | AggFunc::Max => {
@@ -26067,31 +26415,46 @@ pub fn infer_param_types(
         // v0.10: CTE bodies, ON CONFLICT expressions and RETURNING list.
         infer_ctes(with, eng, snap, own, session, &mut out);
         infer_on_conflict(on_conflict, table, eng, snap, own, session, &mut out);
-        infer_returning(returning, table, eng, snap, own, session, &mut out);
+        infer_returning(
+            returning,
+            table,
+            table,
+            &[],
+            eng,
+            snap,
+            own,
+            session,
+            &mut out,
+        );
     }
     if let Stmt::Update {
         table,
+        alias,
         sets,
+        from,
         where_,
         with,
         returning,
         ..
     } = stmt
     {
+        // v0.76: SET/WHERE see the UPDATE ... FROM tables too (PG19); the
+        // alias (if any) is the visible qualifier. A bad FROM table must
+        // not break Bind (from_schemas' unwrap_or_default rule).
+        let uqual = alias.as_deref().unwrap_or(table);
+        let uextra: Vec<Vec<QCol>> =
+            from_schemas(eng, snap, own, session, from, with, &[]).unwrap_or_default();
         if let Some(t) = eng.db.find_table(table, snap, own, session) {
-            let schemas: Vec<Vec<QCol>> = vec![
-                t.columns
-                    .iter()
-                    .map(|(n, ty)| QCol {
-                        qual: String::new(),
-                        name: n.clone(),
-                        ty: *ty,
+            let mut combined: Vec<QCol> = uextra.iter().flatten().cloned().collect();
+            combined.extend(t.columns.iter().map(|(n, ty)| QCol {
+                qual: uqual.to_string(),
+                name: n.clone(),
+                ty: *ty,
 
-                        hidden: false,
-                        src_ord: 0,
-                    })
-                    .collect(),
-            ];
+                hidden: false,
+                src_ord: 0,
+            }));
+            let schemas: Vec<Vec<QCol>> = vec![combined];
             let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
             for (col, expr) in sets {
                 if let Expr::Param(p) = expr {
@@ -26111,7 +26474,9 @@ pub fn infer_param_types(
         }
         // v0.10: CTE bodies and RETURNING list.
         infer_ctes(with, eng, snap, own, session, &mut out);
-        infer_returning(returning, table, eng, snap, own, session, &mut out);
+        infer_returning(
+            returning, table, uqual, &uextra, eng, snap, own, session, &mut out,
+        );
     }
     match stmt {
         Stmt::Select(sel) => {
@@ -26120,6 +26485,7 @@ pub fn infer_param_types(
         Stmt::Delete {
             table,
             alias,
+            using,
             where_,
             with,
             returning,
@@ -26127,30 +26493,32 @@ pub fn infer_param_types(
         } => {
             // v0.22: WHERE is a full expression; infer its params against
             // the target table's schema. v0.65: the alias (if any) is
-            // the visible qualifier.
+            // the visible qualifier. v0.76: DELETE ... USING tables are
+            // visible too (PG19).
             let qual = alias.as_deref().unwrap_or(table);
+            let dextra: Vec<Vec<QCol>> =
+                from_schemas(eng, snap, own, session, using, with, &[]).unwrap_or_default();
             if let Some(w) = where_ {
                 if let Some(t) = eng.db.find_table(table, snap, own, session) {
-                    let schemas: Vec<Vec<QCol>> = vec![
-                        t.columns
-                            .iter()
-                            .map(|(n, ty)| QCol {
-                                qual: qual.to_string(),
-                                name: n.clone(),
-                                ty: *ty,
+                    let mut combined: Vec<QCol> = dextra.iter().flatten().cloned().collect();
+                    combined.extend(t.columns.iter().map(|(n, ty)| QCol {
+                        qual: qual.to_string(),
+                        name: n.clone(),
+                        ty: *ty,
 
-                                hidden: false,
-                                src_ord: 0,
-                            })
-                            .collect(),
-                    ];
+                        hidden: false,
+                        src_ord: 0,
+                    }));
+                    let schemas: Vec<Vec<QCol>> = vec![combined];
                     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
                     infer_expr(w, eng, snap, own, session, &refs, &mut out)?;
                 }
             }
             // v0.10: CTE bodies and RETURNING list.
             infer_ctes(with, eng, snap, own, session, &mut out);
-            infer_returning(returning, table, eng, snap, own, session, &mut out);
+            infer_returning(
+                returning, table, qual, &dextra, eng, snap, own, session, &mut out,
+            );
         }
         _ => {}
     }
@@ -26182,6 +26550,8 @@ fn infer_ctes(
 fn infer_returning(
     returning: &[SelectItem],
     table: &str,
+    qual: &str,
+    extra: &[Vec<QCol>],
     eng: &Engine,
     snap: &Snapshot,
     own: u64,
@@ -26192,19 +26562,22 @@ fn infer_returning(
         return;
     }
     if let Some(t) = eng.db.find_table(table, snap, own, session) {
-        let schemas: Vec<Vec<QCol>> = vec![
-            t.columns
-                .iter()
-                .map(|(n, ty)| QCol {
-                    qual: String::new(),
-                    name: n.clone(),
-                    ty: *ty,
+        // v0.76: UPDATE ... FROM / DELETE ... USING — RETURNING may
+        // reference those tables (PG19); flatten their schemas ahead of
+        // the target's, like the describe path.
+        let mut combined: Vec<QCol> = Vec::new();
+        for s in extra {
+            combined.extend(s.iter().cloned());
+        }
+        combined.extend(t.columns.iter().map(|(n, ty)| QCol {
+            qual: qual.to_string(),
+            name: n.clone(),
+            ty: *ty,
 
-                    hidden: false,
-                    src_ord: 0,
-                })
-                .collect(),
-        ];
+            hidden: false,
+            src_ord: 0,
+        }));
+        let schemas: Vec<Vec<QCol>> = vec![combined];
         let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
         for item in returning {
             if let SelectItem::Expr { expr, .. } = item {
@@ -26530,12 +26903,18 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
         Stmt::Select(sel) => subst_select(sel, params),
         Stmt::Update {
             sets,
+            from,
             where_,
             with,
             returning,
             ..
         } => {
             subst_ctes(with, params)?;
+            // v0.76: parameters inside UPDATE ... FROM items (derived
+            // tables, functions, VALUES).
+            for f in from {
+                subst_from(f, params)?;
+            }
             for (_, e) in sets {
                 subst_expr(e, params)?;
             }
@@ -26545,12 +26924,17 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
             subst_returning(returning, params)
         }
         Stmt::Delete {
+            using,
             where_,
             with,
             returning,
             ..
         } => {
             subst_ctes(with, params)?;
+            // v0.76: parameters inside DELETE ... USING items.
+            for f in using {
+                subst_from(f, params)?;
+            }
             if let Some(w) = where_ {
                 subst_expr(w, params)?;
             }
@@ -26847,24 +27231,6 @@ pub fn describe_columns(
         // it there are no result columns (like a plain command tag).
         Stmt::Insert {
             table, returning, ..
-        }
-        | Stmt::Update {
-            table, returning, ..
-        } => {
-            if returning.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(describe_returning(
-                    eng, snap, own, session, table, table, returning,
-                )?))
-            }
-        }
-        // v0.65: DELETE's alias (if any) is the visible qualifier.
-        Stmt::Delete {
-            table,
-            alias,
-            returning,
-            ..
         } => {
             if returning.is_empty() {
                 Ok(None)
@@ -26875,7 +27241,61 @@ pub fn describe_columns(
                     own,
                     session,
                     table,
+                    table,
+                    &[],
+                    returning,
+                )?))
+            }
+        }
+        // v0.76: UPDATE ... FROM — RETURNING may reference the FROM
+        // tables (PG19); the alias (if any) is the visible qualifier.
+        Stmt::Update {
+            table,
+            alias,
+            from,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(None)
+            } else {
+                let extra = from_schemas(eng, snap, own, session, from, with, &[])?;
+                Ok(Some(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
                     alias.as_deref().unwrap_or(table),
+                    &extra,
+                    returning,
+                )?))
+            }
+        }
+        // v0.65: DELETE's alias (if any) is the visible qualifier.
+        // v0.76: DELETE ... USING — RETURNING may reference the USING
+        // tables (PG19).
+        Stmt::Delete {
+            table,
+            alias,
+            using,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(None)
+            } else {
+                let extra = from_schemas(eng, snap, own, session, using, with, &[])?;
+                Ok(Some(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref().unwrap_or(table),
+                    &extra,
                     returning,
                 )?))
             }
@@ -27863,7 +28283,22 @@ mod tests {
         assert!(ts2.len() >= 19);
         let ts3 = one(&mut eng, "SELECT transaction_timestamp()");
         assert!(ts3.len() >= 19);
-        assert_eq!(err_code(&mut eng, "SELECT clock_timestamp(1)"), "42883");
+        // v0.76: only CURRENT_TIMESTAMP takes the optional precision in
+        // PG19 — now()/clock_timestamp()/statement_timestamp()/
+        // transaction_timestamp() are 0-argument functions (42883 at the
+        // parse layer; the test harness flattens parse codes to 42601).
+        let ts_prec = one(&mut eng, "SELECT current_timestamp(3)");
+        assert!(ts_prec.len() >= 19);
+        for q in [
+            "SELECT now(3)",
+            "SELECT clock_timestamp(1)",
+            "SELECT statement_timestamp(0)",
+            "SELECT transaction_timestamp(6)",
+        ] {
+            assert!(run(&mut eng, q).is_err(), "{}", q);
+            let perr = parse_statement(q).unwrap_err();
+            assert_eq!(perr.code, "42883", "{}", q);
+        }
         // Deliberately unimplemented: 42883.
         assert_eq!(err_code(&mut eng, "SELECT age(now())"), "42883");
         assert_eq!(err_code(&mut eng, "SELECT make_interval(1)"), "42883");
@@ -29992,6 +30427,334 @@ mod tests {
         let err = run(&mut eng, "insert into rgxc values ('abc')").unwrap_err();
         assert_eq!(err.code, "23514");
     }
+
+    /// v0.76: UPDATE ... FROM — SET/WHERE/RETURNING resolve the FROM
+    /// tables (PG19). Regression test for the protocol-78 A3 failure
+    /// (`column "delta" does not exist` on
+    /// `UPDATE u78a SET code = code + delta FROM u78b WHERE ...`).
+    #[test]
+    fn v76_update_from_returning_sees_from() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int, code int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, delta int)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1, 10), (2, 20)").unwrap();
+        run(&mut eng, "INSERT INTO b VALUES (1, 5), (2, 7)").unwrap();
+        let r = run(
+            &mut eng,
+            "UPDATE a SET code = code + delta FROM b WHERE a.id = b.id RETURNING a.id, b.delta",
+        )
+        .unwrap();
+        let (tag, cols, rows) = match r {
+            ExecResult::Dml { tag, columns, rows } => (tag, columns, rows),
+            _ => panic!("expected Dml"),
+        };
+        assert_eq!(tag, "UPDATE 2");
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["id", "delta"]);
+        let mut got: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![vec!["1", "5"], vec!["2", "7"]]);
+        // The SET expressions themselves applied the FROM values.
+        let got = rows_of(run(&mut eng, "SELECT id, code FROM a ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["1", "15"], vec!["2", "27"]]);
+    }
+
+    /// v0.76: UPDATE with a target alias — the alias is the visible
+    /// qualifier in SET/WHERE/RETURNING (PG19).
+    #[test]
+    fn v76_update_alias_from_returning() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int, code int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, delta int)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1, 10), (2, 20)").unwrap();
+        run(&mut eng, "INSERT INTO b VALUES (1, 5), (2, 7)").unwrap();
+        let r = run(
+            &mut eng,
+            "UPDATE a AS x SET code = code + b.delta FROM b WHERE x.id = b.id RETURNING x.id, x.code",
+        )
+        .unwrap();
+        let rows = match r {
+            ExecResult::Dml { rows, .. } => rows,
+            _ => panic!("expected Dml"),
+        };
+        let mut got: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![vec!["1", "15"], vec!["2", "27"]]);
+    }
+
+    /// v0.76: the Describe path for UPDATE ... FROM ... RETURNING
+    /// resolves FROM columns (the protocol-78 A3 failure was in
+    /// statement description, SQLSTATE 42703).
+    #[test]
+    fn v76_describe_update_from_returning() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int, code int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, delta int)").unwrap();
+        let stmt = parse_statement(
+            "UPDATE a SET code = code + delta FROM b WHERE a.id = b.id RETURNING a.id, b.delta",
+        )
+        .unwrap();
+        let snap = eng.take_snapshot();
+        let cols = describe_columns(&stmt, &[], &eng, &snap, 9, 0)
+            .unwrap()
+            .expect("RETURNING describes columns");
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["id", "delta"]);
+        assert!(cols.iter().all(|(_, ty)| *ty == ColType::Int));
+    }
+
+    /// v0.76: DELETE ... USING — RETURNING sees the USING tables (PG19).
+    #[test]
+    fn v76_delete_using_returning_sees_using() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int, code int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, delta int)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        run(&mut eng, "INSERT INTO b VALUES (1, 5), (3, 9)").unwrap();
+        let r = run(
+            &mut eng,
+            "DELETE FROM a USING b WHERE a.id = b.id RETURNING a.id, b.delta",
+        )
+        .unwrap();
+        let (tag, rows) = match r {
+            ExecResult::Dml { tag, rows, .. } => (tag, rows),
+            _ => panic!("expected Dml"),
+        };
+        assert_eq!(tag, "DELETE 2");
+        let mut got: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![vec!["1", "5"], vec!["3", "9"]]);
+        let left = rows_of(run(&mut eng, "SELECT id FROM a").unwrap());
+        assert_eq!(left, vec![vec!["2"]]);
+    }
+
+    /// v0.76: DELETE ... USING without WHERE deletes every target row
+    /// (PG19 cross-product semantics); RETURNING sees the first USING
+    /// row deterministically.
+    #[test]
+    fn v76_delete_using_no_where_returns_first_using_row() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int, delta int)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1), (2)").unwrap();
+        run(&mut eng, "INSERT INTO b VALUES (9, 99), (8, 88)").unwrap();
+        let r = run(&mut eng, "DELETE FROM a USING b RETURNING a.id, b.delta").unwrap();
+        let (tag, rows) = match r {
+            ExecResult::Dml { tag, rows, .. } => (tag, rows),
+            _ => panic!("expected Dml"),
+        };
+        assert_eq!(tag, "DELETE 2");
+        let mut got: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![vec!["1", "99"], vec!["2", "99"]]);
+    }
+
+    /// v0.76: DELETE ... USING with an empty USING table matches nothing
+    /// (PG19: no USING rows means no target row can satisfy the implicit
+    /// cross product).
+    #[test]
+    fn v76_delete_using_empty_matches_nothing() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a(id int)").unwrap();
+        run(&mut eng, "CREATE TABLE b(id int)").unwrap();
+        run(&mut eng, "INSERT INTO a VALUES (1), (2)").unwrap();
+        let r = run(&mut eng, "DELETE FROM a USING b").unwrap();
+        let tag = match r {
+            ExecResult::Dml { tag, .. } => tag,
+            _ => panic!("expected Dml"),
+        };
+        assert_eq!(tag, "DELETE 0");
+        let left = rows_of(run(&mut eng, "SELECT id FROM a ORDER BY id").unwrap());
+        assert_eq!(left, vec![vec!["1"], vec!["2"]]);
+    }
+
+    /// v0.76: `ADD CONSTRAINT ... NOT NULL ... NOT VALID` skips the
+    /// existing-row scan but still enforces the constraint on future
+    /// writes (PG19), via check_row_constraints.
+    #[test]
+    fn v76_not_null_not_valid_enforced_on_writes() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t(id int, v int)").unwrap();
+        run(&mut eng, "INSERT INTO t VALUES (1, NULL)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t ADD CONSTRAINT nn_v NOT NULL v NOT VALID",
+        )
+        .unwrap();
+        // Existing NULL row survives the NOT VALID add.
+        let got = rows_of(run(&mut eng, "SELECT id, v FROM t").unwrap());
+        assert_eq!(got, vec![vec!["1", "NULL"]]);
+        // Future NULL writes are rejected.
+        let err = run(&mut eng, "INSERT INTO t VALUES (2, NULL)").unwrap_err();
+        assert_eq!(err.code, "23502");
+        let err = run(&mut eng, "UPDATE t SET v = NULL WHERE id = 1").unwrap_err();
+        assert_eq!(err.code, "23502");
+        // Valid writes still work.
+        run(&mut eng, "INSERT INTO t VALUES (2, 5)").unwrap();
+        run(&mut eng, "UPDATE t SET v = 7 WHERE id = 2").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id, v FROM t ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["1", "NULL"], vec!["2", "7"]]);
+    }
+
+    /// v0.76: timestamp precision rounds half away from zero, like PG19
+    /// AdjustTimestampForTypmod (it does not truncate).
+    #[test]
+    fn v76_round_micros_to_precision() {
+        assert_eq!(round_micros_to_precision(1_234_567, None), 1_234_567);
+        // Ties round up (away from zero).
+        assert_eq!(round_micros_to_precision(1_500_000, Some(0)), 2_000_000);
+        assert_eq!(round_micros_to_precision(1_499_999, Some(0)), 1_000_000);
+        // Symmetric for negative timestamps.
+        assert_eq!(round_micros_to_precision(-1_500_000, Some(0)), -2_000_000);
+        assert_eq!(round_micros_to_precision(-1_499_999, Some(0)), -1_000_000);
+        assert_eq!(round_micros_to_precision(-1_400_000, Some(0)), -1_000_000);
+        // Sub-second scales.
+        assert_eq!(round_micros_to_precision(1_234_567, Some(3)), 1_235_000);
+        assert_eq!(round_micros_to_precision(1_234_499, Some(3)), 1_234_000);
+        assert_eq!(round_micros_to_precision(1_234_567, Some(6)), 1_234_567);
+    }
+
+    /// v0.76: only CURRENT_TIMESTAMP takes the optional precision in
+    /// PG19 — now()/clock_timestamp()/statement_timestamp()/
+    /// transaction_timestamp() are 0-argument functions (42883).
+    #[test]
+    fn v76_timestamp_precision_arity_pg19() {
+        let mut eng = engine();
+        // current_timestamp(3) works and returns a value.
+        assert!(run(&mut eng, "SELECT current_timestamp(3)").is_ok());
+        assert!(run(&mut eng, "SELECT current_timestamp").is_ok());
+        // The rest are 0-argument in PG19: the parse layer raises 42883
+        // (the run() harness flattens parse codes to 42601).
+        for q in [
+            "SELECT now(3)",
+            "SELECT clock_timestamp(1)",
+            "SELECT statement_timestamp(0)",
+            "SELECT transaction_timestamp(6)",
+        ] {
+            assert!(run(&mut eng, q).is_err(), "{}", q);
+            assert_eq!(parse_statement(q).unwrap_err().code, "42883", "{}", q);
+        }
+        assert!(run(&mut eng, "SELECT now()").is_ok());
+        assert!(run(&mut eng, "SELECT clock_timestamp()").is_ok());
+    }
+
+    /// v0.76: the VALUES form of quantified comparisons desugars ANY/SOME
+    /// to OR and ALL to AND, preserving NULL three-valued logic.
+    #[test]
+    fn v76_quantified_values_forms() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| rows_of(run(eng, sql).unwrap());
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ANY (VALUES (2), (3))"),
+            vec![vec!["f"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ANY (VALUES (1), (3))"),
+            vec![vec!["t"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = SOME (VALUES (1), (3))"),
+            vec![vec!["t"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ALL (VALUES (1), (1))"),
+            vec![vec!["t"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ALL (VALUES (1), (2))"),
+            vec![vec!["f"]]
+        );
+        // NULL three-valued logic survives the desugar.
+        assert_eq!(
+            one(&mut eng, "SELECT NULL = ANY (VALUES (NULL))"),
+            vec![vec!["NULL"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ANY (VALUES (NULL))"),
+            vec![vec!["NULL"]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 1 = ALL (VALUES (1), (NULL))"),
+            vec![vec!["NULL"]]
+        );
+    }
+
+    /// v0.76: `Stmt::max_param` sees parameters inside UPDATE ... FROM
+    /// and DELETE ... USING items (derived tables, functions, VALUES),
+    /// so Bind sizes the parameter vector correctly.
+    #[test]
+    fn v76_max_param_sees_from_and_using() {
+        let u =
+            parse_statement("UPDATE a SET x = 1 FROM (SELECT $1 AS y) s WHERE a.id = s.y").unwrap();
+        assert_eq!(u.max_param(), 1);
+        let d = parse_statement("DELETE FROM a USING (SELECT $2 AS y) s WHERE a.id = s.y").unwrap();
+        assert_eq!(d.max_param(), 2);
+    }
+
+    /// v0.76: the NOT VALID flag on check constraints survives the
+    /// checkpoint encode/decode round trip, and pre-v0.76 checkpoints
+    /// that omit the flag decode as not_valid = false.
+    #[test]
+    fn v76_check_not_valid_encode_decode_roundtrip() {
+        use crate::sql::{CheckDef, Expr, Literal, decode_constraints, encode_constraints};
+        let mut t = Table::new(vec![("v".to_string(), ColType::Int)], 1);
+        t.checks.push(CheckDef {
+            name: "c_valid".to_string(),
+            expr: Expr::Literal(Literal::Int(1)),
+            not_valid: false,
+        });
+        t.checks.push(CheckDef {
+            name: "c_nv".to_string(),
+            expr: Expr::Literal(Literal::Int(1)),
+            not_valid: true,
+        });
+        let encoded = encode_constraints(&t);
+        let dec = decode_constraints(&encoded).unwrap();
+        let flags: Vec<(String, bool)> = dec
+            .checks
+            .iter()
+            .map(|c| (c.name.clone(), c.not_valid))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![("c_valid".to_string(), false), ("c_nv".to_string(), true)]
+        );
+        // Backward compatibility: strip the new flag (as a pre-v0.76
+        // checkpoint would) and confirm it decodes as false.
+        let legacy = encoded.replace("(\"c_nv\" (lit int 1) 1)", "(\"c_nv\" (lit int 1))");
+        assert_ne!(legacy, encoded);
+        let dec = decode_constraints(&legacy).unwrap();
+        let nv = dec.checks.iter().find(|c| c.name == "c_nv").unwrap();
+        assert!(!nv.not_valid);
+    }
 }
 
 // ============================================================================
@@ -31715,8 +32478,9 @@ fn exec_alter_one(
             unique,
             pkey,
             fk,
+            notnull,
         } => {
-            let res = alter_add_constraint(eng, ctx, name, check, unique, pkey, fk);
+            let res = alter_add_constraint(eng, ctx, name, check, unique, pkey, fk, notnull);
             // v0.70: propagate ADD CONSTRAINT to partitions (PG does
             // this). Per-child backing indexes get per-table names via
             // `constraint_index_name`, so siblings never collide.
@@ -31726,7 +32490,8 @@ fn exec_alter_one(
                     .map(|c| c.name.as_str())
                     .or(unique.as_ref().map(|u| u.name.as_str()))
                     .or(pkey.as_ref().map(|p| p.name.as_str()))
-                    .or(fk.as_ref().map(|f| f.name.as_str()));
+                    .or(fk.as_ref().map(|f| f.name.as_str()))
+                    .or(notnull.as_ref().map(|n| n.name.as_str()));
                 let children: Vec<String> = eng
                     .db
                     .find_table(name, ctx.snap, ctx.own, ctx.session)
@@ -31749,6 +32514,7 @@ fn exec_alter_one(
                         unique: unique.clone(),
                         pkey: pkey.clone(),
                         fk: fk.clone(),
+                        notnull: notnull.clone(),
                     };
                     exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
@@ -32285,6 +33051,7 @@ fn alter_add_constraint(
     unique: &Option<UniqueDef>,
     pkey: &Option<UniqueDef>,
     fk: &Option<FkDef>,
+    notnull: &Option<crate::sql::NotNullDef>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
@@ -32292,6 +33059,55 @@ fn alter_add_constraint(
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let mut next = t.clone();
     let meta = TableMeta::of(&next);
+    // v0.76: `ADD CONSTRAINT name NOT NULL col [NOT VALID]`. With NOT
+    // VALID, existing rows are not validated (PG19). Without it, verify
+    // no existing visible row has a NULL in the column. (Done here, before
+    // the CHECK validation below, so the `t` borrow ends before
+    // `check_row_constraints` needs `&mut eng`.)
+    let notnull_to_add: Option<CheckDef> = if let Some(n) = notnull {
+        if table_has_constraint(&next, &n.name) {
+            return Err(exec_err(
+                "42710",
+                format!("constraint \"{}\" already exists", n.name),
+            ));
+        }
+        let col_idx = meta.column_index(&n.col).ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    n.col, name
+                ),
+            )
+        })?;
+        if !n.not_valid {
+            for r in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+                if r.values.get(col_idx) == Some(&crate::storage::Value::Null) {
+                    return Err(exec_err(
+                        "23502",
+                        format!("column \"{}\" contains null values", n.col),
+                    ));
+                }
+            }
+        }
+        // Record as a check-like constraint for DROP CONSTRAINT
+        // visibility. check_row_constraints evaluates it on every future
+        // write, so NOT NULL is enforced going forward (like PG19);
+        // NOT VALID only skipped the existing-row scan above.
+        Some(CheckDef {
+            name: n.name.clone(),
+            expr: crate::sql::Expr::IsNull {
+                expr: Box::new(crate::sql::Expr::Column {
+                    table: None,
+                    name: n.col.clone(),
+                }),
+                neg: true,
+            },
+            not_valid: n.not_valid,
+        })
+    } else {
+        None
+    };
     if let Some(c) = check {
         validate_constraint_expr(&c.expr, "CHECK").map_err(sql_err)?;
         if table_has_constraint(&next, &c.name) {
@@ -32333,6 +33149,10 @@ fn alter_add_constraint(
             )?;
         }
         next.checks.push(c.clone());
+    }
+    // v0.76: push the NOT NULL check-like constraint (validated above).
+    if let Some(nn) = notnull_to_add {
+        next.checks.push(nn);
     }
     if let Some(u) = unique {
         if table_has_constraint(&next, &u.name) {
