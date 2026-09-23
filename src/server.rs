@@ -29,6 +29,15 @@ const SSL_REQUEST_CODE: i32 = 80877103;
 const CANCEL_REQUEST_CODE: i32 = 80877102;
 const PROTOCOL_V3: i32 = 196608;
 
+/// A prepared statement created by SQL-level PREPARE (parameters bound
+/// by EXECUTE). Separate namespace from the extended-protocol `stmts`.
+#[derive(Clone)]
+struct SqlPrepared {
+    /// Declared parameter types (arity-checked at EXECUTE).
+    types: Vec<String>,
+    stmt: Stmt,
+}
+
 /// A prepared statement created by Parse (parameters not yet bound).
 #[derive(Clone)]
 struct Prepared {
@@ -66,6 +75,9 @@ pub(crate) struct Session {
     role: String,
     stmts: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
+    /// v0.74: SQL-level `PREPARE name AS ...` statements, separate from
+    /// the extended-protocol namespace (like PostgreSQL).
+    sql_prepared: HashMap<String, SqlPrepared>,
     /// After an extended-protocol error: discard input until Sync.
     in_error: bool,
     /// Explicit transaction state; None = autocommit.
@@ -230,6 +242,7 @@ impl Session {
             role,
             stmts: HashMap::new(),
             portals: HashMap::new(),
+            sql_prepared: HashMap::new(),
             in_error: false,
             txn: None,
             cursors: HashMap::new(),
@@ -2088,12 +2101,70 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
     }
 }
 
+/// v0.74: resolve SQL-level `EXECUTE name (args)` to the stored prepared
+/// statement with `$N` bound to the evaluated argument values, ready to
+/// run through the normal statement path.
+fn resolve_sql_execute(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    name: &str,
+    args: &[crate::sql::Expr],
+) -> Result<Stmt, ExecError> {
+    let prepared = session
+        .sql_prepared
+        .get(name)
+        .cloned()
+        .ok_or_else(|| ExecError {
+            detail: None,
+            code: "26000",
+            message: format!("prepared statement \"{}\" does not exist", name),
+        })?;
+    if !prepared.types.is_empty() && args.len() != prepared.types.len() {
+        return Err(ExecError {
+            detail: None,
+            code: "42P02",
+            message: format!(
+                "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
+                name,
+                prepared.types.len(),
+                args.len()
+            ),
+        });
+    }
+    // Evaluate the argument expressions under a throwaway snapshot; the
+    // bound statement itself runs later under its own statement snapshot.
+    let mut guard = lock_engine(engine);
+    let snap = guard.take_snapshot();
+    let xid = guard.begin_txn();
+    let mut params: Vec<Option<crate::storage::Value>> = Vec::with_capacity(args.len());
+    for a in args {
+        let v = exec::eval_execute_arg(&mut guard, &snap, xid, session.sid, &session.role, a)?;
+        params.push(Some(v));
+    }
+    guard.end_txn(xid);
+    drop(guard);
+    let mut stmt = prepared.stmt;
+    exec::subst_params(&mut stmt, &params)?;
+    Ok(stmt)
+}
+
 fn run_statement(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
+    // v0.74: SQL-level EXECUTE resolves to the stored prepared
+    // statement with its arguments bound, so the checks below see the
+    // real statement. (PREPARE/DEALLOCATE are handled in the match.)
+    let owned;
+    let stmt = match stmt {
+        Stmt::Execute { name, args } => {
+            owned = resolve_sql_execute(engine, session, name, args)?;
+            &owned
+        }
+        other => other,
+    };
     if let Some(t) = &session.txn {
         if t.failed && !allowed_in_aborted(stmt) {
             return Err(ExecError {
@@ -2147,6 +2218,44 @@ fn run_statement(
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
         Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
+        // v0.74: SQL-level PREPARE / DEALLOCATE are session-state writes
+        // (the statement text was already parsed); EXECUTE is resolved
+        // to the bound inner statement before the match.
+        Stmt::Prepare { name, types, stmt } => {
+            if session.sql_prepared.contains_key(name) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42P05",
+                    message: format!("prepared statement \"{}\" already exists", name),
+                });
+            }
+            session.sql_prepared.insert(
+                name.clone(),
+                SqlPrepared {
+                    types: types.clone(),
+                    stmt: (**stmt).clone(),
+                },
+            );
+            Ok(ExecResult::Command {
+                tag: "PREPARE".to_string(),
+            })
+        }
+        Stmt::Deallocate { name } => {
+            match name {
+                Some(n) => {
+                    session.sql_prepared.remove(n);
+                }
+                None => session.sql_prepared.clear(),
+            }
+            Ok(ExecResult::Command {
+                tag: "DEALLOCATE".to_string(),
+            })
+        }
+        Stmt::Execute { .. } => Err(ExecError {
+            detail: None,
+            code: "XX000",
+            message: "internal error: EXECUTE reached the executor unresolved".to_string(),
+        }),
         // v0.16: SQL cursors are session-level (the cursor map lives on
         // the Session, next to the prepared statements).
         Stmt::Declare {
@@ -3438,6 +3547,7 @@ mod tests {
             role: "postgres".to_string(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
+            sql_prepared: HashMap::new(),
             in_error: false,
             cursors: HashMap::new(),
             default_txn_level: None,
@@ -3619,6 +3729,7 @@ mod tests {
             role: "postgres".to_string(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
+            sql_prepared: HashMap::new(),
             in_error: false,
             txn: None,
             cursors: HashMap::new(),

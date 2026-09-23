@@ -1903,8 +1903,11 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
     // only reject a list with neither columns nor LIKE clauses.
     // (Checked against the raw items: pass 2 below is what fills
     // def.likes.)
+    // v0.74: zero-column tables (`CREATE TABLE t()`) are legal in
+    // PostgreSQL; only a list that intended columns but produced none
+    // (and no LIKE) is an error.
     let has_like = items.iter().any(|i| matches!(i, TableItem::Like(_)));
-    if def.columns.is_empty() && !has_like {
+    if def.columns.is_empty() && !has_like && !items.is_empty() {
         return Err(err(
             "syntax error: table must have at least one column".to_string()
         ));
@@ -2313,6 +2316,9 @@ pub enum Stmt {
         /// v0.65: optional table alias (`DELETE FROM t AS dt`); the
         /// alias is the qualifier visible in WHERE/RETURNING, like PG.
         alias: Option<String>,
+        /// v0.74: `USING <from-items>` — extra tables the WHERE clause
+        /// may reference (PG19), like SELECT's FROM.
+        using: Vec<FromItem>,
         /// v0.22: full predicate expression (was `Vec<WhereCond>`).
         where_: Option<Expr>,
         /// v0.10: `RETURNING ...`.
@@ -2444,6 +2450,26 @@ pub enum Stmt {
     /// `RESET name` / `RESET ALL`.
     Reset {
         name: String,
+    },
+    /// v0.74: `PREPARE name [(type, ...)] AS statement` (PG19) — a
+    /// session-level named prepared statement; the inner statement may
+    /// reference `$N` parameters bound by EXECUTE.
+    Prepare {
+        name: String,
+        /// Declared parameter types (for arity checking at EXECUTE).
+        types: Vec<String>,
+        stmt: Box<Stmt>,
+    },
+    /// v0.74: `EXECUTE name [(expr, ...)]` (PG19) — run a statement
+    /// created by SQL-level PREPARE with the argument values bound.
+    Execute {
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// v0.74: `DEALLOCATE name` / `DEALLOCATE ALL` (PG19).
+    Deallocate {
+        /// None = ALL.
+        name: Option<String>,
     },
 }
 
@@ -3087,6 +3113,10 @@ impl Parser {
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
             "delete" => self.parse_delete(),
+            // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
+            "prepare" => self.parse_prepare(),
+            "execute" => self.parse_execute(),
+            "deallocate" => self.parse_deallocate(),
             // --- v0.16: TRUNCATE / cursors
             "truncate" => self.parse_truncate(),
             "declare" => self.parse_declare(),
@@ -3565,27 +3595,32 @@ impl Parser {
         }
         self.expect(Token::LParen, "'('")?;
         let mut items: Vec<TableItem> = Vec::new();
-        loop {
-            // v0.72: `LIKE source_table [like_option ...]` — a
-            // first-class item of the column list (PG19).
-            if matches!(self.peek(), Token::Ident(s) if s == "like") {
-                items.push(TableItem::Like(self.parse_like_clause()?));
-            } else if self.is_table_constraint_start() {
-                items.push(TableItem::TableCon(self.parse_table_constraint()?));
-            } else {
-                items.push(TableItem::Col(self.parse_column_def()?));
-            }
-            match self.next() {
-                Token::Comma => continue,
-                Token::RParen => break,
-                other => {
-                    return Err(err(format!(
-                        "syntax error: expected ',' or ')', found {:?}",
-                        other
-                    )));
+        // v0.74: PostgreSQL allows zero-column tables (`CREATE TABLE t()`).
+        if *self.peek() == Token::RParen {
+            self.next();
+        } else {
+            loop {
+                // v0.72: `LIKE source_table [like_option ...]` — a
+                // first-class item of the column list (PG19).
+                if matches!(self.peek(), Token::Ident(s) if s == "like") {
+                    items.push(TableItem::Like(self.parse_like_clause()?));
+                } else if self.is_table_constraint_start() {
+                    items.push(TableItem::TableCon(self.parse_table_constraint()?));
+                } else {
+                    items.push(TableItem::Col(self.parse_column_def()?));
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
                 }
             }
-        }
+        } // v0.74: end of non-empty column list; `()` handled above.
         let mut def = build_table_def(&name, items)?;
         // v0.72: `WITH (storage_parameter = value, ...)` (PG19
         // reloptions). Parsed into the def; exec validates the
@@ -4643,7 +4678,13 @@ impl Parser {
         // v0.10: `INSERT INTO ... SELECT ...` (or VALUES).
         // v0.72: `INSERT INTO ... (SELECT ...)` — parenthesized query
         // source (PG19); parse_select_query_not_consumed eats the parens.
-        let (rows, select) = if self.eat_keyword("select") {
+        // v0.74: `INSERT INTO t DEFAULT VALUES` (PG19) — one row with
+        // every column at its default. Parsed as a single empty row;
+        // exec's default-filling handles the rest.
+        let (rows, select) = if self.eat_keyword("default") {
+            self.expect_keyword("values")?;
+            (vec![Vec::new()], None)
+        } else if self.eat_keyword("select") {
             let sel = self.parse_select_query()?;
             (Vec::new(), Some(sel))
         } else if *self.peek() == Token::LParen {
@@ -6773,15 +6814,117 @@ impl Parser {
         // v0.65: `DELETE FROM t AS dt` / `DELETE FROM t dt` (PG's alias
         // clause; the alias becomes the visible qualifier).
         let alias = self.parse_alias_opt()?;
+        // v0.74: `DELETE FROM t USING <from-items>` (PG19) — extra
+        // tables the WHERE clause may reference, like SELECT's FROM.
+        let using = if self.eat_keyword("using") {
+            self.parse_from()?
+        } else {
+            Vec::new()
+        };
         let where_ = self.parse_where_expr_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Delete {
             table,
             alias,
+            using,
             where_,
             returning,
             with: Vec::new(),
         })
+    }
+
+    // --- v0.74: PREPARE / EXECUTE / DEALLOCATE (PG19) ------------------
+    // `PREPARE name [(type, ...)] AS statement`.
+    fn parse_prepare(&mut self) -> Result<Stmt, SqlError> {
+        let name = self.expect_ident()?;
+        let types = if *self.peek() == Token::LParen {
+            self.next();
+            let mut ts = Vec::new();
+            loop {
+                let ct = self.parse_type_name()?;
+                // Normalized name for the arity check / error messages.
+                let tn = match ct {
+                    crate::storage::ColType::Int => "integer",
+                    crate::storage::ColType::BigInt => "bigint",
+                    crate::storage::ColType::SmallInt => "smallint",
+                    crate::storage::ColType::Float => "double precision",
+                    crate::storage::ColType::Float4 => "real",
+                    crate::storage::ColType::Numeric(_) => "numeric",
+                    crate::storage::ColType::Text => "text",
+                    crate::storage::ColType::Char(_) => "character",
+                    crate::storage::ColType::Varchar(_) => "character varying",
+                    crate::storage::ColType::SingleChar => "\"char\"",
+                    crate::storage::ColType::Bool => "boolean",
+                    crate::storage::ColType::Date => "date",
+                    crate::storage::ColType::Timestamp => "timestamp",
+                    crate::storage::ColType::Timestamptz => "timestamptz",
+                    crate::storage::ColType::Bytea => "bytea",
+                    crate::storage::ColType::Uuid => "uuid",
+                    _ => "unknown",
+                };
+                ts.push(tn.to_string());
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            ts
+        } else {
+            Vec::new()
+        };
+        self.expect_keyword("as")?;
+        let inner = self.parse_top()?;
+        Ok(Stmt::Prepare {
+            name,
+            types,
+            stmt: Box::new(inner),
+        })
+    }
+
+    // `EXECUTE name [(expr, ...)]`.
+    fn parse_execute(&mut self) -> Result<Stmt, SqlError> {
+        let name = self.expect_ident()?;
+        let args = if *self.peek() == Token::LParen {
+            self.next();
+            let mut es = Vec::new();
+            if *self.peek() == Token::RParen {
+                self.next();
+            } else {
+                loop {
+                    es.push(self.parse_or()?);
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            }
+            es
+        } else {
+            Vec::new()
+        };
+        Ok(Stmt::Execute { name, args })
+    }
+
+    // `DEALLOCATE name` / `DEALLOCATE ALL`.
+    fn parse_deallocate(&mut self) -> Result<Stmt, SqlError> {
+        let name = if self.eat_keyword("all") {
+            None
+        } else {
+            Some(self.expect_ident()?)
+        };
+        Ok(Stmt::Deallocate { name })
     }
 
     // --- v0.16: TRUNCATE / SQL cursors -----------------------------------
@@ -7503,8 +7646,41 @@ impl Parser {
         Ok(vec![acc])
     }
 
+    /// v0.74: true when the next tokens start another join in a FROM chain
+    /// (`[NATURAL] [INNER|LEFT|RIGHT|FULL|CROSS] JOIN`). Used for PostgreSQL's
+    /// shift-preferred join grammar: when a join's right operand is followed
+    /// immediately by another join (no ON/USING yet), the right operand
+    /// extends rightward (`a LEFT JOIN b LEFT JOIN c ON p1 ON p2` =
+    /// `a LEFT JOIN (b LEFT JOIN c ON p1) ON p2`).
+    fn peek_join_start(&self) -> bool {
+        match self.peek() {
+            Token::Ident(s)
+                if s == "join"
+                    || s == "inner"
+                    || s == "left"
+                    || s == "right"
+                    || s == "full"
+                    || s == "cross"
+                    || s == "natural" =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn parse_join_chain(&mut self) -> Result<FromItem, SqlError> {
-        let mut left = self.parse_from_primary()?;
+        let left = self.parse_from_primary()?;
+        self.parse_join_rest(left)
+    }
+
+    /// v0.74: right-recursive join parsing matching PostgreSQL's grammar.
+    /// `parse_join_chain` parses the first operand, then this consumes the
+    /// join tail: after each join's right operand, if another join keyword
+    /// follows (no ON/USING seen yet), that join nests into the right
+    /// operand (bison shift preference); once ON/USING attaches, parsing
+    /// continues left-deep as before.
+    fn parse_join_rest(&mut self, mut left: FromItem) -> Result<FromItem, SqlError> {
         loop {
             // v0.20: NATURAL [kind] JOIN — desugared at execution time.
             let natural = self.eat_keyword("natural");
@@ -7534,7 +7710,12 @@ impl Parser {
                 }
                 break;
             };
-            let right = self.parse_from_primary()?;
+            let mut right = self.parse_from_primary()?;
+            // v0.74: PG shift preference — a join keyword immediately after
+            // the right operand (no ON/USING yet) extends the right operand.
+            if self.peek_join_start() {
+                right = self.parse_join_rest(right)?;
+            }
             let (on, using) = match kind {
                 JoinKind::Cross => (None, Vec::new()),
                 // v0.20: NATURAL has no ON/USING — condition is implicit.
@@ -7554,6 +7735,9 @@ impl Parser {
                         self.expect(Token::RParen, "')'")?;
                         (None, cols)
                     } else {
+                        // v0.74: PG19 requires ON/USING for INNER/LEFT/
+                        // RIGHT/FULL JOIN (only CROSS and NATURAL omit
+                        // it); a missing qualifier is a syntax error.
                         self.expect_keyword("on")?;
                         (Some(self.parse_or()?), Vec::new())
                     }

@@ -264,6 +264,12 @@ fn require_view_owner(eng: &Engine, ctx: &StmtCtx, view: &str) -> Result<(), Exe
 
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     match stmt {
+        // v0.74: session-level PREPARE/EXECUTE/DEALLOCATE are resolved in
+        // server.rs before reaching the executor.
+        Stmt::Prepare { .. } | Stmt::Execute { .. } | Stmt::Deallocate { .. } => Err(exec_err(
+            "XX000",
+            "internal error: PREPARE/EXECUTE/DEALLOCATE reached the executor",
+        )),
         Stmt::CreateTable { name, def, temp } => exec_create(eng, ctx, name, def, *temp),
         // v0.48: CREATE TABLE ... AS <query>.
         Stmt::CreateTableAs {
@@ -431,10 +437,11 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
         Stmt::Delete {
             table,
             alias,
+            using,
             where_,
             with,
             returning,
-        } => exec_delete(eng, ctx, table, alias, where_, with, returning),
+        } => exec_delete(eng, ctx, table, alias, using, where_, with, returning),
         // v0.16: TRUNCATE is executor-level (transactional row removal).
         Stmt::Truncate {
             tables,
@@ -5640,6 +5647,7 @@ fn exec_delete(
     ctx: &mut StmtCtx,
     table: &str,
     alias: &Option<String>,
+    using: &[FromItem],
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
@@ -5720,23 +5728,69 @@ fn exec_delete(
             v
         };
         let mut plan = Vec::new();
+        // v0.74: DELETE ... USING — evaluate the USING from-items once
+        // (like SELECT's FROM); each target row is tested against the
+        // cross product, and deleted if any combination satisfies WHERE.
+        let using_data: Option<(Vec<QCol>, Vec<QRow>)> = if using.is_empty() {
+            None
+        } else {
+            let mut lock_ids = Vec::new();
+            let mut q = Q {
+                eng: &mut *eng,
+                snap: ctx.snap,
+                own: ctx.own,
+                session: ctx.session,
+                role: ctx.role,
+                read_only: ctx.read_only,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+                ctes: ctes.clone(),
+                wctx: None,
+                priv_scopes: Vec::new(),
+            };
+            let (uschema, urows) = build_from(&mut q, &[], using, None, false, None, None)?;
+            Some((uschema, urows))
+        };
         for (leaf, id, xmax, values, leaf_values, _toast) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
             let row_matches = match where_ {
                 None => true,
                 Some(pred) => {
-                    let v = eval_update_expr(
-                        eng,
-                        ctx.snap,
-                        ctx.own,
-                        ctx.session,
-                        ctx.role,
-                        &schema,
-                        values,
-                        pred,
-                        &ctes,
-                    )?;
-                    v == Value::Bool(true)
+                    if let Some((uschema, urows)) = &using_data {
+                        // Target frame last: unqualified refs resolve to
+                        // the target table (eval_dml_expr convention).
+                        let mut matched = false;
+                        for urow in urows {
+                            let v = eval_dml_expr(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                &[(uschema, &urow.cells), (&schema, values)],
+                                pred,
+                                &ctes,
+                            )?;
+                            if v == Value::Bool(true) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        matched
+                    } else {
+                        let v = eval_update_expr(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &schema,
+                            values,
+                            pred,
+                            &ctes,
+                        )?;
+                        v == Value::Bool(true)
+                    }
                 }
             };
             if row_matches {
@@ -26393,6 +26447,19 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
             message: format!("parameter ${}: {}", n, e.message),
         }
     })
+}
+
+/// v0.74: evaluate a SQL-level EXECUTE argument expression against an
+/// empty scope (no tables). Used to bind `$N` in prepared statements.
+pub fn eval_execute_arg(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    role: &str,
+    e: &Expr,
+) -> Result<Value, ExecError> {
+    eval_dml_expr(eng, snap, own, session, role, &[], e, &[])
 }
 
 /// Replace every `$N` in the statement with its bound value's literal.
