@@ -122,6 +122,9 @@ enum Token {
     Amp,           // v0.25: `&` bitwise AND
     Hash,          // v0.25: `#` bitwise XOR
     Tilde,         // v0.25: `~` bitwise NOT (unary)
+    TildeStar,     // v0.68: `~*` POSIX regex match, case-insensitive
+    BangTilde,     // v0.68: `!~` POSIX regex non-match
+    BangTildeStar, // v0.68: `!~*` POSIX regex non-match, case-insensitive
     Shl,           // v0.25: `<<` shift left
     Shr,           // v0.25: `>>` shift right
     At,            // v0.21: `@` prefix abs operator
@@ -388,8 +391,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         if c == '~' {
-            toks.push(Token::Tilde);
-            i += 1;
+            // v0.68: `~*` lexes as one operator token (PG lexes the
+            // multi-char regex operators as single Op tokens); a lone
+            // `~` stays the unary bitwise NOT.
+            if i + 1 < chars.len() && chars[i + 1] == '*' {
+                toks.push(Token::TildeStar);
+                i += 2;
+            } else {
+                toks.push(Token::Tilde);
+                i += 1;
+            }
             continue;
         }
         // v0.21: `@` prefix absolute-value operator.
@@ -530,6 +541,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Token::Neq);
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '~' {
+                    // v0.68: `!~` / `!~*` POSIX regex non-match operators
+                    // lex as single tokens, like PG.
+                    if i + 2 < chars.len() && chars[i + 2] == '*' {
+                        toks.push(Token::BangTildeStar);
+                        i += 3;
+                    } else {
+                        toks.push(Token::BangTilde);
+                        i += 2;
+                    }
                 } else {
                     return Err(err(format!("unexpected character '{}'", c)));
                 }
@@ -991,6 +1012,14 @@ pub enum Expr {
         not: bool,
         ilike: bool,
         escape: Option<Box<Expr>>,
+    },
+    /// v0.68: POSIX regex match `~` / `!~` / `~*` / `!~*`
+    /// (PG "other native operators" precedence).
+    Regex {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        not: bool,
+        case_insensitive: bool,
     },
     /// v0.7: `[NOT] BETWEEN low AND high`.
     Between {
@@ -1877,6 +1906,11 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
             collect_col_refs(expr, out);
             collect_col_refs(pattern, out);
         }
+        // v0.68: regex match visits both operands like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            collect_col_refs(expr, out);
+            collect_col_refs(pattern, out);
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -2529,6 +2563,8 @@ fn max_param_expr(e: &Expr) -> usize {
         Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Like { expr, pattern, .. } => max_param_expr(expr).max(max_param_expr(pattern)),
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => max_param_expr(expr).max(max_param_expr(pattern)),
         Expr::Between {
             expr, low, high, ..
         } => max_param_expr(expr)
@@ -4979,9 +5015,34 @@ impl Parser {
     /// v0.25: bitwise OR — the loosest bitwise operator (PG binds `|`
     /// looser than `#`, `&`, `<<`/`>>`, and all of those looser than
     /// `||`). Operands are the next-tighter level.
+    /// v0.68: the POSIX regex match operators `~`, `!~`, `~*`, `!~*`
+    /// share this level — PG19 ranks every "other native operator"
+    /// (syntax.sgml) in one left-associative level looser than `+`/`-`
+    /// and tighter than LIKE/BETWEEN and the comparisons.
     fn parse_bitor(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_bitxor()?;
-        while *self.peek() == Token::Pipe {
+        loop {
+            let regex = match self.peek() {
+                Token::Tilde => Some((false, false)),
+                Token::BangTilde => Some((true, false)),
+                Token::TildeStar => Some((false, true)),
+                Token::BangTildeStar => Some((true, true)),
+                _ => None,
+            };
+            if let Some((not, case_insensitive)) = regex {
+                self.next();
+                let right = self.parse_bitxor()?;
+                left = Expr::Regex {
+                    expr: Box::new(left),
+                    pattern: Box::new(right),
+                    not,
+                    case_insensitive,
+                };
+                continue;
+            }
+            if *self.peek() != Token::Pipe {
+                break;
+            }
             self.next();
             let right = self.parse_bitxor()?;
             left = Expr::Arith {
@@ -8164,6 +8225,11 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(expr, what)?;
             validate_constraint_expr(pattern, what)
         }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            validate_constraint_expr(expr, what)?;
+            validate_constraint_expr(pattern, what)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -8327,6 +8393,23 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
                 Some(e) => encode_expr_inner(e, out),
                 None => out.push_str("(null)"),
             }
+            out.push(')');
+        }
+        // v0.68: regex match operators.
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => {
+            out.push_str(&format!(
+                "(regex {} {} ",
+                if *not { 1 } else { 0 },
+                if *case_insensitive { 1 } else { 0 }
+            ));
+            encode_expr_inner(expr, out);
+            out.push(' ');
+            encode_expr_inner(pattern, out);
             out.push(')');
         }
         Expr::Between {
@@ -8615,6 +8698,19 @@ impl<'a> SexprParser<'a> {
                     not,
                     ilike,
                     escape,
+                }
+            }
+            // v0.68: regex match operators.
+            "regex" => {
+                let not = self.atom()? == "1";
+                let case_insensitive = self.atom()? == "1";
+                let x = self.expr()?;
+                let p = self.expr()?;
+                Expr::Regex {
+                    expr: Box::new(x),
+                    pattern: Box::new(p),
+                    not,
+                    case_insensitive,
                 }
             }
             "between" => {

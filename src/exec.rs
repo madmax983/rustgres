@@ -5977,6 +5977,8 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
                 escape,
                 ..
             } => expr_uses(expr) || expr_uses(pattern) || escape.as_deref().is_some_and(expr_uses),
+            // v0.68: regex match visits both operands.
+            Expr::Regex { expr, pattern, .. } => expr_uses(expr) || expr_uses(pattern),
             Expr::Between {
                 expr, low, high, ..
             } => expr_uses(expr) || expr_uses(low) || expr_uses(high),
@@ -6171,6 +6173,18 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             not: *not,
             ilike: *ilike,
             escape: escape.as_ref().map(|e| r(e)).transpose()?.map(Box::new),
+        }),
+        // v0.68: regex match rewrite.
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => Ok(Expr::Regex {
+            expr: Box::new(r(expr)?),
+            pattern: Box::new(r(pattern)?),
+            not: *not,
+            case_insensitive: *case_insensitive,
         }),
         Expr::Between {
             expr,
@@ -7665,6 +7679,11 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             validate_expr(expr)?;
             validate_expr(pattern)
         }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            validate_expr(expr)?;
+            validate_expr(pattern)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -7732,6 +7751,8 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
         Expr::Cmp { left, right, .. } => contains_agg(left) || contains_agg(right),
         Expr::Like { expr, pattern, .. } => contains_agg(expr) || contains_agg(pattern),
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => contains_agg(expr) || contains_agg(pattern),
         Expr::Between {
             expr, low, high, ..
         } => contains_agg(expr) || contains_agg(low) || contains_agg(high),
@@ -7787,6 +7808,8 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
         Expr::Cmp { left, right, .. } => contains_window(left) || contains_window(right),
         Expr::Like { expr, pattern, .. } => contains_window(expr) || contains_window(pattern),
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => contains_window(expr) || contains_window(pattern),
         Expr::Between {
             expr, low, high, ..
         } => contains_window(expr) || contains_window(low) || contains_window(high),
@@ -8042,6 +8065,11 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             validate_window_expr(expr, in_agg)?;
             validate_window_expr(pattern, in_agg)
         }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            validate_window_expr(expr, in_agg)?;
+            validate_window_expr(pattern, in_agg)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -8203,6 +8231,11 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
                 walk(expr, visit);
                 walk(pattern, visit);
             }
+            // v0.68: regex match, like LIKE.
+            Expr::Regex { expr, pattern, .. } => {
+                walk(expr, visit);
+                walk(pattern, visit);
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -8288,6 +8321,11 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 stamp(right, windows);
             }
             Expr::Like { expr, pattern, .. } => {
+                stamp(expr, windows);
+                stamp(pattern, windows);
+            }
+            // v0.68: regex match, like LIKE.
+            Expr::Regex { expr, pattern, .. } => {
                 stamp(expr, windows);
                 stamp(pattern, windows);
             }
@@ -9345,6 +9383,10 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
         Expr::Like { expr, pattern, .. } => {
             pushable_columns(expr, cols) && pushable_columns(pattern, cols)
         }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            pushable_columns(expr, cols) && pushable_columns(pattern, cols)
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -9467,6 +9509,11 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
         }
         Expr::Cast { expr, .. } => collect_column_refs(expr, out),
         Expr::Like { expr, pattern, .. } => {
+            collect_column_refs(expr, out);
+            collect_column_refs(pattern, out);
+        }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
             collect_column_refs(expr, out);
             collect_column_refs(pattern, out);
         }
@@ -11767,6 +11814,21 @@ fn eval_grouped(
             };
             eval_like(&va, &vb, ve.as_ref(), *not, *ilike)
         }
+        // v0.68: regex match operators.
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            let vb = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, pattern,
+            )?;
+            eval_regex_match(&va, &vb, *not, *case_insensitive)
+        }
         Expr::Between {
             expr,
             low,
@@ -12875,6 +12937,17 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                 None => None,
             };
             eval_like(&va, &vb, ve.as_ref(), *not, *ilike)
+        }
+        // v0.68: regex match operators.
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => {
+            let va = eval_expr(q, scopes, expr)?;
+            let vb = eval_expr(q, scopes, pattern)?;
+            eval_regex_match(&va, &vb, *not, *case_insensitive)
         }
         Expr::Between {
             expr,
@@ -15755,6 +15828,60 @@ fn match_like(s: &[char], toks: &[PatTok]) -> bool {
         ti += 1;
     }
     ti == toks.len()
+}
+
+/// v0.68: POSIX regex match operators `~` / `!~` / `~*` / `!~*`
+/// (PG textregexeq etc., src/backend/utils/adt/regexp.c). Unanchored
+/// search; NULL in either operand -> NULL; an invalid pattern is
+/// 2201B like the regexp_* functions; non-text operands are 42883.
+fn eval_regex_match(
+    a: &Value,
+    pattern: &Value,
+    not: bool,
+    case_insensitive: bool,
+) -> Result<Value, ExecError> {
+    let op = match (not, case_insensitive) {
+        (false, false) => "~",
+        (true, false) => "!~",
+        (false, true) => "~*",
+        (true, true) => "!~*",
+    };
+    // v0.68: PG coerces bpchar regex operands to text (rtrim1), like LIKE.
+    let a_norm;
+    let a = match a {
+        Value::BpChar(s) => {
+            a_norm = Value::text(crate::storage::rtrim_spaces(s));
+            &a_norm
+        }
+        _ => a,
+    };
+    let p_norm;
+    let pattern = match pattern {
+        Value::BpChar(s) => {
+            p_norm = Value::text(crate::storage::rtrim_spaces(s));
+            &p_norm
+        }
+        _ => pattern,
+    };
+    match (a, pattern) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(s), Value::Text(p)) => {
+            let re = crate::regex::compile(p, case_insensitive)
+                .map_err(|e| exec_err("2201B", format!("invalid regular expression: {}", e)))?;
+            let sc: Vec<char> = s.chars().collect();
+            let m = re.is_match(&sc);
+            Ok(Value::Bool(if not { !m } else { m }))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!(
+                "operator does not exist: {} {} {}",
+                a.type_name(),
+                op,
+                pattern.type_name()
+            ),
+        )),
+    }
 }
 
 fn eval_like(
@@ -22220,6 +22347,7 @@ fn expr_type(
         | Expr::IsBool { .. }
         | Expr::IsDistinctFrom { .. }
         | Expr::Like { .. }
+        | Expr::Regex { .. }
         | Expr::Between { .. }
         | Expr::InSub { .. }
         | Expr::Exists { .. } => Ok(ColType::Bool),
@@ -23608,6 +23736,11 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             subst_expr(right, params)?;
         }
         Expr::Like { expr, pattern, .. } => {
+            subst_expr(expr, params)?;
+            subst_expr(pattern, params)?;
+        }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
             subst_expr(expr, params)?;
             subst_expr(pattern, params)?;
         }
@@ -26767,6 +26900,85 @@ mod tests {
         assert_eq!(e("SELECT DISTINCT ON uid, amt FROM orders").code, "42601");
         assert_eq!(e("SELECT DISTINCT ON (uid), amt FROM orders").code, "42601");
     }
+
+    #[test]
+    fn v68_regex_operators_match_pg() {
+        // PG19 textregexeq family: `~` / `!~` / `~*` / `!~*`.
+        let mut eng = engine();
+        let mut one = |sql: &str| rows_of(run(&mut eng, sql).unwrap())[0][0].clone();
+        assert_eq!(one("select 'abc' ~ '.*'"), "t");
+        assert_eq!(one("select 'abc' !~ '.*'"), "f");
+        assert_eq!(one("select 'ABC' ~ 'abc'"), "f");
+        assert_eq!(one("select 'ABC' ~* 'abc'"), "t");
+        assert_eq!(one("select 'ABC' !~* 'abc'"), "f");
+        assert_eq!(one("select 'a1' ~ '[0-9]'"), "t");
+        assert_eq!(one("select 'asdfghjkl;' ~ '.*asdf.*'"), "t");
+        // Anchors and alternation.
+        assert_eq!(one("select 'abc' ~ '^a.c$'"), "t");
+        assert_eq!(one("select 'abc' ~ '^(a|b)c$'"), "f");
+        // NULL propagates (PG three-valued logic).
+        assert_eq!(one("select NULL ~ 'x'"), "NULL");
+        assert_eq!(one("select 'x' ~ NULL"), "NULL");
+        // Precedence: `~` binds tighter than `=` and LIKE, looser than `||`.
+        assert_eq!(one("select 'ab' ~ '^a' = true"), "t");
+        assert_eq!(one("select 'ab' ~ 'a' || 'b'"), "t");
+        // Works in WHERE over a table scan.
+        let rows = rows_of(run(&mut eng, "select name from users where name ~ '^[ab]'").unwrap());
+        let names: Vec<_> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(names, vec!["ann", "bob"]);
+    }
+
+    #[test]
+    fn v68_regex_operators_errors() {
+        // Invalid pattern is 2201B, like the regexp_* functions.
+        let mut eng = engine();
+        let err = run(&mut eng, "select 'abc' ~ '('").unwrap_err();
+        assert_eq!(err.code, "2201B");
+        // Non-text operands are 42883 with the operator spelled out.
+        let err = run(&mut eng, "select 1 ~ 'x'").unwrap_err();
+        assert_eq!(err.code, "42883");
+        assert!(
+            err.message.contains("integer ~ text"),
+            "got: {}",
+            err.message
+        );
+        let err = run(&mut eng, "select 'x' !~* 1").unwrap_err();
+        assert_eq!(err.code, "42883");
+        assert!(
+            err.message.contains("text !~* integer"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn v68_regex_expr_codec_roundtrip() {
+        // The new Expr variant survives the CHECK-constraint s-expr codec
+        // (used by WAL checkpoints).
+        let mut eng = engine();
+        run(&mut eng, "create table rgx (a text check (a ~* 'x'))").unwrap();
+        let tbl = &eng.db.tables["rgx"][0];
+        let enc = crate::sql::encode_constraints(tbl);
+        assert!(
+            enc.contains("(regex 0 1 "),
+            "codec must tag the regex op: {}",
+            enc
+        );
+        let dec = crate::sql::decode_constraints(&enc).unwrap();
+        let before = format!("{:?}", tbl.checks);
+        let after = format!("{:?}", dec.checks);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn v68_regex_in_check_constraint() {
+        // CHECK (a ~* 'x') enforces end to end.
+        let mut eng = engine();
+        run(&mut eng, "create table rgxc (a text check (a ~* 'x'))").unwrap();
+        run(&mut eng, "insert into rgxc values ('xyz')").unwrap();
+        let err = run(&mut eng, "insert into rgxc values ('abc')").unwrap_err();
+        assert_eq!(err.code, "23514");
+    }
 }
 
 // ============================================================================
@@ -28338,6 +28550,11 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(expr, old, new);
             rename_col_in_expr(pattern, old, new);
         }
+        // v0.68: regex match, like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            rename_col_in_expr(expr, old, new);
+            rename_col_in_expr(pattern, old, new);
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -29656,10 +29873,8 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
 mod variance_stress_tests {
     use super::Value;
     use super::bool_and_vals;
-    use super::eval_arith;
     use super::numeric_to_u64_exact;
     use super::variance_vals;
-    use crate::sql::ArithOp;
     use crate::storage::Numeric;
 
     fn num(s: &str) -> Value {

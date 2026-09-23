@@ -1961,6 +1961,14 @@ fn stmt_set_guc(
                 }
             }
         },
+        // v0.68: read-only (PGC_INTERNAL, PG19 guc.c) GUCs are known
+        // parameters, so SET on them is 55P02
+        // ERRCODE_CANT_CHANGE_RUNTIME_PARAM (`parameter "x" cannot be
+        // changed`), not 42704.
+        "server_version" | "server_version_num" => Err(ExecError {
+            code: "55P02",
+            message: format!("parameter \"{}\" cannot be changed", name),
+        }),
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
@@ -2030,6 +2038,12 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
                 tag: "RESET".to_string(),
             })
         }
+        // v0.68: RESET on a read-only GUC is 55P02 too — PG19's
+        // set_config_option context check fires for every action.
+        "server_version" | "server_version_num" => Err(ExecError {
+            code: "55P02",
+            message: format!("parameter \"{}\" cannot be changed", name),
+        }),
         _ => Err(ExecError {
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
@@ -3754,5 +3768,60 @@ mod tests {
         // The pre-transaction session values are restored.
         assert_eq!(show_text(&session, "bytea_output"), "escape");
         assert_eq!(show_text(&session, "default_toast_compression"), "lz4");
+    }
+
+    #[test]
+    fn v68_set_readonly_guc_is_55p02() {
+        // PG19 guc.c: SET on a PGC_INTERNAL GUC is 55P02
+        // ERRCODE_CANT_CHANGE_RUNTIME_PARAM, not 42704.
+        let mut session = session_no_txn();
+        for name in ["server_version", "server_version_num"] {
+            let err = stmt_set_guc(
+                &mut session,
+                name,
+                &SetValue::Str("bogus".to_string()),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "55P02");
+            assert_eq!(
+                err.message,
+                format!("parameter \"{}\" cannot be changed", name)
+            );
+            // SHOW still works; the value is untouched.
+            assert!(!show_text(&session, name).is_empty());
+        }
+    }
+
+    #[test]
+    fn v68_reset_readonly_guc_is_55p02() {
+        // PG19's set_config_option context check fires for RESET too.
+        let mut session = session_no_txn();
+        let err = stmt_reset_guc(&mut session, "server_version").unwrap_err();
+        assert_eq!(err.code, "55P02");
+        assert_eq!(
+            err.message,
+            "parameter \"server_version\" cannot be changed"
+        );
+        // Unknown names are still 42704.
+        let err = stmt_reset_guc(&mut session, "nosuchguc").unwrap_err();
+        assert_eq!(err.code, "42704");
+    }
+
+    #[test]
+    fn v68_set_unknown_guc_still_42704() {
+        let mut session = session_no_txn();
+        let err = stmt_set_guc(
+            &mut session,
+            "nosuchguc",
+            &SetValue::Str("1".to_string()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42704");
+        assert_eq!(
+            err.message,
+            "unrecognized configuration parameter \"nosuchguc\""
+        );
     }
 }
