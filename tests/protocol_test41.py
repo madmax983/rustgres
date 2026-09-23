@@ -22,7 +22,7 @@ Also bundled, following PG19's `GetAttributeCompression` /
   unknown methods are 22023; SET COMPRESSION only affects future writes.
 - `pg_column_compression()` reports the actual method ('pglz'/'lz4').
 - Compression methods survive WAL replay and checkpoints
-  (RGSWAL10/RGSCHK08).
+  (RGSWAL11/RGSCHK09 as of v0.72).
 
 This test manages its own server on port 5545 (so it never collides
 with the conformance runner) and is RED on the v0.40 base, GREEN on

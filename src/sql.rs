@@ -1443,12 +1443,27 @@ pub struct TableDef {
     /// v0.41: raw `COMPRESSION` option per column, parallel to
     /// `columns` (`None` = not specified). Validated in exec.
     pub compression: Vec<Option<String>>,
+    /// v0.72: per-column TOAST storage strategy override, parallel to
+    /// `columns` (`None` = type default). Carries `LIKE ...
+    /// INCLUDING STORAGE` copies from the source table's `col_storage`.
+    pub storage: Vec<Option<u8>>,
     pub checks: Vec<CheckDef>,
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
     /// v0.69: declarative partitioning (`None` = ordinary table).
     pub partition: Option<PartitionDef>,
+    /// v0.72: `LIKE` clauses, expanded at exec. PG19 option defaults
+    /// (gram.y: a bare LIKE yields options = 0): column names/types are
+    /// always copied, NOT NULL constraints are always copied, and every
+    /// other kind (DEFAULTS, CONSTRAINTS, INDEXES, STORAGE, COMPRESSION,
+    /// COMMENTS, STATISTICS, IDENTITY, GENERATED) is copied only with
+    /// the matching INCLUDING option (or INCLUDING ALL).
+    pub likes: Vec<LikeClause>,
+    /// v0.72: `WITH (storage_parameter = value, ...)` reloptions
+    /// (PG19). Recognized parameters are validated at exec; the rest
+    /// are accepted and recorded.
+    pub reloptions: Vec<(String, String)>,
 }
 
 /// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
@@ -1608,6 +1623,44 @@ impl SequenceOpts {
 enum TableItem {
     Col(ParsedColDef),
     TableCon(ParsedTableCon),
+    /// v0.72: `LIKE source_table [like_option ...]` in a CREATE TABLE
+    /// column list (PG19 §CREATE TABLE).
+    Like(LikeClause),
+}
+
+/// v0.72: one `LIKE source_table [like_option ...]` clause. Each option
+/// is `INCLUDING`/`EXCLUDING` + one of ALL/COMMENTS/CONSTRAINTS/
+/// DEFAULTS/IDENTITY/INDEXES/STATISTICS/STORAGE/GENERATED.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LikeClause {
+    pub source: String,
+    pub options: Vec<LikeOption>,
+}
+
+/// v0.72: a single `INCLUDING`/`EXCLUDING <kind>` LIKE option.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LikeOption {
+    pub including: bool,
+    pub kind: LikeKind,
+}
+
+/// v0.72: the LIKE option kinds. PG19 defaults (gram.y: a bare LIKE
+/// yields options = 0, i.e. every kind EXCLUDING): only the matching
+/// INCLUDING option (or INCLUDING ALL) enables a kind. NOT NULL
+/// constraints are copied regardless of options
+/// (transformTableLikeClause: "regardless of options given").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LikeKind {
+    All,
+    Comments,
+    Compression,
+    Constraints,
+    Defaults,
+    Identity,
+    Indexes,
+    Statistics,
+    Storage,
+    Generated,
 }
 
 struct ParsedColDef {
@@ -1678,11 +1731,14 @@ impl TableDef {
             defaults: Vec::new(),
             serial: Vec::new(),
             compression: Vec::new(),
+            storage: Vec::new(),
             checks: Vec::new(),
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
             partition: None,
+            likes: Vec::new(),
+            reloptions: Vec::new(),
         }
     }
 }
@@ -1833,9 +1889,17 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
             def.serial.push(c.serial);
             // v0.41: raw COMPRESSION option travels with the column.
             def.compression.push(c.compression.clone());
+            // v0.72: no column-level STORAGE syntax yet; LIKE ...
+            // INCLUDING STORAGE fills this at exec.
+            def.storage.push(None);
         }
     }
-    if def.columns.is_empty() {
+    // v0.72: a bare `(LIKE src)` list contributes its columns at exec;
+    // only reject a list with neither columns nor LIKE clauses.
+    // (Checked against the raw items: pass 2 below is what fills
+    // def.likes.)
+    let has_like = items.iter().any(|i| matches!(i, TableItem::Like(_)));
+    if def.columns.is_empty() && !has_like {
         return Err(err(
             "syntax error: table must have at least one column".to_string()
         ));
@@ -1843,6 +1907,11 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
     // Pass 2: constraints.
     for item in &items {
         match item {
+            // v0.72: LIKE clauses are collected verbatim; exec expands
+            // them against the source table (needs catalog access).
+            TableItem::Like(lc) => {
+                def.likes.push(lc.clone());
+            }
             TableItem::Col(c) => {
                 let i = def.columns.iter().position(|(n, _)| n == &c.name).unwrap();
                 // v0.65: a serial column is implicitly NOT NULL (PG's
@@ -2108,7 +2177,9 @@ pub enum Stmt {
     // --- v0.9: ALTER TABLE ---
     AlterTable {
         name: String,
-        action: AlterAction,
+        /// v0.72: PG19 allows a comma-separated list of actions in one
+        /// ALTER TABLE; they run left to right in a single statement.
+        actions: Vec<AlterAction>,
     },
     // --- v0.9: views ---
     CreateView {
@@ -2936,6 +3007,28 @@ impl Parser {
 
     /// v0.37: read a reloption value (`SET (opt = val, ...)`). Accepts an
     /// identifier, number, or string literal; returns the raw text.
+    /// v0.72: parse a `(opt = val, ...)` reloptions list (shared by
+    /// CREATE TABLE ... WITH (...) and ALTER TABLE ... SET (...)).
+    fn parse_reloptions(&mut self) -> Result<Vec<(String, String)>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut options = Vec::new();
+        loop {
+            let opt_name = self.expect_ident()?;
+            self.expect(Token::Eq, "'='")?;
+            // Option values are simple: identifiers, numbers, or
+            // string literals. Read the raw token text.
+            let opt_val = self.expect_reloption_value()?;
+            options.push((opt_name, opt_val));
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(options)
+    }
+
     fn expect_reloption_value(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Ident(s) | Token::QIdent(s) | Token::Number(s) | Token::Str(s) => Ok(s),
@@ -3463,7 +3556,11 @@ impl Parser {
         self.expect(Token::LParen, "'('")?;
         let mut items: Vec<TableItem> = Vec::new();
         loop {
-            if self.is_table_constraint_start() {
+            // v0.72: `LIKE source_table [like_option ...]` — a
+            // first-class item of the column list (PG19).
+            if matches!(self.peek(), Token::Ident(s) if s == "like") {
+                items.push(TableItem::Like(self.parse_like_clause()?));
+            } else if self.is_table_constraint_start() {
                 items.push(TableItem::TableCon(self.parse_table_constraint()?));
             } else {
                 items.push(TableItem::Col(self.parse_column_def()?));
@@ -3480,6 +3577,12 @@ impl Parser {
             }
         }
         let mut def = build_table_def(&name, items)?;
+        // v0.72: `WITH (storage_parameter = value, ...)` (PG19
+        // reloptions). Parsed into the def; exec validates the
+        // recognized parameters (fillfactor range) and records them.
+        if self.eat_keyword("with") {
+            def.reloptions = self.parse_reloptions()?;
+        }
         // v0.69: `PARTITION BY ...` after the column list.
         if matches!(self.peek(), Token::Ident(s) if s == "partition") {
             let (method, keys) = self.parse_partition_by()?;
@@ -3515,6 +3618,7 @@ impl Parser {
             defaults: Vec::new(),
             serial: Vec::new(),
             compression: Vec::new(),
+            storage: Vec::new(),
             checks: Vec::new(),
             uniques: Vec::new(),
             pkey: None,
@@ -3525,6 +3629,8 @@ impl Parser {
                 parent: Some(parent),
                 bound: Some(bound),
             }),
+            likes: Vec::new(),
+            reloptions: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -3643,6 +3749,58 @@ impl Parser {
         matches!(self.peek(), Token::Ident(s)
             if s == "constraint" || s == "primary" || s == "unique"
                 || s == "check" || s == "foreign")
+    }
+
+    /// v0.72: `LIKE source_table [INCLUDING|EXCLUDING kind ...]`
+    /// (PG19 transformTableLikeClause). The source name resolves at
+    /// exec, which has catalog access.
+    fn parse_like_clause(&mut self) -> Result<LikeClause, SqlError> {
+        self.expect_keyword("like")?;
+        // v0.72: the source may be schema-qualified (PG19).
+        let mut source = self.expect_ident()?;
+        while matches!(self.peek(), Token::Dot) {
+            self.next(); // '.'
+            source.push('.');
+            source.push_str(&self.expect_ident()?);
+        }
+        let mut options = Vec::new();
+        loop {
+            let including = if self.eat_keyword("including") {
+                true
+            } else if self.eat_keyword("excluding") {
+                false
+            } else {
+                break;
+            };
+            let kind = if self.eat_keyword("all") {
+                LikeKind::All
+            } else if self.eat_keyword("comments") {
+                LikeKind::Comments
+            } else if self.eat_keyword("compression") {
+                LikeKind::Compression
+            } else if self.eat_keyword("constraints") {
+                LikeKind::Constraints
+            } else if self.eat_keyword("defaults") {
+                LikeKind::Defaults
+            } else if self.eat_keyword("identity") {
+                LikeKind::Identity
+            } else if self.eat_keyword("indexes") {
+                LikeKind::Indexes
+            } else if self.eat_keyword("statistics") {
+                LikeKind::Statistics
+            } else if self.eat_keyword("storage") {
+                LikeKind::Storage
+            } else if self.eat_keyword("generated") {
+                LikeKind::Generated
+            } else {
+                return Err(err(format!(
+                    "syntax error: unrecognized LIKE option near {:?}",
+                    self.peek()
+                )));
+            };
+            options.push(LikeOption { including, kind });
+        }
+        Ok(LikeClause { source, options })
     }
 
     /// `name type [column constraints...]`.
@@ -3835,12 +3993,23 @@ impl Parser {
         }
     }
 
-    /// ALTER TABLE name <action>.
+    /// ALTER TABLE name <action> [, <action> ...] (v0.72: PG19 takes a
+    /// comma-separated action list; each action parses exactly as the
+    /// single-action form did, so commas inside parenthesized option
+    /// lists are unaffected).
     fn parse_alter(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("table")?;
         let name = self.expect_ident()?;
-        let action = self.parse_alter_action()?;
-        Ok(Stmt::AlterTable { name, action })
+        let mut actions = Vec::new();
+        loop {
+            actions.push(self.parse_alter_action()?);
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::AlterTable { name, actions })
     }
 
     // ------------------------------------------------------------------
@@ -4044,22 +4213,7 @@ impl Parser {
         }
         // v0.37: ALTER TABLE name SET (opt = val, ...) — reloptions.
         if self.eat_keyword("set") {
-            self.expect(Token::LParen, "'('")?;
-            let mut options = Vec::new();
-            loop {
-                let opt_name = self.expect_ident()?;
-                self.expect(Token::Eq, "'='")?;
-                // Option values are simple: identifiers, numbers, or
-                // string literals. Read the raw token text.
-                let opt_val = self.expect_reloption_value()?;
-                options.push((opt_name, opt_val));
-                if *self.peek() == Token::Comma {
-                    self.next();
-                    continue;
-                }
-                break;
-            }
-            self.expect(Token::RParen, "')'")?;
+            let options = self.parse_reloptions()?;
             return Ok(AlterAction::SetRelOptions { options });
         }
         if self.eat_keyword("add") {
@@ -4448,7 +4602,15 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
         let table = self.expect_ident()?;
-        let columns = if *self.peek() == Token::LParen {
+        // v0.72: `INSERT INTO t (SELECT ...)` — a parenthesized query
+        // is a row source, not a column list (PG19). Peek past the
+        // paren: a query starter means "no column list".
+        let paren_opens_query = *self.peek() == Token::LParen
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s)) if s == "select" || s == "values" || s == "table"
+            );
+        let columns = if *self.peek() == Token::LParen && !paren_opens_query {
             self.next();
             let mut cols = Vec::new();
             loop {
@@ -4469,8 +4631,13 @@ impl Parser {
             None
         };
         // v0.10: `INSERT INTO ... SELECT ...` (or VALUES).
+        // v0.72: `INSERT INTO ... (SELECT ...)` — parenthesized query
+        // source (PG19); parse_select_query_not_consumed eats the parens.
         let (rows, select) = if self.eat_keyword("select") {
             let sel = self.parse_select_query()?;
+            (Vec::new(), Some(sel))
+        } else if *self.peek() == Token::LParen {
+            let sel = self.parse_select_query_not_consumed()?;
             (Vec::new(), Some(sel))
         } else {
             self.expect_keyword("values")?;
@@ -9553,5 +9720,122 @@ mod partition_by_tests {
         assert_eq!(p.keys.len(), 2);
         assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
         assert!(matches!(p.keys[1], PartitionKeyDef::Expr(_)));
+    }
+}
+
+// v0.72: parser unit tests for the DDL conformance scope (LIKE,
+// reloptions, multi-action ALTER). Exec behavior is pinned by
+// tests/protocol_test73.py.
+#[cfg(test)]
+mod v72_ddl_tests {
+    use super::*;
+
+    fn create_def(sql: &str) -> TableDef {
+        match parse_statement(sql).expect("parses") {
+            Stmt::CreateTable { def, .. } => def,
+            other => panic!("expected CREATE TABLE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn like_bare_clause() {
+        let def = create_def("create table t (like src)");
+        assert_eq!(def.likes.len(), 1);
+        assert_eq!(def.likes[0].source, "src");
+        assert!(def.likes[0].options.is_empty());
+        assert!(def.columns.is_empty());
+    }
+
+    #[test]
+    fn like_mixed_with_columns_and_options() {
+        let def = create_def(
+            "create table t (z int, like src including defaults excluding constraints, like other including all)",
+        );
+        assert_eq!(def.columns.len(), 1);
+        assert_eq!(def.likes.len(), 2);
+        assert_eq!(def.likes[0].source, "src");
+        assert_eq!(
+            def.likes[0].options,
+            vec![
+                LikeOption {
+                    including: true,
+                    kind: LikeKind::Defaults
+                },
+                LikeOption {
+                    including: false,
+                    kind: LikeKind::Constraints
+                }
+            ]
+        );
+        assert_eq!(def.likes[1].source, "other");
+        assert_eq!(
+            def.likes[1].options,
+            vec![LikeOption {
+                including: true,
+                kind: LikeKind::All
+            }]
+        );
+    }
+
+    #[test]
+    fn like_schema_qualified_source() {
+        let def = create_def("create table t (like public.src)");
+        assert_eq!(def.likes[0].source, "public.src");
+    }
+
+    #[test]
+    fn like_including_excluding_compression() {
+        let def = create_def(
+            "create table t (like src including compression, like o2 excluding compression)",
+        );
+        assert_eq!(def.likes.len(), 2);
+        assert_eq!(
+            def.likes[0].options,
+            vec![LikeOption {
+                including: true,
+                kind: LikeKind::Compression
+            }]
+        );
+        assert_eq!(
+            def.likes[1].options,
+            vec![LikeOption {
+                including: false,
+                kind: LikeKind::Compression
+            }]
+        );
+    }
+
+    #[test]
+    fn reloptions_fillfactor() {
+        let def =
+            create_def("create table t (a int) with (fillfactor = 10, autovacuum_enabled = true)");
+        assert_eq!(
+            def.reloptions,
+            vec![
+                ("fillfactor".to_string(), "10".to_string()),
+                ("autovacuum_enabled".to_string(), "true".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn alter_multi_action() {
+        match parse_statement("alter table t add a int, add b text").expect("parses") {
+            Stmt::AlterTable { name, actions, .. } => {
+                assert_eq!(name, "t");
+                assert_eq!(actions.len(), 2);
+                assert!(matches!(actions[0], AlterAction::AddColumn { .. }));
+                assert!(matches!(actions[1], AlterAction::AddColumn { .. }));
+            }
+            other => panic!("expected ALTER TABLE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_single_action_still_vec_of_one() {
+        match parse_statement("alter table t add a int").expect("parses") {
+            Stmt::AlterTable { actions, .. } => assert_eq!(actions.len(), 1),
+            other => panic!("expected ALTER TABLE, got {:?}", other),
+        }
     }
 }

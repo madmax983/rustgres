@@ -23,12 +23,12 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 10 (`RGSWAL10` / `RGSCHK08`) is NOT compatible with v0.40
-//! or earlier: v0.41 stores the compression *method* (`pglz`/`lz4`) in
-//! TOAST metadata and per-column `COMPRESSION` settings, replacing the
-//! old compressed flags. Like every format bump, old data directories
-//! are refused with a clear error instead of being misread. v0.39 was
-//! `RGSWAL09` / `RGSCHK07`.
+//! Format version 11 (`RGSWAL11` / `RGSCHK09`) is NOT compatible with v0.71
+//! or earlier: v0.72 adds the `is_partitioned` flag to partition
+//! metadata (a partitioned table with no children is no longer
+//! misread as a leaf). Like every format bump, old data directories
+//! are refused with a clear error instead of being misread. v0.41 was
+//! `RGSWAL10` / `RGSCHK08`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -128,11 +128,11 @@ use crate::storage::{ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK08";
-/// v0.41: version 8 adds per-column compression methods and method
-/// codes in TOAST metadata. v7 checkpoints are refused; remove
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK09";
+/// v0.72: version 11 adds the `is_partitioned` flag to partition
+/// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
-const CHKPT_VERSION: u32 = 10;
+const CHKPT_VERSION: u32 = 11;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -148,7 +148,9 @@ const CHKPT_VERSION: u32 = 10;
 /// v0.41: `RGSWAL10` — TOAST metadata carries the compression *method*
 /// (`pglz`/`lz4`) per value id and per column (`col_compression`),
 /// not just a compressed flag. Old `RGSWAL09` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL10";
+/// v0.72: `RGSWAL11` — partition metadata carries the `is_partitioned`
+/// flag. Old `RGSWAL10` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL11";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -3773,6 +3775,9 @@ impl Wal {
                     for c in &p.children {
                         body.str(c);
                     }
+                    // v0.72: whether this table is itself partitioned
+                    // (a childless partitioned table is not a leaf).
+                    body.u8(if p.is_partitioned { 1 } else { 0 });
                 } else {
                     body.u8(0);
                 }
@@ -4224,6 +4229,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             for _ in 0..n_children {
                 children.push(d.str().map_err(|e| bad(&e))?);
             }
+            // v0.72: the is_partitioned flag (format version 11).
+            let is_partitioned = d.u8().map_err(|e| bad(&e))? != 0;
             __t.partition = Some(crate::storage::PartitionInfo {
                 method,
                 key,
@@ -4231,6 +4238,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 is_default,
                 parent,
                 children,
+                is_partitioned,
             });
         }
         eng.db.tables.entry(name).or_default().push(__t);

@@ -338,7 +338,7 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             cascade,
         } => exec_drop(eng, ctx, names, *if_exists, *cascade),
         // --- v0.9: constraints / ALTER / views / sequences
-        Stmt::AlterTable { name, action } => exec_alter(eng, ctx, name, action),
+        Stmt::AlterTable { name, actions } => exec_alter(eng, ctx, name, actions),
         Stmt::CreateView {
             name,
             query,
@@ -709,6 +709,9 @@ fn build_partition_info(
             is_default: matches!(bound_def, PartBoundDef::Default),
             parent: Some(parent_name.clone()),
             children: Vec::new(),
+            // v0.72: a trailing PARTITION BY (non-empty keys) makes this
+            // a sub-partitioned intermediate; otherwise it is a leaf.
+            is_partitioned: !def.keys.is_empty(),
         };
         Ok((info, Some(parent_name.clone())))
     } else {
@@ -743,6 +746,9 @@ fn build_partition_info(
             is_default: false,
             parent: None,
             children: Vec::new(),
+            // v0.72: a partitioned root always accepts routed inserts;
+            // only its leaves (or a DEFAULT child) hold rows.
+            is_partitioned: true,
         };
         Ok((info, None))
     }
@@ -1078,6 +1084,12 @@ fn range_bound_lt(a: &[RangeBound], b: &[RangeBound]) -> bool {
 
 /// v0.69: does a key satisfy `[lower, upper)`? (Range partition containment.)
 fn range_bound_contains(lower: &[RangeBound], upper: &[RangeBound], key: &[Value]) -> bool {
+    // v0.72: a NULL partition key value never satisfies a range bound
+    // (PG19: NULL is not routable for RANGE — it lands in the DEFAULT
+    // partition if one exists, else 23514).
+    if key.iter().any(|k| matches!(k, Value::Null)) {
+        return false;
+    }
     // key >= lower (lexicographic)
     for (k, b) in key.iter().zip(lower.iter()) {
         match b {
@@ -1340,6 +1352,8 @@ fn attach_partition(
             is_default,
             parent: Some(parent_name.to_string()),
             children: cp.children,
+            // v0.72: an already-partitioned child stays partitioned.
+            is_partitioned: cp.is_partitioned,
         },
         None => PartitionInfo {
             method: pinfo.method,
@@ -1348,6 +1362,8 @@ fn attach_partition(
             is_default,
             parent: Some(parent_name.to_string()),
             children: Vec::new(),
+            // v0.72: a plain table attached as a partition is a leaf.
+            is_partitioned: false,
         },
     };
     let prev = eng
@@ -1438,18 +1454,17 @@ fn collect_partition_leaves(
         if let Some(t) = db.find_table(&name, snap, own, session) {
             if let Some(p) = &t.partition {
                 if p.children.is_empty() {
-                    // A partitioned table with no children (shouldn't
-                    // happen for a parent, but be safe).
-                    leaves.push(name);
-                } else {
-                    // If it has a bound, it's a leaf (or intermediate);
-                    // if it has children, recurse. A table with both a
-                    // bound and children is an intermediate: recurse.
-                    if p.bound.is_some() && p.children.is_empty() {
+                    // v0.72: a childless *partitioned* table holds no
+                    // rows (direct inserts are rejected) — it is not a
+                    // leaf, so skip it. A true leaf holds the rows.
+                    if !p.is_partitioned {
                         leaves.push(name);
-                    } else {
-                        stack.extend(p.children.iter().cloned());
                     }
+                } else {
+                    // A table with children is a root or an
+                    // intermediate: recurse (a bound + children means
+                    // intermediate).
+                    stack.extend(p.children.iter().cloned());
                 }
             } else {
                 // Not partitioned (shouldn't happen).
@@ -1508,6 +1523,15 @@ fn route_partition_inserts(
         }
     };
     if pinfo.bound.is_some() {
+        // v0.72: a partitioned table with no children is not a leaf —
+        // direct inserts fail exactly like a parent with no matching
+        // partition (PG19 23514 "no partition of relation ... found").
+        if pinfo.is_partitioned && pinfo.children.is_empty() {
+            return Err(exec_err(
+                "23514",
+                format!("no partition of relation \"{}\" found for row", table),
+            ));
+        }
         // Direct insert: validate the bound (and all ancestors).
         for (_id, row) in inserts {
             check_leaf_bound(eng, ctx, table, &pinfo, &table_cols, &row[..])?;
@@ -1707,6 +1731,12 @@ fn find_partition_leaf(
                 continue;
             }
             if cinfo.children.is_empty() {
+                // v0.72: a childless *partitioned* table holds no rows —
+                // skip it (the row falls through to the DEFAULT
+                // partition or 23514, like PG19).
+                if cinfo.is_partitioned {
+                    continue;
+                }
                 return Ok(child_name.clone());
             }
             // Recurse: remap the row to the child's column order and
@@ -1783,6 +1813,192 @@ fn check_leaf_bound(
     Ok(())
 }
 
+/// v0.72: expand `LIKE source_table [like_option ...]` clauses into the
+/// new table's definition (PG19 `transformTableLikeClause` +
+/// `expandTableLikeClause`). Columns merge left to right — a source
+/// column whose name already exists is skipped. PG19 option defaults
+/// (gram.y: a bare LIKE yields options = 0): column names/types are
+/// always copied, NOT NULL constraints are always copied regardless of
+/// options, and every other kind (DEFAULTS, CONSTRAINTS, INDEXES,
+/// STORAGE, COMPRESSION, COMMENTS, STATISTICS, IDENTITY, GENERATED)
+/// is copied only with the matching INCLUDING option (or INCLUDING
+/// ALL). Explicit options apply in order with later ones winning, and
+/// `INCLUDING|EXCLUDING ALL` fans out to every kind. COMMENTS,
+/// STATISTICS, IDENTITY and GENERATED have no runtime effect here (no
+/// comment catalog / extended stats / identity columns in this engine).
+fn expand_like_clauses(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    _name: &str,
+    def: &mut crate::sql::TableDef,
+) -> Result<(), ExecError> {
+    use crate::sql::{CheckDef, LikeKind, UniqueDef};
+    if def.likes.is_empty() {
+        return Ok(());
+    }
+    fn all_kinds() -> [LikeKind; 9] {
+        use LikeKind::*;
+        [
+            Comments,
+            Compression,
+            Constraints,
+            Defaults,
+            Identity,
+            Indexes,
+            Statistics,
+            Storage,
+            Generated,
+        ]
+    }
+    let likes = std::mem::take(&mut def.likes);
+    for lc in &likes {
+        let src = eng
+            .db
+            .find_table(&lc.source, ctx.snap, ctx.own, ctx.session)
+            .ok_or_else(|| {
+                exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", lc.source),
+                )
+            })?;
+        // PG19 defaults (gram.y: a bare LIKE yields options = 0, so every
+        // kind defaults to EXCLUDING). NOT NULL is copied regardless —
+        // handled below, not via this flag set
+        // (transformTableLikeClause: "regardless of options given").
+        let mut flags: [(LikeKind, bool); 9] = all_kinds().map(|k| (k, false));
+        for o in &lc.options {
+            if o.kind == LikeKind::All {
+                for f in flags.iter_mut() {
+                    f.1 = o.including;
+                }
+            } else if let Some(f) = flags.iter_mut().find(|f| f.0 == o.kind) {
+                f.1 = o.including;
+            }
+        }
+        let including = |kind: LikeKind| flags.iter().find(|f| f.0 == kind).is_some_and(|f| f.1);
+        // Columns (with per-column NOT NULL / DEFAULT / serial /
+        // compression / storage slots kept in lockstep, like
+        // build_table_def). Dropped columns do not exist here (DROP
+        // COLUMN removes the slot); PG also skips attisdropped.
+        for (i, (cname, ctype)) in src.columns.iter().enumerate() {
+            // PG19 MergeAttributes (tablecmds.c): a LIKE-copied column
+            // colliding with an explicitly defined column is 42701
+            // "column ... specified more than once" — LIKE columns are
+            // not is_from_type, so they never merge.
+            if def.columns.iter().any(|(n, _)| n == cname) {
+                return Err(exec_err(
+                    "42701",
+                    format!("column \"{cname}\" specified more than once"),
+                ));
+            }
+            def.columns.push((cname.clone(), ctype.clone()));
+            // v0.72: NOT NULL is ALWAYS copied (PG19
+            // transformTableLikeClause, "regardless of options given").
+            def.not_null
+                .push(src.not_null.get(i).copied().unwrap_or(false));
+            def.defaults.push(if including(LikeKind::Defaults) {
+                src.defaults.get(i).cloned().flatten()
+            } else {
+                None
+            });
+            // v0.72: serial/identity backing sequences are *not* copied
+            // (PG copies identity as identity; we have no identity
+            // columns — a nextval DEFAULT may still ride along via
+            // INCLUDING DEFAULTS, referencing the source's sequence).
+            def.serial.push(None);
+            // v0.72: compression only with INCLUDING COMPRESSION (or ALL);
+            // the parent's explicit method round-trips through its name
+            // (PG: GetCompressionMethodName(attcompression)).
+            def.compression.push(if including(LikeKind::Compression) {
+                src.col_compression
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|c| c.name().to_string())
+            } else {
+                None
+            });
+            // v0.72: storage only with INCLUDING STORAGE (or ALL).
+            def.storage.push(if including(LikeKind::Storage) {
+                src.col_storage.get(i).copied()
+            } else {
+                None
+            });
+        }
+        // CHECK constraints get fresh per-table names (PG generates new
+        // names for the copies; ours are per-table anyway).
+        if including(LikeKind::Constraints) {
+            for ck in &src.checks {
+                let mut cname = ck.name.clone();
+                let mut n = 1;
+                while def.checks.iter().any(|c| c.name == cname) {
+                    n += 1;
+                    cname = format!("{}_{}", ck.name, n);
+                }
+                def.checks.push(CheckDef {
+                    name: cname,
+                    expr: ck.expr.clone(),
+                });
+            }
+        }
+        // INCLUDING INDEXES copies unique/pkey constraints (their
+        // backing indexes are built by the normal create path under
+        // per-table names).
+        if including(LikeKind::Indexes) {
+            for u in &src.uniques {
+                let mut cname = u.name.clone();
+                let mut n = 1;
+                while def.uniques.iter().any(|x| x.name == cname)
+                    || def.pkey.as_ref().is_some_and(|p| p.name == cname)
+                {
+                    n += 1;
+                    cname = format!("{}_{}", u.name, n);
+                }
+                def.uniques.push(UniqueDef {
+                    name: cname,
+                    cols: u.cols.clone(),
+                });
+            }
+            if def.pkey.is_none() {
+                if let Some(pk) = &src.pkey {
+                    def.pkey = Some(UniqueDef {
+                        name: pk.name.clone(),
+                        cols: pk.cols.clone(),
+                    });
+                }
+            }
+        }
+    }
+    if def.columns.is_empty() {
+        return Err(exec_err(
+            "42601",
+            "table must have at least one column".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// v0.72: validate the recognized `WITH (...)` storage parameters at
+/// CREATE TABLE (PG19 reloptions.c `check_fillfactor`: 22023 when out
+/// of range). Unrecognized parameters are accepted and ignored — they
+/// have no runtime effect yet.
+fn validate_reloptions(options: &[(String, String)]) -> Result<(), ExecError> {
+    for (name, val) in options {
+        if name == "fillfactor" {
+            let n: i64 = val
+                .parse()
+                .map_err(|_| exec_err("22023", format!("invalid fillfactor value: {}", val)))?;
+            if !(10..=100).contains(&n) {
+                return Err(exec_err(
+                    "22023",
+                    "fillfactor must be between 10 and 100".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_table_from_def(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1794,6 +2010,14 @@ fn create_table_from_def(
     // `Database::temp_tables[session]`, shadowing any permanent table of
     // the same name *only within this session* (PostgreSQL semantics).
     // The permanent table is never touched.
+    // v0.72: expand LIKE clauses first (PG19 transformTableLikeClause),
+    // so both the temp and permanent paths below see the merged def.
+    let mut like_def = def.clone();
+    expand_like_clauses(eng, ctx, name, &mut like_def)?;
+    // v0.72: validate the recognized `WITH (...)` storage parameters
+    // (PG19 reloptions.c); unrecognized ones are accepted and ignored.
+    validate_reloptions(&like_def.reloptions)?;
+    let def = &like_def;
     if temp {
         // Existence check first so a duplicate name fails before any
         // serial sequences are created (statement-atomic either way).
@@ -1833,6 +2057,17 @@ fn create_table_from_def(
                 def.uniques = parent.uniques.clone();
                 def.pkey = parent.pkey.clone();
                 def.fks = parent.fks.clone();
+                // v0.72: inherit the parent's per-column COMPRESSION
+                // settings too (PG copies the whole rowtype) — see the
+                // permanent-table PARTITION OF path for why.
+                def.compression = parent
+                    .col_compression
+                    .iter()
+                    .map(|m| m.map(|c| c.name().to_string()))
+                    .collect();
+                // v0.72: same for STORAGE — PG copies attstorage as part
+                // of the rowtype.
+                def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
                 let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
                 temp_pinfo = Some(pinfo);
                 temp_parent = Some(parent_name.clone());
@@ -1848,11 +2083,15 @@ fn create_table_from_def(
         t.owner = ctx.role.to_string();
         // v0.41: validate each column's COMPRESSION option (PG19
         // GetAttributeCompression) and store the explicit methods.
+        // v0.72: index-based (not zip) so a short `def.compression`
+        // degrades to None instead of truncating `col_compression`.
         t.col_compression = def
             .columns
             .iter()
-            .zip(def.compression.iter())
-            .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
+            .enumerate()
+            .map(|(i, (_, ty))| {
+                parse_column_compression(ty, def.compression.get(i).and_then(|m| m.as_deref()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         // v0.65: serial backing sequences for temp tables too (PG
         // creates them in pg_temp_N; ours live in the global sequence
@@ -1936,6 +2175,20 @@ fn create_table_from_def(
             def.uniques = parent.uniques.clone();
             def.pkey = parent.pkey.clone();
             def.fks = parent.fks.clone();
+            // v0.72: inherit the parent's per-column COMPRESSION settings
+            // too (PG copies the whole rowtype). Without this,
+            // `def.compression` stays empty and the zip below truncates
+            // `col_compression` to [], desyncing it from `columns` and
+            // panicking the next ALTER on this table (debug_assert in
+            // the ALTER finish path).
+            def.compression = parent
+                .col_compression
+                .iter()
+                .map(|m| m.map(|c| c.name().to_string()))
+                .collect();
+            // v0.72: same for STORAGE — PG copies attstorage as part of
+            // the rowtype.
+            def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
             // Build the partition info (validates the bound).
             let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
             // Stash the info for after the table is created.
@@ -1944,11 +2197,15 @@ fn create_table_from_def(
             t.partition = Some(pinfo);
             // v0.11: the creating role owns the table.
             t.owner = ctx.role.to_string();
+            // v0.72: index-based (not zip) so a short `def.compression`
+            // degrades to None instead of truncating `col_compression`.
             t.col_compression = def
                 .columns
                 .iter()
-                .zip(def.compression.iter())
-                .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
+                .enumerate()
+                .map(|(i, (_, ty))| {
+                    parse_column_compression(ty, def.compression.get(i).and_then(|m| m.as_deref()))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             t.oid = eng.db.alloc_oid();
             ensure_toast_table_eager(eng, ctx, name, &mut t);
@@ -1988,11 +2245,15 @@ fn create_table_from_def(
     t.owner = ctx.role.to_string();
     // v0.41: validate each column's COMPRESSION option (PG19
     // GetAttributeCompression) and store the explicit methods.
+    // v0.72: index-based (not zip) so a short `def.compression`
+    // degrades to None instead of truncating `col_compression`.
     t.col_compression = def
         .columns
         .iter()
-        .zip(def.compression.iter())
-        .map(|((_, ty), mode)| parse_column_compression(ty, mode.as_deref()))
+        .enumerate()
+        .map(|(i, (_, ty))| {
+            parse_column_compression(ty, def.compression.get(i).and_then(|m| m.as_deref()))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     // v0.37: assign the table OID (pg_class.oid).
     t.oid = eng.db.alloc_oid();
@@ -4006,11 +4267,14 @@ fn exec_create_table_as(
         defaults: vec![None; ncols],
         serial: vec![None; ncols],
         compression: vec![None; ncols],
+        storage: vec![None; ncols],
         checks: Vec::new(),
         uniques: Vec::new(),
         pkey: None,
         fks: Vec::new(),
         partition: None,
+        likes: Vec::new(),
+        reloptions: Vec::new(),
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -4103,13 +4367,13 @@ fn exec_insert(
                 "ON CONFLICT on a partitioned temporary table is not supported yet",
             ));
         }
-        // A partitioned target that is not a leaf (a parent, or a
-        // sub-partitioned intermediate): rows route to leaves before
-        // conflict arbitration. Leaves keep the single-table path.
-        let partitioned = t
-            .partition
-            .as_ref()
-            .is_some_and(|p| p.bound.is_none() || !p.children.is_empty());
+        // A partitioned target that is not a leaf (a parent, a
+        // sub-partitioned intermediate, or a partitioned table with no
+        // children yet): rows route to leaves before conflict
+        // arbitration. True leaves keep the single-table path.
+        // (v0.72: `is_partitioned` is the honest discriminator — a
+        // childless partitioned table is not a leaf.)
+        let partitioned = t.partition.as_ref().is_some_and(|p| p.is_partitioned);
         (TableMeta::of(t), partitioned)
     };
     let upsert: Option<UpsertPlan> = match on_conflict {
@@ -4255,7 +4519,12 @@ fn exec_insert(
                 priv_scopes: Vec::new(),
             };
             built = Vec::with_capacity(rows.len());
-            for row in rows {
+            // v0.72: expand top-level set-returning calls in VALUES
+            // (PG19 ROWS FROM: `VALUES (generate_series(1,3))` is three
+            // rows). Width is unchanged by expansion, so the
+            // targets/width checks above still apply.
+            let rows = expand_insert_srf_rows(&mut q, rows)?;
+            for row in &rows {
                 if row.len() != targets.len() {
                     // v0.65: explicit lists need the exact count; with no
                     // list the first row set the width, so a mismatch means
@@ -5752,8 +6021,16 @@ fn exec_drop(
     if_exists: bool,
     cascade: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.72: PG resolves every name before dropping, and a partition
+    // dropped implicitly with its parent is not an error when also
+    // named explicitly (performMultipleDeletions deletes each object
+    // once). Track statement-level drops and skip repeats.
+    let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in names {
-        drop_one_table(eng, ctx, name, if_exists, cascade)?;
+        if dropped.contains(name) {
+            continue;
+        }
+        drop_one_table(eng, ctx, name, if_exists, cascade, &mut dropped)?;
     }
     Ok(ExecResult::Command {
         tag: "DROP TABLE".to_string(),
@@ -5820,6 +6097,7 @@ fn drop_one_table(
     name: &str,
     if_exists: bool,
     cascade: bool,
+    dropped: &mut std::collections::HashSet<String>,
 ) -> Result<(), ExecError> {
     // v0.11: only the owner (or a superuser) may drop a table.
     require_table_owner(eng, ctx, name)?;
@@ -5834,7 +6112,7 @@ fn drop_one_table(
         .unwrap_or_default();
     for child in &children {
         // Recurse (the child may itself be partitioned).
-        drop_one_table(eng, ctx, child, false, cascade)?;
+        drop_one_table(eng, ctx, child, false, cascade, dropped)?;
     }
     // v0.22: DROP resolves a session-local temp table first (PostgreSQL
     // semantics): dropping it reveals any permanent table of the same
@@ -5891,6 +6169,8 @@ fn drop_one_table(
         // indexes" by table name would delete a same-named permanent
         // table's indexes — that block was removed for exactly this
         // reason.
+        // v0.72: record the statement-level drop (multi-name DROP).
+        dropped.insert(name.to_string());
         return Ok(());
     }
     // Find the visible version first (immutable) for the conflict check,
@@ -6040,6 +6320,8 @@ fn drop_one_table(
     for iname in idx_names {
         drop_index_internal(eng, ctx, &iname)?;
     }
+    // v0.72: record the statement-level drop (multi-name DROP).
+    dropped.insert(name.to_string());
     Ok(())
 }
 
@@ -12714,7 +12996,7 @@ fn build_source(
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
             // v0.23: more column aliases than VALUES columns is 42601.
             check_col_alias_arity(alias, ncols, col_aliases)?;
-            let mut eval_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+            let mut eval_rows: Vec<Vec<Value>> = Vec::new();
             for row in rows {
                 if row.len() != ncols {
                     return Err(exec_err(
@@ -12726,11 +13008,9 @@ fn build_source(
                         ),
                     ));
                 }
-                let mut cells = Vec::with_capacity(ncols);
-                for e in row {
-                    cells.push(eval_expr(q, &[], e)?);
-                }
-                eval_rows.push(cells);
+                // v0.72: expand top-level set-returning calls (PG19 ROWS
+                // FROM: `VALUES (generate_series(1,3))` is three rows).
+                eval_rows.extend(expand_values_srf_row(q, row)?);
             }
             let schema: Vec<QCol> = (0..ncols)
                 .map(|i| {
@@ -19446,6 +19726,135 @@ fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
     }
 }
 
+/// v0.72: is this VALUES cell a top-level set-returning function call?
+/// (INSERT form — `InsertValue::Expr(Expr::Func)`; the SELECT
+/// targetlist has its own SRF handling.)
+fn insert_cell_is_srf(v: &InsertValue) -> bool {
+    matches!(v, InsertValue::Expr(Expr::Func { name, .. }) if is_srf(name))
+}
+
+/// v0.72: expand top-level set-returning function calls in
+/// `INSERT ... VALUES` rows (PG19 `ExecProjectSRF` semantics): each SRF
+/// cell evaluates to its output set; the row fans out to one row per
+/// SRF value, zipped positionally. An exhausted SRF NULL-pads
+/// (`SELECT g(1,3), g(1,2)` -> (1,1),(2,2),(3,NULL)); scalar cells are
+/// re-evaluated per output row (they repeat, never NULL-pad); if every
+/// SRF in the row is empty, the row produces nothing (`VALUES
+/// (generate_series(1,0))` inserts nothing). SRF outputs re-enter as
+/// literals so the normal literal coercion/validation below applies
+/// unchanged.
+fn expand_insert_srf_rows(
+    q: &mut Q,
+    rows: &[Vec<InsertValue>],
+) -> Result<Vec<Vec<InsertValue>>, ExecError> {
+    if !rows.iter().flatten().any(insert_cell_is_srf) {
+        return Ok(rows.to_vec());
+    }
+    let mut out: Vec<Vec<InsertValue>> = Vec::new();
+    for row in rows {
+        // Evaluate each cell to either one literal (scalar: repeats) or
+        // the SRF's set (NULL-pads once exhausted).
+        let mut cells: Vec<(Vec<InsertValue>, bool)> = Vec::with_capacity(row.len());
+        let mut width = 0usize;
+        let mut has_result = false;
+        for v in row {
+            if let InsertValue::Expr(Expr::Func { name, args, .. }) = v {
+                if is_srf(name) {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(eval_expr(q, &[], a)?);
+                    }
+                    let set = eval_srf_vals(name, &arg_vals)?;
+                    has_result |= !set.is_empty();
+                    width = width.max(set.len());
+                    cells.push((
+                        set.into_iter()
+                            .map(|sv| InsertValue::Lit(value_to_literal(&Some(sv))))
+                            .collect(),
+                        true,
+                    ));
+                    continue;
+                }
+            }
+            cells.push((vec![v.clone()], false));
+        }
+        // PG: "If all the SRFs returned ExprEndResult, we consider that
+        // as no row being produced."
+        if !has_result {
+            continue;
+        }
+        for i in 0..width {
+            out.push(
+                cells
+                    .iter()
+                    .map(|(c, is_srf)| {
+                        if *is_srf {
+                            c.get(i).cloned().unwrap_or(InsertValue::Lit(Literal::Null))
+                        } else {
+                            c[0].clone()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// v0.72: expand top-level set-returning function calls in a
+/// FROM-clause `VALUES` row (same PG19 `ExecProjectSRF` semantics as
+/// [`expand_insert_srf_rows`], but the cells evaluate straight to
+/// `Value`s for the scan): SRFs zip with NULL padding, scalars repeat,
+/// all-empty SRFs produce no rows.
+fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, ExecError> {
+    if !row
+        .iter()
+        .any(|e| matches!(e, Expr::Func { name, .. } if is_srf(name)))
+    {
+        return Ok(vec![
+            row.iter()
+                .map(|e| eval_expr(q, &[], e))
+                .collect::<Result<Vec<_>, _>>()?,
+        ]);
+    }
+    let mut cells: Vec<(Vec<Value>, bool)> = Vec::with_capacity(row.len());
+    let mut width = 0usize;
+    let mut has_result = false;
+    for e in row {
+        if let Expr::Func { name, args, .. } = e {
+            if is_srf(name) {
+                let mut arg_vals = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(eval_expr(q, &[], a)?);
+                }
+                let set = eval_srf_vals(name, &arg_vals)?;
+                has_result |= !set.is_empty();
+                width = width.max(set.len());
+                cells.push((set, true));
+                continue;
+            }
+        }
+        cells.push((vec![eval_expr(q, &[], e)?], false));
+    }
+    if !has_result {
+        return Ok(Vec::new());
+    }
+    Ok((0..width)
+        .map(|i| {
+            cells
+                .iter()
+                .map(|(c, is_srf)| {
+                    if *is_srf {
+                        c.get(i).cloned().unwrap_or(Value::Null)
+                    } else {
+                        c[0].clone()
+                    }
+                })
+                .collect()
+        })
+        .collect())
+}
+
 fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" => Ok(match str_arg(name, &vals[0])? {
@@ -25823,7 +26232,14 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
     let v = params
         .get((p - 1) as usize)
         .ok_or_else(|| exec_err("42P02", format!("there is no parameter ${}", p)))?;
-    Ok(match v {
+    Ok(value_to_literal(v))
+}
+
+/// v0.72: losslessly lower a runtime `Value` to a `Literal`
+/// (extracted from `param_literal`; also used to re-inject expanded
+/// SRF outputs into INSERT VALUES rows).
+fn value_to_literal(v: &Option<Value>) -> Literal {
+    match v {
         None => Literal::Null,
         Some(Value::SmallInt(i)) => Literal::SmallInt(*i),
         Some(Value::Int(i)) => Literal::Int(*i),
@@ -25850,7 +26266,7 @@ fn param_literal(p: u32, params: &[Option<Value>]) -> Result<Literal, ExecError>
             Literal::Text(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF).into())
         }
         Some(Value::Null) => Literal::Null,
-    })
+    }
 }
 
 fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
@@ -30718,7 +31134,25 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
     }
 }
 
+/// v0.72: run a comma-separated ALTER TABLE action list left to right
+/// in one statement (PG19). The per-action checks (ownership, temp
+/// rejection) apply to each action; the statement stays atomic through
+/// the shared write log.
 fn exec_alter(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    actions: &[AlterAction],
+) -> Result<ExecResult, ExecError> {
+    for action in actions {
+        exec_alter_one(eng, ctx, name, action)?;
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+fn exec_alter_one(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
@@ -30786,7 +31220,7 @@ fn exec_alter(
                         pkey: pkey.clone(),
                         fks: fks.clone(),
                     };
-                    exec_alter(eng, ctx, child, &child_action)?;
+                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
             }
             res
@@ -30806,7 +31240,7 @@ fn exec_alter(
                         name: col.clone(),
                         cascade: *cascade,
                     };
-                    exec_alter(eng, ctx, child, &child_action)?;
+                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
             }
             res
@@ -30851,7 +31285,7 @@ fn exec_alter(
                         pkey: pkey.clone(),
                         fk: fk.clone(),
                     };
-                    exec_alter(eng, ctx, child, &child_action)?;
+                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
             }
             res
@@ -30879,7 +31313,7 @@ fn exec_alter(
                         name: con.clone(),
                         cascade: *cascade,
                     };
-                    exec_alter(eng, ctx, child, &child_action)?;
+                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
             }
             res

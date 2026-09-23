@@ -3683,6 +3683,13 @@ pub struct PartitionInfo {
     pub parent: Option<String>,
     /// Direct child (partition) names, in creation/attach order.
     pub children: Vec<String>,
+    /// v0.72: true when this table is itself partitioned (a partition
+    /// root, or an intermediate created `PARTITION OF` a parent with its
+    /// own `PARTITION BY`). Distinguishes a partitioned table that
+    /// currently has no children from a leaf partition: both have
+    /// `children.is_empty()`, but only the former must reject direct
+    /// inserts with 23514 ("no partition of relation ... found").
+    pub is_partitioned: bool,
 }
 
 /// A single cell value.
@@ -4353,6 +4360,13 @@ impl Table {
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
         t.fks = def.fks.clone();
+        // v0.72: per-column STORAGE overrides (LIKE ... INCLUDING
+        // STORAGE); `None` keeps the type default from `Table::new`.
+        for (i, s) in def.storage.iter().enumerate() {
+            if let (Some(b), Some(slot)) = (s, t.col_storage.get_mut(i)) {
+                *slot = *b;
+            }
+        }
         t
     }
 
