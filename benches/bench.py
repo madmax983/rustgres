@@ -595,6 +595,51 @@ def w_idxscan(conn, seconds):
     return res
 
 
+def w_partition(conn, seconds):
+    """v0.71: bulk INSERT into a RANGE-partitioned table (50 leaf
+    partitions). Each row's id is randomized across the full range, so
+    every row exercises route_partition_inserts/find_partition_leaf's
+    per-row partition search (v0.69/v0.70) instead of always hitting the
+    first candidate. Same row shape/batch size as `insert`, so the two
+    are directly comparable."""
+    conn.simple("DROP TABLE IF EXISTS bench_part")
+    r = conn.simple(
+        "CREATE TABLE bench_part(id INT, name TEXT, active BOOL) "
+        "PARTITION BY RANGE (id)"
+    )
+    assert tag_of(r) == "CREATE TABLE"
+    n_parts = 50
+    width = 2000
+    for p in range(n_parts):
+        lo, hi = p * width, (p + 1) * width
+        r = conn.simple(
+            f"CREATE TABLE bench_part_{p} PARTITION OF bench_part "
+            f"FOR VALUES FROM ({lo}) TO ({hi})"
+        )
+        assert tag_of(r) == "CREATE TABLE", tag_of(r)
+
+    import random
+    random.seed(42)
+
+    def op():
+        rows = ",".join(
+            f"({i},'name{i}',{'true' if i % 2 == 0 else 'false'})"
+            for i in (random.randrange(n_parts * width) for _ in range(1000))
+        )
+        msgs = conn.simple(f"INSERT INTO bench_part VALUES {rows}")
+        assert tag_of(msgs) == "INSERT 0 1000", tag_of(msgs)
+    res = measure(op, seconds)
+    res["rows_per_s"] = res["qps"] * 1000
+    conn.simple("DROP TABLE bench_part")
+    res["note"] = (
+        f"1000-row multi-VALUES INSERT into a RANGE-partitioned table "
+        f"({n_parts} partitions, width {width}); random id per row forces "
+        f"a full per-row partition search; compare qps against `insert` "
+        f"(same shape, unpartitioned)"
+    )
+    return res
+
+
 WORKLOADS = {
     "select1": ("simple-query SELECT 1", w_select1),
     "expr": ("expression-heavy SELECT (v0.7 types/ops/built-ins)", w_expr),
@@ -607,6 +652,7 @@ WORKLOADS = {
     "idxscan": ("indexed vs sequential point/range/order scans (50k rows)", w_idxscan),
     "window": ("window functions over 10k rows (v0.10)", w_window),
     "copy": ("COPY TO STDOUT throughput over 10k rows (v0.10)", w_copy),
+    "partition": ("1000-row batched INSERTs into a 50-partition RANGE table (v0.71)", w_partition),
 }
 
 

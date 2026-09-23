@@ -2,6 +2,82 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `find_partition_leaf` clones every rejected candidate's metadata before checking it — fix — 2026-09-23
+
+New workload: `benches/bench.py --workload partition` (`w_partition`).
+50-partition RANGE table (`bench_part`, range `[0, 100000)`, 2000-wide
+leaves), 1000-row multi-VALUES `INSERT` per op with the row `id`
+randomized across the full range so every row forces a real per-row
+partition search instead of always landing in the first candidate
+(`insert`, the unpartitioned equivalent, is the point of comparison).
+Wall-clock (noisy sandbox, context only): partitioned insert ran at
+~14.8 qps vs. ~74.7 qps unpartitioned — about 5x slower for the same
+1000-row batch shape.
+
+### Profile (before fix)
+
+`benches/profile.sh --workload partition --seconds 5`, debug build,
+valgrind 3.22.0. Callgrind: **894,146,116** instructions for one
+measured 1000-row batch (the workload is dominated almost entirely by
+this one INSERT; nothing else competes for cost here, so the target's
+share of the *measured* cost is effectively 100%). DHAT's top three
+allocation sites by bytes were all `PartitionInfo`/`columns` clone
+sites in `route_partition_inserts`'s per-row partition search:
+
+| site | bytes | blocks |
+|------|-------|--------|
+| `Vec<PartKey>` (leaf's inherited partition key) | 11,208,960 | 77,840 |
+| `Vec<(String, ColType)>` (child `columns.clone()`) | 9,340,800 | 77,840 |
+| `Vec<RangeBound>` x2 (leaf bound's lower+upper) | 7,472,640 | 155,680 |
+| **subtotal** | **28,022,400 (62.5% of 44,829,442 total bytes)** | **311,360 (41.9% of 743,149 total blocks)** |
+
+### Hypothesis
+
+`find_partition_leaf` (`src/exec.rs`) loops `pinfo.children` looking
+for the partition whose bound contains the row's key. For *every*
+candidate — including the ~P-1 that don't match, out of P=50 siblings
+here — it unconditionally cloned the candidate's full `PartitionInfo`
+(a leaf's `key` is not empty: `build_partition_info` copies the
+parent's key onto every plain leaf, so this clone allocates a real
+`Vec<PartKey>`, plus a `Vec<RangeBound>` each for the range bound's
+`lower`/`upper`) and its `columns: Vec<(String, ColType)>`, *before*
+checking `is_default`/`bound_contains` against it. A bulk INSERT into a
+P-partition table pays this full-metadata clone O(P) times per row for
+O(1) useful work (the one candidate that actually matches). The bound
+check only needs a borrow of `child.partition`/`child.columns`, so
+deferring the clone until after a match is confirmed should turn the
+O(P) clones into O(1).
+
+### Change
+
+`find_partition_leaf`: read `child.partition.as_ref()` and
+`child.columns` by reference to run `is_default`/`bound_contains`
+(and, for a DEFAULT candidate, `explicit_sibling_accepts`); only the
+winning candidate's `PartitionInfo`/`columns` get cloned, right before
+the `children.is_empty()` check / recursive call that actually need
+owned copies. No change to routing order, bound semantics, or the
+default-partition rule — same PG19 two-pass (explicit siblings, then
+default) structure, same values compared, same result.
+
+### Measurement (after fix)
+
+Same harness, same machine, same session. Callgrind: **625,102,615**
+instructions for one measured 1000-row batch — **-30.09%** vs. the
+894,146,116 baseline above. DHAT: total bytes 44,829,442 ->
+**20,932,142** (**-53.31%**); total blocks 743,149 -> **187,022**
+(**-74.83%**); the `PartKey`/`columns`/`RangeBound` sites above no
+longer appear in the top allocation sites at all. `cargo test
+--all-features`: 253/253 passed, unchanged. `tests/protocol_test70.py`
+(32 checks) and `tests/protocol_test71.py` (57 checks) — covering
+list/range/hash partitioning, multilevel routing, DEFAULT partitions,
+expression keys, ATTACH/DETACH, transactional rollback, and
+UPDATE/DELETE routing — all pass unchanged. Wall-clock (context only,
+noisy sandbox): ~14.8 qps -> ~19.5 qps.
+
+Reproduce: `./benches/profile.sh --workload partition --seconds 5`,
+then `callgrind_annotate benches/profiles/callgrind.out.<pid>` for the
+instruction totals and `python3 -c "import json; d=json.load(open('benches/profiles/dhat.out.<pid>')); print(sum(p['tb'] for p in d['pps']), sum(p['tbk'] for p in d['pps']))"` for the DHAT totals.
+
 ## Bolt: window specs sharing `PARTITION BY`/`ORDER BY` redundantly recompute the same partition grouping and sort — fix — 2026-09-22
 
 Fixes the target identified in the baseline entry immediately below this
