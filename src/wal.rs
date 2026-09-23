@@ -3272,7 +3272,9 @@ pub fn records_for_commit(
             // v0.22: temp-table DDL is session-local and never WAL-logged.
             // The temp table itself is already in `temp_tables`; the op
             // only exists for statement-atomic undo.
-            WriteOp::CreateTempTable { .. } | WriteOp::DropTempTable { .. } => {
+            WriteOp::CreateTempTable { .. }
+            | WriteOp::DropTempTable { .. }
+            | WriteOp::AlterTempTable { .. } => {
                 i += 1;
                 continue;
             }

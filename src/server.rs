@@ -942,6 +942,12 @@ fn handle_query(
                     e.message.clone()
                 };
                 send_error(stream, e.code, &msg)?;
+                // v0.77: PG aborts the transaction on ANY error —
+                // including a simple-protocol parse error — so mark the
+                // txn failed before skipping the rest of the message.
+                if let Some(t) = session.txn.as_mut() {
+                    t.failed = true;
+                }
                 break;
             }
             Ok(s) => s,
@@ -950,6 +956,11 @@ fn handle_query(
         let mut stmt = stmt;
         if let Err(e) = exec::subst_params(&mut stmt, &[]) {
             send_exec_error(stream, &e)?;
+            // v0.77: same abort rule for the parameter-substitution
+            // error as for parse errors above.
+            if let Some(t) = session.txn.as_mut() {
+                t.failed = true;
+            }
             break;
         }
         // v0.10: COPY needs the protocol stream (CopyIn/CopyOut exchange).
@@ -2562,6 +2573,7 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }
             | WriteOp::DropTempTable { .. }
+            | WriteOp::AlterTempTable { .. }
             | WriteOp::CreateType { .. }
             | WriteOp::DropType { .. } => continue,
         };

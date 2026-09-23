@@ -1970,6 +1970,7 @@ fn expand_like_clauses(
                     name: cname,
                     expr: ck.expr.clone(),
                     not_valid: ck.not_valid,
+                    kind: ck.kind,
                 });
             }
         }
@@ -2049,6 +2050,80 @@ fn create_table_from_def(
     // v0.72: validate the recognized `WITH (...)` storage parameters
     // (PG19 reloptions.c); unrecognized ones are accepted and ignored.
     validate_reloptions(&like_def.reloptions)?;
+    // v0.77: expand `INHERITS (parent [, ...])` (PG19
+    // transformInhRelation, column part): the child gets each parent's
+    // columns first (in parent order), then its own. Unlike PARTITION
+    // OF, constraints are not inherited — only the columns with their
+    // NOT NULL flags, defaults, and CHECK constraints. Parent scans
+    // including children's rows are not yet implemented.
+    if !like_def.inherits.is_empty() {
+        let mut merged = TableDef::empty();
+        merged.inherits = like_def.inherits.clone();
+        for parent_name in &like_def.inherits {
+            let parent = eng
+                .db
+                .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+                .ok_or_else(|| {
+                    exec_err(
+                        "42P01",
+                        format!("relation \"{}\" does not exist", parent_name),
+                    )
+                })?;
+            for (i, (col, ty)) in parent.columns.iter().enumerate() {
+                if merged.columns.iter().any(|(n, _)| n == col) {
+                    continue;
+                }
+                merged.columns.push((col.clone(), ty.clone()));
+                merged
+                    .not_null
+                    .push(parent.not_null.get(i).copied().unwrap_or(false));
+                merged
+                    .defaults
+                    .push(parent.defaults.get(i).cloned().unwrap_or(None));
+                merged.serial.push(None);
+                merged.compression.push(None);
+                merged.storage.push(None);
+            }
+            merged.checks.extend(parent.checks.iter().cloned());
+        }
+        // The child's own columns; a child column with the same name as
+        // an inherited one keeps the inherited position (PG merges them).
+        for (i, (col, ty)) in like_def.columns.iter().enumerate() {
+            if let Some(pos) = merged.columns.iter().position(|(n, _)| n == col) {
+                merged.columns[pos] = (col.clone(), ty.clone());
+                merged.not_null[pos] = like_def.not_null.get(i).copied().unwrap_or(false);
+                merged.defaults[pos] = like_def.defaults.get(i).cloned().unwrap_or(None);
+                merged.serial[pos] = like_def.serial.get(i).cloned().unwrap_or(None);
+                merged.compression[pos] = like_def.compression.get(i).cloned().unwrap_or(None);
+                merged.storage[pos] = like_def.storage.get(i).cloned().unwrap_or(None);
+            } else {
+                merged.columns.push((col.clone(), ty.clone()));
+                merged
+                    .not_null
+                    .push(like_def.not_null.get(i).copied().unwrap_or(false));
+                merged
+                    .defaults
+                    .push(like_def.defaults.get(i).cloned().unwrap_or(None));
+                merged
+                    .serial
+                    .push(like_def.serial.get(i).cloned().unwrap_or(None));
+                merged
+                    .compression
+                    .push(like_def.compression.get(i).cloned().unwrap_or(None));
+                merged
+                    .storage
+                    .push(like_def.storage.get(i).cloned().unwrap_or(None));
+            }
+        }
+        merged.checks.extend(like_def.checks.iter().cloned());
+        merged.uniques = like_def.uniques.clone();
+        merged.pkey = like_def.pkey.clone();
+        merged.fks = like_def.fks.clone();
+        merged.partition = like_def.partition.clone();
+        merged.likes = like_def.likes.clone();
+        merged.reloptions = like_def.reloptions.clone();
+        like_def = merged;
+    }
     let def = &like_def;
     if temp {
         // Existence check first so a duplicate name fails before any
@@ -2633,18 +2708,23 @@ fn check_row_constraints(
         let v = eval_expr(&mut q, &[frame], &check.expr)?;
         // Postgres CHECK passes on TRUE or NULL; only FALSE fails it.
         if matches!(v, Value::Bool(false)) {
-            // v0.76: an ALTER-added NOT NULL constraint is stored as an
+            // v0.77: an ALTER-added NOT NULL constraint is stored as an
             // `IS NOT NULL` check; PG19 reports its violation as 23502
-            // (not-null violation), not 23514 (check violation).
-            if let crate::sql::Expr::IsNull { expr, neg: true } = &check.expr {
-                if let crate::sql::Expr::Column { table: None, name } = expr.as_ref() {
-                    return Err(exec_err(
-                        "23502",
-                        format!(
-                            "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
-                            name, table
-                        ),
-                    ));
+            // (not-null violation), not 23514 (check violation). The
+            // `CheckKind` marker decides — not the expression shape — so
+            // an ordinary user CHECK with an `IS NOT NULL` shape still
+            // reports 23514.
+            if check.kind == crate::sql::CheckKind::NotNull {
+                if let crate::sql::Expr::IsNull { expr, neg: true } = &check.expr {
+                    if let crate::sql::Expr::Column { table: None, name } = expr.as_ref() {
+                        return Err(exec_err(
+                            "23502",
+                            format!(
+                                "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                                name, table
+                            ),
+                        ));
+                    }
                 }
             }
             return Err(exec_err(
@@ -4327,6 +4407,7 @@ fn exec_create_table_as(
         partition: None,
         likes: Vec::new(),
         reloptions: Vec::new(),
+        inherits: Vec::new(),
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -8823,6 +8904,7 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
                 arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
             }
             Expr::ScalarSub(s) => stmt_uses_pg_column_compression(s),
+            Expr::ArraySubquery(s) => stmt_uses_pg_column_compression(s),
             Expr::InSub { expr, sub, .. } => {
                 expr_uses(expr) || stmt_uses_pg_column_compression(sub)
             }
@@ -8998,7 +9080,9 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         // Leaves and already-resolved nodes pass through (idempotent).
         Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => Ok(pred.clone()),
         // Separate query levels: runtime resolution (correlation intact).
-        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => Ok(pred.clone()),
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
+            Ok(pred.clone())
+        }
         Expr::Arith { op, left, right } => Ok(Expr::Arith {
             op: *op,
             left: Box::new(r(left)?),
@@ -10125,6 +10209,19 @@ fn validate_ctes(ctes: &[CteDef]) -> Result<(), ExecError> {
 /// names the given relation.
 fn stmt_refs_table(sel: &SelectStmt, name: &str) -> bool {
     sel.from.iter().any(|f| from_refs_table(f, name))
+        // v0.77: the recursive reference may hide inside an inner WITH
+        // (e.g. `(WITH z AS NOT MATERIALIZED (SELECT * FROM x) ...)` as
+        // the recursive term of `x`).
+        || sel.with.iter().any(|c| cte_body_refs_table(&c.body, name))
+}
+
+fn cte_body_refs_table(body: &CteBody, name: &str) -> bool {
+    match body {
+        CteBody::Simple(s) => stmt_refs_table(s, name),
+        CteBody::Union { left, right, .. } => {
+            stmt_refs_table(left, name) || stmt_refs_table(right, name)
+        }
+    }
 }
 
 fn from_refs_table(f: &FromItem, name: &str) -> bool {
@@ -10642,8 +10739,8 @@ fn contains_agg(e: &Expr) -> bool {
         Expr::Func { args, .. } => args.iter().any(contains_agg),
         Expr::Extract { from, .. } => contains_agg(from),
         Expr::InSub { expr, .. } => contains_agg(expr),
-        // ScalarSub / Exists are separate query levels.
-        Expr::ScalarSub(_) | Expr::Exists { .. } => false,
+        // ScalarSub / ArraySubquery / Exists are separate query levels.
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
         // v0.10: a window counts as an aggregate when any of its input
         // expressions does (e.g. `sum(x) OVER (...)`).
         Expr::Window {
@@ -10707,7 +10804,7 @@ fn contains_window(e: &Expr) -> bool {
         Expr::Extract { from, .. } => contains_window(from),
         Expr::InSub { expr, .. } => contains_window(expr),
         // Subqueries are separate query levels.
-        Expr::ScalarSub(_) | Expr::Exists { .. } => false,
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
     }
 }
 
@@ -10989,6 +11086,7 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         | Expr::Literal(_)
         | Expr::Param(_)
         | Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
         | Expr::Exists { .. } => Ok(()),
     }
 }
@@ -12445,6 +12543,7 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             }
         }
         Expr::ScalarSub(s) => collect_stmt_refs(s, out),
+        Expr::ArraySubquery(s) => collect_stmt_refs(s, out),
         Expr::InSub { expr, sub, .. } => {
             collect_column_refs(expr, out);
             collect_stmt_refs(sub, out);
@@ -14706,7 +14805,7 @@ fn eval_grouped(
         )),
         // Subqueries are their own query level: evaluate normally, with
         // the group's first row available for correlation.
-        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
             let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
             scopes.extend_from_slice(outer);
             scopes.push(gscope);
@@ -16042,6 +16141,60 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                 .first()
                 .map(|r| r[0].clone())
                 .unwrap_or(Value::Null))
+        }
+        // v0.77: `array(SELECT ...)` — evaluate the subquery and format
+        // the first column of each row as a PG array literal.
+        Expr::ArraySubquery(sub) => {
+            let out = {
+                let mut sub_q = Q {
+                    eng: &mut *q.eng,
+                    snap: q.snap,
+                    own: q.own,
+                    session: q.session,
+                    role: q.role,
+                    read_only: q.read_only,
+                    depth: q.depth + 1,
+                    lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
+                };
+                run_select(&mut sub_q, sub, scopes)?
+            };
+            if out.columns.len() != 1 {
+                return Err(exec_err("42601", "subquery must return only one column"));
+            }
+            let mut lit = String::from("{");
+            for (i, row) in out.rows.iter().enumerate() {
+                if i > 0 {
+                    lit.push(',');
+                }
+                // Format the value as PG array literal element.
+                match &row[0] {
+                    Value::Null => lit.push_str("NULL"),
+                    Value::Text(s) | Value::BpChar(s) => {
+                        // Quote if needed.
+                        let needs_quote = s.chars().any(|c| {
+                            c == ',' || c == '{' || c == '}' || c == '"' || c.is_whitespace()
+                        });
+                        if needs_quote {
+                            lit.push('"');
+                            for c in s.chars() {
+                                if c == '"' || c == '\\' {
+                                    lit.push('\\');
+                                }
+                                lit.push(c);
+                            }
+                            lit.push('"');
+                        } else {
+                            lit.push_str(s);
+                        }
+                    }
+                    v => lit.push_str(&value_to_text_cast(v)),
+                }
+            }
+            lit.push('}');
+            Ok(Value::Text(lit.into()))
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
         Expr::Exists { sub, neg } => {
@@ -25679,6 +25832,9 @@ fn expr_type(
             }
             Ok(cols[0].clone().1)
         }
+        // v0.77: `array(SELECT ...)` returns a PG array literal as Text
+        // (a proper array type is future work).
+        Expr::ArraySubquery(_) => Ok(ColType::Text),
         // v0.10: window function result types.
         Expr::Window { func, args, .. } => {
             window_result_type(eng, snap, own, session, schemas, outer, ctes, func, args)
@@ -27355,6 +27511,12 @@ mod tests {
     /// fresh snapshot). Returns the rows as debug strings.
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         let stmt = parse_statement(sql).map_err(|e| exec_err("42601", e.message))?;
+        run_stmt(eng, &stmt)
+    }
+
+    /// v0.77: execute an already-parsed (and possibly parameter-bound)
+    /// statement, sharing `run`'s harness.
+    fn run_stmt(eng: &mut Engine, stmt: &Stmt) -> Result<ExecResult, ExecError> {
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -27367,7 +27529,7 @@ mod tests {
             read_only: false,
             default_toast_compression: crate::storage::ToastCompression::Pglz,
         };
-        execute(eng, &mut ctx, &stmt)
+        execute(eng, &mut ctx, stmt)
     }
 
     fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
@@ -30730,11 +30892,26 @@ mod tests {
             name: "c_valid".to_string(),
             expr: Expr::Literal(Literal::Int(1)),
             not_valid: false,
+            kind: crate::sql::CheckKind::Check,
         });
         t.checks.push(CheckDef {
             name: "c_nv".to_string(),
             expr: Expr::Literal(Literal::Int(1)),
             not_valid: true,
+            kind: crate::sql::CheckKind::Check,
+        });
+        // v0.77: a NOT NULL-kind check round-trips its kind.
+        t.checks.push(CheckDef {
+            name: "c_nn".to_string(),
+            expr: Expr::IsNull {
+                expr: Box::new(Expr::Column {
+                    table: None,
+                    name: "v".to_string(),
+                }),
+                neg: true,
+            },
+            not_valid: true,
+            kind: crate::sql::CheckKind::NotNull,
         });
         let encoded = encode_constraints(&t);
         let dec = decode_constraints(&encoded).unwrap();
@@ -30745,15 +30922,394 @@ mod tests {
             .collect();
         assert_eq!(
             flags,
-            vec![("c_valid".to_string(), false), ("c_nv".to_string(), true)]
+            vec![
+                ("c_valid".to_string(), false),
+                ("c_nv".to_string(), true),
+                ("c_nn".to_string(), true)
+            ]
         );
-        // Backward compatibility: strip the new flag (as a pre-v0.76
-        // checkpoint would) and confirm it decodes as false.
-        let legacy = encoded.replace("(\"c_nv\" (lit int 1) 1)", "(\"c_nv\" (lit int 1))");
+        let kinds: Vec<crate::sql::CheckKind> = dec.checks.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::sql::CheckKind::Check,
+                crate::sql::CheckKind::Check,
+                crate::sql::CheckKind::NotNull
+            ]
+        );
+        // Backward compatibility: strip the new flag and kind (as a
+        // pre-v0.76 checkpoint would) and confirm they decode as false
+        // / CHECK.
+        let legacy = encoded.replace("(\"c_nv\" (lit int 1) 1 c)", "(\"c_nv\" (lit int 1))");
         assert_ne!(legacy, encoded);
         let dec = decode_constraints(&legacy).unwrap();
         let nv = dec.checks.iter().find(|c| c.name == "c_nv").unwrap();
         assert!(!nv.not_valid);
+        assert_eq!(nv.kind, crate::sql::CheckKind::Check);
+    }
+
+    /// v0.77: ALTER TABLE ... ADD CONSTRAINT ... NOT NULL [NOT VALID]
+    /// on a TEMP table (was 0A000 before v0.77). Mirrors the
+    /// subselect.sql NOT VALID suite that drove this work.
+    #[test]
+    fn v77_temp_alter_add_constraint_not_null_not_valid() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t77a (id int)").unwrap();
+        run(&mut eng, "INSERT INTO t77a VALUES (NULL)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t77a ADD CONSTRAINT nn NOT NULL id NOT VALID",
+        )
+        .unwrap();
+        // The existing NULL row survives NOT VALID.
+        let got = rows_of(run(&mut eng, "SELECT id FROM t77a").unwrap());
+        assert_eq!(got, vec![vec!["NULL".to_string()]]);
+        // Future NULL writes are rejected as 23502 (CheckKind::NotNull).
+        let err = run(&mut eng, "INSERT INTO t77a VALUES (NULL)").unwrap_err();
+        assert_eq!(err.code, "23502");
+        run(&mut eng, "INSERT INTO t77a VALUES (1)").unwrap();
+        let err = run(&mut eng, "UPDATE t77a SET id = NULL").unwrap_err();
+        assert_eq!(err.code, "23502");
+        // Without NOT VALID, existing NULLs are rejected at ALTER time.
+        run(&mut eng, "CREATE TEMP TABLE t77b (id int)").unwrap();
+        run(&mut eng, "INSERT INTO t77b VALUES (NULL)").unwrap();
+        let err = run(&mut eng, "ALTER TABLE t77b ADD CONSTRAINT nn NOT NULL id").unwrap_err();
+        assert_eq!(err.code, "23502");
+        // DROP CONSTRAINT removes the enforcement.
+        run(&mut eng, "ALTER TABLE t77a DROP CONSTRAINT nn").unwrap();
+        run(&mut eng, "INSERT INTO t77a VALUES (NULL)").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT count(*) FROM t77a").unwrap());
+        assert_eq!(got, vec![vec!["3".to_string()]]);
+    }
+
+    /// v0.77: row-rewriting ALTERs (ADD/DROP COLUMN) on temp tables keep
+    /// the data; RENAME COLUMN / RENAME TO work on temp tables.
+    #[test]
+    fn v77_temp_alter_add_drop_rename_column() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t77c (id int)").unwrap();
+        run(&mut eng, "INSERT INTO t77c VALUES (1), (2)").unwrap();
+        run(&mut eng, "ALTER TABLE t77c ADD COLUMN v int DEFAULT 7").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id, v FROM t77c ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["1", "7"], vec!["2", "7"]]);
+        // ADD COLUMN NOT NULL without a default fails on existing rows.
+        let err = run(&mut eng, "ALTER TABLE t77c ADD COLUMN w int NOT NULL").unwrap_err();
+        assert_eq!(err.code, "23502");
+        run(&mut eng, "ALTER TABLE t77c DROP COLUMN v").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id FROM t77c ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["1"], vec!["2"]]);
+        run(&mut eng, "ALTER TABLE t77c RENAME COLUMN id TO num").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT num FROM t77c ORDER BY num").unwrap());
+        assert_eq!(got, vec![vec!["1"], vec!["2"]]);
+        run(&mut eng, "ALTER TABLE t77c RENAME TO t77c2").unwrap();
+        let err = run(&mut eng, "SELECT num FROM t77c").unwrap_err();
+        assert_eq!(err.code, "42P01");
+        let got = rows_of(run(&mut eng, "SELECT num FROM t77c2 ORDER BY num").unwrap());
+        assert_eq!(got, vec![vec!["1"], vec!["2"]]);
+    }
+
+    /// v0.77: ADD CONSTRAINT UNIQUE / PRIMARY KEY on a temp table —
+    /// duplicates are rejected by a row scan (temp tables have no
+    /// backing global indexes), and the constraint is scan-enforced on
+    /// later writes.
+    #[test]
+    fn v77_temp_alter_add_unique() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t77d (id int, v int)").unwrap();
+        run(&mut eng, "INSERT INTO t77d VALUES (1, 1), (2, 2)").unwrap();
+        run(&mut eng, "ALTER TABLE t77d ADD CONSTRAINT uq UNIQUE (id)").unwrap();
+        // Scan-enforced going forward (no backing index on temp tables).
+        let err = run(&mut eng, "INSERT INTO t77d VALUES (1, 9)").unwrap_err();
+        assert_eq!(err.code, "23505");
+        // NULLs stay distinct, like PG.
+        run(&mut eng, "INSERT INTO t77d VALUES (NULL, 3)").unwrap();
+        run(&mut eng, "INSERT INTO t77d VALUES (NULL, 4)").unwrap();
+        // Duplicates present at ADD time are rejected.
+        run(&mut eng, "CREATE TEMP TABLE t77e (id int)").unwrap();
+        run(&mut eng, "INSERT INTO t77e VALUES (1), (1)").unwrap();
+        let err = run(&mut eng, "ALTER TABLE t77e ADD CONSTRAINT uq2 UNIQUE (id)").unwrap_err();
+        assert_eq!(err.code, "23505");
+        // PRIMARY KEY on a temp table too.
+        run(&mut eng, "CREATE TEMP TABLE t77f (id int)").unwrap();
+        run(&mut eng, "INSERT INTO t77f VALUES (1), (2)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t77f ADD CONSTRAINT pk PRIMARY KEY (id)",
+        )
+        .unwrap();
+        let err = run(&mut eng, "INSERT INTO t77f VALUES (2)").unwrap_err();
+        assert_eq!(err.code, "23505");
+    }
+
+    /// v0.77: the `CheckKind` marker — not the expression shape — decides
+    /// 23502 vs 23514. An ordinary user CHECK with an `IS NOT NULL`
+    /// shape stays 23514; an ALTER-added NOT NULL reports 23502.
+    #[test]
+    fn v77_checkkind_notnull_vs_check_shape() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t77g (id int)").unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE t77g ADD CONSTRAINT ck CHECK (id IS NOT NULL)",
+        )
+        .unwrap();
+        let err = run(&mut eng, "INSERT INTO t77g VALUES (NULL)").unwrap_err();
+        assert_eq!(err.code, "23514");
+        run(&mut eng, "CREATE TABLE t77h (id int)").unwrap();
+        run(&mut eng, "ALTER TABLE t77h ADD CONSTRAINT nn NOT NULL id").unwrap();
+        let err = run(&mut eng, "INSERT INTO t77h VALUES (NULL)").unwrap_err();
+        assert_eq!(err.code, "23502");
+    }
+
+    /// v0.77: an unqualified column present in both the UPDATE target and
+    /// a FROM item is ambiguous (42702); qualified references resolve.
+    #[test]
+    fn v77_update_from_ambiguous_column_is_42702() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a77 (id int, v int)").unwrap();
+        run(&mut eng, "CREATE TABLE b77 (id int, v int)").unwrap();
+        run(&mut eng, "INSERT INTO a77 VALUES (1, 10)").unwrap();
+        run(&mut eng, "INSERT INTO b77 VALUES (1, 20)").unwrap();
+        // `v` is in both a77 and b77: ambiguous in the WHERE clause.
+        let err = run(&mut eng, "UPDATE a77 SET v = 0 FROM b77 WHERE v = 1").unwrap_err();
+        assert_eq!(err.code, "42702");
+        // Ambiguous in a SET expression too (combined FROM+target schema).
+        let err = run(
+            &mut eng,
+            "UPDATE a77 SET v = v + 1 FROM b77 WHERE a77.id = b77.id",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42702");
+        // Qualified references resolve fine.
+        run(
+            &mut eng,
+            "UPDATE a77 SET v = b77.v FROM b77 WHERE a77.id = b77.id",
+        )
+        .unwrap();
+        let got = rows_of(run(&mut eng, "SELECT v FROM a77").unwrap());
+        assert_eq!(got, vec![vec!["20".to_string()]]);
+    }
+
+    /// v0.77: ambiguity inside DELETE ... USING items is 42702 (when the
+    /// target table doesn't have the column to shadow it). An
+    /// unqualified column present in both the target and a USING item
+    /// resolves to the target by the documented eval_dml_expr
+    /// convention — target frame last.
+    #[test]
+    fn v77_delete_using_ambiguous_column_is_42702() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a77 (id int, v int)").unwrap();
+        run(&mut eng, "CREATE TABLE b77 (id int, w int)").unwrap();
+        run(&mut eng, "CREATE TABLE c77 (id int, w int)").unwrap();
+        run(&mut eng, "INSERT INTO a77 VALUES (1, 10), (2, 20)").unwrap();
+        run(&mut eng, "INSERT INTO b77 VALUES (1, 10)").unwrap();
+        run(&mut eng, "INSERT INTO c77 VALUES (1, 10)").unwrap();
+        // `w` is in both USING items b77 and c77 (not in the target):
+        // ambiguous.
+        let err = run(&mut eng, "DELETE FROM a77 USING b77, c77 WHERE w = 10").unwrap_err();
+        assert_eq!(err.code, "42702");
+        // Qualified references resolve fine.
+        run(
+            &mut eng,
+            "DELETE FROM a77 USING b77 WHERE a77.id = b77.id AND b77.w = 10",
+        )
+        .unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id FROM a77 ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["2".to_string()]]);
+        // Target-vs-USING: the unqualified `v` resolves to the target
+        // table (eval_dml_expr convention), deleting the row with
+        // a77.v = 20 only.
+        run(&mut eng, "DELETE FROM a77 USING b77 WHERE v = 20").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id FROM a77").unwrap());
+        assert!(got.is_empty(), "got: {:?}", got);
+    }
+
+    /// v0.77: extended-protocol parameters inside FROM/USING items bind
+    /// and execute (v0.76 only checked `max_param` sizing).
+    #[test]
+    fn v77_params_in_from_using_items_execute() {
+        use crate::storage::Value;
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE a77 (id int, v int)").unwrap();
+        run(&mut eng, "INSERT INTO a77 VALUES (1, 10), (2, 20)").unwrap();
+        // $1 inside a FROM derived table.
+        let mut stmt =
+            parse_statement("UPDATE a77 SET v = v + s.d FROM (SELECT $1 AS d) s WHERE a77.id = 1")
+                .unwrap();
+        subst_params(&mut stmt, &[Some(Value::Int(5))]).unwrap();
+        run_stmt(&mut eng, &stmt).unwrap();
+        let got = rows_of(run(&mut eng, "SELECT v FROM a77 WHERE id = 1").unwrap());
+        assert_eq!(got, vec![vec!["15".to_string()]]);
+        // $1 inside a USING derived table.
+        let mut stmt =
+            parse_statement("DELETE FROM a77 USING (SELECT $1 AS did) s WHERE a77.id = s.did")
+                .unwrap();
+        subst_params(&mut stmt, &[Some(Value::Int(2))]).unwrap();
+        run_stmt(&mut eng, &stmt).unwrap();
+        let got = rows_of(run(&mut eng, "SELECT id FROM a77 ORDER BY id").unwrap());
+        assert_eq!(got, vec![vec!["1".to_string()]]);
+    }
+
+    /// v0.77: ALTER on a temp table never touches a same-named
+    /// permanent table's indexes — temp tables shadow by name, and the
+    /// v0.77 guards keep the global index catalog out of reach.
+    #[test]
+    fn v77_temp_alter_isolated_from_shadowed_permanent() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE sh77 (id int, v int)").unwrap();
+        run(&mut eng, "CREATE INDEX sh77_idx ON sh77(v)").unwrap();
+        run(&mut eng, "INSERT INTO sh77 VALUES (1, 10)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE sh77 (id int, v int)").unwrap();
+        run(&mut eng, "INSERT INTO sh77 VALUES (2, 20)").unwrap();
+        // RENAME COLUMN on the temp table: the permanent index keeps `v`.
+        run(&mut eng, "ALTER TABLE sh77 RENAME COLUMN v TO w").unwrap();
+        let ix = eng.db.indexes.get("sh77_idx").expect("perm index survives");
+        assert_eq!(ix.def.table, "sh77");
+        assert_eq!(ix.def.col_names, vec!["v".to_string()]);
+        // DROP COLUMN ... CASCADE on the temp table must not drop the
+        // permanent table's index.
+        run(&mut eng, "ALTER TABLE sh77 DROP COLUMN w CASCADE").unwrap();
+        assert!(eng.db.indexes.get("sh77_idx").is_some());
+        // The temp table itself did change.
+        let got = rows_of(run(&mut eng, "SELECT id FROM sh77").unwrap());
+        assert_eq!(got, vec![vec!["2".to_string()]]);
+        // RENAME TO on the temp table: the permanent index still points
+        // at `sh77`.
+        run(&mut eng, "ALTER TABLE sh77 RENAME TO sh77t").unwrap();
+        let ix = eng.db.indexes.get("sh77_idx").expect("perm index survives");
+        assert_eq!(ix.def.table, "sh77");
+        // Permanent table's schema and data intact (checked in the
+        // catalog; it is shadowed for this session's SQL).
+        let pt = eng.db.tables.get("sh77").unwrap();
+        let live = pt.last().unwrap();
+        assert!(live.column_index("v").is_some());
+        assert_eq!(live.rows.len(), 1);
+    }
+
+    /// v0.77: quantified comparisons over an empty set — `= ANY` is
+    /// false, `<> ALL` is true (PG semantics).
+    #[test]
+    fn v77_quantified_empty_set() {
+        let mut eng = engine();
+        let one = |eng: &mut Engine, sql: &str| rows_of(run(eng, sql).unwrap());
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT 1 = ANY (SELECT id FROM users WHERE id > 100)"
+            ),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT 1 = SOME (SELECT id FROM users WHERE id > 100)"
+            ),
+            vec![vec!["f".to_string()]]
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT 1 <> ALL (SELECT id FROM users WHERE id > 100)"
+            ),
+            vec![vec!["t".to_string()]]
+        );
+        // Non-empty control: the desugar still works.
+        assert_eq!(
+            one(&mut eng, "SELECT 2 = ANY (SELECT id FROM users)"),
+            vec![vec!["t".to_string()]]
+        );
+        assert_eq!(
+            one(&mut eng, "SELECT 9 <> ALL (SELECT id FROM users)"),
+            vec![vec!["t".to_string()]]
+        );
+    }
+
+    #[test]
+    fn v77_recursive_cte_parenthesized_terms_with_inner_with() {
+        // v0.77: a recursive CTE whose non-recursive term is a
+        // parenthesized VALUES and whose recursive term is a
+        // parenthesized query with its own WITH (NOT MATERIALIZED).
+        // From the subselect.sql conformance suite.
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "WITH RECURSIVE x(a) AS (
+                   (VALUES ('a'), ('b'))
+                    UNION ALL
+                    (WITH z AS NOT MATERIALIZED (SELECT * FROM x)
+                     SELECT z.a || z1.a AS a FROM z CROSS JOIN z AS z1
+                     WHERE length(z.a || z1.a) < 5)
+                 )
+                 SELECT * FROM x",
+            )
+            .unwrap(),
+        );
+        // 2 seeds + 4 (len 2) + 16 (len 4) = 22 rows.
+        assert_eq!(rows.len(), 22);
+        let mut vals: Vec<String> = rows.into_iter().map(|r| r[0].clone()).collect();
+        vals.sort();
+        assert!(vals.contains(&"a".to_string()));
+        assert!(vals.contains(&"bbbb".to_string()));
+    }
+
+    #[test]
+    fn v77_create_table_inherits_copies_columns() {
+        // v0.77: `CREATE TABLE ... INHERITS (parent)` copies the
+        // parent's columns so the child is usable. Parent scans do
+        // not yet include children's rows.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE inh_p (a int, b int)").unwrap();
+        run(&mut eng, "INSERT INTO inh_p VALUES (1, 10)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE inh_c () INHERITS (inh_p)").unwrap();
+        run(&mut eng, "INSERT INTO inh_c VALUES (2, 20)").unwrap();
+        let child = rows_of(run(&mut eng, "SELECT * FROM inh_c").unwrap());
+        assert_eq!(child, vec![vec!["2".to_string(), "20".to_string()]]);
+        // Parent scan does not (yet) include the child's row.
+        let parent = rows_of(run(&mut eng, "SELECT * FROM inh_p").unwrap());
+        assert_eq!(parent, vec![vec!["1".to_string(), "10".to_string()]]);
+        // Unknown parent is 42P01.
+        let err = run(&mut eng, "CREATE TEMP TABLE inh_x () INHERITS (nope)").unwrap_err();
+        assert_eq!(err.code, "42P01");
+    }
+
+    #[test]
+    fn v77_explain_with_options_parses() {
+        // v0.77: `EXPLAIN (COSTS OFF, ...)` — the parenthesized option
+        // list is accepted (options parsed and ignored) so a valid PG
+        // statement doesn't 42601 and poison an explicit transaction.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE exp_t (a int)").unwrap();
+        let r = run(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM exp_t").unwrap();
+        match r {
+            ExecResult::Explain { columns, rows } => {
+                assert_eq!(columns[0].0, "QUERY PLAN");
+                assert!(!rows.is_empty());
+            }
+            _ => panic!("expected Explain"),
+        }
+        // Multiple options with values.
+        let r2 = run(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE TRUE) SELECT * FROM exp_t",
+        )
+        .unwrap();
+        assert!(matches!(r2, ExecResult::Explain { .. }));
+    }
+
+    #[test]
+    fn v77_array_subquery_formats_literal() {
+        // v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
+        // Returns the first column as a PG array literal (Text for now).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE arr_t (x int)").unwrap();
+        run(&mut eng, "INSERT INTO arr_t VALUES (1), (2), (3)").unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT array(SELECT x FROM arr_t ORDER BY x)").unwrap());
+        assert_eq!(rows, vec![vec!["{1,2,3}".to_string()]]);
+        // Empty subquery -> '{}'.
+        let rows2 =
+            rows_of(run(&mut eng, "SELECT array(SELECT x FROM arr_t WHERE x > 100)").unwrap());
+        assert_eq!(rows2, vec![vec!["{}".to_string()]]);
     }
 }
 
@@ -32193,6 +32749,71 @@ fn eval_sequence_func(
 /// push the new one, and log WriteOp::AlterTable for undo/WAL.
 /// `new_rows`: Some for ADD/DROP COLUMN (rows rewritten with new ids, WAL-
 /// logged as InsertRow); None for pure-metadata alters (rows move over).
+/// v0.77: temp-table counterpart of [`alter_swap`]. Temp tables are
+/// single-version and session-local, so there is no catalog version to
+/// retire: the previous `Table` is cloned for the undo op and the new
+/// one takes its place in `temp_tables[session]` (under the new name
+/// when renamed). Row-rewriting ALTERs log `InsertRow` ops for the
+/// fresh row ids exactly like the permanent path; their undos run
+/// before this op's (newest-first) and are temp-aware
+/// (`remove_own_version` searches temp tables too).
+fn alter_swap_temp(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    renamed_to: Option<String>,
+    mut next: Table,
+    new_rows: Option<Vec<RowVersion>>,
+) -> Result<(), ExecError> {
+    let prev = eng
+        .db
+        .temp_tables
+        .get(&ctx.session)
+        .and_then(|m| m.get(name))
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    // v0.37/v0.41 (mirrored): the per-column TOAST storage and
+    // COMPRESSION metadata must stay parallel to `columns`.
+    debug_assert_eq!(
+        next.col_storage.len(),
+        next.columns.len(),
+        "col_storage out of sync with columns in ALTER TABLE {}",
+        name
+    );
+    debug_assert_eq!(
+        next.col_compression.len(),
+        next.columns.len(),
+        "col_compression out of sync with columns in ALTER TABLE {}",
+        name
+    );
+    let mut log_ids = Vec::new();
+    if let Some(rows) = new_rows {
+        log_ids.extend(rows.iter().map(|r| r.id));
+        next.rows = rows;
+        // v0.9: the row ids changed — rebuild the id->position index.
+        next.rebuild_row_index();
+    }
+    let target = renamed_to.clone().unwrap_or_else(|| name.to_string());
+    let tmps = eng.db.temp_tables.entry(ctx.session).or_default();
+    if renamed_to.is_some() {
+        tmps.remove(name);
+    }
+    tmps.insert(target.clone(), next);
+    ctx.writes.push(WriteOp::AlterTempTable {
+        session: ctx.session,
+        name: name.to_string(),
+        prev,
+        renamed_to,
+    });
+    for id in log_ids {
+        ctx.writes.push(WriteOp::InsertRow {
+            table: target.clone(),
+            row_id: id,
+        });
+    }
+    Ok(())
+}
+
 fn alter_swap(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -32201,6 +32822,12 @@ fn alter_swap(
     mut next: Table,
     new_rows: Option<Vec<RowVersion>>,
 ) -> Result<(), ExecError> {
+    // v0.77: temp tables live in `Database::temp_tables[session]`, not
+    // the versioned catalog — swap them in place with a temp undo op
+    // instead of minting a catalog version.
+    if eng.db.is_temp_table(ctx.session, name) {
+        return alter_swap_temp(eng, ctx, name, renamed_to, next, new_rows);
+    }
     let prev = eng
         .db
         .find_table(name, ctx.snap, ctx.own, ctx.session)
@@ -32356,7 +32983,7 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             }
         }
         Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } | Expr::Agg { .. } => {}
-        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {}
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {}
         // v0.10: windows cannot appear in constraints; nothing to rename.
         Expr::Window { .. } => {}
     }
@@ -32388,14 +33015,19 @@ fn exec_alter_one(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: every ALTER TABLE needs owner-or-superuser.
     require_table_owner(eng, ctx, name)?;
-    // v0.22: ALTER TABLE is not supported on temp tables yet — the
-    // versioned-catalog machinery it runs on (`alter_swap`) only knows
-    // permanent tables. Reject honestly rather than corrupt.
-    if eng.db.is_temp_table(ctx.session, name) {
-        return Err(exec_err(
-            "0A000",
-            "ALTER TABLE on temporary tables is not supported in this version",
-        ));
+    // v0.77: ALTER TABLE on temp tables is supported — `alter_swap`
+    // branches to a temp-safe path (`alter_swap_temp`) since the
+    // versioned-catalog machinery only knows permanent tables.
+    // ATTACH PARTITION still needs the versioned catalog
+    // (`commit_table_version` / `parent_link_child`), so it stays
+    // 0A000 on temp tables (either side).
+    if let AlterAction::AttachPartition { child, .. } = action {
+        if eng.db.is_temp_table(ctx.session, name) || eng.db.is_temp_table(ctx.session, child) {
+            return Err(exec_err(
+                "0A000",
+                "ALTER TABLE ... ATTACH PARTITION on temporary tables is not supported in this version",
+            ));
+        }
     }
     match action {
         AlterAction::AddColumn {
@@ -32434,6 +33066,13 @@ fn exec_alter_one(
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
                 for child in &children {
+                    // v0.77: a temp table may shadow a partition child's
+                    // name in this session — never propagate into it
+                    // (PG resolves children by OID; we resolve by name,
+                    // so skip rather than alter the wrong table).
+                    if eng.db.is_temp_table(ctx.session, child) {
+                        continue;
+                    }
                     // Recurse via exec_alter to handle nested partitions.
                     // Construct the action anew (we have the parts).
                     let child_action = AlterAction::AddColumn {
@@ -32464,6 +33103,11 @@ fn exec_alter_one(
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
                 for child in &children {
+                    // v0.77: skip temp-shadowed partition children (see
+                    // ADD COLUMN propagation above).
+                    if eng.db.is_temp_table(ctx.session, child) {
+                        continue;
+                    }
                     let child_action = AlterAction::DropColumn {
                         name: col.clone(),
                         cascade: *cascade,
@@ -32499,6 +33143,11 @@ fn exec_alter_one(
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
                 for child in &children {
+                    // v0.77: skip temp-shadowed partition children (see
+                    // ADD COLUMN propagation above).
+                    if eng.db.is_temp_table(ctx.session, child) {
+                        continue;
+                    }
                     // Skip children that already carry this constraint
                     // (e.g. inherited at CREATE PARTITION OF time).
                     let already = con_name.is_some_and(|n| {
@@ -32598,6 +33247,11 @@ fn alter_add_column(
             format!("column \"{}\" of relation \"{}\" already exists", col, name),
         ));
     }
+    // v0.77: temp tables have no global indexes; a shadowed permanent
+    // table's index entries must never be touched by the row rewrite
+    // below (row ids are globally unique so it would be a no-op, but
+    // say what we mean).
+    let is_temp = eng.db.is_temp_table(ctx.session, name);
     // Validate the default and check expressions up front.
     if let Some(d) = default {
         if let DefaultExpr::Expr(e) = d {
@@ -32731,8 +33385,12 @@ fn alter_add_column(
             // v0.42: the row id changed, so migrate surviving index
             // entries to the new id. The indexed key columns are
             // untouched (the new column is appended), so the keys are
-            // identical; only the row id moves.
-            eng.db.index_remove_row(name, old_id, &values);
+            // identical; only the row id moves. v0.77: temp tables
+            // have no global indexes — skip (index_insert_row below
+            // already no-ops for temp tables via its session guard).
+            if !is_temp {
+                eng.db.index_remove_row(name, old_id, &values);
+            }
             eng.db
                 .index_insert_row(name, new_id, &rv.values, ctx.session);
             rv
@@ -32754,7 +33412,13 @@ fn alter_add_column(
     ensure_toast_table_eager(eng, ctx, name, &mut next);
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
     for (ix_name, cols) in new_indexes {
-        create_constraint_index(eng, ctx, name, &ix_name, &cols, true)?;
+        if eng.db.is_temp_table(ctx.session, name) {
+            // v0.77: temp tables have no backing global indexes (v0.22);
+            // duplicates are checked by scanning the rows.
+            temp_unique_dup_check(eng, ctx, name, &ix_name, &cols)?;
+        } else {
+            create_constraint_index(eng, ctx, name, &ix_name, &cols, true)?;
+        }
     }
     Ok(ExecResult::Command {
         tag: format!("ALTER TABLE"),
@@ -32778,6 +33442,11 @@ fn alter_drop_column(
             format!("column \"{}\" of relation \"{}\" does not exist", col, name),
         )
     })?;
+    // v0.77: temp tables have no global indexes, no views can depend on
+    // them, and no other catalog table's FKs reference them — a
+    // same-named permanent table's catalog objects must not be touched
+    // when the temp table shadows it.
+    let is_temp = eng.db.is_temp_table(ctx.session, name);
     // Dependency scan.
     let mut dep_constraints: Vec<String> = Vec::new();
     for c in &t.checks {
@@ -32804,48 +33473,55 @@ fn alter_drop_column(
     }
     // Other tables' FKs referencing this column.
     let mut dep_fks: Vec<(String, String)> = Vec::new();
-    for (tname, vs) in &eng.db.tables {
-        if tname == name {
-            continue;
-        }
-        let Some(ot) = vs
-            .iter()
-            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
-        else {
-            continue;
-        };
-        for fk in &ot.fks {
-            if fk.ref_table != name {
+    if !is_temp {
+        for (tname, vs) in &eng.db.tables {
+            if tname == name {
                 continue;
             }
-            // Empty ref_cols = references our pkey.
-            let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
-                t.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
-            } else {
-                fk.ref_cols.clone()
+            let Some(ot) = vs
+                .iter()
+                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+            else {
+                continue;
             };
-            if ref_cols.iter().any(|c| c == col) {
-                dep_fks.push((tname.clone(), fk.name.clone()));
+            for fk in &ot.fks {
+                if fk.ref_table != name {
+                    continue;
+                }
+                // Empty ref_cols = references our pkey.
+                let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+                    t.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
+                } else {
+                    fk.ref_cols.clone()
+                };
+                if ref_cols.iter().any(|c| c == col) {
+                    dep_fks.push((tname.clone(), fk.name.clone()));
+                }
             }
         }
     }
     // Indexes on the column.
     let mut dep_indexes: Vec<String> = Vec::new();
-    for (ix_name, ix) in &eng.db.indexes {
-        if ix.def.table != name {
-            continue;
-        }
-        if ix.def.col_names.iter().any(|c| c == col) {
-            dep_indexes.push(ix_name.clone());
+    if !is_temp {
+        for (ix_name, ix) in &eng.db.indexes {
+            if ix.def.table != name {
+                continue;
+            }
+            if ix.def.col_names.iter().any(|c| c == col) {
+                dep_indexes.push(ix_name.clone());
+            }
         }
     }
     // Views reading the table.
     let mut dep_views: Vec<String> = Vec::new();
-    for (vname, vs) in &eng.db.views {
-        if vs.iter().any(|v| {
-            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
-        }) {
-            dep_views.push(vname.clone());
+    if !is_temp {
+        for (vname, vs) in &eng.db.views {
+            if vs.iter().any(|v| {
+                crate::storage::view_visible(v, ctx.snap, ctx.own)
+                    && v.deps.iter().any(|d| d == name)
+            }) {
+                dep_views.push(vname.clone());
+            }
         }
     }
     if !cascade
@@ -32911,15 +33587,19 @@ fn alter_drop_column(
         next.pkey = None;
     }
     next.fks.retain(|fk| !fk.cols.iter().any(|c| c == col));
-    for ix in drop_idx_for {
-        // v0.9: DROP the backing index for the dropped UNIQUE/PK constraint.
-        // Use direct map removal (bypasses MVCC visibility which may miss
-        // the index due to snapshot timing).
-        if let Some(index) = eng.db.indexes.remove(&ix) {
-            ctx.writes.push(WriteOp::DropIndex {
-                name: ix.clone(),
-                index,
-            });
+    // v0.77: temp tables have no backing global indexes — never touch
+    // the global index map for them.
+    if !is_temp {
+        for ix in drop_idx_for {
+            // v0.9: DROP the backing index for the dropped UNIQUE/PK constraint.
+            // Use direct map removal (bypasses MVCC visibility which may miss
+            // the index due to snapshot timing).
+            if let Some(index) = eng.db.indexes.remove(&ix) {
+                ctx.writes.push(WriteOp::DropIndex {
+                    name: ix.clone(),
+                    index,
+                });
+            }
         }
     }
     // Other tables' FKs referencing the column.
@@ -32933,16 +33613,20 @@ fn alter_drop_column(
         }
     }
     // Remaining indexes: shift positions after the dropped column.
+    // v0.77: temp tables have no global indexes, so there is nothing
+    // to shift.
     let mut index_defs: Vec<(String, Vec<usize>, Vec<String>)> = Vec::new();
-    for (ix_name, ix) in &eng.db.indexes {
-        if ix.def.table != name {
-            continue;
+    if !is_temp {
+        for (ix_name, ix) in &eng.db.indexes {
+            if ix.def.table != name {
+                continue;
+            }
+            index_defs.push((
+                ix_name.clone(),
+                ix.def.cols.clone(),
+                ix.def.col_names.clone(),
+            ));
         }
-        index_defs.push((
-            ix_name.clone(),
-            ix.def.cols.clone(),
-            ix.def.col_names.clone(),
-        ));
     }
     // Now mutate the table shape.
     next.columns.remove(ci);
@@ -33043,6 +33727,53 @@ fn table_has_constraint(t: &Table, con: &str) -> bool {
         || t.fks.iter().any(|f| f.name == con)
 }
 
+/// v0.77: duplicate check for ADD CONSTRAINT UNIQUE/PRIMARY KEY (or ADD
+/// COLUMN with an inline unique/pkey constraint) on a temp table, which
+/// has no backing global index (v0.22). Scans visible rows instead;
+/// NULL keys are distinct, mirroring `create_constraint_index`.
+fn temp_unique_dup_check(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    cname: &str,
+    cols: &[String],
+) -> Result<(), ExecError> {
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+    let positions: Vec<usize> = cols
+        .iter()
+        .map(|c| {
+            t.column_index(c).ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", c, table),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut seen: Vec<IndexKey> = Vec::new();
+    for r in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+        let key = temp_key(&positions, &r.values);
+        // PG: NULLs are distinct in unique constraints.
+        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if seen.contains(&key) {
+            return Err(exec_err(
+                "23505",
+                format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    cname
+                ),
+            ));
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 fn alter_add_constraint(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -33104,6 +33835,7 @@ fn alter_add_constraint(
                 neg: true,
             },
             not_valid: n.not_valid,
+            kind: crate::sql::CheckKind::NotNull,
         })
     } else {
         None
@@ -33171,7 +33903,13 @@ fn alter_add_constraint(
         }
         next.uniques.push(u.clone());
         alter_swap(eng, ctx, name, None, next, None)?;
-        create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+        if eng.db.is_temp_table(ctx.session, name) {
+            // v0.77: temp tables have no backing global indexes (v0.22);
+            // duplicates are checked by scanning the rows.
+            temp_unique_dup_check(eng, ctx, name, &u.name, &u.cols)?;
+        } else {
+            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+        }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
         });
@@ -33199,7 +33937,12 @@ fn alter_add_constraint(
         }
         next.pkey = Some(pk.clone());
         alter_swap(eng, ctx, name, None, next, None)?;
-        create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+        if eng.db.is_temp_table(ctx.session, name) {
+            // v0.77: temp tables have no backing global indexes (v0.22).
+            temp_unique_dup_check(eng, ctx, name, &pk.name, &pk.cols)?;
+        } else {
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+        }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
         });
@@ -33273,9 +34016,13 @@ fn alter_drop_constraint_internal(
         ));
     }
     alter_swap(eng, ctx, name, None, next, None)?;
-    if let Some(ix) = backing_index {
-        if eng.db.find_index(&ix, ctx.snap, ctx.own).is_some() {
-            drop_index_internal(eng, ctx, &ix)?;
+    // v0.77: temp tables have no backing global indexes — never drop a
+    // same-named permanent table's index when the temp table shadows it.
+    if !eng.db.is_temp_table(ctx.session, name) {
+        if let Some(ix) = backing_index {
+            if eng.db.find_index(&ix, ctx.snap, ctx.own).is_some() {
+                drop_index_internal(eng, ctx, &ix)?;
+            }
         }
     }
     Ok(())
@@ -33296,7 +34043,10 @@ fn alter_drop_constraint(
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let is_uniqueish =
         t.uniques.iter().any(|u| u.name == con) || t.pkey.as_ref().is_some_and(|p| p.name == con);
-    if is_uniqueish {
+    // v0.77: temp tables are session-local — no other catalog table's
+    // FK can reference one's constraints; skip the global scan so a
+    // shadowed permanent table's FKs are never touched.
+    if is_uniqueish && !eng.db.is_temp_table(ctx.session, name) {
         let mut dep_fks: Vec<(String, String)> = Vec::new();
         for (tname, vs) in &eng.db.tables {
             if tname == name {
@@ -33384,19 +34134,26 @@ fn alter_rename_column(
             format!("column \"{}\" of relation \"{}\" already exists", new, name),
         ));
     }
+    // v0.77: temp tables are session-local — no global view can depend
+    // on one, and a same-named permanent table's views/indexes must not
+    // be touched.
+    let is_temp = eng.db.is_temp_table(ctx.session, name);
     // Views reference columns by name in stored SQL; refuse rather than
     // silently breaking them.
-    for (vname, vs) in &eng.db.views {
-        if vs.iter().any(|v| {
-            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
-        }) {
-            return Err(exec_err(
-                "2BP01",
-                format!(
-                    "cannot rename column {} because view {} depends on table {}",
-                    old, vname, name
-                ),
-            ));
+    if !is_temp {
+        for (vname, vs) in &eng.db.views {
+            if vs.iter().any(|v| {
+                crate::storage::view_visible(v, ctx.snap, ctx.own)
+                    && v.deps.iter().any(|d| d == name)
+            }) {
+                return Err(exec_err(
+                    "2BP01",
+                    format!(
+                        "cannot rename column {} because view {} depends on table {}",
+                        old, vname, name
+                    ),
+                ));
+            }
         }
     }
     let mut next = t.clone();
@@ -33434,19 +34191,23 @@ fn alter_rename_column(
         }
     }
     alter_swap(eng, ctx, name, None, next, None)?;
-    // Update index col_names.
-    let ix_names: Vec<String> = eng
-        .db
-        .indexes
-        .iter()
-        .filter(|(_, ix)| ix.def.table == name)
-        .map(|(n, _)| n.clone())
-        .collect();
-    for ix_name in ix_names {
-        if let Some(ix) = eng.db.indexes.get_mut(&ix_name) {
-            for c in &mut ix.def.col_names {
-                if c == old {
-                    *c = new.to_string();
+    // Update index col_names. v0.77: temp tables have no global
+    // indexes — skip so a shadowed permanent table's indexes are
+    // never touched.
+    if !is_temp {
+        let ix_names: Vec<String> = eng
+            .db
+            .indexes
+            .iter()
+            .filter(|(_, ix)| ix.def.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for ix_name in ix_names {
+            if let Some(ix) = eng.db.indexes.get_mut(&ix_name) {
+                for c in &mut ix.def.col_names {
+                    if c == old {
+                        *c = new.to_string();
+                    }
                 }
             }
         }
@@ -33481,53 +34242,61 @@ fn alter_rename_to(
         .find_table(name, ctx.snap, ctx.own, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
+    // v0.77: a temp-table rename is session-local — never rewrite other
+    // tables' FKs, view deps, or global indexes, which belong to the
+    // permanent catalog (a shadowed same-named permanent table's
+    // objects must not be touched).
+    let is_temp = eng.db.is_temp_table(ctx.session, name);
     // Update FK ref_table in other tables that point at the old name.
-    let mut ref_tables: Vec<String> = Vec::new();
-    for (tname, vs) in &eng.db.tables {
-        if tname == name {
-            continue;
-        }
-        if let Some(ot) = vs
-            .iter()
-            .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
-        {
-            if ot.fks.iter().any(|fk| fk.ref_table == name) {
-                ref_tables.push(tname.clone());
+    if !is_temp {
+        let mut ref_tables: Vec<String> = Vec::new();
+        for (tname, vs) in &eng.db.tables {
+            if tname == name {
+                continue;
             }
-        }
-    }
-    for tname in ref_tables {
-        let ot = eng
-            .db
-            .find_table(&tname, ctx.snap, ctx.own, ctx.session)
-            .expect("found above")
-            .clone();
-        let mut onext = ot.clone();
-        for fk in &mut onext.fks {
-            if fk.ref_table == name {
-                fk.ref_table = new_name.to_string();
-            }
-        }
-        alter_swap(eng, ctx, &tname, None, onext, None)?;
-    }
-    // Update view dependencies.
-    let mut view_names: Vec<String> = Vec::new();
-    for (vname, vs) in &eng.db.views {
-        if vs.iter().any(|v| {
-            crate::storage::view_visible(v, ctx.snap, ctx.own) && v.deps.iter().any(|d| d == name)
-        }) {
-            view_names.push(vname.clone());
-        }
-    }
-    for vname in view_names {
-        if let Some(vs) = eng.db.views.get_mut(&vname) {
-            if let Some(v) = vs
-                .iter_mut()
-                .find(|v| crate::storage::view_visible(v, ctx.snap, ctx.own))
+            if let Some(ot) = vs
+                .iter()
+                .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
             {
-                for d in &mut v.deps {
-                    if d == name {
-                        *d = new_name.to_string();
+                if ot.fks.iter().any(|fk| fk.ref_table == name) {
+                    ref_tables.push(tname.clone());
+                }
+            }
+        }
+        for tname in ref_tables {
+            let ot = eng
+                .db
+                .find_table(&tname, ctx.snap, ctx.own, ctx.session)
+                .expect("found above")
+                .clone();
+            let mut onext = ot.clone();
+            for fk in &mut onext.fks {
+                if fk.ref_table == name {
+                    fk.ref_table = new_name.to_string();
+                }
+            }
+            alter_swap(eng, ctx, &tname, None, onext, None)?;
+        }
+        // Update view dependencies.
+        let mut view_names: Vec<String> = Vec::new();
+        for (vname, vs) in &eng.db.views {
+            if vs.iter().any(|v| {
+                crate::storage::view_visible(v, ctx.snap, ctx.own)
+                    && v.deps.iter().any(|d| d == name)
+            }) {
+                view_names.push(vname.clone());
+            }
+        }
+        for vname in view_names {
+            if let Some(vs) = eng.db.views.get_mut(&vname) {
+                if let Some(v) = vs
+                    .iter_mut()
+                    .find(|v| crate::storage::view_visible(v, ctx.snap, ctx.own))
+                {
+                    for d in &mut v.deps {
+                        if d == name {
+                            *d = new_name.to_string();
+                        }
                     }
                 }
             }
@@ -33535,9 +34304,12 @@ fn alter_rename_to(
     }
     alter_swap(eng, ctx, name, Some(new_name.to_string()), t, None)?;
     // Indexes were updated inside alter_swap; fix their table field via def.
-    for ix in eng.db.indexes.values_mut() {
-        if ix.def.table == name {
-            ix.def.table = new_name.to_string();
+    // v0.77: temp tables have no global indexes — skip.
+    if !is_temp {
+        for ix in eng.db.indexes.values_mut() {
+            if ix.def.table == name {
+                ix.def.table = new_name.to_string();
+            }
         }
     }
     Ok(ExecResult::Command {

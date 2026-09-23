@@ -1089,6 +1089,11 @@ pub enum Expr {
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
+    /// v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
+    /// Evaluates the subquery and returns the first column of each row
+    /// as a PG array literal (e.g. `{1,2,3}`). Currently returned as
+    /// Text; a proper array type is future work.
+    ArraySubquery(Box<SelectStmt>),
     /// v0.73: PG19 whole-row Var (varattno = 0) — `tbl` or `tbl.*` in
     /// expression position, evaluating to a composite (record) value.
     WholeRow {
@@ -1398,6 +1403,20 @@ pub enum SerialKind {
     BigSerial,
 }
 
+/// v0.77: what a check-like constraint represents. ALTER-added NOT NULL
+/// constraints are stored as `col IS NOT NULL` checks (so DROP
+/// CONSTRAINT sees them); the kind marker — not the expression shape —
+/// decides the 23502-vs-23514 classification in `check_row_constraints`,
+/// so an ordinary user CHECK with an `IS NOT NULL` shape can't be
+/// misclassified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckKind {
+    /// An ordinary CHECK constraint (23514 on violation).
+    Check,
+    /// An ALTER-added NOT NULL constraint (23502 on violation).
+    NotNull,
+}
+
 /// v0.9: a CHECK constraint (name + parsed expression).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckDef {
@@ -1408,6 +1427,7 @@ pub struct CheckDef {
     /// enforced on new/updated rows by `check_row_constraints`, like PG19;
     /// the flag only skips the one-time existing-row scan.
     pub not_valid: bool,
+    pub kind: CheckKind,
 }
 
 /// v0.76: a NOT NULL column constraint added via ALTER TABLE
@@ -1483,6 +1503,11 @@ pub struct TableDef {
     /// (PG19). Recognized parameters are validated at exec; the rest
     /// are accepted and recorded.
     pub reloptions: Vec<(String, String)>,
+    /// v0.77: `INHERITS (parent [, ...])` — table inheritance (PG19
+    /// transformInhRelation). The child copies the parents' columns at
+    /// CREATE time. Querying a parent does NOT yet include children's
+    /// rows (no inheritance expansion in scans).
+    pub inherits: Vec<String>,
 }
 
 /// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
@@ -1751,7 +1776,7 @@ fn classify_default(e: Expr) -> Result<DefaultExpr, SqlError> {
 }
 
 impl TableDef {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         TableDef {
             columns: Vec::new(),
             not_null: Vec::new(),
@@ -1766,6 +1791,7 @@ impl TableDef {
             partition: None,
             likes: Vec::new(),
             reloptions: Vec::new(),
+            inherits: Vec::new(),
         }
     }
 }
@@ -1865,6 +1891,7 @@ fn def_add_check(
         name: cname,
         expr: e,
         not_valid: false,
+        kind: CheckKind::Check,
     });
     Ok(())
 }
@@ -2105,6 +2132,7 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         | Expr::Param(_)
         | Expr::Agg { .. }
         | Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::ResolvedCol { .. } => {}
@@ -2814,6 +2842,7 @@ fn max_param_expr(e: &Expr) -> usize {
             .unwrap_or(0)
             .max(arg2.as_deref().map(max_param_expr).unwrap_or(0)),
         Expr::ScalarSub(s) => max_param_select(s),
+        Expr::ArraySubquery(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
         Expr::Exists { sub, .. } => max_param_select(sub),
         // v0.10: window functions.
@@ -3274,6 +3303,43 @@ impl Parser {
                         message: "EXPLAIN ANALYZE is not supported yet".to_string(),
                         code: "0A000",
                     });
+                }
+                // v0.77: EXPLAIN (option, ...) — parse and ignore the options
+                // (COSTS, VERBOSE, BUFFERS, TIMING, SUMMARY, SETTINGS, FORMAT).
+                // The options don't affect rustgres's plan output format, but
+                // accepting the syntax avoids a 42601 that would (correctly)
+                // abort an explicit transaction in the conformance suite.
+                if matches!(self.peek(), Token::LParen) {
+                    let _ = self.next(); // consume '('
+                    loop {
+                        // Option name: identifier.
+                        match self.next() {
+                            Token::Ident(_) => {}
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: unexpected {:?} in EXPLAIN options",
+                                    other
+                                )));
+                            }
+                        }
+                        // Optional value: boolean keyword, number, string, or identifier.
+                        match self.peek() {
+                            Token::Number(_) | Token::Str(_) | Token::Ident(_) => {
+                                let _ = self.next();
+                            }
+                            _ => {}
+                        }
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: unexpected {:?} in EXPLAIN options",
+                                    other
+                                )));
+                            }
+                        }
+                    }
                 }
                 let inner_kw = match self.next() {
                     Token::Ident(s) => s,
@@ -3789,6 +3855,25 @@ impl Parser {
             }
         } // v0.74: end of non-empty column list; `()` handled above.
         let mut def = build_table_def(&name, items)?;
+        // v0.77: `INHERITS (parent [, ...])` — table inheritance. The
+        // child copies the parents' columns at exec; recorded in the
+        // def for future inheritance-expansion support.
+        if self.eat_keyword("inherits") {
+            self.expect(Token::LParen, "'('")?;
+            loop {
+                def.inherits.push(self.expect_ident()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in INHERITS list, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
         // v0.72: `WITH (storage_parameter = value, ...)` (PG19
         // reloptions). Parsed into the def; exec validates the
         // recognized parameters (fillfactor range) and records them.
@@ -3843,6 +3928,7 @@ impl Parser {
             }),
             likes: Vec::new(),
             reloptions: Vec::new(),
+            inherits: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -4492,6 +4578,7 @@ impl Parser {
                             .unwrap_or_else(|| format!("{}_check_{}", col.name, checks.len() + 1)),
                         expr: e,
                         not_valid: false,
+                        kind: CheckKind::Check,
                     }),
                     ColCon::References { name: n, tail } => fks.push(FkDef {
                         name: n.unwrap_or_else(|| format!("{}_fkey", col.name)),
@@ -4615,6 +4702,7 @@ impl Parser {
                     name: name.unwrap_or_default(),
                     expr: e,
                     not_valid: false,
+                    kind: CheckKind::Check,
                 }),
                 unique: None,
                 pkey: None,
@@ -5178,6 +5266,13 @@ impl Parser {
     /// v0.10: one CTE body. A recursive CTE may be
     /// `non_recursive UNION [ALL] recursive`.
     fn parse_cte_body(&mut self, recursive: bool) -> Result<CteBody, SqlError> {
+        // v0.77: the body may start with a parenthesized query, e.g.
+        // `((VALUES ('a'),('b')) UNION ALL (WITH ... SELECT ...))` as the
+        // body of a recursive CTE.
+        if *self.peek() == Token::LParen {
+            let first = self.parse_select_query_not_consumed()?;
+            return self.finish_cte_body(first, recursive);
+        }
         // The body must start with SELECT (or VALUES in a non-recursive
         // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
         let is_values = match self.next() {
@@ -5204,6 +5299,12 @@ impl Parser {
         } else {
             self.parse_select_query()?
         };
+        self.finish_cte_body(first, recursive)
+    }
+
+    /// v0.77: shared tail of `parse_cte_body` — after the first term,
+    /// optionally parse `UNION [ALL] <recursive term>`.
+    fn finish_cte_body(&mut self, first: SelectStmt, recursive: bool) -> Result<CteBody, SqlError> {
         if self.eat_keyword("union") {
             if !recursive {
                 return Err(SqlError {
@@ -6442,6 +6543,19 @@ impl Parser {
     /// forms, and the v0.7 built-in function set. Anything else is
     /// "function does not exist" (SQLSTATE 42883).
     fn parse_call(&mut self, name: String) -> Result<Expr, SqlError> {
+        // v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
+        // This is valid PG syntax; without it the 42601 would (correctly)
+        // abort an explicit transaction in the conformance suite.
+        if name == "array"
+            && *self.peek() == Token::LParen
+            && matches!(self.peek2(), Token::Ident(s) if s == "select")
+        {
+            self.next(); // consume '('
+            self.next(); // consume 'select'
+            let sub = self.parse_select_query()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::ArraySubquery(Box::new(sub)));
+        }
         // v0.14: function-style cast — PostgreSQL treats `typename(expr)`
         // as a cast when the name is a type and there is exactly one
         // argument (e.g. `float8(count(*))`).
@@ -9344,7 +9458,7 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
     match e {
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
-        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
+        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
             Err(err(format!("cannot use subquery in {} constraint", what)))
         }
         Expr::Param(_) => Err(err(format!("cannot use parameter in {} constraint", what))),
@@ -9703,6 +9817,7 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         // appear in a persisted CHECK / DEFAULT (validated at parse time).
         Expr::Agg { .. }
         | Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::Window { .. }
@@ -10110,6 +10225,12 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         // v0.76: NOT VALID flag (older checkpoints omit it; the decoder
         // defaults a missing flag to false).
         out.push_str(if c.not_valid { " 1" } else { " 0" });
+        // v0.77: constraint kind (`c` = CHECK, `n` = NOT NULL). Older
+        // checkpoints omit it; the decoder defaults to CHECK.
+        out.push_str(match c.kind {
+            CheckKind::Check => " c",
+            CheckKind::NotNull => " n",
+        });
         out.push(')');
     }
     out.push_str(") (uniques");
@@ -10250,11 +10371,27 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 o => return Err(format!("bad check not-valid flag {}", o)),
             }
         };
+        // v0.77: optional kind token (`c` = CHECK, `n` = NOT NULL).
+        // Pre-v0.77 checkpoints omit it and decode as CHECK. (A v0.76
+        // checkpoint holding an ALTER-added NOT NULL would decode as a
+        // plain CHECK — 23514 instead of 23502 on violation after a
+        // load; the checkpoint format is not stable across versions,
+        // so this corner is documented, not preserved.)
+        let kind = if sexpr_is_close(&mut p) {
+            CheckKind::Check
+        } else {
+            match p.atom()?.as_str() {
+                "c" => CheckKind::Check,
+                "n" => CheckKind::NotNull,
+                o => return Err(format!("bad check kind {}", o)),
+            }
+        };
         p.close()?;
         checks.push(CheckDef {
             name,
             expr,
             not_valid,
+            kind,
         });
     }
     p.close()?;

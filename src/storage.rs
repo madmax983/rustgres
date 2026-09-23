@@ -5951,6 +5951,19 @@ pub enum WriteOp {
         name: String,
         prev: Option<Table>,
     },
+    // --- v0.77: ALTER TABLE on a temp table. Like the v0.22 temp DDL
+    // ops above, temp tables are single-version and session-local, so
+    // the op carries the whole previous `Table` (schema and rows) and
+    // the owning session id; undo swaps it back in place. `renamed_to`
+    // is Some when the alter renamed the table: the altered version
+    // lives under the new name and `prev` is restored under `name`.
+    // Never WAL-logged (temp tables are session-local).
+    AlterTempTable {
+        session: u64,
+        name: String,
+        prev: Table,
+        renamed_to: Option<String>,
+    },
     // --- v0.22: CREATE/DROP TYPE. Types live in `Database::types` (not
     // the versioned catalog); the op carries the previous entry (or
     // None) so undo restores it exactly. Types are never WAL-logged.
@@ -6118,6 +6131,26 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                     tmps.remove(name);
                 }
             }
+            if tmps.is_empty() {
+                eng.db.temp_tables.remove(session);
+            }
+        }
+        // --- v0.77: undo an ALTER on a temp table. Temp tables are
+        // single-version: remove the altered version (under the new
+        // name when renamed) and restore the previous table whole.
+        // Runs newest-first, so InsertRow undos for a row-rewriting
+        // ALTER's fresh row ids already ran; temp rows have no global
+        // index entries to rebuild (v0.22).
+        WriteOp::AlterTempTable {
+            session,
+            name,
+            prev,
+            renamed_to,
+        } => {
+            let target = renamed_to.as_deref().unwrap_or(name);
+            let tmps = eng.db.temp_tables.entry(*session).or_default();
+            tmps.remove(target);
+            tmps.insert(name.clone(), prev.clone());
             if tmps.is_empty() {
                 eng.db.temp_tables.remove(session);
             }
