@@ -1089,6 +1089,11 @@ pub enum Expr {
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
+    /// v0.73: PG19 whole-row Var (varattno = 0) — `tbl` or `tbl.*` in
+    /// expression position, evaluating to a composite (record) value.
+    WholeRow {
+        qual: String,
+    },
     /// `[NOT] IN (subquery)`.
     InSub {
         expr: Box<Expr>,
@@ -1995,6 +2000,8 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
 pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        // v0.73: a whole-row ref depends on every column of the range.
+        Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
         Expr::Arith { left, right, .. } => {
             collect_col_refs(left, out);
             collect_col_refs(right, out);
@@ -2680,7 +2687,10 @@ fn max_param_from(f: &FromItem) -> usize {
 fn max_param_expr(e: &Expr) -> usize {
     match e {
         Expr::Param(n) => *n as usize,
-        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) => 0,
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::WholeRow { .. }
+        | Expr::Literal(_) => 0,
         Expr::Arith { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
             max_param_expr(left).max(max_param_expr(right))
         }
@@ -5922,6 +5932,12 @@ impl Parser {
                 // Qualified ref `table.column`?
                 if *self.peek() == Token::Dot {
                     self.next();
+                    // v0.73: `qual.*` in expression position is PG19's
+                    // whole-row Var (varattno = 0), not a column ref.
+                    if *self.peek() == Token::Star {
+                        self.next();
+                        return Ok(Expr::WholeRow { qual: name });
+                    }
                     let col = self.expect_ident()?;
                     return Ok(Expr::Column {
                         table: Some(name),
@@ -5972,6 +5988,12 @@ impl Parser {
                 // Qualified ref `"table".column`?
                 if *self.peek() == Token::Dot {
                     self.next();
+                    // v0.73: `qual.*` in expression position is PG19's
+                    // whole-row Var (varattno = 0), not a column ref.
+                    if *self.peek() == Token::Star {
+                        self.next();
+                        return Ok(Expr::WholeRow { qual: name });
+                    }
                     let col = self.expect_ident()?;
                     return Ok(Expr::Column {
                         table: Some(name),
@@ -8374,6 +8396,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "nextval" | "currval" | "setval"
         // v0.14: PostgreSQL internal operator-function aliases
         | "booleq" | "boolne" | "int4eq" | "texteq"
+        // v0.73: row_to_json(record) -> json (json.c).
+        | "row_to_json"
     )
 }
 
@@ -8401,6 +8425,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "setval" => n == 2 || n == 3,
         // v0.14: PostgreSQL internal operator-function aliases
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
+        // v0.73: row_to_json(record) takes exactly one argument.
+        "row_to_json" => n == 1,
         _ => false,
     };
     if ok {
@@ -8675,7 +8701,7 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         }
         Expr::Param(_) => Err(err(format!("cannot use parameter in {} constraint", what))),
         Expr::ResolvedCol { .. } => Err(err(format!("invalid expression in {}", what))),
-        Expr::Column { .. } | Expr::Literal(_) => Ok(()),
+        Expr::Column { .. } | Expr::WholeRow { .. } | Expr::Literal(_) => Ok(()),
         Expr::Arith { left, right, .. } => {
             validate_constraint_expr(left, what)?;
             validate_constraint_expr(right, what)
@@ -8822,6 +8848,12 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             sexpr_escape(table.as_deref().unwrap_or(""), out);
             out.push(' ');
             sexpr_escape(name, out);
+            out.push(')');
+        }
+        // v0.73: whole-row Var.
+        Expr::WholeRow { qual } => {
+            out.push_str("(wholerow ");
+            sexpr_escape(qual, out);
             out.push(')');
         }
         Expr::Literal(l) => encode_literal(l, out),
@@ -9129,6 +9161,8 @@ impl<'a> SexprParser<'a> {
                     name,
                 }
             }
+            // v0.73: whole-row Var.
+            "wholerow" => Expr::WholeRow { qual: self.atom()? },
             "lit" => Expr::Literal(self.literal()?),
             "param" => Expr::Param(self.atom()?.parse::<u32>().map_err(|_| "bad param")?),
             "arith" => {

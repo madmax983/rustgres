@@ -3390,7 +3390,7 @@ fn describe_returning(
     for item in returning {
         match item {
             SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(eng, snap, own, session, &refs, &[], expr)?;
+                let ty = expr_type(eng, snap, own, session, &refs, &[], &[], expr)?;
                 let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
                 out.push((name, ty));
             }
@@ -7757,7 +7757,8 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Timestamptz(_) => ColType::Timestamptz,
         Value::Bytea(_) => ColType::Bytea,
         Value::Uuid(_) => ColType::Uuid,
-        Value::PgLsn(_) => ColType::PgLsn, // v0.64
+        Value::PgLsn(_) => ColType::PgLsn,   // v0.64
+        Value::Record(_) => ColType::Record, // v0.73
         Value::Null => ColType::Text,
     }
 }
@@ -8309,6 +8310,100 @@ fn qual_star_order(schema: &[QCol], qual: &str) -> Vec<usize> {
     idx
 }
 
+/// v0.73: evaluate a PG19 whole-row Var (`tbl` / `tbl.*` in expression
+/// position) to a composite `Value::Record`. The field order is the
+/// qualifier's source-column order — exactly matching target-list
+/// `tbl.*` expansion via `qual_star_order`. Hidden join-original columns
+/// are skipped the same way. An unknown qualifier is PG19's 42703.
+fn eval_wholerow(scopes: &[Scope], qual: &str) -> Result<Value, ExecError> {
+    for sc in scopes.iter().rev() {
+        let idx = qual_star_order(sc.schema, qual);
+        if idx.is_empty() {
+            continue;
+        }
+        let fields: Vec<(String, Value)> = idx
+            .into_iter()
+            .map(|i| {
+                let c = &sc.schema[i];
+                (c.name.clone(), sc.row[i].clone())
+            })
+            .collect();
+        return Ok(Value::Record(fields));
+    }
+    Err(exec_err(
+        "42703",
+        format!("missing FROM-clause entry for table \"{qual}\""),
+    ))
+}
+
+/// v0.73: `row_to_json(record)` (json.c): one JSON object, field names as
+/// keys, values per PG's `datum_to_json` — strings quoted with JSON
+/// escapes, numbers/bools bare, NULL as `null`. Nested records recurse.
+/// Carried as `Value::Text` typed `ColType::Json`.
+fn row_to_json_text(fields: &[(String, Value)]) -> String {
+    fn esc(s: &str, out: &mut String) {
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+    }
+    fn val(v: &Value, out: &mut String) {
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Record(fs) => out.push_str(&row_to_json_text(fs)),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            // v0.35: bpchar renders rtrimmed in casts, but json.c uses the
+            // value's output text; keep the stored text form here.
+            Value::Text(s) | Value::BpChar(s) => {
+                out.push('"');
+                esc(s, out);
+                out.push('"');
+            }
+            other => match other.to_text() {
+                Some(t) => {
+                    // Numeric-likes render bare; anything else is quoted.
+                    let bare = matches!(
+                        other,
+                        Value::SmallInt(_)
+                            | Value::Int(_)
+                            | Value::BigInt(_)
+                            | Value::Float4(_)
+                            | Value::Float(_)
+                            | Value::Numeric(_)
+                    );
+                    if bare {
+                        out.push_str(&t);
+                    } else {
+                        out.push('"');
+                        esc(&t, out);
+                        out.push('"');
+                    }
+                }
+                None => out.push_str("null"),
+            },
+        }
+    }
+    let mut out = String::from("{");
+    for (i, (name, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        esc(name, &mut out);
+        out.push_str("\":");
+        val(v, &mut out);
+    }
+    out.push('}');
+    out
+}
+
 /// One working row: cell values parallel to the schema, plus provenance —
 /// (table name, row-version id) of each contributing base-table row —
 /// used by SELECT ... FOR UPDATE.
@@ -8335,9 +8430,11 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
                 }
                 args.iter().any(expr_uses)
             }
-            Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => {
-                false
-            }
+            Expr::Column { .. }
+            | Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_) => false,
             Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Cast { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
@@ -8514,8 +8611,36 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
     let r = |e: &Expr| resolve_predicate_columns_in(e, scopes);
     match pred {
         Expr::Column { table, name } => {
-            let (frame, idx) = resolve_col(scopes, table.as_deref(), name)?;
-            Ok(Expr::ResolvedCol { frame, idx })
+            match resolve_col(scopes, table.as_deref(), name) {
+                Ok((frame, idx)) => Ok(Expr::ResolvedCol { frame, idx }),
+                Err(e) => {
+                    // v0.73: PG19 whole-row fallback at plan time (see
+                    // eval_expr): a bare range name becomes a whole-row Var.
+                    if table.is_none()
+                        && e.code == "42703"
+                        && scopes
+                            .iter()
+                            .any(|sc| sc.schema.iter().any(|c| c.qual == *name))
+                    {
+                        return Ok(Expr::WholeRow { qual: name.clone() });
+                    }
+                    Err(e)
+                }
+            }
+        }
+        // v0.73: whole-row refs validate the qualifier at plan time
+        // (PG19 42703), then resolve per row at runtime.
+        Expr::WholeRow { qual } => {
+            if !scopes
+                .iter()
+                .any(|sc| sc.schema.iter().any(|c| c.qual == *qual))
+            {
+                return Err(exec_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table \"{qual}\""),
+                ));
+            }
+            Ok(pred.clone())
         }
         // Leaves and already-resolved nodes pass through (idempotent).
         Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => Ok(pred.clone()),
@@ -8945,7 +9070,7 @@ fn case_result_type(
         if unknown(e) {
             continue;
         }
-        let t = expr_type(eng, snap, own, session, schemas, ctes, e)?;
+        let t = expr_type(eng, snap, own, session, schemas, &[], ctes, e)?;
         acc = Some(match acc {
             Some(a) => common_supertype("CASE", &a, &t)?,
             None => t,
@@ -9677,7 +9802,18 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
     validate_select(stmt)?;
     // Column metadata first, so names/types are identical between
     // Describe and execution.
-    let out_cols = describe_select(&*q.eng, q.snap, q.own, q.session, stmt, &q.ctes)?;
+    // v0.73: PG19 correlated references — the enclosing scopes' schemas
+    // let a subquery's output describe resolve outer range/column refs.
+    let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+    let out_cols = describe_select(
+        &*q.eng,
+        q.snap,
+        q.own,
+        q.session,
+        stmt,
+        &q.ctes,
+        &outer_schemas,
+    )?;
     // v0.8: when the whole query is a plain single-table SELECT whose
     // ORDER BY matches an index, rows stream out of the index in ORDER BY
     // order and the sort step below is skipped.
@@ -10114,7 +10250,11 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
 fn contains_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } => true,
-        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => false,
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::WholeRow { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_) => false,
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
@@ -10171,7 +10311,11 @@ fn contains_agg(e: &Expr) -> bool {
 fn contains_window(e: &Expr) -> bool {
     match e {
         Expr::Window { .. } => true,
-        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => false,
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::WholeRow { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_) => false,
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
@@ -10488,6 +10632,7 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         Expr::InSub { expr, .. } => validate_window_expr(expr, in_agg),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
+        | Expr::WholeRow { .. }
         | Expr::Literal(_)
         | Expr::Param(_)
         | Expr::ScalarSub(_)
@@ -11868,6 +12013,8 @@ fn filter_rows(
 fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        // v0.73: a whole-row ref depends on every column of the range.
+        Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
         // Already resolved (unambiguous by construction): nothing to collect.
         Expr::ResolvedCol { .. } => {}
         Expr::Literal(_) | Expr::Param(_) => {}
@@ -12545,7 +12692,7 @@ fn lateral_function_schema(
         let schemas = [left];
         let mut tys = Vec::with_capacity(args.len());
         for a in args {
-            tys.push(expr_type(eng, snap, own, session, &schemas, &[], a)?);
+            tys.push(expr_type(eng, snap, own, session, &schemas, &[], &[], a)?);
         }
         let ty = if tys.iter().any(|t| matches!(t, ColType::Numeric(..))) {
             ColType::Numeric(None)
@@ -13745,6 +13892,15 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.push(14);
             out.push(*b);
         }
+        // v0.73: records group by their field values (names do not
+        // participate, like PG's record equality).
+        Value::Record(fields) => {
+            out.push(16);
+            out.extend_from_slice(&(fields.len() as u64).to_be_bytes());
+            for (_, f) in fields {
+                value_key(f, out);
+            }
+        }
     }
 }
 
@@ -14163,13 +14319,32 @@ fn eval_grouped(
             *distinct,
             arg2.as_deref(),
         ),
-        Expr::Column { table, name } => grouped_col_value(
-            gscope,
-            group_by,
-            key_vals,
-            table.as_deref().unwrap_or(""),
-            name,
-        ),
+        Expr::Column { table, name } => {
+            let qual = table.as_deref().unwrap_or("");
+            // v0.73: PG19 whole-row fallback for a bare range name (see
+            // eval_expr); evaluates against the group's first row.
+            if qual.is_empty()
+                && matches!(
+                    resolve_col(&[gscope], None, name),
+                    Err(ref e) if e.code == "42703"
+                )
+                && gscope.schema.iter().any(|c| c.qual == *name)
+            {
+                let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(gscope);
+                return eval_wholerow(&scopes, name);
+            }
+            grouped_col_value(gscope, group_by, key_vals, qual, name)
+        }
+        // v0.73: whole-row refs evaluate against the group's first row,
+        // like correlated subqueries do here.
+        Expr::WholeRow { qual } => {
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(gscope);
+            eval_wholerow(&scopes, qual)
+        }
         // Resolved columns never reach grouped evaluation (GROUP BY /
         // select-list expressions are resolved per row at runtime).
         Expr::ResolvedCol { .. } => Err(exec_err(
@@ -14727,12 +14902,15 @@ fn eval_agg_func(
         let v = eval_expr(q, scopes, a)?;
         if func == AggFunc::StringAgg {
             let d = eval_expr(q, scopes, arg2.expect("string_agg takes a delimiter"))?;
-            if v == Value::Null {
+            // v0.73: whole-row null test (see the general filter below).
+            if crate::storage::value_is_null(&v) {
                 continue;
             }
             vals.push(v);
             delims.push(d);
-        } else if v != Value::Null {
+        // v0.73: a whole-row value counts as null iff every field is
+        // null (PG19: `count(t.*)` skips null-extended outer-join rows).
+        } else if !crate::storage::value_is_null(&v) {
             vals.push(v);
         }
     }
@@ -15309,9 +15487,29 @@ fn order_key(
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
         Expr::Column { table, name } => {
-            let (si, ci) = resolve_col(scopes, table.as_deref(), name)?;
-            Ok(scopes[si].row[ci].clone())
+            match resolve_col(scopes, table.as_deref(), name) {
+                Ok((si, ci)) => Ok(scopes[si].row[ci].clone()),
+                Err(e) => {
+                    // v0.73: PG19 whole-row fallback — a bare identifier
+                    // that names no column but names a range is a
+                    // whole-row Var (`SELECT view_a FROM view_a`,
+                    // `RETURNING tbl`). Column references win over range
+                    // names, and a genuinely unknown name keeps its 42703.
+                    if table.is_none()
+                        && e.code == "42703"
+                        && scopes
+                            .iter()
+                            .any(|sc| sc.schema.iter().any(|c| c.qual == *name))
+                    {
+                        return eval_wholerow(scopes, name);
+                    }
+                    Err(e)
+                }
+            }
         }
+        // v0.73: PG19 whole-row Var — `tbl` / `tbl.*` in expression
+        // position evaluates to a composite record value.
+        Expr::WholeRow { qual } => eval_wholerow(scopes, qual),
         // Pre-resolved by resolve_predicate_columns for a fixed scope
         // shape: direct positional fetch, no name lookup. The positions
         // were resolved against these exact schemas, so the indexes hold.
@@ -15435,7 +15633,9 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         }
         Expr::IsNull { expr: x, neg } => {
             let v = eval_expr(q, scopes, x)?;
-            Ok(Value::Bool((v == Value::Null) != *neg))
+            // v0.73: a whole-row value is null iff every field is null
+            // (PG19 ExecEvalNullTest / IS NULL semantics).
+            Ok(Value::Bool(crate::storage::value_is_null(&v) != *neg))
         }
         // v0.48: `IS [NOT] DISTINCT FROM` — the NULL-safe comparison
         // (PG19): NULLs compare equal and never produce unknown; NaN
@@ -18115,6 +18315,14 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 }
             }
         },
+        // v0.73: no composite input function — nothing casts TO record.
+        ColType::Record => Err(cast_err(v, "record")),
+        // v0.73: PG19 has record->json and text->json casts.
+        ColType::Json => match v {
+            Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
+            Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
+            other => Err(cast_err(other, "json")),
+        },
     }
 }
 
@@ -18756,6 +18964,9 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 Value::Timestamptz(_) => 8,
                 Value::Uuid(_) => 16,
                 Value::PgLsn(_) => 8, // v0.64
+                // v0.73: records never persist in tables; approximate
+                // from the rendered text length if one ever appears.
+                Value::Record(fields) => crate::storage::record_text(fields).len() as i64,
             };
         }
         size += 24; // per-tuple overhead (approximate)
@@ -18775,6 +18986,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "cbrt" | "factorial" | "numeric_inc" => n == 1,
         // v0.64: pg_lsn(numeric) -> pg_lsn display.
         "pg_lsn" => n == 1,
+        // v0.73: row_to_json(record) takes exactly one argument.
+        "row_to_json" => n == 1,
         "scale" | "trim_scale" => n == 1,
         "min_scale" => n == 1,
         "pi" | "random" => n == 0,
@@ -19024,6 +19237,13 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         // conformance): booleq(x,y) ≡ x = y, boolne(x,y) ≡ x <> y, etc.
         "booleq" | "int4eq" | "texteq" => eval_cmp_vals(CmpOp::Eq, &vals[0], &vals[1]),
         "boolne" => eval_cmp_vals(CmpOp::Ne, &vals[0], &vals[1]),
+        // v0.73: row_to_json(record) -> json (json.c). The JSON document
+        // is carried as text typed `ColType::Json`.
+        "row_to_json" => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
+            other => Err(func_arg_err(name, other)),
+        },
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -23872,9 +24092,10 @@ fn func_result_type(
     own: u64,
     session: u64,
     schemas: &[&[QCol]],
+    outer: &[&[QCol]],
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
-    let arg0 = || expr_type(eng, snap, own, session, schemas, ctes, &args[0]);
+    let arg0 = || expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0]);
     // v0.33: bytea-returning string functions dispatch on input type.
     let bytea_if_arg0_bytea = || match arg0() {
         Ok(ColType::Bytea) => Ok(ColType::Bytea),
@@ -23921,7 +24142,7 @@ fn func_result_type(
                 return Ok(ColType::Numeric(None));
             }
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -23938,7 +24159,7 @@ fn func_result_type(
         // Postgres returns numeric for sqrt(real)).
         "sqrt" | "power" => {
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -23948,7 +24169,7 @@ fn func_result_type(
         // v0.18: exp/ln/log return numeric (or float if any arg is float).
         "exp" | "ln" | "log" => {
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -23960,7 +24181,7 @@ fn func_result_type(
         // 42883 before evaluation is ever reached.
         "cbrt" | "degrees" | "radians" => {
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -23980,7 +24201,7 @@ fn func_result_type(
                 return Ok(ColType::Numeric(None));
             }
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     ColType::Float4 | ColType::Float => return Ok(ColType::Float),
                     _ => {}
                 }
@@ -23990,6 +24211,8 @@ fn func_result_type(
         "scale" | "min_scale" | "width_bucket" => Ok(ColType::Int),
         // v0.64: pg_lsn returns display text (pg_lsn type not yet a Value).
         "pg_lsn" => Ok(ColType::PgLsn), // v0.64: native pg_lsn type (OID 3220)
+        // v0.73: row_to_json returns json (OID 114).
+        "row_to_json" => Ok(ColType::Json),
         "random" => Ok(ColType::Float),
         // v0.21: float8 transcendental functions always return float8.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
@@ -24012,7 +24235,7 @@ fn func_result_type(
             Ok(ColType::Timestamptz)
         }
         "current_date" => Ok(ColType::Date),
-        "date_trunc" => match expr_type(eng, snap, own, session, schemas, ctes, &args[1])? {
+        "date_trunc" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
             _ => Ok(ColType::Timestamp),
         },
@@ -24026,7 +24249,7 @@ fn func_result_type(
         // v0.17: version() returns text.
         "version" => Ok(ColType::Text),
         "make_timestamp" => Ok(ColType::Timestamp),
-        "timezone" => match expr_type(eng, snap, own, session, schemas, ctes, &args[1])? {
+        "timezone" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamp),
             ColType::Timestamp => Ok(ColType::Timestamptz),
             // Other inputs are a runtime 42883; Describe still needs a
@@ -24054,7 +24277,7 @@ fn func_result_type(
             }
             let mut ty = ColType::Int;
             for a in args {
-                match expr_type(eng, snap, own, session, schemas, ctes, a)? {
+                match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
                     n @ ColType::Numeric(..) => return Ok(n),
                     ColType::BigInt => ty = ColType::BigInt,
                     _ => {}
@@ -24219,7 +24442,8 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Timestamptz(_) => "timestamptz",
         Value::Bytea(_) => "bytea",
         Value::Uuid(_) => "uuid",
-        Value::PgLsn(_) => "pg_lsn", // v0.64
+        Value::PgLsn(_) => "pg_lsn",  // v0.64
+        Value::Record(_) => "record", // v0.73
         Value::Null => "null",
     }
 }
@@ -24362,7 +24586,7 @@ fn from_schema_item(
                         ));
                     }
                 };
-                let cols = describe_select(eng, snap, own, session, &select, &[])?;
+                let cols = describe_select(eng, snap, own, session, &select, &[], &[])?;
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = cols
                     .into_iter()
@@ -24454,7 +24678,7 @@ fn from_schema_item(
             alias,
             col_aliases,
         } => {
-            let cols = describe_select_outer(eng, snap, own, session, sub, visible, &[])?;
+            let cols = describe_select_outer(eng, snap, own, session, sub, visible, &[], &[])?;
             // v0.23: more column aliases than output columns is 42601.
             check_col_alias_arity(alias, cols.len(), col_aliases)?;
             out.push(
@@ -24615,7 +24839,7 @@ fn describe_cte(
         CteBody::Simple(s) => s,
         CteBody::Union { left, .. } => left,
     };
-    let cols = describe_select_outer(eng, snap, own, session, body, earlier, &[])?;
+    let cols = describe_select_outer(eng, snap, own, session, body, earlier, &[], &[])?;
     // v0.23: more column aliases than CTE output columns is 42601.
     check_col_alias_arity(&cte.name, cols.len(), &cte.col_aliases)?;
     Ok(cols
@@ -24641,8 +24865,9 @@ fn describe_select(
     session: u64,
     stmt: &SelectStmt,
     bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
-    describe_select_outer(eng, snap, own, session, stmt, &[], bindings)
+    describe_select_outer(eng, snap, own, session, stmt, &[], bindings, outer_schemas)
 }
 
 /// v0.44: describe a set-operation root: describe every branch, require
@@ -24657,15 +24882,34 @@ fn describe_set_op(
     root: &SetOpRoot,
     visible: &[CteDef],
     bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
-    let mut out = describe_select_outer(eng, snap, own, session, &root.left, visible, bindings)?;
+    let mut out = describe_select_outer(
+        eng,
+        snap,
+        own,
+        session,
+        &root.left,
+        visible,
+        bindings,
+        outer_schemas,
+    )?;
     for b in &root.chain {
         let op_name = match b.op {
             SetOpKind::Union => "UNION",
             SetOpKind::Intersect => "INTERSECT",
             SetOpKind::Except => "EXCEPT",
         };
-        let r = describe_select_outer(eng, snap, own, session, &b.right, visible, bindings)?;
+        let r = describe_select_outer(
+            eng,
+            snap,
+            own,
+            session,
+            &b.right,
+            visible,
+            bindings,
+            outer_schemas,
+        )?;
         if r.len() != out.len() {
             return Err(exec_err(
                 "42804",
@@ -24694,6 +24938,7 @@ fn describe_select_outer(
     stmt: &SelectStmt,
     outer: &[CteDef],
     bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     let mut visible: Vec<CteDef> = outer.to_vec();
     visible.extend(stmt.with.iter().cloned());
@@ -24701,7 +24946,16 @@ fn describe_select_outer(
     // from the leftmost branch, types resolved per column. The carrier's
     // WITH (now in `visible`) applies to every branch.
     if let Some(root) = &stmt.set_op {
-        return describe_set_op(eng, snap, own, session, root, &visible, bindings);
+        return describe_set_op(
+            eng,
+            snap,
+            own,
+            session,
+            root,
+            &visible,
+            bindings,
+            outer_schemas,
+        );
     }
     let schemas = from_schemas(eng, snap, own, session, &stmt.from, &visible, bindings)?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
@@ -24734,7 +24988,16 @@ fn describe_select_outer(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(eng, snap, own, session, &refs, &visible, expr)?;
+                let ty = expr_type(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    &refs,
+                    outer_schemas,
+                    &visible,
+                    expr,
+                )?;
                 let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
                 out.push((name, ty));
             }
@@ -24755,6 +25018,21 @@ fn describe_select_outer(
 fn expr_col_name_strength(e: &Expr) -> (String, u8) {
     match e {
         Expr::Column { name, .. } => (name.clone(), 2),
+        // v0.73: PG19 names an unaliased whole-row Var after the range
+        // (`SELECT tbl` -> `tbl`).
+        Expr::WholeRow { qual } => (qual.clone(), 2),
+        // v0.73: PG19 names a scalar subquery's output column after the
+        // subquery's own output column (`SELECT (SELECT view_a)` -> `view_a`).
+        Expr::ScalarSub(sub) => match sub.items.as_slice() {
+            [crate::sql::SelectItem::Expr { expr, alias }] => {
+                if let Some(a) = alias {
+                    (a.clone(), 2)
+                } else {
+                    expr_col_name_strength(expr)
+                }
+            }
+            _ => ("?column?".to_string(), 0),
+        },
         Expr::Agg { func, .. } => (func.name().to_string(), 2),
         Expr::Cast { expr, to } => {
             let (inner, s) = expr_col_name_strength(expr);
@@ -24782,11 +25060,15 @@ fn expr_type(
     own: u64,
     session: u64,
     schemas: &[&[QCol]],
+    outer: &[&[QCol]],
     ctes: &[CteDef],
     e: &Expr,
 ) -> Result<ColType, ExecError> {
     match e {
         Expr::Column { table, name } => {
+            // v0.73: PG19 correlated references — a subquery's expressions
+            // resolve against the enclosing query's ranges after its own
+            // (ambiguity is reported per level, like PG).
             let scopes: Vec<Scope> = schemas
                 .iter()
                 .map(|s| Scope {
@@ -24795,8 +25077,49 @@ fn expr_type(
                     prov: None,
                 })
                 .collect();
-            let (si, ci) = resolve_col(&scopes, table.as_deref(), name)?;
-            Ok(schemas[si][ci].ty.clone())
+            let oscopes: Vec<Scope> = outer
+                .iter()
+                .map(|s| Scope {
+                    schema: s,
+                    row: &[],
+                    prov: None,
+                })
+                .collect();
+            // v0.73: PG19 whole-row fallback (see eval_expr): a bare range
+            // name has the `record` pseudo-type.
+            let is_range = |ss: &[&[QCol]]| {
+                table.is_none() && ss.iter().any(|s| s.iter().any(|c| c.qual == *name))
+            };
+            match resolve_col(&scopes, table.as_deref(), name) {
+                Ok((si, ci)) => Ok(schemas[si][ci].ty.clone()),
+                Err(e) if e.code == "42703" => {
+                    match resolve_col(&oscopes, table.as_deref(), name) {
+                        Ok((si, ci)) => Ok(outer[si][ci].ty.clone()),
+                        Err(e2) => {
+                            if e2.code == "42703" && (is_range(schemas) || is_range(outer)) {
+                                return Ok(ColType::Record);
+                            }
+                            Err(if e2.code == "42703" { e } else { e2 })
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // v0.73: a whole-row Var has PG's `record` pseudo-type (the
+        // per-table rowtype OID is a documented gap; 2249 is genuine).
+        // An unknown qualifier is PG19's 42703.
+        Expr::WholeRow { qual } => {
+            // v0.73: a correlated whole-row Var may name an outer range.
+            if !schemas.iter().any(|s| s.iter().any(|c| c.qual == *qual))
+                && !outer.iter().any(|s| s.iter().any(|c| c.qual == *qual))
+            {
+                return Err(exec_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table \"{qual}\""),
+                ));
+            }
+            Ok(ColType::Record)
         }
         // Pre-resolved: the type lives at the same position in the schemas.
         Expr::ResolvedCol { frame, idx } => schemas
@@ -24807,8 +25130,8 @@ fn expr_type(
         Expr::Literal(lit) => Ok(lit.col_type()),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
         Expr::Arith { op, left, right } => {
-            let ta = arith_operand_type(eng, snap, own, session, schemas, ctes, left, *op)?;
-            let tb = arith_operand_type(eng, snap, own, session, schemas, ctes, right, *op)?;
+            let ta = arith_operand_type(eng, snap, own, session, schemas, outer, ctes, left, *op)?;
+            let tb = arith_operand_type(eng, snap, own, session, schemas, outer, ctes, right, *op)?;
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
@@ -24820,7 +25143,7 @@ fn expr_type(
             if matches!(**x, Expr::Literal(Literal::Null)) {
                 return Ok(ColType::Int);
             }
-            match expr_type(eng, snap, own, session, schemas, ctes, x)? {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, x)? {
                 ColType::BigInt => Ok(ColType::BigInt),
                 ColType::SmallInt | ColType::Int => Ok(ColType::Int),
                 t => Err(exec_err(
@@ -24834,7 +25157,7 @@ fn expr_type(
             // stays int2 — the old `0 - x` desugar widened it to int).
             // An unknown-type (text) literal resolves to integer, as
             // the old `0 - text` typing did.
-            match expr_type(eng, snap, own, session, schemas, ctes, x)? {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, x)? {
                 t @ (ColType::SmallInt
                 | ColType::Int
                 | ColType::BigInt
@@ -24871,7 +25194,7 @@ fn expr_type(
                     ) {
                         continue;
                     }
-                    let t = expr_type(eng, snap, own, session, schemas, ctes, k)?;
+                    let t = expr_type(eng, snap, own, session, schemas, outer, ctes, k)?;
                     cmp_acc = Some(match cmp_acc {
                         Some(a) => common_supertype("CASE", &a, &t)?,
                         None => t,
@@ -24894,7 +25217,7 @@ fn expr_type(
         | Expr::InSub { .. }
         | Expr::Exists { .. } => Ok(ColType::Bool),
         Expr::Func { name, args } => {
-            func_result_type(name, args, eng, snap, own, session, schemas, ctes)
+            func_result_type(name, args, eng, snap, own, session, schemas, outer, ctes)
         }
         Expr::Extract { .. } => Ok(ColType::Numeric(None)),
         Expr::Agg {
@@ -24908,13 +25231,19 @@ fn expr_type(
             own,
             session,
             schemas,
+            outer,
             ctes,
             *func,
             arg.as_deref(),
             arg2.as_deref(),
         ),
         Expr::ScalarSub(sub) => {
-            let cols = describe_select_outer(eng, snap, own, session, sub, ctes, &[])?;
+            // v0.73: the subquery sees this level's ranges (plus any
+            // enclosing ones) as correlated outer scopes.
+            let mut sub_outer: Vec<&[QCol]> = Vec::with_capacity(schemas.len() + outer.len());
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            let cols = describe_select_outer(eng, snap, own, session, sub, ctes, &[], &sub_outer)?;
             if cols.len() != 1 {
                 return Err(exec_err("42601", "subquery must return only one column"));
             }
@@ -24922,7 +25251,7 @@ fn expr_type(
         }
         // v0.10: window function result types.
         Expr::Window { func, args, .. } => {
-            window_result_type(eng, snap, own, session, schemas, ctes, func, args)
+            window_result_type(eng, snap, own, session, schemas, outer, ctes, func, args)
         }
     }
 }
@@ -24934,6 +25263,7 @@ fn window_result_type(
     own: u64,
     session: u64,
     schemas: &[&[QCol]],
+    outer: &[&[QCol]],
     ctes: &[CteDef],
     func: &WindowFunc,
     args: &[Expr],
@@ -24953,12 +25283,12 @@ fn window_result_type(
             let a = args
                 .first()
                 .ok_or_else(|| exec_err("42883", "window function requires an argument"))?;
-            expr_type(eng, snap, own, session, schemas, ctes, a)
+            expr_type(eng, snap, own, session, schemas, outer, ctes, a)
         }
         WindowFunc::Agg(f) => {
             let arg = args.first();
             let arg2 = args.get(1);
-            agg_result_type(eng, snap, own, session, schemas, ctes, *f, arg, arg2)
+            agg_result_type(eng, snap, own, session, schemas, outer, ctes, *f, arg, arg2)
         }
     }
 }
@@ -24971,6 +25301,7 @@ fn arith_operand_type(
     own: u64,
     session: u64,
     schemas: &[&[QCol]],
+    outer: &[&[QCol]],
     ctes: &[CteDef],
     e: &Expr,
     op: ArithOp,
@@ -24979,28 +25310,36 @@ fn arith_operand_type(
         Expr::Literal(Literal::Null) => Ok(None),
         Expr::Literal(lit) => Ok(Some(lit.col_type())),
         Expr::Param(n) => Err(exec_err("42P02", format!("there is no parameter ${}", n))),
-        Expr::Column { .. } | Expr::ResolvedCol { .. } => {
-            Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?))
-        }
+        Expr::Column { .. } | Expr::ResolvedCol { .. } => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         Expr::Arith {
             op: inner,
             left,
             right,
         } => {
-            let ta = arith_operand_type(eng, snap, own, session, schemas, ctes, left, *inner)?;
-            let tb = arith_operand_type(eng, snap, own, session, schemas, ctes, right, *inner)?;
+            let ta =
+                arith_operand_type(eng, snap, own, session, schemas, outer, ctes, left, *inner)?;
+            let tb =
+                arith_operand_type(eng, snap, own, session, schemas, outer, ctes, right, *inner)?;
             Ok(Some(combine_arith_types(*inner, ta, tb)?))
         }
-        Expr::Agg { .. } | Expr::ScalarSub(_) => {
-            Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?))
-        }
+        Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         Expr::Cast { to, .. } => Ok(Some(*to)),
-        Expr::Func { .. } => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        Expr::Func { .. } => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         Expr::Concat(..) => Ok(Some(ColType::Text)),
         // v0.25: `~x` result type via the shared expr_type rule.
-        Expr::BitNot(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        Expr::BitNot(_) => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         // v0.53: `-x` result type via the shared expr_type rule.
-        Expr::Neg(_) => Ok(Some(expr_type(eng, snap, own, session, schemas, ctes, e)?)),
+        Expr::Neg(_) => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         // v0.55: best-effort CASE hint = common type of the result
         // arms' hints (unknown literals skipped, conflicts ignored).
         Expr::Case { whens, else_, .. } => {
@@ -25179,6 +25518,7 @@ fn agg_result_type(
     own: u64,
     session: u64,
     schemas: &[&[QCol]],
+    outer: &[&[QCol]],
     ctes: &[CteDef],
     func: AggFunc,
     arg: Option<&Expr>,
@@ -25191,7 +25531,7 @@ fn agg_result_type(
             if let Some(a) = arg {
                 numeric_agg_arg(
                     "avg",
-                    &expr_type(eng, snap, own, session, schemas, ctes, a)?,
+                    &expr_type(eng, snap, own, session, schemas, outer, ctes, a)?,
                 )?;
             }
             Ok(ColType::Float)
@@ -25200,7 +25540,7 @@ fn agg_result_type(
             // Only COUNT takes `*`; the parser guarantees it.
             None => Ok(ColType::Int),
             Some(a) => {
-                let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+                let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
                 numeric_agg_arg("sum", &t)?;
                 // v0.6 rule kept (documented): sum returns the
                 // argument type; Postgres would widen int->bigint.
@@ -25209,13 +25549,13 @@ fn agg_result_type(
         },
         AggFunc::Min | AggFunc::Max => {
             let a = arg.expect("min/max always take an argument");
-            expr_type(eng, snap, own, session, schemas, ctes, a)
+            expr_type(eng, snap, own, session, schemas, outer, ctes, a)
         }
         AggFunc::StringAgg => {
             // Delimiter should be text-ish; be permissive here (the
             // executor coerces via casts) and just require an argument.
             let a = arg.expect("string_agg always takes arguments");
-            let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
             if !matches!(t, ColType::Text) {
                 return Err(exec_err(
                     "42883",
@@ -25227,7 +25567,7 @@ fn agg_result_type(
         }
         AggFunc::BoolAnd => {
             let a = arg.expect("bool_and always takes an argument");
-            let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
             if !matches!(t, ColType::Bool) {
                 return Err(exec_err(
                     "42883",
@@ -25238,7 +25578,7 @@ fn agg_result_type(
         }
         AggFunc::VarianceSamp | AggFunc::VariancePop | AggFunc::StddevSamp | AggFunc::StddevPop => {
             let a = arg.expect("variance/stddev always take an argument");
-            let t = expr_type(eng, snap, own, session, schemas, ctes, a)?;
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
             // PG: variance(int-kind) -> numeric; variance(float) ->
             // double precision; variance(numeric) -> numeric.
             match t {
@@ -25325,7 +25665,7 @@ fn hint_type(
         Expr::Concat(..) => Some(ColType::Text),
         Expr::Extract { .. } => Some(ColType::Numeric(None)),
         Expr::Func { name, args } => {
-            func_result_type(name, args, eng, snap, own, session, schemas, &[]).ok()
+            func_result_type(name, args, eng, snap, own, session, schemas, &[], &[]).ok()
         }
         Expr::Agg {
             func,
@@ -25339,13 +25679,14 @@ fn hint_type(
             session,
             schemas,
             &[],
+            &[],
             *func,
             arg.as_deref(),
             arg2.as_deref(),
         )
         .ok(),
         Expr::ScalarSub(sub) => {
-            let cols = describe_select(eng, snap, own, session, sub, &[]).ok()?;
+            let cols = describe_select(eng, snap, own, session, sub, &[], &[]).ok()?;
             if cols.len() == 1 {
                 Some(cols[0].1.clone())
             } else {
@@ -25488,7 +25829,7 @@ fn infer_expr(
             infer_select(sub, eng, snap, own, session, schemas, out)?;
             // `$N IN (SELECT col ...)` pins the param to the column type.
             if let Expr::Param(p) = **expr {
-                if let Ok(cols) = describe_select(eng, snap, own, session, sub, &[]) {
+                if let Ok(cols) = describe_select(eng, snap, own, session, sub, &[], &[]) {
                     if cols.len() == 1 {
                         pin_param(out, p, cols[0].1.clone())?;
                     }
@@ -26035,6 +26376,14 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         }
         // v0.37: regclass input not supported via binary protocol.
         ColType::Regclass => Err(bad("invalid input syntax for type regclass".into())),
+        // v0.73: record input is not supported (no composite input
+        // function); json accepts its text form.
+        ColType::Record => Err(bad("invalid input syntax for type record".into())),
+        ColType::Json => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            Ok(Value::text(s))
+        }
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -26265,6 +26614,9 @@ fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::PgLsn(lsn)) => {
             Literal::Text(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF).into())
         }
+        // v0.73: records never arrive as parameters (parse_param_value
+        // rejects the record type); substituting NULL is unreachable.
+        Some(Value::Record(_)) => Literal::Null,
         Some(Value::Null) => Literal::Null,
     }
 }
@@ -26357,6 +26709,10 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Regclass => Value::Text("".into()),
         ColType::Name => Value::text(""),  // v0.57
         ColType::PgLsn => Value::PgLsn(0), // v0.64
+        // v0.73: records never appear as parameter types in practice;
+        // the empty record is the honest dummy.
+        ColType::Record => Value::Record(Vec::new()),
+        ColType::Json => Value::text(""),
     }
 }
 
@@ -26378,7 +26734,15 @@ pub fn describe_columns(
             let mut s = sel.clone();
             let dummy: Vec<Option<Value>> = eff.iter().map(|t| Some(dummy_value(t))).collect();
             subst_select(&mut s, &dummy)?;
-            Ok(Some(describe_select(eng, snap, own, session, &s, &[])?))
+            Ok(Some(describe_select(
+                eng,
+                snap,
+                own,
+                session,
+                &s,
+                &[],
+                &[],
+            )?))
         }
         // v0.10: DML with RETURNING describes the RETURNING list; without
         // it there are no result columns (like a plain command tag).
@@ -31067,6 +31431,8 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
                 *name = new.to_string();
             }
         }
+        // v0.73: a whole-row qualifier names a range, not a column.
+        Expr::WholeRow { .. } => {}
         Expr::Arith { left, right, .. } => {
             rename_col_in_expr(left, old, new);
             rename_col_in_expr(right, old, new);

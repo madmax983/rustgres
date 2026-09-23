@@ -144,6 +144,9 @@ fn type_tag(v: &Value) -> u8 {
         Value::SingleChar(_) => 14,
         // v0.64: pg_lsn gets its own tag (append-only).
         Value::PgLsn(_) => 15,
+        // v0.73: records never index, but the total-order fallback must
+        // stay total (append-only tag).
+        Value::Record(_) => 16,
     }
 }
 

@@ -1081,6 +1081,15 @@ impl Enc {
                 self.u8(19);
                 return;
             }
+            // v0.73: record and json; tags append after v0.64's.
+            ColType::Record => {
+                self.u8(20);
+                return;
+            }
+            ColType::Json => {
+                self.u8(21);
+                return;
+            }
         });
     }
 
@@ -1156,6 +1165,9 @@ impl Enc {
                 self.u8(16);
                 self.u64(*lsn);
             }
+            // v0.73: records never persist (INSERT/CTAS coerce or reject
+            // them first); encoding one is an internal bug.
+            Value::Record(_) => panic!("wal: whole-row record values are never stored"),
         }
     }
 
@@ -1639,6 +1651,9 @@ impl<'a> Dec<'a> {
             17 => Ok(ColType::Name),
             // v0.64: pg_lsn.
             19 => Ok(ColType::PgLsn),
+            // v0.73: record, json.
+            20 => Ok(ColType::Record),
+            21 => Ok(ColType::Json),
             // v0.60: numeric with typmod (precision, scale).
             18 => {
                 let p = self.i32()?;

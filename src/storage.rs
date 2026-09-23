@@ -69,6 +69,15 @@ pub enum ColType {
     // Number displayed as HIGH/LOW in uppercase hex, LOW zero-padded
     // to 8 digits (e.g. `0/016AE7F8`).
     PgLsn, // OID 3220
+    // v0.73: PG's `record` pseudo-type (OID 2249) — the type of a
+    // whole-row value (`tbl` / `tbl.*` in expression position). The
+    // engine does not track per-table rowtype OIDs (a documented gap);
+    // 2249 is PG's genuine `record` pseudo-type OID.
+    Record, // OID 2249
+    // v0.73: PG's `json` type (OID 114) — the return type of
+    // `row_to_json`. Values are carried as `Value::Text` holding the
+    // JSON document text.
+    Json, // OID 114
 }
 
 impl ColType {
@@ -94,6 +103,8 @@ impl ColType {
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
             ColType::Name => 19,          // NAME (v0.57)
+            ColType::Record => 2249,      // RECORD (v0.73)
+            ColType::Json => 114,         // JSON (v0.73)
         }
     }
 
@@ -121,6 +132,8 @@ impl ColType {
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Regclass => "regclass",
             ColType::Name => "name",
+            ColType::Record => "record", // v0.73
+            ColType::Json => "json",     // v0.73
         }
     }
 
@@ -151,6 +164,8 @@ impl ColType {
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Regclass => "regclass",
             ColType::Name => "name",
+            ColType::Record => "record", // v0.73
+            ColType::Json => "json",     // v0.73
         }
     }
 
@@ -3722,6 +3737,12 @@ pub enum Value {
     // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
     // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
     PgLsn(u64),
+    // v0.73: a whole-row (composite) value — PG19's whole-row Var
+    // (varattno = 0). Field names travel with the value so `row_to_json`
+    // can label its object keys; the text format `(f1,f2,...)` ignores
+    // them, like PG's record_out. Never stored in a table (there are no
+    // composite column types); only flows through expression evaluation.
+    Record(Vec<(String, Value)>),
     Null,
 }
 
@@ -3769,6 +3790,9 @@ impl Value {
             // v0.64: pg_lsn displays as HIGH/LOW uppercase hex, LOW
             // zero-padded to 8 digits (e.g. `0/016AE7F8`).
             Value::PgLsn(lsn) => Some(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF)),
+            // v0.73: PG19 record_out: `(f1,f2,...)`; NULL fields are
+            // empty and unquoted.
+            Value::Record(fields) => Some(record_text(fields)),
             Value::Null => None,
         }
     }
@@ -3856,7 +3880,8 @@ impl Value {
             Value::Timestamptz(_) => "timestamp with time zone",
             Value::Bytea(_) => "bytea",
             Value::Uuid(_) => "uuid",
-            Value::PgLsn(_) => "pg_lsn", // v0.64
+            Value::PgLsn(_) => "pg_lsn",  // v0.64
+            Value::Record(_) => "record", // v0.73
             Value::Null => "unknown",
         }
     }
@@ -3882,6 +3907,8 @@ impl Value {
             Value::Bytea(_) => ColType::Bytea,
             Value::Uuid(_) => ColType::Uuid,
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
+            // v0.73: a whole-row value has composite (record) type.
+            Value::Record(_) => ColType::Record,
             Value::Null => ColType::Text,
         }
     }
@@ -3895,6 +3922,55 @@ pub enum ByteaOutput {
     #[default]
     Hex,
     Escape,
+}
+
+/// v0.73: PG19 `record_out` composite literal: `(f1,f2,...)`. NULL
+/// fields render as empty and unquoted; a field is double-quoted when it
+/// is empty or contains `(`, `)`, `,`, `"`, `\`, or whitespace, with `"`
+/// and `\` backslash-escaped inside the quotes. Nested records render
+/// recursively, so their parens trigger quoting (`("(1)")`).
+pub fn record_text(fields: &[(String, Value)]) -> String {
+    let mut out = String::from("(");
+    for (i, (_, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if let Some(t) = v.to_text() {
+            if record_field_needs_quote(&t) {
+                out.push('"');
+                for ch in t.chars() {
+                    if ch == '"' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            } else {
+                out.push_str(&t);
+            }
+        }
+        // NULL -> empty, unquoted.
+    }
+    out.push(')');
+    out
+}
+
+fn record_field_needs_quote(t: &str) -> bool {
+    t.is_empty()
+        || t.chars()
+            .any(|c| matches!(c, '(' | ')' | ',' | '"' | '\\') || c.is_whitespace())
+}
+
+/// v0.73: PG19 null test for whole-row values: a record is null iff every
+/// field is null (so `count(t.*)` skips null-extended join rows and
+/// `(t.*) IS NULL` matches PG). Plain `Value::Null` is null; every other
+/// scalar is not.
+pub fn value_is_null(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Record(fields) => fields.iter().all(|(_, f)| value_is_null(f)),
+        _ => false,
+    }
 }
 
 /// `\x` + lowercase hex, like Postgres' hex-format bytea output.
