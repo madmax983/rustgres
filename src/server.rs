@@ -848,6 +848,16 @@ pub(crate) fn send_ready(stream: &mut Writer, session: &Session) -> io::Result<(
 }
 
 pub(crate) fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::Result<()> {
+    send_error_detail(stream, code, message, None)
+}
+
+/// v0.71: ErrorResponse with an optional PG-style DETAIL (`D`) field.
+pub(crate) fn send_error_detail(
+    stream: &mut Writer,
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'E');
     b.u8(b'S')
         .cstr("ERROR")
@@ -856,9 +866,17 @@ pub(crate) fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::
         .u8(b'C')
         .cstr(code)
         .u8(b'M')
-        .cstr(message)
-        .u8(0);
+        .cstr(message);
+    if let Some(d) = detail {
+        b.u8(b'D').cstr(d);
+    }
+    b.u8(0);
     b.send(stream)
+}
+
+/// v0.71: send an `ExecError`, including its DETAIL line when present.
+pub(crate) fn send_exec_error(stream: &mut Writer, e: &exec::ExecError) -> io::Result<()> {
+    send_error_detail(stream, e.code, &e.message, e.detail.as_deref())
 }
 
 /// Extended-protocol failure: ErrorResponse, then discard input until Sync.
@@ -918,7 +936,7 @@ fn handle_query(
         // The simple protocol has no parameters: a `$N` here is 42P02.
         let mut stmt = stmt;
         if let Err(e) = exec::subst_params(&mut stmt, &[]) {
-            send_error(stream, e.code, &e.message)?;
+            send_exec_error(stream, &e)?;
             break;
         }
         // v0.10: COPY needs the protocol stream (CopyIn/CopyOut exchange).
@@ -957,7 +975,7 @@ fn handle_query(
         }
         match run_statement(engine, wal, session, &stmt) {
             Err(e) => {
-                send_error(stream, e.code, &e.message)?;
+                send_exec_error(stream, &e)?;
                 break;
             }
             Ok(ExecResult::Select { columns, rows }) => {
@@ -1069,6 +1087,7 @@ fn copy_to_fetch(
     if let Some(t) = &session.txn {
         if t.failed {
             return Err(exec::ExecError {
+                detail: None,
                 code: "25P02",
                 message:
                     "current transaction is aborted, commands ignored until end of transaction block"
@@ -1213,6 +1232,7 @@ fn copy_from_ingest(
                 let _ = txn_rollback(engine, session, false);
             }
             return Err(exec::ExecError {
+                detail: None,
                 code: "22P04",
                 message: format!("COPY error on line {}: {}", e.line, e.message),
             });
@@ -1269,6 +1289,7 @@ fn copy_from_ingest(
                         retire_txn(&mut guard, xid);
                         auto_vacuum(&mut guard, &writes);
                         return Err(exec::ExecError {
+                            detail: None,
                             code: "40001",
                             message: format!(
                                 "could not serialize access due to concurrent update: {}",
@@ -1282,6 +1303,7 @@ fn copy_from_ingest(
                     retire_txn(&mut guard, xid);
                     auto_vacuum(&mut guard, &writes);
                     return Err(exec::ExecError {
+                        detail: None,
                         code: "58000",
                         message: format!("WAL write failed: {}", e),
                     });
@@ -1314,7 +1336,7 @@ fn handle_copy_to(
     let (cols, rows) = match copy_to_fetch(engine, session, table, columns) {
         Ok(r) => r,
         Err(e) => {
-            send_error(stream, e.code, &e.message)?;
+            send_exec_error(stream, &e)?;
             stream.flush()?;
             return Ok(());
         }
@@ -1354,7 +1376,7 @@ fn handle_copy_from(
     let ncols = match copy_from_ncols(engine, session.sid, table, columns) {
         Ok(n) => n,
         Err(e) => {
-            send_error(stream, e.code, &e.message)?;
+            send_exec_error(stream, &e)?;
             stream.flush()?;
             return Ok(());
         }
@@ -1388,7 +1410,7 @@ fn handle_copy_from(
                 .send(stream)?;
         }
         Err(e) => {
-            send_error(stream, e.code, &e.message)?;
+            send_exec_error(stream, &e)?;
         }
     }
     stream.flush()?;
@@ -1494,6 +1516,7 @@ fn cmd(tag: &str) -> ExecResult {
 
 fn err_25001(msg: impl Into<String>) -> ExecError {
     ExecError {
+        detail: None,
         code: "25001",
         message: msg.into(),
     }
@@ -1595,6 +1618,7 @@ fn cursor_declare(
     }
     if session.cursors.contains_key(name) {
         return Err(ExecError {
+            detail: None,
             code: "42P11",
             message: format!("cursor \"{}\" already exists", name),
         });
@@ -1627,6 +1651,7 @@ fn cursor_declare(
             Ok(cmd("DECLARE CURSOR"))
         }
         Ok(_) => Err(ExecError {
+            detail: None,
             code: "XX000",
             message: "internal error: DECLARE query did not return rows".to_string(),
         }),
@@ -1641,6 +1666,7 @@ fn cursor_fetch(
     is_move: bool,
 ) -> Result<ExecResult, ExecError> {
     let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
+        detail: None,
         code: "34000",
         message: format!("cursor \"{}\" does not exist", name),
     })?;
@@ -1665,6 +1691,7 @@ fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult,
         Some(n) => {
             if session.cursors.remove(n).is_none() {
                 return Err(ExecError {
+                    detail: None,
                     code: "34000",
                     message: format!("cursor \"{}\" does not exist", n),
                 });
@@ -1866,6 +1893,7 @@ fn stmt_set_guc(
             let ro = match value {
                 SetValue::Default => false,
                 SetValue::Str(s) => parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?,
@@ -1884,6 +1912,7 @@ fn stmt_set_guc(
                     "escape" => crate::storage::ByteaOutput::Escape,
                     _ => {
                         return Err(ExecError {
+                            detail: None,
                             code: "22023",
                             message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                         });
@@ -1905,6 +1934,7 @@ fn stmt_set_guc(
                 SetValue::Default => crate::storage::ToastCompression::default(),
                 SetValue::Str(s) => {
                     crate::storage::ToastCompression::from_name(s).ok_or_else(|| ExecError {
+                        detail: None,
                         code: "22023",
                         message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                     })?
@@ -1933,6 +1963,7 @@ fn stmt_set_guc(
                     })
                 } else {
                     Err(ExecError {
+                        detail: None,
                         code: "22023",
                         message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                     })
@@ -1955,6 +1986,7 @@ fn stmt_set_guc(
                     })
                 } else {
                     Err(ExecError {
+                        detail: None,
                         code: "22023",
                         message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                     })
@@ -1966,10 +1998,12 @@ fn stmt_set_guc(
         // ERRCODE_CANT_CHANGE_RUNTIME_PARAM (`parameter "x" cannot be
         // changed`), not 42704.
         "server_version" | "server_version_num" => Err(ExecError {
+            detail: None,
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
         _ => Err(ExecError {
+            detail: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -1985,6 +2019,7 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
             rows: vec![Row::new(vec![Value::text(v)])],
         }),
         None => Err(ExecError {
+            detail: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -2041,10 +2076,12 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         // v0.68: RESET on a read-only GUC is 55P02 too — PG19's
         // set_config_option context check fires for every action.
         "server_version" | "server_version_num" => Err(ExecError {
+            detail: None,
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
         _ => Err(ExecError {
+            detail: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -2060,6 +2097,7 @@ fn run_statement(
     if let Some(t) = &session.txn {
         if t.failed && !allowed_in_aborted(stmt) {
             return Err(ExecError {
+                detail: None,
                 code: "25P02",
                 message:
                     "current transaction is aborted, commands ignored until end of transaction block"
@@ -2076,6 +2114,7 @@ fn run_statement(
                 t.failed = true;
             }
             return Err(ExecError {
+                detail: None,
                 code: "25006",
                 message: format!("cannot execute {} in a read-only transaction", cmd),
             });
@@ -2189,6 +2228,7 @@ fn run_statement(
 /// A WAL/filesystem failure becomes SQLSTATE 58000 (system_error).
 fn wal_err(e: io::Error) -> ExecError {
     ExecError {
+        detail: None,
         code: "58000",
         message: format!("WAL write failed: {}", e),
     }
@@ -2341,6 +2381,7 @@ fn autocommit_execute(
             retire_txn(&mut guard, xid);
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
+                detail: None,
                 code: "40001",
                 message: format!(
                     "could not serialize access due to concurrent update: {}",
@@ -2505,6 +2546,7 @@ fn txn_commit(
             t.failed = true;
             session.txn = Some(t);
             return Err(ExecError {
+                detail: None,
                 code: "40001",
                 message: format!(
                     "could not serialize access due to concurrent update: {}",
@@ -2590,12 +2632,14 @@ fn txn_vacuum(
     if let Some(name) = table {
         if !guard.db.tables.contains_key(name) {
             return Err(ExecError {
+                detail: None,
                 code: "42P01",
                 message: format!("table \"{}\" does not exist", name),
             });
         }
         if !is_owner(&guard.db, &snap, name) {
             return Err(ExecError {
+                detail: None,
                 code: "42501",
                 message: format!("permission denied: must be owner of table \"{}\"", name),
             });
@@ -2729,6 +2773,7 @@ fn txn_rollback_to(
         .iter()
         .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
+            detail: None,
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
@@ -2800,6 +2845,7 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         .iter()
         .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
+            detail: None,
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
@@ -3132,6 +3178,7 @@ fn describe_prepared(
         Some(Stmt::Fetch { name, .. }) => match session.cursors.get(name) {
             Some(cur) => Ok(Some(cur.cols.clone())),
             None => Err(exec::ExecError {
+                detail: None,
                 code: "34000",
                 message: format!("cursor \"{}\" does not exist", name),
             }),

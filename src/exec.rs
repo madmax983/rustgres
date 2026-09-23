@@ -58,10 +58,27 @@ use std::rc::Rc;
 pub struct ExecError {
     pub code: &'static str,
     pub message: String,
+    /// v0.71: optional PG-style DETAIL line, sent as the `D` field of the
+    /// ErrorResponse. `None` for the vast majority of errors.
+    pub detail: Option<String>,
 }
 
 fn exec_err(code: &'static str, message: impl Into<String>) -> ExecError {
     ExecError {
+        detail: None,
+        code,
+        message: message.into(),
+    }
+}
+
+/// v0.71: error with a PG-style DETAIL line.
+fn exec_err_detail(
+    code: &'static str,
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> ExecError {
+    ExecError {
+        detail: Some(detail.into()),
         code,
         message: message.into(),
     }
@@ -2145,7 +2162,7 @@ fn create_constraint_index(
         seen.push(pos);
     }
     let mut ix = Index::new(IndexDef {
-        name: ix_name,
+        name: ix_name.clone(),
         table: table.to_string(),
         cols: seen,
         col_names: cols.to_vec(),
@@ -2174,10 +2191,8 @@ fn create_constraint_index(
             ));
         }
     }
-    eng.db.indexes.insert(cname.to_string(), ix);
-    ctx.writes.push(WriteOp::CreateIndex {
-        name: cname.to_string(),
-    });
+    eng.db.indexes.insert(ix_name.clone(), ix);
+    ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
     Ok(())
 }
 
@@ -3167,6 +3182,22 @@ struct UpsertPlan {
     /// Target column positions for DO UPDATE SET, in SET order.
     set_cols: Vec<usize>,
     action: ConflictAction,
+    /// v0.71: the constraint behind each arbiter index, for mapping a
+    /// partitioned target's arbiter to each leaf's backing index
+    /// (`{leaf}_{constraint}`, the v0.70 naming convention). `None`
+    /// for standalone unique indexes, which have no per-leaf
+    /// enforcement in this engine.
+    con_names: Vec<Option<String>>,
+    /// v0.71: key column NAMES for each arbiter (parent column order).
+    /// A partitioned target's arbiter maps to the leaf unique index
+    /// with the same key column names — this covers PARTITION OF
+    /// children (`{leaf}_{constraint}`) and ATTACHed partitions (whose
+    /// indexes keep their own names).
+    key_names: Vec<Vec<String>>,
+    /// v0.71: whether the arbiter was explicit (columns or constraint
+    /// name). DO NOTHING without an arbiter arbitrates every usable
+    /// leaf constraint instead of the parent's index list.
+    explicit_arbiter: bool,
 }
 
 fn plan_upsert(
@@ -3176,20 +3207,27 @@ fn plan_upsert(
     oc: &OnConflict,
     meta: &TableMeta,
 ) -> Result<UpsertPlan, ExecError> {
-    // (index name, key column positions, key column names), sorted.
+    // (index name, key column positions, key column names, backing
+    // constraint name), sorted. v0.71: the constraint name maps a
+    // partitioned target's arbiter to each leaf's backing index.
     // v0.22: temp tables have no backing indexes; their PRIMARY KEY /
     // UNIQUE constraints arbitrate ON CONFLICT directly.
-    let mut unique: Vec<(String, Vec<usize>, Vec<String>)> =
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{table}\" does not exist")))?;
+    // v0.71: partition children name constraint backing indexes
+    // `{table}_{constraint}` (v0.70 convention); the constraint name is
+    // the index name with that prefix stripped. Parents and plain
+    // tables keep the historical `{constraint}` name.
+    let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+    let mut unique: Vec<(String, Vec<usize>, Vec<String>, Option<String>)> =
         if eng.db.is_temp_table(ctx.session, table) {
-            let t = eng
-                .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
-                .ok_or_else(|| exec_err("42P01", format!("relation \"{table}\" does not exist")))?;
             let mut out = Vec::new();
             let mut push = |u: &UniqueDef| {
                 let cols: Vec<usize> = u.cols.iter().filter_map(|c| t.column_index(c)).collect();
                 if cols.len() == u.cols.len() {
-                    out.push((u.name.clone(), cols, u.cols.clone()));
+                    out.push((u.name.clone(), cols, u.cols.clone(), Some(u.name.clone())));
                 }
             };
             if let Some(pk) = &t.pkey {
@@ -3205,10 +3243,26 @@ fn plan_upsert(
                 .into_iter()
                 .filter(|ix| ix.def.unique)
                 .map(|ix| {
+                    // v0.71: only constraint-backed indexes (internal)
+                    // carry a constraint name for ON CONFLICT ON
+                    // CONSTRAINT and partitioned leaf mapping. A
+                    // standalone CREATE UNIQUE INDEX has no constraint
+                    // and no per-leaf backing index.
+                    let con = if !ix.def.internal {
+                        None
+                    } else if is_child {
+                        ix.def
+                            .name
+                            .strip_prefix(&format!("{table}_"))
+                            .map(|s| s.to_string())
+                    } else {
+                        Some(ix.def.name.clone())
+                    };
                     (
                         ix.def.name.clone(),
                         ix.def.cols.clone(),
                         ix.def.col_names.clone(),
+                        con,
                     )
                 })
                 .collect()
@@ -3220,7 +3274,8 @@ fn plan_upsert(
             "there is no unique or exclusion constraint matching the ON CONFLICT specification",
         )
     };
-    let indexes: Vec<(String, Vec<usize>)> = match &oc.arbiter {
+    let explicit_arbiter = !matches!(oc.arbiter, ConflictArbiter::None);
+    let resolved: Vec<(String, Vec<usize>, Option<String>)> = match &oc.arbiter {
         ConflictArbiter::None => {
             if let ConflictAction::DoUpdate { .. } = &oc.action {
                 return Err(exec_err(
@@ -3231,7 +3286,7 @@ fn plan_upsert(
             // DO NOTHING without an arbiter: every unique index arbitrates.
             unique
                 .iter()
-                .map(|(n, cols, _)| (n.clone(), cols.clone()))
+                .map(|(n, cols, _, con)| (n.clone(), cols.clone(), con.clone()))
                 .collect()
         }
         ConflictArbiter::Columns(cols) => {
@@ -3247,20 +3302,38 @@ fn plan_upsert(
             want.sort_unstable();
             unique
                 .iter()
-                .find(|(_, _, cn)| {
+                .find(|(_, _, cn, _)| {
                     let mut have: Vec<&str> = cn.iter().map(|s| s.as_str()).collect();
                     have.sort_unstable();
                     have == want
                 })
-                .map(|(n, cols, _)| vec![(n.clone(), cols.clone())])
+                .map(|(n, cols, _, con)| vec![(n.clone(), cols.clone(), con.clone())])
                 .ok_or_else(no_arbiter)?
         }
+        // v0.71: match the constraint name as well as the index name, so
+        // ON CONFLICT ON CONSTRAINT works against sub-partitioned
+        // intermediates (whose backing indexes are `{table}_{constraint}`).
+        // v0.71: only actual constraints match (con.is_some()); a
+        // standalone CREATE UNIQUE INDEX is not a constraint (42P10).
         ConflictArbiter::Constraint(name) => unique
             .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(n, cols, _)| vec![(n.clone(), cols.clone())])
+            .find(|(_, _, _, con)| con.as_deref() == Some(name.as_str()))
+            .map(|(n, cols, _, con)| vec![(n.clone(), cols.clone(), con.clone())])
             .ok_or_else(no_arbiter)?,
     };
+    let indexes: Vec<(String, Vec<usize>)> = resolved
+        .iter()
+        .map(|(n, cols, _)| (n.clone(), cols.clone()))
+        .collect();
+    let con_names: Vec<Option<String>> = resolved.iter().map(|(_, _, con)| con.clone()).collect();
+    let key_names: Vec<Vec<String>> = resolved
+        .iter()
+        .map(|(_, cols, _)| {
+            cols.iter()
+                .map(|&p| meta.columns[p].0.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     if indexes.is_empty() {
         // No unique index to arbitrate: DO NOTHING degrades to a plain
         // insert; DO UPDATE (already rejected without an arbiter) would be
@@ -3296,28 +3369,10 @@ fn plan_upsert(
         indexes,
         set_cols,
         action: oc.action.clone(),
+        con_names,
+        key_names,
+        explicit_arbiter,
     })
-}
-
-/// v0.10: locate an upsert conflict for a candidate row: returns the
-/// conflicting row version's id. Checks the table's unique indexes, like
-/// Postgres' speculative insertion.
-fn find_upsert_conflict(
-    eng: &Engine,
-    ctx: &StmtCtx,
-    table: &str,
-    plan: &UpsertPlan,
-    values: &[Value],
-) -> Option<u64> {
-    for (iname, _) in &plan.indexes {
-        if let Some(id) =
-            eng.db
-                .unique_conflict_row(table, iname, values, None, ctx.snap, ctx.own, ctx.session)
-        {
-            return Some(id);
-        }
-    }
-    None
 }
 
 /// v0.10: current values of one row version, by id.
@@ -3335,6 +3390,147 @@ fn arbiter_key(values: &[Value], key_cols: &[usize]) -> Vec<u8> {
         out.push(0xff);
     }
     out
+}
+
+/// v0.71: route one candidate row to its leaf for ON CONFLICT
+/// arbitration (PG19: tuple routing happens before the arbiter index is
+/// mapped to the leaf). Mirrors `route_partition_inserts` for a single
+/// row: a leaf validates its bound; a sub-partitioned intermediate
+/// validates its bound then routes to descendant leaves.
+fn find_row_leaf(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    values: &Row,
+) -> Result<String, ExecError> {
+    let (pinfo, table_cols) = {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .expect("target still visible; engine lock held throughout");
+        match &t.partition {
+            Some(p) => (p.clone(), t.columns.clone()),
+            None => return Ok(table.to_string()),
+        }
+    };
+    if pinfo.bound.is_some() {
+        check_leaf_bound(eng, ctx, table, &pinfo, &table_cols, &values[..])?;
+        if pinfo.children.is_empty() {
+            return Ok(table.to_string());
+        }
+        // Sub-partitioned intermediate: fall through and route to
+        // descendant leaves.
+    }
+    find_partition_leaf(eng, ctx, table, &pinfo, &table_cols, &values[..])
+}
+
+/// v0.71: remap a parent-order row to a leaf's column order (the inverse
+/// of `remap_row_to_parent`).
+fn remap_parent_to_leaf(
+    parent_cols: &[(String, ColType)],
+    leaf_cols: &[(String, ColType)],
+    values: &[Value],
+) -> Vec<Value> {
+    leaf_cols
+        .iter()
+        .map(|(ln, _)| {
+            parent_cols
+                .iter()
+                .position(|(pn, _)| pn == ln)
+                .map(|i| values[i].clone())
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+/// v0.71: per-leaf ON CONFLICT resolution for a partitioned target.
+struct LeafUpsertCtx {
+    /// The leaf's column list (for parent<->leaf remapping).
+    cols: Vec<(String, ColType)>,
+    /// The plan's explicit arbiter mapped to this leaf's backing
+    /// indexes: (leaf index name, leaf key positions).
+    arbiters: Vec<(String, Vec<usize>)>,
+    /// Every unique index on the leaf, for DO NOTHING without an
+    /// arbiter (PG19: the individual leaf partitions' constraints are
+    /// considered, not the whole hierarchy's).
+    all_unique: Vec<(String, Vec<usize>)>,
+}
+
+/// v0.71: build the per-leaf upsert context: map the parent arbiter
+/// index to the corresponding leaf index (PG19), like
+/// `get_partition_parent(indexOid, true)` inverted. A standalone
+/// unique index on the parent has no per-leaf enforcement in this
+/// engine, so an explicit arbiter that maps to one is an honest 42P10.
+fn leaf_upsert_ctx(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    plan: &UpsertPlan,
+    leaf: &str,
+) -> Result<LeafUpsertCtx, ExecError> {
+    let cols = {
+        let lt = eng
+            .db
+            .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+            .expect("leaf still visible; engine lock held throughout");
+        lt.columns.clone()
+    };
+    let no_arbiter = || {
+        exec_err(
+            "42P10",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        )
+    };
+    let mut arbiters = Vec::with_capacity(plan.key_names.len());
+    if plan.explicit_arbiter {
+        for (key_names, con) in plan.key_names.iter().zip(plan.con_names.iter()) {
+            // v0.71: map the parent arbiter to the leaf unique index with
+            // the same key column names. This covers PARTITION OF
+            // children (v0.70 `{leaf}_{constraint}` naming) and ATTACHed
+            // partitions (which keep their own index names). A standalone
+            // parent unique index (con == None) has no per-leaf backing
+            // index in this engine.
+            let found = con.as_ref().and_then(|_| {
+                eng.db
+                    .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+                    .into_iter()
+                    .filter(|ix| ix.def.unique)
+                    .find(|ix| ix.def.col_names == *key_names)
+                    .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            });
+            match found {
+                Some(pair) => arbiters.push(pair),
+                None => return Err(no_arbiter()),
+            }
+        }
+    }
+    let all_unique: Vec<(String, Vec<usize>)> = eng
+        .db
+        .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+        .into_iter()
+        .filter(|ix| ix.def.unique)
+        .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+        .collect();
+    Ok(LeafUpsertCtx {
+        cols,
+        arbiters,
+        all_unique,
+    })
+}
+
+/// v0.71: name a leaf backing index (`{leaf}_{constraint}`) by its
+/// constraint in 23505 messages, like Postgres names the constraint
+/// rather than the partition's index.
+fn leaf_constraint_name(eng: &Engine, ctx: &StmtCtx, leaf: &str, index_name: &str) -> String {
+    if let Some(con) = index_name.strip_prefix(&format!("{leaf}_")) {
+        if let Some(t) = eng.db.find_table(leaf, ctx.snap, ctx.own, ctx.session) {
+            let known = t.pkey.as_ref().is_some_and(|p| p.name == con)
+                || t.uniques.iter().any(|u| u.name == con);
+            if known {
+                return con.to_string();
+            }
+        }
+    }
+    index_name.to_string()
 }
 
 /// v0.37: name of the toast table for a main-table OID, as PG names it
@@ -3889,23 +4085,32 @@ fn exec_insert(
     };
     // v0.10: resolve the ON CONFLICT arbiter before building rows (needs
     // the table metadata).
-    let meta_for_upsert = {
+    let (meta_for_upsert, partitioned_upsert) = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
-        // v0.70: ON CONFLICT against a partitioned parent is rejected.
-        // PostgreSQL arbitrates the parent's unique constraints across all
-        // partitions; this engine's upsert resolves indexes on the named
-        // table only, so DO NOTHING would silently insert duplicates and
-        // arbiter lookup would fail. A clear 0A000 beats wrong results.
-        if on_conflict.is_some() && t.partition.is_some() {
+        // v0.71: PG19 implements ON CONFLICT against partitioned tables
+        // (route each row to its leaf, then arbitrate per leaf — see the
+        // upsert loop below). Partitioned *temporary* tables stay
+        // rejected: their constraints have no backing indexes to map.
+        if on_conflict.is_some()
+            && t.partition.is_some()
+            && eng.db.is_temp_table(ctx.session, table)
+        {
             return Err(exec_err(
                 "0A000",
-                "ON CONFLICT on a partitioned table is not supported yet",
+                "ON CONFLICT on a partitioned temporary table is not supported yet",
             ));
         }
-        TableMeta::of(t)
+        // A partitioned target that is not a leaf (a parent, or a
+        // sub-partitioned intermediate): rows route to leaves before
+        // conflict arbitration. Leaves keep the single-table path.
+        let partitioned = t
+            .partition
+            .as_ref()
+            .is_some_and(|p| p.bound.is_none() || !p.children.is_empty());
+        (TableMeta::of(t), partitioned)
     };
     let upsert: Option<UpsertPlan> = match on_conflict {
         None => None,
@@ -4136,8 +4341,18 @@ fn exec_insert(
         // against the indexes and against earlier rows of this statement
         // before any version is pushed. v0.10: skipped when there is an
         // ON CONFLICT clause — conflicts are resolved per row instead.
+        // v0.71: a partitioned target enforces each leaf's unique indexes
+        // (the parent's own indexes hold no rows).
         if upsert.is_none() {
-            check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own, ctx.session)?;
+            let is_partitioned_parent = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.parent.is_none()));
+            if is_partitioned_parent {
+                check_partitioned_insert_unique(eng, ctx, table, &built)?;
+            } else {
+                check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own, ctx.session)?;
+            }
         }
         // v0.9: child-side foreign keys. Rows inserted earlier in the same
         // statement are visible to later rows (self-references).
@@ -4159,19 +4374,32 @@ fn exec_insert(
     // v0.10: plan the per-row ON CONFLICT resolution. No mutation happens
     // here, so a failed row still leaves the statement atomic. Tracks:
     // - inserts: (new row id, values) to insert,
-    // - updates: (conflict row id, prev xmax, new values) for DO UPDATE,
+    // - updates: (target table, conflict row id, prev xmax, new values)
+    //   for DO UPDATE,
     // - ret_rows: RETURNING source rows in statement order (inserted values
     //   or updated new values; skipped rows contribute nothing).
     // Same-statement conflicts are detected via `key_map`: (index name,
     // key bytes) -> row id of a planned insert.
     let mut inserts: Vec<(u64, Row)> = Vec::new();
-    let mut updates: Vec<(u64, u64, Row)> = Vec::new();
+    let mut updates: Vec<(String, u64, u64, Row)> = Vec::new();
     let mut ret_rows: Vec<Row> = Vec::new();
     if let Some(plan) = &upsert {
         let mut key_map: HashMap<(String, Vec<u8>), u64> = HashMap::new();
         // Latest planned values per row id (planned inserts and the new
         // values of planned updates), for chained same-statement conflicts.
+        // Stored in the row's home table column order (the leaf's, for a
+        // partitioned target).
         let mut latest: HashMap<u64, Row> = HashMap::new();
+        // v0.71: per-leaf upsert contexts for a partitioned target, and
+        // the home leaf of each planned insert (for the DO UPDATE
+        // cross-partition check on same-statement conflicts).
+        let mut leaf_ctxs: HashMap<String, LeafUpsertCtx> = HashMap::new();
+        // v0.71: PG19 deterministic DO UPDATE — one row cannot be
+        // affected twice by the same statement (21000). Tracks
+        // (conflict-search table, row id) of completed DO UPDATEs.
+        let mut do_updated: std::collections::HashSet<(String, u64)> =
+            std::collections::HashSet::new();
+        let mut planned_leaf: HashMap<u64, String> = HashMap::new();
         // Schemas for DO UPDATE evaluation: excluded first, target last
         // (unqualified columns resolve to the target, like Postgres).
         let mk_schemas = || {
@@ -4202,16 +4430,54 @@ fn exec_insert(
             (excl, tgt)
         };
         for values in &new_rows {
+            // v0.71: partitioned target — route the row to its leaf first
+            // (PG19: tuple routing precedes ON CONFLICT arbitration), then
+            // arbitrate in the leaf's column order and index space.
+            // `ctable`/`cvalues`/`arbiters` are the conflict-search target:
+            // the leaf for a partitioned target, else the table itself.
+            let (ctable, cvalues, arbiters): (String, Vec<Value>, Vec<(String, Vec<usize>)>) =
+                if partitioned_upsert {
+                    let leaf = find_row_leaf(eng, ctx, table, values)?;
+                    if !leaf_ctxs.contains_key(&leaf) {
+                        let lu = leaf_upsert_ctx(eng, ctx, plan, &leaf)?;
+                        leaf_ctxs.insert(leaf.clone(), lu);
+                    }
+                    let lu = &leaf_ctxs[&leaf];
+                    let cvalues =
+                        remap_parent_to_leaf(&meta_for_upsert.columns, &lu.cols, &values[..]);
+                    let arbiters = if plan.explicit_arbiter {
+                        lu.arbiters.clone()
+                    } else {
+                        lu.all_unique.clone()
+                    };
+                    (leaf, cvalues, arbiters)
+                } else {
+                    (table.to_string(), values.to_vec(), plan.indexes.clone())
+                };
             // 1. Conflict with a table row?
-            let mut conflict: Option<u64> = find_upsert_conflict(eng, ctx, table, plan, values);
+            let mut conflict: Option<u64> = None;
+            for (iname, _) in &arbiters {
+                if let Some(id) = eng.db.unique_conflict_row(
+                    &ctable,
+                    iname,
+                    &cvalues,
+                    None,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                ) {
+                    conflict = Some(id);
+                    break;
+                }
+            }
             // 2. Conflict with a row planned earlier in this statement?
             if conflict.is_none() {
-                for (iname, kcols) in &plan.indexes {
+                for (iname, kcols) in &arbiters {
                     // NULL key parts never conflict.
-                    if kcols.iter().any(|&c| values[c] == Value::Null) {
+                    if kcols.iter().any(|&c| cvalues[c] == Value::Null) {
                         continue;
                     }
-                    if let Some(id) = key_map.get(&(iname.clone(), arbiter_key(values, kcols))) {
+                    if let Some(id) = key_map.get(&(iname.clone(), arbiter_key(&cvalues, kcols))) {
                         conflict = Some(*id);
                         break;
                     }
@@ -4220,16 +4486,20 @@ fn exec_insert(
             let Some(tid) = conflict else {
                 // No conflict: insert.
                 let id = eng.alloc_row_id();
-                for (iname, kcols) in &plan.indexes {
-                    if kcols.iter().any(|&c| values[c] == Value::Null) {
+                for (iname, kcols) in &arbiters {
+                    if kcols.iter().any(|&c| cvalues[c] == Value::Null) {
                         continue;
                     }
-                    key_map.insert((iname.clone(), arbiter_key(values, kcols)), id);
+                    key_map.insert((iname.clone(), arbiter_key(&cvalues, kcols)), id);
                 }
-                let values = values.clone();
-                latest.insert(id, values.clone());
+                if partitioned_upsert {
+                    planned_leaf.insert(id, ctable.clone());
+                }
+                latest.insert(id, Row::new(cvalues));
+                // Inserts stay in target (parent) column order: the
+                // partition router remaps them per leaf.
                 inserts.push((id, values.clone()));
-                ret_rows.push(values);
+                ret_rows.push(values.clone());
                 continue;
             };
             match &plan.action {
@@ -4237,10 +4507,20 @@ fn exec_insert(
                     // Skipped: contributes no row and no RETURNING output.
                 }
                 ConflictAction::DoUpdate { sets, where_ } => {
-                    // Target values: latest planned, else the table row.
+                    // v0.71: PG19 deterministic DO UPDATE — a row
+                    // affected once by this statement cannot be affected
+                    // again (21000).
+                    if !do_updated.insert((ctable.clone(), tid)) {
+                        return Err(exec_err(
+                            "21000",
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                        ));
+                    }
+                    // Target values in conflict-target order: latest
+                    // planned, else the table row.
                     let target_values: Row = match latest.get(&tid) {
                         Some(v) => v.clone(),
-                        None => row_values_by_id(eng, ctx, table, tid)
+                        None => row_values_by_id(eng, ctx, &ctable, tid)
                             .ok_or_else(|| exec_err("XX000", "upsert conflict target vanished"))?,
                     };
                     // Only real table rows need the concurrency checks;
@@ -4249,17 +4529,26 @@ fn exec_insert(
                     if !is_planned {
                         let t = eng
                             .db
-                            .find_table(table, ctx.snap, ctx.own, ctx.session)
+                            .find_table(&ctable, ctx.snap, ctx.own, ctx.session)
                             .expect("table still visible; engine lock held throughout");
                         let pos = t.row_pos(tid).expect("conflict target still present");
                         let r = &t.rows[pos];
                         check_write_conflict(eng, r.xmax, ctx.level)?;
-                        check_row_lock(eng, table, tid, ctx.own)?;
+                        check_row_lock(eng, &ctable, tid, ctx.own)?;
                     }
+                    // v0.71: SET/WHERE evaluate against parent-order rows
+                    // (the schemas name the target's columns); remap the
+                    // leaf-order target up for a partitioned target.
+                    let target_parent: Vec<Value> = if partitioned_upsert {
+                        let lu = &leaf_ctxs[&ctable];
+                        remap_row_to_parent(&lu.cols, &meta_for_upsert.columns, &target_values[..])
+                    } else {
+                        target_values.to_vec()
+                    };
                     let (excl_schema, tgt_schema) = mk_schemas();
                     let frames: Vec<(&[QCol], &[Value])> = vec![
                         (&excl_schema, &values[..]),
-                        (&tgt_schema, &target_values[..]),
+                        (&tgt_schema, &target_parent[..]),
                     ];
                     // Optional DO UPDATE ... WHERE: false means skip.
                     if let Some(w) = where_ {
@@ -4277,7 +4566,7 @@ fn exec_insert(
                             continue;
                         }
                     }
-                    let mut new_values = target_values.to_vec();
+                    let mut new_values = target_parent.clone();
                     for ((_, expr), &ci) in sets.iter().zip(plan.set_cols.iter()) {
                         let v = eval_dml_expr(
                             eng,
@@ -4292,15 +4581,47 @@ fn exec_insert(
                         let (cname, ctype) = &meta_for_upsert.columns[ci];
                         new_values[ci] = coerce_value(v, ctype, cname)?;
                     }
+                    // v0.71: PG19 forbids ON CONFLICT DO UPDATE from moving
+                    // the row to a different partition (0A000). An
+                    // unroutable result is likewise rejected: it would
+                    // appear in a different partition than the original.
+                    if partitioned_upsert {
+                        let home: &str = if is_planned {
+                            planned_leaf.get(&tid).expect("planned row has a home leaf")
+                        } else {
+                            &ctable
+                        };
+                        let new_leaf =
+                            find_row_leaf(eng, ctx, table, &Row::new(new_values.clone()))?;
+                        if new_leaf != home {
+                            return Err(exec_err_detail(
+                                "0A000",
+                                "invalid ON UPDATE specification",
+                                "The result tuple would appear in a different partition than the original tuple.",
+                            ));
+                        }
+                    }
+                    // Store and index in conflict-target order.
+                    let store_values: Vec<Value> = if partitioned_upsert {
+                        let lu = &leaf_ctxs[&ctable];
+                        remap_parent_to_leaf(&meta_for_upsert.columns, &lu.cols, &new_values)
+                    } else {
+                        new_values.clone()
+                    };
                     // Same validations as a plain UPDATE row.
                     if let Some(vname) = eng.db.unique_violation(
-                        table,
-                        &new_values,
+                        &ctable,
+                        &store_values,
                         Some(tid),
                         ctx.snap,
                         ctx.own,
                         ctx.session,
                     ) {
+                        let vname = if partitioned_upsert {
+                            leaf_constraint_name(eng, ctx, &ctable, &vname)
+                        } else {
+                            vname
+                        };
                         return Err(exec_err(
                             "23505",
                             format!(
@@ -4336,24 +4657,27 @@ fn exec_insert(
                     } else {
                         let t = eng
                             .db
-                            .find_table(table, ctx.snap, ctx.own, ctx.session)
+                            .find_table(&ctable, ctx.snap, ctx.own, ctx.session)
                             .expect("table still visible; engine lock held throughout");
                         t.rows[t.row_pos(tid).expect("conflict target still present")].xmax
                     };
                     // Refresh the same-statement key map when the key changed.
-                    for (iname, kcols) in &plan.indexes {
+                    for (iname, kcols) in &arbiters {
                         let old_null = kcols.iter().any(|&c| target_values[c] == Value::Null);
-                        let new_null = kcols.iter().any(|&c| new_values[c] == Value::Null);
+                        let new_null = kcols.iter().any(|&c| store_values[c] == Value::Null);
                         if !old_null {
                             key_map.remove(&(iname.clone(), arbiter_key(&target_values, kcols)));
                         }
                         if !new_null {
-                            key_map.insert((iname.clone(), arbiter_key(&new_values, kcols)), tid);
+                            key_map.insert((iname.clone(), arbiter_key(&store_values, kcols)), tid);
                         }
                     }
                     let new_values = Row::new(new_values);
-                    latest.insert(tid, new_values.clone());
-                    updates.push((tid, prev_xmax, new_values.clone()));
+                    // latest tracks the home-table order; updates carry
+                    // their target table; RETURNING stays in target order.
+                    let store_row = Row::new(store_values);
+                    latest.insert(tid, store_row.clone());
+                    updates.push((ctable.clone(), tid, prev_xmax, store_row));
                     ret_rows.push(new_values);
                 }
             }
@@ -4383,41 +4707,41 @@ fn exec_insert(
     }
     // Apply DO UPDATEs: delete old version + insert new version.
     // Pre-allocate the new row ids (the table borrow below conflicts).
+    // v0.71: each update carries its target table (the leaf, for a
+    // partitioned target).
     let mut update_ids = Vec::with_capacity(updates.len());
     for _ in 0..updates.len() {
         update_ids.push(eng.alloc_row_id());
     }
-    let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(updates.len());
-    {
+    let mut indexed: Vec<(String, u64, Row)> = Vec::with_capacity(updates.len());
+    for ((utab, old_id, prev_xmax, new_values), new_id) in updates.iter().zip(update_ids) {
         let t = eng
             .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(utab, ctx.snap, ctx.own, ctx.session)
             .expect("table still visible; engine lock held throughout");
-        for ((old_id, prev_xmax, new_values), new_id) in updates.iter().zip(update_ids) {
-            let pos = t
-                .row_pos(*old_id)
-                .expect("row version still present; engine lock held throughout");
-            // v0.13: UpdateRow carries the old values for logical decoding.
-            let old_values = t.rows[pos].values.clone();
-            t.rows[pos].xmax = ctx.own;
-            t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
-            ctx.writes.push(WriteOp::UpdateRow {
-                table: table.to_string(),
-                old_id: *old_id,
-                new_id,
-                prev_xmax: *prev_xmax,
-                old_values,
-            });
-            indexed.push((new_id, new_values.clone()));
-        }
+        let pos = t
+            .row_pos(*old_id)
+            .expect("row version still present; engine lock held throughout");
+        // v0.13: UpdateRow carries the old values for logical decoding.
+        let old_values = t.rows[pos].values.clone();
+        t.rows[pos].xmax = ctx.own;
+        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
+        ctx.writes.push(WriteOp::UpdateRow {
+            table: utab.clone(),
+            old_id: *old_id,
+            new_id,
+            prev_xmax: *prev_xmax,
+            old_values,
+        });
+        indexed.push((utab.clone(), new_id, new_values.clone()));
     }
     // v0.37: TOAST the updated rows.
-    for (new_id, new_values) in &indexed {
-        toast_new_row(eng, ctx, table, *new_id, new_values)?;
+    for (utab, new_id, new_values) in &indexed {
+        toast_new_row(eng, ctx, utab, *new_id, new_values)?;
     }
-    for (new_id, new_values) in &indexed {
+    for (utab, new_id, new_values) in &indexed {
         eng.db
-            .index_insert_row(table, *new_id, new_values, ctx.session);
+            .index_insert_row(utab, *new_id, new_values, ctx.session);
     }
     // v0.10: RETURNING.
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
@@ -5768,6 +6092,82 @@ fn check_insert_unique(
         }
         if let Some(name) = db.unique_violation(table, values, None, snap, own, session) {
             return Err(unique_violation_err(&name));
+        }
+    }
+    Ok(())
+}
+
+/// v0.71: statement-atomic UNIQUE enforcement for INSERT into a
+/// partitioned parent (PG19: the per-leaf backing indexes are the
+/// enforced constraints; the parent's own indexes hold no rows). Each
+/// candidate row is routed to its leaf and remapped to the leaf's column
+/// order, then checked against that leaf's unique indexes and against
+/// earlier rows of this statement bound for the same leaf.
+fn check_partitioned_insert_unique(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    rows: &[Row],
+) -> Result<(), ExecError> {
+    let parent_cols = {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .expect("target still visible; engine lock held throughout");
+        t.columns.clone()
+    };
+    // Group candidate row indices by destination leaf (routing is
+    // statement-atomic: no mutation happens here).
+    let mut by_leaf: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let leaf = find_row_leaf(eng, ctx, table, row)?;
+        match by_leaf.iter_mut().find(|(l, _)| *l == leaf) {
+            Some((_, idxs)) => idxs.push(i),
+            None => by_leaf.push((leaf, vec![i])),
+        }
+    }
+    for (leaf, idxs) in &by_leaf {
+        let leaf_cols = {
+            let lt = eng
+                .db
+                .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                .expect("leaf still visible; engine lock held throughout");
+            lt.columns.clone()
+        };
+        let uniques: Vec<(String, Vec<usize>)> = eng
+            .db
+            .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+            .into_iter()
+            .filter(|ix| ix.def.unique)
+            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .collect();
+        let leaf_rows: Vec<Vec<Value>> = idxs
+            .iter()
+            .map(|&i| remap_parent_to_leaf(&parent_cols, &leaf_cols, &rows[i]))
+            .collect();
+        for (j, values) in leaf_rows.iter().enumerate() {
+            for (iname, cols) in &uniques {
+                let key = temp_key(cols, values);
+                if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                    continue; // NULLs never conflict
+                }
+                if leaf_rows[..j]
+                    .iter()
+                    .any(|prev| temp_key(cols, prev) == key)
+                {
+                    return Err(unique_violation_err(&leaf_constraint_name(
+                        eng, ctx, leaf, iname,
+                    )));
+                }
+            }
+            if let Some(name) =
+                eng.db
+                    .unique_violation(leaf, values, None, ctx.snap, ctx.own, ctx.session)
+            {
+                return Err(unique_violation_err(&leaf_constraint_name(
+                    eng, ctx, leaf, &name,
+                )));
+            }
         }
     }
     Ok(())
@@ -9594,12 +9994,14 @@ pub fn copy_to_rows(
         table.replace('"', "\"\"")
     );
     let stmt = crate::sql::parse_statement(&sql).map_err(|e| ExecError {
+        detail: None,
         code: e.code,
         message: e.message,
     })?;
     match execute(eng, ctx, &stmt)? {
         ExecResult::Select { columns, rows } => Ok((columns, rows)),
         _ => Err(ExecError {
+            detail: None,
             code: "XX000",
             message: "internal error: COPY TO did not return rows".to_string(),
         }),
@@ -25228,6 +25630,7 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
         ExecError {
+            detail: None,
             code: e.code,
             message: format!("parameter ${}: {}", n, e.message),
         }

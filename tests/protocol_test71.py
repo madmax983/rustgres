@@ -23,6 +23,7 @@ Covers the v0.70 scope:
    (v0.69: they touched only the parent's own — zero — rows).
 9. UPDATE changing the partition key moves the row between leaves.
 10. ON CONFLICT on a partitioned table is cleanly rejected (0A000).
+    [v0.71: now supported per PG19; assertion updated to expect success.]
 
 Requires a running rustgres server on port 5433.
 Run: python3 tests/protocol_test71.py
@@ -290,13 +291,16 @@ def main():
         check(st == "ok" and rows == ["2"], "row arrived in the new leaf",
               f"rows={rows}")
 
-        # --- 10. ON CONFLICT on partitioned -> 0A000 -------------------
-        st, code, msg = run(
+        # --- 10. ON CONFLICT on partitioned (v0.71: supported) -----------
+        # v0.70 rejected this with 0A000; v0.71 implements PG19
+        # partitioned-parent ON CONFLICT, so DO NOTHING now succeeds.
+        # (No unique constraint here: degrades to a plain insert.)
+        st, tag, rows = run(
             s, "insert into p71_ud values (2, 'x') on conflict do nothing"
         )
-        check(st == "error" and code == "0A000",
-              "on conflict on partitioned table -> 0A000",
-              f"st={st} code={code} msg={msg}")
+        check(st == "ok" and tag == "INSERT 0 1",
+              "on conflict do nothing on partitioned table succeeds (v0.71)",
+              f"st={st} tag={tag}")
 
         # cleanup
         for t in ("p71_expr", "p71_def", "p71_ml", "p71_rb", "p71_ud"):
