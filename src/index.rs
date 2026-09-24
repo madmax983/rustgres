@@ -147,6 +147,8 @@ fn type_tag(v: &Value) -> u8 {
         // v0.73: records never index, but the total-order fallback must
         // stay total (append-only tag).
         Value::Record(_) => 16,
+        // v0.79: arrays never index either, but stay total (append-only).
+        Value::Array(_) => 17,
     }
 }
 

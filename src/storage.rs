@@ -21,6 +21,7 @@
 //! xid is 1). Row versions additionally carry a globally unique `id`, used
 //! by the WAL to name deleted versions and by undo/vacuum to find them.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -3907,7 +3908,123 @@ pub enum Value {
     // them, like PG's record_out. Never stored in a table (there are no
     // composite column types); only flows through expression evaluation.
     Record(Vec<(String, Value)>),
+    // v0.79: a real array value — PG19's ArrayType, flattened like PG
+    // (elements are always scalar; `integer[][]` is still `_int4` with
+    // two dims). Elements are row-major; `Value::Null` marks SQL NULL
+    // elements. `lower` holds PG's per-dimension lower bounds (default
+    // 1; slices preserve the source bounds, e.g. `[2:3]`).
+    Array(ArrayVal),
     Null,
+}
+
+/// v0.79: a PostgreSQL array value (PG19 `ArrayType`, text-modelled).
+/// The element type is always scalar — nested arrays flatten, exactly
+/// like PG: `ARRAY[[1,2],[3,4]]` is `_int4` with dims `[2,2]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayVal {
+    /// Scalar element type (never itself an array).
+    pub elem: ArrayElem,
+    /// Per-dimension element counts, row-major.
+    pub dims: Vec<i32>,
+    /// Per-dimension lower bounds (PG default: 1).
+    pub lower: Vec<i32>,
+    /// Elements in row-major order; `Value::Null` for SQL NULLs.
+    pub elems: Vec<Value>,
+}
+
+impl ArrayVal {
+    /// Number of dimensions (PG's `array_ndims`).
+    pub fn ndim(&self) -> usize {
+        self.dims.len()
+    }
+
+    /// PG's `pg_typeof` rendering for the array (`integer[]`, ...).
+    pub fn type_name(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("{}[]", self.elem.sql_name()))
+    }
+
+    /// Total element count (PG's `cardinality`).
+    pub fn nitems(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// `true` for the empty array (PG's `construct_empty_array`: no dims).
+    pub fn is_empty(&self) -> bool {
+        self.elems.is_empty()
+    }
+
+    /// PG19's `array_out` (arrayfuncs.c): `{...}` text, with the exact
+    /// quoting rules — NULL elements render as bare `NULL`, empty or
+    /// case-insensitive-`NULL` elements are forced into quotes, and any
+    /// element containing `"`, `\`, `{`, `}`, `,` or whitespace is
+    /// quoted (with `"`/`\` backslash-escaped). Arrays whose lower
+    /// bounds differ from 1 print an explicit `[l:u]...=` dims prefix.
+    pub fn to_literal(&self) -> String {
+        if self.is_empty() {
+            return "{}".to_string();
+        }
+        let ndim = self.ndim();
+        let mut out = String::new();
+        let need_dims = self.lower.iter().any(|&l| l != 1);
+        if need_dims {
+            for (d, l) in self.dims.iter().zip(self.lower.iter()) {
+                out.push_str(&format!("[{}:{}]", l, l + d - 1));
+            }
+            out.push('=');
+        }
+        out.push('{');
+        let mut idx = vec![0i32; ndim];
+        let mut k = 0usize;
+        // `j` is the dimension the closing loop stopped at (or -1 when
+        // the whole array closed); the opening loop reopens braces for
+        // `j..ndim-1`. This is PG's array_out do/while verbatim.
+        let mut j: i32 = 0;
+        loop {
+            for _ in j..ndim as i32 - 1 {
+                out.push('{');
+            }
+            match self.elems[k].to_text() {
+                None => out.push_str("NULL"),
+                Some(t) => {
+                    let need_quote = t.is_empty()
+                        || t.eq_ignore_ascii_case("null")
+                        || t.bytes().any(|b| {
+                            matches!(b, b'"' | b'\\' | b'{' | b'}' | b',')
+                                || b.is_ascii_whitespace()
+                        });
+                    if need_quote {
+                        out.push('"');
+                        for ch in t.chars() {
+                            if ch == '"' || ch == '\\' {
+                                out.push('\\');
+                            }
+                            out.push(ch);
+                        }
+                        out.push('"');
+                    } else {
+                        out.push_str(&t);
+                    }
+                }
+            }
+            k += 1;
+            let mut i = ndim as i32 - 1;
+            while i >= 0 {
+                idx[i as usize] += 1;
+                if idx[i as usize] < self.dims[i as usize] {
+                    out.push(',');
+                    break;
+                }
+                idx[i as usize] = 0;
+                out.push('}');
+                i -= 1;
+            }
+            j = i;
+            if j < 0 {
+                break;
+            }
+        }
+        out
+    }
 }
 
 impl Value {
@@ -3957,6 +4074,8 @@ impl Value {
             // v0.73: PG19 record_out: `(f1,f2,...)`; NULL fields are
             // empty and unquoted.
             Value::Record(fields) => Some(record_text(fields)),
+            // v0.79: PG19 array_out: `{...}` with PG's quoting rules.
+            Value::Array(a) => Some(a.to_literal()),
             Value::Null => None,
         }
     }
@@ -4026,27 +4145,29 @@ impl Value {
         }
     }
 
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> Cow<'static, str> {
         match self {
-            Value::SmallInt(_) => "smallint",
-            Value::Int(_) => "integer",
-            Value::BigInt(_) => "bigint",
-            Value::Float4(_) => "real",
-            Value::Float(_) => "double precision",
-            Value::Numeric(_) => "numeric",
-            Value::Text(_) => "text",
-            Value::BpChar(_) => "character", // v0.35
+            Value::SmallInt(_) => Cow::Borrowed("smallint"),
+            Value::Int(_) => Cow::Borrowed("integer"),
+            Value::BigInt(_) => Cow::Borrowed("bigint"),
+            Value::Float4(_) => Cow::Borrowed("real"),
+            Value::Float(_) => Cow::Borrowed("double precision"),
+            Value::Numeric(_) => Cow::Borrowed("numeric"),
+            Value::Text(_) => Cow::Borrowed("text"),
+            Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
             // v0.36: PG's format_type(18) renders `"char"` (quoted).
-            Value::SingleChar(_) => "\"char\"",
-            Value::Bool(_) => "boolean",
-            Value::Date(_) => "date",
-            Value::Timestamp(_) => "timestamp without time zone",
-            Value::Timestamptz(_) => "timestamp with time zone",
-            Value::Bytea(_) => "bytea",
-            Value::Uuid(_) => "uuid",
-            Value::PgLsn(_) => "pg_lsn",  // v0.64
-            Value::Record(_) => "record", // v0.73
-            Value::Null => "unknown",
+            Value::SingleChar(_) => Cow::Borrowed("\"char\""),
+            Value::Bool(_) => Cow::Borrowed("boolean"),
+            Value::Date(_) => Cow::Borrowed("date"),
+            Value::Timestamp(_) => Cow::Borrowed("timestamp without time zone"),
+            Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
+            Value::Bytea(_) => Cow::Borrowed("bytea"),
+            Value::Uuid(_) => Cow::Borrowed("uuid"),
+            Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
+            Value::Record(_) => Cow::Borrowed("record"), // v0.73
+            // v0.79: PG's pg_typeof on an array reports `integer[]` etc.
+            Value::Array(a) => Cow::Owned(format!("{}[]", a.elem.sql_name())),
+            Value::Null => Cow::Borrowed("unknown"),
         }
     }
 
@@ -4073,6 +4194,8 @@ impl Value {
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
             // v0.73: a whole-row value has composite (record) type.
             Value::Record(_) => ColType::Record,
+            // v0.79: array values report their array type.
+            Value::Array(a) => ColType::Array(a.elem),
             Value::Null => ColType::Text,
         }
     }

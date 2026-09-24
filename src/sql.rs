@@ -102,6 +102,9 @@ enum Token {
     Param(u32),     // $N parameter placeholder, 1-based
     LParen,
     RParen,
+    LBracket, // v0.79: `[` array constructor / subscript / type suffix
+    RBracket, // v0.79: `]` array constructor / subscript / type suffix
+    Colon,    // v0.79: lone `:` (array slice bounds; `::` stays ColonColon)
     Comma,
     Semi,
     Star,
@@ -351,14 +354,28 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             i += 1;
             continue;
         }
-        // `::` cast operator (a lone `:` is a syntax error).
+        // `::` cast operator; a lone `:` is the array-slice bound
+        // separator (v0.79).
         if c == ':' {
             if i + 1 < chars.len() && chars[i + 1] == ':' {
                 toks.push(Token::ColonColon);
                 i += 2;
             } else {
-                return Err(err("unexpected character ':'"));
+                toks.push(Token::Colon);
+                i += 1;
             }
+            continue;
+        }
+        // v0.79: `[` and `]` — array constructors, subscripts, slices,
+        // and `type[]` suffixes.
+        if c == '[' {
+            toks.push(Token::LBracket);
+            i += 1;
+            continue;
+        }
+        if c == ']' {
+            toks.push(Token::RBracket);
+            i += 1;
             continue;
         }
         // `||/` prefix cbrt, `|/` prefix sqrt, `||` concatenation,
@@ -1094,6 +1111,38 @@ pub enum Expr {
     /// as a PG array literal (e.g. `{1,2,3}`). Currently returned as
     /// Text; a proper array type is future work.
     ArraySubquery(Box<SelectStmt>),
+    /// v0.79: `ARRAY[...]` constructor (PG19 `array_expr`). `nested`
+    /// marks the `ARRAY[[...],[...]]` form whose elements are themselves
+    /// bracketed arrays; an empty element list is the 42P08 "cannot
+    /// determine type of empty array" error.
+    ArrayCtor {
+        elems: Vec<Expr>,
+        nested: bool,
+    },
+    /// v0.79: array subscript (PG19 `A_Indices`). Adjacent bracket
+    /// pairs are ONE multidimensional subscript operation (PG19
+    /// gram.y / `transformIndirection`: "Adjacent A_Indices nodes
+    /// have to be treated as a single multidimensional subscript
+    /// operation"), so `a[i][j]` parses to a single node with
+    /// `indices = [i, j]`, never nested subscripts. The result type
+    /// is the element type; at execution PG19's `array_get_element`
+    /// yields NULL unless the index count equals the array's
+    /// dimensionality (a partial subscript is NULL, not a subarray).
+    Subscript {
+        array: Box<Expr>,
+        indices: Vec<Expr>,
+    },
+    /// v0.79: array slice (PG19 `A_Indices` with `is_slice`). If any
+    /// bracket in the chain is a slice, the whole chain is a slice
+    /// operation (PG19 `array_subscript_transform`): a plain `[i]`
+    /// in a slice chain becomes `[1:i]`. Either bound may be absent
+    /// (`a[:2]`, `a[1:]`, `a[:]`); absent bounds default to the
+    /// array's own bounds, and PG19's `array_get_slice` resets the
+    /// result's lower bounds to 1.
+    Slice {
+        array: Box<Expr>,
+        bounds: Vec<(Option<Box<Expr>>, Option<Box<Expr>>)>,
+    },
     /// v0.73: PG19 whole-row Var (varattno = 0) — `tbl` or `tbl.*` in
     /// expression position, evaluating to a composite (record) value.
     WholeRow {
@@ -2146,6 +2195,29 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::ResolvedCol { .. } => {}
+        // v0.79: array expressions — collect from elements/operands.
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                collect_col_refs(e, out);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            collect_col_refs(array, out);
+            for i in indices {
+                collect_col_refs(i, out);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            collect_col_refs(array, out);
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    collect_col_refs(l, out);
+                }
+                if let Some(u) = u {
+                    collect_col_refs(u, out);
+                }
+            }
+        }
         // v0.10: window functions — collect from args, PARTITION BY and
         // ORDER BY.
         Expr::Window {
@@ -2814,6 +2886,15 @@ fn max_param_expr(e: &Expr) -> usize {
         }
         Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
+        // v0.79: array expressions recurse into their operands.
+        Expr::ArrayCtor { elems, .. } => elems.iter().map(max_param_expr).max().unwrap_or(0),
+        Expr::Subscript { array, indices } => {
+            max_param_expr(array).max(indices.iter().map(max_param_expr).max().unwrap_or(0))
+        }
+        Expr::Slice { array, bounds } => bounds.iter().fold(max_param_expr(array), |m, (l, u)| {
+            m.max(l.as_ref().map(|l| max_param_expr(l)).unwrap_or(0))
+                .max(u.as_ref().map(|u| max_param_expr(u)).unwrap_or(0))
+        }),
         Expr::Like { expr, pattern, .. } => max_param_expr(expr).max(max_param_expr(pattern)),
         // v0.68: regex match, like LIKE.
         Expr::Regex { expr, pattern, .. } => max_param_expr(expr).max(max_param_expr(pattern)),
@@ -3450,7 +3531,7 @@ impl Parser {
     }
 
     fn parse_type_name_rest(&mut self, name: String) -> Result<ColType, SqlError> {
-        match name.as_str() {
+        let base: ColType = match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
             // v0.14: PostgreSQL internal alias names (pg_regress conformance).
             "int4" => Ok(ColType::Int),
@@ -3591,7 +3672,23 @@ impl Parser {
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
             _ => Err(err(format!("syntax error: unknown type \"{}\"", name))),
+        }?;
+        // v0.79: array type suffixes — `int[]`, `int[3]`, `int[][]`
+        // (PG19 `opt_array_bounds`; declared bounds are accepted and
+        // ignored, exactly like PG). Each `[]` level flattens to the
+        // scalar element type (ArrayElem::of).
+        let mut ty = base;
+        while *self.peek() == Token::LBracket {
+            self.next(); // consume '['
+            // An optional bound `[n]` (a plain number; anything else is
+            // a syntax error, like PG).
+            if let Token::Number(_) = self.peek() {
+                self.next();
+            }
+            self.expect(Token::RBracket, "']'")?;
+            ty = ColType::Array(crate::storage::ArrayElem::of(&ty));
         }
+        Ok(ty)
     }
 
     /// v0.35: parse an optional character-type length modifier `(n)`,
@@ -6135,6 +6232,9 @@ impl Parser {
     /// cast := unary (`::` type)*
     fn parse_cast(&mut self) -> Result<Expr, SqlError> {
         let mut expr = self.parse_unary()?;
+        // v0.79: array subscripts/slices bind tighter than `::`
+        // (PG19 indirection sits below the cast in the grammar).
+        expr = self.parse_postfix_subscripts(expr)?;
         while *self.peek() == Token::ColonColon {
             self.next();
             let to = self.parse_type_name()?;
@@ -6157,6 +6257,11 @@ impl Parser {
                 expr: Box::new(expr),
                 to,
             };
+            // v0.79: subscripts/slices bind to the cast result too —
+            // `('...'::int[])[1]` and `('...'::int[])[1]::text`, like
+            // PG19 where indirection sits below the cast and above
+            // the next `::`.
+            expr = self.parse_postfix_subscripts(expr)?;
         }
         Ok(expr)
     }
@@ -6347,6 +6452,13 @@ impl Parser {
             }
             Token::Ident(_) => {
                 let name = self.expect_ident()?;
+                // v0.79: `ARRAY[...]` constructor (PG19 `array_expr`).
+                // `ARRAY[1,2]`, `ARRAY[]`, and the nested form
+                // `ARRAY[[1,2],[3,4]]`. (`array(SELECT...)` stays in
+                // parse_call.)
+                if name == "array" && *self.peek() == Token::LBracket {
+                    return self.parse_array_ctor();
+                }
                 // `EXISTS (SELECT ...)` — only when followed by `(` so a
                 // column actually named "exists" still works elsewhere.
                 if name == "exists" && *self.peek() == Token::LParen {
@@ -6552,6 +6664,160 @@ impl Parser {
     /// `name(...)` — aggregates, EXTRACT/TRIM/POSITION/SUBSTRING special
     /// forms, and the v0.7 built-in function set. Anything else is
     /// "function does not exist" (SQLSTATE 42883).
+    /// v0.79: `ARRAY[...]` — PG19's `array_expr`. Handles `ARRAY[]`
+    /// (empty), `ARRAY[1,2]` (element list), and the nested
+    /// `ARRAY[[1,2],[3,4]]` form. The `[` has already been peeked
+    /// (not consumed).
+    fn parse_array_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.next(); // consume '['
+        if *self.peek() == Token::RBracket {
+            self.next();
+            return Ok(Expr::ArrayCtor {
+                elems: Vec::new(),
+                nested: false,
+            });
+        }
+        // Nested form: each element is itself a bracketed array.
+        if *self.peek() == Token::LBracket {
+            let mut rows = vec![self.parse_bracketed_array()?];
+            while *self.peek() == Token::Comma {
+                self.next();
+                rows.push(self.parse_bracketed_array()?);
+            }
+            self.expect(Token::RBracket, "']'")?;
+            return Ok(Expr::ArrayCtor {
+                elems: rows,
+                nested: true,
+            });
+        }
+        let mut elems = vec![self.parse_or()?];
+        while *self.peek() == Token::Comma {
+            self.next();
+            elems.push(self.parse_or()?);
+        }
+        self.expect(Token::RBracket, "']'")?;
+        Ok(Expr::ArrayCtor {
+            elems,
+            nested: false,
+        })
+    }
+
+    /// v0.79: one `[...]` level of the nested `ARRAY[[...],[...]]`
+    /// form, parsed recursively (deeper nesting stacks dims).
+    fn parse_bracketed_array(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LBracket, "'['")?;
+        if *self.peek() == Token::RBracket {
+            self.next();
+            return Ok(Expr::ArrayCtor {
+                elems: Vec::new(),
+                nested: false,
+            });
+        }
+        if *self.peek() == Token::LBracket {
+            let mut rows = vec![self.parse_bracketed_array()?];
+            while *self.peek() == Token::Comma {
+                self.next();
+                rows.push(self.parse_bracketed_array()?);
+            }
+            self.expect(Token::RBracket, "']'")?;
+            return Ok(Expr::ArrayCtor {
+                elems: rows,
+                nested: true,
+            });
+        }
+        let mut elems = vec![self.parse_or()?];
+        while *self.peek() == Token::Comma {
+            self.next();
+            elems.push(self.parse_or()?);
+        }
+        self.expect(Token::RBracket, "']'")?;
+        Ok(Expr::ArrayCtor {
+            elems,
+            nested: false,
+        })
+    }
+
+    /// v0.79: postfix array subscripts and slices. Adjacent brackets
+    /// form ONE subscript/slice operation (PG19 gram.y /
+    /// transformIndirection): `a[i][j]` is a single two-index
+    /// subscript; if any bracket is `l:u` the whole chain is a slice
+    /// and a plain `[i]` becomes `[1:i]` (PG19
+    /// array_subscript_transform). More than 6 brackets is PG19's
+    /// 54000 "number of array dimensions exceeds the maximum allowed
+    /// (6)". Binds tighter than `::`, like PG19's indirection.
+    fn parse_postfix_subscripts(&mut self, mut expr: Expr) -> Result<Expr, SqlError> {
+        // (lower, upper, is_slice) per bracket pair.
+        let mut items: Vec<(Option<Expr>, Option<Expr>, bool)> = Vec::new();
+        while *self.peek() == Token::LBracket {
+            self.next(); // consume '['
+            if *self.peek() == Token::Colon {
+                // `[:upper]` — null lower bound.
+                self.next();
+                let upper = if *self.peek() == Token::RBracket {
+                    None
+                } else {
+                    Some(self.parse_or()?)
+                };
+                self.expect(Token::RBracket, "']'")?;
+                items.push((None, upper, true));
+            } else {
+                let first = self.parse_or()?;
+                if *self.peek() == Token::Colon {
+                    self.next();
+                    let upper = if *self.peek() == Token::RBracket {
+                        None
+                    } else {
+                        Some(self.parse_or()?)
+                    };
+                    self.expect(Token::RBracket, "']'")?;
+                    items.push((Some(first), upper, true));
+                } else {
+                    self.expect(Token::RBracket, "']'")?;
+                    items.push((None, Some(first), false));
+                }
+            }
+        }
+        if items.is_empty() {
+            return Ok(expr);
+        }
+        if items.len() > 6 {
+            return Err(SqlError {
+                message: format!(
+                    "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                    items.len()
+                ),
+                code: "54000",
+            });
+        }
+        if items.iter().any(|(_, _, s)| *s) {
+            let one = Expr::Literal(Literal::Int(1));
+            let bounds = items
+                .into_iter()
+                .map(|(l, u, s)| {
+                    if s {
+                        (l.map(Box::new), u.map(Box::new))
+                    } else {
+                        (Some(Box::new(one.clone())), u.map(Box::new))
+                    }
+                })
+                .collect();
+            expr = Expr::Slice {
+                array: Box::new(expr),
+                bounds,
+            };
+        } else {
+            let indices = items
+                .into_iter()
+                .map(|(_, u, _)| u.expect("non-slice bracket always has an index"))
+                .collect();
+            expr = Expr::Subscript {
+                array: Box::new(expr),
+                indices,
+            };
+        }
+        Ok(expr)
+    }
+
     fn parse_call(&mut self, name: String) -> Result<Expr, SqlError> {
         // v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
         // This is valid PG syntax; without it the 42601 would (correctly)
@@ -9298,6 +9564,9 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "booleq" | "boolne" | "int4eq" | "texteq"
         // v0.73: row_to_json(record) -> json (json.c).
         | "row_to_json"
+        // v0.79: array functions (PG19 arrayfuncs.c).
+        | "array_length" | "cardinality" | "array_dims" | "array_ndims"
+        | "array_lower" | "array_upper" | "unnest"
     )
 }
 
@@ -9334,6 +9603,13 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
         // v0.73: row_to_json(record) takes exactly one argument.
         "row_to_json" => n == 1,
+        // v0.79: array functions (PG19 arrayfuncs.c arities).
+        "array_length" => n == 2,
+        "cardinality" => n == 1,
+        "array_dims" => n == 1,
+        "array_ndims" => n == 1,
+        "array_lower" | "array_upper" => n == 2,
+        "unnest" => n == 1,
         _ => false,
     };
     if ok {
@@ -9614,6 +9890,34 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(right, what)
         }
         Expr::Cast { expr, .. } => validate_constraint_expr(expr, what),
+        // v0.79: array constructors/subscripts are fine in CHECK /
+        // DEFAULT (no subqueries, no aggregates inside them — enforced
+        // by recursing).
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                validate_constraint_expr(e, what)?;
+            }
+            Ok(())
+        }
+        Expr::Subscript { array, indices } => {
+            validate_constraint_expr(array, what)?;
+            for i in indices {
+                validate_constraint_expr(i, what)?;
+            }
+            Ok(())
+        }
+        Expr::Slice { array, bounds } => {
+            validate_constraint_expr(array, what)?;
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    validate_constraint_expr(l, what)?;
+                }
+                if let Some(u) = u {
+                    validate_constraint_expr(u, what)?;
+                }
+            }
+            Ok(())
+        }
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             validate_constraint_expr(a, what)?;
             validate_constraint_expr(b, what)
@@ -9795,6 +10099,42 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(a, out);
             out.push(' ');
             encode_expr_inner(b, out);
+            out.push(')');
+        }
+        // v0.79: array constructors/subscripts/slices.
+        Expr::ArrayCtor { elems, nested } => {
+            out.push_str("(array ");
+            out.push_str(if *nested { "nested" } else { "flat" });
+            for e in elems {
+                out.push(' ');
+                encode_expr_inner(e, out);
+            }
+            out.push(')');
+        }
+        Expr::Subscript { array, indices } => {
+            out.push_str("(subscript ");
+            encode_expr_inner(array, out);
+            for i in indices {
+                out.push(' ');
+                encode_expr_inner(i, out);
+            }
+            out.push(')');
+        }
+        Expr::Slice { array, bounds } => {
+            out.push_str("(slice ");
+            encode_expr_inner(array, out);
+            for (lower, upper) in bounds {
+                out.push(' ');
+                match lower {
+                    Some(l) => encode_expr_inner(l, out),
+                    None => out.push_str("nil"),
+                }
+                out.push(' ');
+                match upper {
+                    Some(u) => encode_expr_inner(u, out),
+                    None => out.push_str("nil"),
+                }
+            }
             out.push(')');
         }
         Expr::Like {

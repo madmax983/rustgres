@@ -45,7 +45,7 @@ use crate::sql::{
     collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
-    ArrayElem, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row,
+    ArrayElem, ArrayVal, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row,
     RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp,
     row_visible, toast_consts, toast_storage,
 };
@@ -3453,13 +3453,13 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
     {
         return eval_assign_cast(&v, col_type).map_err(|e| {
             if e.code == "42846" {
-                assign_err(col_name, col_type, v.type_name())
+                assign_err(col_name, col_type, &v.type_name())
             } else {
                 e
             }
         });
     }
-    Err(assign_err(col_name, col_type, v.type_name()))
+    Err(assign_err(col_name, col_type, &v.type_name()))
 }
 
 /// v0.10: materialize a DML statement's WITH list. DML bodies cannot
@@ -8210,6 +8210,8 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Uuid(_) => ColType::Uuid,
         Value::PgLsn(_) => ColType::PgLsn,   // v0.64
         Value::Record(_) => ColType::Record, // v0.73
+        // v0.79: array values report their array type.
+        Value::Array(a) => ColType::Array(a.elem),
         Value::Null => ColType::Text,
     }
 }
@@ -8941,6 +8943,17 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
                 }
                 args.iter().any(expr_uses)
             }
+            // v0.79: array constructors/subscripts/slices recurse into
+            // their operands.
+            Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
+            Expr::Subscript { array, indices } => expr_uses(array) || indices.iter().any(expr_uses),
+            Expr::Slice { array, bounds } => {
+                expr_uses(array)
+                    || bounds.iter().any(|(l, u)| {
+                        l.as_deref().map(expr_uses).unwrap_or(false)
+                            || u.as_deref().map(expr_uses).unwrap_or(false)
+                    })
+            }
             Expr::Column { .. }
             | Expr::ResolvedCol { .. }
             | Expr::WholeRow { .. }
@@ -9166,6 +9179,27 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             right: Box::new(r(right)?),
         }),
         Expr::Concat(a, b) => Ok(Expr::Concat(Box::new(r(a)?), Box::new(r(b)?))),
+        // v0.79: array expressions rebuild with resolved operands.
+        Expr::ArrayCtor { elems, nested } => Ok(Expr::ArrayCtor {
+            elems: elems.iter().map(r).collect::<Result<Vec<_>, _>>()?,
+            nested: *nested,
+        }),
+        Expr::Subscript { array, indices } => Ok(Expr::Subscript {
+            array: Box::new(r(array)?),
+            indices: indices.iter().map(r).collect::<Result<Vec<_>, _>>()?,
+        }),
+        Expr::Slice { array, bounds } => Ok(Expr::Slice {
+            array: Box::new(r(array)?),
+            bounds: bounds
+                .iter()
+                .map(|(l, u)| {
+                    Ok((
+                        l.as_deref().map(r).transpose()?.map(Box::new),
+                        u.as_deref().map(r).transpose()?.map(Box::new),
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
         Expr::Cast { expr, to } => Ok(Expr::Cast {
             expr: Box::new(r(expr)?),
             to: *to,
@@ -10786,6 +10820,18 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
+        // v0.79: array operands can hide aggregates — recurse.
+        Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_agg),
+        Expr::Subscript { array, indices } => {
+            contains_agg(array) || indices.iter().any(contains_agg)
+        }
+        Expr::Slice { array, bounds } => {
+            contains_agg(array)
+                || bounds.iter().any(|(l, u)| {
+                    l.as_deref().map(contains_agg).unwrap_or(false)
+                        || u.as_deref().map(contains_agg).unwrap_or(false)
+                })
+        }
         Expr::Cmp { left, right, .. } => contains_agg(left) || contains_agg(right),
         Expr::Like { expr, pattern, .. } => contains_agg(expr) || contains_agg(pattern),
         // v0.68: regex match, like LIKE.
@@ -10847,6 +10893,18 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
+        // v0.79: array operands can hide window functions — recurse.
+        Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_window),
+        Expr::Subscript { array, indices } => {
+            contains_window(array) || indices.iter().any(contains_window)
+        }
+        Expr::Slice { array, bounds } => {
+            contains_window(array)
+                || bounds.iter().any(|(l, u)| {
+                    l.as_deref().map(contains_window).unwrap_or(false)
+                        || u.as_deref().map(contains_window).unwrap_or(false)
+                })
+        }
         Expr::Cmp { left, right, .. } => contains_window(left) || contains_window(right),
         Expr::Like { expr, pattern, .. } => contains_window(expr) || contains_window(pattern),
         // v0.68: regex match, like LIKE.
@@ -11125,6 +11183,33 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         | Expr::Neg(x)
         | Expr::IsNull { expr: x, .. }
         | Expr::IsBool { expr: x, .. } => validate_window_expr(x, in_agg),
+        // v0.79: array constructors/subscripts/slices propagate the
+        // nesting rules into their operands.
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                validate_window_expr(e, in_agg)?;
+            }
+            Ok(())
+        }
+        Expr::Subscript { array, indices } => {
+            validate_window_expr(array, in_agg)?;
+            for i in indices {
+                validate_window_expr(i, in_agg)?;
+            }
+            Ok(())
+        }
+        Expr::Slice { array, bounds } => {
+            validate_window_expr(array, in_agg)?;
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    validate_window_expr(l, in_agg)?;
+                }
+                if let Some(u) = u {
+                    validate_window_expr(u, in_agg)?;
+                }
+            }
+            Ok(())
+        }
         // v0.55: windows may appear in any CASE arm (a CASE is not a
         // window boundary); nesting rules propagate unchanged.
         Expr::Case {
@@ -12554,6 +12639,30 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_column_refs(a, out);
             collect_column_refs(b, out);
         }
+        // v0.79: array constructors/subscripts/slices depend on their
+        // operands' columns.
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                collect_column_refs(e, out);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            collect_column_refs(array, out);
+            for i in indices {
+                collect_column_refs(i, out);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            collect_column_refs(array, out);
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    collect_column_refs(l, out);
+                }
+                if let Some(u) = u {
+                    collect_column_refs(u, out);
+                }
+            }
+        }
         Expr::Cast { expr, .. } => collect_column_refs(expr, out),
         Expr::Like { expr, pattern, .. } => {
             collect_column_refs(expr, out);
@@ -13065,6 +13174,8 @@ fn combine_join_pair(l: &QRow, r: &QRow, layout: &JoinLayout, kind: JoinKind) ->
 fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecError> {
     match name {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
+        // v0.79: unnest's single output column is named for the function.
+        "unnest" => Ok(vec![name.to_string()]),
         "pg_input_error_info" => Ok(["message", "detail", "hint", "sql_error_code"]
             .iter()
             .map(|s| s.to_string())
@@ -13168,7 +13279,46 @@ fn eval_function_item(
     // v0.46: PG's real output types (generate_series is int4/int8/
     // numeric, so the wire RowDescription carries the right OIDs and
     // the harness canonicalizes numerics by value, not by text).
-    let col_types = table_function_col_types(name, &arg_vals)?;
+    // v0.79: unnest returns setof the array's element type — from the
+    // value when available, else statically (so `unnest(NULL::int[])`
+    // still reports int4 with zero rows, like PG's declared return
+    // type; a text *literal* coerces to text[], like PG's unknown
+    // literal, while a typed text value has no unnest signature).
+    let col_types = if name == "unnest" {
+        if args.len() != 1 {
+            return Err(exec_err(
+                "42883",
+                "function unnest() does not exist".to_string(),
+            ));
+        }
+        let elem_ty = match &arg_vals[0] {
+            Value::Array(a) => elem_scalar_type(a.elem),
+            Value::Text(_) | Value::BpChar(_) => ColType::Text,
+            Value::Null => {
+                let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+                match expr_type(
+                    &mut *q.eng,
+                    q.snap,
+                    q.own,
+                    q.session,
+                    &schemas,
+                    &[],
+                    &[],
+                    &args[0],
+                ) {
+                    Ok(ColType::Array(e)) => elem_scalar_type(e),
+                    // Typing failed (e.g. a CTE reference, which the
+                    // Describe path types properly): zero rows either
+                    // way; fall back to text for the column type.
+                    _ => ColType::Text,
+                }
+            }
+            other => return Err(func_arg_err(name, other)),
+        };
+        vec![elem_ty]
+    } else {
+        table_function_col_types(name, &arg_vals)?
+    };
     let schema = function_item_schema(name, &col_names, &col_types, alias, col_aliases)?;
     let rows = row_vals
         .into_iter()
@@ -13229,6 +13379,27 @@ fn lateral_function_schema(
             ColType::BigInt
         } else {
             ColType::Int
+        };
+        vec![ty]
+    } else if name == "unnest" {
+        // v0.79: setof the array's element type (a text literal coerces
+        // to text[], like PG's unknown literal).
+        if args.len() != 1 {
+            return Err(exec_err(
+                "42883",
+                "function unnest() does not exist".to_string(),
+            ));
+        }
+        let schemas = [left];
+        let ty = match expr_type(eng, snap, own, session, &schemas, &[], &[], &args[0])? {
+            ColType::Array(e) => elem_scalar_type(e),
+            ColType::Text if matches!(args[0], Expr::Literal(_)) => ColType::Text,
+            other => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function unnest({}) does not exist", other.sql_name()),
+                ));
+            }
         };
         vec![ty]
     } else {
@@ -14430,6 +14601,23 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
                 value_key(f, out);
             }
         }
+        // v0.79: arrays group by element type, dims and element keys
+        // (PG's hash_array mixes the same inputs). NULL elements hash
+        // distinctly from the string "NULL", like every other type.
+        Value::Array(a) => {
+            out.push(17);
+            out.push(a.elem as u8);
+            out.extend_from_slice(&(a.dims.len() as u64).to_be_bytes());
+            for d in &a.dims {
+                out.extend_from_slice(&d.to_be_bytes());
+            }
+            for l in &a.lower {
+                out.extend_from_slice(&l.to_be_bytes());
+            }
+            for e in &a.elems {
+                value_key(e, out);
+            }
+        }
     }
 }
 
@@ -15030,6 +15218,9 @@ fn eval_grouped(
             eval_arith(*op, &va, &vb)
         }
         Expr::Cast { expr, to } => {
+            if let Some(v) = cast_empty_array_ctor(expr, to) {
+                return Ok(v);
+            }
             let v = eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
             )?;
@@ -15039,6 +15230,51 @@ fn eval_grouped(
             let va = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
             let vb = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, b)?;
             eval_concat(&va, &vb)
+        }
+        // v0.79: real array expressions (operands evaluate in the
+        // grouped scope, like every other scalar expression here).
+        Expr::ArrayCtor { elems, nested } => {
+            let mut vals = Vec::with_capacity(elems.len());
+            for e in elems {
+                vals.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, e,
+                )?);
+            }
+            array_ctor_from_vals(vals, *nested)
+        }
+        Expr::Subscript { array, indices } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, array,
+            )?;
+            let mut idx_vals = Vec::with_capacity(indices.len());
+            for i in indices {
+                idx_vals.push(eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, i,
+                )?);
+            }
+            eval_subscript_vals(&va, &idx_vals)
+        }
+        Expr::Slice { array, bounds } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, array,
+            )?;
+            let mut bound_vals = Vec::with_capacity(bounds.len());
+            for (l, u) in bounds {
+                let lo = match l {
+                    Some(l) => Some(eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, l,
+                    )?),
+                    None => None,
+                };
+                let hi = match u {
+                    Some(u) => Some(eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, u,
+                    )?),
+                    None => None,
+                };
+                bound_vals.push((lo, hi));
+            }
+            eval_slice_vals(&va, &bound_vals)
         }
         Expr::Like {
             expr,
@@ -16149,6 +16385,870 @@ fn order_key(
 // Expressions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// v0.79: real array support (PG19 arrayfuncs.c / parse_expr.c semantics)
+// ---------------------------------------------------------------------------
+
+/// v0.79: `ARRAY[]::<elem>[]` — an empty array constructor takes its
+/// element type from an enclosing array cast (PG's parse analysis
+/// coerces the empty ArrayExpr to the cast target); a bare empty
+/// constructor is still 42P08. Returns `Some` only for the empty
+/// constructor under an array cast.
+fn cast_empty_array_ctor(expr: &Expr, to: &ColType) -> Option<Value> {
+    match (expr, to) {
+        (Expr::ArrayCtor { elems, .. }, ColType::Array(elem)) if elems.is_empty() => {
+            Some(Value::Array(ArrayVal {
+                elem: *elem,
+                dims: Vec::new(),
+                lower: Vec::new(),
+                elems: Vec::new(),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// v0.79: evaluate `ARRAY[...]` to a real array value. The element type
+/// is PG19's `select_common_type` over the elements (NULLs don't
+/// constrain, all-unknown resolves to text); an empty list is 42P08.
+/// The nested `ARRAY[[...],[...]]` form requires every element to be an
+/// array with identical dims (PG's "multidimensional arrays must have
+/// array expressions with matching dimensions", 22P02); dims stack.
+fn eval_array_ctor(
+    q: &mut Q,
+    scopes: &[Scope],
+    elems: &[Expr],
+    nested: bool,
+) -> Result<Value, ExecError> {
+    if elems.is_empty() {
+        return Err(exec_err("42P08", "cannot determine type of empty array"));
+    }
+    let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
+    for e in elems {
+        vals.push(eval_expr(q, scopes, e)?);
+    }
+    array_ctor_from_vals(vals, nested)
+}
+
+/// v0.79: `ARRAY[...]` from already-evaluated element values — shared by
+/// `eval_expr` and `eval_grouped` (which evaluate operands differently).
+/// The flat form takes PG19's `select_common_type` over the elements
+/// (NULLs don't constrain; all-unknown resolves to text). The nested
+/// `ARRAY[[...],[...]]` form requires every element to be an array with
+/// identical element type and dims (PG's "multidimensional arrays must
+/// have array expressions with matching dimensions", 22P02); dims stack.
+fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecError> {
+    if nested {
+        let mut rows: Vec<ArrayVal> = Vec::with_capacity(vals.len());
+        for v in vals {
+            match v {
+                Value::Array(a) => rows.push(a),
+                Value::Null => {
+                    return Err(exec_err(
+                        "22P02",
+                        "multidimensional arrays must have array expressions with matching dimensions",
+                    ));
+                }
+                other => {
+                    return Err(exec_err(
+                        "22P02",
+                        format!(
+                            "multidimensional arrays must have array expressions with matching dimensions, not {}",
+                            other.type_name()
+                        ),
+                    ));
+                }
+            }
+        }
+        let first = &rows[0];
+        for r in &rows[1..] {
+            if r.elem != first.elem || r.dims != first.dims {
+                return Err(exec_err(
+                    "22P02",
+                    "multidimensional arrays must have array expressions with matching dimensions",
+                ));
+            }
+        }
+        let mut flat: Vec<Value> = Vec::new();
+        for r in &rows {
+            flat.extend(r.elems.iter().cloned());
+        }
+        let mut dims = Vec::with_capacity(first.dims.len() + 1);
+        dims.push(rows.len() as i32);
+        dims.extend(first.dims.iter().cloned());
+        let mut lower = Vec::with_capacity(first.lower.len() + 1);
+        lower.push(1);
+        lower.extend(first.lower.iter().cloned());
+        return Ok(Value::Array(ArrayVal {
+            elem: first.elem,
+            dims,
+            lower,
+            elems: flat,
+        }));
+    }
+    // Common element type, skipping NULLs (PG's unknown literals don't
+    // constrain select_common_type; all-unknown resolves to text).
+    let mut acc: Option<ColType> = None;
+    for v in &vals {
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let t = value_coltype(v);
+        acc = Some(match acc {
+            Some(a) => common_supertype("ARRAY", &a, &t)?,
+            None => t,
+        });
+    }
+    let elem_ty = acc.unwrap_or(ColType::Text);
+    let elem = crate::storage::ArrayElem::of(&elem_ty);
+    let mut out: Vec<Value> = Vec::with_capacity(vals.len());
+    for v in vals {
+        out.push(eval_cast(&v, elem_ty)?);
+    }
+    Ok(Value::Array(ArrayVal {
+        elem,
+        dims: vec![out.len() as i32],
+        lower: vec![1],
+        elems: out,
+    }))
+}
+
+/// v0.79: coerce an array subscript/slice-bound value to an integer, like
+/// PG19's assignment coercion of `A_Indices` to int4. NULL is handled by
+/// the caller (NULL bound => NULL result / default bound).
+fn array_index_to_i64(v: &Value) -> Result<i64, ExecError> {
+    match eval_cast(v, ColType::Int)? {
+        Value::Int(n) => Ok(n),
+        // SmallInt/BigInt fold into Int through the cast; anything else
+        // the cast produced is an internal inconsistency.
+        other => Err(exec_err(
+            "42804",
+            format!(
+                "array subscript must have type integer, not {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// v0.79: `a[i, ...]` — PG19 `array_get_element` semantics for one
+/// multidimensional subscript operation. A NULL array or NULL index
+/// yields NULL; a non-array base is 42804 ("cannot subscript type
+/// ..."); a non-integer index is 42804 ("array subscript must have
+/// type integer", PG19 array_subscript_transform). PG19 returns
+/// NULL unless the index count equals the array's dimensionality
+/// (a partial subscript is NULL, not a subarray), and NULL for any
+/// out-of-range index (PG never raises on fetch).
+fn eval_subscript_vals(base: &Value, indices: &[Value]) -> Result<Value, ExecError> {
+    if matches!(base, Value::Null) || indices.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Value::Array(a) = base else {
+        return Err(exec_err(
+            "42804",
+            format!("cannot subscript type {}", base.type_name()),
+        ));
+    };
+    if a.ndim() == 0 || a.ndim() != indices.len() {
+        return Ok(Value::Null);
+    }
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+    for d in (0..a.ndim()).rev() {
+        let i = array_index_to_i64(&indices[d])?;
+        let pos = i - a.lower[d] as i64;
+        if pos < 0 || pos >= a.dims[d] as i64 {
+            return Ok(Value::Null);
+        }
+        offset += pos as usize * stride;
+        stride *= a.dims[d] as usize;
+    }
+    Ok(a.elems[offset].clone())
+}
+
+/// v0.79: `a[l:u, ...]` — PG19 `array_get_slice` semantics. A NULL
+/// array yields NULL; slicing a non-array is 42804. More slice dims
+/// than array dims, or any empty dim range, yields PG's empty
+/// (0-dimensional) array. Absent (or NULL-valued) bounds default to
+/// the array's own bounds for that dimension; bounds clamp to the
+/// array's range; dims beyond the slice list keep their full range.
+/// The result's lower bounds are reset to 1 (PG19 array_get_slice:
+/// "Lower bounds of the new array are set to 1").
+fn eval_slice_vals(
+    base: &Value,
+    bounds: &[(Option<Value>, Option<Value>)],
+) -> Result<Value, ExecError> {
+    if matches!(base, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Array(a) = base else {
+        return Err(exec_err(
+            "42804",
+            format!("cannot subscript type {}", base.type_name()),
+        ));
+    };
+    if a.ndim() == 0 {
+        return Ok(base.clone());
+    }
+    // PG19 array_get_slice: more subscripts than dimensions is the
+    // empty array, not an error.
+    if bounds.len() > a.ndim() {
+        return Ok(Value::Array(ArrayVal {
+            elem: a.elem,
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        }));
+    }
+    let bound = |v: Option<&Value>, dflt: i64| -> Result<i64, ExecError> {
+        match v {
+            Some(x) if !matches!(x, Value::Null) => array_index_to_i64(x),
+            _ => Ok(dflt),
+        }
+    };
+    let ndim = a.ndim();
+    // Per-dim (start offset into the source, element count).
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        let arr_lo = a.lower[d] as i64;
+        let arr_hi = arr_lo + a.dims[d] as i64 - 1;
+        let (lo, hi) = if d < bounds.len() {
+            let (l, u) = &bounds[d];
+            let lo = bound(l.as_ref(), arr_lo)?.max(arr_lo);
+            let hi = bound(u.as_ref(), arr_hi)?.min(arr_hi);
+            (lo, hi)
+        } else {
+            (arr_lo, arr_hi)
+        };
+        if hi < lo {
+            return Ok(Value::Array(ArrayVal {
+                elem: a.elem,
+                dims: Vec::new(),
+                lower: Vec::new(),
+                elems: Vec::new(),
+            }));
+        }
+        ranges.push(((lo - arr_lo) as usize, (hi - lo + 1) as usize));
+    }
+    // Row-major strides of the source array.
+    let mut strides = vec![0usize; ndim];
+    let mut s = 1usize;
+    for d in (0..ndim).rev() {
+        strides[d] = s;
+        s *= a.dims[d] as usize;
+    }
+    let total: usize = ranges.iter().map(|(_, c)| c).product();
+    let mut elems = Vec::with_capacity(total);
+    // Odometer over the selected ranges, innermost dim fastest.
+    let mut pos = vec![0usize; ndim];
+    for _ in 0..total {
+        let mut off = 0usize;
+        for d in 0..ndim {
+            off += (ranges[d].0 + pos[d]) * strides[d];
+        }
+        elems.push(a.elems[off].clone());
+        for d in (0..ndim).rev() {
+            pos[d] += 1;
+            if pos[d] < ranges[d].1 {
+                break;
+            }
+            pos[d] = 0;
+        }
+    }
+    Ok(Value::Array(ArrayVal {
+        elem: a.elem,
+        dims: ranges.iter().map(|(_, c)| *c as i32).collect(),
+        lower: vec![1i32; ndim],
+        elems,
+    }))
+}
+
+/// v0.79: `=` / `<>` on arrays — PG19 `array_eq` semantics. Dimensions
+/// must match exactly (else false); elements compare with three-valued
+/// logic: any false element comparison makes the result false, else any
+/// NULL element makes it NULL. Element types are unified through the
+/// common supertype first (so `int[] = bigint[]` works, like PG's
+/// operator resolution). Ordering operators have no PG array support.
+fn eval_array_cmp(op: CmpOp, a: &ArrayVal, b: &ArrayVal) -> Result<Value, ExecError> {
+    if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+        return Err(exec_err(
+            "42883",
+            format!(
+                "operator does not exist: {} {} {}",
+                a.type_name(),
+                op.sql(),
+                b.type_name()
+            ),
+        ));
+    }
+    if a.ndim() != b.ndim() || a.dims != b.dims {
+        return Ok(Value::Bool(matches!(op, CmpOp::Ne)));
+    }
+    let cty = common_supertype(
+        "array comparison",
+        &elem_scalar_type(a.elem),
+        &elem_scalar_type(b.elem),
+    )?;
+    let mut null_seen = false;
+    for (x, y) in a.elems.iter().zip(b.elems.iter()) {
+        let x = eval_cast(x, cty)?;
+        let y = eval_cast(y, cty)?;
+        match eval_cmp_vals(CmpOp::Eq, &x, &y)? {
+            Value::Bool(false) => return Ok(Value::Bool(matches!(op, CmpOp::Ne))),
+            Value::Null => null_seen = true,
+            Value::Bool(true) => {}
+            other => {
+                return Err(exec_err(
+                    "XX000",
+                    format!(
+                        "internal error: array element comparison returned {}",
+                        other.type_name()
+                    ),
+                ));
+            }
+        }
+    }
+    if null_seen {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(matches!(op, CmpOp::Eq)))
+}
+
+/// v0.79: `||` with an array operand — PG19 `array_cat` (array||array),
+/// `array_append` (array||element), `array_prepend` (element||array). A
+/// NULL array yields NULL; an untyped NULL scalar is a NULL *element*
+/// (PG resolves the unknown literal to the element type). Array||array
+/// merges along the first dimension (multi-dim arrays need matching
+/// inner dims, else 2202E like PG's "cannot concatenate incompatible
+/// arrays"); append/prepend require a one-dimensional array (2202E).
+fn eval_array_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
+    match (a, b) {
+        // NULL array (strict, like PG).
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::Array(x), Value::Array(y)) => array_cat_vals(x, y),
+        // Untyped NULL scalar: NULL element (PG's unknown-literal
+        // resolution). A typed NULL array is indistinguishable at
+        // runtime; the literal case is the common one.
+        (Value::Array(x), Value::Null) => array_append_elem(x, &Value::Null),
+        (Value::Array(x), scalar) => array_append_elem(x, scalar),
+        (scalar, Value::Array(y)) => array_prepend_elem(y, scalar),
+        _ => Err(exec_err(
+            "XX000",
+            "internal error: eval_array_concat without an array operand",
+        )),
+    }
+}
+
+/// Element type both arrays coerce to for `||` / comparison.
+fn array_common_elem(
+    x: &ArrayVal,
+    y: &ArrayVal,
+    op: &str,
+) -> Result<crate::storage::ArrayElem, ExecError> {
+    let cty = common_supertype(op, &elem_scalar_type(x.elem), &elem_scalar_type(y.elem))?;
+    Ok(crate::storage::ArrayElem::of(&cty))
+}
+
+fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecError> {
+    let elem = array_common_elem(x, y, "||")?;
+    let cty = elem_scalar_type(elem);
+    let cast_all = |a: &ArrayVal| -> Result<Vec<Value>, ExecError> {
+        a.elems.iter().map(|v| eval_cast(v, cty)).collect()
+    };
+    // PG: concatenating with an empty (0-dim) array yields the other
+    // side (retyped to the common element type).
+    if x.ndim() == 0 {
+        return Ok(Value::Array(ArrayVal {
+            elem,
+            dims: y.dims.clone(),
+            lower: y.lower.clone(),
+            elems: cast_all(y)?,
+        }));
+    }
+    if y.ndim() == 0 {
+        return Ok(Value::Array(ArrayVal {
+            elem,
+            dims: x.dims.clone(),
+            lower: x.lower.clone(),
+            elems: cast_all(x)?,
+        }));
+    }
+    if x.ndim() != y.ndim() || x.dims[1..] != y.dims[1..] {
+        return Err(exec_err("2202E", "cannot concatenate incompatible arrays"));
+    }
+    let mut elems = cast_all(x)?;
+    elems.extend(cast_all(y)?);
+    let mut dims = x.dims.clone();
+    dims[0] += y.dims[0];
+    Ok(Value::Array(ArrayVal {
+        elem,
+        dims,
+        lower: x.lower.clone(),
+        elems,
+    }))
+}
+
+fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
+    if x.ndim() > 1 {
+        return Err(exec_err(
+            "2202E",
+            "array_append requires a one-dimensional array",
+        ));
+    }
+    let cty = elem_scalar_type(x.elem);
+    let v = eval_cast(scalar, cty)?;
+    let mut elems: Vec<Value> = x
+        .elems
+        .iter()
+        .map(|e| eval_cast(e, cty))
+        .collect::<Result<_, _>>()?;
+    elems.push(v);
+    let (dims, lower) = if x.ndim() == 0 {
+        (vec![1i32], vec![1i32])
+    } else {
+        (vec![x.dims[0] + 1], x.lower.clone())
+    };
+    Ok(Value::Array(ArrayVal {
+        elem: x.elem,
+        dims,
+        lower,
+        elems,
+    }))
+}
+
+fn array_prepend_elem(y: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
+    if y.ndim() > 1 {
+        return Err(exec_err(
+            "2202E",
+            "array_prepend requires a one-dimensional array",
+        ));
+    }
+    let cty = elem_scalar_type(y.elem);
+    let v = eval_cast(scalar, cty)?;
+    let mut elems = Vec::with_capacity(y.elems.len() + 1);
+    elems.push(v);
+    elems.extend(
+        y.elems
+            .iter()
+            .map(|e| eval_cast(e, cty))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let (dims, lower) = if y.ndim() == 0 {
+        (vec![1i32], vec![1i32])
+    } else {
+        // PG19 array_prepend: the element is inserted below the
+        // input's lower bound, then the result's lower bound is
+        // readjusted to match the input's ("as expected for
+        // prepend"), so `0 || '{1,2}'::int[]` is `{0,1,2}`.
+        (vec![y.dims[0] + 1], vec![y.lower[0]])
+    };
+    Ok(Value::Array(ArrayVal {
+        elem: y.elem,
+        dims,
+        lower,
+        elems,
+    }))
+}
+
+/// v0.79: scalar array functions (PG19 arrayfuncs.c). NULL array (or
+/// NULL dimension) yields NULL; an invalid dimension (out of 1..ndims)
+/// yields NULL; an empty array yields NULL for length/lower/upper/dims
+/// and 0 for ndims/cardinality.
+fn eval_array_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    let arr = |idx: usize| -> Result<Option<&ArrayVal>, ExecError> {
+        match &vals[idx] {
+            Value::Null => Ok(None),
+            Value::Array(a) => Ok(Some(a)),
+            // PG coerces an unknown text literal to text[] for unnest;
+            // other functions have no text signature (42883).
+            other => Err(func_arg_err(name, other)),
+        }
+    };
+    let dim = |idx: usize| -> Result<Option<i64>, ExecError> {
+        match int_arg(name, &vals[idx])? {
+            None => Ok(None),
+            Some(n) => Ok(Some(n)),
+        }
+    };
+    // Resolve the (array, dim) pair shared by array_length/lower/upper:
+    // Ok(None) means "SQL NULL result".
+    let len_lower_upper = |idx_arr: usize, idx_dim: usize| -> Result<Option<i64>, ExecError> {
+        let a = match arr(idx_arr)? {
+            None => return Ok(None),
+            Some(a) => a,
+        };
+        let d = match dim(idx_dim)? {
+            None => return Ok(None),
+            Some(d) => d,
+        };
+        if a.ndim() == 0 || d < 1 || d > a.ndim() as i64 {
+            return Ok(None);
+        }
+        let i = (d - 1) as usize;
+        Ok(Some(match name {
+            "array_length" => a.dims[i] as i64,
+            "array_lower" => a.lower[i] as i64,
+            _ => (a.lower[i] + a.dims[i] - 1) as i64, // array_upper
+        }))
+    };
+    match name {
+        "array_length" | "array_lower" | "array_upper" => Ok(match len_lower_upper(0, 1)? {
+            None => Value::Null,
+            Some(n) => Value::Int(n),
+        }),
+        "cardinality" => Ok(match arr(0)? {
+            None => Value::Null,
+            Some(a) => Value::Int(a.nitems() as i64),
+        }),
+        "array_ndims" => Ok(match arr(0)? {
+            None => Value::Null,
+            Some(a) => Value::Int(a.ndim() as i64),
+        }),
+        "array_dims" => Ok(match arr(0)? {
+            None => Value::Null,
+            Some(a) if a.ndim() == 0 => Value::Null,
+            Some(a) => {
+                let mut s = String::new();
+                for (d, l) in a.dims.iter().zip(a.lower.iter()) {
+                    s.push_str(&format!("[{}:{}]", l, l + d - 1));
+                }
+                Value::text(s.as_str())
+            }
+        }),
+        _ => Err(exec_err(
+            "42883",
+            format!("function {name}() does not exist"),
+        )),
+    }
+}
+
+/// v0.79: `unnest(anyarray)` element rows — one output row per element
+/// (NULL elements become NULL rows); a NULL array yields zero rows, like
+/// PG. A text value is parsed as a text[] literal (PG's unknown-literal
+/// coercion for `unnest('{1,2}')`); anything else is 42883.
+fn unnest_rows(v: &Value) -> Result<Vec<Value>, ExecError> {
+    match v {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => Ok(a.elems.clone()),
+        Value::Text(s) | Value::BpChar(s) => {
+            let a = parse_array_literal(s, crate::storage::ArrayElem::Text)?;
+            Ok(a.elems)
+        }
+        other => Err(func_arg_err("unnest", other)),
+    }
+}
+
+/// v0.79: PG19 `array_in` for one-dimensional (possibly nested-brace)
+/// literals. Parses `{...}` text into an `ArrayVal`, running each
+/// element through the element type's input function (via `eval_cast`
+/// of its text form, so `int4in`-style 22P02 errors surface intact).
+/// Multidimensional input must have matching dims (22P02); malformed
+/// input is 22P02 `malformed array literal: "<string>"`.
+fn parse_array_literal(s: &str, elem: crate::storage::ArrayElem) -> Result<ArrayVal, ExecError> {
+    struct P<'a> {
+        chars: &'a [u8],
+        pos: usize,
+        src: &'a str,
+    }
+    impl<'a> P<'a> {
+        fn malformed(&self) -> ExecError {
+            exec_err("22P02", format!("malformed array literal: {:?}", self.src))
+        }
+        fn ws(&mut self) {
+            while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+        }
+        // Parse one element (quoted or unquoted) at the current depth;
+        // returns None for a nested `{...}` (handled by the caller).
+        fn element(&mut self) -> Result<(String, bool), ExecError> {
+            self.ws();
+            if self.pos < self.chars.len() && self.chars[self.pos] == b'"' {
+                self.pos += 1;
+                let mut out = String::new();
+                loop {
+                    if self.pos >= self.chars.len() {
+                        return Err(self.malformed());
+                    }
+                    let c = self.chars[self.pos];
+                    if c == b'\\' {
+                        self.pos += 1;
+                        if self.pos >= self.chars.len() {
+                            return Err(self.malformed());
+                        }
+                        out.push(self.chars[self.pos] as char);
+                        self.pos += 1;
+                    } else if c == b'"' {
+                        self.pos += 1;
+                        break;
+                    } else {
+                        out.push(c as char);
+                        self.pos += 1;
+                    }
+                }
+                Ok((out, true))
+            } else {
+                let start = self.pos;
+                while self.pos < self.chars.len()
+                    && !matches!(self.chars[self.pos], b',' | b'}' | b'{')
+                {
+                    self.pos += 1;
+                }
+                let raw = &self.src[start..self.pos];
+                Ok((raw.trim().to_string(), false))
+            }
+        }
+    }
+
+    fn cast_elem(
+        text: &str,
+        is_null: bool,
+        elem: crate::storage::ArrayElem,
+    ) -> Result<Value, ExecError> {
+        if is_null {
+            return Ok(Value::Null);
+        }
+        let ty = elem_scalar_type(elem);
+        eval_cast(&Value::text(text), ty)
+    }
+
+    // Recursive descent: parse one `{...}` level, returning the nested
+    // values as a tree; the caller flattens and validates dims.
+    #[derive(Debug)]
+    enum Node {
+        Elem(String, bool), // (text, is_null)
+        Arr(Vec<Node>),
+    }
+    fn parse_level(p: &mut P) -> Result<Vec<Node>, ExecError> {
+        // Caller consumed '{'.
+        let mut items: Vec<Node> = Vec::new();
+        loop {
+            p.ws();
+            if p.pos >= p.chars.len() {
+                return Err(p.malformed());
+            }
+            if p.chars[p.pos] == b'}' {
+                p.pos += 1;
+                return Ok(items);
+            }
+            if p.chars[p.pos] == b'{' {
+                p.pos += 1;
+                let inner = parse_level(p)?;
+                items.push(Node::Arr(inner));
+            } else {
+                let (t, quoted) = p.element()?;
+                // Quoted "NULL" stays a string; unquoted NULL (any
+                // case) is SQL NULL.
+                let is_null = !quoted && t.eq_ignore_ascii_case("null");
+                items.push(Node::Elem(t, is_null));
+            }
+            p.ws();
+            if p.pos < p.chars.len() && p.chars[p.pos] == b',' {
+                p.pos += 1;
+                continue;
+            }
+            p.ws();
+            if p.pos < p.chars.len() && p.chars[p.pos] == b'}' {
+                continue; // loop head consumes it
+            }
+            return Err(p.malformed());
+        }
+    }
+
+    let mut p = P {
+        chars: s.as_bytes(),
+        pos: 0,
+        src: s,
+    };
+    // Optional `[l:u]...=` dimension prefix (array_out form), per
+    // PG's ReadArrayDimensions: `[` int `:` int `]` groups, then `=`.
+    let mut dim_decls: Vec<(i32, i32)> = Vec::new();
+    // Copy the source out so the int parsing below doesn't hold `p`
+    // borrowed while `p.malformed()` also needs it.
+    let psrc: &str = p.src;
+    p.ws();
+    while p.pos < p.chars.len() && p.chars[p.pos] == b'[' {
+        p.pos += 1; // consume '['
+        p.ws();
+        let lb_start = p.pos;
+        if p.pos < p.chars.len() && p.chars[p.pos] == b'-' {
+            p.pos += 1;
+        }
+        while p.pos < p.chars.len() && p.chars[p.pos].is_ascii_digit() {
+            p.pos += 1;
+        }
+        let lb: i32 = psrc[lb_start..p.pos].parse().map_err(|_| p.malformed())?;
+        p.ws();
+        if p.pos >= p.chars.len() || p.chars[p.pos] != b':' {
+            return Err(p.malformed());
+        }
+        p.pos += 1;
+        p.ws();
+        let ub_start = p.pos;
+        if p.pos < p.chars.len() && p.chars[p.pos] == b'-' {
+            p.pos += 1;
+        }
+        while p.pos < p.chars.len() && p.chars[p.pos].is_ascii_digit() {
+            p.pos += 1;
+        }
+        let ub: i32 = psrc[ub_start..p.pos].parse().map_err(|_| p.malformed())?;
+        p.ws();
+        if p.pos >= p.chars.len() || p.chars[p.pos] != b']' {
+            return Err(p.malformed());
+        }
+        p.pos += 1;
+        if ub < lb {
+            return Err(p.malformed());
+        }
+        dim_decls.push((lb, ub));
+    }
+    if !dim_decls.is_empty() {
+        p.ws();
+        if p.pos >= p.chars.len() || p.chars[p.pos] != b'=' {
+            return Err(p.malformed());
+        }
+        p.pos += 1; // consume '='
+    }
+    p.ws();
+    if p.pos >= p.chars.len() || p.chars[p.pos] != b'{' {
+        return Err(p.malformed());
+    }
+    p.pos += 1;
+    let top = parse_level(&mut p)?;
+    p.ws();
+    if p.pos != p.chars.len() {
+        return Err(p.malformed());
+    }
+
+    // Validate the tree is a proper rectangle (PG's ReadArrayStr):
+    // every level's children share one kind (all scalars or all
+    // arrays), sibling arrays have equal lengths, and all leaves sit
+    // at the same depth. Then flatten in row-major order.
+    fn shape(
+        nodes: &[Node],
+        depth: usize,
+        leaf_depth: &mut Option<usize>,
+        dims: &mut Vec<i32>,
+    ) -> Result<(), ExecError> {
+        let mismatch = || {
+            exec_err(
+                "22P02",
+                "multidimensional arrays must have array expressions with matching dimensions",
+            )
+        };
+        if depth >= dims.len() {
+            dims.push(nodes.len() as i32);
+        } else if dims[depth] != nodes.len() as i32 {
+            return Err(mismatch());
+        }
+        let mut child_is_arr: Option<bool> = None;
+        for n in nodes {
+            let is_arr = matches!(n, Node::Arr(_));
+            match child_is_arr {
+                Some(k) if k != is_arr => return Err(mismatch()),
+                _ => child_is_arr = Some(is_arr),
+            }
+        }
+        for n in nodes {
+            match n {
+                Node::Elem(..) => match leaf_depth {
+                    Some(d) if *d != depth => return Err(mismatch()),
+                    _ => *leaf_depth = Some(depth),
+                },
+                Node::Arr(inner) => shape(inner, depth + 1, leaf_depth, dims)?,
+            }
+        }
+        Ok(())
+    }
+    fn emit(
+        nodes: &[Node],
+        elem: crate::storage::ArrayElem,
+        out: &mut Vec<Value>,
+    ) -> Result<(), ExecError> {
+        for n in nodes {
+            match n {
+                Node::Elem(t, is_null) => out.push(cast_elem(t, *is_null, elem)?),
+                Node::Arr(inner) => emit(inner, elem, out)?,
+            }
+        }
+        Ok(())
+    }
+
+    if top.is_empty() {
+        return Ok(ArrayVal {
+            elem,
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        });
+    }
+    let mut dims: Vec<i32> = Vec::new();
+    let mut leaf_depth: Option<usize> = None;
+    shape(&top, 0, &mut leaf_depth, &mut dims)?;
+    let mut elems: Vec<Value> = Vec::with_capacity(top.len());
+    emit(&top, elem, &mut elems)?;
+    // Declared `[l:u]...=` lower bounds (parsed above) apply to the
+    // result; the declared sizes must match the data (PG rejects
+    // mismatched dimension declarations in array_in).
+    let mut lower = vec![1i32; dims.len()];
+    for (i, (lb, _ub)) in dim_decls.iter().enumerate() {
+        if i < lower.len() {
+            lower[i] = *lb;
+        }
+    }
+    if !dim_decls.is_empty() {
+        if dim_decls.len() != dims.len() {
+            return Err(exec_err(
+                "22P02",
+                format!("malformed array literal: {:?}", s),
+            ));
+        }
+        for (i, (_lb, ub)) in dim_decls.iter().enumerate() {
+            let declared = ub - dim_decls[i].0 + 1;
+            if declared != dims[i] {
+                return Err(exec_err(
+                    "22P02",
+                    format!("malformed array literal: {:?}", s),
+                ));
+            }
+        }
+    }
+    Ok(ArrayVal {
+        elem,
+        dims,
+        lower,
+        elems,
+    })
+}
+
+/// v0.79: scalar `ColType` for an `ArrayElem` (element input/output).
+fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
+    use crate::storage::ArrayElem as E;
+    match elem {
+        E::Bool => ColType::Bool,
+        E::Bytea => ColType::Bytea,
+        E::SingleChar => ColType::SingleChar,
+        E::Name => ColType::Name,
+        E::SmallInt => ColType::SmallInt,
+        E::Int => ColType::Int,
+        E::Text => ColType::Text,
+        E::Char => ColType::Char(None),
+        E::Varchar => ColType::Varchar(None),
+        E::BigInt => ColType::BigInt,
+        E::Float4 => ColType::Float4,
+        E::Float => ColType::Float,
+        E::Date => ColType::Date,
+        E::Timestamp => ColType::Timestamp,
+        E::Timestamptz => ColType::Timestamptz,
+        E::Numeric => ColType::Numeric(None),
+        E::Uuid => ColType::Uuid,
+        E::Regclass => ColType::Regclass,
+        E::Json => ColType::Json,
+        E::Record => ColType::Record,
+        E::PgLsn => ColType::PgLsn,
+    }
+}
+
 /// Evaluate one expression against the scope chain (params substituted).
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
@@ -16188,6 +17288,9 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             eval_arith(*op, &va, &vb)
         }
         Expr::Cast { expr, to } => {
+            if let Some(v) = cast_empty_array_ctor(expr, to) {
+                return Ok(v);
+            }
             let v = eval_expr(q, scopes, expr)?;
             // v0.37: regclass cast needs catalog lookup (OID -> name).
             if *to == ColType::Regclass {
@@ -16199,6 +17302,29 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let va = eval_expr(q, scopes, a)?;
             let vb = eval_expr(q, scopes, b)?;
             eval_concat(&va, &vb)
+        }
+        // v0.79: real array expressions.
+        Expr::ArrayCtor { elems, nested } => eval_array_ctor(q, scopes, elems, *nested),
+        Expr::Subscript { array, indices } => {
+            let va = eval_expr(q, scopes, array)?;
+            let idx_vals = indices
+                .iter()
+                .map(|i| eval_expr(q, scopes, i))
+                .collect::<Result<Vec<_>, _>>()?;
+            eval_subscript_vals(&va, &idx_vals)
+        }
+        Expr::Slice { array, bounds } => {
+            let va = eval_expr(q, scopes, array)?;
+            let bound_vals = bounds
+                .iter()
+                .map(|(l, u)| {
+                    Ok((
+                        l.as_deref().map(|l| eval_expr(q, scopes, l)).transpose()?,
+                        u.as_deref().map(|u| eval_expr(q, scopes, u)).transpose()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            eval_slice_vals(&va, &bound_vals)
         }
         Expr::Like {
             expr,
@@ -16371,37 +17497,42 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             if out.columns.len() != 1 {
                 return Err(exec_err("42601", "subquery must return only one column"));
             }
-            let mut lit = String::from("{");
-            for (i, row) in out.rows.iter().enumerate() {
-                if i > 0 {
-                    lit.push(',');
+            // v0.79: a real typed array, not text (PG19's array subquery
+            // builds the array value directly). The element type is the
+            // subquery's column type, flattened like PG (`array(SELECT
+            // array(...))` keeps the innermost element's array OID);
+            // array-valued rows stack into extra dims (nested
+            // `ARRAY[[...],[...]]` semantics), scalar rows cast to the
+            // element type.
+            let col_ty = out.columns[0].1;
+            let vals: Vec<Value> = out.rows.iter().map(|r| r[0].clone()).collect();
+            if matches!(col_ty, ColType::Array(_)) {
+                if vals.is_empty() {
+                    // Empty subquery over an array column: PG yields an
+                    // empty array of the (flattened) element type.
+                    let elem = crate::storage::ArrayElem::of(&col_ty);
+                    return Ok(Value::Array(ArrayVal {
+                        elem,
+                        dims: Vec::new(),
+                        lower: Vec::new(),
+                        elems: Vec::new(),
+                    }));
                 }
-                // Format the value as PG array literal element.
-                match &row[0] {
-                    Value::Null => lit.push_str("NULL"),
-                    Value::Text(s) | Value::BpChar(s) => {
-                        // Quote if needed.
-                        let needs_quote = s.chars().any(|c| {
-                            c == ',' || c == '{' || c == '}' || c == '"' || c.is_whitespace()
-                        });
-                        if needs_quote {
-                            lit.push('"');
-                            for c in s.chars() {
-                                if c == '"' || c == '\\' {
-                                    lit.push('\\');
-                                }
-                                lit.push(c);
-                            }
-                            lit.push('"');
-                        } else {
-                            lit.push_str(s);
-                        }
-                    }
-                    v => lit.push_str(&value_to_text_cast(v)),
+                array_ctor_from_vals(vals, true)
+            } else {
+                let elem = crate::storage::ArrayElem::of(&col_ty);
+                let ty = elem_scalar_type(elem);
+                let mut elems = Vec::with_capacity(vals.len());
+                for v in vals {
+                    elems.push(eval_cast(&v, ty)?);
                 }
+                Ok(Value::Array(ArrayVal {
+                    elem,
+                    dims: vec![elems.len() as i32],
+                    lower: vec![1],
+                    elems,
+                }))
             }
-            lit.push('}');
-            Ok(Value::Text(lit.into()))
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
         Expr::Exists { sub, neg } => {
@@ -16782,6 +17913,25 @@ fn eval_is_distinct_from(l: Value, r: Value, neg: bool) -> Result<Value, ExecErr
 }
 
 fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    // v0.79: array comparisons — `=`/`<>` are PG19 `array_eq`
+    // (three-valued element-wise); anything else has no PG array
+    // operator (42883); array-vs-NULL is NULL.
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => return eval_array_cmp(op, x, y),
+        (Value::Array(_), Value::Null) | (Value::Null, Value::Array(_)) => return Ok(Value::Null),
+        (Value::Array(_), _other) | (_other, Value::Array(_)) => {
+            return Err(exec_err(
+                "42883",
+                format!(
+                    "operator does not exist: {} {} {}",
+                    a.type_name(),
+                    op.sql(),
+                    b.type_name()
+                ),
+            ));
+        }
+        _ => {}
+    }
     // v0.21: text-vs-numeric coercion (unknown-literal resolution) runs
     // before the NaN special-case, so 'nan' = x behaves like NaN = x
     // and 1.5 = '1.5' is true.
@@ -19043,12 +20193,26 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
             other => Err(cast_err(other, "json")),
         },
-        // v0.78: casts to an array type take the `{...}` literal text
-        // (array_in accepts it); other inputs are a cast error, like PG.
-        // (Unreachable from the parser — type names can't name arrays —
-        // but the match must be exhaustive.)
-        ColType::Array(_) => match v {
-            Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
+        // v0.79: real array casts (PG19 array_in/array_out semantics).
+        // Text (or bpchar) input parses as a `{...}` literal through
+        // the element type's input function (22P02 on bad elements, like
+        // PG); array-to-array casts retype element-wise, preserving
+        // dims, lower bounds, and NULL elements.
+        ColType::Array(elem) => match v {
+            Value::Text(s) | Value::BpChar(s) => parse_array_literal(s, elem).map(Value::Array),
+            Value::Array(a) => {
+                let ty = elem_scalar_type(elem);
+                let mut out = Vec::with_capacity(a.elems.len());
+                for e in &a.elems {
+                    out.push(eval_cast(e, ty)?);
+                }
+                Ok(Value::Array(ArrayVal {
+                    elem,
+                    dims: a.dims.clone(),
+                    lower: a.lower.clone(),
+                    elems: out,
+                }))
+            }
             other => Err(cast_err(other, &to.sql_name())),
         },
     }
@@ -19058,9 +20222,17 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
 // ||, LIKE, BETWEEN, IS TRUE/FALSE/UNKNOWN
 // ---------------------------------------------------------------------------
 
-/// `||`: bytea||bytea -> bytea; anything else coerces to text
-/// (Postgres' anynonarray || text behavior). NULL propagates.
+/// `||`: array||array / array||element / element||array (PG19
+/// array_cat/array_append/array_prepend); bytea||bytea -> bytea; anything
+/// else coerces to text (Postgres' anynonarray || text behavior). NULL
+/// propagates, except an untyped NULL scalar next to an array is a NULL
+/// array *element* (PG's unknown-literal resolution).
 fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
+    // v0.79: array concatenation takes precedence over the NULL
+    // short-circuit below (so `ARRAY[1] || NULL` appends a NULL).
+    if matches!(a, Value::Array(_)) || matches!(b, Value::Array(_)) {
+        return eval_array_concat(a, b);
+    }
     if a == &Value::Null || b == &Value::Null {
         return Ok(Value::Null);
     }
@@ -19697,6 +20869,8 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 // v0.73: records never persist in tables; approximate
                 // from the rendered text length if one ever appears.
                 Value::Record(fields) => crate::storage::record_text(fields).len() as i64,
+                // v0.79: arrays persist; approximate from the literal.
+                Value::Array(a) => a.to_literal().len() as i64,
             };
         }
         size += 24; // per-tuple overhead (approximate)
@@ -19757,6 +20931,10 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.46: generate_series(int,int[,int]) / (bigint,bigint[,bigint])
         // / (numeric,numeric[,numeric]) — PG19 int.c, int8.c, numeric.c.
         "generate_series" => (2..=3).contains(&n),
+        // v0.79: array functions (PG19 arrayfuncs.c) and unnest.
+        "array_length" | "array_lower" | "array_upper" => n == 2,
+        "cardinality" | "array_dims" | "array_ndims" => n == 1,
+        "unnest" => n == 1,
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
         // v0.43: pg_input_error_info(input, type) -> record (table
@@ -19855,6 +21033,21 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         vals
     };
     match name {
+        // v0.79: array functions (PG19 arrayfuncs.c). A text value
+        // parses as a `{...}` literal (unknown-literal coercion); an
+        // untyped NULL is NULL.
+        "array_length" | "array_lower" | "array_upper" | "cardinality" | "array_dims"
+        | "array_ndims" => return eval_array_func(name, vals),
+        // v0.79: nested scalar unnest — the SRF path (eval_srf_vals)
+        // only applies at the top level of the SELECT list. Nested
+        // (e.g. inside pg_typeof(...)), unnest yields the array's
+        // first element; NULL or an empty array yields NULL.
+        "unnest" => {
+            return Ok(unnest_rows(&vals[0])?
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null));
+        }
         "upper"
         | "lower"
         | "length"
@@ -20639,6 +21832,16 @@ fn eval_table_function(
             };
             Ok((vec![name.to_string()], rows))
         }
+        // v0.79: unnest(anyarray) — one row per element (PG19
+        // arrayfuncs.c `unnest`). NULL yields zero rows; a text value
+        // parses as a text[] literal (unknown-literal coercion).
+        "unnest" => {
+            let rows = unnest_rows(&vals[0])?
+                .into_iter()
+                .map(|v| vec![v])
+                .collect();
+            Ok((vec![name.to_string()], rows))
+        }
         _ => Err(exec_err(
             "42883",
             format!(
@@ -20659,7 +21862,7 @@ fn eval_table_function(
 /// the targetlist (planner.c `adjust_paths_for_srfs`), which is exactly
 /// what this gate matches. Unknown names are not SRFs.
 fn is_srf(name: &str) -> bool {
-    matches!(name, "regexp_matches" | "generate_series")
+    matches!(name, "regexp_matches" | "generate_series" | "unnest")
 }
 
 /// v0.32: evaluate a set-returning function to its output rows (one Value
@@ -20671,6 +21874,19 @@ fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
     check_builtin_arity(name, vals)?;
     match name {
         "regexp_matches" => regexp_matches_rows(vals),
+        // v0.79: unnest reuses the FROM-clause table-function core,
+        // flattened to one value per row — PG19's unnest returns a
+        // single column.
+        "unnest" => {
+            let (_, rows) = eval_table_function(name, vals)?;
+            rows.into_iter()
+                .map(|mut r| {
+                    r.pop().ok_or_else(|| {
+                        exec_err("XX000", "unnest returned a row with no columns".to_string())
+                    })
+                })
+                .collect()
+        }
         "generate_series" => {
             let (_, rows) = eval_table_function(name, vals)?;
             rows.into_iter()
@@ -24925,6 +26141,22 @@ fn func_result_type(
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
             Ok(ColType::Int)
         }
+        // v0.79: array functions (PG19 arrayfuncs.c) — the runtime
+        // dispatches these in eval_func_vals, but inference fell
+        // through to 42883. scalar unnest(array) yields the element
+        // type.
+        "array_length" | "array_lower" | "array_upper" | "cardinality" | "array_ndims" => {
+            Ok(ColType::Int)
+        }
+        "array_dims" => Ok(ColType::Text),
+        "unnest" => match arg0() {
+            Ok(ColType::Array(e)) => Ok(elem_scalar_type(e)),
+            Ok(other) => Err(exec_err(
+                "42883",
+                format!("function unnest({}) does not exist", other.sql_name()),
+            )),
+            Err(e) => Err(e),
+        },
         "abs" | "sign" => arg0(),
         // v0.67: round is overloaded like trunc — float in -> float8
         // out (PG dround), numeric in -> numeric out (mirrors
@@ -25221,26 +26453,30 @@ fn float_val(v: &Value) -> f64 {
     }
 }
 
-fn value_type_name(v: &Value) -> &'static str {
+use std::borrow::Cow;
+
+fn value_type_name(v: &Value) -> Cow<'static, str> {
     match v {
-        Value::SmallInt(_) => "smallint",
-        Value::Int(_) => "integer",
-        Value::BigInt(_) => "bigint",
-        Value::Float4(_) => "real",
-        Value::Float(_) => "float",
-        Value::Numeric(_) => "numeric",
-        Value::Text(_) => "text",
-        Value::BpChar(_) => "character",    // v0.35
-        Value::SingleChar(_) => "\"char\"", // v0.36
-        Value::Bool(_) => "boolean",
-        Value::Date(_) => "date",
-        Value::Timestamp(_) => "timestamp",
-        Value::Timestamptz(_) => "timestamptz",
-        Value::Bytea(_) => "bytea",
-        Value::Uuid(_) => "uuid",
-        Value::PgLsn(_) => "pg_lsn",  // v0.64
-        Value::Record(_) => "record", // v0.73
-        Value::Null => "null",
+        Value::SmallInt(_) => Cow::Borrowed("smallint"),
+        Value::Int(_) => Cow::Borrowed("integer"),
+        Value::BigInt(_) => Cow::Borrowed("bigint"),
+        Value::Float4(_) => Cow::Borrowed("real"),
+        Value::Float(_) => Cow::Borrowed("float"),
+        Value::Numeric(_) => Cow::Borrowed("numeric"),
+        Value::Text(_) => Cow::Borrowed("text"),
+        Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
+        Value::SingleChar(_) => Cow::Borrowed("\"char\""), // v0.36
+        Value::Bool(_) => Cow::Borrowed("boolean"),
+        Value::Date(_) => Cow::Borrowed("date"),
+        Value::Timestamp(_) => Cow::Borrowed("timestamp"),
+        Value::Timestamptz(_) => Cow::Borrowed("timestamptz"),
+        Value::Bytea(_) => Cow::Borrowed("bytea"),
+        Value::Uuid(_) => Cow::Borrowed("uuid"),
+        Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
+        Value::Record(_) => Cow::Borrowed("record"), // v0.73
+        // v0.79: arrays report their element type, like pg_typeof.
+        Value::Array(a) => Cow::Owned(format!("{}[]", a.elem.sql_name())),
+        Value::Null => Cow::Borrowed("null"),
     }
 }
 
@@ -26065,10 +27301,135 @@ fn expr_type(
             // keeps the innermost element's array OID.
             Ok(ColType::Array(ArrayElem::of(&elem)))
         }
+        // v0.79: real array expressions (mirror the runtime typing in
+        // array_ctor_from_vals / eval_subscript_val / eval_slice_val so
+        // RowDescription agrees with execution).
+        Expr::ArrayCtor { elems, nested } => {
+            let r = |e: &Expr| expr_type(eng, snap, own, session, schemas, outer, ctes, e);
+            if elems.is_empty() {
+                return Err(exec_err("42P08", "cannot determine type of empty array"));
+            }
+            if *nested {
+                let mut elem_ty: Option<crate::storage::ArrayElem> = None;
+                for e in elems {
+                    match r(e)? {
+                        ColType::Array(ae) => {
+                            if let Some(prev) = elem_ty {
+                                if prev != ae {
+                                    return Err(exec_err(
+                                        "22P02",
+                                        "multidimensional arrays must have array expressions with matching dimensions",
+                                    ));
+                                }
+                            } else {
+                                elem_ty = Some(ae);
+                            }
+                        }
+                        other => {
+                            return Err(exec_err(
+                                "22P02",
+                                format!(
+                                    "multidimensional arrays must have array expressions with matching dimensions, not {}",
+                                    other.sql_name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(ColType::Array(
+                    elem_ty.unwrap_or(crate::storage::ArrayElem::Text),
+                ))
+            } else {
+                let mut acc: Option<ColType> = None;
+                for e in elems {
+                    // NULL literals don't constrain the common type
+                    // (PG's unknown literals), mirroring
+                    // array_ctor_from_vals.
+                    if matches!(e, Expr::Literal(Literal::Null)) {
+                        continue;
+                    }
+                    let t = r(e)?;
+                    acc = Some(match acc {
+                        Some(a) => common_supertype("ARRAY", &a, &t)?,
+                        None => t,
+                    });
+                }
+                let elem_ty = acc.unwrap_or(ColType::Text);
+                Ok(ColType::Array(crate::storage::ArrayElem::of(&elem_ty)))
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, array)? {
+                ColType::Array(e) => {
+                    for i in indices {
+                        check_array_index_type(eng, snap, own, session, schemas, outer, ctes, i)?;
+                    }
+                    Ok(elem_scalar_type(e))
+                }
+                other => Err(exec_err(
+                    "42804",
+                    format!("cannot subscript type {}", other.sql_name()),
+                )),
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, array)? {
+                ct @ ColType::Array(_) => {
+                    for (l, u) in bounds {
+                        if let Some(l) = l {
+                            check_array_index_type(
+                                eng, snap, own, session, schemas, outer, ctes, l,
+                            )?;
+                        }
+                        if let Some(u) = u {
+                            check_array_index_type(
+                                eng, snap, own, session, schemas, outer, ctes, u,
+                            )?;
+                        }
+                    }
+                    Ok(ct)
+                }
+                other => Err(exec_err(
+                    "42804",
+                    format!("cannot subscript type {}", other.sql_name()),
+                )),
+            }
+        }
         // v0.10: window function result types.
         Expr::Window { func, args, .. } => {
             window_result_type(eng, snap, own, session, schemas, outer, ctes, func, args)
         }
+    }
+}
+
+/// v0.79: PG19 `array_subscript_transform` coerces every subscript
+/// (and slice bound) to int4, raising 42804 "array subscript must
+/// have type integer" when the index expression's type is not
+/// integer. A NULL literal has unknown type (coercible; a NULL
+/// index yields NULL at execution, like PG).
+#[allow(clippy::too_many_arguments)]
+fn check_array_index_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    ctes: &[CteDef],
+    e: &Expr,
+) -> Result<(), ExecError> {
+    if matches!(e, Expr::Literal(Literal::Null)) {
+        return Ok(());
+    }
+    match expr_type(eng, snap, own, session, schemas, outer, ctes, e)? {
+        ColType::SmallInt | ColType::Int | ColType::BigInt => Ok(()),
+        other => Err(exec_err(
+            "42804",
+            format!(
+                "array subscript must have type integer, not {}",
+                other.sql_name()
+            ),
+        )),
     }
 }
 
@@ -27488,6 +28849,10 @@ fn value_to_literal(v: &Option<Value>) -> Literal {
         // v0.73: records never arrive as parameters (parse_param_value
         // rejects the record type); substituting NULL is unreachable.
         Some(Value::Record(_)) => Literal::Null,
+        // v0.79: an array parameter substitutes as its `{...}` literal
+        // text (dims prefix included, so lower bounds round-trip);
+        // downstream coercion re-parses it for the target type.
+        Some(Value::Array(a)) => Literal::Text(a.to_literal().into()),
         Some(Value::Null) => Literal::Null,
     }
 }
@@ -27745,7 +29110,9 @@ mod tests {
     /// Parse + execute a statement as one autocommit-ish step (own xid 9,
     /// fresh snapshot). Returns the rows as debug strings.
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
-        let stmt = parse_statement(sql).map_err(|e| exec_err("42601", e.message))?;
+        // v0.79: preserve the parser's SQLSTATE (e.g. 54000 for >6 array
+        // dimensions) instead of flattening every parse error to 42601.
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         run_stmt(eng, &stmt)
     }
 
@@ -31758,6 +33125,193 @@ mod tests {
         .unwrap();
         assert!(!rows_of(r).is_empty());
     }
+
+    #[test]
+    fn v079_subscript_pg19_semantics() {
+        // v0.79: PG19-grounded subscript/slice semantics (REL_19_STABLE
+        // gram.y, parse_node.c, arraysubs.c, arrayfuncs.c):
+        // - adjacent brackets are ONE multidimensional operation;
+        // - partial subscript (fewer indices than dims) is NULL;
+        // - >6 brackets is 54000;
+        // - non-integer index is 42804;
+        // - slices reset lower bounds to 1 (array_get_slice);
+        // - prepend readjusts the lower bound to the input's.
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT ('{{1,2},{3,4}}'::int[])[2][1]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["3".to_string()]]);
+        let r = run(&mut eng, "SELECT ('{{1,2},{3,4}}'::int[])[2]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["NULL".to_string()]]);
+        let r = run(
+            &mut eng,
+            "SELECT (ARRAY[10,20,30])[5], (ARRAY[10,20,30])[0]",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["NULL".to_string(), "NULL".to_string()]]
+        );
+        let r = run(&mut eng, "SELECT (NULL::int[])[1], (ARRAY[1])[NULL]").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["NULL".to_string(), "NULL".to_string()]]
+        );
+        let err = run(&mut eng, "SELECT 5[1]").unwrap_err();
+        assert_eq!(err.code, "42804");
+        let err = run(&mut eng, "SELECT (ARRAY[1])['x']").unwrap_err();
+        assert_eq!(err.code, "42804");
+        let err = run(&mut eng, "SELECT ('{1}'::int[])[1][1][1][1][1][1][1]").unwrap_err();
+        assert_eq!(err.code, "54000");
+        let r = run(&mut eng, "SELECT ('{1,2,3,4}'::int[])[2:3]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{2,3}".to_string()]]);
+        let r = run(&mut eng, "SELECT array_dims(('{1,2,3,4}'::int[])[2:3])").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["[1:2]".to_string()]]);
+        // Mixed chain: any slice makes the whole chain a slice; a
+        // plain [i] becomes [1:i].
+        let r = run(&mut eng, "SELECT ('{{1,2,3},{4,5,6}}'::int[])[1:2][2:3]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{{2,3},{5,6}}".to_string()]]);
+        // Empty slice range -> PG's empty (0-dim) array.
+        let r = run(&mut eng, "SELECT ('{1,2}'::int[])[3:1]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{}".to_string()]]);
+        // Prepend keeps the input's lower bound (PG19 array_prepend).
+        let r = run(&mut eng, "SELECT 0 || '{1,2}'::int[]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{0,1,2}".to_string()]]);
+        // Array function result types (inference, not just runtime).
+        let r = run(
+            &mut eng,
+            "SELECT pg_typeof(array_length(ARRAY[1],1)), pg_typeof(cardinality(ARRAY[1])), \
+             pg_typeof(array_ndims(ARRAY[1])), pg_typeof(array_dims(ARRAY[1])), \
+             pg_typeof(unnest(ARRAY['a']))",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "integer".to_string(),
+                "integer".to_string(),
+                "integer".to_string(),
+                "text".to_string(),
+                "text".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn v079_array_index_type_check() {
+        // v0.79: PG19 `array_subscript_transform` coerces every subscript
+        // (and slice bound) to int4: int2/int4/int8 indices are accepted, a
+        // NULL literal index is coercible (NULL at execution), and anything
+        // else raises 42804 "array subscript must have type integer".
+        let mut eng = engine();
+        // int2 / int8 indices are accepted.
+        let r = run(&mut eng, "SELECT (ARRAY[10,20,30])[1::smallint]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["10".to_string()]]);
+        let r = run(&mut eng, "SELECT (ARRAY[10,20,30])[2::bigint]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["20".to_string()]]);
+        // NULL literal index passes the type check; NULL at execution.
+        let r = run(&mut eng, "SELECT (ARRAY[1])[NULL]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["NULL".to_string()]]);
+        // Non-integer index: 42804.
+        let err = run(&mut eng, "SELECT (ARRAY[1])['x']").unwrap_err();
+        assert_eq!(err.code, "42804");
+        assert!(
+            err.message
+                .contains("array subscript must have type integer")
+        );
+        let err = run(&mut eng, "SELECT (ARRAY[1])[1.5]").unwrap_err();
+        assert_eq!(err.code, "42804");
+        assert!(
+            err.message
+                .contains("array subscript must have type integer")
+        );
+        // Slice bounds are validated the same way.
+        let err = run(&mut eng, "SELECT (ARRAY[1,2])['a':2]").unwrap_err();
+        assert_eq!(err.code, "42804");
+        let r = run(&mut eng, "SELECT ('{1,2,3}'::int[])[1::smallint:2::bigint]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{1,2}".to_string()]]);
+    }
+
+    #[test]
+    fn v079_empty_array_ctor_cast() {
+        // v0.79: `ARRAY[]::int[]` takes its element type from the cast
+        // (PG's parse analysis coerces the empty ArrayExpr); a bare
+        // `ARRAY[]` is still 42P08.
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT array[]::int[]").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["{}".to_string()]]);
+        let r = run(&mut eng, "SELECT pg_typeof(array[]::int[])").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["integer[]".to_string()]]);
+        let r = run(&mut eng, "SELECT cardinality(array[]::text[])").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["0".to_string()]]);
+        let err = run(&mut eng, "SELECT array[]").unwrap_err();
+        assert_eq!(err.code, "42P08");
+    }
+}
+
+fn info_columns_schema() -> Vec<QCol> {
+    [
+        ("table_catalog", ColType::Text),
+        ("table_schema", ColType::Text),
+        ("table_name", ColType::Text),
+        ("column_name", ColType::Text),
+        ("ordinal_position", ColType::Int),
+        ("column_default", ColType::Text),
+        ("is_nullable", ColType::Text),
+        ("data_type", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "information_schema.columns".to_string(),
+        name: n.to_string(),
+        ty,
+
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_columns_schema();
+    let mut rows = Vec::new();
+    let mut tables: Vec<(String, Table)> = db
+        .tables
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|t| crate::storage::table_visible(t, snap, own))
+        })
+        .map(|(n, vs)| {
+            let t = vs
+                .iter()
+                .find(|t| crate::storage::table_visible(t, snap, own))
+                .expect("filtered")
+                .clone();
+            (n.clone(), t)
+        })
+        .collect();
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+    for (tn, t) in tables {
+        for (i, (cn, ty)) in t.columns.iter().enumerate() {
+            let default = match &t.defaults[i] {
+                Some(d) => Value::text(format!("{:?}", d)),
+                None => Value::Null,
+            };
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::text("rustgres"),
+                    Value::text("public"),
+                    Value::text(tn.as_str()),
+                    Value::text(cn.as_str()),
+                    Value::Int((i + 1) as i64),
+                    default,
+                    Value::text(if t.not_null[i] { "NO" } else { "YES" }),
+                    Value::text(format!("{:?}", ty)),
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
 }
 
 // ============================================================================
@@ -33378,6 +34932,29 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(a, old, new);
             rename_col_in_expr(b, old, new);
         }
+        // v0.79: array expressions recurse into their operands.
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                rename_col_in_expr(e, old, new);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            rename_col_in_expr(array, old, new);
+            for i in indices {
+                rename_col_in_expr(i, old, new);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            rename_col_in_expr(array, old, new);
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    rename_col_in_expr(l, old, new);
+                }
+                if let Some(u) = u {
+                    rename_col_in_expr(u, old, new);
+                }
+            }
+        }
         Expr::Not(a) => rename_col_in_expr(a, old, new),
         Expr::BitNot(a) => rename_col_in_expr(a, old, new),
         Expr::Neg(a) => rename_col_in_expr(a, old, new),
@@ -34991,73 +36568,6 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     (schema, rows)
 }
 
-fn info_columns_schema() -> Vec<QCol> {
-    [
-        ("table_catalog", ColType::Text),
-        ("table_schema", ColType::Text),
-        ("table_name", ColType::Text),
-        ("column_name", ColType::Text),
-        ("ordinal_position", ColType::Int),
-        ("column_default", ColType::Text),
-        ("is_nullable", ColType::Text),
-        ("data_type", ColType::Text),
-    ]
-    .into_iter()
-    .map(|(n, ty)| QCol {
-        qual: "information_schema.columns".to_string(),
-        name: n.to_string(),
-        ty,
-
-        hidden: false,
-        src_ord: 0,
-    })
-    .collect()
-}
-
-fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
-    let schema = info_columns_schema();
-    let mut rows = Vec::new();
-    let mut tables: Vec<(String, Table)> = db
-        .tables
-        .iter()
-        .filter(|(_, vs)| {
-            vs.iter()
-                .any(|t| crate::storage::table_visible(t, snap, own))
-        })
-        .map(|(n, vs)| {
-            let t = vs
-                .iter()
-                .find(|t| crate::storage::table_visible(t, snap, own))
-                .expect("filtered")
-                .clone();
-            (n.clone(), t)
-        })
-        .collect();
-    tables.sort_by(|a, b| a.0.cmp(&b.0));
-    for (tn, t) in tables {
-        for (i, (cn, ty)) in t.columns.iter().enumerate() {
-            let default = match &t.defaults[i] {
-                Some(d) => Value::text(format!("{:?}", d)),
-                None => Value::Null,
-            };
-            rows.push(QRow {
-                cells: Row::new(vec![
-                    Value::text("rustgres"),
-                    Value::text("public"),
-                    Value::text(tn.as_str()),
-                    Value::text(cn.as_str()),
-                    Value::Int((i + 1) as i64),
-                    default,
-                    Value::text(if t.not_null[i] { "NO" } else { "YES" }),
-                    Value::text(format!("{:?}", ty)),
-                ]),
-                prov: Vec::new(),
-            });
-        }
-    }
-    (schema, rows)
-}
-
 #[cfg(test)]
 mod variance_stress_tests {
     use super::Value;
@@ -35180,13 +36690,6 @@ mod variance_stress_tests {
         assert_ne!(tiny2.to_text(), "0");
         let tiny3 = Numeric::parse("3e-16383").unwrap();
         assert_ne!(tiny3.to_text(), "0");
-        // Verify the dscale cap logic: mul of two dscale-16383 values
-        // caps the result dscale at 16383 (not 32766).
-        let a = Numeric::parse("0.1").unwrap();
-        let b = Numeric::parse("0.1").unwrap();
-        // dscale of 0.1 is 1; product dscale should be 2 (not capped).
-        let p = a.checked_mul(&b).unwrap();
-        assert_eq!(p.dscale, 2);
     }
 }
 

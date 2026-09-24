@@ -123,7 +123,9 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{Index, IndexDef};
 use crate::sql::{ArithOp, Expr, Literal};
-use crate::storage::{ArrayElem, ColType, Engine, Row, RowVersion, Table, Value, WriteOp};
+use crate::storage::{
+    ArrayElem, ArrayVal, ColType, Engine, Row, RowVersion, Table, Value, WriteOp,
+};
 
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
@@ -1174,6 +1176,25 @@ impl Enc {
                 self.u8(16);
                 self.u64(*lsn);
             }
+            // v0.79: real array values. Tag 17, then the PG array OID
+            // identifying the element type (same table as col_type tag
+            // 22), dims, lower bounds, and each element as a nested
+            // value — elements are always scalar, so no cycle.
+            Value::Array(a) => {
+                self.u8(17);
+                self.u32(a.elem.array_oid());
+                self.u32(a.dims.len() as u32);
+                for d in &a.dims {
+                    self.i32(*d);
+                }
+                for l in &a.lower {
+                    self.i32(*l);
+                }
+                self.u32(a.elems.len() as u32);
+                for e in &a.elems {
+                    self.value(e);
+                }
+            }
             // v0.73: records never persist (INSERT/CTAS coerce or reject
             // them first); encoding one is an internal bug.
             Value::Record(_) => panic!("wal: whole-row record values are never stored"),
@@ -1737,7 +1758,60 @@ impl<'a> Dec<'a> {
             15 => Ok(Value::SingleChar(self.u8()?)),
             // v0.64: pg_lsn.
             16 => Ok(Value::PgLsn(self.u64()?)),
+            // v0.79: real array values (tag 17; mirrors the encoder).
+            17 => {
+                let elem = self.array_elem()?;
+                let ndim = self.u32()? as usize;
+                let mut dims = Vec::with_capacity(ndim);
+                for _ in 0..ndim {
+                    dims.push(self.i32()?);
+                }
+                let mut lower = Vec::with_capacity(ndim);
+                for _ in 0..ndim {
+                    lower.push(self.i32()?);
+                }
+                let nelems = self.u32()? as usize;
+                let mut elems = Vec::with_capacity(nelems);
+                for _ in 0..nelems {
+                    elems.push(self.value()?);
+                }
+                Ok(Value::Array(ArrayVal {
+                    elem,
+                    dims,
+                    lower,
+                    elems,
+                }))
+            }
             t => Err(self.err(&format!("unknown value tag {}", t))),
+        }
+    }
+
+    /// v0.79: decode the PG array OID used by both `col_type` tag 22
+    /// and `value` tag 17 into the element type.
+    fn array_elem(&mut self) -> Result<ArrayElem, String> {
+        match self.u32()? {
+            1000 => Ok(ArrayElem::Bool),
+            1001 => Ok(ArrayElem::Bytea),
+            1002 => Ok(ArrayElem::SingleChar),
+            1003 => Ok(ArrayElem::Name),
+            1005 => Ok(ArrayElem::SmallInt),
+            1007 => Ok(ArrayElem::Int),
+            1009 => Ok(ArrayElem::Text),
+            1014 => Ok(ArrayElem::Char),
+            1015 => Ok(ArrayElem::Varchar),
+            1016 => Ok(ArrayElem::BigInt),
+            1021 => Ok(ArrayElem::Float4),
+            1022 => Ok(ArrayElem::Float),
+            1182 => Ok(ArrayElem::Date),
+            1115 => Ok(ArrayElem::Timestamp),
+            1185 => Ok(ArrayElem::Timestamptz),
+            1231 => Ok(ArrayElem::Numeric),
+            2951 => Ok(ArrayElem::Uuid),
+            2206 => Ok(ArrayElem::Regclass),
+            199 => Ok(ArrayElem::Json),
+            2287 => Ok(ArrayElem::Record),
+            3221 => Ok(ArrayElem::PgLsn),
+            t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }
 
