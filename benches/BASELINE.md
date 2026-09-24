@@ -2,6 +2,71 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — baseline — 2026-09-24
+
+Workload: `benches/profile_agg.py --rows 40000 --groups 4000 --count 50`
+(added in #26) — a fixed-iteration-count wire-protocol driver. Loads
+`bench_agg(k INT, a INT, b INT, c INT, d INT)` with 40,000 rows across
+4,000 distinct `k` values (10 rows/group), then sends an exact 50
+iterations of `SELECT k, count(*), sum(a), sum(b), max(c), min(d) FROM
+bench_agg GROUP BY k` over the real wire protocol against a debug
+build.
+
+This is the same harness issue #27 used for the (reverted,
+below-floor) `exec_agg_one` output-cell finding. That writeup's
+profile table flagged two bigger, still-unaddressed sites in the same
+workload: `exec::value_key` (exec.rs:14346, group-key hashing, 45.9%
+of blocks) and `exec::eval_agg_func` (accumulator state, 50.4% of
+bytes). This entry follows up on the first one.
+
+### Profile (before fix)
+
+DHAT, valgrind 3.22.0, debug build, this session (reproduced
+independently of issue #27's numbers to confirm determinism — its
+13,059,900 blocks / 2,135,183,906 bytes vs. this run's 13,059,899
+blocks / 2,135,183,602 bytes, both counters within noise of each
+other and safely reproducible):
+
+- Total: **13,059,899** allocation blocks, **2,135,183,602** bytes.
+- Target site (`exec_agg_one`'s row-grouping loop, `src/exec.rs`, the
+  `value_key(v, &mut key_bytes)` calls into a freshly `Vec::new()`'d
+  `key_bytes` buffer, one per input row): **6,000,000** blocks
+  (**45.94%** of total) / **118,000,000** bytes (**5.53%** of total).
+
+### Hypothesis
+
+`exec_agg_one`'s row-to-group hashing loop
+(`for (i, key_vals) in xkeys.iter().enumerate()`) allocates a brand
+new `let mut key_bytes = Vec::new();` on *every input row*, then
+`value_key`-encodes each GROUP BY key column into it purely to look
+the row up in `group_index: HashMap<Vec<u8>, usize>` — and then
+throws the buffer away unless this is the first row of a new group,
+in which case it's moved into the map as the map's key. For this
+workload's single-`INT`-column key, each row's encoding is 21 bytes
+(1 tag byte + 16 bytes of `i128`-widened value + 4 bytes of scale),
+which needs two `Vec<u8>` reallocations to grow from `Vec::new()`'s
+capacity 0 (0→4→8, per the same growth-then-realloc shape as the
+`project_row`/`exec_agg` output-cell findings) — three allocations
+per row, 10 rows per group, but only one row per group actually needs
+an *owned* key.
+
+Since `group_index` only needs to *borrow* the encoded bytes for the
+lookup (`HashMap<Vec<u8>, _>::get` accepts `&[u8]` via `Borrow`), the
+buffer only needs to become an owned allocation on the "new group"
+path — every repeat-lookup row (9 out of every 10, at this workload's
+group size) can reuse one scratch buffer across the whole row loop
+instead of allocating and growing its own. This should collapse the
+per-row alloc-and-grow-3x cost down to one alloc-on-first-sight (a
+`key_bytes.clone()`, sized exactly, no growth) per *distinct group*,
+not per row — roughly a 10x reduction in this site's own allocation
+count at this workload's row/group ratio, well over the ≥10%
+allocation-count impact floor if it holds.
+
+Fix (measured next commit): keep `key_bytes: Vec<u8>` outside the
+per-row loop, `.clear()` it each iteration instead of re-allocating,
+look it up with `group_index.get(key_bytes.as_slice())`, and only
+`.clone()` it into `group_index.insert(...)` on the "new group" path.
+
 ## Bolt: `find_partition_leaf` clones every rejected candidate's metadata before checking it — fix — 2026-09-23
 
 New workload: `benches/bench.py --workload partition` (`w_partition`).
