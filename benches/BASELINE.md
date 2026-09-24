@@ -2,6 +2,71 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — fix — 2026-09-24
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec.rs`, `exec_agg_one`'s row-to-group hashing loop:
+
+```rust
+let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
+let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+let mut key_bytes: Vec<u8> = Vec::new();
+for (i, key_vals) in xkeys.iter().enumerate() {
+    key_bytes.clear();
+    for v in key_vals {
+        value_key(v, &mut key_bytes);
+    }
+    match group_index.get(key_bytes.as_slice()) {
+        Some(&gi) => groups[gi].1.push(i),
+        None => {
+            group_index.insert(key_bytes.clone(), groups.len());
+            groups.push((key_vals.clone(), vec![i]));
+        }
+    }
+}
+```
+
+`key_bytes` moves outside the loop and is `.clear()`'d instead of
+re-allocated each iteration; `group_index.get` borrows the scratch
+buffer as `&[u8]` for the lookup (`Vec<u8>: Borrow<[u8]>`), and only
+the "new group" branch pays for an owned allocation, via
+`key_bytes.clone()` (sized exactly to the current key's length, no
+growth). No change to grouping order, key encoding, or which rows
+land in which group — same `value_key` bytes compared the same way,
+same `HashMap<Vec<u8>, usize>` entries, same result.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000
+--count 50`), same machine, same session. DHAT: total blocks
+13,059,899 -> **7,260,049** (**-44.41%**); total bytes 2,135,183,602
+-> **2,021,386,566** (**-5.33%**). The target site (exec.rs:14733,
+the `value_key` call inside the row loop) drops from 6,000,000 blocks
+/ 118,000,000 bytes to **150 blocks / 2,950 bytes** — the residual is
+the reused scratch buffer's own one-time growth (~3 reallocations per
+query execution before its capacity stabilizes, x 50 iterations =
+150, matching exactly). The new "owned on first sight" allocation
+(`key_bytes.clone()` on the `None` branch) shows up as a new
+`Vec<u8>::to_vec` site: exactly 200,000 blocks (4,000 groups x 50
+iterations) / 4,200,000 bytes -- matching the hypothesis precisely
+(one alloc per distinct group instead of three per row).
+
+`cargo test --all-features`: 289/289 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: same pre-existing failures before and after (340
+errors, confirmed via git stash -- all in unrelated code; matches the
+342-line count issue #27 also reported for this same tree).
+
+Reproduce: run `benches/profile_agg.py --rows 40000 --groups 4000
+--count 50` against a `valgrind --tool=dhat`-wrapped debug build on
+both the pre-fix and post-fix tree, then sum `tb`/`tbk` over the
+`pps` array in the resulting `dhat.out.*` JSON for the totals (per
+`benches/profiles/README.md`).
+
 ## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — baseline — 2026-09-24
 
 Workload: `benches/profile_agg.py --rows 40000 --groups 4000 --count 50`
