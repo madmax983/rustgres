@@ -11,7 +11,23 @@
 //! (days-from-civil / civil-from-days), implemented from the published
 //! formulas.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// v0.90: PGDATESTYLE support. When true, `format_date` renders
+/// `MM-DD-YYYY` (Postgres style, as pg_regress sets via
+/// `PGDATESTYLE=Postgres, MDY`); when false (default), it renders
+/// ISO `YYYY-MM-DD` (real PG19 default is `ISO, MDY`).
+static DATESTYLE_POSTGRES: AtomicBool = AtomicBool::new(false);
+
+/// Set by `main` from the `PGDATESTYLE` environment variable.
+pub fn set_datestyle_postgres(on: bool) {
+    DATESTYLE_POSTGRES.store(on, Ordering::Relaxed);
+}
+
+fn datestyle_postgres() -> bool {
+    DATESTYLE_POSTGRES.load(Ordering::Relaxed)
+}
 
 /// Days from civil date to days since 1970-01-01. `m` is 1-12, `d` is 1-31.
 pub fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
@@ -231,10 +247,15 @@ fn parse_time(t: &str) -> Result<i64, String> {
     Ok(((hh as i64 * 60 + mm as i64) * 60 + ss as i64) * 1_000_000 + us)
 }
 
-/// `YYYY-MM-DD`.
+/// `YYYY-MM-DD` (ISO), or `MM-DD-YYYY` when PGDATESTYLE selects
+/// the Postgres style (see `set_datestyle_postgres`).
 pub fn format_date(days: i32) -> String {
     let (y, m, d) = civil_from_days(days as i64);
-    format!("{:04}-{:02}-{:02}", y, m, d)
+    if datestyle_postgres() {
+        format!("{:02}-{:02}-{:04}", m, d, y)
+    } else {
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
 }
 
 /// `YYYY-MM-DD HH:MM:SS[.ffffff]` (fraction trimmed, like Postgres).

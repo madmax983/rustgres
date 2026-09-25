@@ -17125,6 +17125,22 @@ fn eval_grouped(
             }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
+                // v0.90: `VARIADIC expr` — expand the array into individual
+                // args (grouped path). A NULL array makes the call NULL.
+                if let Some(inner) = is_variadic_marker(a) {
+                    let v = eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, inner,
+                    )?;
+                    match expand_variadic_value(v) {
+                        None => return Ok(Value::Null),
+                        Some(expanded) => {
+                            for ev in expanded {
+                                vals.push(normalize_func_arg(name, ev));
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
                 vals.push(normalize_func_arg(name, v));
             }
@@ -23740,6 +23756,30 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
 /// else coerces to text (Postgres' anynonarray || text behavior). NULL
 /// propagates, except an untyped NULL scalar next to an array is a NULL
 /// array *element* (PG's unknown-literal resolution).
+///
+/// v0.90: `__variadic` marker check — returns true if `e` is the
+/// `__variadic(inner)` marker produced by the parser for `VARIADIC inner`.
+fn is_variadic_marker(e: &Expr) -> Option<&Expr> {
+    if let Expr::Func { name, args } = e {
+        if name == "__variadic" && args.len() == 1 {
+            return Some(&args[0]);
+        }
+    }
+    None
+}
+
+/// v0.90: Expand a `VARIADIC` argument value. A NULL array means the
+/// whole call returns NULL (PG: `concat(VARIADIC NULL)` is NULL);
+/// an array expands to its elements; anything else is a PG type error
+/// but we pass it through as a single value to be lenient.
+fn expand_variadic_value(v: Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Null => None,
+        Value::Array(arr) => Some(arr.elems),
+        other => Some(vec![other]),
+    }
+}
+
 fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
     // v0.79: array concatenation takes precedence over the NULL
     // short-circuit below (so `ARRAY[1] || NULL` appends a NULL).
@@ -23756,7 +23796,30 @@ fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
             r.extend_from_slice(y);
             Ok(Value::Bytea(r))
         }
-        _ => Ok(text_value_of(&[a, b])),
+        _ => {
+            // v0.90: PG19 only resolves `||` to text concatenation when
+            // the implicit cast to text is allowed, i.e. when at least
+            // one operand is text-like (text/varchar/char) or an unknown
+            // literal (which becomes text). `SELECT 3 || 4.0` (integer ||
+            // numeric) raises 42883. See PG19 text.out.
+            let text_like = |v: &Value| {
+                matches!(
+                    v,
+                    Value::Text(_) | Value::BpChar(_) | Value::SingleChar(_)
+                )
+            };
+            if !text_like(a) && !text_like(b) {
+                return Err(exec_err(
+                    "42883",
+                    format!(
+                        "operator does not exist: {} || {}",
+                        value_type_name(a),
+                        value_type_name(b)
+                    ),
+                ));
+            }
+            Ok(text_value_of(&[a, b]))
+        }
     }
 }
 
@@ -24442,21 +24505,31 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     // arity takes the call (raw argument values; the call coerces to
     // the declared types). Builtins keep precedence for names with no
     // user definition.
+    // v0.90: `VARIADIC expr` args are expanded here (before UDF
+    // resolution) so both UDF and builtin paths see the expanded args.
+    // A NULL variadic array makes the whole call NULL (PG semantics).
     {
         let mut raw_vals = Vec::with_capacity(args.len());
         for a in args {
-            raw_vals.push(eval_expr(q, scopes, a)?);
+            if let Some(inner) = is_variadic_marker(a) {
+                let v = eval_expr(q, scopes, inner)?;
+                match expand_variadic_value(v) {
+                    None => return Ok(Value::Null),
+                    Some(expanded) => raw_vals.extend(expanded),
+                }
+            } else {
+                raw_vals.push(eval_expr(q, scopes, a)?);
+            }
         }
         if let Some(fdef) = resolve_function_overload(q.eng, name, &raw_vals) {
             return call_user_function(q, scopes, &fdef, &raw_vals);
         }
+        let mut vals = Vec::with_capacity(raw_vals.len());
+        for v in raw_vals {
+            vals.push(normalize_func_arg(name, v));
+        }
+        return eval_func_vals(name, &vals);
     }
-    let mut vals = Vec::with_capacity(args.len());
-    for a in args {
-        let v = eval_expr(q, scopes, a)?;
-        vals.push(normalize_func_arg(name, v));
-    }
-    eval_func_vals(name, &vals)
 }
 
 /// v0.37: `pg_column_compression(any)` — like PG19's implementation in

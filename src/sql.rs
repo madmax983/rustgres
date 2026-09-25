@@ -8113,7 +8113,19 @@ impl Parser {
             let mut args = Vec::new();
             if *self.peek() != Token::RParen {
                 loop {
-                    args.push(self.parse_or()?);
+                    // v0.90: `VARIADIC expr` — marks the argument for
+                    // array expansion (PG19). Parsed as a `__variadic`
+                    // marker func; exec.rs expands it in function-call
+                    // evaluation.
+                    if self.eat_keyword("variadic") {
+                        let inner = self.parse_or()?;
+                        args.push(Expr::Func {
+                            name: "__variadic".to_string(),
+                            args: vec![inner],
+                        });
+                    } else {
+                        args.push(self.parse_or()?);
+                    }
                     if *self.peek() == Token::Comma {
                         self.next();
                         continue;

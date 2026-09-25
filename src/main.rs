@@ -76,6 +76,14 @@ fn port() -> u16 {
 fn main() {
     let port = port();
     let data_dir = data_dir();
+    // v0.90: honor PGDATESTYLE like real PG (pg_regress sets
+    // `PGDATESTYLE=Postgres, MDY`). When the Postgres style is selected,
+    // date output renders MM-DD-YYYY; otherwise ISO YYYY-MM-DD.
+    if let Ok(ds) = std::env::var("PGDATESTYLE") {
+        if ds.to_ascii_lowercase().contains("postgres") {
+            crate::datetime::set_datestyle_postgres(true);
+        }
+    }
     // Crash recovery: load the latest checkpoint, replay WAL frames after
     // it. A missing/empty data dir yields an empty database — the server
     // keeps its in-memory behavior when there is no state.

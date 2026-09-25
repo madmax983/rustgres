@@ -4368,7 +4368,7 @@ mod tests {
 
     #[test]
     fn v81_is_catalog_changing_ddl() {
-        use crate::sql::{Stmt, parse_statement};
+        use crate::sql::parse_statement;
         // DDL statements bump the catalog epoch.
         for sql in [
             "CREATE TABLE t (a int)",
