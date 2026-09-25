@@ -2350,7 +2350,14 @@ fn build_table_def(
                 }
                 ParsedTableCon::Unique(n, cols) => {
                     let first = cols[0].clone();
-                    def_add_unique(table, &mut def, n.clone(), cols, &first, !inherits.is_empty())?
+                    def_add_unique(
+                        table,
+                        &mut def,
+                        n.clone(),
+                        cols,
+                        &first,
+                        !inherits.is_empty(),
+                    )?
                 }
                 ParsedTableCon::Check(n, e) => {
                     def_add_check(table, &mut def, n.clone(), e.clone(), table)?
@@ -2629,14 +2636,8 @@ pub enum FuncLang {
 /// `<domain>_check[N]` like CREATE DOMAIN does.
 #[derive(Clone, Debug)]
 pub enum AlterDomainAction {
-    AddConstraint {
-        name: Option<String>,
-        expr: Expr,
-    },
-    DropConstraint {
-        name: String,
-        if_exists: bool,
-    },
+    AddConstraint { name: Option<String>, expr: Expr },
+    DropConstraint { name: String, if_exists: bool },
     SetNotNull,
     DropNotNull,
     SetDefault(DefaultExpr),
@@ -2708,6 +2709,28 @@ pub fn desugar_plpgsql_body(body: &str) -> Result<String, String> {
     Ok(format!("SELECT {}", expr))
 }
 
+/// v1.00: parse a bounded trigger-function body (`RETURNS trigger`,
+/// `LANGUAGE plpgsql`) into [`TriggerBodyStmt`]s. The grammar is
+/// deliberately small — `BEGIN <stmt>; ... END` where each statement is
+/// one of:
+/// - `NEW.<col> = <expr>` or `NEW.<col> := <expr>` (assignment)
+/// - `RETURN NEW` | `RETURN OLD` | `RETURN NULL`
+/// - `RAISE NOTICE '<format>' [, <expr> ...]` |
+///   `RAISE EXCEPTION '<format>' [, <expr> ...]`
+///
+/// Expressions reuse the main SQL expression parser. Anything else is a
+/// 42601 syntax error (like PG's plpgsql validator at CREATE time).
+pub fn parse_trigger_body(body: &str) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+    let tokens = tokenize(body)?;
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        unnamed_seq: 0,
+        allow_similar_to: true,
+    };
+    p.parse_trigger_body_stmts()
+}
+
 /// v0.86: `VOLATILE` / `STABLE` / `IMMUTABLE` markers. Stored for
 /// catalog fidelity; the executor does not yet reorder or cache on
 /// volatility.
@@ -2727,6 +2750,83 @@ pub struct IndexColSpec {
     pub expr: Option<String>,
     pub desc: bool,
     pub nulls_first: bool,
+}
+
+// ---------------------------------------------------------------------------
+// v1.00: triggers (PG19 `CreateTrigStmt`, bounded). BEFORE INSERT
+// FOR EACH ROW triggers fire in the executor (NEW assignment,
+// RETURN NEW/NULL, RAISE NOTICE); AFTER triggers and other events are
+// parsed and cataloged but never fired (documented gap).
+// ---------------------------------------------------------------------------
+
+/// v1.00: trigger timing (PG19 `TRIGGER_BEFORE` / `TRIGGER_AFTER`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// v1.00: trigger event bitmask (PG19 `TRIGGER_INSERT` etc., simplified
+/// to one bit per event so it fits in a single WAL/checkpoint byte).
+pub mod trig_event {
+    /// INSERT event.
+    pub const INSERT: u8 = 1;
+    /// DELETE event.
+    pub const DELETE: u8 = 2;
+    /// UPDATE event.
+    pub const UPDATE: u8 = 4;
+    /// TRUNCATE event (parsed; never fired in v1.00).
+    pub const TRUNCATE: u8 = 8;
+}
+
+/// v1.00: a trigger definition as parsed from `CREATE TRIGGER`. Stored
+/// on the table's catalog entry (`storage::Table.triggers`) so it
+/// versions, WAL-replays, and checkpoints with the table. `args` are
+/// the `EXECUTE FUNCTION f(args)` argument source texts (debug format);
+/// v1.00 accepts them syntactically but does not pass them to the
+/// function (no `TG_ARGV`).
+#[derive(Clone, Debug)]
+pub struct TriggerDef {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub events: u8,
+    pub for_each_row: bool,
+    pub function: String,
+    /// v1.00: accepted syntactically, not passed to the function (no
+    /// `TG_ARGV`). Kept so the DDL round-trips faithfully.
+    #[allow(dead_code)]
+    pub args: Vec<String>,
+}
+
+/// v1.00: one statement of a bounded trigger-function body
+/// (`RETURNS trigger`, `LANGUAGE plpgsql`). This is a separate,
+/// deliberately small grammar — not an expansion of the bounded
+/// PL/pgSQL function body (`desugar_plpgsql_body`): it supports exactly
+/// what BEFORE ROW triggers need.
+#[derive(Clone, Debug)]
+pub enum TriggerBodyStmt {
+    /// `NEW.col = <expr>` or `NEW.col := <expr>`.
+    Assign { col: String, expr: Expr },
+    /// `RETURN NEW`.
+    ReturnNew,
+    /// `RETURN OLD`.
+    ReturnOld,
+    /// `RETURN NULL` — the row is skipped (like PG19).
+    ReturnNull,
+    /// `RAISE <level> '<format>' [, <expr> ...]`.
+    Raise {
+        level: RaiseLevel,
+        format: String,
+        args: Vec<Expr>,
+    },
+}
+
+/// v1.00: `RAISE` levels supported in trigger bodies. Anything else
+/// (DEBUG, LOG, INFO, WARNING) is rejected at parse time with 0A000.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaiseLevel {
+    Notice,
+    Exception,
 }
 
 #[derive(Clone, Debug)]
@@ -2852,6 +2952,30 @@ pub enum Stmt {
         arg_types: Vec<String>,
         if_exists: bool,
         /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
+        cascade: bool,
+    },
+    // --- v1.00: CREATE TRIGGER (bounded, PG19 `CreateTrigStmt`) ---
+    CreateTrigger {
+        name: String,
+        table: String,
+        timing: TriggerTiming,
+        /// Bitmask of `trig_event::*`.
+        events: u8,
+        for_each_row: bool,
+        function: String,
+        /// `EXECUTE FUNCTION f(args)` argument source texts.
+        args: Vec<String>,
+        /// v1.00: `WHEN (...)` is parsed; the executor does not
+        /// evaluate it (documented gap).
+        when: Option<Expr>,
+        /// `CONSTRAINT` triggers are cataloged; enforcement is a gap.
+        is_constraint: bool,
+    },
+    /// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
         cascade: bool,
     },
     /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
@@ -4098,7 +4222,8 @@ impl Parser {
                     self.parse_alter_role()
                 }
                 _ => Err(err(
-                    "syntax error: expected TABLE, SEQUENCE, DOMAIN or ROLE after ALTER".to_string(),
+                    "syntax error: expected TABLE, SEQUENCE, DOMAIN or ROLE after ALTER"
+                        .to_string(),
                 )),
             },
             // --- v0.17: SET / SHOW / RESET
@@ -4438,6 +4563,10 @@ impl Parser {
         }
         if matches!(self.peek(), Token::Ident(s) if s == "operator") {
             return self.parse_create_operator();
+        }
+        // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
+        if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            return self.parse_create_trigger();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -5794,14 +5923,11 @@ impl Parser {
                 // cost-based planner).
                 match self.next() {
                     Token::Number(raw) => {
-                        let v: f64 = raw.parse().map_err(|_| {
-                            err(format!("invalid COST value: {}", raw))
-                        })?;
+                        let v: f64 = raw
+                            .parse()
+                            .map_err(|_| err(format!("invalid COST value: {}", raw)))?;
                         if v <= 0.0 {
-                            return Err(err(format!(
-                                "COST must be positive, got {}",
-                                raw
-                            )));
+                            return Err(err(format!("COST must be positive, got {}", raw)));
                         }
                     }
                     other => {
@@ -5950,6 +6076,262 @@ impl Parser {
             if_exists,
             cascade,
         })
+    }
+
+    /// v1.00: `CREATE [CONSTRAINT] TRIGGER name {BEFORE|AFTER|INSTEAD OF}
+    /// event [OR event ...] ON table [WHEN (...)] FOR EACH {ROW|STATEMENT}
+    /// EXECUTE {FUNCTION|PROCEDURE} func(args)` (PG19 `CreateTrigStmt`,
+    /// bounded). Timing, events, row/statement granularity, the function
+    /// name, and WHEN are all parsed; only BEFORE INSERT FOR EACH ROW
+    /// triggers fire in v1.00.
+    fn parse_create_trigger(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("trigger")?;
+        // v1.00: PG19 `CONSTRAINT TRIGGER` (parsed; enforcement is a
+        // documented gap, like WHEN below).
+        let is_constraint = self.eat_keyword("constraint");
+        let name = self.expect_ident()?;
+        let timing = if self.eat_keyword("before") {
+            TriggerTiming::Before
+        } else if self.eat_keyword("after") {
+            TriggerTiming::After
+        } else if self.eat_keyword("instead") {
+            // PG19: INSTEAD OF is only valid on views; rustgres has no
+            // view triggers at all, so this is an honest 0A000.
+            self.expect_keyword("of")?;
+            return Err(SqlError {
+                message: "INSTEAD OF triggers are not supported".to_string(),
+                code: "0A000",
+            });
+        } else {
+            return Err(err(
+                "syntax error: expected BEFORE, AFTER, or INSTEAD OF".to_string()
+            ));
+        };
+        let mut events: u8 = 0;
+        loop {
+            if self.eat_keyword("insert") {
+                events |= trig_event::INSERT;
+            } else if self.eat_keyword("delete") {
+                events |= trig_event::DELETE;
+            } else if self.eat_keyword("update") {
+                events |= trig_event::UPDATE;
+            } else if self.eat_keyword("truncate") {
+                events |= trig_event::TRUNCATE;
+            } else {
+                break;
+            }
+            if !self.eat_keyword("or") {
+                break;
+            }
+        }
+        if events == 0 {
+            return Err(err(
+                "syntax error: expected INSERT, DELETE, UPDATE, or TRUNCATE".to_string(),
+            ));
+        }
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        // Optional WHEN clause (parsed; not evaluated in v1.00).
+        let when = if self.eat_keyword("when") {
+            self.expect(Token::LParen, "'('")?;
+            let expr = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            Some(expr)
+        } else {
+            None
+        };
+        self.expect_keyword("for")?;
+        self.expect_keyword("each")?;
+        let for_each_row = if self.eat_keyword("row") {
+            true
+        } else if self.eat_keyword("statement") {
+            false
+        } else {
+            return Err(err("syntax error: expected ROW or STATEMENT".to_string()));
+        };
+        self.expect_keyword("execute")?;
+        // PG19 accepts both FUNCTION and PROCEDURE here.
+        if !(self.eat_keyword("function") || self.eat_keyword("procedure")) {
+            return Err(err(
+                "syntax error: expected FUNCTION or PROCEDURE".to_string()
+            ));
+        }
+        let function = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                let arg = self.parse_or()?;
+                // v1.00: trigger arguments are accepted syntactically
+                // and stored as source text, but not passed to the
+                // function (no TG_ARGV).
+                args.push(format!("{:?}", arg));
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next(); // ','
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Stmt::CreateTrigger {
+            name,
+            table,
+            timing,
+            events,
+            for_each_row,
+            function,
+            args,
+            when,
+            is_constraint,
+        })
+    }
+
+    /// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`
+    /// (PG19 `DropStmt` with `OBJECT_TRIGGER`).
+    fn parse_drop_trigger(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("trigger")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::DropTrigger {
+            name,
+            table,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v1.00: parse the statement list of a trigger-function body (see
+    /// [`parse_trigger_body`]). The parser is positioned at the first
+    /// token of the body; it must start with `BEGIN` and end with `END`.
+    fn parse_trigger_body_stmts(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+        self.expect_keyword("begin")?;
+        let mut stmts = Vec::new();
+        loop {
+            // `END` terminates the body (an optional trailing `;`
+            // before it is allowed).
+            if matches!(self.peek(), Token::Ident(s) if s == "end") {
+                self.next();
+                break;
+            }
+            stmts.push(self.parse_trigger_body_stmt()?);
+            // Statements are `;`-separated; the `;` before `END` is
+            // optional.
+            if matches!(self.peek(), Token::Semi) {
+                self.next();
+            } else if !matches!(self.peek(), Token::Ident(s) if s == "end") {
+                return Err(err(format!(
+                    "syntax error in trigger body: expected ';' or END, found {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        // Nothing may follow END (an optional trailing `;` is allowed,
+        // like PG's plpgsql).
+        if matches!(self.peek(), Token::Semi) {
+            self.next();
+        }
+        match self.next() {
+            Token::EOF => Ok(stmts),
+            other => Err(err(format!(
+                "syntax error in trigger body: unexpected {:?} after END",
+                other
+            ))),
+        }
+    }
+
+    /// v1.00: parse one trigger-body statement (see [`parse_trigger_body`]).
+    fn parse_trigger_body_stmt(&mut self) -> Result<TriggerBodyStmt, SqlError> {
+        // Assignment: `NEW.<col> = <expr>` or `NEW.<col> := <expr>`.
+        // (`OLD` assignments are rejected: PG forbids them.)
+        if matches!(self.peek(), Token::Ident(s) if s == "new")
+            && matches!(self.peek2(), Token::Dot)
+        {
+            self.next(); // 'new'
+            self.next(); // '.'
+            let col = self.expect_ident()?;
+            // `=` or `:=` (the lexer produces Colon + Eq for `:=`).
+            if matches!(self.peek(), Token::Eq) {
+                self.next();
+            } else if matches!(self.peek(), Token::Colon) && matches!(self.peek2(), Token::Eq) {
+                self.next();
+                self.next();
+            } else {
+                return Err(err(format!(
+                    "syntax error in trigger body: expected '=' or ':=', found {:?}",
+                    self.peek()
+                )));
+            }
+            let expr = self.parse_or()?;
+            return Ok(TriggerBodyStmt::Assign { col, expr });
+        }
+        // `RETURN NEW | OLD | NULL`.
+        if matches!(self.peek(), Token::Ident(s) if s == "return") {
+            self.next();
+            match self.next() {
+                Token::Ident(s) if s == "new" => return Ok(TriggerBodyStmt::ReturnNew),
+                Token::Ident(s) if s == "old" => return Ok(TriggerBodyStmt::ReturnOld),
+                Token::Ident(s) if s == "null" => return Ok(TriggerBodyStmt::ReturnNull),
+                other => {
+                    return Err(err(format!(
+                        "syntax error in trigger body: expected NEW, OLD, or NULL after RETURN, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        // `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+        if matches!(self.peek(), Token::Ident(s) if s == "raise") {
+            self.next();
+            let level = match self.next() {
+                Token::Ident(s) if s == "notice" => RaiseLevel::Notice,
+                Token::Ident(s) if s == "exception" => RaiseLevel::Exception,
+                other => {
+                    return Err(SqlError {
+                        message: format!(
+                            "RAISE level {:?} is not supported in trigger bodies",
+                            other
+                        ),
+                        code: "0A000",
+                    });
+                }
+            };
+            let format = match self.next() {
+                Token::Str(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error in trigger body: expected format string after RAISE, found {:?}",
+                        other
+                    )));
+                }
+            };
+            let mut args = Vec::new();
+            while matches!(self.peek(), Token::Comma) {
+                self.next(); // ','
+                args.push(self.parse_or()?);
+            }
+            return Ok(TriggerBodyStmt::Raise {
+                level,
+                format,
+                args,
+            });
+        }
+        Err(err(format!(
+            "syntax error in trigger body: unexpected {:?}",
+            self.peek()
+        )))
     }
 
     /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`
@@ -6221,7 +6603,10 @@ impl Parser {
             let e = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
             validate_constraint_expr(&e, "CHECK")?;
-            AlterDomainAction::AddConstraint { name: cname, expr: e }
+            AlterDomainAction::AddConstraint {
+                name: cname,
+                expr: e,
+            }
         } else if self.eat_keyword("drop") {
             if self.eat_keyword("constraint") {
                 let if_exists = if self.eat_keyword("if") {
@@ -6256,7 +6641,8 @@ impl Parser {
                 AlterDomainAction::SetDefault(classify_default(e)?)
             } else {
                 return Err(err(
-                    "syntax error: expected NOT NULL or DEFAULT after ALTER DOMAIN ... SET".to_string(),
+                    "syntax error: expected NOT NULL or DEFAULT after ALTER DOMAIN ... SET"
+                        .to_string(),
                 ));
             }
         } else {
@@ -6274,7 +6660,9 @@ impl Parser {
                 // v0.99: `AS smallint | int | bigint` (PG19; anything
                 // else is a 22023 at execution).
                 if opts.seq_type.is_some() {
-                    return Err(err("syntax error: duplicate AS in sequence options".to_string()));
+                    return Err(err(
+                        "syntax error: duplicate AS in sequence options".to_string()
+                    ));
                 }
                 opts.seq_type = Some(self.parse_seq_type()?);
             } else if self.eat_keyword("start") {
@@ -10881,6 +11269,10 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "operator") {
             return self.parse_drop_operator();
         }
+        // v1.00: DROP TRIGGER [IF EXISTS] name ON table (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            return self.parse_drop_trigger();
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
@@ -11389,12 +11781,9 @@ pub fn split_statements(input: &str) -> Vec<String> {
                         .next()
                         .is_some_and(|c0| c0.is_alphabetic() || c0 == '_'));
             if valid_tag {
-                let closer: Vec<char> =
-                    format!("${}$", tag).chars().collect();
+                let closer: Vec<char> = format!("${}$", tag).chars().collect();
                 i = j + 1; // past the opening $tag$
-                while i + closer.len() <= chars.len()
-                    && chars[i..i + closer.len()] != closer[..]
-                {
+                while i + closer.len() <= chars.len() && chars[i..i + closer.len()] != closer[..] {
                     i += 1;
                 }
                 i += closer.len(); // past the closing $tag$ (or EOF)

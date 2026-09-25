@@ -4842,6 +4842,12 @@ pub struct Table {
     /// resolved against the visible catalog on each use. Empty = no
     /// parents (ordinary table).
     pub inherits: Vec<String>,
+    /// v1.00: triggers defined on this table, in creation order (PG19
+    /// `pg_trigger`, simplified). Versions, WAL-replays, and
+    /// checkpoints with the table, so CREATE/DROP TRIGGER are fully
+    /// transactional. Only BEFORE INSERT FOR EACH ROW triggers fire
+    /// in v1.00.
+    pub triggers: Vec<crate::sql::TriggerDef>,
 }
 
 impl Table {
@@ -4886,6 +4892,8 @@ impl Table {
             partition: None,
             // v0.96: no inheritance parents by default.
             inherits: Vec::new(),
+            // v1.00: no triggers by default.
+            triggers: Vec::new(),
         }
     }
 
@@ -5429,7 +5437,13 @@ impl Database {
         session: u64,
     ) -> Vec<String> {
         // Direct children of `name`, sorted for determinism.
-        fn direct(db: &Database, name: &str, snap: &Snapshot, own: u64, session: u64) -> Vec<String> {
+        fn direct(
+            db: &Database,
+            name: &str,
+            snap: &Snapshot,
+            own: u64,
+            session: u64,
+        ) -> Vec<String> {
             let mut kids: Vec<String> = Vec::new();
             let mut consider = |tname: &String, t: &Table| {
                 if t.inherits.iter().any(|p| p == name) && tname != name {

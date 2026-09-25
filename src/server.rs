@@ -102,6 +102,11 @@ pub(crate) struct Session {
     /// compressor TOAST uses for columns without an explicit
     /// `COMPRESSION` method. Default is pglz.
     default_toast_compression: crate::storage::ToastCompression,
+    /// v1.00: notices (e.g. `RAISE NOTICE` from trigger bodies)
+    /// pending delivery to the client. Execution paths append here;
+    /// the protocol handlers drain and send them as NoticeResponse
+    /// ('N') before the completion tag.
+    pending_notices: Vec<String>,
     /// v0.81: parsed-AST cache for the extended protocol. Keyed by the
     /// exact query text of a Parse message; each entry records the
     /// catalog epoch it was parsed under. A hit (epoch matches) skips
@@ -313,6 +318,8 @@ impl Session {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices on a fresh session.
+            pending_notices: Vec::new(),
             // v0.81: parsed-AST cache starts empty.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -938,6 +945,32 @@ pub(crate) fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::
     send_error_detail(stream, code, message, None)
 }
 
+/// v1.00: send a NoticeResponse ('N') for a `RAISE NOTICE` message.
+/// Severity is NOTICE, code is 00000 (like PG's successful-completion
+/// notices from plpgsql RAISE).
+pub(crate) fn send_notice(stream: &mut Writer, message: &str) -> io::Result<()> {
+    let mut b = MsgBuilder::new(b'N');
+    b.u8(b'S')
+        .cstr("NOTICE")
+        .u8(b'V')
+        .cstr("NOTICE")
+        .u8(b'C')
+        .cstr("00000")
+        .u8(b'M')
+        .cstr(message);
+    b.send(stream)
+}
+
+/// v1.00: drain `session.pending_notices`, sending each as a
+/// NoticeResponse. Called before the CommandComplete of a successful
+/// statement (PG sends notices before the completion tag).
+fn drain_notices(stream: &mut Writer, session: &mut Session) -> io::Result<()> {
+    for notice in std::mem::take(&mut session.pending_notices) {
+        send_notice(stream, &notice)?;
+    }
+    Ok(())
+}
+
 /// v0.71: ErrorResponse with an optional PG-style DETAIL (`D`) field.
 pub(crate) fn send_error_detail(
     stream: &mut Writer,
@@ -1104,6 +1137,8 @@ fn handle_query(
                 for row in &rows {
                     send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
+                // v1.00: notices before the completion tag.
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C')
                     .cstr(&format!("SELECT {}", rows.len()))
                     .send(stream)?;
@@ -1114,9 +1149,11 @@ fn handle_query(
                 for row in &rows {
                     send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr("EXPLAIN").send(stream)?;
             }
             Ok(ExecResult::Command { tag }) => {
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
             // v0.10: DML with RETURNING sends rows like a SELECT, then the
@@ -1130,6 +1167,7 @@ fn handle_query(
                         send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                     }
                 }
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
         }
@@ -1228,6 +1266,7 @@ fn copy_to_fetch(
             read_only: t.read_only == Some(true),
             writes: &mut t.writes,
             default_toast_compression: session.default_toast_compression,
+            notices: Vec::new(),
         };
         match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
             Ok(r) => Ok(r),
@@ -1249,6 +1288,7 @@ fn copy_to_fetch(
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut writes,
             };
             exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
@@ -1372,6 +1412,7 @@ fn copy_from_ingest(
                 role: &session.role,
                 read_only: t.read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut t.writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1394,6 +1435,7 @@ fn copy_from_ingest(
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1807,10 +1849,10 @@ fn cursor_fetch(
     // the transaction (via txn_execute), like PG19.
     if let Some(query) = query {
         let sel = Stmt::Select(query);
-        let result = if session.txn.is_some() {
+        let result: Result<ExecResult, ExecError> = if session.txn.is_some() {
             txn_execute(engine, session, &sel)
         } else {
-            autocommit_execute(
+            match autocommit_execute(
                 engine,
                 wal,
                 session.sid,
@@ -1818,7 +1860,13 @@ fn cursor_fetch(
                 session.default_txn_read_only == Some(true),
                 session.default_toast_compression,
                 &sel,
-            )
+            ) {
+                Ok((r, notices)) => {
+                    session.pending_notices.extend(notices);
+                    Ok(r)
+                }
+                Err(e) => Err(e),
+            }
         };
         let cur = session.cursors.get_mut(name).expect("cursor checked above");
         match result {
@@ -2480,7 +2528,7 @@ fn run_statement(
                 let a = Stmt::Analyze {
                     table: table.clone(),
                 };
-                autocommit_execute(
+                let (_, notices) = autocommit_execute(
                     engine,
                     wal,
                     session.sid,
@@ -2489,6 +2537,9 @@ fn run_statement(
                     session.default_toast_compression,
                     &a,
                 )?;
+                // v1.00: trigger RAISE NOTICE output (ANALYZE has no
+                // triggers, but keep the plumbing uniform).
+                session.pending_notices.extend(notices);
             }
             Ok(out)
         }
@@ -2523,7 +2574,7 @@ fn run_statement(
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(
+                match autocommit_execute(
                     engine,
                     wal,
                     session.sid,
@@ -2531,7 +2582,14 @@ fn run_statement(
                     session.default_txn_read_only == Some(true),
                     session.default_toast_compression,
                     stmt,
-                )
+                ) {
+                    Ok((r, notices)) => {
+                        // v1.00: trigger RAISE NOTICE output.
+                        session.pending_notices.extend(notices);
+                        Ok(r)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     };
@@ -2607,10 +2665,16 @@ fn txn_execute(
             role: &session.role,
             read_only: t.read_only == Some(true),
             default_toast_compression: session.default_toast_compression,
+            notices: Vec::new(),
             writes: &mut t.writes,
         };
-        exec::execute(&mut *guard, &mut ctx, stmt)
+        let r = exec::execute(&mut *guard, &mut ctx, stmt);
+        // v1.00: collect trigger RAISE NOTICE output for the client.
+        let notices = std::mem::take(&mut ctx.notices);
+        (r, notices)
     };
+    let (result, notices) = result;
+    session.pending_notices.extend(notices);
     // v0.9: sequence advances are non-transactional: on success, stage
     // their commit-time WAL markers. (On failure the in-memory advance
     // still stands, like Postgres; there is just nothing to log yet.)
@@ -2649,12 +2713,12 @@ fn autocommit_execute(
     // v0.41: session's `default_toast_compression` GUC.
     default_toast_compression: crate::storage::ToastCompression,
     stmt: &Stmt,
-) -> Result<ExecResult, ExecError> {
+) -> Result<(ExecResult, Vec<String>), ExecError> {
     let mut guard = lock_engine(engine);
     let xid = guard.begin_txn();
     let snap = guard.take_snapshot();
     let mut writes: Vec<WriteOp> = Vec::new();
-    let result = {
+    let (result, notices) = {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
@@ -2663,9 +2727,13 @@ fn autocommit_execute(
             role,
             read_only,
             default_toast_compression,
+            notices: Vec::new(),
             writes: &mut writes,
         };
-        exec::execute(&mut *guard, &mut ctx, stmt)
+        let r = exec::execute(&mut *guard, &mut ctx, stmt);
+        // v1.00: collect trigger RAISE NOTICE output for the client.
+        let notices = std::mem::take(&mut ctx.notices);
+        (r, notices)
     };
     // v0.9: stage sequence-advance WAL markers on success (see
     // txn_execute for the semantics).
@@ -2719,7 +2787,7 @@ fn autocommit_execute(
     }
     retire_txn(&mut guard, xid);
     auto_vacuum(&mut guard, &writes);
-    Ok(result)
+    Ok((result, notices))
 }
 
 /// Undo every op, newest first (abort / failed autocommit / WAL failure).
@@ -3700,6 +3768,8 @@ fn handle_execute(
                 session.portals.get_mut(&portal_name).unwrap().explain = true;
             }
             Ok(ExecResult::Command { tag }) => {
+                // v1.00: notices before the completion tag.
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
                 let portal = session.portals.get_mut(&portal_name).unwrap();
                 portal.done = true;
@@ -3718,36 +3788,45 @@ fn handle_execute(
     }
 
     // Emit up to max_rows (<= 0 means all rows).
-    let portal = session.portals.get_mut(&portal_name).unwrap();
-    let pending = portal.pending.as_mut().expect("pending rows");
-    let remaining = pending.rows.len() - pending.pos;
-    let n = if max_rows <= 0 {
-        remaining
-    } else {
-        std::cmp::min(max_rows as usize, remaining)
-    };
-    let mut row_buf = Vec::new();
-    for row in pending.rows.iter().skip(pending.pos).take(n) {
-        send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
-    }
-    pending.pos += n;
-    if pending.pos < pending.rows.len() {
-        MsgBuilder::new(b's').send(stream)?; // PortalSuspended
-    } else {
-        let total = pending.rows.len();
-        // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
-        // v0.10: DML (INSERT/UPDATE/DELETE) completes with its own tag.
-        let tag = if portal.explain {
-            "EXPLAIN".to_string()
-        } else if let Some(t) = portal.dml_tag.clone() {
-            t
+    let completion: Option<String> = {
+        let portal = session.portals.get_mut(&portal_name).unwrap();
+        let pending = portal.pending.as_mut().expect("pending rows");
+        let remaining = pending.rows.len() - pending.pos;
+        let n = if max_rows <= 0 {
+            remaining
         } else {
-            format!("SELECT {}", total)
+            std::cmp::min(max_rows as usize, remaining)
         };
+        let mut row_buf = Vec::new();
+        for row in pending.rows.iter().skip(pending.pos).take(n) {
+            send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
+        }
+        pending.pos += n;
+        if pending.pos < pending.rows.len() {
+            MsgBuilder::new(b's').send(stream)?; // PortalSuspended
+            None
+        } else {
+            let total = pending.rows.len();
+            // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
+            // v0.10: DML (INSERT/UPDATE/DELETE) completes with its own tag.
+            let tag = if portal.explain {
+                "EXPLAIN".to_string()
+            } else if let Some(t) = portal.dml_tag.clone() {
+                t
+            } else {
+                format!("SELECT {}", total)
+            };
+            portal.pending = None;
+            portal.done = true;
+            portal.last_tag = Some(tag.clone());
+            Some(tag)
+        }
+    };
+    // v1.00: notices before the completion tag (the portal borrow has
+    // ended, so session is free).
+    if let Some(tag) = completion {
+        drain_notices(stream, session)?;
         MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
-        portal.pending = None;
-        portal.done = true;
-        portal.last_tag = Some(tag);
     }
     stream.flush()?;
     Ok(())
@@ -3868,6 +3947,8 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices.
+            pending_notices: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -4056,6 +4137,8 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices.
+            pending_notices: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),

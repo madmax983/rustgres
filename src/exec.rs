@@ -41,9 +41,10 @@ use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, IndexColSpec,
     InsertIndirection, InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict,
-    OrderTerm, QuantKind, QuantOp, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind,
-    SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
-    collect_table_refs, parse_statement, validate_constraint_expr,
+    OrderTerm, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind,
+    SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming,
+    UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
+    parse_trigger_body, trig_event, validate_constraint_expr,
 };
 use crate::storage::index_visible;
 use crate::storage::{
@@ -116,6 +117,11 @@ pub struct StmtCtx<'a> {
     /// TOAST for columns without an explicit `COMPRESSION` method.
     /// Set by the server from the session, like `read_only`.
     pub default_toast_compression: crate::storage::ToastCompression,
+    /// v1.00: out-of-band messages (e.g. `RAISE NOTICE` from trigger
+    /// bodies) collected during execution. The server drains these
+    /// after a successful statement and sends them as NoticeResponse
+    /// ('N') messages before the completion tag.
+    pub notices: Vec<String>,
 }
 
 /// Outcome of executing one statement.
@@ -471,6 +477,36 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             *hashes,
             *merges,
         ),
+        // --- v1.00: triggers (bounded) ---
+        Stmt::CreateTrigger {
+            name,
+            table,
+            timing,
+            events,
+            for_each_row,
+            function,
+            args,
+            when,
+            is_constraint,
+        } => exec_create_trigger(
+            eng,
+            ctx,
+            name,
+            table,
+            *timing,
+            *events,
+            *for_each_row,
+            function,
+            args,
+            when.as_ref(),
+            *is_constraint,
+        ),
+        Stmt::DropTrigger {
+            name,
+            table,
+            if_exists,
+            cascade,
+        } => exec_drop_trigger(eng, ctx, name, table, *if_exists, *cascade),
         // --- v0.11: roles and privileges ---
         Stmt::CreateRole {
             name,
@@ -1596,10 +1632,7 @@ fn alter_inherit(
         {
             return Err(exec_err(
                 "42809",
-                format!(
-                    "cannot inherit from temporary relation \"{}\"",
-                    parent_name
-                ),
+                format!("cannot inherit from temporary relation \"{}\"", parent_name),
             ));
         }
         // Partitioned tables cannot be inherited from (PG19
@@ -1607,13 +1640,14 @@ fn alter_inherit(
         if parent.partition.as_ref().is_some_and(|p| p.is_partitioned) {
             return Err(exec_err(
                 "42809",
-                format!(
-                    "cannot inherit from partitioned table \"{}\"",
-                    parent_name
-                ),
+                format!("cannot inherit from partitioned table \"{}\"", parent_name),
             ));
         }
-        if parent.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
+        if parent
+            .partition
+            .as_ref()
+            .is_some_and(|p| p.parent.is_some())
+        {
             return Err(exec_err(
                 "42809",
                 "cannot inherit from a partition".to_string(),
@@ -1815,7 +1849,7 @@ fn col_type_name(ty: &ColType) -> &'static str {
 /// bound instead of routing.
 fn route_partition_inserts(
     eng: &mut Engine,
-    ctx: &StmtCtx,
+    ctx: &mut StmtCtx,
     table: &str,
     inserts: &[(u64, Row)],
 ) -> Result<Vec<(String, Vec<(u64, Row)>)>, ExecError> {
@@ -1856,7 +1890,7 @@ fn route_partition_inserts(
         // route to descendant leaves. Fall through.
     }
     // Parent: route each row to a leaf.
-    let mut by_leaf: std::collections::HashMap<String, Vec<(u64, Row)>> =
+    let mut by_leaf: std::collections::HashMap<String, (Vec<(String, ColType)>, Vec<(u64, Row)>)> =
         std::collections::HashMap::new();
     for (id, row) in inserts {
         // Find the leaf. Each level evaluates its own partition key
@@ -1881,11 +1915,239 @@ fn route_partition_inserts(
             })
             .collect();
         by_leaf
-            .entry(leaf_name)
-            .or_default()
+            .entry(leaf_name.clone())
+            .or_insert_with(|| (leaf_cols.clone(), Vec::new()))
+            .1
             .push((*id, Row::new(remapped)));
     }
-    Ok(by_leaf.into_iter().collect())
+    // v1.00: fire each leaf's BEFORE INSERT row triggers on its routed
+    // rows (PG19 fires leaf triggers after routing), then re-validate
+    // the leaf bound — a trigger may have moved the row out of its
+    // partition (the fixtures' 23514 "violates partition constraint"
+    // cases). Suppressed rows never reach the leaf.
+    let mut result: Vec<(String, Vec<(u64, Row)>)> = Vec::with_capacity(by_leaf.len());
+    for (leaf_name, (leaf_cols, leaf_rows)) in by_leaf {
+        let leaf_pinfo = {
+            let lt = eng
+                .db
+                .find_table(&leaf_name, ctx.snap, ctx.own, ctx.session)
+                .expect("leaf still visible");
+            lt.partition.clone().expect("leaf is partitioned")
+        };
+        let rows_only: Vec<Row> = leaf_rows.iter().map(|(_, r)| r.clone()).collect();
+        let fired = fire_before_insert_triggers(eng, ctx, &leaf_name, &leaf_cols, &rows_only)?;
+        // Re-pair ids with fired rows in order; suppressed rows (None)
+        // drop their ids.
+        let mut fired_rows: Vec<(u64, Row)> = Vec::with_capacity(fired.len());
+        for ((id, _), opt_row) in leaf_rows.iter().zip(fired.iter()) {
+            if let Some(fr) = opt_row {
+                fired_rows.push((*id, fr.clone()));
+            }
+        }
+        // v1.00: the leaf's partition bound is an implicit CHECK — it
+        // must hold for the post-trigger row.
+        for (_, row) in &fired_rows {
+            check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+        }
+        result.push((leaf_name, fired_rows));
+    }
+    Ok(result)
+}
+
+/// v1.00: fire BEFORE INSERT FOR EACH ROW triggers for `table`.
+///
+/// `rows` are the rows about to be inserted, in the table's own column
+/// order. Returns one entry per input row, in order: `Some(row)` for
+/// the (possibly modified) row to insert, `None` for a row suppressed
+/// by a `RETURN NULL` body. Each firing trigger runs its function body
+/// against each row in trigger-creation order (PG19 fires in name
+/// order; creation order is the documented v1.00 simplification).
+/// AFTER triggers, non-INSERT events, and statement-level triggers are
+/// cataloged but inert in v1.00.
+///
+/// Bodies are parsed once per call (they were validated at CREATE
+/// FUNCTION time, so a parse failure here is a defensive 0A000).
+#[allow(clippy::too_many_arguments)]
+fn fire_before_insert_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    cols: &[(String, ColType)],
+    rows: &[Row],
+) -> Result<Vec<Option<Row>>, ExecError> {
+    let firing: Vec<TriggerDef> = {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible");
+        t.triggers
+            .iter()
+            .filter(|tr| {
+                tr.timing == TriggerTiming::Before
+                    && tr.for_each_row
+                    && (tr.events & trig_event::INSERT) != 0
+            })
+            .cloned()
+            .collect()
+    };
+    if firing.is_empty() {
+        return Ok(rows.iter().map(|r| Some(r.clone())).collect());
+    }
+    // Resolve and parse each trigger's function body once.
+    let mut bodies: Vec<Vec<TriggerBodyStmt>> = Vec::with_capacity(firing.len());
+    for tr in &firing {
+        let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!("function {}() does not exist", tr.function),
+            )
+        })?;
+        let stmts = parse_trigger_body(&fdef.body).map_err(|e| {
+            exec_err(
+                e.code,
+                format!("invalid trigger function body: {}", e.message),
+            )
+        })?;
+        bodies.push(stmts);
+    }
+    let mut out: Vec<Option<Row>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut cur: Option<Vec<Value>> = Some(row[..].to_vec());
+        for stmts in &bodies {
+            let Some(row_vals) = cur else { break };
+            cur = exec_trigger_body(eng, ctx, table, cols, &row_vals, stmts)?;
+        }
+        out.push(cur.map(Row::new));
+    }
+    Ok(out)
+}
+
+/// v1.00: execute one trigger-function body for a single NEW row.
+/// Returns `Ok(Some(row))` for the (possibly modified) row to insert,
+/// `Ok(None)` when the body returned NULL (the row is suppressed).
+fn exec_trigger_body(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    cols: &[(String, ColType)],
+    new_row: &[Value],
+    stmts: &[TriggerBodyStmt],
+) -> Result<Option<Vec<Value>>, ExecError> {
+    let mut row: Vec<Value> = new_row.to_vec();
+    for stmt in stmts {
+        match stmt {
+            TriggerBodyStmt::Assign { col, expr } => {
+                let idx = cols.iter().position(|(n, _)| n == col).ok_or_else(|| {
+                    exec_err(
+                        "42703",
+                        format!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            col, table
+                        ),
+                    )
+                })?;
+                let val = eval_trigger_expr(eng, ctx, table, cols, &row, expr)?;
+                // Coerce like a normal INSERT assignment would.
+                row[idx] = coerce_value(val, &cols[idx].1, col)?;
+            }
+            TriggerBodyStmt::ReturnNew => return Ok(Some(row)),
+            TriggerBodyStmt::ReturnOld => {
+                // v1.00: INSERT has no OLD row. PG would return the
+                // (all-null) OLD row; the bounded grammar only runs on
+                // INSERT, so treat it as the current NEW row.
+                return Ok(Some(row));
+            }
+            TriggerBodyStmt::ReturnNull => return Ok(None),
+            TriggerBodyStmt::Raise {
+                level,
+                format,
+                args,
+            } => {
+                let vals: Vec<Value> = args
+                    .iter()
+                    .map(|e| eval_trigger_expr(eng, ctx, table, cols, &row, e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let msg = format_raise_message(format, &vals);
+                match level {
+                    RaiseLevel::Notice => ctx.notices.push(msg),
+                    RaiseLevel::Exception => return Err(exec_err("P0001", msg)),
+                }
+            }
+        }
+    }
+    // Falling off the end without RETURN: PG19 raises 2F005
+    // (null_value_not_allowed / "control reached end of trigger
+    // procedure without RETURN").
+    Err(exec_err(
+        "2F005",
+        "control reached end of trigger procedure without RETURN".to_string(),
+    ))
+}
+
+/// v1.00: evaluate a trigger-body expression against the NEW row. The
+/// scope is qualified as `new`, so both `new.col` and bare `col`
+/// resolve against the row (PG19 trigger bodies see NEW/OLD as the
+/// row variables).
+fn eval_trigger_expr(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    _table: &str,
+    cols: &[(String, ColType)],
+    row: &[Value],
+    expr: &Expr,
+) -> Result<Value, ExecError> {
+    let schema: Vec<QCol> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, (n, ty))| QCol {
+            qual: "new".to_string(),
+            name: n.clone(),
+            ty: *ty,
+            hidden: false,
+            src_ord: i as u32,
+        })
+        .collect();
+    eval_partition_key_expr(
+        eng,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        ctx.role,
+        &schema,
+        row,
+        expr,
+    )
+}
+
+/// v1.00: expand a `RAISE ... '<format>'` format string. Each `%`
+/// consumes the next argument (rendered in its text-cast form, like
+/// PG's `%`); `%%` is a literal `%`. Surplus arguments are ignored
+/// and a `%` with no argument left is kept literally (PG would raise,
+/// but the bounded grammar keeps this total).
+fn format_raise_message(format: &str, args: &[Value]) -> String {
+    let mut out = String::new();
+    let mut arg_iter = args.iter();
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.clone().next() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            _ => {
+                if let Some(v) = arg_iter.next() {
+                    out.push_str(&value_to_text_cast(v));
+                } else {
+                    out.push('%');
+                }
+            }
+        }
+    }
+    out
 }
 
 /// v0.69: evaluate a partition key expression against a row.
@@ -2457,10 +2719,7 @@ fn create_table_from_def(
             if !temp && eng.db.is_temp_table(ctx.session, parent_name) {
                 return Err(exec_err(
                     "42809",
-                    format!(
-                        "cannot inherit from temporary relation \"{}\"",
-                        parent_name
-                    ),
+                    format!("cannot inherit from temporary relation \"{}\"", parent_name),
                 ));
             }
             // Partitioned tables and partitions cannot participate in
@@ -2468,13 +2727,14 @@ fn create_table_from_def(
             if parent.partition.as_ref().is_some_and(|p| p.is_partitioned) {
                 return Err(exec_err(
                     "42809",
-                    format!(
-                        "cannot inherit from partitioned table \"{}\"",
-                        parent_name
-                    ),
+                    format!("cannot inherit from partitioned table \"{}\"", parent_name),
                 ));
             }
-            if parent.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
+            if parent
+                .partition
+                .as_ref()
+                .is_some_and(|p| p.parent.is_some())
+            {
                 return Err(exec_err(
                     "42809",
                     "cannot inherit from a partition".to_string(),
@@ -2556,8 +2816,7 @@ fn create_table_from_def(
                     == like_def.composite_types.get(i).cloned().unwrap_or(None)
                 && merged.domain_types[pos]
                     == like_def.domain_types.get(i).cloned().unwrap_or(None)
-                && merged.domain_elem[pos]
-                    == like_def.domain_elem.get(i).copied().unwrap_or(false);
+                && merged.domain_elem[pos] == like_def.domain_elem.get(i).copied().unwrap_or(false);
             if !same {
                 return Err(exec_err(
                     "42804",
@@ -3307,22 +3566,13 @@ fn check_domain_value(
 /// the base type). Returns None otherwise — the caller falls back
 /// to the value's type name.
 fn pg_typeof_domain_name(q: &Q, scopes: &[Scope], arg: &Expr) -> Option<String> {
-    let is_domain = |n: &str| {
-        q.eng
-            .db
-            .types
-            .get(n)
-            .is_some_and(|st| st.domain.is_some())
-    };
+    let is_domain = |n: &str| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some());
     match arg {
         Expr::CastNamed { name, .. } => is_domain(name).then(|| name.clone()),
         Expr::Column { table, name: col } => {
             let (si, ci) = resolve_col(scopes, table.as_deref(), col).ok()?;
             let qual = scopes[si].schema[ci].qual.clone();
-            let t = q
-                .eng
-                .db
-                .find_table(&qual, q.snap, q.own, q.session)?;
+            let t = q.eng.db.find_table(&qual, q.snap, q.own, q.session)?;
             let idx = t.columns.iter().position(|(n, _)| n == col)?;
             t.domain_types.get(idx).and_then(Clone::clone)
         }
@@ -6016,6 +6266,56 @@ fn exec_insert(
             )?;
         }
         built
+    };
+    // v1.00: fire BEFORE INSERT FOR EACH ROW triggers on the target
+    // table before ON CONFLICT planning and partition routing. PG19
+    // fires the target's triggers first; the partition router fires
+    // each leaf's triggers after routing (see route_partition_inserts).
+    // Suppressed rows (RETURN NULL) never reach the arbiter or the
+    // router.
+    let new_rows: Vec<Row> = {
+        let target_cols: Vec<(String, ColType)> = {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .expect("target still visible");
+            t.columns.clone()
+        };
+        let fired: Vec<Row> =
+            fire_before_insert_triggers(eng, ctx, table, &target_cols, &new_rows)?
+                .into_iter()
+                .flatten()
+                .collect();
+        // v1.00: PG validates CHECK/NOT NULL after BEFORE triggers fire,
+        // so re-validate the post-trigger rows (a trigger may have
+        // broken a constraint, e.g. the mlparted11_trig fixture).
+        if fired.len() != new_rows.len()
+            || fired
+                .iter()
+                .zip(new_rows.iter())
+                .any(|(a, b)| a[..] != b[..])
+        {
+            let meta = {
+                let t = eng
+                    .db
+                    .find_table(table, ctx.snap, ctx.own, ctx.session)
+                    .expect("target still visible");
+                TableMeta::of(t)
+            };
+            for row in &fired {
+                check_row_constraints(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    table,
+                    &row[..],
+                )?;
+            }
+        }
+        fired
     };
     // v0.10: plan the per-row ON CONFLICT resolution. No mutation happens
     // here, so a failed row still leaves the statement atomic. Tracks:
@@ -9877,6 +10177,10 @@ fn pg_class_schema() -> Vec<QCol> {
         ("oid", ColType::Int),
         ("relname", ColType::Text),
         ("reltoastrelid", ColType::Int),
+        // v1.00: relkind — 'p' for partitioned tables (PG19
+        // RELKIND_PARTITIONED_TABLE), 'r' for ordinary tables and leaf
+        // partitions (RELKIND_RELATION).
+        ("relkind", ColType::SingleChar),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -9903,11 +10207,18 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
         };
         // Skip the toast tables themselves? No — PG lists them in
         // pg_class too. Include everything.
+        // v1.00: relkind — 'p' for partitioned tables, 'r' otherwise.
+        let relkind = if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+            Value::SingleChar(b'p')
+        } else {
+            Value::SingleChar(b'r')
+        };
         rows.push(QRow {
             cells: Row::new(vec![
                 Value::Int(t.oid as i64),
                 Value::text(name.as_str()),
                 Value::Int(t.toast_relid as i64),
+                relkind,
             ]),
             prov: Vec::new(),
         });
@@ -9923,6 +10234,9 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
                 Value::Int(1259),
                 Value::text("pg_class"),
                 Value::Int(0),
+                // v1.00: the virtual pg_class itself is an ordinary
+                // relation ('r').
+                Value::SingleChar(b'r'),
             ]),
             prov: Vec::new(),
         });
@@ -10099,21 +10413,16 @@ fn pg_sequences_schema() -> Vec<QCol> {
     .collect()
 }
 
-fn pg_sequences_scan(
-    db: &Database,
-    snap: &Snapshot,
-    own: u64,
-) -> (Vec<QCol>, Vec<QRow>) {
+fn pg_sequences_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
     let schema = pg_sequences_schema();
     let mut rows = Vec::new();
     let mut names: Vec<&String> = db.sequences.keys().collect();
     names.sort();
     for name in names {
-        let Some(s) = db
-            .sequences
-            .get(name)
-            .and_then(|vs| vs.iter().find(|s| crate::storage::seq_visible(s, snap, own)))
-        else {
+        let Some(s) = db.sequences.get(name).and_then(|vs| {
+            vs.iter()
+                .find(|s| crate::storage::seq_visible(s, snap, own))
+        }) else {
             continue;
         };
         // v0.99: data_type is the stored sequence type (PG19 seqtypid).
@@ -14770,7 +15079,11 @@ fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         es.iter().any(|x| expr_is_volatile(db, x))
     }
     match e {
-        Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) | Expr::WholeRow { .. } | Expr::ResolvedCol { .. } => false,
+        Expr::Column { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::WholeRow { .. }
+        | Expr::ResolvedCol { .. } => false,
         Expr::Arith { left, right, .. }
         | Expr::Cmp { left, right, .. }
         | Expr::IsDistinctFrom { left, right, .. }
@@ -14793,9 +15106,9 @@ fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
             expr_is_volatile(db, expr) || expr_is_volatile(db, pattern)
         }
-        Expr::Between { expr, low, high, .. } => {
-            expr_is_volatile(db, expr) || expr_is_volatile(db, low) || expr_is_volatile(db, high)
-        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_is_volatile(db, expr) || expr_is_volatile(db, low) || expr_is_volatile(db, high),
         Expr::Case {
             operand,
             whens,
@@ -18494,10 +18807,14 @@ fn eval_grouped(
                 if let Some(dname) = pg_typeof_domain_name(q, &chained, &args[0]) {
                     // PG19 still evaluates the argument; only the
                     // reported name is static.
-                    eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0])?;
+                    eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0],
+                    )?;
                     return Ok(Value::text(dname));
                 }
-                let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0])?;
+                let v = eval_grouped(
+                    q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0],
+                )?;
                 return Ok(Value::text(v.type_name()));
             }
             // v0.47: an SRF in the select list that is also a GROUP BY
@@ -32896,7 +33213,15 @@ fn from_schema_item(
             // as the executor builds), not two side-by-side schemas.
             let mut l: Vec<Vec<QCol>> = Vec::new();
             from_schema_item(
-                eng, snap, own, session, left, &mut l, visible, bindings, outer_schemas,
+                eng,
+                snap,
+                own,
+                session,
+                left,
+                &mut l,
+                visible,
+                bindings,
+                outer_schemas,
             )?;
             let lflat: Vec<QCol> = l.into_iter().flatten().collect();
             // v0.46: implicit LATERAL (comma joins parse into CROSS
@@ -32927,7 +33252,15 @@ fn from_schema_item(
                 _ => {
                     let mut r: Vec<Vec<QCol>> = Vec::new();
                     from_schema_item(
-                        eng, snap, own, session, right, &mut r, visible, bindings, outer_schemas,
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        right,
+                        &mut r,
+                        visible,
+                        bindings,
+                        outer_schemas,
                     )?;
                     r.into_iter().flatten().collect()
                 }
@@ -33080,7 +33413,16 @@ fn describe_select_outer(
             outer_schemas,
         );
     }
-    let schemas = from_schemas(eng, snap, own, session, &stmt.from, &visible, bindings, outer_schemas)?;
+    let schemas = from_schemas(
+        eng,
+        snap,
+        own,
+        session,
+        &stmt.from,
+        &visible,
+        bindings,
+        outer_schemas,
+    )?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
     for item in &stmt.items {
@@ -35349,6 +35691,7 @@ mod tests {
             role: "postgres",
             read_only: false,
             default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
         };
         execute(eng, &mut ctx, stmt)
     }
@@ -35942,6 +36285,7 @@ mod tests {
             role: "postgres",
             read_only: false,
             default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
         };
         let sel = parse_statement("SELECT * FROM users WHERE id = 1 FOR UPDATE").unwrap();
         execute(&mut eng, &mut ctx, &sel).unwrap();
@@ -35958,6 +36302,7 @@ mod tests {
             role: "postgres",
             read_only: false,
             default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
         };
         let upd = parse_statement("UPDATE users SET name = 'x' WHERE id = 1").unwrap();
         let e = execute(&mut eng, &mut ctx2, &upd).unwrap_err();
@@ -39236,7 +39581,11 @@ mod tests {
         let err = run(&mut eng, "ALTER TABLE ic_nnc INHERIT ic_nnp").unwrap_err();
         assert_eq!(err.code, "42804");
         // Child NOT NULL is fine.
-        run(&mut eng, "CREATE TEMP TABLE ic_nnc2 (a int NOT NULL, b int)").unwrap();
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE ic_nnc2 (a int NOT NULL, b int)",
+        )
+        .unwrap();
         run(&mut eng, "ALTER TABLE ic_nnc2 INHERIT ic_nnp").unwrap();
         // Self-inheritance is 42P16.
         let err = run(&mut eng, "ALTER TABLE ic_p INHERIT ic_p").unwrap_err();
@@ -39259,7 +39608,11 @@ mod tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TEMP TABLE mp1 (a int, b text)").unwrap();
         run(&mut eng, "CREATE TEMP TABLE mp2 (b text, c int)").unwrap();
-        run(&mut eng, "CREATE TEMP TABLE mpc (d text) INHERITS (mp1, mp2)").unwrap();
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE mpc (d text) INHERITS (mp1, mp2)",
+        )
+        .unwrap();
         run(&mut eng, "INSERT INTO mpc VALUES (1, 'x', 2, 'y')").unwrap();
         // The child has all four columns in merge order.
         let rows = rows_of(run(&mut eng, "SELECT a, b, c, d FROM mpc").unwrap());
@@ -39274,15 +39627,9 @@ mod tests {
         );
         // Each parent scan sees the child row remapped to its own columns.
         let rows = rows_of(run(&mut eng, "SELECT a, b FROM mp1").unwrap());
-        assert_eq!(
-            rows,
-            vec![vec!["1".to_string(), "x".to_string()]]
-        );
+        assert_eq!(rows, vec![vec!["1".to_string(), "x".to_string()]]);
         let rows = rows_of(run(&mut eng, "SELECT b, c FROM mp2").unwrap());
-        assert_eq!(
-            rows,
-            vec![vec!["x".to_string(), "2".to_string()]]
-        );
+        assert_eq!(rows, vec![vec!["x".to_string(), "2".to_string()]]);
         // Duplicate parent in one list is 42P16.
         let err = run(
             &mut eng,
@@ -39347,18 +39694,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // Permanent child of a temp parent is 42809.
         run(&mut eng, "CREATE TEMP TABLE rt_p (a int)").unwrap();
-        let err = run(
-            &mut eng,
-            "CREATE TABLE rt_c (z int) INHERITS (rt_p)",
-        )
-        .unwrap_err();
+        let err = run(&mut eng, "CREATE TABLE rt_c (z int) INHERITS (rt_p)").unwrap_err();
         assert_eq!(err.code, "42809");
         // Temp child of a permanent parent is fine.
-        run(
-            &mut eng,
-            "CREATE TEMP TABLE rt_c2 (z int) INHERITS (rp)",
-        )
-        .unwrap();
+        run(&mut eng, "CREATE TEMP TABLE rt_c2 (z int) INHERITS (rp)").unwrap();
         let rows = rows_of(run(&mut eng, "SELECT a FROM rp ORDER BY a").unwrap());
         assert_eq!(rows.len(), 3);
     }
@@ -40304,7 +40643,11 @@ mod tests {
     #[test]
     fn v98_setval_out_of_bounds_is_22003() {
         let mut eng = engine();
-        run(&mut eng, "CREATE SEQUENCE bd MINVALUE 1 MAXVALUE 10 START WITH 1").unwrap();
+        run(
+            &mut eng,
+            "CREATE SEQUENCE bd MINVALUE 1 MAXVALUE 10 START WITH 1",
+        )
+        .unwrap();
         assert_eq!(err_code(&mut eng, "SELECT setval('bd', 99)"), "22003");
         assert_eq!(err_code(&mut eng, "SELECT setval('bd', 0)"), "22003");
         // Boundary values are fine.
@@ -40317,7 +40660,11 @@ mod tests {
     #[test]
     fn v98_restart_out_of_bounds_is_22023() {
         let mut eng = engine();
-        run(&mut eng, "CREATE SEQUENCE rs MINVALUE 1 MAXVALUE 10 START WITH 1").unwrap();
+        run(
+            &mut eng,
+            "CREATE SEQUENCE rs MINVALUE 1 MAXVALUE 10 START WITH 1",
+        )
+        .unwrap();
         assert_eq!(
             err_code(&mut eng, "ALTER SEQUENCE rs RESTART WITH 99"),
             "22023"
@@ -40350,10 +40697,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows_of(r), vec![vec!["50".to_string()]]);
-        assert_eq!(
-            err_code(&mut eng, "CREATE SEQUENCE cs0 CACHE 0"),
-            "22023"
-        );
+        assert_eq!(err_code(&mut eng, "CREATE SEQUENCE cs0 CACHE 0"), "22023");
         // Bare START n is legal PG19 (START [ WITH ] n).
         run(&mut eng, "CREATE SEQUENCE cs1 START 7").unwrap();
         let r = run(&mut eng, "SELECT nextval('cs1')").unwrap();
@@ -40440,10 +40784,7 @@ mod tests {
     fn v98_alter_sequence_if_exists() {
         let mut eng = engine();
         run(&mut eng, "ALTER SEQUENCE IF EXISTS nosuch RESTART").unwrap();
-        assert_eq!(
-            err_code(&mut eng, "ALTER SEQUENCE nosuch RESTART"),
-            "42P01"
-        );
+        assert_eq!(err_code(&mut eng, "ALTER SEQUENCE nosuch RESTART"), "42P01");
     }
 
     /// Exhaustion is PG19 22000 (not 55000); CYCLE wraps to the bound;
@@ -40593,8 +40934,11 @@ mod tests {
             ]
         );
         // Explicit bounds outside the type range are 22023.
-        let e = run(&mut eng, "CREATE SEQUENCE t_bad AS smallint MAXVALUE 100000")
-            .unwrap_err();
+        let e = run(
+            &mut eng,
+            "CREATE SEQUENCE t_bad AS smallint MAXVALUE 100000",
+        )
+        .unwrap_err();
         assert_eq!(e.code, "22023");
         // pg_sequences exposes `cycle`, not `cycle_option`.
         let r = run(
@@ -40756,11 +41100,10 @@ fn info_sequences_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, 
     let mut names: Vec<&String> = db.sequences.keys().collect();
     names.sort();
     for name in names {
-        let Some(s) = db
-            .sequences
-            .get(name)
-            .and_then(|vs| vs.iter().find(|s| crate::storage::seq_visible(s, snap, own)))
-        else {
+        let Some(s) = db.sequences.get(name).and_then(|vs| {
+            vs.iter()
+                .find(|s| crate::storage::seq_visible(s, snap, own))
+        }) else {
             continue;
         };
         // v0.99: data_type/precision follow the stored sequence type
@@ -40821,10 +41164,7 @@ fn sequence_params(
 > {
     use crate::sql::SeqType;
     let bad = |m: &str| exec_err("22023", m.to_string());
-    let increment = opts
-        .increment
-        .or(cur.map(|s| s.increment))
-        .unwrap_or(1);
+    let increment = opts.increment.or(cur.map(|s| s.increment)).unwrap_or(1);
     if increment == 0 {
         return Err(bad("INCREMENT must not be zero"));
     }
@@ -40908,10 +41248,7 @@ fn sequence_params(
     let cache = opts.cache.or(cur.map(|s| s.cache)).unwrap_or(1);
     if let Some(c) = opts.cache {
         if c < 1 {
-            return Err(bad(&format!(
-                "CACHE value {} must be greater than zero",
-                c
-            )));
+            return Err(bad(&format!("CACHE value {} must be greater than zero", c)));
         }
     }
     if min_value >= max_value {
@@ -40974,7 +41311,10 @@ fn validate_sequence_owned_by(
             if !t.columns.iter().any(|(c, _)| c == column) {
                 return Err(exec_err(
                     "42703",
-                    format!("column \"{}\" of relation \"{}\" does not exist", column, table),
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        column, table
+                    ),
                 ));
             }
             // v0.98: PG19 requires the owned-by table to have the same
@@ -41089,19 +41429,18 @@ fn exec_alter_sequence(
         sequence_params(opts, Some(live))?;
     // v0.98: OWNED BY is validated (table/column existence) before any
     // version is created.
-    let owned_by_update: Option<Option<(String, String, Option<u64>)>> =
-        match &opts.owned_by {
-            None => None,
-            Some(owned) => {
-                let temp_session = validate_sequence_owned_by(eng, ctx, owned, &live.owner)?;
-                Some(match owned {
-                    crate::sql::OwnedBySpec::None_ => None,
-                    crate::sql::OwnedBySpec::Table { table, column } => {
-                        Some((table.clone(), column.clone(), temp_session))
-                    }
-                })
-            }
-        };
+    let owned_by_update: Option<Option<(String, String, Option<u64>)>> = match &opts.owned_by {
+        None => None,
+        Some(owned) => {
+            let temp_session = validate_sequence_owned_by(eng, ctx, owned, &live.owner)?;
+            Some(match owned {
+                crate::sql::OwnedBySpec::None_ => None,
+                crate::sql::OwnedBySpec::Table { table, column } => {
+                    Some((table.clone(), column.clone(), temp_session))
+                }
+            })
+        }
+    };
     let prev = live.clone();
     let versions = eng.db.sequences.get_mut(name).expect("visible above");
     let cur = versions
@@ -41487,18 +41826,16 @@ fn exec_alter_domain(
     action: &crate::sql::AlterDomainAction,
 ) -> Result<ExecResult, ExecError> {
     use crate::sql::AlterDomainAction;
-    let old = eng.db.types.get(name).cloned().ok_or_else(|| {
-        exec_err(
-            "42704",
-            format!("type \"{}\" does not exist", name),
-        )
-    })?;
-    let mut dom = old.domain.clone().ok_or_else(|| {
-        exec_err(
-            "42809",
-            format!("\"{}\" is not a domain", name),
-        )
-    })?;
+    let old = eng
+        .db
+        .types
+        .get(name)
+        .cloned()
+        .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", name)))?;
+    let mut dom = old
+        .domain
+        .clone()
+        .ok_or_else(|| exec_err("42809", format!("\"{}\" is not a domain", name)))?;
     match action {
         AlterDomainAction::AddConstraint { name: cname, expr } => {
             // PG19: domain CHECK expressions may only reference VALUE
@@ -41543,7 +41880,10 @@ fn exec_alter_domain(
                 kind: crate::sql::CheckKind::Check,
             });
         }
-        AlterDomainAction::DropConstraint { name: cname, if_exists } => {
+        AlterDomainAction::DropConstraint {
+            name: cname,
+            if_exists,
+        } => {
             let pos = dom.checks.iter().position(|c| &c.name == cname);
             match pos {
                 Some(i) => {
@@ -41681,7 +42021,35 @@ fn exec_create_function(
     strict: bool,
 ) -> Result<ExecResult, ExecError> {
     // PG19: the return type must exist at CREATE time.
-    resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, ret_type)?;
+    // v1.00: `RETURNS trigger` is PG19's trigger pseudo-type — valid
+    // only for trigger functions (which must be LANGUAGE plpgsql here).
+    let is_trigger_fn = ret_type.eq_ignore_ascii_case("trigger");
+    if is_trigger_fn {
+        if lang != crate::sql::FuncLang::Plpgsql {
+            return Err(exec_err(
+                "0A000",
+                "trigger functions must use LANGUAGE plpgsql".to_string(),
+            ));
+        }
+        if returns_set {
+            return Err(exec_err(
+                "42601",
+                "trigger functions cannot return a set".to_string(),
+            ));
+        }
+        // Validate the body against the bounded trigger-body grammar
+        // now (like PG's plpgsql validator at CREATE time) — but do NOT
+        // run it through the bounded PL/pgSQL desugar; trigger bodies
+        // are a separate, deliberately small grammar.
+        crate::sql::parse_trigger_body(body).map_err(|e| {
+            exec_err(
+                e.code,
+                format!("invalid trigger function body: {}", e.message),
+            )
+        })?;
+    } else {
+        resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, ret_type)?;
+    }
     for a in args {
         resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &a.type_name)?;
     }
@@ -41690,8 +42058,12 @@ fn exec_create_function(
     // symbol instead of SQL text.
     // v0.97: bounded plpgsql — a single-RETURN body desugars to a SQL
     // SELECT here; anything richer is an honest 0A000.
+    // v1.00: trigger functions bypass the desugar entirely (their raw
+    // body was validated against the trigger grammar above).
     let owned_body: String;
-    let body: &str = if lang == crate::sql::FuncLang::Plpgsql {
+    let body: &str = if is_trigger_fn {
+        body
+    } else if lang == crate::sql::FuncLang::Plpgsql {
         owned_body = crate::sql::desugar_plpgsql_body(body)
             .map_err(|e| exec_err("0A000", format!("plpgsql: {}", e)))?;
         &owned_body
@@ -41699,7 +42071,9 @@ fn exec_create_function(
         body
     };
     let mut parsed: Option<Stmt> = None;
-    if lang == crate::sql::FuncLang::Sql || lang == crate::sql::FuncLang::Plpgsql {
+    if !is_trigger_fn
+        && (lang == crate::sql::FuncLang::Sql || lang == crate::sql::FuncLang::Plpgsql)
+    {
         let mut stmt = crate::sql::parse_statement(body)
             .map_err(|e| exec_err("42601", format!("syntax error in function body: {:?}", e)))?;
         // Only SELECT bodies are supported (bounded: no multi-statement
@@ -41906,6 +42280,121 @@ fn exec_drop_function(
     });
     Ok(ExecResult::Command {
         tag: "DROP FUNCTION".to_string(),
+    })
+}
+
+/// v1.00: `CREATE TRIGGER` (bounded, PG19 `CreateTrigStmt`). The
+/// trigger is stored on the table's catalog entry (`Table.triggers`),
+/// so creation is transactional (ROLLBACK-safe), WAL-logged, and
+/// checkpointed via the normal table-version machinery. Only BEFORE
+/// INSERT FOR EACH ROW triggers fire in v1.00; AFTER triggers, other
+/// events, WHEN clauses, and constraint triggers are cataloged but
+/// inert (documented gaps).
+#[allow(clippy::too_many_arguments)]
+fn exec_create_trigger(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    table: &str,
+    timing: crate::sql::TriggerTiming,
+    events: u8,
+    for_each_row: bool,
+    function: &str,
+    args: &[String],
+    when: Option<&crate::sql::Expr>,
+    is_constraint: bool,
+) -> Result<ExecResult, ExecError> {
+    // v0.11: creating a trigger needs table ownership (like ALTER).
+    require_table_owner(eng, ctx, table)?;
+    let prev = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
+        .clone();
+    // PG19: duplicate trigger names on one table are 42723.
+    if prev.triggers.iter().any(|t| t.name == name) {
+        return Err(exec_err(
+            "42723",
+            format!(
+                "trigger \"{}\" for relation \"{}\" already exists",
+                name, table
+            ),
+        ));
+    }
+    // The function must exist and be a trigger function (PG19:
+    // `RETURNS trigger`). Trigger functions take no arguments.
+    let fdef = find_function_by_signature(eng, function, &[])
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", function)))?;
+    if !fdef.ret_type.eq_ignore_ascii_case("trigger") {
+        return Err(exec_err(
+            "42P17",
+            format!("function \"{}\" must return type \"trigger\"", function),
+        ));
+    }
+    // v1.00: WHEN (...) is parsed and stored for catalog fidelity, but
+    // the executor does not evaluate it (documented gap).
+    let _ = when;
+    let mut next = prev.clone();
+    next.triggers.push(crate::sql::TriggerDef {
+        name: name.to_string(),
+        timing,
+        events,
+        for_each_row,
+        function: function.to_string(),
+        args: args.to_vec(),
+    });
+    let _ = is_constraint;
+    commit_table_version(eng, ctx, table, prev, next);
+    Ok(ExecResult::Command {
+        tag: "CREATE TRIGGER".to_string(),
+    })
+}
+
+/// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`
+/// (PG19). Like creation, this versions the table, so it is
+/// transactional, WAL-logged, and checkpointed.
+fn exec_drop_trigger(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    table: &str,
+    if_exists: bool,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    require_table_owner(eng, ctx, table)?;
+    let prev = eng
+        .db
+        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
+        .clone();
+    if !prev.triggers.iter().any(|t| t.name == name) {
+        if !if_exists {
+            return Err(exec_err(
+                "42704",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" does not exist",
+                    name, table
+                ),
+            ));
+        }
+        // PG19: IF EXISTS on a missing trigger is a NOTICE, not silent.
+        ctx.notices.push(format!(
+            "trigger \"{}\" for relation \"{}\" does not exist, skipping",
+            name, table
+        ));
+        return Ok(ExecResult::Command {
+            tag: "DROP TRIGGER".to_string(),
+        });
+    }
+    // v1.00: no trigger dependents are tracked (constraint triggers are
+    // cataloged but inert), so CASCADE/RESTRICT have no observable
+    // difference yet.
+    let _ = cascade;
+    let mut next = prev.clone();
+    next.triggers.retain(|t| t.name != name);
+    commit_table_version(eng, ctx, table, prev, next);
+    Ok(ExecResult::Command {
+        tag: "DROP TRIGGER".to_string(),
     })
 }
 
@@ -45142,7 +45631,7 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     }
     (schema, rows)
 }
-    // ========================================================================
+// ========================================================================
 
 #[cfg(test)]
 mod variance_stress_tests {
@@ -45429,9 +45918,7 @@ mod variance_stress_tests {
         let tiny3 = Numeric::parse("3e-16383").unwrap();
         assert_ne!(tiny3.to_text(), "0");
     }
-
 }
-
 
 #[cfg(test)]
 mod v097_domain_tests {
@@ -45442,8 +45929,7 @@ mod v097_domain_tests {
     }
 
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -45455,6 +45941,7 @@ mod v097_domain_tests {
             role: "postgres",
             read_only: false,
             default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
         };
         execute(eng, &mut ctx, &stmt)
     }
@@ -45496,9 +45983,15 @@ mod v097_domain_tests {
         )
         .unwrap();
         assert_eq!(err_code(&mut eng, "SELECT '500'::d97"), "23514");
-        assert_eq!(rows_of(run(&mut eng, "SELECT '5'::d97").unwrap()), vec![vec!["5"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT '5'::d97").unwrap()),
+            vec![vec!["5"]]
+        );
         run(&mut eng, "ALTER DOMAIN d97 DROP CONSTRAINT c_small").unwrap();
-        assert_eq!(rows_of(run(&mut eng, "SELECT '500'::d97").unwrap()), vec![vec!["500"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT '500'::d97").unwrap()),
+            vec![vec!["500"]]
+        );
         // The original CREATE DOMAIN check still applies.
         assert_eq!(err_code(&mut eng, "SELECT '-1'::d97"), "23514");
     }
@@ -45514,11 +46007,21 @@ mod v097_domain_tests {
         assert_eq!(err_code(&mut eng, "SELECT '500'::d97n"), "23514");
         // Auto-names d97n_check and d97n_check1.
         run(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT d97n_check1").unwrap();
-        assert_eq!(rows_of(run(&mut eng, "SELECT '500'::d97n").unwrap()), vec![vec!["500"]]);
-        // Explicit duplicate name is 42710.
-        run(&mut eng, "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 1)").unwrap();
         assert_eq!(
-            err_code(&mut eng, "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 2)"),
+            rows_of(run(&mut eng, "SELECT '500'::d97n").unwrap()),
+            vec![vec!["500"]]
+        );
+        // Explicit duplicate name is 42710.
+        run(
+            &mut eng,
+            "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 1)",
+        )
+        .unwrap();
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 2)"
+            ),
             "42710"
         );
         // Dropping a missing constraint is 42704; IF EXISTS is silent.
@@ -45526,7 +46029,11 @@ mod v097_domain_tests {
             err_code(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT nosuch"),
             "42704"
         );
-        run(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT IF EXISTS nosuch").unwrap();
+        run(
+            &mut eng,
+            "ALTER DOMAIN d97n DROP CONSTRAINT IF EXISTS nosuch",
+        )
+        .unwrap();
     }
 
     /// v0.97: ALTER DOMAIN on a missing name is 42704; on a non-domain
@@ -45708,7 +46215,10 @@ mod v097_domain_tests {
         .unwrap();
         assert_eq!(err_code(&mut eng, "SELECT '50'::d97r"), "23514");
         run(&mut eng, "ALTER DOMAIN d97r DROP CONSTRAINT c1").unwrap();
-        assert_eq!(rows_of(run(&mut eng, "SELECT '50'::d97r").unwrap()), vec![vec!["50"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT '50'::d97r").unwrap()),
+            vec![vec!["50"]]
+        );
     }
 }
 
