@@ -23,12 +23,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 11 (`RGSWAL11` / `RGSCHK09`) is NOT compatible with v0.71
-//! or earlier: v0.72 adds the `is_partitioned` flag to partition
-//! metadata (a partitioned table with no children is no longer
-//! misread as a leaf). Like every format bump, old data directories
-//! are refused with a clear error instead of being misread. v0.41 was
-//! `RGSWAL10` / `RGSCHK08`.
+//! Format version 12 (`RGSWAL12` / `RGSCHK10`) is NOT compatible with v0.81
+//! or earlier: v0.82 WAL-logs type DDL (`CreateType`/`DropType` records)
+//! and checkpoints the type catalog. Like every format bump, old data
+//! directories are refused with a clear error instead of being misread.
+//! v0.72 was `RGSWAL11` / `RGSCHK09`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -130,11 +129,14 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK09";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK10";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
-const CHKPT_VERSION: u32 = 11;
+/// v0.82: version 12 adds the named/shell type catalog (`eng.db.types`),
+/// so CREATE TYPE survives checkpoint/restart. v11 checkpoints are
+/// refused; remove the data directory to start fresh.
+const CHKPT_VERSION: u32 = 12;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -152,7 +154,9 @@ const CHKPT_VERSION: u32 = 11;
 /// not just a compressed flag. Old `RGSWAL09` files are refused loudly.
 /// v0.72: `RGSWAL11` — partition metadata carries the `is_partitioned`
 /// flag. Old `RGSWAL10` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL11";
+/// v0.82: `RGSWAL12` — new `CreateType` / `DropType` records (tags 22/23)
+/// WAL-log type DDL. Old `RGSWAL11` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL12";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -417,6 +421,18 @@ pub enum WalRecord {
         name: String,
         restart_lsn: u64,
         confirmed_flush_lsn: u64,
+    },
+    // --- v0.82: type DDL. `CREATE TYPE` carries the full definition so
+    // replay rebuilds the catalog entry exactly; `DROP TYPE` removes it.
+    CreateType {
+        name: String,
+        like_base: Option<String>,
+        composite: Option<Vec<(String, ColType, Option<String>)>>,
+        xmin: u64,
+    },
+    DropType {
+        name: String,
+        xmax: u64,
     },
 }
 
@@ -1480,6 +1496,47 @@ impl Enc {
                 self.u64(*restart_lsn);
                 self.u64(*confirmed_flush_lsn);
             }
+            // v0.82: type DDL (tags 22/23).
+            WalRecord::CreateType {
+                name,
+                like_base,
+                composite,
+                xmin,
+            } => {
+                self.u8(22);
+                self.str(name);
+                match like_base {
+                    Some(b) => {
+                        self.u8(1);
+                        self.str(b);
+                    }
+                    None => self.u8(0),
+                }
+                match composite {
+                    Some(fields) => {
+                        self.u8(1);
+                        self.u32(fields.len() as u32);
+                        for (fname, fty, nested) in fields {
+                            self.str(fname);
+                            self.col_type(fty);
+                            match nested {
+                                Some(n) => {
+                                    self.u8(1);
+                                    self.str(n);
+                                }
+                                None => self.u8(0),
+                            }
+                        }
+                    }
+                    None => self.u8(0),
+                }
+                self.u64(*xmin);
+            }
+            WalRecord::DropType { name, xmax } => {
+                self.u8(23);
+                self.str(name);
+                self.u64(*xmax);
+            }
         }
     }
 
@@ -2142,6 +2199,44 @@ impl<'a> Dec<'a> {
                     confirmed_flush_lsn,
                 })
             }
+            // v0.82: type DDL.
+            22 => {
+                let name = self.str()?;
+                let like_base = if self.u8()? != 0 {
+                    Some(self.str()?)
+                } else {
+                    None
+                };
+                let composite = if self.u8()? != 0 {
+                    let n = self.u32()? as usize;
+                    let mut fields = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let fname = self.str()?;
+                        let fty = self.col_type()?;
+                        let nested = if self.u8()? != 0 {
+                            Some(self.str()?)
+                        } else {
+                            None
+                        };
+                        fields.push((fname, fty, nested));
+                    }
+                    Some(fields)
+                } else {
+                    None
+                };
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateType {
+                    name,
+                    like_base,
+                    composite,
+                    xmin,
+                })
+            }
+            23 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropType { name, xmax })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -2435,14 +2530,40 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             }
             eng.db.db_acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
         }
+        // v0.82: type DDL replay — rebuild the catalog entry exactly.
+        WalRecord::CreateType {
+            name,
+            like_base,
+            composite,
+            xmin,
+        } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            eng.db.types.insert(
+                name.clone(),
+                crate::storage::ShellType {
+                    like_base: like_base.clone(),
+                    composite: composite.clone(),
+                },
+            );
+        }
+        WalRecord::DropType { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            eng.db.types.remove(name);
+        }
     }
     match r {
         // v0.11: role records are applied by the match above; nothing left
-        // to do here.
+        // to do here. v0.82: type records likewise.
         WalRecord::CreateRole { .. }
         | WalRecord::DropRole { .. }
         | WalRecord::AlterRole { .. }
-        | WalRecord::DbAcl { .. } => {}
+        | WalRecord::DbAcl { .. }
+        | WalRecord::CreateType { .. }
+        | WalRecord::DropType { .. } => {}
         // v0.13: replication slot records are applied here.
         WalRecord::ReplSlotCreate {
             name,
@@ -3398,13 +3519,28 @@ pub fn records_for_commit(
                 i += 1;
                 continue;
             }
-            // v0.22: bounded shell types are transactional in memory but
-            // not WAL-logged or checkpointed (documented limitation):
-            // they vanish on restart. The op only exists for
-            // statement-atomic undo.
-            WriteOp::CreateType { .. } | WriteOp::DropType { .. } => {
+            // v0.82: type DDL is WAL-logged (definitions survive
+            // checkpoint/restart). The new definition is read from the
+            // type map, which the executor updated; absent means a later
+            // DROP TYPE in the same txn removed it, so only the drop is
+            // logged. DROP TYPE logs the removal.
+            WriteOp::CreateType { name, .. } => {
+                if let Some(st) = eng.db.types.get(name) {
+                    out.push(WalRecord::CreateType {
+                        name: name.clone(),
+                        like_base: st.like_base.clone(),
+                        composite: st.composite.clone(),
+                        xmin: own,
+                    });
+                }
                 i += 1;
-                continue;
+            }
+            WriteOp::DropType { name, .. } => {
+                out.push(WalRecord::DropType {
+                    name: name.clone(),
+                    xmax: own,
+                });
+                i += 1;
             }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
@@ -4057,6 +4193,45 @@ impl Wal {
         img.u32(n_slots);
         img.bytes(&s_body.buf);
 
+        // v0.82: named/shell types (`eng.db.types`). Sorted for a
+        // deterministic image. Only committed state is meaningful here,
+        // but types carry no xid (v0.22 design); snapshotting the live
+        // map is strictly better than the old behavior (types vanished
+        // entirely). An uncommitted CREATE TYPE caught by a checkpoint
+        // is a known minor gap, documented in the ShellType docs.
+        let mut t_names: Vec<&String> = eng.db.types.keys().collect();
+        t_names.sort();
+        img.u32(t_names.len() as u32);
+        for name in t_names {
+            let st = &eng.db.types[name];
+            img.str(name);
+            match &st.like_base {
+                Some(b) => {
+                    img.u8(1);
+                    img.str(b);
+                }
+                None => img.u8(0),
+            }
+            match &st.composite {
+                Some(fields) => {
+                    img.u8(1);
+                    img.u32(fields.len() as u32);
+                    for (fname, fty, nested) in fields {
+                        img.str(fname);
+                        img.col_type(fty);
+                        match nested {
+                            Some(n) => {
+                                img.u8(1);
+                                img.str(n);
+                            }
+                            None => img.u8(0),
+                        }
+                    }
+                }
+                None => img.u8(0),
+            }
+        }
+
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
         {
@@ -4538,6 +4713,41 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 restart_lsn,
                 confirmed_flush_lsn,
                 active: false,
+            },
+        );
+    }
+    // v0.82: named/shell types (v12 images only; v11 and older are
+    // refused loudly by the version check at the top of this function).
+    let n_types = d.u32().map_err(|e| bad(&e))?;
+    for _ in 0..n_types {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let like_base = if d.u8().map_err(|e| bad(&e))? != 0 {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        let composite = if d.u8().map_err(|e| bad(&e))? != 0 {
+            let n = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut fields = Vec::with_capacity(n);
+            for _ in 0..n {
+                let fname = d.str().map_err(|e| bad(&e))?;
+                let fty = d.col_type().map_err(|e| bad(&e))?;
+                let nested = if d.u8().map_err(|e| bad(&e))? != 0 {
+                    Some(d.str().map_err(|e| bad(&e))?)
+                } else {
+                    None
+                };
+                fields.push((fname, fty, nested));
+            }
+            Some(fields)
+        } else {
+            None
+        };
+        eng.db.types.insert(
+            name,
+            crate::storage::ShellType {
+                like_base,
+                composite,
             },
         );
     }

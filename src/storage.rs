@@ -4818,7 +4818,8 @@ pub struct ShellType {
     /// v0.81: `CREATE TYPE name AS (field type, ...)` composite
     /// definition — ordered `(field_name, ColType,
     /// nested_composite_name)` triples. None for shell/LIKE types.
-    /// Not WAL-logged (documented gap); transactional via the undo log.
+    /// v0.82: WAL-logged and checkpointed; committed definitions survive
+    /// restart (pre-v0.82 this was a documented gap).
     pub composite: Option<Vec<(String, ColType, Option<String>)>>,
 }
 
@@ -4851,11 +4852,11 @@ pub struct Database {
     pub stats: HashMap<String, TableStats, FxBuildHasher>,
     /// Shell types by name (v0.22, bounded — see `ShellType`). Types are
     /// database-global and transactional via the statement undo log
-    /// (`WriteOp::CreateType` / `WriteOp::DropType`), but are not
-    /// WAL-logged or checkpointed in v0.22: an inter-checkpoint crash or
-    /// a restart loses type definitions. Nothing can reference a shell
-    /// type yet (no column-type or cast support), so recovery stays
-    /// consistent; documented in the README.
+    /// (`WriteOp::CreateType` / `WriteOp::DropType`). v0.82: type DDL is
+    /// WAL-logged (`WalRecord::CreateType` / `DropType`) and the catalog
+    /// is checkpointed, so committed types survive restart. (Pre-v0.82
+    /// they vanished on restart.) Types carry no xid, so a checkpoint
+    /// may snapshot an uncommitted CREATE TYPE — a known minor gap.
     pub types: HashMap<String, ShellType, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
@@ -6290,7 +6291,8 @@ pub enum WriteOp {
     },
     // --- v0.22: CREATE/DROP TYPE. Types live in `Database::types` (not
     // the versioned catalog); the op carries the previous entry (or
-    // None) so undo restores it exactly. Types are never WAL-logged.
+    // None) so undo restores it exactly. v0.82: type DDL is WAL-logged
+    // (`WalRecord::CreateType` / `DropType`) and checkpointed.
     CreateType {
         name: String,
         prev: Option<ShellType>,

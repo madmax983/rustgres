@@ -225,6 +225,13 @@ fn decode_frame(eng: &Engine, frame_lsn: u64, records: &[WalRecord]) -> Vec<Stri
             WalRecord::AlterTable { name, .. } => {
                 changes.push(format!("DDL ALTER_TABLE {}", name));
             }
+            // v0.82: type DDL is visible to logical decoding like other DDL.
+            WalRecord::CreateType { name, .. } => {
+                changes.push(format!("DDL CREATE_TYPE {}", name));
+            }
+            WalRecord::DropType { name, .. } => {
+                changes.push(format!("DDL DROP_TYPE {}", name));
+            }
             // Non-table records (sequences, roles, ACLs, slot metadata)
             // are invisible to logical decoding in v0.13.
             _ => {}

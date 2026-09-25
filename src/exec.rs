@@ -17707,6 +17707,215 @@ fn parse_array_literal(s: &str, elem: crate::storage::ArrayElem) -> Result<Array
     })
 }
 
+/// v0.82: parse a composite text literal `'(f1,f2,...)'` (PG19
+/// `record_in` format) against a named composite definition. Returns
+/// the field values in order. Quoting mirrors PG: `"..."` quoted fields
+/// with `\"`/`\\` escapes, backslash escapes outside quotes, an empty
+/// *unquoted* field is NULL (a quoted `""` is an empty string, and the
+/// word NULL unquoted is the literal text "NULL" — unlike array_in).
+/// A field whose type is itself a composite must be a nested `(...)`
+/// literal (quoted or bare) and is parsed recursively. 22P02 on any
+/// malformed input, like PG's record_in.
+fn parse_record_literal(
+    s: &str,
+    type_name: &str,
+    fields: &[(String, ColType, Option<String>)],
+    types: &std::collections::HashMap<
+        String,
+        crate::storage::ShellType,
+        crate::fxhash::FxBuildHasher,
+    >,
+) -> Result<Vec<Value>, ExecError> {
+    fn bad(s: &str, type_name: &str) -> ExecError {
+        exec_err(
+            "22P02",
+            format!("invalid input syntax for type {}: {:?}", type_name, s),
+        )
+    }
+    let chars: &[u8] = s.as_bytes();
+    let mut pos = 0usize;
+    let ws = |pos: &mut usize| {
+        while *pos < chars.len() && chars[*pos].is_ascii_whitespace() {
+            *pos += 1;
+        }
+    };
+    // Parse one field: Ok((text, quoted)). Quoted-ness matters because
+    // only an empty *unquoted* field is NULL.
+    fn field(
+        chars: &[u8],
+        pos: &mut usize,
+        s: &str,
+        type_name: &str,
+    ) -> Result<(String, bool), ExecError> {
+        let bad = |s: &str| {
+            exec_err(
+                "22P02",
+                format!("invalid input syntax for type {}: {:?}", type_name, s),
+            )
+        };
+        if *pos < chars.len() && chars[*pos] == b'"' {
+            *pos += 1;
+            let mut out = String::new();
+            loop {
+                if *pos >= chars.len() {
+                    return Err(bad(s));
+                }
+                let c = chars[*pos];
+                if c == b'\\' {
+                    *pos += 1;
+                    if *pos >= chars.len() {
+                        return Err(bad(s));
+                    }
+                    out.push(chars[*pos] as char);
+                    *pos += 1;
+                } else if c == b'"' {
+                    *pos += 1;
+                    break;
+                } else {
+                    out.push(c as char);
+                    *pos += 1;
+                }
+            }
+            Ok((out, true))
+        } else {
+            // Unquoted field: scan to `,` or `)` at depth 0, tracking
+            // balanced parens (nested composites like `((5),hi)`) and
+            // skipping quoted sections so their commas don't delimit.
+            let start = *pos;
+            let mut depth = 0;
+            while *pos < chars.len() {
+                let c = chars[*pos];
+                if c == b'(' {
+                    depth += 1;
+                } else if c == b')' {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                } else if c == b',' && depth == 0 {
+                    break;
+                } else if c == b'"' {
+                    *pos += 1;
+                    while *pos < chars.len() && chars[*pos] != b'"' {
+                        if chars[*pos] == b'\\' {
+                            *pos += 1;
+                            if *pos >= chars.len() {
+                                return Err(bad(s));
+                            }
+                        }
+                        *pos += 1;
+                    }
+                    if *pos >= chars.len() {
+                        return Err(bad(s));
+                    }
+                } else if c == b'\\' {
+                    *pos += 1;
+                    if *pos >= chars.len() {
+                        return Err(bad(s));
+                    }
+                }
+                *pos += 1;
+            }
+            // Note: backslash escapes are resolved when the field text is
+            // used below; here we just delimit.
+            Ok((s[start..*pos].to_string(), false))
+        }
+    }
+    // Resolve backslash escapes in an unquoted field body.
+    fn unescape(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut it = raw.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    ws(&mut pos);
+    if pos >= chars.len() || chars[pos] != b'(' {
+        return Err(bad(s, type_name));
+    }
+    pos += 1;
+    let mut vals: Vec<Value> = Vec::with_capacity(fields.len());
+    // `()` is the empty record; otherwise parse `field (, field)*`.
+    // An empty unquoted field (e.g. the second field of `(1,)`) is NULL.
+    ws(&mut pos);
+    let empty_record = pos < chars.len() && chars[pos] == b')';
+    if empty_record {
+        pos += 1;
+    }
+    while !empty_record {
+        if vals.len() >= fields.len() {
+            return Err(exec_err(
+                "22P02",
+                format!(
+                    "invalid input syntax for type {}: too many columns in {:?}",
+                    type_name, s
+                ),
+            ));
+        }
+        let (raw, quoted) = field(chars, &mut pos, s, type_name)?;
+        let (_, fty, nested) = &fields[vals.len()];
+        let text = if quoted {
+            raw
+        } else {
+            unescape(&raw).trim().to_string()
+        };
+        let val = if !quoted && text.is_empty() {
+            Value::Null
+        } else if *fty == ColType::Composite {
+            let nested_name = nested.as_deref().unwrap_or(type_name);
+            let nested_fields = types
+                .get(nested_name)
+                .and_then(|st| st.composite.clone())
+                .ok_or_else(|| {
+                    exec_err("42704", format!("type \"{}\" does not exist", nested_name))
+                })?;
+            let inner = parse_record_literal(&text, nested_name, &nested_fields, types)?;
+            Value::Record(
+                nested_fields
+                    .iter()
+                    .zip(inner)
+                    .map(|((n, _, _), v)| (n.clone(), v))
+                    .collect(),
+            )
+        } else {
+            eval_cast(&Value::text(text.as_str()), *fty).map_err(|_| bad(s, type_name))?
+        };
+        vals.push(val);
+        ws(&mut pos);
+        if pos < chars.len() && chars[pos] == b',' {
+            pos += 1;
+            continue;
+        }
+        if pos < chars.len() && chars[pos] == b')' {
+            pos += 1;
+            break;
+        }
+        return Err(bad(s, type_name));
+    }
+    if vals.len() != fields.len() {
+        return Err(exec_err(
+            "22P02",
+            format!(
+                "invalid input syntax for type {}: too few columns in {:?}",
+                type_name, s
+            ),
+        ));
+    }
+    ws(&mut pos);
+    if pos != chars.len() {
+        return Err(bad(s, type_name));
+    }
+    Ok(vals)
+}
+
 /// v0.79: scalar `ColType` for an `ArrayElem` (element input/output).
 fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
     use crate::storage::ArrayElem as E;
@@ -19052,6 +19261,21 @@ fn record_image_eq(fa: &[(String, Value)], fb: &[(String, Value)]) -> bool {
 }
 
 fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, ExecError> {
+    // v0.82: `*=` (ImageEq) exists only for record operands. PG has no
+    // such operator for scalars, so `1 *= 2` is 42883 "operator does
+    // not exist" — checked before the NULL arm, since PG resolves the
+    // operator at analysis time regardless of nullness.
+    if op == CmpOp::ImageEq && !matches!((a, b), (Value::Record(_), Value::Record(_))) {
+        return Err(exec_err(
+            "42883",
+            format!(
+                "operator does not exist: {} {} {}",
+                a.type_name(),
+                op.sql(),
+                b.type_name()
+            ),
+        ));
+    }
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
         (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
@@ -21405,6 +21629,17 @@ fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError>
         .ok_or_else(|| exec_err("42846", format!("cannot cast type record to {}", name)))?;
     let src = match v {
         Value::Record(fields) => fields,
+        // v0.82: composite text input `'(f1,f2,...)'::mytype` — PG19
+        // `record_in` format, parsed field-wise against the composite
+        // definition and coerced through each field's input function.
+        Value::Text(s) | Value::BpChar(s) => {
+            let parsed = parse_record_literal(s, name, fields, &q.eng.db.types)?;
+            let mut out = Vec::with_capacity(fields.len());
+            for ((fname, _, _), val) in fields.iter().zip(parsed) {
+                out.push((fname.clone(), val));
+            }
+            return Ok(Value::Record(out));
+        }
         _ => {
             return Err(exec_err(
                 "42846",
@@ -27872,6 +28107,10 @@ fn compare_values(
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" ordering is a plain byte comparison.
         (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),
+        // v0.82: PG19 record ordering for ORDER BY — lexicographic over
+        // fields with NULL sorting larger (PG's default ASC NULLS LAST),
+        // mirroring `cmp_records`' comparison semantics as a total order.
+        (Value::Record(fa), Value::Record(fb)) => cmp_record_values(fa, fb)?,
         _ => {
             return Err(exec_err(
                 "42804",
@@ -27884,6 +28123,38 @@ fn compare_values(
         }
     };
     Ok(if desc { ord.reverse() } else { ord })
+}
+
+/// v0.82: total lexicographic ordering over record fields for ORDER BY.
+/// NULL fields sort larger (PG's default ASC NULLS LAST); nested records
+/// recurse. Mismatched field counts are 42883, like `cmp_records`.
+fn cmp_record_values(
+    fa: &[(String, Value)],
+    fb: &[(String, Value)],
+) -> Result<Ordering, ExecError> {
+    if fa.len() != fb.len() {
+        return Err(exec_err(
+            "42883",
+            "cannot compare records with different field counts".to_string(),
+        ));
+    }
+    for ((_, va), (_, vb)) in fa.iter().zip(fb.iter()) {
+        let ord = match (va, vb) {
+            (Value::Null, Value::Null) => continue,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            (Value::Record(rfa), Value::Record(rfb)) => cmp_record_values(rfa, rfb)?,
+            _ => match cmp_ordering(va, vb, CmpOp::Lt)? {
+                // None only arises for NULL operands, handled above.
+                Some(o) => o,
+                None => continue,
+            },
+        };
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(Ordering::Equal)
 }
 
 /// Exact numeric kinds: int2/int4/int8/numeric.

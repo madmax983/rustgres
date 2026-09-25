@@ -6,7 +6,7 @@ childless partitioned intermediate) across a CHECKPOINT + restart:
 
 1. A childless partitioned intermediate rejects direct inserts with
    23514 both before and after the restart (the flag survives the
-   RGSCHK09 checkpoint roundtrip).
+   RGSCHK10 checkpoint roundtrip).
 2. Routing still works after recovery: inserts through the parent land
    in the right leaf, and previously inserted rows are visible.
 3. ATTACH preserves the leaf-vs-partitioned distinction: an attached
