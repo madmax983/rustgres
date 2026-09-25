@@ -1004,6 +1004,9 @@ mod tests {
                 oid: 0,
                 toast_relid: 0,
                 col_compression: vec![],
+                composite_types: vec![],
+                domain_types: vec![],
+                domain_elem: vec![],
             },
             WalRecord::InsertRows {
                 table: "t".into(),

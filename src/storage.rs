@@ -4644,6 +4644,13 @@ pub struct Table {
     /// v0.81: named composite type per column, parallel to `columns`
     /// (`Some(name)` iff the column's `ColType` is `Composite`).
     pub composite_types: Vec<Option<String>>,
+    /// v0.85: domain name per column, parallel to `columns`
+    /// (`Some(d)` iff the column was declared with domain type `d`,
+    /// possibly as `d[]`).
+    pub domain_types: Vec<Option<String>>,
+    /// v0.85: iff `domain_types[i]` is `Some` and the column was
+    /// declared as `d[]`: the domain applies per array element.
+    pub domain_elem: Vec<bool>,
     pub rows: Vec<RowVersion>,
     /// Row-version id -> position in `rows`. Keeps id lookups O(1) so
     /// multi-row writes don't degrade to O(rows) per row.
@@ -4705,6 +4712,9 @@ impl Table {
             columns,
             // v0.81: no named composites by default.
             composite_types: vec![None; n],
+            // v0.85: no domain-typed columns by default.
+            domain_types: vec![None; n],
+            domain_elem: vec![false; n],
             rows: Vec::new(),
             row_index: HashMap::new(),
             created_xmin,
@@ -4744,6 +4754,9 @@ impl Table {
         t.fks = def.fks.clone();
         // v0.81: named composite types per column.
         t.composite_types = def.composite_types.clone();
+        // v0.85: domain type use per column.
+        t.domain_types = def.domain_types.clone();
+        t.domain_elem = def.domain_elem.clone();
         // v0.72: per-column STORAGE overrides (LIKE ... INCLUDING
         // STORAGE); `None` keeps the type default from `Table::new`.
         for (i, s) in def.storage.iter().enumerate() {
@@ -4811,6 +4824,27 @@ pub const NO_SESSION: u64 = u64::MAX;
 /// only the shell + LIKE-completion forms (no I/O functions, no
 /// composite/enum/range types): enough for the pg_regress float8
 /// cluster, which builds a float8 alias this way.
+/// v0.85: `CREATE DOMAIN` definition — a named type over a base type
+/// with CHECK constraints (PG19 coerce_to_domain). Stored on
+/// `ShellType`; WAL-logged and checkpointed like the composite
+/// definition.
+#[derive(Clone, Debug)]
+pub struct DomainDef {
+    /// The base type (builtins, `ColType::Array`, or `ColType::Composite`
+    /// for a named composite base).
+    pub base: ColType,
+    /// Named base type (`Some(name)` when `base` is `Composite` or when
+    /// the base is itself a domain); resolved at CREATE DOMAIN time.
+    pub base_named: Option<String>,
+    /// v0.85: domain-over-domain — the inner domain name. When set,
+    /// `base`/`base_named` are the inner domain's resolved base; checks
+    /// recurse into the inner domain first (PG19 checks innermost first).
+    pub base_domain: Option<String>,
+    pub checks: Vec<CheckDef>,
+    pub not_null: bool,
+    pub default: Option<DefaultExpr>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ShellType {
     /// Base type name from LIKE = <base>; None while still a shell.
@@ -4821,6 +4855,9 @@ pub struct ShellType {
     /// v0.82: WAL-logged and checkpointed; committed definitions survive
     /// restart (pre-v0.82 this was a documented gap).
     pub composite: Option<Vec<(String, ColType, Option<String>)>>,
+    /// v0.85: `CREATE DOMAIN` definition. None for shell/LIKE/composite
+    /// types; a type is never both composite and domain.
+    pub domain: Option<DomainDef>,
 }
 
 #[derive(Clone, Debug)]
@@ -5843,6 +5880,36 @@ impl Engine {
         }
         out.sort();
         out
+    }
+
+    /// v0.85: vacuum a session-local temp table. Returns `Some(removed)`
+    /// when the session owns a temp table by that name, `None` otherwise
+    /// (the caller falls back to the permanent table). Temp tables are
+    /// single-version, so this removes versions dead to all snapshots;
+    /// index entries for removed versions are cleaned up like the
+    /// permanent-table path.
+    pub fn vacuum_temp_table(&mut self, session: u64, name: &str) -> Option<usize> {
+        let txns = &self.txns;
+        let mut dead: Vec<(u64, Row, Vec<u32>)> = Vec::new();
+        let removed;
+        {
+            let tmps = self.db.temp_tables.get_mut(&session)?;
+            let t = tmps.get_mut(name)?;
+            for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
+                dead.push((v.id, v.values.clone(), v.toast.clone()));
+            }
+            let before = t.rows.len();
+            t.rows.retain(|v| !version_dead_to_all(txns, v));
+            removed = before - t.rows.len();
+            if removed > 0 {
+                t.rebuild_row_index();
+            }
+        }
+        // Index cleanup needs `&mut self`; the temp-table borrow ends above.
+        for (id, values, _) in &dead {
+            self.db.index_remove_row(name, *id, values);
+        }
+        Some(removed)
     }
 }
 

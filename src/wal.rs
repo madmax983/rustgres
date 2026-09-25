@@ -23,11 +23,13 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 12 (`RGSWAL12` / `RGSCHK10`) is NOT compatible with v0.81
-//! or earlier: v0.82 WAL-logs type DDL (`CreateType`/`DropType` records)
-//! and checkpoints the type catalog. Like every format bump, old data
-//! directories are refused with a clear error instead of being misread.
-//! v0.72 was `RGSWAL11` / `RGSCHK09`.
+//! Format version 13 (`RGSWAL13` / `RGSCHK11`) is NOT compatible with v0.84
+//! or earlier: v0.85 WAL-logs domain definitions (`WalDomain` in
+//! `CreateType`) and per-column composite/domain type use in
+//! `CreateTable`/`AlterTable`, and checkpoints the domain catalog. Like
+//! every format bump, old data directories are refused with a clear
+//! error instead of being misread.
+//! v0.82 was `RGSWAL12` / `RGSCHK10`; v0.72 was `RGSWAL11` / `RGSCHK09`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -129,14 +131,17 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK10";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK11";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
 /// v0.82: version 12 adds the named/shell type catalog (`eng.db.types`),
 /// so CREATE TYPE survives checkpoint/restart. v11 checkpoints are
 /// refused; remove the data directory to start fresh.
-const CHKPT_VERSION: u32 = 12;
+/// v0.85: version 13 adds domain definitions to the type catalog and
+/// per-column composite/domain type use to table images. v12
+/// checkpoints are refused; remove the data directory to start fresh.
+const CHKPT_VERSION: u32 = 13;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -154,9 +159,11 @@ const CHKPT_VERSION: u32 = 12;
 /// not just a compressed flag. Old `RGSWAL09` files are refused loudly.
 /// v0.72: `RGSWAL11` — partition metadata carries the `is_partitioned`
 /// flag. Old `RGSWAL10` files are refused loudly.
-/// v0.82: `RGSWAL12` — new `CreateType` / `DropType` records (tags 22/23)
-/// WAL-log type DDL. Old `RGSWAL11` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL12";
+/// v0.85: `RGSWAL13` — `CreateType` carries the domain definition
+/// (base type + s-expr CHECKs/DEFAULT); `CreateTable`/`AlterTable`
+/// carry per-column `composite_types`/`domain_types`/`domain_elem`.
+/// Old `RGSWAL12` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL13";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -279,6 +286,15 @@ pub enum WalRecord {
         /// v0.41: per-column explicit compression methods as
         /// ToastCompression codes, 0 = default (`col_compression`).
         col_compression: Vec<u8>,
+        /// v0.85: named composite type per column (`composite_types`);
+        /// empty on old records.
+        composite_types: Vec<Option<String>>,
+        /// v0.85: domain type per column (`domain_types`); empty on old
+        /// records.
+        domain_types: Vec<Option<String>>,
+        /// v0.85: domain applies to array elements (`domain_elem`); empty
+        /// on old records.
+        domain_elem: Vec<bool>,
         xmin: u64,
     },
     InsertRows {
@@ -348,6 +364,15 @@ pub enum WalRecord {
         /// v0.41: per-column explicit compression methods as
         /// ToastCompression codes, 0 = default (`col_compression`).
         col_compression: Vec<u8>,
+        /// v0.85: named composite type per column (`composite_types`);
+        /// empty on old records.
+        composite_types: Vec<Option<String>>,
+        /// v0.85: domain type per column (`domain_types`); empty on old
+        /// records.
+        domain_types: Vec<Option<String>>,
+        /// v0.85: domain applies to array elements (`domain_elem`); empty
+        /// on old records.
+        domain_elem: Vec<bool>,
         next_value_id: u32,
         /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
@@ -428,6 +453,8 @@ pub enum WalRecord {
         name: String,
         like_base: Option<String>,
         composite: Option<Vec<(String, ColType, Option<String>)>>,
+        /// v0.85: domain definition (None for shell/LIKE/composite types).
+        domain: Option<WalDomain>,
         xmin: u64,
     },
     DropType {
@@ -441,6 +468,20 @@ pub enum WalRecord {
 pub struct WalAcl {
     pub role: String,
     pub privs: u32,
+}
+
+/// v0.85: a domain definition in WAL/checkpoint form. CHECKs and the
+/// DEFAULT travel as s-expr strings (`sql::encode_domain_checks` /
+/// `encode_domain_default`); the base type uses the binary `col_type`
+/// codec.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalDomain {
+    pub base: ColType,
+    pub base_named: Option<String>,
+    pub base_domain: Option<String>,
+    pub checks: String,
+    pub not_null: bool,
+    pub default: String,
 }
 
 impl WalAcl {
@@ -1253,6 +1294,9 @@ impl Enc {
                 oid,
                 toast_relid,
                 col_compression,
+                composite_types,
+                domain_types,
+                domain_elem,
                 xmin,
             } => {
                 self.u8(1);
@@ -1269,6 +1313,10 @@ impl Enc {
                 for m in col_compression {
                     self.u8(*m);
                 }
+                // v0.85: composite/domain type use per column.
+                self.opt_str_list(composite_types);
+                self.opt_str_list(domain_types);
+                self.bool_list(domain_elem);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -1370,6 +1418,9 @@ impl Enc {
                 toast_target,
                 col_storage,
                 col_compression,
+                composite_types,
+                domain_types,
+                domain_elem,
                 next_value_id,
                 toast_info,
                 xmin,
@@ -1395,6 +1446,10 @@ impl Enc {
                 for m in col_compression {
                     self.u8(*m);
                 }
+                // v0.85: composite/domain type use per column.
+                self.opt_str_list(composite_types);
+                self.opt_str_list(domain_types);
+                self.bool_list(domain_elem);
                 self.u32(*next_value_id);
                 self.u32(toast_info.len() as u32);
                 for (k, c) in toast_info {
@@ -1511,6 +1566,7 @@ impl Enc {
                 name,
                 like_base,
                 composite,
+                domain,
                 xmin,
             } => {
                 self.u8(22);
@@ -1540,6 +1596,31 @@ impl Enc {
                     }
                     None => self.u8(0),
                 }
+                // v0.85: domain definition (present only for domains).
+                match domain {
+                    Some(d) => {
+                        self.u8(1);
+                        self.col_type(&d.base);
+                        match &d.base_named {
+                            Some(n) => {
+                                self.u8(1);
+                                self.str(n);
+                            }
+                            None => self.u8(0),
+                        }
+                        match &d.base_domain {
+                            Some(n) => {
+                                self.u8(1);
+                                self.str(n);
+                            }
+                            None => self.u8(0),
+                        }
+                        self.u8(if d.not_null { 1 } else { 0 });
+                        self.str(&d.checks);
+                        self.str(&d.default);
+                    }
+                    None => self.u8(0),
+                }
                 self.u64(*xmin);
             }
             WalRecord::DropType { name, xmax } => {
@@ -1555,6 +1636,28 @@ impl Enc {
         for e in acl {
             self.str(&e.role);
             self.u32(e.privs);
+        }
+    }
+
+    /// v0.85: encode a `Vec<Option<String>>` (composite/domain type names).
+    fn opt_str_list(&mut self, v: &[Option<String>]) {
+        self.u32(v.len() as u32);
+        for o in v {
+            match o {
+                Some(s) => {
+                    self.u8(1);
+                    self.str(s);
+                }
+                None => self.u8(0),
+            }
+        }
+    }
+
+    /// v0.85: encode a `Vec<bool>` (domain_elem).
+    fn bool_list(&mut self, v: &[bool]) {
+        self.u32(v.len() as u32);
+        for b in v {
+            self.u8(if *b { 1 } else { 0 });
         }
     }
 
@@ -1961,6 +2064,10 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_compression {
                     col_compression.push(self.u8()?);
                 }
+                // v0.85: composite/domain type use per column.
+                let composite_types = self.opt_str_list_d()?;
+                let domain_types = self.opt_str_list_d()?;
+                let domain_elem = self.bool_list_d()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -1972,6 +2079,9 @@ impl<'a> Dec<'a> {
                     oid,
                     toast_relid,
                     col_compression,
+                    composite_types,
+                    domain_types,
+                    domain_elem,
                     xmin,
                 })
             }
@@ -2078,6 +2188,10 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_compression {
                     col_compression.push(self.u8()?);
                 }
+                // v0.85: composite/domain type use per column.
+                let composite_types = self.opt_str_list_d()?;
+                let domain_types = self.opt_str_list_d()?;
+                let domain_elem = self.bool_list_d()?;
                 let next_value_id = self.u32()?;
                 let n_ti = self.u32()? as usize;
                 let mut toast_info = Vec::with_capacity(n_ti);
@@ -2098,6 +2212,9 @@ impl<'a> Dec<'a> {
                     toast_target,
                     col_storage,
                     col_compression,
+                    composite_types,
+                    domain_types,
+                    domain_elem,
                     next_value_id,
                     toast_info,
                     xmin,
@@ -2245,11 +2362,39 @@ impl<'a> Dec<'a> {
                 } else {
                     None
                 };
+                // v0.85: domain definition.
+                let domain = if self.u8()? != 0 {
+                    let base = self.col_type()?;
+                    let base_named = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let base_domain = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let not_null = self.u8()? != 0;
+                    let checks = self.str()?;
+                    let default = self.str()?;
+                    Some(WalDomain {
+                        base,
+                        base_named,
+                        base_domain,
+                        checks,
+                        not_null,
+                        default,
+                    })
+                } else {
+                    None
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateType {
                     name,
                     like_base,
                     composite,
+                    domain,
                     xmin,
                 })
             }
@@ -2312,6 +2457,30 @@ impl<'a> Dec<'a> {
                 role: self.str()?,
                 privs: self.u32()?,
             });
+        }
+        Ok(out)
+    }
+
+    /// v0.85: decode a `Vec<Option<String>>` (composite/domain type names).
+    fn opt_str_list_d(&mut self) -> Result<Vec<Option<String>>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(if self.u8()? != 0 {
+                Some(self.str()?)
+            } else {
+                None
+            });
+        }
+        Ok(out)
+    }
+
+    /// v0.85: decode a `Vec<bool>` (domain_elem).
+    fn bool_list_d(&mut self) -> Result<Vec<bool>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.u8()? != 0);
         }
         Ok(out)
     }
@@ -2556,16 +2725,34 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             name,
             like_base,
             composite,
+            domain,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
+            // v0.85: restore the domain definition from the s-expr
+            // strings. A corrupt record fails replay loudly rather than
+            // silently dropping constraints.
+            let domain = match domain {
+                Some(d) => Some(crate::storage::DomainDef {
+                    base: d.base.clone(),
+                    base_named: d.base_named.clone(),
+                    base_domain: d.base_domain.clone(),
+                    checks: crate::sql::decode_domain_checks(&d.checks)
+                        .map_err(|e| format!("corrupt domain checks in WAL: {}", e))?,
+                    not_null: d.not_null,
+                    default: crate::sql::decode_domain_default(&d.default)
+                        .map_err(|e| format!("corrupt domain default in WAL: {}", e))?,
+                }),
+                None => None,
+            };
             eng.db.types.insert(
                 name.clone(),
                 crate::storage::ShellType {
                     like_base: like_base.clone(),
                     composite: composite.clone(),
+                    domain,
                 },
             );
         }
@@ -2627,6 +2814,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             oid,
             toast_relid,
             col_compression,
+            composite_types,
+            domain_types,
+            domain_elem,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
@@ -2637,6 +2827,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // v0.37: restore the table OID and its toast table link.
             t.oid = *oid;
             t.toast_relid = *toast_relid;
+            // v0.85: restore composite/domain type use (empty vecs on old
+            // records mean "no domain use").
+            t.composite_types = composite_types.clone();
+            t.domain_types = domain_types.clone();
+            t.domain_elem = domain_elem.clone();
             // v0.41: restore per-column compression methods (0 = default).
             t.col_compression = col_compression
                 .iter()
@@ -2872,6 +3067,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             toast_target,
             col_storage,
             col_compression,
+            composite_types,
+            domain_types,
+            domain_elem,
             next_value_id,
             toast_info,
             xmin,
@@ -2921,6 +3119,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .max(toast_relid.wrapping_add(1));
             t.toast_target = *toast_target;
             t.col_storage = col_storage.clone();
+            // v0.85: restore composite/domain type use (empty vecs on old
+            // records mean "no domain use").
+            t.composite_types = composite_types.clone();
+            t.domain_types = domain_types.clone();
+            t.domain_elem = domain_elem.clone();
             // v0.41: per-column compression methods (0 = default).
             t.col_compression = col_compression
                 .iter()
@@ -3281,6 +3484,10 @@ pub fn records_for_commit(
                         .iter()
                         .map(|m| m.map(|m| m.code()).unwrap_or(0))
                         .collect(),
+                    // v0.85: composite/domain type use.
+                    composite_types: ours.composite_types.clone(),
+                    domain_types: ours.domain_types.clone(),
+                    domain_elem: ours.domain_elem.clone(),
                     xmin: own,
                 });
             }
@@ -3317,6 +3524,10 @@ pub fn records_for_commit(
                         .iter()
                         .map(|m| m.map(|m| m.code()).unwrap_or(0))
                         .collect(),
+                    // v0.85: composite/domain type use.
+                    composite_types: ours.composite_types.clone(),
+                    domain_types: ours.domain_types.clone(),
+                    domain_elem: ours.domain_elem.clone(),
                     next_value_id: ours.next_value_id,
                     toast_info: ours
                         .toast_info
@@ -3551,6 +3762,17 @@ pub fn records_for_commit(
                         name: name.clone(),
                         like_base: st.like_base.clone(),
                         composite: st.composite.clone(),
+                        // v0.85: domain definitions travel as s-expr
+                        // strings (sql::encode_domain_checks /
+                        // encode_domain_default).
+                        domain: st.domain.as_ref().map(|d| WalDomain {
+                            base: d.base.clone(),
+                            base_named: d.base_named.clone(),
+                            base_domain: d.base_domain.clone(),
+                            checks: crate::sql::encode_domain_checks(&d.checks),
+                            not_null: d.not_null,
+                            default: crate::sql::encode_domain_default(&d.default),
+                        }),
                         xmin: own,
                     });
                 }
@@ -3972,6 +4194,10 @@ impl Wal {
                 for m in &t.col_compression {
                     body.u8(m.map(|m| m.code()).unwrap_or(0));
                 }
+                // v0.85: composite/domain type use per column.
+                body.opt_str_list(&t.composite_types);
+                body.opt_str_list(&t.domain_types);
+                body.bool_list(&t.domain_elem);
                 let mut toast_keys: Vec<u32> = t.toast_info.keys().copied().collect();
                 toast_keys.sort_unstable();
                 body.u32(toast_keys.len() as u32);
@@ -4251,6 +4477,31 @@ impl Wal {
                 }
                 None => img.u8(0),
             }
+            // v0.85: domain definition (present only for domains).
+            match &st.domain {
+                Some(d) => {
+                    img.u8(1);
+                    img.col_type(&d.base);
+                    match &d.base_named {
+                        Some(n) => {
+                            img.u8(1);
+                            img.str(n);
+                        }
+                        None => img.u8(0),
+                    }
+                    match &d.base_domain {
+                        Some(n) => {
+                            img.u8(1);
+                            img.str(n);
+                        }
+                        None => img.u8(0),
+                    }
+                    img.u8(if d.not_null { 1 } else { 0 });
+                    img.str(&crate::sql::encode_domain_checks(&d.checks));
+                    img.str(&crate::sql::encode_domain_default(&d.default));
+                }
+                None => img.u8(0),
+            }
         }
 
         // 2. Write tmp file + fsync.
@@ -4418,6 +4669,30 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             };
             col_compression.push(method);
         }
+        // v0.85: composite/domain type use per column.
+        let n_ct = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut composite_types = Vec::with_capacity(n_ct);
+        for _ in 0..n_ct {
+            composite_types.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            });
+        }
+        let n_dt = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut domain_types = Vec::with_capacity(n_dt);
+        for _ in 0..n_dt {
+            domain_types.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            });
+        }
+        let n_de = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut domain_elem = Vec::with_capacity(n_de);
+        for _ in 0..n_de {
+            domain_elem.push(d.u8().map_err(|e| bad(&e))? != 0);
+        }
         let n_toast_info = d.u32().map_err(|e| bad(&e))? as usize;
         let mut toast_info = std::collections::HashMap::new();
         for _ in 0..n_toast_info {
@@ -4469,6 +4744,10 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         __t.col_compression = col_compression;
         __t.toast_info = toast_info;
         __t.next_value_id = next_value_id;
+        // v0.85: composite/domain type use.
+        __t.composite_types = composite_types;
+        __t.domain_types = domain_types;
+        __t.domain_elem = domain_elem;
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;
@@ -4764,11 +5043,39 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         } else {
             None
         };
+        // v0.85: domain definition.
+        let domain = if d.u8().map_err(|e| bad(&e))? != 0 {
+            let base = d.col_type().map_err(|e| bad(&e))?;
+            let base_named = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let base_domain = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let not_null = d.u8().map_err(|e| bad(&e))? != 0;
+            let checks = d.str().map_err(|e| bad(&e))?;
+            let default = d.str().map_err(|e| bad(&e))?;
+            Some(crate::storage::DomainDef {
+                base,
+                base_named,
+                base_domain,
+                checks: crate::sql::decode_domain_checks(&checks).map_err(|e| bad(&e))?,
+                not_null,
+                default: crate::sql::decode_domain_default(&default).map_err(|e| bad(&e))?,
+            })
+        } else {
+            None
+        };
         eng.db.types.insert(
             name,
             crate::storage::ShellType {
                 like_base,
                 composite,
+                domain,
             },
         );
     }
@@ -4896,6 +5203,9 @@ mod tests {
                 oid: 16384,
                 toast_relid: 16385,
                 col_compression: vec![0],
+                composite_types: vec![None],
+                domain_types: vec![None],
+                domain_elem: vec![false],
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -5108,6 +5418,9 @@ mod tests {
                 oid: 16384,
                 toast_relid: 0,
                 col_compression: vec![0],
+                composite_types: vec![None],
+                domain_types: vec![None],
+                domain_elem: vec![false],
                 xmin: 4,
             },
         )

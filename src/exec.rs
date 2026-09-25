@@ -378,6 +378,25 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             composite,
         } => exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref()),
         Stmt::DropType { names, if_exists } => exec_drop_type(eng, ctx, names, *if_exists),
+        // --- v0.85: CREATE/DROP DOMAIN ---
+        Stmt::CreateDomain {
+            name,
+            base,
+            base_named,
+            checks,
+            not_null,
+            default,
+        } => exec_create_domain(
+            eng,
+            ctx,
+            name,
+            base,
+            base_named.as_deref(),
+            checks,
+            *not_null,
+            default.as_ref(),
+        ),
+        Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
         // --- v0.11: roles and privileges ---
         Stmt::CreateRole {
             name,
@@ -1963,6 +1982,14 @@ fn expand_like_clauses(
             } else {
                 None
             });
+            // v0.81/v0.85: the named composite and domain type use ride
+            // along with the column (PG copies the whole rowtype).
+            def.composite_types
+                .push(src.composite_types.get(i).cloned().unwrap_or(None));
+            def.domain_types
+                .push(src.domain_types.get(i).cloned().unwrap_or(None));
+            def.domain_elem
+                .push(src.domain_elem.get(i).copied().unwrap_or(false));
         }
         // CHECK constraints get fresh per-table names (PG generates new
         // names for the copies; ours are per-table anyway).
@@ -2057,16 +2084,47 @@ fn create_table_from_def(
     expand_like_clauses(eng, ctx, name, &mut like_def)?;
     // v0.81: validate named composite columns — each `ColType::Composite`
     // must name a defined composite type (42704 otherwise, like PG).
-    for (i, (_, ty)) in like_def.columns.iter().enumerate() {
-        if *ty == ColType::Composite {
-            let tname = like_def.composite_types.get(i).and_then(|o| o.as_deref());
-            match tname.and_then(|n| eng.db.types.get(n)) {
+    // v0.85: a named type that resolves to a domain rewrites the column
+    // to the domain's base type and records the domain use
+    // (`domain_types` / `domain_elem`); the domain's constraints are
+    // enforced on the finished value (PG19 coerce_to_domain).
+    for i in 0..like_def.columns.len() {
+        let ty = like_def.columns[i].1.clone();
+        if ty == ColType::Composite {
+            let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
+            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            match st {
                 Some(st) if st.composite.is_some() => {}
+                Some(st) if st.domain.is_some() => {
+                    let dom = st.domain.clone().expect("domain branch has a def");
+                    like_def.columns[i].1 = dom.base.clone();
+                    like_def.composite_types[i] = dom.base_named.clone();
+                    like_def.domain_types[i] = tname;
+                    like_def.domain_elem[i] = false;
+                }
                 _ => {
                     return Err(exec_err(
                         "42704",
-                        format!("type \"{}\" does not exist", tname.unwrap_or("<unknown>")),
+                        format!(
+                            "type \"{}\" does not exist",
+                            tname.as_deref().unwrap_or("<unknown>")
+                        ),
                     ));
+                }
+            }
+        } else if ty == ColType::Array(ArrayElem::Record) {
+            // v0.85: `d[]` — array of domain (or array of composite,
+            // which keeps its existing shape). The column becomes an
+            // array of the domain's base; the domain applies per array
+            // element.
+            let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
+            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            if let Some(st) = st {
+                if let Some(dom) = st.domain.clone() {
+                    like_def.columns[i].1 = ColType::Array(ArrayElem::of(&dom.base));
+                    like_def.composite_types[i] = dom.base_named.clone();
+                    like_def.domain_types[i] = tname;
+                    like_def.domain_elem[i] = true;
                 }
             }
         }
@@ -2103,6 +2161,12 @@ fn create_table_from_def(
                     .composite_types
                     .push(parent.composite_types.get(i).cloned().unwrap_or(None));
                 merged
+                    .domain_types
+                    .push(parent.domain_types.get(i).cloned().unwrap_or(None));
+                merged
+                    .domain_elem
+                    .push(parent.domain_elem.get(i).copied().unwrap_or(false));
+                merged
                     .not_null
                     .push(parent.not_null.get(i).copied().unwrap_or(false));
                 merged
@@ -2121,6 +2185,8 @@ fn create_table_from_def(
                 merged.columns[pos] = (col.clone(), ty.clone());
                 merged.composite_types[pos] =
                     like_def.composite_types.get(i).cloned().unwrap_or(None);
+                merged.domain_types[pos] = like_def.domain_types.get(i).cloned().unwrap_or(None);
+                merged.domain_elem[pos] = like_def.domain_elem.get(i).copied().unwrap_or(false);
                 merged.not_null[pos] = like_def.not_null.get(i).copied().unwrap_or(false);
                 merged.defaults[pos] = like_def.defaults.get(i).cloned().unwrap_or(None);
                 merged.serial[pos] = like_def.serial.get(i).cloned().unwrap_or(None);
@@ -2132,6 +2198,13 @@ fn create_table_from_def(
                 merged
                     .composite_types
                     .push(like_def.composite_types.get(i).cloned().unwrap_or(None));
+                // v0.85: domain type use for the new column.
+                merged
+                    .domain_types
+                    .push(like_def.domain_types.get(i).cloned().unwrap_or(None));
+                merged
+                    .domain_elem
+                    .push(like_def.domain_elem.get(i).copied().unwrap_or(false));
                 merged
                     .not_null
                     .push(like_def.not_null.get(i).copied().unwrap_or(false));
@@ -2190,6 +2263,8 @@ fn create_table_from_def(
                     })?;
                 def.columns = parent.columns.clone();
                 def.composite_types = parent.composite_types.clone();
+                def.domain_types = parent.domain_types.clone();
+                def.domain_elem = parent.domain_elem.clone();
                 def.not_null = parent.not_null.clone();
                 def.defaults = parent.defaults.clone();
                 def.checks = parent.checks.clone();
@@ -2309,6 +2384,8 @@ fn create_table_from_def(
             // Inherit columns (PG copies the parent's rowtype).
             def.columns = parent.columns.clone();
             def.composite_types = parent.composite_types.clone();
+            def.domain_types = parent.domain_types.clone();
+            def.domain_elem = parent.domain_elem.clone();
             def.not_null = parent.not_null.clone();
             def.defaults = parent.defaults.clone();
             def.checks = parent.checks.clone();
@@ -2620,6 +2697,12 @@ struct TableMeta {
     /// v0.84: named composite type per column, parallel to `columns`
     /// (`Some(name)` iff the ColType is `Composite`).
     composite_types: Vec<Option<String>>,
+    /// v0.85: domain name per column, parallel to `columns`
+    /// (`Some(d)` iff the column was declared with domain type `d`).
+    domain_types: Vec<Option<String>>,
+    /// v0.85: iff `domain_types[i]` is `Some` and the column was
+    /// declared as `d[]`: the domain applies per array element.
+    domain_elem: Vec<bool>,
     not_null: Vec<bool>,
     defaults: Vec<Option<DefaultExpr>>,
     checks: Vec<CheckDef>,
@@ -2632,6 +2715,8 @@ impl TableMeta {
         TableMeta {
             columns: t.columns.clone(),
             composite_types: t.composite_types.clone(),
+            domain_types: t.domain_types.clone(),
+            domain_elem: t.domain_elem.clone(),
             not_null: t.not_null.clone(),
             defaults: t.defaults.clone(),
             checks: t.checks.clone(),
@@ -2687,8 +2772,145 @@ fn eval_default(
     }
 }
 
+/// v0.85: enforce a domain's constraints on a finished value (PG19
+/// `coerce_to_domain` / `domain_check`). The checks run only on the
+/// fully reconstructed container value — never on partial subfield
+/// assignments. TRUE and NULL pass; only FALSE violates (23514),
+/// matching the table CHECK semantics. `is_elem` marks the
+/// array-of-domain case: each array element is checked as a domain
+/// value (a NULL array passes whole).
+fn check_domain_value(
+    q: &mut Q,
+    dname: &str,
+    value: &Value,
+    is_elem: bool,
+) -> Result<Value, ExecError> {
+    let dom = q
+        .eng
+        .db
+        .types
+        .get(dname)
+        .and_then(|st| st.domain.clone())
+        .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", dname)))?;
+    if is_elem {
+        // Array of domain: check each element against the domain.
+        match value {
+            Value::Null => return Ok(Value::Null),
+            Value::Array(a) => {
+                for e in &a.elems {
+                    check_domain_value(q, dname, e, false)?;
+                }
+                return Ok(value.clone());
+            }
+            _ => {}
+        }
+    }
+    if matches!(value, Value::Null) {
+        if dom.not_null {
+            return Err(exec_err(
+                "23502",
+                format!("value for domain {} violates not-null constraint", dname),
+            ));
+        }
+        // PG19 still enforces inner domains' NOT NULL on nulls.
+        if let Some(inner) = &dom.base_domain {
+            check_domain_value(q, inner, value, false)?;
+        }
+        return Ok(Value::Null);
+    }
+    // Domain over domain: the inner domain's constraints run first
+    // (PG19 checks innermost first).
+    if let Some(inner) = &dom.base_domain {
+        check_domain_value(q, inner, value, false)?;
+    }
+    // This domain's CHECKs see a one-column scope named `value` (PG19's
+    // VALUE pseudo-column).
+    for c in &dom.checks {
+        let schema = vec![QCol {
+            qual: String::new(),
+            name: "value".to_string(),
+            ty: dom.base.clone(),
+            hidden: false,
+            src_ord: 0,
+        }];
+        let frame = Scope {
+            schema: &schema,
+            row: std::slice::from_ref(value),
+            prov: None,
+        };
+        let result = eval_expr(q, &[frame], &c.expr)?;
+        if matches!(result, Value::Bool(false)) {
+            return Err(exec_err(
+                "23514",
+                format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    dname, c.name
+                ),
+            ));
+        }
+    }
+    Ok(value.clone())
+}
+
+/// v0.85: coerce a record value to a named composite by position
+/// (PG19 assignment coercion): record field `i` goes to composite
+/// field `i`, each coerced to the field's type; missing fields become
+/// NULL and extras are dropped. Used for bare `ROW(...)` values
+/// assigned to composite (or domain-over-composite) columns.
+fn coerce_record_to_composite(
+    eng: &Engine,
+    rec: &[(String, Value)],
+    tname: &str,
+) -> Result<Value, ExecError> {
+    let st = eng
+        .db
+        .types
+        .get(tname)
+        .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", tname)))?;
+    let cdef = st.composite.clone().ok_or_else(|| {
+        exec_err(
+            "0A000",
+            format!("type \"{}\" is not a composite type", tname),
+        )
+    })?;
+    let mut out: Vec<(String, Value)> = Vec::with_capacity(cdef.len());
+    for (i, (fname, fty, _nested)) in cdef.iter().enumerate() {
+        let fv = rec
+            .get(i)
+            .map(|(_, val)| val.clone())
+            .unwrap_or(Value::Null);
+        let cv = eval_cast(&fv, fty.clone())?;
+        out.push((fname.clone(), cv));
+    }
+    Ok(Value::Record(out))
+}
+
+/// v0.85: after the ordinary assignment coercion, a record value
+/// assigned to a composite (or domain-over-composite) column is
+/// coerced by position. Non-record values pass through unchanged.
+fn coerce_assign_composite(eng: &Engine, v: Value, comp: Option<&str>) -> Result<Value, ExecError> {
+    match (v, comp) {
+        (Value::Record(rec), Some(tname)) => coerce_record_to_composite(eng, &rec, tname),
+        (v, _) => Ok(v),
+    }
+}
+
+/// v0.85: the DEFAULT for a domain-typed column with no column-level
+/// DEFAULT: the domain's own DEFAULT (PG19 falls back to it). Does not
+/// apply to `d[]` columns (the array column's type is not the domain).
+fn domain_default<'e>(eng: &'e Engine, meta: &TableMeta, ci: usize) -> Option<&'e DefaultExpr> {
+    if meta.domain_elem.get(ci).copied().unwrap_or(false) {
+        return None;
+    }
+    let dname = meta.domain_types.get(ci)?.as_deref()?;
+    eng.db.types.get(dname)?.domain.as_ref()?.default.as_ref()
+}
+
 /// NOT NULL + CHECK validation for a fully-built row (INSERT / UPDATE /
-/// cascaded writes). SQLSTATEs 23502 / 23514, like Postgres.
+/// cascades writes). SQLSTATEs 23502 / 23514, like Postgres.
+/// v0.85: domain CHECKs are enforced here too, on the finished row
+/// (PG19 checks domain constraints during value coercion, before the
+/// table's own CHECK constraints).
 fn check_row_constraints(
     eng: &mut Engine,
     snap: &Snapshot,
@@ -2708,6 +2930,32 @@ fn check_row_constraints(
                     name, table
                 ),
             ));
+        }
+    }
+    // v0.85: domain CHECK constraints (PG19 coerce_to_domain) — on the
+    // finished value, before the table's own CHECK constraints.
+    for (i, dname) in meta.domain_types.iter().enumerate() {
+        if let Some(dname) = dname {
+            let is_elem = meta.domain_elem.get(i).copied().unwrap_or(false);
+            let mut lock_ids = Vec::new();
+            let mut q = Q {
+                eng,
+                snap,
+                own,
+                session,
+                role,
+                // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
+                // statement-blocked when read-only, so this is false.
+                read_only: false,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+                ctes: Vec::new(),
+                wctx: None,
+                priv_scopes: Vec::new(),
+                hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                hashed_in: Rc::new(RefCell::new(Vec::new())),
+            };
+            check_domain_value(&mut q, dname, &values[i], is_elem)?;
         }
     }
     if meta.checks.is_empty() {
@@ -4450,6 +4698,8 @@ fn exec_create_table_as(
     let def = crate::sql::TableDef {
         columns,
         composite_types: vec![None; ncols],
+        domain_types: vec![None; ncols],
+        domain_elem: vec![false; ncols],
         not_null: vec![false; ncols],
         defaults: vec![None; ncols],
         serial: vec![None; ncols],
@@ -5186,27 +5436,39 @@ fn exec_insert(
                                 coerce_value(val, ctype, cname)?
                             }
                             // v0.9: DEFAULT in VALUES applies the column default.
-                            InsertValue::Default => match &meta.defaults[ci] {
-                                Some(d) => eval_default(
-                                    q.eng,
-                                    ctx.snap,
-                                    ctx.own,
-                                    ctx.session,
-                                    ctx.role,
-                                    d,
-                                    ctype,
-                                    cname,
-                                )?,
-                                None => Value::Null,
-                            },
+                            // v0.85: falls back to the domain's DEFAULT (PG19).
+                            InsertValue::Default => {
+                                let dd = domain_default(q.eng, &meta, ci).cloned();
+                                match meta.defaults[ci].as_ref().or(dd.as_ref()) {
+                                    Some(d) => eval_default(
+                                        q.eng,
+                                        ctx.snap,
+                                        ctx.own,
+                                        ctx.session,
+                                        ctx.role,
+                                        d,
+                                        ctype,
+                                        cname,
+                                    )?,
+                                    None => Value::Null,
+                                }
+                            }
                         };
+                        // v0.85: bare ROW() into a composite (or
+                        // domain-over-composite) column — coerce by
+                        // position (PG19 assignment coercion).
+                        let comp = meta.composite_types.get(ci).and_then(|o| o.as_deref());
+                        let assigned = std::mem::replace(&mut values[ci], Value::Null);
+                        values[ci] = coerce_assign_composite(q.eng, assigned, comp)?;
                     }
                     explicit[ci] = true;
                 }
                 // v0.9: fill defaults for columns not mentioned.
                 for (i, d) in meta.defaults.iter().enumerate() {
                     if !explicit[i] {
-                        if let Some(d) = d {
+                        // v0.85: fall back to the domain's DEFAULT (PG19).
+                        let dd = domain_default(q.eng, &meta, i).cloned();
+                        if let Some(d) = d.as_ref().or(dd.as_ref()) {
                             let (cname, ctype) = &meta.columns[i];
                             values[i] = eval_default(
                                 q.eng,
@@ -5478,6 +5740,14 @@ fn exec_insert(
                         )?;
                         let (cname, ctype) = &meta_for_upsert.columns[ci];
                         new_values[ci] = coerce_value(v, ctype, cname)?;
+                        // v0.85: positional record coercion for
+                        // composite/domain-over-composite targets.
+                        let comp = meta_for_upsert
+                            .composite_types
+                            .get(ci)
+                            .and_then(|o| o.as_deref());
+                        let assigned = std::mem::replace(&mut new_values[ci], Value::Null);
+                        new_values[ci] = coerce_assign_composite(eng, assigned, comp)?;
                     }
                     // v0.71: PG19 forbids ON CONFLICT DO UPDATE from moving
                     // the row to a different partition (0A000). An
@@ -5863,6 +6133,9 @@ fn exec_update(
             })
             .collect::<Result<_, _>>()?;
         let columns = meta.columns.clone();
+        // v0.85: composite type names for positional record coercion on
+        // UPDATE assignment.
+        let composite_types = meta.composite_types.clone();
         // v0.22: the target table name is the qualifier (was empty), so
         // `tbl.col` references resolve in SET and WHERE, as in PostgreSQL.
         // v0.76: an alias makes it the visible qualifier (PG's alias clause).
@@ -6062,6 +6335,11 @@ fn exec_update(
                 };
                 let (cname, ctype) = &columns[ci];
                 new_values[ci] = coerce_value(v, ctype, cname)?;
+                // v0.85: positional record coercion for
+                // composite/domain-over-composite targets.
+                let comp = composite_types.get(ci).and_then(|o| o.as_deref());
+                let assigned = std::mem::replace(&mut new_values[ci], Value::Null);
+                new_values[ci] = coerce_assign_composite(eng, assigned, comp)?;
             }
             // v0.70: route the new row through the partitioned target. A
             // changed partition key moves the row to another leaf
@@ -22066,9 +22344,39 @@ fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
 /// are dropped (PG matches by position for ROW() casts); each field is
 /// coerced to the target field type. A non-record source is 42846.
 fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
+    // v0.85: cast to a domain — coerce to the base type, then enforce
+    // the domain's constraints (PG19 coerce_to_domain). NULL still goes
+    // through so NOT NULL domains can reject it (23502); plain casts
+    // return NULL unchanged.
+    let dom = q.eng.db.types.get(name).and_then(|st| st.domain.clone());
+    if let Some(dom) = dom {
+        if v == &Value::Null {
+            return check_domain_value(q, name, v, false);
+        }
+        let coerced = match &dom.base {
+            ColType::Composite => {
+                let bn = dom.base_named.clone().ok_or_else(|| {
+                    exec_err(
+                        "0A000",
+                        format!("domain \"{}\" has no composite base type", name),
+                    )
+                })?;
+                eval_cast_composite_inner(q, v, &bn)?
+            }
+            _ => eval_cast(v, dom.base.clone())?,
+        };
+        return check_domain_value(q, name, &coerced, false);
+    }
     if v == &Value::Null {
         return Ok(Value::Null);
     }
+    eval_cast_composite_inner(q, v, name)
+}
+
+/// v0.81: cast to a named composite type (`expr::t_rec`). Resolves
+/// `name` against the type catalog (42704 if unknown, 42846 if not a
+/// composite).
+fn eval_cast_composite_inner(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
     let st = q
         .eng
         .db
@@ -29387,10 +29695,19 @@ fn expr_type(
         // v0.81: `expr::named_composite` — the name must denote a defined
         // composite type (42704 otherwise, like the execution-time check
         // in eval_cast_named); the result is the named composite marker.
+        // v0.85: a domain name is also accepted — the cast's result type
+        // is the domain's base type.
         Expr::CastNamed { expr, name } => {
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
             match eng.db.types.get(name) {
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
+                Some(st) => match st.domain.as_ref() {
+                    Some(dom) => Ok(dom.base.clone()),
+                    None => Err(exec_err(
+                        "42704",
+                        format!("type \"{}\" does not exist", name),
+                    )),
+                },
                 _ => Err(exec_err(
                     "42704",
                     format!("type \"{}\" does not exist", name),
@@ -36014,6 +36331,7 @@ fn exec_create_type(
             ShellType {
                 like_base: None,
                 composite: Some(fields.to_vec()),
+                domain: None,
             },
         );
         ctx.writes.push(WriteOp::CreateType {
@@ -36038,6 +36356,7 @@ fn exec_create_type(
                 ShellType {
                     like_base: None,
                     composite: None,
+                    domain: None,
                 },
             );
         }
@@ -36066,6 +36385,7 @@ fn exec_create_type(
                 ShellType {
                     like_base: Some(base.to_string()),
                     composite: None,
+                    domain: None,
                 },
             );
         }
@@ -36102,6 +36422,155 @@ fn exec_drop_type(
     }
     Ok(ExecResult::Command {
         tag: "DROP TYPE".to_string(),
+    })
+}
+
+/// v0.85: CREATE DOMAIN — a named type over a base type with CHECK
+/// constraints (PG19 `coerce_to_domain`). The base resolves against
+/// the type catalog: builtins pass through, a named composite base
+/// must be a defined composite (42704 otherwise), and a named domain
+/// base chains (`base_domain`) with the inner base flattened in.
+/// Domain CHECK expressions may only reference `value` (PG19
+/// DefineDomain / domain_check).
+#[allow(clippy::too_many_arguments)]
+fn exec_create_domain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    base: &ColType,
+    base_named: Option<&str>,
+    checks: &[CheckDef],
+    not_null: bool,
+    default: Option<&DefaultExpr>,
+) -> Result<ExecResult, ExecError> {
+    if eng.db.types.contains_key(name) {
+        return Err(exec_err(
+            "42710",
+            format!("type \"{}\" already exists", name),
+        ));
+    }
+    let (base_ty, resolved_named, base_domain) = match base_named {
+        None => (base.clone(), None, None),
+        Some(bn) => match eng.db.types.get(bn) {
+            Some(st) if st.composite.is_some() => {
+                if *base != ColType::Composite {
+                    return Err(exec_err(
+                        "0A000",
+                        format!("domain base type mismatch for \"{}\"", name),
+                    ));
+                }
+                (ColType::Composite, Some(bn.to_string()), None)
+            }
+            Some(st) if st.domain.is_some() => {
+                // Domain over domain: flatten the inner base, chain the
+                // checks via `base_domain` (PG19 checks innermost first).
+                let inner = st.domain.as_ref().expect("domain branch has a def");
+                (
+                    inner.base.clone(),
+                    inner.base_named.clone(),
+                    Some(bn.to_string()),
+                )
+            }
+            Some(st) if st.like_base.is_some() => {
+                // LIKE-completed alias: resolve to the builtin it names.
+                match crate::sql::coltype_by_name(st.like_base.as_deref().unwrap_or("")) {
+                    Ok(bt) => (bt, None, None),
+                    Err(_) => {
+                        return Err(exec_err("42704", format!("type \"{}\" does not exist", bn)));
+                    }
+                }
+            }
+            _ => {
+                return Err(exec_err("42704", format!("type \"{}\" does not exist", bn)));
+            }
+        },
+    };
+    // Array-of-domain bases (`CREATE DOMAIN d AS e[]` with `e` a domain)
+    // are not supported yet — honest 0A000 instead of mis-checking.
+    if matches!(base_ty, ColType::Array(_)) && base_named.is_some() {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "domain over array of domain \"{}\" is not supported yet",
+                name
+            ),
+        ));
+    }
+    // PG19: domain CHECK expressions may only reference VALUE.
+    for c in checks {
+        let mut refs = Vec::new();
+        crate::sql::collect_col_refs(&c.expr, &mut refs);
+        for (_, r) in &refs {
+            if r != "value" {
+                return Err(exec_err(
+                    "42601",
+                    format!(
+                        "cannot use column reference \"{}\" in domain check constraint",
+                        r
+                    ),
+                ));
+            }
+        }
+    }
+    eng.db.types.insert(
+        name.to_string(),
+        ShellType {
+            like_base: None,
+            composite: None,
+            domain: Some(crate::storage::DomainDef {
+                base: base_ty,
+                base_named: resolved_named,
+                base_domain,
+                checks: checks.to_vec(),
+                not_null,
+                default: default.cloned(),
+            }),
+        },
+    );
+    // v0.82's CreateType WAL path reads the live type map, so the domain
+    // definition is WAL-logged (and checkpointed) automatically.
+    ctx.writes.push(WriteOp::CreateType {
+        name: name.to_string(),
+        prev: None,
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE DOMAIN".to_string(),
+    })
+}
+
+/// v0.85: DROP DOMAIN [IF EXISTS] name [, ...] — mirrors DROP TYPE
+/// (dependents are not tracked, like the bounded type support).
+fn exec_drop_domain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    names: &[String],
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    for name in names {
+        let prev = eng.db.types.remove(name);
+        let is_domain = prev.as_ref().is_some_and(|st| st.domain.is_some());
+        if !is_domain {
+            // Restore a non-domain type (a domain drop must not remove
+            // a composite/shell type); PG reports "type does not exist"
+            // for a non-domain name here.
+            if let Some(st) = prev {
+                eng.db.types.insert(name.clone(), st);
+            }
+            if !if_exists {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", name),
+                ));
+            }
+            continue;
+        }
+        ctx.writes.push(WriteOp::DropType {
+            name: name.clone(),
+            prev,
+        });
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP DOMAIN".to_string(),
     })
 }
 

@@ -54,31 +54,31 @@ STMT_TIMEOUT = 30.0
 # ---------------------------------------------------------------------------
 
 TESTS = [
-    # (name, need_tenk, need_onek): tenk1/tenk2 for the join/subselect/union
+    # (name, need_tenk, need_onek, need_road): tenk1/tenk2 for the join/subselect/union
     # families; onek/onek2 for the select/subselect/join families (PG's
     # test_setup.sql builds onek/onek2 as 1000-row slices of tenk1).
-    ("boolean", False, False),
-    ("char", False, False),
-    ("name", False, False),
-    ("text", False, False),
-    ("varchar", False, False),
-    ("int2", False, False),
-    ("int4", False, False),
-    ("int8", False, False),
-    ("float4", False, False),
-    ("float8", False, False),
-    ("numeric", False, False),
-    ("strings", False, False),
-    ("select", False, True),
-    ("select_distinct", False, True),
-    ("select_having", False, False),
-    ("case", False, False),
-    ("union", True, False),
-    ("subselect", True, True),
-    ("join", True, True),
-    ("transactions", False, False),
-    ("insert", False, False),
-    ("delete", False, False),
+    ("boolean", False, False, False),
+    ("char", False, False, False),
+    ("name", False, False, False),
+    ("text", False, False, False),
+    ("varchar", False, False, False),
+    ("int2", False, False, False),
+    ("int4", False, False, False),
+    ("int8", False, False, False),
+    ("float4", False, False, False),
+    ("float8", False, False, False),
+    ("numeric", False, False, False),
+    ("strings", False, False, False),
+    ("select", False, True, False),
+    ("select_distinct", False, True, False),
+    ("select_having", False, False, False),
+    ("case", False, False, False),
+    ("union", True, False, False),
+    ("subselect", True, True, True),
+    ("join", True, True, False),
+    ("transactions", False, False, False),
+    ("insert", False, False, False),
+    ("delete", False, False, False),
 ]
 
 # ---------------------------------------------------------------------------
@@ -869,7 +869,32 @@ def _tenk_setup(stmts, tables):
         _load_data_table(stmts, tbl, "tenk.data", 10000)
 
 
-def setup_statements(need_tenk, need_onek):
+def _load_road_table(stmts):
+    """Append DDL + chunked INSERTs loading PG's authentic road table.
+
+    PG's test_setup.sql creates road(name text, thepath path) from
+    data/streets.data (5124 rows, 2911 distinct names). rustgres has no
+    geometric path type, so thepath is stored as text — the conformance
+    queries only touch `name`, and the authentic names are what the
+    expected counts (2911) depend on.
+    """
+    stmts.append("CREATE TABLE road (name text, thepath text)")
+    with open(os.path.join(DATA, "streets.data"), encoding="utf-8") as f:
+        rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+    assert len(rows) == 5124, "streets.data row count changed: %d" % len(rows)
+    assert all(len(r) == 2 for r in rows), "streets.data column count changed"
+    for i in range(0, len(rows), 500):
+        chunk = rows[i : i + 500]
+        vals = []
+        for name, thepath in chunk:
+            n = "'" + name.replace("'", "''") + "'"
+            p = "'" + thepath.replace("'", "''") + "'"
+            vals.append("(%s,%s)" % (n, p))
+        stmts.append("INSERT INTO road (name, thepath) VALUES " + ",".join(vals))
+    stmts.append("VACUUM road")
+
+
+def setup_statements(need_tenk, need_onek, need_road):
     stmts = [
         "CREATE TABLE CHAR_TBL(f1 char(4))",
         "INSERT INTO CHAR_TBL (f1) VALUES ('a'), ('ab'), ('abcd'), ('abcd    ')",
@@ -905,6 +930,8 @@ def setup_statements(need_tenk, need_onek):
     if need_onek:
         _load_data_table(stmts, "onek", "onek.data", 1000)
         stmts.append("CREATE TABLE onek2 AS SELECT * FROM onek")
+    if need_road:
+        _load_road_table(stmts)
     return stmts
 
 
@@ -1236,15 +1263,16 @@ def main():
         print("missing %s; run `cargo build` first" % BIN)
         return 2
 
-    tests = [(n, t, o) for n, t, o in TESTS if only is None or n in only]
+    tests = [(n, t, o, r) for n, t, o, r in TESTS if only is None or n in only]
     server = Server()
     server.start()
     all_results = {}
-    need_tenk_any = any(t for _, t, _ in tests)
-    need_onek_any = any(o for _, _, o in tests)
+    need_tenk_any = any(t for _, t, _, _ in tests)
+    need_onek_any = any(o for _, _, o, _ in tests)
+    need_road_any = any(r for _, _, _, r in tests)
 
     def run_setup(c):
-        setup = setup_statements(need_tenk_any, need_onek_any)
+        setup = setup_statements(need_tenk_any, need_onek_any, need_road_any)
         print("setup: %d statements ..." % len(setup), flush=True)
         t0 = time.time()
         for s in setup:
@@ -1256,7 +1284,7 @@ def main():
 
     wedged = {}  # stmt -> reason: kills the connection; skip on retry
     try:
-        for name, need_tenk, need_onek in tests:
+        for name, need_tenk, need_onek, need_road in tests:
             # pg_regress runs each file in its own psql session. Use a fresh
             # server+connection per suite so one file's abandoned transaction
             # state (e.g. transactions.sql's last test) cannot poison the next

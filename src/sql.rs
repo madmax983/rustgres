@@ -1587,6 +1587,15 @@ pub struct TableDef {
     /// (`Some(name)` iff the column's `ColType` is `Composite`); resolved
     /// against the type catalog at execution time.
     pub composite_types: Vec<Option<String>>,
+    /// v0.85: domain name per column, parallel to `columns`
+    /// (`Some(d)` iff the column was declared with domain type `d`,
+    /// possibly as `d[]`); resolved against the type catalog at
+    /// execution time.
+    pub domain_types: Vec<Option<String>>,
+    /// v0.85: iff `domain_types[i]` is `Some` and the column was
+    /// declared as `d[]` (array of domain): the domain applies per
+    /// array element, not to the whole column value.
+    pub domain_elem: Vec<bool>,
     pub not_null: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
     /// v0.65: per-column serial pseudo-type marker (parallel to
@@ -1898,6 +1907,8 @@ impl TableDef {
         TableDef {
             columns: Vec::new(),
             composite_types: Vec::new(),
+            domain_types: Vec::new(),
+            domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -2059,6 +2070,10 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
             // v0.81: named composite type travels to exec for catalog
             // resolution.
             def.composite_types.push(c.composite_name.clone());
+            // v0.85: domain slots travel alongside; exec resolves the
+            // named type to a domain (or not) and fills them in.
+            def.domain_types.push(None);
+            def.domain_elem.push(false);
             def.not_null.push(false);
             def.defaults.push(None);
             // v0.65: serial marker (with kind) travels to exec for
@@ -2452,6 +2467,23 @@ pub enum Stmt {
         names: Vec<String>,
         if_exists: bool,
     },
+    // --- v0.85: CREATE DOMAIN (bounded): a named type over a base
+    // type with optional CHECK constraints, NOT NULL, and DEFAULT.
+    // `base_named` carries the named type for a composite or domain
+    // base (None for builtins); resolved against the type catalog at
+    // execution time.
+    CreateDomain {
+        name: String,
+        base: ColType,
+        base_named: Option<String>,
+        checks: Vec<CheckDef>,
+        not_null: bool,
+        default: Option<DefaultExpr>,
+    },
+    DropDomain {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     // --- v0.11: roles and privileges ---
     CreateRole {
         name: String,
@@ -2728,6 +2760,8 @@ impl Stmt {
                 | Stmt::DropSequence { .. }
                 | Stmt::CreateType { .. }
                 | Stmt::DropType { .. }
+                | Stmt::CreateDomain { .. }
+                | Stmt::DropDomain { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }
                 | Stmt::CreateStatistics
@@ -3962,6 +3996,10 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "type") {
             return self.parse_create_type();
         }
+        // v0.85: CREATE DOMAIN name AS type [constraints...].
+        if matches!(self.peek(), Token::Ident(s) if s == "domain") {
+            return self.parse_create_domain();
+        }
         // v0.75: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
         // cols FROM table. Accepted as a no-op (statistics are not used
         // by the planner); the syntax is validated.
@@ -4149,6 +4187,8 @@ impl Parser {
         let def = TableDef {
             columns: Vec::new(), // inherited from parent at exec
             composite_types: Vec::new(),
+            domain_types: Vec::new(),
+            domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -5077,6 +5117,89 @@ impl Parser {
             name,
             like_base,
             composite: None,
+        })
+    }
+
+    /// v0.85: `CREATE DOMAIN name AS type [CONSTRAINT cname] CHECK
+    /// (expr) [...] [NOT NULL | NULL] [DEFAULT expr]` — PG19
+    /// CreateDomainStmt, bounded to the supported constraint kinds
+    /// (CHECK / NOT NULL / DEFAULT; no UNIQUE/PKEY/FK on domains).
+    fn parse_create_domain(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("domain")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("as")?;
+        let (base, base_named) = self.parse_type_name()?;
+        let mut checks = Vec::new();
+        let mut not_null = false;
+        let mut default = None;
+        loop {
+            let cname = if self.eat_keyword("constraint") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            if self.eat_keyword("check") {
+                self.expect(Token::LParen, "'('")?;
+                let e = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                validate_constraint_expr(&e, "CHECK")?;
+                // PG19 auto-names domain checks `<domain>_check`,
+                // `<domain>_check1`, ... (ChooseConstraintName).
+                let cname = cname.unwrap_or_else(|| {
+                    let mut n = format!("{}_check", name);
+                    let mut i = 1;
+                    while checks.iter().any(|c: &CheckDef| c.name == n) {
+                        n = format!("{}_check{}", name, i);
+                        i += 1;
+                    }
+                    n
+                });
+                checks.push(CheckDef {
+                    name: cname,
+                    expr: e,
+                    not_valid: false,
+                    kind: CheckKind::Check,
+                });
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on NOT NULL".to_string()
+                    ));
+                }
+                not_null = true;
+            } else if self.eat_keyword("null") {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on NULL".to_string()
+                    ));
+                }
+                not_null = false;
+            } else if self.eat_keyword("default") {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on DEFAULT".to_string()
+                    ));
+                }
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                default = Some(classify_default(e)?);
+            } else {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: expected constraint type after CONSTRAINT name".to_string(),
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(Stmt::CreateDomain {
+            name,
+            base,
+            base_named,
+            checks,
+            not_null,
+            default,
         })
     }
 
@@ -9351,6 +9474,26 @@ impl Parser {
             self.parse_cascade_opt()?;
             return Ok(Stmt::DropType { names, if_exists });
         }
+        // v0.85: DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+        // — mirrors DROP TYPE (dependents are not tracked).
+        if self.eat_keyword("domain") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            self.parse_cascade_opt()?;
+            return Ok(Stmt::DropDomain { names, if_exists });
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
@@ -10704,6 +10847,24 @@ impl<'a> SexprParser<'a> {
             self.chars.next();
         }
     }
+    /// v0.85: peek whether the next atom (without consuming) equals `want`.
+    /// Used for `nil` bounds and `_` placeholders.
+    fn peek_atom_is(&mut self, want: &str) -> bool {
+        self.ws();
+        let s: String = self
+            .chars
+            .clone()
+            .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ')')
+            .collect();
+        s == want
+    }
+    /// v0.85: peek whether the upcoming text starts with `prefix`.
+    /// Used to distinguish `(when ...)` sublists in CASE encodings.
+    fn peek_starts_with(&mut self, prefix: &str) -> bool {
+        self.ws();
+        let s: String = self.chars.clone().take(prefix.len()).collect();
+        s == prefix
+    }
     fn atom(&mut self) -> Result<String, String> {
         self.ws();
         let mut s = String::new();
@@ -10940,6 +11101,138 @@ impl<'a> SexprParser<'a> {
                     left: Box::new(l),
                     right: Box::new(r),
                     neg,
+                }
+            }
+            // v0.85: array subscript / slice / constructors, composite
+            // field access, row constructors, named casts, CASE — the
+            // encoder (`encode_expr_inner`) produces these heads.
+            "subscript" => {
+                let array = self.expr()?;
+                let mut indices = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    indices.push(self.expr()?);
+                }
+                Expr::Subscript {
+                    array: Box::new(array),
+                    indices,
+                }
+            }
+            "fieldacc" => {
+                let field = self.atom()?;
+                let expr = self.expr()?;
+                Expr::FieldAccess {
+                    expr: Box::new(expr),
+                    field,
+                }
+            }
+            "slice" => {
+                let array = self.expr()?;
+                let mut bounds = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    let low = if self.peek_atom_is("nil") {
+                        self.atom()?;
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    let high = if self.peek_atom_is("nil") {
+                        self.atom()?;
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    bounds.push((low, high));
+                }
+                Expr::Slice {
+                    array: Box::new(array),
+                    bounds,
+                }
+            }
+            "array" => {
+                let nested = self.atom()? == "nested";
+                let mut elems = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    elems.push(self.expr()?);
+                }
+                Expr::ArrayCtor { elems, nested }
+            }
+            "row" => {
+                let mut elems = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    elems.push(self.expr()?);
+                }
+                Expr::Row(elems)
+            }
+            "castnamed" => {
+                let name = self.atom()?;
+                let expr = self.expr()?;
+                Expr::CastNamed {
+                    expr: Box::new(expr),
+                    name,
+                }
+            }
+            "case" => {
+                let operand = if self.peek_atom_is("_") {
+                    self.atom()?;
+                    None
+                } else {
+                    Some(Box::new(self.expr()?))
+                };
+                let mut whens = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    // Peek: a `(when ...)` sublist vs the final else.
+                    // The else is the last element; whens are `(when k r)`.
+                    // We distinguish by looking ahead for "(when".
+                    if self.peek_starts_with("(when") {
+                        self.open()?;
+                        let w = self.atom()?;
+                        if w != "when" {
+                            return Err("expected when in case encoding".into());
+                        }
+                        let k = self.expr()?;
+                        let r = self.expr()?;
+                        self.close()?;
+                        whens.push((Box::new(k), Box::new(r)));
+                    } else {
+                        break;
+                    }
+                }
+                let else_ = if self.peek_atom_is("_") {
+                    self.atom()?;
+                    None
+                } else {
+                    // Could be `)` already (no else and no whens tail).
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    }
+                };
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_,
                 }
             }
             o => return Err(format!("bad expr head {}", o)),
@@ -11344,6 +11637,96 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         pkey,
         fks,
     })
+}
+
+/// v0.85: encode a domain's CHECK list as an s-expr. WAL and checkpoint
+/// records carry it as a length-prefixed string (the binary record
+/// layer has no expression codec; the s-expr layer does).
+pub fn encode_domain_checks(checks: &[CheckDef]) -> String {
+    let mut out = String::from("(domainchecks");
+    for c in checks {
+        out.push('(');
+        sexpr_escape(&c.name, &mut out);
+        out.push(' ');
+        encode_expr_inner(&c.expr, &mut out);
+        out.push(')');
+    }
+    out.push(')');
+    out
+}
+
+/// v0.85: decode `encode_domain_checks`. Domain checks are always
+/// `CheckKind::Check` (23514 on violation).
+pub fn decode_domain_checks(s: &str) -> Result<Vec<CheckDef>, String> {
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    if p.atom()? != "domainchecks" {
+        return Err("bad domain checks encoding".into());
+    }
+    let mut checks = Vec::new();
+    loop {
+        p.ws();
+        if p.chars.peek() == Some(&')') {
+            p.chars.next();
+            break;
+        }
+        p.open()?;
+        let name = p.atom()?;
+        let expr = p.expr()?;
+        p.close()?;
+        checks.push(CheckDef {
+            name,
+            expr,
+            not_valid: false,
+            kind: CheckKind::Check,
+        });
+    }
+    p.ws();
+    if p.chars.peek().is_some() {
+        return Err("trailing data in domain checks encoding".into());
+    }
+    Ok(checks)
+}
+
+/// v0.85: encode a domain DEFAULT as an s-expr (`-` = none), mirroring
+/// `encode_default`.
+pub fn encode_domain_default(d: &Option<DefaultExpr>) -> String {
+    match d {
+        Some(dd) => {
+            let mut out = String::new();
+            encode_default(dd, &mut out);
+            out
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// v0.85: decode `encode_domain_default`. Reuses the constraint
+/// decoder's default forms (`(default-lit ...)`, `(default-nextval
+/// ...)`, `(default-expr ...)`).
+pub fn decode_domain_default(s: &str) -> Result<Option<DefaultExpr>, String> {
+    if s == "-" {
+        return Ok(None);
+    }
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    let tag = p.atom()?;
+    let d = match tag.as_str() {
+        "default-lit" => {
+            p.open()?;
+            if p.atom()? != "lit" {
+                return Err("bad domain default-lit head".into());
+            }
+            let lit = p.literal()?;
+            p.close()?;
+            DefaultExpr::Lit(lit)
+        }
+        "default-nextval" => DefaultExpr::Nextval(p.atom()?),
+        "default-expr" => DefaultExpr::Expr(p.expr()?),
+        _ => return Err(format!("bad domain default encoding: {}", tag)),
+    };
+    p.close()?;
+    Ok(Some(d))
 }
 
 // --- v0.70: focused parser tests for PARTITION BY keys -----------------------

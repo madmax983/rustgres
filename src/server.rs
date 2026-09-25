@@ -1895,6 +1895,9 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
         // v0.22: bounded CREATE TYPE.
         Stmt::CreateType { .. } => Some("CREATE TYPE"),
         Stmt::DropType { .. } => Some("DROP TYPE"),
+        // v0.85: domain DDL.
+        Stmt::CreateDomain { .. } => Some("CREATE DOMAIN"),
+        Stmt::DropDomain { .. } => Some("DROP DOMAIN"),
         Stmt::CreateRole { .. } => Some("CREATE ROLE"),
         Stmt::AlterRole { .. } => Some("ALTER ROLE"),
         Stmt::DropRole { .. } => Some("DROP ROLE"),
@@ -2868,7 +2871,13 @@ fn txn_vacuum(
             .unwrap_or(false)
     };
     if let Some(name) = table {
-        if !guard.db.tables.contains_key(name) {
+        // v0.85: resolve temp tables too — `find_table` checks the
+        // session's temp tables first, like ANALYZE does.
+        if guard
+            .db
+            .find_table(name, &snap, u64::MAX, session.sid)
+            .is_none()
+        {
             return Err(ExecError {
                 detail: None,
                 code: "42P01",
@@ -2883,10 +2892,21 @@ fn txn_vacuum(
             });
         }
     }
+    // v0.85: vacuum a temp table when the name resolves to one; otherwise
+    // the permanent table.
+    let vacuum_one = |guard: &mut std::sync::MutexGuard<crate::storage::Engine>,
+                      sid: u64,
+                      name: &str|
+     -> usize {
+        if let Some(n) = guard.vacuum_temp_table(sid, name) {
+            return n;
+        }
+        guard.vacuum_table(name)
+    };
     if !verbose {
         match table {
             Some(name) => {
-                guard.vacuum_table(name);
+                vacuum_one(&mut guard, session.sid, name);
             }
             None => {
                 // Plain VACUUM only touches tables this role owns
@@ -2908,7 +2928,7 @@ fn txn_vacuum(
     let mut rows: Vec<Row> = Vec::new();
     match table {
         Some(name) => {
-            let n = guard.vacuum_table(name);
+            let n = vacuum_one(&mut guard, session.sid, name);
             rows.push(Row::new(vec![Value::text(format!(
                 "table \"{}\": removed {} dead row version(s)",
                 name, n
