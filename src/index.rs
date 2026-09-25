@@ -207,6 +207,61 @@ pub struct IndexDef {
     pub internal: bool,
     pub created_xmin: u64,
     pub dropped_xmax: u64,
+    /// v0.88: per-key-column sort direction, parallel to `cols` /
+    /// `col_names` (`CREATE INDEX ... (c DESC)`). The tree is always
+    /// built in canonical ascending order (NULLs high); the flags are
+    /// catalog fidelity for now — the ORDER BY fast path only trusts
+    /// all-ascending indexes, so a wrong direction can never produce
+    /// wrong row order (it just falls back to Sort).
+    pub desc: Vec<bool>,
+    /// v0.88: per-key-column NULL placement, parallel to `cols` /
+    /// `col_names` (`... NULLS FIRST`). PG defaults: ASC → NULLS LAST
+    /// (false), DESC → NULLS FIRST (true).
+    pub nulls_first: Vec<bool>,
+    /// v0.88: per-key-column expression source (`Some(src)`) vs plain
+    /// column (`None`), parallel to `cols` / `col_names`. Expression
+    /// columns carry `cols[i] == usize::MAX` (no single column position).
+    pub exprs: Vec<Option<String>>,
+    /// v0.88: partial-index predicate source (`WHERE ...`), if any.
+    pub predicate: Option<String>,
+    /// v0.88: false for expression / partial indexes: accepted by DDL
+    /// and stored in the catalog, but the planner cannot exploit them
+    /// yet (no expression evaluation or predicate implication), so no
+    /// entries are built or maintained and no scan path consults them.
+    /// A wrong choice here would cost correctness, not just speed, so
+    /// they stay invisible until the planner learns them.
+    pub planner_usable: bool,
+}
+
+impl IndexDef {
+    /// v0.88: plain single- or multi-column ascending index, the
+    /// pre-v0.88 shape. All new fields take their neutral defaults.
+    pub fn plain(
+        name: String,
+        table: String,
+        cols: Vec<usize>,
+        col_names: Vec<String>,
+        unique: bool,
+        internal: bool,
+        created_xmin: u64,
+    ) -> Self {
+        let n = cols.len();
+        IndexDef {
+            name,
+            table,
+            cols,
+            col_names,
+            unique,
+            internal,
+            created_xmin,
+            dropped_xmax: 0,
+            desc: vec![false; n],
+            nulls_first: vec![false; n],
+            exprs: vec![None; n],
+            predicate: None,
+            planner_usable: true,
+        }
+    }
 }
 
 /// One live index: its definition plus the ordered key -> row-version-id

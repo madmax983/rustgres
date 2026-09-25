@@ -922,6 +922,19 @@ def setup_statements(need_tenk, need_onek, need_road):
         "CREATE TABLE VARCHAR_TBL(f1 varchar(4))",
         "INSERT INTO VARCHAR_TBL (f1) VALUES ('a'), ('ab'), ('abcd'), ('abcd    ')",
         "VACUUM VARCHAR_TBL",
+        # v0.88: join.sql's "proven-dummy append rels" test needs b_star.
+        # PG's create_misc.sql builds it as
+        #   CREATE TABLE a_star (class char, a int4);
+        #   CREATE TABLE b_star (b text) INHERITS (a_star);
+        #   ALTER TABLE b_star RENAME b TO bb;
+        #   ALTER TABLE a_star RENAME a TO aa;
+        # rustgres does not implement table inheritance, so the harness
+        # creates the flattened post-rename shape directly as a plain
+        # table. The test only checks the planner copes with the empty
+        # right side (the predicate `bb < bb AND bb IS NULL` can never
+        # match), so no inheritance semantics are needed.
+        "CREATE TABLE b_star (class char, aa int4, bb text)",
+        "VACUUM b_star",
     ]
     if need_tenk:
         _tenk_setup(stmts, ("tenk1", "tenk2"))

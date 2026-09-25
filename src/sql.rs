@@ -2490,6 +2490,17 @@ pub enum FuncVolatility {
     Immutable,
 }
 
+/// v0.88: one key column of `CREATE INDEX`. Either a plain column
+/// (`name`) or an index expression (`expr`, the source text — stored
+/// for catalog fidelity; the v0.88 planner does not evaluate it).
+#[derive(Clone, Debug)]
+pub struct IndexColSpec {
+    pub name: Option<String>,
+    pub expr: Option<String>,
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -2809,12 +2820,14 @@ pub enum Stmt {
     CreateIndex {
         name: String,
         table: String,
-        columns: Vec<String>,
+        columns: Vec<IndexColSpec>,
         unique: bool,
         if_not_exists: bool,
+        /// v0.88: partial-index predicate source (`WHERE ...`), if any.
+        predicate: Option<String>,
     },
     DropIndex {
-        name: String,
+        names: Vec<String>,
         if_exists: bool,
     },
     // --- v0.8: EXPLAIN (planned, never executed)
@@ -3362,6 +3375,94 @@ struct WindowSpec {
     partition_by: Vec<Expr>,
     order_by: Vec<OrderTerm>,
     frame: WindowFrame,
+}
+
+/// v0.88: render a token slice back to SQL-ish source text, for stored
+/// index expressions / partial-index predicates (catalog fidelity
+/// only — never re-parsed for evaluation). Spacing is canonical, not
+/// verbatim: `a * a`, `id1 % 1000 = 1`.
+fn tokens_to_sql(toks: &[Token]) -> String {
+    fn text(t: &Token) -> String {
+        match t {
+            Token::Ident(s) => s.clone(),
+            Token::QIdent(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+            Token::Number(s) => s.clone(),
+            Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            Token::UStr(s) => format!("U&'{}'", s.replace('\'', "''")),
+            Token::UIdent(s) => format!("U&\"{}\"", s.replace('"', "\"\"")),
+            Token::Param(n) => format!("${}", n),
+            Token::Op(s) => s.clone(),
+            Token::LParen => "(".to_string(),
+            Token::RParen => ")".to_string(),
+            Token::LBracket => "[".to_string(),
+            Token::RBracket => "]".to_string(),
+            Token::Colon => ":".to_string(),
+            Token::Comma => ",".to_string(),
+            Token::Semi => ";".to_string(),
+            Token::Star => "*".to_string(),
+            Token::Plus => "+".to_string(),
+            Token::Minus => "-".to_string(),
+            Token::Slash => "/".to_string(),
+            Token::Percent => "%".to_string(),
+            Token::Eq => "=".to_string(),
+            Token::Dot => ".".to_string(),
+            Token::Lt => "<".to_string(),
+            Token::Gt => ">".to_string(),
+            Token::LtEq => "<=".to_string(),
+            Token::GtEq => ">=".to_string(),
+            Token::Neq => "<>".to_string(),
+            Token::ColonColon => "::".to_string(),
+            Token::PipePipe => "||".to_string(),
+            Token::Pipe => "|".to_string(),
+            Token::Amp => "&".to_string(),
+            Token::Hash => "#".to_string(),
+            Token::Tilde => "~".to_string(),
+            Token::TildeStar => "~*".to_string(),
+            Token::BangTilde => "!~".to_string(),
+            Token::BangTildeStar => "!~*".to_string(),
+            Token::Shl => "<<".to_string(),
+            Token::Shr => ">>".to_string(),
+            Token::At => "@".to_string(),
+            Token::PipeSlash => "|/".to_string(),
+            Token::PipePipeSlash => "||/".to_string(),
+            Token::Caret => "^".to_string(),
+            Token::StarEq => "*=".to_string(),
+            Token::EOF => String::new(),
+        }
+    }
+    /// No space before these (closers and infix punctuation).
+    fn no_space_before(t: &Token) -> bool {
+        matches!(
+            t,
+            Token::RParen
+                | Token::Comma
+                | Token::Semi
+                | Token::Dot
+                | Token::RBracket
+                | Token::ColonColon
+                | Token::EOF
+        )
+    }
+    /// No space after these (openers and prefix punctuation).
+    fn no_space_after(t: &Token) -> bool {
+        matches!(
+            t,
+            Token::LParen | Token::LBracket | Token::Dot | Token::ColonColon | Token::At
+        )
+    }
+    let mut out = String::new();
+    let mut prev: Option<&Token> = None;
+    for t in toks {
+        if let Token::EOF = t {
+            break;
+        }
+        if !out.is_empty() && !no_space_before(t) && !prev.is_some_and(no_space_after) {
+            out.push(' ');
+        }
+        out.push_str(&text(t));
+        prev = Some(t);
+    }
+    out
 }
 
 struct Parser {
@@ -4116,10 +4217,50 @@ impl Parser {
             };
             self.expect_keyword("on")?;
             let table = self.expect_ident()?;
+            // v0.88: `USING btree` (or another access method) may appear
+            // between the table and the column list. rustgres only
+            // implements btree; accept and ignore the method name.
+            if self.eat_keyword("using") {
+                self.expect_ident()?;
+            }
             self.expect(Token::LParen, "'('")?;
             let mut columns = Vec::new();
             loop {
-                columns.push(self.expect_ident()?);
+                // v0.88: `(expr)` is an index expression; anything else
+                // must be a plain column name.
+                let (name_opt, expr_opt) = if matches!(self.peek(), Token::LParen) {
+                    self.next(); // consume the expression's '('
+                    let start = self.pos;
+                    let _ = self.parse_or()?;
+                    let src = tokens_to_sql(&self.tokens[start..self.pos]);
+                    self.expect(Token::RParen, "')'")?;
+                    (None, Some(src))
+                } else {
+                    (Some(self.expect_ident()?), None)
+                };
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                let nulls_first = if self.eat_keyword("nulls") {
+                    if self.eat_keyword("first") {
+                        true
+                    } else {
+                        self.expect_keyword("last")?;
+                        false
+                    }
+                } else {
+                    // PG defaults: ASC → NULLS LAST, DESC → NULLS FIRST.
+                    desc
+                };
+                columns.push(IndexColSpec {
+                    name: name_opt,
+                    expr: expr_opt,
+                    desc,
+                    nulls_first,
+                });
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -4136,8 +4277,27 @@ impl Parser {
                     "syntax error: index requires at least one column".to_string()
                 ));
             }
+            // v0.88: partial index predicate.
+            let predicate = if self.eat_keyword("where") {
+                let start = self.pos;
+                let _ = self.parse_or()?;
+                Some(tokens_to_sql(&self.tokens[start..self.pos]))
+            } else {
+                None
+            };
             let name = if name.is_empty() {
-                format!("{}_{}_idx", table, columns.join("_"))
+                let key_part: Vec<String> = columns
+                    .iter()
+                    .map(|c| {
+                        c.name.clone().unwrap_or_else(|| {
+                            // PG mangles expression auto-names; "expr" is
+                            // unambiguous and cannot collide with a real
+                            // column list's mangling.
+                            "expr".to_string()
+                        })
+                    })
+                    .collect();
+                format!("{}_{}_idx", table, key_part.join("_"))
             } else {
                 name
             };
@@ -4147,6 +4307,7 @@ impl Parser {
                 columns,
                 unique,
                 if_not_exists,
+                predicate,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -10041,8 +10202,16 @@ impl Parser {
             } else {
                 false
             };
-            let name = self.expect_ident()?;
-            return Ok(Stmt::DropIndex { name, if_exists });
+            // v0.88: `DROP INDEX a, b, c` (PG allows a name list).
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next(); // ','
+            }
+            return Ok(Stmt::DropIndex { names, if_exists });
         }
         // v0.9: DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
         if self.eat_keyword("view") {

@@ -144,7 +144,10 @@ const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK12";
 /// v0.86: version 14 adds the function/operator catalogs
 /// (`eng.db.functions` / `eng.db.operators`). v13 checkpoints are
 /// refused; remove the data directory to start fresh.
-const CHKPT_VERSION: u32 = 14;
+/// v0.88: version 15 adds per-column direction / null-placement /
+/// expression sources and the partial predicate to index images. v14
+/// checkpoints are refused; remove the data directory to start fresh.
+const CHKPT_VERSION: u32 = 15;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -169,7 +172,10 @@ const CHKPT_VERSION: u32 = 14;
 /// v0.86: `RGSWAL14` — function/operator DDL records
 /// (`CreateFunction`/`DropFunction`/`CreateOperator`/`DropOperator`,
 /// tags 24-27). Old `RGSWAL13` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL14";
+/// v0.88: `RGSWAL15` — `CreateIndex` carries per-column direction /
+/// null-placement / expression sources plus the partial predicate.
+/// Old `RGSWAL14` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL15";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -340,6 +346,16 @@ pub enum WalRecord {
         unique: bool,
         /// v0.9: constraint-owned backing index.
         internal: bool,
+        /// v0.88: per-key-column DESC flags (parallel to `columns`).
+        desc: Vec<bool>,
+        /// v0.88: per-key-column NULLS FIRST flags (parallel to
+        /// `columns`).
+        nulls_first: Vec<bool>,
+        /// v0.88: per-key-column expression source (`Some`) vs plain
+        /// column (`None`); parallel to `columns`.
+        exprs: Vec<Option<String>>,
+        /// v0.88: partial-index predicate source, if any.
+        predicate: Option<String>,
         xmin: u64,
     },
     DropIndex {
@@ -1436,6 +1452,10 @@ impl Enc {
                 columns,
                 unique,
                 internal,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
                 xmin,
             } => {
                 self.u8(5);
@@ -1447,6 +1467,18 @@ impl Enc {
                 }
                 self.u8(*unique as u8);
                 self.u8(*internal as u8);
+                // v0.88: per-column direction / null placement /
+                // expression sources, plus the partial predicate.
+                self.bool_list(desc);
+                self.bool_list(nulls_first);
+                self.opt_str_list(exprs);
+                match predicate {
+                    Some(p) => {
+                        self.u8(1);
+                        self.str(p);
+                    }
+                    None => self.u8(0),
+                }
                 self.u64(*xmin);
             }
             WalRecord::DropIndex { name, xmax } => {
@@ -2292,6 +2324,17 @@ impl<'a> Dec<'a> {
                 }
                 let unique = self.u8()? != 0;
                 let internal = self.u8()? != 0;
+                // v0.88 (RGSWAL15): per-column direction / null
+                // placement / expression sources, partial predicate.
+                let desc = self.bool_list_d()?;
+                let nulls_first = self.bool_list_d()?;
+                let exprs = self.opt_str_list_d()?;
+                let has_predicate = self.u8()? != 0;
+                let predicate = if has_predicate {
+                    Some(self.str()?)
+                } else {
+                    None
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateIndex {
                     name,
@@ -2299,6 +2342,10 @@ impl<'a> Dec<'a> {
                     columns,
                     unique,
                     internal,
+                    desc,
+                    nulls_first,
+                    exprs,
+                    predicate,
                     xmin,
                 })
             }
@@ -3359,17 +3406,39 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             columns,
             unique,
             internal,
+            desc,
+            nulls_first,
+            exprs,
+            predicate,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
             // every row present comes from a committed batch, so indexing
             // all versions is correct (visibility filters at scan time).
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built); their definitions still round-trip for fidelity.
             let built: Option<Index> = (|| {
                 let t = live_table(eng, table)?;
-                let mut cols = Vec::with_capacity(columns.len());
-                for c in columns {
-                    cols.push(t.column_index(c)?);
+                let n = columns.len();
+                let mut cols = Vec::with_capacity(n);
+                let mut any_expr = false;
+                for (i, c) in columns.iter().enumerate() {
+                    let is_expr = exprs.get(i).and_then(|e| e.as_ref()).is_some();
+                    if is_expr {
+                        any_expr = true;
+                        cols.push(usize::MAX);
+                    } else {
+                        cols.push(t.column_index(c)?);
+                    }
                 }
+                let pad_bool = |v: &[bool]| {
+                    let mut out = v.to_vec();
+                    out.resize(n, false);
+                    out
+                };
+                let mut ex = exprs.clone();
+                ex.resize(n, None);
+                let planner_usable = !any_expr && predicate.is_none();
                 let mut ix = Index::new(IndexDef {
                     name: name.clone(),
                     table: table.clone(),
@@ -3379,10 +3448,17 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     internal: *internal,
                     created_xmin: *xmin,
                     dropped_xmax: 0,
+                    desc: pad_bool(desc),
+                    nulls_first: pad_bool(nulls_first),
+                    exprs: ex,
+                    predicate: predicate.clone(),
+                    planner_usable,
                 });
-                for r in &t.rows {
-                    let key = ix.key_for(&r.values);
-                    ix.insert(key, r.id);
+                if planner_usable {
+                    for r in &t.rows {
+                        let key = ix.key_for(&r.values);
+                        ix.insert(key, r.id);
+                    }
                 }
                 Some(ix)
             })();
@@ -4235,6 +4311,10 @@ pub fn records_for_commit(
                     columns: ix.def.col_names.clone(),
                     unique: ix.def.unique,
                     internal: ix.def.internal,
+                    desc: ix.def.desc.clone(),
+                    nulls_first: ix.def.nulls_first.clone(),
+                    exprs: ix.def.exprs.clone(),
+                    predicate: ix.def.predicate.clone(),
                     xmin: own,
                 });
             }
@@ -4761,6 +4841,18 @@ impl Wal {
             ix_body.u8(ix.def.unique as u8);
             // v0.9: persist the constraint-owned flag.
             ix_body.u8(ix.def.internal as u8);
+            // v0.88: per-column direction / null placement / expression
+            // sources, plus the partial predicate.
+            ix_body.bool_list(&ix.def.desc);
+            ix_body.bool_list(&ix.def.nulls_first);
+            ix_body.opt_str_list(&ix.def.exprs);
+            match &ix.def.predicate {
+                Some(p) => {
+                    ix_body.u8(1);
+                    ix_body.str(p);
+                }
+                None => ix_body.u8(0),
+            }
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -5387,6 +5479,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let unique = d.u8().map_err(|e| bad(&e))? != 0;
         // v0.9: constraint-owned flag.
         let internal = d.u8().map_err(|e| bad(&e))? != 0;
+        // v0.88: per-column direction / null placement / expression
+        // sources, plus the partial predicate.
+        let mut desc = d.bool_list_d().map_err(|e| bad(&e))?;
+        let mut nulls_first = d.bool_list_d().map_err(|e| bad(&e))?;
+        let mut exprs = d.opt_str_list_d().map_err(|e| bad(&e))?;
+        let has_predicate = d.u8().map_err(|e| bad(&e))? != 0;
+        let predicate = if has_predicate {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        desc.resize(n_cols, false);
+        nulls_first.resize(n_cols, false);
+        exprs.resize(n_cols, None);
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -5408,11 +5514,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 .find(|t| t.dropped_xmax == 0)
                 .ok_or_else(|| bad_idx(format!("no live version of table \"{}\"", table)))?;
             let mut cols = Vec::with_capacity(col_names.len());
-            for c in &col_names {
-                cols.push(t.column_index(c).ok_or_else(|| {
-                    bad_idx(format!("unknown column \"{}\" in table \"{}\"", c, table))
-                })?);
+            let mut any_expr = false;
+            for (i, c) in col_names.iter().enumerate() {
+                if exprs[i].is_some() {
+                    any_expr = true;
+                    cols.push(usize::MAX);
+                } else {
+                    cols.push(t.column_index(c).ok_or_else(|| {
+                        bad_idx(format!("unknown column \"{}\" in table \"{}\"", c, table))
+                    })?);
+                }
             }
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built); their definitions still round-trip for fidelity.
+            let planner_usable = !any_expr && predicate.is_none();
             let mut ix = Index::new(IndexDef {
                 name: name.clone(),
                 table: table.clone(),
@@ -5422,10 +5537,17 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 internal,
                 created_xmin,
                 dropped_xmax,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
+                planner_usable,
             });
-            for r in &t.rows {
-                let key = ix.key_for(&r.values);
-                ix.insert(key, r.id);
+            if planner_usable {
+                for r in &t.rows {
+                    let key = ix.key_for(&r.values);
+                    ix.insert(key, r.id);
+                }
             }
             ix
         };
@@ -6229,5 +6351,53 @@ mod tests {
             assert_eq!(d.col_type().unwrap(), t);
             d.end().unwrap();
         }
+    }
+
+    #[test]
+    fn v088_create_index_metadata_roundtrip() {
+        // v0.88: CreateIndex carries per-column direction / null-placement
+        // / expression sources plus the partial predicate (RGSWAL15).
+        let rec = WalRecord::CreateIndex {
+            name: "ix".into(),
+            table: "t".into(),
+            columns: vec!["a".into(), "(a + b)".into()],
+            unique: true,
+            internal: false,
+            desc: vec![true, false],
+            nulls_first: vec![false, true],
+            exprs: vec![None, Some("a + b".into())],
+            predicate: Some("b > 0".into()),
+            xmin: 42,
+        };
+        let mut e = Enc::new();
+        e.record(&rec);
+        let mut d = Dec::new(&e.buf);
+        match d.record().unwrap() {
+            WalRecord::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                internal,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
+                xmin,
+            } => {
+                assert_eq!(name, "ix");
+                assert_eq!(table, "t");
+                assert_eq!(columns, vec!["a".to_string(), "(a + b)".to_string()]);
+                assert!(unique);
+                assert!(!internal);
+                assert_eq!(desc, vec![true, false]);
+                assert_eq!(nulls_first, vec![false, true]);
+                assert_eq!(exprs, vec![None, Some("a + b".to_string())]);
+                assert_eq!(predicate, Some("b > 0".to_string()));
+                assert_eq!(xmin, 42);
+            }
+            other => panic!("expected CreateIndex, got {:?}", other),
+        }
+        d.end().unwrap();
     }
 }

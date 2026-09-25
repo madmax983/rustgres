@@ -39,11 +39,11 @@
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertIndirection,
-    InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, QuantKind,
-    QuantOp, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
-    Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
-    parse_statement, validate_constraint_expr,
+    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, IndexColSpec,
+    InsertIndirection, InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict,
+    OrderTerm, QuantKind, QuantOp, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind,
+    SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
+    collect_table_refs, parse_statement, validate_constraint_expr,
 };
 use crate::storage::index_visible;
 use crate::storage::{
@@ -519,8 +519,9 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             columns,
             unique,
             if_not_exists,
-        } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists),
-        Stmt::DropIndex { name, if_exists } => exec_drop_index(eng, ctx, name, *if_exists),
+            predicate,
+        } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref()),
+        Stmt::DropIndex { names, if_exists } => exec_drop_index(eng, ctx, names, *if_exists),
         Stmt::Explain { stmt } => exec_explain(eng, ctx, stmt),
         Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
         Stmt::Update {
@@ -2717,16 +2718,15 @@ fn create_constraint_index(
         }
         seen.push(pos);
     }
-    let mut ix = Index::new(IndexDef {
-        name: ix_name.clone(),
-        table: table.to_string(),
-        cols: seen,
-        col_names: cols.to_vec(),
-        unique: true,
+    let mut ix = Index::new(IndexDef::plain(
+        ix_name.clone(),
+        table.to_string(),
+        seen,
+        cols.to_vec(),
+        true,
         internal,
-        created_xmin: ctx.own,
-        dropped_xmax: 0,
-    });
+        ctx.own,
+    ));
     for r in &t.rows {
         let key = ix.key_for(&r.values);
         ix.insert(key, r.id);
@@ -4001,7 +4001,7 @@ fn plan_upsert(
             eng.db
                 .visible_indexes_for(table, ctx.snap, ctx.own, ctx.session)
                 .into_iter()
-                .filter(|ix| ix.def.unique)
+                .filter(|ix| ix.def.unique && ix.def.planner_usable)
                 .map(|ix| {
                     // v0.71: only constraint-backed indexes (internal)
                     // carry a constraint name for ON CONFLICT ON
@@ -4253,7 +4253,7 @@ fn leaf_upsert_ctx(
                 eng.db
                     .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
                     .into_iter()
-                    .filter(|ix| ix.def.unique)
+                    .filter(|ix| ix.def.unique && ix.def.planner_usable)
                     .find(|ix| ix.def.col_names == *key_names)
                     .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             });
@@ -4267,7 +4267,7 @@ fn leaf_upsert_ctx(
         .db
         .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
         .into_iter()
-        .filter(|ix| ix.def.unique)
+        .filter(|ix| ix.def.unique && ix.def.planner_usable)
         .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
         .collect();
     Ok(LeafUpsertCtx {
@@ -7577,7 +7577,7 @@ fn check_insert_unique(
     } else {
         db.visible_indexes_for(table, snap, own, session)
             .into_iter()
-            .filter(|ix| ix.def.unique)
+            .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect()
     };
@@ -7639,7 +7639,7 @@ fn check_partitioned_insert_unique(
             .db
             .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
             .into_iter()
-            .filter(|ix| ix.def.unique)
+            .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         let leaf_rows: Vec<Vec<Value>> = idxs
@@ -7728,7 +7728,7 @@ fn check_update_unique_pairs(
     } else {
         db.visible_indexes_for(table, snap, own, session)
             .into_iter()
-            .filter(|ix| ix.def.unique)
+            .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect()
     };
@@ -7754,9 +7754,10 @@ fn exec_create_index(
     ctx: &mut StmtCtx,
     name: &str,
     table: &str,
-    columns: &[String],
+    columns: &[IndexColSpec],
     unique: bool,
     if_not_exists: bool,
+    predicate: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
@@ -7783,81 +7784,119 @@ fn exec_create_index(
             format!("relation \"{}\" already exists", name),
         ));
     }
-    // Resolve the table and columns (immutable borrows only).
-    {
+    // v0.88: expression / partial indexes are catalog-only for now: the
+    // v0.88 planner has no expression evaluation or predicate
+    // implication, so they are stored but never built, maintained, or
+    // consulted by a scan path.
+    let planner_usable = predicate.is_none() && columns.iter().all(|c| c.expr.is_none());
+    // Resolve the table and plain columns (immutable borrows only).
+    // Expression key columns carry usize::MAX (no single position).
+    let (cols, col_names, descs, nulls_firsts, exprs) = {
         let t = eng
             .db
             .find_table(table, ctx.snap, ctx.own, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let mut cols = Vec::with_capacity(columns.len());
+        let mut col_names = Vec::with_capacity(columns.len());
+        let mut descs = Vec::with_capacity(columns.len());
+        let mut nulls_firsts = Vec::with_capacity(columns.len());
+        let mut exprs = Vec::with_capacity(columns.len());
         let mut seen = Vec::with_capacity(columns.len());
         for c in columns {
-            let pos = t.column_index(c).ok_or_else(|| {
-                exec_err(
-                    "42703",
-                    format!("column \"{}\" of relation \"{}\" does not exist", c, table),
-                )
-            })?;
-            if seen.contains(&pos) {
-                return Err(exec_err(
-                    "42701",
-                    format!("column \"{}\" specified more than once", c),
-                ));
+            match (&c.name, &c.expr) {
+                (Some(n), None) => {
+                    let pos = t.column_index(n).ok_or_else(|| {
+                        exec_err(
+                            "42703",
+                            format!("column \"{}\" of relation \"{}\" does not exist", n, table),
+                        )
+                    })?;
+                    if seen.contains(&pos) {
+                        return Err(exec_err(
+                            "42701",
+                            format!("column \"{}\" specified more than once", n),
+                        ));
+                    }
+                    seen.push(pos);
+                    cols.push(pos);
+                    col_names.push(n.clone());
+                }
+                (None, Some(e)) => {
+                    cols.push(usize::MAX);
+                    col_names.push(e.clone());
+                }
+                _ => {
+                    return Err(exec_err(
+                        "42601",
+                        "syntax error: malformed index key".to_string(),
+                    ));
+                }
             }
-            seen.push(pos);
+            descs.push(c.desc);
+            nulls_firsts.push(c.nulls_first);
+            exprs.push(c.expr.clone());
         }
-        if seen.is_empty() {
+        if cols.is_empty() {
             return Err(exec_err(
                 "42601",
                 "syntax error: index requires at least one column".to_string(),
             ));
         }
-    }
-    // Build + backfill from every version of the visible table version;
-    // visibility is resolved at scan time, so uncommitted and dead
-    // versions get entries too (like Postgres' heap/index split).
-    let t = eng
-        .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
-        .expect("table still visible; engine lock held throughout");
-    let cols: Vec<usize> = columns
-        .iter()
-        .map(|c| t.column_index(c).expect("columns resolved above"))
-        .collect();
+        (cols, col_names, descs, nulls_firsts, exprs)
+    };
     let mut ix = Index::new(IndexDef {
         name: name.to_string(),
         table: table.to_string(),
         cols,
-        col_names: columns.to_vec(),
+        col_names,
         unique,
         internal: false,
         created_xmin: ctx.own,
         dropped_xmax: 0,
+        desc: descs,
+        nulls_first: nulls_firsts,
+        exprs,
+        predicate: predicate.map(|s| s.to_string()),
+        planner_usable,
     });
-    for r in &t.rows {
-        let key = ix.key_for(&r.values);
-        ix.insert(key, r.id);
-    }
-    if unique {
-        // A duplicate among versions that could still become visible
-        // fails the CREATE, like Postgres. Conservative: versions deleted
-        // only by still-active transactions (or by us) count as live.
-        for (key, ids) in &ix.tree {
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue;
-            }
-            let mut live = 0u32;
-            for &id in ids {
-                let dead = match t.row_pos(id) {
-                    Some(pos) => {
-                        let r = &t.rows[pos];
-                        r.xmax != 0 && r.xmax != ctx.own && eng.xid_committed(r.xmax)
-                    }
-                    None => true, // vacuumed away: cannot conflict
-                };
-                if !dead {
-                    live += 1;
-                    if live >= 2 {
-                        return Err(unique_violation_err(name));
+    if planner_usable {
+        // Build + backfill from every version of the visible table
+        // version; visibility is resolved at scan time, so uncommitted
+        // and dead versions get entries too (like Postgres' heap/index
+        // split). v0.88: the tree is always built in canonical ascending
+        // order (NULLs high), even for DESC keys — the DESC flags are
+        // catalog fidelity; the ORDER BY fast path only trusts
+        // all-ascending indexes.
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .expect("table still visible; engine lock held throughout");
+        for r in &t.rows {
+            let key = ix.key_for(&r.values);
+            ix.insert(key, r.id);
+        }
+        if unique {
+            // A duplicate among versions that could still become visible
+            // fails the CREATE, like Postgres. Conservative: versions deleted
+            // only by still-active transactions (or by us) count as live.
+            for (key, ids) in &ix.tree {
+                if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                let mut live = 0u32;
+                for &id in ids {
+                    let dead = match t.row_pos(id) {
+                        Some(pos) => {
+                            let r = &t.rows[pos];
+                            r.xmax != 0 && r.xmax != ctx.own && eng.xid_committed(r.xmax)
+                        }
+                        None => true, // vacuumed away: cannot conflict
+                    };
+                    if !dead {
+                        live += 1;
+                        if live >= 2 {
+                            return Err(unique_violation_err(name));
+                        }
                     }
                 }
             }
@@ -7889,9 +7928,25 @@ fn exec_create_index(
 fn exec_drop_index(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
-    name: &str,
+    names: &[String],
     if_exists: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.88: `DROP INDEX a, b, c` drops each in turn; the first missing
+    // name aborts the rest (like PostgreSQL).
+    for name in names {
+        exec_drop_one_index(eng, ctx, name, if_exists)?;
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP INDEX".to_string(),
+    })
+}
+
+fn exec_drop_one_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    if_exists: bool,
+) -> Result<(), ExecError> {
     // v0.87: check session-local temp indexes first.
     let temp_snapshot = eng
         .db
@@ -7913,9 +7968,7 @@ fn exec_drop_index(
             name: name.to_string(),
             index: snapshot,
         });
-        return Ok(ExecResult::Command {
-            tag: "DROP INDEX".to_string(),
-        });
+        return Ok(());
     }
     // Snapshot the definition first: the write log's undo restores it on
     // ROLLBACK, and the WAL replays the drop on commit.
@@ -7927,9 +7980,7 @@ fn exec_drop_index(
         Some(ix) => ix.clone(),
         None => {
             if if_exists {
-                return Ok(ExecResult::Command {
-                    tag: "DROP INDEX".to_string(),
-                });
+                return Ok(());
             }
             return Err(exec_err(
                 "42P01",
@@ -7946,9 +7997,7 @@ fn exec_drop_index(
         name: name.to_string(),
         index: snapshot,
     });
-    Ok(ExecResult::Command {
-        tag: "DROP INDEX".to_string(),
-    })
+    Ok(())
 }
 
 // --- v0.8 planner ----------------------------------------------------------
@@ -8102,6 +8151,11 @@ fn plan_access_path(
     let mut best: Option<AccessPath> = None;
     let mut best_score = (0usize, 0usize, false);
     for ix in db.visible_indexes_for(table_name, snap, own, session) {
+        // v0.88: expression / partial indexes are catalog-only (never
+        // built); no scan path may consult them.
+        if !ix.def.planner_usable {
+            continue;
+        }
         let mut prefix: Vec<Value> = Vec::new();
         let mut cond_parts: Vec<String> = Vec::new();
         let mut i = 0;
@@ -8337,7 +8391,19 @@ fn plan_order_scan(
     // the ordering (indexes are ascending; a DESC query scans backwards).
     // A composite index also satisfies a prefix: (a,b) order implies
     // a-order.
+    // v0.88: only all-ascending, default-null-placement, planner-usable
+    // indexes are trusted here. A DESC (or otherwise directed) index is
+    // built in canonical ascending order with the direction stored as
+    // catalog metadata, so streaming it as if it were ordered would
+    // produce wrong row order; those queries fall back to Sort (which is
+    // what happened before v0.88 accepted the DDL at all).
     for ix in eng.db.visible_indexes_for(table_name, snap, own, session) {
+        if !ix.def.planner_usable
+            || ix.def.desc.iter().any(|d| *d)
+            || ix.def.nulls_first.iter().any(|n| *n)
+        {
+            continue;
+        }
         if ix.def.col_names.len() >= cols.len() && ix.def.col_names[..cols.len()] == cols[..] {
             return Some(OrderHint {
                 index: ix.def.name.clone(),
@@ -8666,6 +8732,24 @@ fn plan_from_item(
                     table: "pg_class".to_string(),
                     filter: None,
                     rows: eng.db.tables.len() as u64,
+                });
+            }
+            // v0.88: pg_attribute is virtual (bounded catalog subset).
+            if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
+                return Ok(PlanNode::SeqScan {
+                    table: "pg_attribute".to_string(),
+                    filter: None,
+                    rows: eng
+                        .db
+                        .tables
+                        .values()
+                        .map(|vs| {
+                            vs.iter()
+                                .find(|t| t.dropped_xmax == 0)
+                                .map(|t| t.columns.len() as u64)
+                                .unwrap_or(0)
+                        })
+                        .sum(),
                 });
             }
             // v0.11: role catalogs are virtual.
@@ -9348,6 +9432,64 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
             ]),
             prov: Vec::new(),
         });
+    }
+    (schema, rows)
+}
+// ---------------------------------------------------------------------------
+// v0.88: pg_attribute (virtual, bounded subset). A real table by the same
+// name takes precedence, like pg_stats. Exposes attrelid (the table OID),
+// attname, and attnum (1-based column position) — enough for catalog
+// introspection queries such as the regression suite's
+// `... right join pg_attribute a on a.attrelid = ss2.oid where ...
+// and attnum = 1`. This is deliberately not the full PostgreSQL
+// pg_attribute (no atttypid/atttypmod/attnotnull/...); those columns
+// raise "column does not exist" rather than returning wrong data.
+// ---------------------------------------------------------------------------
+
+fn pg_attribute_schema() -> Vec<QCol> {
+    [
+        ("attrelid", ColType::Int),
+        ("attname", ColType::Text),
+        ("attnum", ColType::Int),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_attribute".to_string(),
+        name: n.to_string(),
+        ty,
+
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn pg_attribute_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_attribute_schema();
+    let mut rows = Vec::new();
+    // Sort by table name for deterministic output.
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    for name in names {
+        // Only the live version is visible in pg_attribute.
+        let Some(t) = db.find_table(name, snap, own, session) else {
+            continue;
+        };
+        for (i, (col_name, _)) in t.columns.iter().enumerate() {
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int(t.oid as i64),
+                    Value::text(col_name.as_str()),
+                    Value::Int((i + 1) as i64),
+                ]),
+                prov: Vec::new(),
+            });
+        }
     }
     (schema, rows)
 }
@@ -14925,6 +15067,23 @@ fn build_source(
                     })
                     .collect();
                 let (_, rows) = pg_class_scan(&q.eng.db, q.snap, q.own, q.session);
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v0.88: pg_attribute is virtual too (bounded catalog subset).
+            if name == "pg_attribute"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, q.own, q.session)
+                    .is_none()
+            {
+                let schema: Vec<QCol> = pg_attribute_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_attribute_scan(&q.eng.db, q.snap, q.own, q.session);
                 return Ok((apply_aliases(schema)?, rows));
             }
             // v0.11: the role catalogs are virtual too.
@@ -30166,6 +30325,19 @@ fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v0.88: pg_attribute is virtual too (bounded catalog subset).
+            if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_attribute_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -37057,6 +37229,146 @@ mod tests {
         let err = run(&mut eng, "SELECT array[]").unwrap_err();
         assert_eq!(err.code, "42P08");
     }
+
+    /// v0.88: CREATE INDEX accepts DESC / NULLS FIRST|LAST key options and
+    /// stores them as catalog metadata. The tree is still built in
+    /// canonical ascending order, so ORDER BY results are unaffected.
+    #[test]
+    fn v088_desc_index_metadata_and_order() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t88 (a int, b int)").unwrap();
+        run(&mut eng, "INSERT INTO t88 VALUES (3, 1), (1, 2), (2, 3)").unwrap();
+        run(&mut eng, "CREATE INDEX t88_desc ON t88 (a DESC)").unwrap();
+        let ix = &eng.db.indexes["t88_desc"];
+        assert_eq!(ix.def.desc, vec![true]);
+        // PG default for a DESC key is NULLS FIRST.
+        assert_eq!(ix.def.nulls_first, vec![true]);
+        assert!(ix.def.planner_usable);
+        assert!(!ix.tree.is_empty());
+        // Explicit NULLS FIRST on a DESC key is stored too.
+        run(&mut eng, "CREATE INDEX t88_nf ON t88 (b DESC NULLS FIRST)").unwrap();
+        let ix = &eng.db.indexes["t88_nf"];
+        assert_eq!(ix.def.desc, vec![true]);
+        assert_eq!(ix.def.nulls_first, vec![true]);
+        // Multi-key: direction is per-column.
+        run(
+            &mut eng,
+            "CREATE INDEX t88_m ON t88 (a ASC, b DESC NULLS LAST)",
+        )
+        .unwrap();
+        let ix = &eng.db.indexes["t88_m"];
+        assert_eq!(ix.def.desc, vec![false, true]);
+        assert_eq!(ix.def.nulls_first, vec![false, false]);
+        // ORDER BY correctness is unaffected by the stored direction.
+        let r = run(&mut eng, "SELECT a FROM t88 ORDER BY a").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let r = run(&mut eng, "SELECT a FROM t88 ORDER BY a DESC").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["3".to_string()],
+                vec!["2".to_string()],
+                vec!["1".to_string()]
+            ]
+        );
+    }
+
+    /// v0.88: expression indexes are accepted as catalog-only definitions
+    /// (planner_usable = false, nothing built) and DML never touches them
+    /// — the `usize::MAX` key positions must not reach `key_for`.
+    #[test]
+    fn v088_expression_index_is_catalog_only() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t88e (a int)").unwrap();
+        run(&mut eng, "CREATE UNIQUE INDEX t88e_fn ON t88e ((a * a))").unwrap();
+        let ix = &eng.db.indexes["t88e_fn"];
+        assert!(!ix.def.planner_usable);
+        assert_eq!(ix.def.exprs, vec![Some("a * a".to_string())]);
+        assert!(ix.tree.is_empty());
+        // DML with an expression index present must not panic (this hit
+        // `committed_unique_violation` -> `key_for` before the v0.88
+        // planner_usable gate).
+        run(&mut eng, "INSERT INTO t88e VALUES (1), (2)").unwrap();
+        run(&mut eng, "UPDATE t88e SET a = 5 WHERE a = 1").unwrap();
+        run(&mut eng, "DELETE FROM t88e WHERE a = 2").unwrap();
+        assert!(eng.db.indexes["t88e_fn"].tree.is_empty());
+        let r = run(&mut eng, "SELECT a FROM t88e").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["5".to_string()]]);
+    }
+
+    /// v0.88: partial indexes (`WHERE` predicate) are likewise
+    /// catalog-only: accepted, stored, never built or consulted.
+    #[test]
+    fn v088_partial_index_is_catalog_only() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t88p (a int)").unwrap();
+        run(&mut eng, "CREATE INDEX t88p_idx ON t88p (a) WHERE a > 0").unwrap();
+        let ix = &eng.db.indexes["t88p_idx"];
+        assert!(!ix.def.planner_usable);
+        assert_eq!(ix.def.predicate, Some("a > 0".to_string()));
+        assert!(ix.tree.is_empty());
+        run(&mut eng, "INSERT INTO t88p VALUES (1), (-1)").unwrap();
+        assert!(eng.db.indexes["t88p_idx"].tree.is_empty());
+        let r = run(&mut eng, "SELECT a FROM t88p WHERE a > 0").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
+    /// v0.88: `DROP INDEX a, b, ...` drops every named index; a missing
+    /// name aborts with 42P01.
+    #[test]
+    fn v088_drop_index_multi_name() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t88d (a int)").unwrap();
+        // v0.88: `USING btree` (or another access method) is accepted
+        // and ignored; rustgres only implements btree.
+        run(&mut eng, "CREATE UNIQUE INDEX u88 ON t88d USING btree (a)").unwrap();
+        assert!(eng.db.indexes["u88"].def.planner_usable);
+        run(&mut eng, "CREATE INDEX d1 ON t88d (a)").unwrap();
+        run(&mut eng, "CREATE INDEX d2 ON t88d (a)").unwrap();
+        run(&mut eng, "DROP INDEX d1, d2").unwrap();
+        // Drops are MVCC (dropped_xmax), not map removals.
+        assert_ne!(eng.db.indexes["d1"].def.dropped_xmax, 0);
+        assert_ne!(eng.db.indexes["d2"].def.dropped_xmax, 0);
+        let err = run(&mut eng, "DROP INDEX nope_missing").unwrap_err();
+        assert_eq!(err.code, "42P01");
+        // A missing name later in the list still aborts the statement.
+        run(&mut eng, "CREATE INDEX d3 ON t88d (a)").unwrap();
+        let err = run(&mut eng, "DROP INDEX nope_missing, d3").unwrap_err();
+        assert_eq!(err.code, "42P01");
+    }
+
+    /// v0.88: the virtual pg_attribute exposes attrelid/attname/attnum;
+    /// the regression suite's RIGHT JOIN introspection query returns the
+    /// expected row.
+    #[test]
+    fn v088_pg_attribute_virtual() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "SELECT attname, attnum FROM pg_attribute WHERE attname = 'uid'",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["uid".to_string(), "2".to_string()]]);
+        // The fixture tables share oid 0, so the join test uses a
+        // SQL-created table (which gets a distinct OID, like the server).
+        run(&mut eng, "CREATE TABLE pa88 (x int, y int)").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT tname, attname FROM (SELECT relname AS tname, * \
+             FROM (SELECT * FROM pg_class c) ss1) ss2 \
+             RIGHT JOIN pg_attribute a ON a.attrelid = ss2.oid \
+             WHERE tname = 'pa88' AND attnum = 1",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["pa88".to_string(), "x".to_string()]]);
+    }
 }
 
 fn info_columns_schema() -> Vec<QCol> {
@@ -40206,16 +40518,15 @@ fn alter_drop_column(
             .into_iter()
             .map(|p| if p > ci { p - 1 } else { p })
             .collect();
-        let mut ix = Index::new(IndexDef {
-            name: ix_name.clone(),
-            table: name.to_string(),
-            cols: new_cols,
+        let mut ix = Index::new(IndexDef::plain(
+            ix_name.clone(),
+            name.to_string(),
+            new_cols,
             col_names,
             unique,
             internal,
-            created_xmin: ctx.own,
-            dropped_xmax: 0,
-        });
+            ctx.own,
+        ));
         let t2 = eng
             .db
             .find_table(name, ctx.snap, ctx.own, ctx.session)

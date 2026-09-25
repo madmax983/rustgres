@@ -5357,7 +5357,9 @@ impl Database {
         let targets: Vec<(String, Vec<usize>)> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built or maintained).
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         for (name, cols) in targets {
@@ -5376,7 +5378,9 @@ impl Database {
         let targets: Vec<(String, Vec<usize>)> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built or maintained).
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         for (name, cols) in targets {
@@ -5414,6 +5418,11 @@ impl Database {
         }
         for ix in self.visible_indexes_for(table, snap, own, session) {
             if !ix.def.unique {
+                continue;
+            }
+            // v0.88: expression / partial unique indexes are catalog-only
+            // (never built); nothing to check against.
+            if !ix.def.planner_usable {
                 continue;
             }
             let key = ix.key_for(values);
@@ -5584,6 +5593,11 @@ impl Database {
         let t = self.find_table(table, &fresh, own, session)?;
         for ix in self.visible_indexes_for(table, &fresh, own, session) {
             if !ix.def.unique {
+                continue;
+            }
+            // v0.88: expression / partial unique indexes are catalog-only
+            // (never built); nothing to check against.
+            if !ix.def.planner_usable {
                 continue;
             }
             let key = ix.key_for(values);
@@ -6791,7 +6805,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 for ix in eng.db.indexes.values_mut() {
                     let ours = ix.def.table == *name
                         || renamed_to.as_deref().is_some_and(|rt| ix.def.table == rt);
-                    if ours && ix.def.dropped_xmax == 0 {
+                    // v0.88: expression / partial indexes are catalog-only
+                    // (never built); their trees are always empty.
+                    if ours && ix.def.dropped_xmax == 0 && ix.def.planner_usable {
                         ix.tree.clear();
                         for (values, id) in &rows {
                             let key = ix.key_for(values);
