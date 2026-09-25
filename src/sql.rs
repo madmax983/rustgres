@@ -134,6 +134,7 @@ enum Token {
     PipeSlash,     // v0.21: `|/` prefix sqrt operator
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
     Caret,         // v0.7: `^` exponentiation
+    StarEq,        // v0.81: `*=` PG19 record-image equality (record_image_eq)
     EOF,
 }
 
@@ -504,8 +505,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 i += 1;
             }
             '*' => {
-                toks.push(Token::Star);
-                i += 1;
+                // v0.81: `*=` is PG19's record-image equality operator.
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    toks.push(Token::StarEq);
+                    i += 2;
+                } else {
+                    toks.push(Token::Star);
+                    i += 1;
+                }
             }
             '+' => {
                 toks.push(Token::Plus);
@@ -904,6 +911,9 @@ pub enum CmpOp {
     Le,
     Gt,
     Ge,
+    /// v0.81: `*=` — PG19 `record_image_eq` (byte-oriented identity for
+    /// fast sorting/grouping; e.g. numeric `1.00` is NOT `*=` `1.0`).
+    ImageEq,
 }
 
 impl CmpOp {
@@ -915,6 +925,7 @@ impl CmpOp {
             CmpOp::Le => "<=",
             CmpOp::Gt => ">",
             CmpOp::Ge => ">=",
+            CmpOp::ImageEq => "*=",
         }
     }
 }
@@ -1019,6 +1030,22 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         to: ColType,
+    },
+    /// v0.81: cast to a named composite type (`ROW(...)::t_rec`). The
+    /// name is resolved against the type catalog at execution time
+    /// (the parser is catalog-free); unknown names are 42704 there.
+    CastNamed {
+        expr: Box<Expr>,
+        name: String,
+    },
+    /// v0.81: `ROW(a, b, ...)` row constructor. Evaluates to
+    /// `Value::Record` with PG's `f1`, `f2`, ... field names.
+    Row(Vec<Expr>),
+    /// v0.81: composite field access, `(expr).field`. The base must
+    /// evaluate to a `Value::Record`; unknown fields are 42703.
+    FieldAccess {
+        expr: Box<Expr>,
+        field: String,
     },
     /// v0.7: `||` string concatenation.
     Concat(Box<Expr>, Box<Expr>),
@@ -1531,6 +1558,10 @@ pub struct FkDef {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableDef {
     pub columns: Vec<(String, ColType)>,
+    /// v0.81: named composite type per column, parallel to `columns`
+    /// (`Some(name)` iff the column's `ColType` is `Composite`); resolved
+    /// against the type catalog at execution time.
+    pub composite_types: Vec<Option<String>>,
     pub not_null: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
     /// v0.65: per-column serial pseudo-type marker (parallel to
@@ -1771,6 +1802,9 @@ pub enum LikeKind {
 struct ParsedColDef {
     name: String,
     col_type: ColType,
+    /// v0.81: named composite type for `col_type == ColType::Composite`
+    /// (`a t_rec`); resolved against the type catalog at execution time.
+    composite_name: Option<String>,
     /// v0.65: serial pseudo-type marker, detected from the raw type
     /// name before it is resolved to a ColType.
     serial: Option<SerialKind>,
@@ -1838,6 +1872,7 @@ impl TableDef {
     pub(crate) fn empty() -> Self {
         TableDef {
             columns: Vec::new(),
+            composite_types: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -1996,6 +2031,9 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                 )));
             }
             def.columns.push((c.name.clone(), c.col_type.clone()));
+            // v0.81: named composite type travels to exec for catalog
+            // resolution.
+            def.composite_types.push(c.composite_name.clone());
             def.not_null.push(false);
             def.defaults.push(None);
             // v0.65: serial marker (with kind) travels to exec for
@@ -2132,6 +2170,14 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
             collect_col_refs(right, out);
         }
         Expr::Cast { expr, .. } => collect_col_refs(expr, out),
+        // v0.81: composite expressions — recurse into sub-expressions.
+        Expr::CastNamed { expr, .. } => collect_col_refs(expr, out),
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_col_refs(e, out);
+            }
+        }
+        Expr::FieldAccess { expr, .. } => collect_col_refs(expr, out),
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             collect_col_refs(a, out);
             collect_col_refs(b, out);
@@ -2372,6 +2418,10 @@ pub enum Stmt {
         /// Base type from LIKE = <base> in the parenthesized completion
         /// form; None for the bare `CREATE TYPE name;` shell form.
         like_base: Option<String>,
+        /// v0.81: `CREATE TYPE name AS (field type, ...)` composite
+        /// definition: `(field_name, ColType, composite_type_name)`.
+        /// None for the shell and LIKE forms.
+        composite: Option<Vec<(String, ColType, Option<String>)>>,
     },
     DropType {
         names: Vec<String>,
@@ -2633,6 +2683,35 @@ pub struct OnConflict {
     pub action: ConflictAction,
 }
 
+/// v0.81: true for statements that change the catalog (DDL). The server
+/// bumps `Engine::catalog_epoch` after one of these succeeds, which
+/// invalidates every session's parsed-AST cache (PostgreSQL invalidates
+/// its plan cache on catalog changes the same way).
+impl Stmt {
+    pub fn is_catalog_changing(&self) -> bool {
+        matches!(
+            self,
+            Stmt::CreateTable { .. }
+                | Stmt::CreateTableAs { .. }
+                | Stmt::AlterTable { .. }
+                | Stmt::DropTable { .. }
+                | Stmt::CreateView { .. }
+                | Stmt::DropView { .. }
+                | Stmt::CreateSequence { .. }
+                | Stmt::AlterSequence { .. }
+                | Stmt::DropSequence { .. }
+                | Stmt::CreateType { .. }
+                | Stmt::DropType { .. }
+                | Stmt::CreateIndex { .. }
+                | Stmt::DropIndex { .. }
+                | Stmt::CreateStatistics
+                | Stmt::CreateRole { .. }
+                | Stmt::AlterRole { .. }
+                | Stmt::DropRole { .. }
+        )
+    }
+}
+
 /// v0.10: conflict arbiter. `None` = no arbiter (`ON CONFLICT DO NOTHING`
 /// catches any unique violation).
 #[derive(Clone, Debug, PartialEq)]
@@ -2886,6 +2965,9 @@ fn max_param_expr(e: &Expr) -> usize {
         }
         Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
+        // v0.81: composite expressions recurse into their operands.
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => max_param_expr(expr),
+        Expr::Row(elems) => elems.iter().map(max_param_expr).max().unwrap_or(0),
         // v0.79: array expressions recurse into their operands.
         Expr::ArrayCtor { elems, .. } => elems.iter().map(max_param_expr).max().unwrap_or(0),
         Expr::Subscript { array, indices } => {
@@ -3485,7 +3567,7 @@ impl Parser {
         }
     }
 
-    fn parse_col_type(&mut self) -> Result<ColType, SqlError> {
+    fn parse_col_type(&mut self) -> Result<(ColType, Option<String>), SqlError> {
         self.parse_type_name()
     }
 
@@ -3493,7 +3575,11 @@ impl Parser {
     /// Multi-word names like `double precision` and
     /// `timestamp with time zone` are accepted; `numeric(p[,s])`
     /// precision/scale are parsed but not enforced (documented).
-    fn parse_type_name(&mut self) -> Result<ColType, SqlError> {
+    /// v0.81: returns the resolved `ColType` plus, for a name that is
+    /// not a builtin, `Some(name)` with `ColType::Composite` — the name
+    /// is resolved against the type catalog at execution time (42704 if
+    /// undefined, like PG's "type does not exist").
+    fn parse_type_name(&mut self) -> Result<(ColType, Option<String>), SqlError> {
         // v0.36: a double-quoted name resolves case-sensitively; quoted
         // `"char"` is PG's one-byte "char" type (OID 18), not character(1).
         if let Token::QIdent(name) = self.peek() {
@@ -3518,19 +3604,25 @@ impl Parser {
     /// one-byte "char" type (OID 18), which takes no typmod; every other
     /// name resolves exactly like its unquoted spelling (so `"text"`,
     /// `"bpchar"` keep working, while `"CHAR"` stays unknown, like PG).
-    fn parse_quoted_type_name(&mut self, name: String) -> Result<ColType, SqlError> {
+    fn parse_quoted_type_name(
+        &mut self,
+        name: String,
+    ) -> Result<(ColType, Option<String>), SqlError> {
         if name == "char" {
             if *self.peek() == Token::LParen {
                 return Err(err(
                     "syntax error: type modifier is not allowed for type \"char\"".to_string(),
                 ));
             }
-            return Ok(ColType::SingleChar);
+            return Ok((ColType::SingleChar, None));
         }
         self.parse_type_name_rest(name)
     }
 
-    fn parse_type_name_rest(&mut self, name: String) -> Result<ColType, SqlError> {
+    fn parse_type_name_rest(
+        &mut self,
+        name: String,
+    ) -> Result<(ColType, Option<String>), SqlError> {
         let base: ColType = match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
             // v0.14: PostgreSQL internal alias names (pg_regress conformance).
@@ -3671,8 +3763,17 @@ impl Parser {
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
-            _ => Err(err(format!("syntax error: unknown type \"{}\"", name))),
+            // v0.81: not a builtin — treat as a (possibly) named composite
+            // type; the name is resolved against the type catalog at
+            // execution time (42704 if undefined).
+            _ => Ok(ColType::Composite),
         }?;
+        // v0.81: the composite name, if this was not a builtin.
+        let composite_name = if base == ColType::Composite {
+            Some(name)
+        } else {
+            None
+        };
         // v0.79: array type suffixes — `int[]`, `int[3]`, `int[][]`
         // (PG19 `opt_array_bounds`; declared bounds are accepted and
         // ignored, exactly like PG). Each `[]` level flattens to the
@@ -3688,7 +3789,10 @@ impl Parser {
             self.expect(Token::RBracket, "']'")?;
             ty = ColType::Array(crate::storage::ArrayElem::of(&ty));
         }
-        Ok(ty)
+        // v0.81: `t_rec[]` — an array of composites is not supported yet;
+        // keep the composite marker (the execution-time resolver will
+        // report it cleanly).
+        Ok((ty, composite_name))
     }
 
     /// v0.35: parse an optional character-type length modifier `(n)`,
@@ -4018,6 +4122,7 @@ impl Parser {
         };
         let def = TableDef {
             columns: Vec::new(), // inherited from parent at exec
+            composite_types: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -4223,7 +4328,7 @@ impl Parser {
             },
             _ => None,
         };
-        let col_type = self.parse_col_type()?;
+        let (col_type, composite_name) = self.parse_col_type()?;
         // v0.41: PG19 `opt_column_compression` sits between the type
         // name and the column constraints.
         let compression = if self.eat_keyword("compression") {
@@ -4273,6 +4378,7 @@ impl Parser {
         Ok(ParsedColDef {
             name,
             col_type,
+            composite_name,
             serial,
             compression,
             cons,
@@ -4885,6 +4991,37 @@ impl Parser {
     fn parse_create_type(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("type")?;
         let name = self.expect_ident()?;
+        // v0.81: `CREATE TYPE name AS (field type, ...)` — PG19 named
+        // composite type. The fields are parsed like table columns
+        // (type names may themselves be composites).
+        if self.eat_keyword("as") {
+            self.expect(Token::LParen, "'('")?;
+            let mut fields = Vec::new();
+            loop {
+                if *self.peek() == Token::RParen {
+                    self.next();
+                    break;
+                }
+                let fname = self.expect_ident()?;
+                let (fty, composite_name) = self.parse_type_name()?;
+                fields.push((fname, fty, composite_name));
+                match self.next() {
+                    Token::Comma => {}
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            return Ok(Stmt::CreateType {
+                name,
+                like_base: None,
+                composite: Some(fields),
+            });
+        }
         let like_base = if *self.peek() == Token::LParen {
             self.next();
             let mut like_base = None;
@@ -4910,7 +5047,11 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::CreateType { name, like_base })
+        Ok(Stmt::CreateType {
+            name,
+            like_base,
+            composite: None,
+        })
     }
 
     /// ALTER SEQUENCE name [options...] — all options optional.
@@ -5678,7 +5819,11 @@ impl Parser {
                 } else {
                     self.parse_type_name_rest(name)
                 };
-                if ty.is_ok() {
+                // v0.81: named composites are not typed literals
+                // (composite input syntax is future work); only take this
+                // branch for builtin types.
+                let is_composite = matches!(&ty, Ok((ColType::Composite, _)));
+                if ty.is_ok() && !is_composite {
                     if let Token::Str(s) = self.next() {
                         return Ok(InsertValue::Lit(Literal::Text(s.into())));
                     }
@@ -5911,6 +6056,8 @@ impl Parser {
             Token::LtEq => Some(CmpOp::Le),
             Token::Gt => Some(CmpOp::Gt),
             Token::GtEq => Some(CmpOp::Ge),
+            // v0.81: `*=` record-image equality.
+            Token::StarEq => Some(CmpOp::ImageEq),
             _ => None,
         };
         let mut expr = match op {
@@ -6237,7 +6384,17 @@ impl Parser {
         expr = self.parse_postfix_subscripts(expr)?;
         while *self.peek() == Token::ColonColon {
             self.next();
-            let to = self.parse_type_name()?;
+            let (to, composite_name) = self.parse_type_name()?;
+            // v0.81: `::named_composite` becomes CastNamed (resolved at
+            // execution time); builtins keep the existing Cast path.
+            if let Some(name) = composite_name {
+                expr = Expr::CastNamed {
+                    expr: Box::new(expr),
+                    name,
+                };
+                expr = self.parse_postfix_subscripts(expr)?;
+                continue;
+            }
             // Fold `decimal-literal::numeric` to an exact Numeric literal
             // so high-precision decimals don't round-trip through f64.
             // (Postgres parses decimal literals as numeric in the first
@@ -6452,6 +6609,25 @@ impl Parser {
             }
             Token::Ident(_) => {
                 let name = self.expect_ident()?;
+                // v0.81: `ROW(...)` row constructor (PG19 `row_expr`).
+                // `ROW()`, `ROW(a)`, and `ROW(a, b, ...)` all produce
+                // `Expr::Row`; field names are PG's `f1`, `f2`, ...
+                if name == "row" && *self.peek() == Token::LParen {
+                    self.next();
+                    let mut elems = Vec::new();
+                    if *self.peek() != Token::RParen {
+                        loop {
+                            elems.push(self.parse_or()?);
+                            if *self.peek() == Token::Comma {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(Expr::Row(elems));
+                }
                 // v0.79: `ARRAY[...]` constructor (PG19 `array_expr`).
                 // `ARRAY[1,2]`, `ARRAY[]`, and the nested form
                 // `ARRAY[[1,2],[3,4]]`. (`array(SELECT...)` stays in
@@ -6482,8 +6658,15 @@ impl Parser {
                     self.next();
                     let expr = self.parse_or()?;
                     self.expect_keyword("as")?;
-                    let to = self.parse_type_name()?;
+                    let (to, composite_name) = self.parse_type_name()?;
                     self.expect(Token::RParen, "')'")?;
+                    // v0.81: CAST(x AS named_composite).
+                    if let Some(name) = composite_name {
+                        return Ok(Expr::CastNamed {
+                            expr: Box::new(expr),
+                            name,
+                        });
+                    }
                     return Ok(Expr::Cast {
                         expr: Box::new(expr),
                         to,
@@ -6494,7 +6677,8 @@ impl Parser {
                 // named e.g. "date" keep working.
                 if Self::is_type_start(&name) {
                     let save = self.pos;
-                    if let Ok(to) = self.parse_type_name_rest(name.clone()) {
+                    // v0.81: named composites are not typed literals.
+                    if let Ok((to, None)) = self.parse_type_name_rest(name.clone()) {
                         if let Token::Str(s) = self.peek() {
                             let s = s.clone();
                             self.next();
@@ -6546,7 +6730,8 @@ impl Parser {
                 // backtrack when no string literal follows, like unquoted.
                 if Self::is_type_start(&name) {
                     let save = self.pos;
-                    if let Ok(to) = self.parse_quoted_type_name(name.clone()) {
+                    // v0.81: named composites are not typed literals.
+                    if let Ok((to, None)) = self.parse_quoted_type_name(name.clone()) {
                         if let Token::Str(s) = self.peek() {
                             let s = s.clone();
                             self.next();
@@ -6746,6 +6931,25 @@ impl Parser {
     /// 54000 "number of array dimensions exceeds the maximum allowed
     /// (6)". Binds tighter than `::`, like PG19's indirection.
     fn parse_postfix_subscripts(&mut self, mut expr: Expr) -> Result<Expr, SqlError> {
+        // v0.81: composite field access `(expr).field` (PG19 indirection).
+        // Qualified `tbl.col` is consumed in the Ident branch, so a `.`
+        // here always follows a parenthesized/composite expression.
+        // Multiple levels `(r).a.b` nest left-associatively.
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    // `tbl.*` whole-row is handled in the Ident branch;
+                    // a `.` here must be followed by a field name.
+                    self.next(); // consume '.'
+                    let field = self.expect_ident()?;
+                    expr = Expr::FieldAccess {
+                        expr: Box::new(expr),
+                        field,
+                    };
+                }
+                _ => break,
+            }
+        }
         // (lower, upper, is_slice) per bracket pair.
         let mut items: Vec<(Option<Expr>, Option<Expr>, bool)> = Vec::new();
         while *self.peek() == Token::LBracket {
@@ -6837,7 +7041,8 @@ impl Parser {
         // argument (e.g. `float8(count(*))`).
         if Self::is_type_start(&name) {
             let save = self.pos;
-            if let Ok(to) = self.parse_type_name_rest(name.clone()) {
+            // v0.81: named composites are not func-style casts.
+            if let Ok((to, None)) = self.parse_type_name_rest(name.clone()) {
                 if *self.peek() == Token::LParen {
                     self.next();
                     if let Ok(expr) = self.parse_or() {
@@ -7598,7 +7803,9 @@ impl Parser {
             self.next();
             let mut ts = Vec::new();
             loop {
-                let ct = self.parse_type_name()?;
+                // v0.81: named composites in PREPARE type lists map to
+                // "unknown" (no param typing for composites yet).
+                let (ct, _) = self.parse_type_name()?;
                 // Normalized name for the arity check / error messages.
                 let tn = match ct {
                     crate::storage::ColType::Int => "integer",
@@ -9921,6 +10128,16 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(left, what)?;
             validate_constraint_expr(right, what)
         }
+        // v0.81: composite expressions — validate sub-expressions.
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+            validate_constraint_expr(expr, what)
+        }
+        Expr::Row(elems) => {
+            for e in elems {
+                validate_constraint_expr(e, what)?;
+            }
+            Ok(())
+        }
         Expr::Cast { expr, .. } => validate_constraint_expr(expr, what),
         // v0.79: array constructors/subscripts are fine in CHECK /
         // DEFAULT (no subqueries, no aggregates inside them — enforced
@@ -10126,6 +10343,29 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(expr, out);
             out.push(')');
         }
+        // v0.81: composite expressions.
+        Expr::CastNamed { expr, name } => {
+            out.push_str("(castnamed ");
+            sexpr_escape(name, out);
+            out.push(' ');
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        Expr::Row(elems) => {
+            out.push_str("(row");
+            for e in elems {
+                out.push(' ');
+                encode_expr_inner(e, out);
+            }
+            out.push(')');
+        }
+        Expr::FieldAccess { expr, field } => {
+            out.push_str("(fieldacc ");
+            sexpr_escape(field, out);
+            out.push(' ');
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
         Expr::Concat(a, b) => {
             out.push_str("(concat ");
             encode_expr_inner(a, out);
@@ -10256,6 +10496,8 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
                 CmpOp::Le => "le",
                 CmpOp::Gt => "gt",
                 CmpOp::Ge => "ge",
+                // v0.81: `*=` record-image equality.
+                CmpOp::ImageEq => "imageeq",
             };
             out.push_str(&format!("(cmp {} ", o));
             encode_expr_inner(left, out);

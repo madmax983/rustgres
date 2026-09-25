@@ -371,9 +371,11 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             tag: "CREATE STATISTICS".to_string(),
         }),
         // --- v0.22: bounded CREATE TYPE ---
-        Stmt::CreateType { name, like_base } => {
-            exec_create_type(eng, ctx, name, like_base.as_deref())
-        }
+        Stmt::CreateType {
+            name,
+            like_base,
+            composite,
+        } => exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref()),
         Stmt::DropType { names, if_exists } => exec_drop_type(eng, ctx, names, *if_exists),
         // --- v0.11: roles and privileges ---
         Stmt::CreateRole {
@@ -2052,6 +2054,22 @@ fn create_table_from_def(
     // so both the temp and permanent paths below see the merged def.
     let mut like_def = def.clone();
     expand_like_clauses(eng, ctx, name, &mut like_def)?;
+    // v0.81: validate named composite columns — each `ColType::Composite`
+    // must name a defined composite type (42704 otherwise, like PG).
+    for (i, (_, ty)) in like_def.columns.iter().enumerate() {
+        if *ty == ColType::Composite {
+            let tname = like_def.composite_types.get(i).and_then(|o| o.as_deref());
+            match tname.and_then(|n| eng.db.types.get(n)) {
+                Some(st) if st.composite.is_some() => {}
+                _ => {
+                    return Err(exec_err(
+                        "42704",
+                        format!("type \"{}\" does not exist", tname.unwrap_or("<unknown>")),
+                    ));
+                }
+            }
+        }
+    }
     // v0.72: validate the recognized `WITH (...)` storage parameters
     // (PG19 reloptions.c); unrecognized ones are accepted and ignored.
     validate_reloptions(&like_def.reloptions)?;
@@ -2079,6 +2097,10 @@ fn create_table_from_def(
                     continue;
                 }
                 merged.columns.push((col.clone(), ty.clone()));
+                // v0.81: inherit the composite type name too.
+                merged
+                    .composite_types
+                    .push(parent.composite_types.get(i).cloned().unwrap_or(None));
                 merged
                     .not_null
                     .push(parent.not_null.get(i).copied().unwrap_or(false));
@@ -2096,6 +2118,8 @@ fn create_table_from_def(
         for (i, (col, ty)) in like_def.columns.iter().enumerate() {
             if let Some(pos) = merged.columns.iter().position(|(n, _)| n == col) {
                 merged.columns[pos] = (col.clone(), ty.clone());
+                merged.composite_types[pos] =
+                    like_def.composite_types.get(i).cloned().unwrap_or(None);
                 merged.not_null[pos] = like_def.not_null.get(i).copied().unwrap_or(false);
                 merged.defaults[pos] = like_def.defaults.get(i).cloned().unwrap_or(None);
                 merged.serial[pos] = like_def.serial.get(i).cloned().unwrap_or(None);
@@ -2103,6 +2127,10 @@ fn create_table_from_def(
                 merged.storage[pos] = like_def.storage.get(i).cloned().unwrap_or(None);
             } else {
                 merged.columns.push((col.clone(), ty.clone()));
+                // v0.81: composite type name for the new column.
+                merged
+                    .composite_types
+                    .push(like_def.composite_types.get(i).cloned().unwrap_or(None));
                 merged
                     .not_null
                     .push(like_def.not_null.get(i).copied().unwrap_or(false));
@@ -2160,6 +2188,7 @@ fn create_table_from_def(
                         )
                     })?;
                 def.columns = parent.columns.clone();
+                def.composite_types = parent.composite_types.clone();
                 def.not_null = parent.not_null.clone();
                 def.defaults = parent.defaults.clone();
                 def.checks = parent.checks.clone();
@@ -2278,6 +2307,7 @@ fn create_table_from_def(
                 })?;
             // Inherit columns (PG copies the parent's rowtype).
             def.columns = parent.columns.clone();
+            def.composite_types = parent.composite_types.clone();
             def.not_null = parent.not_null.clone();
             def.defaults = parent.defaults.clone();
             def.checks = parent.checks.clone();
@@ -3400,6 +3430,12 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
     if v == Value::Null || v.col_type() == *col_type {
         return Ok(v);
     }
+    // v0.81: a Record value (from ROW(...) or a named-composite cast)
+    // assigns into a Composite column directly — the fields were
+    // already coerced at cast time.
+    if matches!(v, Value::Record(_)) && matches!(col_type, ColType::Composite) {
+        return Ok(v);
+    }
     // v0.65: narrowing integer assignments (PG's assignment casts, e.g.
     // nextval()'s bigint into a serial integer column). Overflow is
     // PG19's 22003, not a type mismatch.
@@ -4408,6 +4444,7 @@ fn exec_create_table_as(
     let ncols = columns.len();
     let def = crate::sql::TableDef {
         columns,
+        composite_types: vec![None; ncols],
         not_null: vec![false; ncols],
         defaults: vec![None; ncols],
         serial: vec![None; ncols],
@@ -8982,6 +9019,11 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             | Expr::Param(_) => false,
             Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Cast { expr, .. } => expr_uses(expr),
+            // v0.81: row constructors, named casts and field accesses
+            // recurse into their operand(s).
+            Expr::CastNamed { expr, .. } => expr_uses(expr),
+            Expr::Row(elems) => elems.iter().any(expr_uses),
+            Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
             Expr::Like {
                 expr,
@@ -9224,6 +9266,19 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::Cast { expr, to } => Ok(Expr::Cast {
             expr: Box::new(r(expr)?),
             to: *to,
+        }),
+        // v0.81: named casts, row constructors and field accesses
+        // rebuild with resolved operands.
+        Expr::CastNamed { expr, name } => Ok(Expr::CastNamed {
+            expr: Box::new(r(expr)?),
+            name: name.clone(),
+        }),
+        Expr::Row(elems) => Ok(Expr::Row(
+            elems.iter().map(r).collect::<Result<Vec<_>, _>>()?,
+        )),
+        Expr::FieldAccess { expr, field } => Ok(Expr::FieldAccess {
+            expr: Box::new(r(expr)?),
+            field: field.clone(),
         }),
         Expr::Like {
             expr,
@@ -10898,6 +10953,9 @@ fn contains_agg(e: &Expr) -> bool {
         | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
         // v0.79: array operands can hide aggregates — recurse.
         Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_agg),
+        // v0.81: composite operands can hide aggregates — recurse.
+        Expr::Row(elems) => elems.iter().any(contains_agg),
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => contains_agg(expr),
         Expr::Subscript { array, indices } => {
             contains_agg(array) || indices.iter().any(contains_agg)
         }
@@ -10975,6 +11033,13 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
                 stack.push(left);
                 stack.push(right);
+            }
+            // v0.81: composite expressions — visit sub-expressions.
+            Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+                stack.push(expr);
+            }
+            Expr::Row(elems) => {
+                stack.extend(elems.iter());
             }
             Expr::Not(x) | Expr::BitNot(x) | Expr::Neg(x) => stack.push(x),
             Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => stack.push(x),
@@ -11232,6 +11297,9 @@ fn contains_window(e: &Expr) -> bool {
         | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
         // v0.79: array operands can hide window functions — recurse.
         Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_window),
+        // v0.81: composite operands can hide window functions — recurse.
+        Expr::Row(elems) => elems.iter().any(contains_window),
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => contains_window(expr),
         Expr::Subscript { array, indices } => {
             contains_window(array) || indices.iter().any(contains_window)
         }
@@ -11498,6 +11566,16 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         Expr::Cmp { left, right, .. } => {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)
+        }
+        // v0.81: composite expressions — validate sub-expressions.
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+            validate_window_expr(expr, in_agg)
+        }
+        Expr::Row(elems) => {
+            for e in elems {
+                validate_window_expr(e, in_agg)?;
+            }
+            Ok(())
         }
         Expr::Like { expr, pattern, .. } => {
             validate_window_expr(expr, in_agg)?;
@@ -12982,6 +13060,15 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             for e in elems {
                 collect_column_refs(e, out);
             }
+        }
+        // v0.81: composite expressions depend on their operands' columns.
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_column_refs(e, out);
+            }
+        }
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+            collect_column_refs(expr, out);
         }
         Expr::Subscript { array, indices } => {
             collect_column_refs(array, out);
@@ -15587,6 +15674,44 @@ fn eval_grouped(
             )?;
             eval_cast(&v, *to)
         }
+        // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
+        // PG's `f1`, `f2`, ... field names.
+        Expr::Row(elems) => {
+            let mut fields = Vec::with_capacity(elems.len());
+            for (i, e) in elems.iter().enumerate() {
+                let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, e)?;
+                fields.push((format!("f{}", i + 1), v));
+            }
+            Ok(Value::Record(fields))
+        }
+        // v0.81: `(expr).field` — composite field access.
+        Expr::FieldAccess { expr, field } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            match v {
+                Value::Record(fields) => fields
+                    .into_iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, v)| v)
+                    .ok_or_else(|| {
+                        exec_err("42703", format!("column \"{}\" not found in record", field))
+                    }),
+                Value::Null => Ok(Value::Null),
+                _ => Err(exec_err(
+                    "42809",
+                    "cannot access field of non-composite value".to_string(),
+                )),
+            }
+        }
+        // v0.81: `expr::named_composite` — resolves the type name against
+        // the catalog (42704 if undefined), then coerces the record.
+        Expr::CastNamed { expr, name } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            eval_cast_named(q, &v, name)
+        }
         Expr::Concat(a, b) => {
             let va = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
             let vb = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, b)?;
@@ -17659,6 +17784,40 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             }
             eval_cast(&v, *to)
         }
+        // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
+        // PG's `f1`, `f2`, ... field names.
+        Expr::Row(elems) => {
+            let mut fields = Vec::with_capacity(elems.len());
+            for (i, e) in elems.iter().enumerate() {
+                let v = eval_expr(q, scopes, e)?;
+                fields.push((format!("f{}", i + 1), v));
+            }
+            Ok(Value::Record(fields))
+        }
+        // v0.81: `(expr).field` — composite field access.
+        Expr::FieldAccess { expr, field } => {
+            let v = eval_expr(q, scopes, expr)?;
+            match v {
+                Value::Record(fields) => fields
+                    .into_iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, v)| v)
+                    .ok_or_else(|| {
+                        exec_err("42703", format!("column \"{}\" not found in record", field))
+                    }),
+                Value::Null => Ok(Value::Null),
+                _ => Err(exec_err(
+                    "42809",
+                    "cannot access field of non-composite value".to_string(),
+                )),
+            }
+        }
+        // v0.81: `expr::named_composite` — resolves the type name against
+        // the catalog (42704 if undefined), then coerces the record.
+        Expr::CastNamed { expr, name } => {
+            let v = eval_expr(q, scopes, expr)?;
+            eval_cast_named(q, &v, name)
+        }
         Expr::Concat(a, b) => {
             let va = eval_expr(q, scopes, a)?;
             let vb = eval_expr(q, scopes, b)?;
@@ -18085,12 +18244,22 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_expr(right, f);
         }
         Expr::Cast { expr, .. }
+        // v0.81: named casts and field accesses recurse into their
+        // operand, just like the builtin cast.
+        | Expr::CastNamed { expr, .. }
+        | Expr::FieldAccess { expr, .. }
         | Expr::Not(expr)
         | Expr::BitNot(expr)
         | Expr::Neg(expr)
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. } => walk_expr(expr, f),
+        // v0.81: row constructors recurse into each element.
+        Expr::Row(elems) => {
+            for el in elems {
+                walk_expr(el, f);
+            }
+        }
         Expr::Like {
             expr,
             pattern,
@@ -18785,6 +18954,103 @@ fn date_as_ts(d: i32) -> i64 {
     d as i64 * 86_400_000_000
 }
 
+/// v0.81: PG19 record comparison (`record_eq`, `record_lt`, ...).
+/// Returns `Ok(None)` for NULL (unknown), `Ok(Some(ordering))` otherwise.
+/// `=` semantics: true iff all field pairs are equal; NULL iff some pair
+/// is NULL and none is definitively unequal; false otherwise. Ordering
+/// is lexicographic with NULL sorting larger (PG's ASC NULLS LAST).
+fn cmp_records(
+    fa: &[(String, Value)],
+    fb: &[(String, Value)],
+    op: CmpOp,
+) -> Result<Option<Ordering>, ExecError> {
+    // `*=` is image equality, not semantic comparison.
+    if op == CmpOp::ImageEq {
+        return Ok(Some(if record_image_eq(fa, fb) {
+            Ordering::Equal
+        } else {
+            Ordering::Less
+        }));
+    }
+    if fa.len() != fb.len() {
+        return Err(exec_err(
+            "42883",
+            "cannot compare records with different field counts".to_string(),
+        ));
+    }
+    let mut saw_null = false;
+    for ((_, va), (_, vb)) in fa.iter().zip(fb.iter()) {
+        // NULL handling: for `=`/`<>`, a NULL field makes the result
+        // NULL (unless a definitive inequality is found); for ordering,
+        // NULL sorts larger (PG's default ASC NULLS LAST).
+        let va_null = matches!(va, Value::Null);
+        let vb_null = matches!(vb, Value::Null);
+        if va_null || vb_null {
+            match op {
+                CmpOp::Eq | CmpOp::Ne => {
+                    if va_null != vb_null || !va_null {
+                        // One side NULL, other not: for `=` this is not
+                        // definitive (result NULL); continue checking.
+                    }
+                    saw_null = true;
+                    continue;
+                }
+                _ => match (va_null, vb_null) {
+                    (true, true) => continue,
+                    (true, false) => return Ok(Some(Ordering::Greater)),
+                    (false, true) => return Ok(Some(Ordering::Less)),
+                    (false, false) => unreachable!(),
+                },
+            }
+        }
+        match cmp_ordering(va, vb, CmpOp::Eq)? {
+            None => saw_null = true,
+            Some(Ordering::Equal) => {}
+            Some(ord) => {
+                // For `=`/`<>`, a definitive inequality decides; for
+                // ordering, the first non-equal field decides.
+                match op {
+                    CmpOp::Eq => return Ok(Some(Ordering::Less)),
+                    CmpOp::Ne => return Ok(Some(Ordering::Greater)),
+                    _ => return Ok(Some(ord)),
+                }
+            }
+        }
+    }
+    match op {
+        CmpOp::Eq | CmpOp::Ne => {
+            if saw_null {
+                Ok(None)
+            } else {
+                Ok(Some(Ordering::Equal))
+            }
+        }
+        _ => Ok(Some(Ordering::Equal)),
+    }
+}
+
+/// v0.81: PG19 `record_image_eq` — byte-oriented record identity for
+/// `*=`. NULL/NULL is identical; non-NULL fields use datum image
+/// equality (for numeric, the full image including display scale, so
+/// `1.00` is NOT `*=` `1.0`).
+fn record_image_eq(fa: &[(String, Value)], fb: &[(String, Value)]) -> bool {
+    if fa.len() != fb.len() {
+        return false;
+    }
+    fa.iter().zip(fb.iter()).all(|((_, va), (_, vb))| {
+        match (va, vb) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            (Value::Numeric(a), Value::Numeric(b)) => {
+                a.unscaled == b.unscaled && a.scale == b.scale && a.dscale == b.dscale
+            }
+            // For other types, semantic equality is the image equality
+            // (no separate binary representation is tracked).
+            _ => va == vb,
+        }
+    })
+}
+
 fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, ExecError> {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
@@ -18836,6 +19102,11 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
         // v0.36: PG's "char" comparison is a plain byte comparison
         // (chareq/charlt compare the single byte).
         (Value::SingleChar(x), Value::SingleChar(y)) => Ok(Some(x.cmp(y))),
+        // v0.81: PG19 record comparison (`record_eq`, `record_lt`, ...).
+        // NULL fields: `=` is NULL (not false) if any field pair is
+        // NULL and all others equal; ordering treats NULL as larger
+        // (PG's default NULLS LAST for ASC). Field counts must match.
+        (Value::Record(fa), Value::Record(fb)) => cmp_records(fa, fb, op),
         _ => Err(exec_err(
             "42883",
             format!(
@@ -19119,6 +19390,9 @@ fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
         Some(ord) => Ok(Value::Bool(match op {
             CmpOp::Eq => ord == Ordering::Equal,
             CmpOp::Ne => ord != Ordering::Equal,
+            // v0.81: `*=` is true iff image-equal (Equal from
+            // record_image_eq); never NULL (NULL/NULL is identical).
+            CmpOp::ImageEq => ord == Ordering::Equal,
             CmpOp::Lt => ord == Ordering::Less,
             CmpOp::Le => ord != Ordering::Greater,
             CmpOp::Gt => ord == Ordering::Greater,
@@ -21109,6 +21383,55 @@ fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
     Ok(Value::text(regclass_display(q, oid)))
 }
 
+/// v0.81: cast to a named composite type (`expr::t_rec`). Resolves
+/// `name` against the type catalog (42704 if undefined or not a
+/// composite). A `Value::Record` is coerced field-by-field: the source
+/// must have at least as many fields as the target; extra source fields
+/// are dropped (PG matches by position for ROW() casts); each field is
+/// coerced to the target field type. A non-record source is 42846.
+fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    let st = q
+        .eng
+        .db
+        .types
+        .get(name)
+        .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", name)))?;
+    let fields = st
+        .composite
+        .as_ref()
+        .ok_or_else(|| exec_err("42846", format!("cannot cast type record to {}", name)))?;
+    let src = match v {
+        Value::Record(fields) => fields,
+        _ => {
+            return Err(exec_err(
+                "42846",
+                format!("cannot cast type {:?} to {}", v.col_type(), name),
+            ));
+        }
+    };
+    if src.len() < fields.len() {
+        return Err(exec_err(
+            "42846",
+            format!(
+                "cannot cast record with {} fields to {} with {} fields",
+                src.len(),
+                name,
+                fields.len()
+            ),
+        ));
+    }
+    let mut out = Vec::with_capacity(fields.len());
+    for (i, (fname, fty, _)) in fields.iter().enumerate() {
+        let (_, sv) = &src[i];
+        let cv = eval_cast(sv, *fty)?;
+        out.push((fname.clone(), cv));
+    }
+    Ok(Value::Record(out))
+}
+
 fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     if v == &Value::Null {
         return Ok(Value::Null);
@@ -21361,6 +21684,10 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             }
             other => Err(cast_err(other, &to.sql_name())),
         },
+        // v0.81: the builtin eval_cast never receives a named composite
+        // target (named casts resolve against the type catalog before
+        // reaching it); nothing casts here.
+        ColType::Composite => Err(exec_err("42846", "cannot cast to composite type here")),
     }
 }
 
@@ -28327,6 +28654,45 @@ fn expr_type(
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
+        // v0.81: `ROW(a, b, ...)` evaluates to a composite record value.
+        Expr::Row(elems) => {
+            for e in elems {
+                expr_type(eng, snap, own, session, schemas, outer, ctes, e)?;
+            }
+            Ok(ColType::Record)
+        }
+        // v0.81: `expr::named_composite` — the name must denote a defined
+        // composite type (42704 otherwise, like the execution-time check
+        // in eval_cast_named); the result is the named composite marker.
+        Expr::CastNamed { expr, name } => {
+            expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            match eng.db.types.get(name) {
+                Some(st) if st.composite.is_some() => Ok(ColType::Composite),
+                _ => Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", name),
+                )),
+            }
+        }
+        // v0.81: `(expr).field` — on a `ROW(...)` literal the field
+        // resolves positionally to the element's type (42703 for an
+        // unknown field, like execution); other composites carry PG's
+        // record pseudo-type since the field type isn't tracked.
+        Expr::FieldAccess { expr, field } => {
+            if let Expr::Row(elems) = &**expr {
+                for (i, e) in elems.iter().enumerate() {
+                    if field == &format!("f{}", i + 1) {
+                        return expr_type(eng, snap, own, session, schemas, outer, ctes, e);
+                    }
+                }
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" not found in record", field),
+                ));
+            }
+            expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            Ok(ColType::Record)
+        }
         Expr::BitNot(x) => {
             // v0.25: `~smallint`/`~int` -> int, `~bigint` -> bigint (PG
             // promotes smallint, having no int2not).
@@ -29745,6 +30111,8 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
         // v0.73: record input is not supported (no composite input
         // function); json accepts its text form.
         ColType::Record => Err(bad("invalid input syntax for type record".into())),
+        // v0.81: no composite input function either — same as record.
+        ColType::Composite => Err(bad("invalid input syntax for type composite".into())),
         ColType::Json => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
@@ -30106,6 +30474,9 @@ fn dummy_value(t: &ColType) -> Value {
         // v0.73: records never appear as parameter types in practice;
         // the empty record is the honest dummy.
         ColType::Record => Value::Record(Vec::new()),
+        // v0.81: named composites likewise never appear as parameter
+        // types; the empty record is the honest dummy here too.
+        ColType::Composite => Value::Record(Vec::new()),
         ColType::Json => Value::text(""),
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
@@ -34877,8 +35248,49 @@ fn exec_create_type(
     ctx: &mut StmtCtx,
     name: &str,
     like_base: Option<&str>,
+    composite: Option<&[(String, ColType, Option<String>)]>,
 ) -> Result<ExecResult, ExecError> {
     let prev = eng.db.types.get(name).cloned();
+    // v0.81: `CREATE TYPE name AS (field type, ...)` — named composite.
+    // Redefining any existing type is 42710 (like the shell form).
+    // Field types that are themselves composites must name defined
+    // composite types (42704 otherwise, like PG's "type does not exist").
+    if let Some(fields) = composite {
+        if prev.is_some() {
+            return Err(exec_err(
+                "42710",
+                format!("type \"{}\" already exists", name),
+            ));
+        }
+        for (_, fty, nested) in fields {
+            if *fty == ColType::Composite {
+                let nested_name = nested.as_deref().unwrap_or(name);
+                match eng.db.types.get(nested_name) {
+                    Some(st) if st.composite.is_some() => {}
+                    _ => {
+                        return Err(exec_err(
+                            "42704",
+                            format!("type \"{}\" does not exist", nested_name),
+                        ));
+                    }
+                }
+            }
+        }
+        eng.db.types.insert(
+            name.to_string(),
+            ShellType {
+                like_base: None,
+                composite: Some(fields.to_vec()),
+            },
+        );
+        ctx.writes.push(WriteOp::CreateType {
+            name: name.to_string(),
+            prev,
+        });
+        return Ok(ExecResult::Command {
+            tag: "CREATE TYPE".to_string(),
+        });
+    }
     match like_base {
         None => {
             // Bare `CREATE TYPE name;`: a shell. Redefining is 42710.
@@ -34888,9 +35300,13 @@ fn exec_create_type(
                     format!("type \"{}\" already exists", name),
                 ));
             }
-            eng.db
-                .types
-                .insert(name.to_string(), ShellType { like_base: None });
+            eng.db.types.insert(
+                name.to_string(),
+                ShellType {
+                    like_base: None,
+                    composite: None,
+                },
+            );
         }
         Some(base) => {
             // Completion form: LIKE = <base> must name a known type.
@@ -34900,7 +35316,13 @@ fn exec_create_type(
                     format!("type \"{}\" does not exist", base),
                 ));
             }
-            if matches!(prev, Some(ShellType { like_base: Some(_) })) {
+            if matches!(
+                prev,
+                Some(ShellType {
+                    like_base: Some(_),
+                    ..
+                })
+            ) {
                 return Err(exec_err(
                     "42710",
                     format!("type \"{}\" already exists", name),
@@ -34910,6 +35332,7 @@ fn exec_create_type(
                 name.to_string(),
                 ShellType {
                     like_base: Some(base.to_string()),
+                    composite: None,
                 },
             );
         }
@@ -36302,6 +36725,16 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_col_in_expr(right, old, new);
         }
         Expr::Cast { expr, .. } => rename_col_in_expr(expr, old, new),
+        // v0.81: named casts, row constructors and field accesses
+        // recurse into their operand(s), mutating in place.
+        Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+            rename_col_in_expr(expr, old, new)
+        }
+        Expr::Row(elems) => {
+            for e in elems {
+                rename_col_in_expr(e, old, new);
+            }
+        }
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             rename_col_in_expr(a, old, new);
             rename_col_in_expr(b, old, new);

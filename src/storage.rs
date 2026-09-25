@@ -75,6 +75,12 @@ pub enum ColType {
     // engine does not track per-table rowtype OIDs (a documented gap);
     // 2249 is PG's genuine `record` pseudo-type OID.
     Record, // OID 2249
+    // v0.81: named composite type marker (`CREATE TYPE name AS (...)`).
+    // The type name is tracked alongside the ColType (in `Expr::CastNamed`,
+    // table definitions, etc.) because `ColType` is `Copy` and cannot
+    // hold a `String`; the definition is resolved from the type catalog
+    // at execution time. Carries PG's `record` OID family semantics.
+    Composite,
     // v0.73: PG's `json` type (OID 114) — the return type of
     // `row_to_json`. Values are carried as `Value::Text` holding the
     // JSON document text.
@@ -144,6 +150,8 @@ impl ArrayElem {
             ColType::Regclass => ArrayElem::Regclass,
             ColType::Json => ArrayElem::Json,
             ColType::Record => ArrayElem::Record,
+            // v0.81: named composites are not arrayable yet.
+            ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
         }
     }
@@ -254,7 +262,9 @@ impl ColType {
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
             ColType::Name => 19,          // NAME (v0.57)
             ColType::Record => 2249,      // RECORD (v0.73)
-            ColType::Json => 114,         // JSON (v0.73)
+            // v0.81: named composite; PG uses the rowtype OID, we use record's.
+            ColType::Composite => 2249,
+            ColType::Json => 114, // JSON (v0.73)
             // v0.78: PG's _<elem> array OIDs (pg_type.dat).
             ColType::Array(e) => e.array_oid() as i32,
         }
@@ -290,7 +300,9 @@ impl ColType {
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
-            ColType::Json => "json",     // v0.73
+            // v0.81: resolved to the actual name at execution time.
+            ColType::Composite => "record",
+            ColType::Json => "json", // v0.73
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -328,7 +340,9 @@ impl ColType {
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
-            ColType::Json => "json",     // v0.73
+            // v0.81: resolved to the actual name at execution time.
+            ColType::Composite => "record",
+            ColType::Json => "json", // v0.73
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -4627,6 +4641,9 @@ impl RowVersion {
 #[derive(Clone, Debug)]
 pub struct Table {
     pub columns: Vec<(String, ColType)>,
+    /// v0.81: named composite type per column, parallel to `columns`
+    /// (`Some(name)` iff the column's `ColType` is `Composite`).
+    pub composite_types: Vec<Option<String>>,
     pub rows: Vec<RowVersion>,
     /// Row-version id -> position in `rows`. Keeps id lookups O(1) so
     /// multi-row writes don't degrade to O(rows) per row.
@@ -4686,6 +4703,8 @@ impl Table {
             .collect();
         Table {
             columns,
+            // v0.81: no named composites by default.
+            composite_types: vec![None; n],
             rows: Vec::new(),
             row_index: HashMap::new(),
             created_xmin,
@@ -4723,6 +4742,8 @@ impl Table {
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
         t.fks = def.fks.clone();
+        // v0.81: named composite types per column.
+        t.composite_types = def.composite_types.clone();
         // v0.72: per-column STORAGE overrides (LIKE ... INCLUDING
         // STORAGE); `None` keeps the type default from `Table::new`.
         for (i, s) in def.storage.iter().enumerate() {
@@ -4794,6 +4815,11 @@ pub const NO_SESSION: u64 = u64::MAX;
 pub struct ShellType {
     /// Base type name from LIKE = <base>; None while still a shell.
     pub like_base: Option<String>,
+    /// v0.81: `CREATE TYPE name AS (field type, ...)` composite
+    /// definition — ordered `(field_name, ColType,
+    /// nested_composite_name)` triples. None for shell/LIKE types.
+    /// Not WAL-logged (documented gap); transactional via the undo log.
+    pub composite: Option<Vec<(String, ColType, Option<String>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -5576,6 +5602,15 @@ pub struct Engine {
     /// v0.13: replication slots by name. Cluster-global, non-transactional;
     /// WAL-logged (ReplSlot* records) and checkpointed for durability.
     pub repl_slots: HashMap<String, ReplSlot>,
+    /// v0.81: catalog epoch, bumped by every successful DDL statement.
+    /// Sessions cache parsed ASTs keyed by (query text, epoch); a bump
+    /// invalidates all cached parses, mirroring PostgreSQL's plan-cache
+    /// invalidation on catalog changes. The cached ASTs are purely
+    /// syntactic (names, not resolved objects), so a stale entry would
+    /// still parse — the epoch is conservative hygiene for the day
+    /// parsing becomes catalog-sensitive, and it matches PG's
+    /// architecture where the plan cache keys off catalog versions.
+    pub catalog_epoch: u64,
 }
 
 impl Engine {
@@ -5594,6 +5629,8 @@ impl Engine {
             seq_advanced: Vec::new(),
             // v0.13: replication slots.
             repl_slots: HashMap::new(),
+            // v0.81: catalog epoch for parse-cache invalidation.
+            catalog_epoch: 0,
         }
     }
 

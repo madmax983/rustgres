@@ -102,7 +102,29 @@ pub(crate) struct Session {
     /// compressor TOAST uses for columns without an explicit
     /// `COMPRESSION` method. Default is pglz.
     default_toast_compression: crate::storage::ToastCompression,
+    /// v0.81: parsed-AST cache for the extended protocol. Keyed by the
+    /// exact query text of a Parse message; each entry records the
+    /// catalog epoch it was parsed under. A hit (epoch matches) skips
+    /// `sql::parse_statement` entirely and clones the cached `Stmt`;
+    /// parameter substitution still happens fresh per Bind. Bounded
+    /// (`PARSE_CACHE_CAP`); `parse_cache_order` is FIFO eviction order.
+    parse_cache: HashMap<String, CachedParse>,
+    parse_cache_order: std::collections::VecDeque<String>,
+    /// v0.81: parse-cache hit/miss counters (for benchmarks/tests).
+    parse_cache_hits: u64,
+    parse_cache_misses: u64,
 }
+
+/// v0.81: one cached parsed statement: the AST plus the catalog epoch it
+/// was parsed under. `Stmt` is purely syntactic, so the epoch is
+/// conservative invalidation (mirrors PG's plan-cache versioning).
+struct CachedParse {
+    epoch: u64,
+    stmt: Stmt,
+}
+
+/// v0.81: maximum parsed ASTs cached per session.
+const PARSE_CACHE_CAP: usize = 256;
 
 /// v0.17: honest version identity. rustgres reports its OWN version, not
 /// a PostgreSQL version it claims to be: the server speaks protocol 3.0
@@ -236,6 +258,43 @@ fn revert_guc_stack(session: &mut Session, stack: Vec<GucStackEntry>, commit: bo
 }
 
 impl Session {
+    /// v0.81: parsed-AST cache lookup. Returns the cached `Stmt` clone on
+    /// a hit (epoch matches), or parses, caches, and returns on a miss.
+    /// Failed parses are not cached. FIFO-evicted at `PARSE_CACHE_CAP`.
+    pub(crate) fn cached_parse(
+        &mut self,
+        engine: &mut crate::storage::Engine,
+        query: &str,
+    ) -> Result<crate::sql::Stmt, crate::sql::SqlError> {
+        let epoch = engine.catalog_epoch;
+        match self.parse_cache.get(query) {
+            Some(cached) if cached.epoch == epoch => {
+                self.parse_cache_hits += 1;
+                Ok(cached.stmt.clone())
+            }
+            _ => {
+                self.parse_cache_misses += 1;
+                let s = crate::sql::parse_statement(query)?;
+                if !self.parse_cache.contains_key(query) {
+                    if self.parse_cache.len() >= PARSE_CACHE_CAP {
+                        if let Some(old) = self.parse_cache_order.pop_front() {
+                            self.parse_cache.remove(&old);
+                        }
+                    }
+                    self.parse_cache_order.push_back(query.to_string());
+                }
+                self.parse_cache.insert(
+                    query.to_string(),
+                    CachedParse {
+                        epoch,
+                        stmt: s.clone(),
+                    },
+                );
+                Ok(s)
+            }
+        }
+    }
+
     pub(crate) fn new(role: String) -> Self {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
@@ -254,6 +313,11 @@ impl Session {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v0.81: parsed-AST cache starts empty.
+            parse_cache: HashMap::new(),
+            parse_cache_order: std::collections::VecDeque::new(),
+            parse_cache_hits: 0,
+            parse_cache_misses: 0,
         }
     }
 }
@@ -804,7 +868,7 @@ fn message_loop(
                 let sql_text = cur.read_cstring()?;
                 handle_query(reader, writer, engine, wal, session, &sql_text)?;
             }
-            b'P' => handle_parse(writer, session, &msg.payload)?,
+            b'P' => handle_parse(writer, engine, session, &msg.payload)?,
             b'B' => handle_bind(writer, engine, session, &msg.payload)?,
             b'D' => handle_describe(writer, engine, session, &msg.payload)?,
             b'E' => handle_execute(reader, writer, engine, wal, session, &msg.payload)?,
@@ -2202,7 +2266,9 @@ fn run_statement(
             });
         }
     }
-    match stmt {
+    // v0.81: capture the dispatch result so successful DDL can bump
+    // the catalog epoch (invalidates sessions' parsed-AST caches).
+    let result = match stmt {
         Stmt::Begin {
             level,
             read_only,
@@ -2342,7 +2408,15 @@ fn run_statement(
                 )
             }
         }
+    };
+    // v0.81: successful DDL bumps the catalog epoch, invalidating cached
+    // parsed ASTs (they're syntactic, so this is conservative — but it
+    // mirrors PG's plan-cache invalidation and keeps the cache honest if
+    // parsing ever becomes catalog-sensitive).
+    if result.is_ok() && stmt.is_catalog_changing() {
+        engine.lock().unwrap().catalog_epoch += 1;
     }
+    result
 }
 
 /// A WAL/filesystem failure becomes SQLSTATE 58000 (system_error).
@@ -2989,7 +3063,12 @@ const ABORTED_MSG: &str =
 // ---------------------------------------------------------------------------
 
 /// Parse: statement name, query string, param OIDs. Stores the parsed AST.
-fn handle_parse(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> io::Result<()> {
+fn handle_parse(
+    stream: &mut Writer,
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    payload: &[u8],
+) -> io::Result<()> {
     let mut cur = Cursor::new(payload);
     let name = cur.read_cstring()?;
     let query = cur.read_cstring()?;
@@ -3002,10 +3081,13 @@ fn handle_parse(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> i
         declared_oids.push(cur.read_i32()?);
     }
 
+    // v0.81: parsed-AST cache via `Session::cached_parse`. A hit
+    // clones the cached Stmt — parameter substitution still happens
+    // fresh per Bind.
     let stmt = if query.trim().is_empty() {
         None
     } else {
-        match sql::parse_statement(&query) {
+        match session.cached_parse(&mut engine.lock().unwrap(), &query) {
             Ok(s) => Some(s),
             Err(e) => {
                 return protocol_error(
@@ -3570,6 +3652,11 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v0.81: parse cache.
+            parse_cache: HashMap::new(),
+            parse_cache_order: std::collections::VecDeque::new(),
+            parse_cache_hits: 0,
+            parse_cache_misses: 0,
             txn: Some(Txn {
                 xid,
                 level,
@@ -3753,6 +3840,11 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v0.81: parse cache.
+            parse_cache: HashMap::new(),
+            parse_cache_order: std::collections::VecDeque::new(),
+            parse_cache_hits: 0,
+            parse_cache_misses: 0,
         }
     }
 
@@ -3993,5 +4085,100 @@ mod tests {
             err.message,
             "unrecognized configuration parameter \"nosuchguc\""
         );
+    }
+
+    // v0.81: parsed-AST cache — hits, misses, DDL invalidation, capacity.
+    #[test]
+    fn v81_parse_cache_hit_and_miss() {
+        let mut engine = Engine::new();
+        let mut session = session_no_txn();
+        // First Parse: miss.
+        let stmt1 = session
+            .cached_parse(&mut engine, "SELECT 1")
+            .expect("parses");
+        assert_eq!(session.parse_cache_misses, 1);
+        assert_eq!(session.parse_cache_hits, 0);
+        // Second Parse of identical text: hit, same AST shape.
+        let stmt2 = session
+            .cached_parse(&mut engine, "SELECT 1")
+            .expect("parses");
+        assert_eq!(session.parse_cache_misses, 1);
+        assert_eq!(session.parse_cache_hits, 1);
+        assert_eq!(format!("{:?}", stmt1), format!("{:?}", stmt2));
+        // Different text: miss.
+        let _ = session
+            .cached_parse(&mut engine, "SELECT 2")
+            .expect("parses");
+        assert_eq!(session.parse_cache_misses, 2);
+        assert_eq!(session.parse_cache_hits, 1);
+    }
+
+    #[test]
+    fn v81_parse_cache_ddl_invalidation() {
+        let mut engine = Engine::new();
+        let mut session = session_no_txn();
+        let _ = session
+            .cached_parse(&mut engine, "SELECT * FROM t")
+            .expect("parses");
+        assert_eq!(session.parse_cache_misses, 1);
+        // DDL bumps the catalog epoch; the cached entry is stale.
+        engine.catalog_epoch += 1;
+        let _ = session
+            .cached_parse(&mut engine, "SELECT * FROM t")
+            .expect("parses");
+        assert_eq!(session.parse_cache_misses, 2);
+        assert_eq!(session.parse_cache_hits, 0);
+    }
+
+    #[test]
+    fn v81_parse_cache_fifo_capacity() {
+        let mut engine = Engine::new();
+        let mut session = session_no_txn();
+        // Fill beyond capacity; the cache must stay bounded.
+        for i in 0..(PARSE_CACHE_CAP + 10) {
+            let sql = format!("SELECT {}", i);
+            session.cached_parse(&mut engine, &sql).expect("parses");
+        }
+        assert!(session.parse_cache.len() <= PARSE_CACHE_CAP);
+        assert_eq!(session.parse_cache_order.len(), session.parse_cache.len());
+        // The earliest entries were evicted.
+        assert!(!session.parse_cache.contains_key("SELECT 0"));
+        // A recent entry is still cached: hit.
+        let hits_before = session.parse_cache_hits;
+        session
+            .cached_parse(&mut engine, &format!("SELECT {}", PARSE_CACHE_CAP + 9))
+            .expect("parses");
+        assert_eq!(session.parse_cache_hits, hits_before + 1);
+    }
+
+    #[test]
+    fn v81_is_catalog_changing_ddl() {
+        use crate::sql::{Stmt, parse_statement};
+        // DDL statements bump the catalog epoch.
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN b int",
+            "CREATE VIEW v AS SELECT 1",
+            "DROP VIEW v",
+            "CREATE TYPE t2 AS (x int)",
+            "DROP TYPE t2",
+        ] {
+            let stmt = parse_statement(sql).expect("parses");
+            assert!(
+                stmt.is_catalog_changing(),
+                "{} should be catalog-changing",
+                sql
+            );
+        }
+        // Non-DDL does not.
+        for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN", "COMMIT"] {
+            let stmt = parse_statement(sql).expect("parses");
+            assert!(
+                !stmt.is_catalog_changing(),
+                "{} should not be catalog-changing",
+                sql
+            );
+        }
     }
 }

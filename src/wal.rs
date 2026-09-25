@@ -1088,6 +1088,12 @@ impl Enc {
                 self.u8(20);
                 return;
             }
+            // v0.81: named composite; tag 23. The name is not stored
+            // (WAL keeps the marker; the catalog is rebuilt from SQL).
+            ColType::Composite => {
+                self.u8(23);
+                return;
+            }
             ColType::Json => {
                 self.u8(21);
                 return;
@@ -1683,6 +1689,8 @@ impl<'a> Dec<'a> {
             19 => Ok(ColType::PgLsn),
             // v0.73: record, json.
             20 => Ok(ColType::Record),
+            // v0.81: named composite marker.
+            23 => Ok(ColType::Composite),
             21 => Ok(ColType::Json),
             // v0.78: array, then the PG array OID identifying the
             // element type.
