@@ -1850,12 +1850,12 @@ impl<'a> Dec<'a> {
                 for _ in 0..nelems {
                     elems.push(self.value()?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims,
                     lower,
                     elems,
-                }))
+                })))
             }
             // v0.84: composite values (tag 18; mirrors the encoder).
             18 => {

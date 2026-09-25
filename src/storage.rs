@@ -3927,7 +3927,16 @@ pub enum Value {
     // two dims). Elements are row-major; `Value::Null` marks SQL NULL
     // elements. `lower` holds PG's per-dimension lower bounds (default
     // 1; slices preserve the source bounds, e.g. `[2:3]`).
-    Array(ArrayVal),
+    //
+    // Boxed: `ArrayVal` (3 Vecs inline) is the largest field any Value
+    // variant carries, so embedding it by value forces every Value —
+    // including the common scalar cases (Int, Bool, ...) that never
+    // touch an array — to be sized and moved/cloned at ArrayVal's width.
+    // One indirection here shrinks `size_of::<Value>()` for every Value
+    // in the system; ArrayVal itself already owns 3 heap-allocated Vecs,
+    // so one more pointer's worth of indirection for actual array values
+    // is negligible.
+    Array(Box<ArrayVal>),
     Null,
 }
 
