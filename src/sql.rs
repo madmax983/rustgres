@@ -986,6 +986,9 @@ pub enum AggFunc {
     VariancePop,
     StddevSamp,
     StddevPop,
+    // v0.91: `array_agg(x)` — collect non-null inputs into a 1-D array
+    // (multidimensional when the input is itself an array, like PG).
+    ArrayAgg,
 }
 
 impl AggFunc {
@@ -1002,6 +1005,7 @@ impl AggFunc {
             AggFunc::VariancePop => "var_pop",
             AggFunc::StddevSamp => "stddev",
             AggFunc::StddevPop => "stddev_pop",
+            AggFunc::ArrayAgg => "array_agg",
         }
     }
 }
@@ -7145,36 +7149,57 @@ impl Parser {
             return Ok(expr);
         }
         // Subquery form.
-        if !matches!(self.peek(), Token::Ident(s) if s == "select") {
-            return Err(err(
-                "syntax error: expected SELECT or VALUES after ANY/ALL/SOME".to_string(),
-            ));
+        if matches!(self.peek(), Token::Ident(s) if s == "select") {
+            let sub = self.parse_subquery()?;
+            self.expect(Token::RParen, "')'")?;
+            // `= ANY/SOME` is `IN`, `<> ALL` is `NOT IN` (scalar or row-wise).
+            match (&op, quant_kind) {
+                (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
+                    return Ok(Expr::InSub {
+                        expr: Box::new(left),
+                        sub: Box::new(sub),
+                        neg: false,
+                    });
+                }
+                (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
+                    return Ok(Expr::InSub {
+                        expr: Box::new(left),
+                        sub: Box::new(sub),
+                        neg: true,
+                    });
+                }
+                _ => {}
+            }
+            return Ok(Expr::Quantified {
+                left: Box::new(left),
+                op,
+                quant: quant_kind,
+                sub: Box::new(sub),
+            });
         }
-        let sub = self.parse_subquery()?;
+        // v0.91: array form — `expr op ANY|ALL|SOME (array_expr)`
+        // (PG19). Desugared to the hidden `__any_all_array` builtin
+        // (same trick as the `__variadic` marker): the executor
+        // iterates the array with PG's three-valued ANY/ALL logic.
+        let arr = self.parse_or()?;
         self.expect(Token::RParen, "')'")?;
-        // `= ANY/SOME` is `IN`, `<> ALL` is `NOT IN` (scalar or row-wise).
-        match (&op, quant_kind) {
-            (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
-                return Ok(Expr::InSub {
-                    expr: Box::new(left),
-                    sub: Box::new(sub),
-                    neg: false,
-                });
-            }
-            (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
-                return Ok(Expr::InSub {
-                    expr: Box::new(left),
-                    sub: Box::new(sub),
-                    neg: true,
-                });
-            }
-            _ => {}
-        }
-        Ok(Expr::Quantified {
-            left: Box::new(left),
-            op,
-            quant: quant_kind,
-            sub: Box::new(sub),
+        let op_txt = match &op {
+            QuantOp::Cmp(c) => c.sql().to_string(),
+            QuantOp::User(name) => format!("user:{}", name),
+        };
+        let quant_txt = if quant_kind == QuantKind::All {
+            "all"
+        } else {
+            "any"
+        };
+        Ok(Expr::Func {
+            name: "__any_all_array".to_string(),
+            args: vec![
+                left,
+                Expr::Literal(Literal::Text(op_txt.into())),
+                Expr::Literal(Literal::Text(quant_txt.into())),
+                arr,
+            ],
         })
     }
 
@@ -8056,6 +8081,7 @@ impl Parser {
             "var_pop" => Some(AggFunc::VariancePop),
             "stddev" | "stddev_samp" => Some(AggFunc::StddevSamp),
             "stddev_pop" => Some(AggFunc::StddevPop),
+            "array_agg" => Some(AggFunc::ArrayAgg),
             _ => None,
         };
         if let Some(func) = agg {

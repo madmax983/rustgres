@@ -12790,7 +12790,8 @@ fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         | AggFunc::VarianceSamp
         | AggFunc::VariancePop
         | AggFunc::StddevSamp
-        | AggFunc::StddevPop => n == 1,
+        | AggFunc::StddevPop
+        | AggFunc::ArrayAgg => n == 1,
         AggFunc::StringAgg => false,
     }
 }
@@ -13876,6 +13877,15 @@ fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
             "0A000",
             "string_agg is not supported as a window function",
         )),
+        // v0.91: PG19 supports array_agg as a window function. NULLs
+        // are filtered by the caller, exactly like the grouped path.
+        AggFunc::ArrayAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let nested = matches!(vals.first(), Some(Value::Array(_)));
+            array_ctor_from_vals(vals.to_vec(), nested)
+        }
     }
 }
 
@@ -17131,7 +17141,7 @@ fn eval_grouped(
                     let v = eval_grouped(
                         q, outer, gscope, schema, rows, idxs, key_vals, group_by, inner,
                     )?;
-                    match expand_variadic_value(v) {
+                    match expand_variadic_value(v)? {
                         None => return Ok(Value::Null),
                         Some(expanded) => {
                             for ev in expanded {
@@ -17159,6 +17169,16 @@ fn eval_grouped(
                     name,
                     &vals,
                 );
+            }
+            // v0.91: hidden `__any_all_array` builtin (desugared from
+            // `expr op ANY|ALL|SOME (array_expr)`); needs engine access
+            // for user-defined operators. Build scopes like
+            // pg_column_compression above.
+            if name == "__any_all_array" {
+                let mut scopes = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(gscope);
+                return eval_any_all_array(q, &scopes, &vals);
             }
             // Grouped context: no correlated subqueries inside function
             // args here (subqueries take the eval_expr path); dispatch on
@@ -17665,6 +17685,18 @@ fn eval_agg_func(
                 out.push_str(&s);
             }
             Ok(Value::text(out))
+        }
+        // v0.91: `array_agg(x)` — PG19 collects the non-null inputs in
+        // row order into a 1-D array (multidimensional when the input
+        // is itself an array); zero non-null inputs -> NULL.
+        // `array_ctor_from_vals` already implements PG's common-type
+        // resolution and per-value coercion for ARRAY[...] literals.
+        AggFunc::ArrayAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let nested = matches!(vals.first(), Some(Value::Array(_)));
+            array_ctor_from_vals(vals, nested)
         }
     }
 }
@@ -20909,6 +20941,148 @@ fn eval_quantified(
     Ok(Value::Bool(matches!(quant, QuantKind::All)))
 }
 
+/// v0.91: `expr op ANY|ALL|SOME (array_expr)` — the hidden
+/// `__any_all_array` builtin the parser desugars the array form of
+/// quantified comparison into. `vals` is
+/// `[left, op_text, quant_text, arr]` where `op_text` is a `CmpOp::sql`
+/// string or `"user:<name>"` and `quant_text` is `"any"`/`"all"`.
+/// PG19's ScalarArrayOp semantics: iterate the (flattened) array
+/// elements with three-valued logic — ANY is true if any comparison
+/// is true (else NULL if any is NULL, else false); ALL is false if
+/// any is false (else NULL if any is NULL, else true). A NULL array
+/// yields NULL; an empty array yields false (ANY) / true (ALL).
+fn eval_any_all_array(q: &mut Q, scopes: &[Scope], vals: &[Value]) -> Result<Value, ExecError> {
+    if vals.len() != 4 {
+        return Err(exec_err(
+            "42883",
+            "function __any_all_array() does not exist".to_string(),
+        ));
+    }
+    let left = &vals[0];
+    let op_txt = match &vals[1] {
+        Value::Text(s) => s.as_ref(),
+        _ => {
+            return Err(exec_err(
+                "XX000",
+                "internal error: __any_all_array op must be text".to_string(),
+            ));
+        }
+    };
+    let is_all = match &vals[2] {
+        Value::Text(s) if s.as_ref() == "all" => true,
+        Value::Text(s) if s.as_ref() == "any" => false,
+        _ => {
+            return Err(exec_err(
+                "XX000",
+                "internal error: __any_all_array quant must be any/all".to_string(),
+            ));
+        }
+    };
+    let arr = match &vals[3] {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        other => {
+            return Err(exec_err(
+                "42821",
+                format!(
+                    "op ANY/ALL (array) requires array on right side, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    // Resolve the comparison operator.
+    enum ArrOp {
+        Cmp(CmpOp),
+        User(crate::storage::OperDef, crate::storage::FuncDef),
+    }
+    let cmp_op = if let Some(name) = op_txt.strip_prefix("user:") {
+        let first_elem = arr.elems.first();
+        let rty = first_elem.and_then(value_op_type_name).unwrap_or_default();
+        let (odef, fdef) =
+            resolve_user_operator(q.eng, name, value_op_type_name(left).unwrap_or(""), rty)
+                .ok_or_else(|| exec_err("42883", format!("operator does not exist: {}", name)))?;
+        ArrOp::User(odef, fdef)
+    } else {
+        let cop = match op_txt {
+            "=" => CmpOp::Eq,
+            "<>" => CmpOp::Ne,
+            "<" => CmpOp::Lt,
+            "<=" => CmpOp::Le,
+            ">" => CmpOp::Gt,
+            ">=" => CmpOp::Ge,
+            "*=" => CmpOp::ImageEq,
+            _ => {
+                return Err(exec_err(
+                    "XX000",
+                    "internal error: __any_all_array unknown operator".to_string(),
+                ));
+            }
+        };
+        ArrOp::Cmp(cop)
+    };
+    let is_row = matches!(left, Value::Record(_));
+    if is_row && matches!(cmp_op, ArrOp::User(..)) {
+        return Err(exec_err(
+            "0A000",
+            "row-wise user-defined quantified operators are not supported".to_string(),
+        ));
+    }
+    let left_fields: Vec<Value> = match left {
+        Value::Record(fields) => fields.iter().map(|(_, v)| v.clone()).collect(),
+        v => vec![v.clone()],
+    };
+    let mut saw_null = false;
+    for elem in &arr.elems {
+        let cmp: Option<bool> = match &cmp_op {
+            ArrOp::User(odef, fdef) => probe_user_eq(q, scopes, odef, fdef, left, elem)?,
+            ArrOp::Cmp(cop) => {
+                if is_row {
+                    let right_fields: Vec<Value> = match elem {
+                        Value::Record(fields) => fields.iter().map(|(_, v)| v.clone()).collect(),
+                        Value::Null => {
+                            saw_null = true;
+                            continue;
+                        }
+                        other => {
+                            return Err(exec_err(
+                                "42883",
+                                format!(
+                                    "operator does not exist: record {} {}",
+                                    cop.sql(),
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    };
+                    eval_row_cmp(*cop, &left_fields, &right_fields)?
+                } else {
+                    match eval_cmp_vals(*cop, &left_fields[0], elem)? {
+                        Value::Bool(b) => Some(b),
+                        Value::Null => None,
+                        _ => {
+                            return Err(exec_err(
+                                "XX000",
+                                "internal error: non-boolean quantified comparison",
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+        match (is_all, cmp) {
+            (false, Some(true)) => return Ok(Value::Bool(true)),
+            (true, Some(false)) => return Ok(Value::Bool(false)),
+            (_, None) => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(is_all))
+}
+
 fn not3(v: Option<bool>) -> Option<bool> {
     v.map(|b| !b)
 }
@@ -23770,13 +23944,21 @@ fn is_variadic_marker(e: &Expr) -> Option<&Expr> {
 
 /// v0.90: Expand a `VARIADIC` argument value. A NULL array means the
 /// whole call returns NULL (PG: `concat(VARIADIC NULL)` is NULL);
-/// an array expands to its elements; anything else is a PG type error
-/// but we pass it through as a single value to be lenient.
-fn expand_variadic_value(v: Value) -> Option<Vec<Value>> {
+/// an array expands to its elements. v0.91: anything else is a PG
+/// type error (42821 "VARIADIC argument must be an array").
+fn expand_variadic_value(v: Value) -> Result<Option<Vec<Value>>, ExecError> {
     match v {
-        Value::Null => None,
-        Value::Array(arr) => Some(arr.elems),
-        other => Some(vec![other]),
+        Value::Null => Ok(None),
+        Value::Array(arr) => Ok(Some(arr.elems)),
+        // v0.91: PG19 raises ERRCODE_DATATYPE_MISMATCH when the VARIADIC
+        // argument is not an array ("VARIADIC argument must be an array").
+        other => Err(exec_err(
+            "42821",
+            format!(
+                "VARIADIC argument must be an array, not type {}",
+                other.type_name()
+            ),
+        )),
     }
 }
 
@@ -23802,12 +23984,8 @@ fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
             // one operand is text-like (text/varchar/char) or an unknown
             // literal (which becomes text). `SELECT 3 || 4.0` (integer ||
             // numeric) raises 42883. See PG19 text.out.
-            let text_like = |v: &Value| {
-                matches!(
-                    v,
-                    Value::Text(_) | Value::BpChar(_) | Value::SingleChar(_)
-                )
-            };
+            let text_like =
+                |v: &Value| matches!(v, Value::Text(_) | Value::BpChar(_) | Value::SingleChar(_));
             if !text_like(a) && !text_like(b) {
                 return Err(exec_err(
                     "42883",
@@ -24464,6 +24642,17 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
             "arguments to GROUPING must be grouping expressions of the associated query level",
         ));
     }
+    // v0.91: hidden `__any_all_array` builtin — the parser desugars
+    // `expr op ANY|ALL|SOME (array_expr)` into it. Needs engine access
+    // for user-defined operators, so it cannot go through the pure
+    // eval_func_vals path.
+    if name == "__any_all_array" {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(normalize_func_arg(name, eval_expr(q, scopes, a)?));
+        }
+        return eval_any_all_array(q, scopes, &vals);
+    }
     // v0.9: sequence functions need engine + snapshot + session access;
     // they cannot go through the pure eval_func_vals path.
     if matches!(name, "nextval" | "currval" | "setval") {
@@ -24513,7 +24702,7 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         for a in args {
             if let Some(inner) = is_variadic_marker(a) {
                 let v = eval_expr(q, scopes, inner)?;
-                match expand_variadic_value(v) {
+                match expand_variadic_value(v)? {
                     None => return Ok(Value::Null),
                     Some(expanded) => raw_vals.extend(expanded),
                 }
@@ -30117,6 +30306,8 @@ fn func_result_type(
         // returns json (OID 114).
         "pg_typeof" => Ok(ColType::Text),
         "json_array" => Ok(ColType::Json),
+        // v0.91: hidden quantified-array-comparison desugar; boolean.
+        "__any_all_array" => Ok(ColType::Bool),
         "random" => Ok(ColType::Float),
         // v0.21: float8 transcendental functions always return float8.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh"
@@ -31768,6 +31959,13 @@ fn agg_result_type(
                 ));
             }
             Ok(ColType::Bool)
+        }
+        // v0.91: array_agg(anyelement) -> anyarray; the element type is
+        // the argument's scalar element (arrays flatten, like PG).
+        AggFunc::ArrayAgg => {
+            let a = arg.expect("array_agg always takes an argument");
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            Ok(ColType::Array(crate::storage::ArrayElem::of(&t)))
         }
         AggFunc::VarianceSamp | AggFunc::VariancePop | AggFunc::StddevSamp | AggFunc::StddevPop => {
             let a = arg.expect("variance/stddev always take an argument");
@@ -41667,6 +41865,7 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
 #[cfg(test)]
 mod variance_stress_tests {
     use super::Value;
+    use super::array_ctor_from_vals;
     use super::bool_and_vals;
     use super::numeric_to_u64_exact;
     use super::variance_vals;
@@ -41750,6 +41949,63 @@ mod variance_stress_tests {
         assert_eq!(v, Value::Null);
         // non-bool -> error
         assert!(bool_and_vals(&[Value::Int(1)]).is_err());
+    }
+
+    /// v0.91: array_agg's collection core — `array_ctor_from_vals` over
+    /// already null-filtered inputs (the aggregate's empty-input NULL
+    /// is handled by the caller).
+    #[test]
+    fn array_agg_collection_core() {
+        // ints collect in order
+        let v =
+            array_ctor_from_vals(vec![Value::Int(1), Value::Int(2), Value::Int(3)], false).unwrap();
+        match &v {
+            Value::Array(a) => {
+                assert_eq!(a.to_literal(), "{1,2,3}");
+                assert_eq!(a.dims, vec![3]);
+                assert_eq!(a.lower, vec![1]);
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+        // mixed int/bigint resolves the common supertype (bigint)
+        let v = array_ctor_from_vals(vec![Value::Int(1), Value::BigInt(2)], false).unwrap();
+        match &v {
+            Value::Array(a) => {
+                assert_eq!(a.elem, crate::storage::ArrayElem::BigInt);
+                assert_eq!(a.to_literal(), "{1,2}");
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+        // text elements
+        let v = array_ctor_from_vals(vec![Value::text("a"), Value::text("b")], false).unwrap();
+        match &v {
+            Value::Array(a) => assert_eq!(a.to_literal(), "{a,b}"),
+            other => panic!("expected array, got {:?}", other),
+        }
+        // nested arrays build the multidimensional form (PG flattens
+        // array_agg(array[...]) the same way ARRAY[[..],[..]] does)
+        let row = |x: i64, y: i64| {
+            array_ctor_from_vals(vec![Value::Int(x), Value::Int(y)], false).unwrap()
+        };
+        let v = array_ctor_from_vals(vec![row(1, 2), row(3, 4)], true).unwrap();
+        match &v {
+            Value::Array(a) => {
+                assert_eq!(a.to_literal(), "{{1,2},{3,4}}");
+                assert_eq!(a.dims, vec![2, 2]);
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+        // mismatched nested dims are 22P02
+        let v = array_ctor_from_vals(vec![row(1, 2), row(3, 4), row(5, 6)], true).unwrap();
+        assert!(matches!(v, Value::Array(_)));
+        let bad = array_ctor_from_vals(
+            vec![
+                array_ctor_from_vals(vec![Value::Int(1)], false).unwrap(),
+                array_ctor_from_vals(vec![Value::Int(2), Value::Int(3)], false).unwrap(),
+            ],
+            true,
+        );
+        assert!(bad.is_err());
     }
 
     /// v0.64: pg_lsn(numeric) — PG19 display and error semantics.

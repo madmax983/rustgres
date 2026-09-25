@@ -8432,7 +8432,6 @@ mod v067_numeric_edge_tests {
         assert!(q.is_zero() && r == 0);
     }
 
-    
     #[test]
     fn div_rem_knuth_invariant() {
         // v0.90: Knuth Algorithm D differential test. q*v + r == u and
@@ -8487,15 +8486,24 @@ mod v067_numeric_edge_tests {
         // single-limb fast path vs general path agreement.
         let cases = [
             ("1", "999999999999999999"),
-            ("123456789012345678901234567890", "123456789012345678901234567890"),
+            (
+                "123456789012345678901234567890",
+                "123456789012345678901234567890",
+            ),
             ("1000000000000000000000000000000", "3"),
-            ("999999999999999999999999999999", "999999999999999999999999999999"),
+            (
+                "999999999999999999999999999999",
+                "999999999999999999999999999999",
+            ),
             ("123456789", "987654321987654321"),
             ("1000000000000000000", "999999999"),
             ("555555555555555555555555555", "777777777777777777"),
             ("100000000000000000000000000000000000000", "1000000007"),
             ("18446744073709551615", "4294967297"),
-            ("99999999999999999999999999999999999999", "1000000000000000003"),
+            (
+                "99999999999999999999999999999999999999",
+                "1000000000000000003",
+            ),
         ];
         for (us, vs) in cases {
             let u = BigUint::from_decimal_str(us);
@@ -8608,13 +8616,15 @@ mod v067_numeric_edge_tests {
             let (q_new, r_new) = u.div_rem(&v);
             let (q_old, r_old) = div_rem_bitwise_old(&u, &v);
             assert_eq!(
-                q_new, q_old,
+                q_new,
+                q_old,
                 "quotient mismatch on iter {i}: u={} v={}",
                 u.to_decimal_string(),
                 v.to_decimal_string()
             );
             assert_eq!(
-                r_new, r_old,
+                r_new,
+                r_old,
                 "remainder mismatch on iter {i}: u={} v={}",
                 u.to_decimal_string(),
                 v.to_decimal_string()
