@@ -2,6 +2,109 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Value::Array` embeds `ArrayVal` (3 Vecs) inline, inflating every `Value` to 80 bytes — baseline — 2026-09-25
+
+**Why this workload**: `benches/bench.py --workload all --seconds 3` was
+re-run this session (current HEAD, v0.83, well past every prior Bolt
+round's target) to find the next profiling target. `join` remains the
+extreme outlier it has been in every previous round of this file — 1.2
+qps, p50 866ms, p99 904ms — nearly three orders of magnitude slower per
+op than every other workload in the suite (`select1` 13,099 qps, `scan`
+103 qps, `window` 9.9 qps being the next-slowest). Re-profiling it fresh
+after several versions' worth of new features (v0.76-v0.83: arrays,
+composite types, GROUPING(), parsed-AST cache, cursors) was the
+motivation, since the last join-focused round (`coerce_regclass_cmp`,
+merged) predates all of them.
+
+`benches/profile_join.py --count 100` (existing driver, unchanged),
+default scaled-down shape (`--users 200 --orders 2000 --filter 20`):
+
+```sql
+SELECT u.name, count(o.id), sum(o.amt) FROM bench_u u
+JOIN bench_o o ON u.id = o.uid WHERE u.id < 20
+GROUP BY u.name ORDER BY u.name
+```
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -60
+```
+
+**Profile** (Callgrind `Ir`, this commit — code unchanged; two runs agree
+to within 0.0005%): **7,999,995,248.5** total instructions (average of
+8,000,015,251 and 7,999,975,246) over the 100-iteration run. Top
+self-costs:
+
+| function | Ir | % of total |
+|---|---|---|
+| `__memcpy_avx_unaligned_erms` (libc) | 1,734,619,508 | **21.68%** |
+| `eval_expr` (monomorphization 1) | 778,180,000 | 9.73% |
+| `eval_expr` (monomorphization 2) | 730,680,000 | 9.13% |
+| `eval_cmp_vals` | 674,020,000 | 8.43% |
+| `Result<T,E> as Try>::branch` | 576,099,359 | 7.20% |
+| `build_source` | 524,577,200 | 6.56% |
+| `cmp_ordering` | 381,640,000 | 4.77% |
+| `Value::clone` | 255,230,400 | 3.19% |
+| `exact_as_i64` | 219,240,000 | 2.74% |
+| `drop_in_place<Value>` | 218,481,000 | 2.73% |
+| `coerce_text_numeric` | 198,940,000 | 2.49% |
+| `check_bool` | 150,220,000 | 1.88% |
+
+**Target**: `__memcpy_avx_unaligned_erms`, at 21.68% of the profile, is by
+a wide margin the single largest line item — more than double the next
+line (`eval_expr`, 9.73%). Reverse-mapping its callers (parsing the raw
+callgrind call-graph: every `cfn=` reference into memcpy's `fn=`, summed
+by caller) attributes it almost entirely to `Value` moves, not string or
+buffer copying:
+
+| caller | Ir attributed to its memcpy calls | % of total |
+|---|---|---|
+| `<Result<T,E> as Try>::branch` (i.e., every `?` on a `Result<Value, _>`) | 784,009,350 | **9.80%** |
+| `eval_cmp_vals` | 332,920,000 | 4.16% |
+| `eval_expr` (monomorphization 1) | 179,960,000 | 2.25% |
+| `eval_expr` (monomorphization 2) | 178,640,000 | 2.23% |
+| `coerce_text_numeric` | 121,800,000 | 1.52% |
+| `build_source` | 96,005,600 | 1.20% |
+
+The single biggest contributor, by nearly 2.4x over the next, is the `?`
+operator's own `Try::branch` glue — not a named function in this
+codebase at all. That is exactly what happens when the debug-build
+compiler can't keep a type in registers across a call boundary: it
+`memcpy`s the whole value instead. `std::mem::size_of::<Value>()` (a
+temporary unit test, `cargo test -- --nocapture`) confirms why: **80
+bytes** — the same width as the `Array` variant's payload,
+`ArrayVal` (`elem: ArrayElem`, `dims: Vec<i32>`, `lower: Vec<i32>`,
+`elems: Vec<Value>` — 3 Vecs at 24 bytes apiece — embedded directly in
+the enum, not behind a pointer). Every other variant is far smaller
+(`Numeric`, the next-largest, is 48 bytes; every scalar variant is under
+16 bytes), but Rust sizes an enum to its largest variant, so `Value`
+pays the 80-byte width everywhere `Value` is moved, cloned, or returned
+through `Result<Value, ExecError>` — including this join/groupby
+workload, which has no array columns at all and never once constructs a
+`Value::Array`.
+
+**Hypothesis**: `Array(ArrayVal)` accounts for 100% of the size gap
+between `Value`'s actual width (80 bytes) and what every other variant
+needs (48 bytes or less). Boxing it (`Array(Box<ArrayVal>)`) removes that
+gap — `ArrayVal` already owns 3 heap-allocated `Vec`s, so one more
+pointer's worth of indirection when an array value is actually
+constructed is negligible, while every `Value` move/clone/return
+elsewhere in the system (scalar comparisons, aggregate accumulation,
+`?`-propagated errors — the entire `eval_expr`/`eval_cmp_vals` call graph
+this profile shows dominating the workload) shrinks from 80 bytes to 48.
+This is a pure representation change with no effect on which values
+compare equal, cast, or serialize identically — see the fix entry's
+"why this is exact" for the call-site-by-call-site argument.
+
+Fix and after-measurement follow in the next entry.
+
 ## Bolt: `find_partition_leaf` clones every rejected candidate's metadata before checking it — fix — 2026-09-23
 
 New workload: `benches/bench.py --workload partition` (`w_partition`).
