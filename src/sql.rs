@@ -1073,6 +1073,10 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         to: ColType,
+        /// v0.93: func-style cast spelling (`float8(x)`): PG19 names the
+        /// output column after the type name as written. `None` for
+        /// `x::type` / `CAST(x AS type)` syntax.
+        written: Option<String>,
     },
     /// v0.81: cast to a named composite type (`ROW(...)::t_rec`). The
     /// name is resolved against the type catalog at execution time
@@ -7418,6 +7422,7 @@ impl Parser {
             expr = Expr::Cast {
                 expr: Box::new(expr),
                 to,
+                written: None,
             };
             // v0.79: subscripts/slices bind to the cast result too —
             // `('...'::int[])[1]` and `('...'::int[])[1]::text`, like
@@ -7677,6 +7682,7 @@ impl Parser {
                     return Ok(Expr::Cast {
                         expr: Box::new(expr),
                         to,
+                        written: None,
                     });
                 }
                 // Typed literal: DATE '2026-01-01', TIMESTAMP '...', etc.
@@ -7692,6 +7698,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
+                                written: None,
                             });
                         }
                     }
@@ -7745,6 +7752,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
+                                written: None,
                             });
                         }
                     }
@@ -7759,6 +7767,7 @@ impl Parser {
                     return Ok(Expr::Cast {
                         expr: Box::new(expr),
                         to: ColType::SingleChar,
+                        written: None,
                     });
                 }
                 // Quoted function call `"name"(...)`?
@@ -8053,6 +8062,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(expr),
                                 to,
+                                written: Some(name.clone()),
                             });
                         }
                     }
@@ -11459,7 +11469,7 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(right, out);
             out.push(')');
         }
-        Expr::Cast { expr, to } => {
+        Expr::Cast { expr, to, .. } => {
             out.push_str(&format!("(cast {} ", to.sql_name()));
             encode_expr_inner(expr, out);
             out.push(')');
@@ -11857,6 +11867,7 @@ impl<'a> SexprParser<'a> {
                 Expr::Cast {
                     expr: Box::new(x),
                     to,
+                    written: None,
                 }
             }
             "concat" => {

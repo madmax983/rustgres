@@ -10313,9 +10313,10 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         }),
-        Expr::Cast { expr, to } => Ok(Expr::Cast {
+        Expr::Cast { expr, to, written } => Ok(Expr::Cast {
             expr: Box::new(r(expr)?),
             to: *to,
+            written: written.clone(),
         }),
         // v0.81: named casts, row constructors and field accesses
         // rebuild with resolved operands.
@@ -14395,6 +14396,382 @@ fn join_fast_path(on: &Expr, lschema: &[QCol], rschema: &[QCol]) -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// v0.93: hash equi-join.
+//
+// A basic in-memory hash join for INNER joins whose ON predicate is a
+// conjunction with at least one `left_col = right_col` equality between
+// plain (resolved) column references. The build side is the right input;
+// probing walks the left rows in order and emits matches with the right
+// rows in their original order, so the output row order is identical to
+// the nested loop's (left-major, right-minor).
+//
+// Correctness argument:
+// * Only top-level AND conjuncts of the form `lcol = rcol` (one side in
+//   the left frame, the other in the right frame) become hash keys. The
+//   full ON predicate must be TRUE for a pair to be emitted, and a TRUE
+//   equi conjunct requires equal keys — so any pair the hash lookup
+//   skips could never have satisfied ON. Every candidate pair is
+//   re-checked against the full resolved ON predicate with the same
+//   two-frame scope the nested loop uses, so three-valued logic,
+//   coercions, and residual (non-equi) conjuncts behave exactly as
+//   before.
+// * NULL key components never match: a `NULL = x` conjunct is never
+//   TRUE, so build/probe both skip NULL keys (like PG's hash join,
+//   which never inserts NULL keys).
+// * The hash key canonicalization below is *consistent* with the
+//   engine's `=` (eval_cmp_vals/cmp_ordering): whenever `a = b` is TRUE,
+//   both sides produce equal key parts. Families are deliberately
+//   narrow — mixed-type conjuncts (int = numeric is fine, int = text is
+//   not) and exotic types decline, falling back to the nested loop.
+//   The per-candidate full-predicate re-check additionally guards
+//   against any false positive the hash might admit.
+// * `RUSTGRES_NO_HASH_JOIN=1` disables the hash path (differential
+//   testing against the nested loop).
+// ---------------------------------------------------------------------------
+
+/// v0.93: the hash family of one equi-join key column, from its static
+/// `ColType`. Both sides of a conjunct must map to the same family;
+/// anything else (mixed families, arrays, records, regclass, name,
+/// json, composite) declines the hash join for that conjunct.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum HashFam {
+    /// int2/int4/int8/numeric: normalized exact decimal
+    /// (special, sign, magnitude, scale) — exactly `=` semantics, and
+    /// mixed int/numeric conjuncts hash consistently.
+    ExactNum,
+    /// float4/float8: f64 bits (float4 widened, as in cmp_ordering).
+    Float,
+    /// text/varchar: raw bytes.
+    Text,
+    /// character(n): PG's bpcharcmp ignores trailing spaces.
+    BpChar,
+    Bool,
+    Date,
+    /// timestamp + timestamptz: the engine compares raw micros
+    /// (UTC-only), so both hash the i64.
+    Ts,
+    Bytea,
+    Uuid,
+    /// "char": the single byte.
+    Char,
+    PgLsn,
+}
+
+fn hash_family(ty: &ColType) -> Option<HashFam> {
+    Some(match ty {
+        ColType::SmallInt | ColType::Int | ColType::BigInt | ColType::Numeric(_) => {
+            HashFam::ExactNum
+        }
+        ColType::Float4 | ColType::Float => HashFam::Float,
+        ColType::Text | ColType::Varchar(_) => HashFam::Text,
+        ColType::Char(_) => HashFam::BpChar,
+        ColType::Bool => HashFam::Bool,
+        ColType::Date => HashFam::Date,
+        ColType::Timestamp | ColType::Timestamptz => HashFam::Ts,
+        ColType::Bytea => HashFam::Bytea,
+        ColType::Uuid => HashFam::Uuid,
+        ColType::SingleChar => HashFam::Char,
+        ColType::PgLsn => HashFam::PgLsn,
+        _ => return None,
+    })
+}
+
+/// v0.93: one canonical hash-join key component. `Eq` on this enum
+/// coincides with the engine's `=` returning TRUE within a family
+/// (see the module docs above); the per-candidate re-check makes any
+/// residual doubt moot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum HashKeyPart {
+    /// (special as u8, negative, magnitude, scale). `Numeric::new`
+    /// normalizes trailing zeros at build time and `from_big`
+    /// downgrades fitting magnitudes to the i128 path, so equal
+    /// finite numerics share one canonical form.
+    ExactNum(u8, bool, crate::storage::BigUint, i32),
+    Float(u64),
+    Text(std::sync::Arc<str>),
+    BpChar(std::sync::Arc<str>),
+    Bool(bool),
+    Date(i32),
+    Ts(i64),
+    Bytea(Vec<u8>),
+    Uuid([u8; 16]),
+    Char(u8),
+    PgLsn(u64),
+}
+
+fn hash_key_part(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
+    match fam {
+        HashFam::ExactNum => {
+            let n = match v {
+                Value::SmallInt(i) => crate::storage::Numeric::new(*i as i128, 0),
+                Value::Int(i) | Value::BigInt(i) => crate::storage::Numeric::new(*i as i128, 0),
+                Value::Numeric(n) => n.clone(),
+                _ => return None,
+            };
+            Some(HashKeyPart::ExactNum(
+                n.special as u8,
+                n.unscaled < 0,
+                n.mag(),
+                n.scale,
+            ))
+        }
+        HashFam::Float => match v {
+            Value::Float4(f) => Some(HashKeyPart::Float((*f as f64).to_bits())),
+            Value::Float(f) => Some(HashKeyPart::Float(f.to_bits())),
+            _ => None,
+        },
+        HashFam::Text => match v {
+            Value::Text(s) => Some(HashKeyPart::Text(s.clone())),
+            _ => None,
+        },
+        HashFam::BpChar => match v {
+            Value::BpChar(s) => Some(HashKeyPart::BpChar(crate::storage::rtrim_spaces(s).into())),
+            _ => None,
+        },
+        HashFam::Bool => match v {
+            Value::Bool(b) => Some(HashKeyPart::Bool(*b)),
+            _ => None,
+        },
+        HashFam::Date => match v {
+            Value::Date(d) => Some(HashKeyPart::Date(*d)),
+            _ => None,
+        },
+        HashFam::Ts => match v {
+            Value::Timestamp(t) | Value::Timestamptz(t) => Some(HashKeyPart::Ts(*t)),
+            _ => None,
+        },
+        HashFam::Bytea => match v {
+            Value::Bytea(b) => Some(HashKeyPart::Bytea(b.clone())),
+            _ => None,
+        },
+        HashFam::Uuid => match v {
+            Value::Uuid(u) => Some(HashKeyPart::Uuid(*u)),
+            _ => None,
+        },
+        HashFam::Char => match v {
+            Value::SingleChar(c) => Some(HashKeyPart::Char(*c)),
+            _ => None,
+        },
+        HashFam::PgLsn => match v {
+            Value::PgLsn(l) => Some(HashKeyPart::PgLsn(*l)),
+            _ => None,
+        },
+    }
+}
+
+/// v0.93: extract the equi-join keys from a resolved ON predicate.
+/// Returns the `(left_idx, right_idx, family)` key conjuncts, or `None`
+/// when the hash join does not apply (no usable equi conjunct). `frame`
+/// is the number of outer scopes; the left frame is `frame` and the
+/// right frame is `frame + 1`.
+fn hash_join_keys(
+    pred: &Expr,
+    n_outer: usize,
+    lschema: &[QCol],
+    rschema: &[QCol],
+) -> Option<Vec<(usize, usize, HashFam)>> {
+    if std::env::var("RUSTGRES_NO_HASH_JOIN").is_ok() {
+        return None;
+    }
+    let (lf, rf) = (n_outer, n_outer + 1);
+    let mut keys = Vec::new();
+    for c in split_conjuncts(pred) {
+        let Expr::Cmp { op, left, right } = c else {
+            continue;
+        };
+        if !matches!(op, CmpOp::Eq) {
+            continue;
+        }
+        let (Expr::ResolvedCol { frame: fl, idx: li }, Expr::ResolvedCol { frame: fr, idx: ri }) =
+            (left.as_ref(), right.as_ref())
+        else {
+            continue;
+        };
+        // One side must be the left frame and the other the right frame
+        // (either order); same-side or outer-frame equalities are not
+        // join keys — they stay in the full predicate, re-checked per
+        // candidate pair.
+        let (li, ri) = match (*fl, *fr) {
+            (a, b) if a == lf && b == rf => (*li, *ri),
+            (a, b) if a == rf && b == lf => (*ri, *li),
+            _ => continue,
+        };
+        let (Some(lt), Some(rt)) = (lschema.get(li), rschema.get(ri)) else {
+            continue;
+        };
+        // An unsupported conjunct only disqualifies *itself*, not the
+        // whole plan: another conjunct may still be a usable key, and the
+        // full predicate (including this conjunct) is re-checked per
+        // candidate pair.
+        let (Some(lfam), Some(rfam)) = (hash_family(&lt.ty), hash_family(&rt.ty)) else {
+            continue;
+        };
+        if lfam != rfam {
+            continue;
+        }
+        keys.push((li, ri, lfam));
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    Some(keys)
+}
+
+/// v0.93: run the hash equi-join. Builds the hash table over the right
+/// rows, then probes in left-row order; every candidate pair is
+/// re-checked against the full ON predicate `pred` (the same two-frame
+/// evaluation the nested loop performs), so the emitted rows are
+/// exactly the nested loop's, in the same order.
+///
+/// Returns `Ok(None)` when a row carries a runtime value outside its
+/// key family's variant set (should not happen for well-typed rows);
+/// the caller then falls back to the nested loop, so correctness never
+/// depends on the type system's promises.
+#[allow(clippy::too_many_arguments)]
+fn exec_hash_join(
+    q: &mut Q,
+    outer: &[Scope],
+    lschema: &[QCol],
+    lrows: &[QRow],
+    rschema: &[QCol],
+    rrows: &[QRow],
+    layout: &JoinLayout,
+    kind: JoinKind,
+    pred: &Expr,
+    keys: &[(usize, usize, HashFam)],
+) -> Result<Option<Vec<QRow>>, ExecError> {
+    type JoinMap =
+        std::collections::HashMap<Vec<HashKeyPart>, Vec<usize>, crate::fxhash::FxBuildHasher>;
+    let mut table: JoinMap =
+        std::collections::HashMap::with_capacity_and_hasher(rrows.len(), Default::default());
+    // Build over the right side. Rows with a NULL key component can
+    // never satisfy the equi conjunct (`NULL = x` is never TRUE) and
+    // are skipped, exactly like PG's hash join.
+    for (ri, r) in rrows.iter().enumerate() {
+        let mut key = Vec::with_capacity(keys.len());
+        let mut null_key = false;
+        for (_, rj, fam) in keys {
+            match &r.cells[*rj] {
+                Value::Null => {
+                    null_key = true;
+                    break;
+                }
+                v => match hash_key_part(v, *fam) {
+                    Some(p) => key.push(p),
+                    None => return Ok(None),
+                },
+            }
+        }
+        if null_key {
+            continue;
+        }
+        table.entry(key).or_default().push(ri);
+    }
+    let mut rows = Vec::new();
+    // Probe in left-row order; matches emit right rows in original
+    // order — identical output order to the nested loop.
+    if outer.is_empty() {
+        // Hot path: the two frames live in a stack array; Scope is Copy.
+        for l in lrows {
+            let mut key = Vec::with_capacity(keys.len());
+            let mut ok = true;
+            let mut null_key = false;
+            for (li, _, fam) in keys {
+                match &l.cells[*li] {
+                    Value::Null => {
+                        null_key = true;
+                        break;
+                    }
+                    v => match hash_key_part(v, *fam) {
+                        Some(p) => key.push(p),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !ok {
+                return Ok(None);
+            }
+            if null_key {
+                continue;
+            }
+            let Some(bucket) = table.get(&key) else {
+                continue;
+            };
+            let fl = Scope {
+                schema: lschema,
+                row: &l.cells,
+                prov: None,
+            };
+            for &ri in bucket {
+                let r = &rrows[ri];
+                let fr = Scope {
+                    schema: rschema,
+                    row: &r.cells,
+                    prov: None,
+                };
+                let scopes = [fl, fr];
+                if check_bool(eval_expr(q, &scopes, pred)?, "join condition")? {
+                    rows.push(combine_join_pair(l, r, layout, kind));
+                }
+            }
+        }
+    } else {
+        // Correlated join (rare): one small scope Vec per candidate.
+        for l in lrows {
+            let mut key = Vec::with_capacity(keys.len());
+            let mut ok = true;
+            let mut null_key = false;
+            for (li, _, fam) in keys {
+                match &l.cells[*li] {
+                    Value::Null => {
+                        null_key = true;
+                        break;
+                    }
+                    v => match hash_key_part(v, *fam) {
+                        Some(p) => key.push(p),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !ok {
+                return Ok(None);
+            }
+            if null_key {
+                continue;
+            }
+            let Some(bucket) = table.get(&key) else {
+                continue;
+            };
+            for &ri in bucket {
+                let r = &rrows[ri];
+                let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 2);
+                scopes.extend_from_slice(outer);
+                scopes.push(Scope {
+                    schema: lschema,
+                    row: &l.cells,
+                    prov: None,
+                });
+                scopes.push(Scope {
+                    schema: rschema,
+                    row: &r.cells,
+                    prov: None,
+                });
+                if check_bool(eval_expr(q, &scopes, pred)?, "join condition")? {
+                    rows.push(combine_join_pair(l, r, layout, kind));
+                }
+            }
+        }
+    }
+    Ok(Some(rows))
+}
+
 /// v0.23: a positional column alias list may be shorter than the column
 /// list (the rest keep their names) but never longer — PostgreSQL raises
 /// 42601 (`table "x" has 3 columns available but 4 specified`).
@@ -15846,6 +16223,25 @@ fn build_source(
                 _ => None,
             };
             let on_fast: Option<&Expr> = on_resolved.as_ref().or(on_pred);
+            // v0.93: hash equi-join for INNER joins. `fast` guarantees
+            // the two-frame evaluation the hash path relies on, and
+            // `on_fast` is the resolved predicate the key extractor
+            // reads. A runtime `None` (unexpected value variant) falls
+            // back to the nested loop below — correctness never depends
+            // on the hash path succeeding.
+            let hash_keys: Option<Vec<(usize, usize, HashFam)>> =
+                if *kind == JoinKind::Inner && fast && !is_cross {
+                    on_fast.and_then(|p| hash_join_keys(p, outer.len(), &lschema, &rschema))
+                } else {
+                    None
+                };
+            if let (Some(pred), Some(keys)) = (on_fast, hash_keys) {
+                if let Some(joined) = exec_hash_join(
+                    q, outer, &lschema, &lrows, &rschema, &rrows, &layout, *kind, pred, &keys,
+                )? {
+                    return Ok((schema, joined));
+                }
+            }
             // v0.23: null-extended sides, in side-schema layout; the
             // combiner projects them into the merged layout (COALESCE for
             // FULL, preserved side otherwise).
@@ -16969,7 +17365,7 @@ fn eval_grouped(
             )?;
             eval_arith(*op, &va, &vb)
         }
-        Expr::Cast { expr, to } => {
+        Expr::Cast { expr, to, .. } => {
             if let Some(v) = cast_empty_array_ctor(expr, to) {
                 return Ok(v);
             }
@@ -19455,7 +19851,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let vb = eval_expr(q, scopes, right)?;
             eval_arith(*op, &va, &vb)
         }
-        Expr::Cast { expr, to } => {
+        Expr::Cast { expr, to, .. } => {
             if let Some(v) = cast_empty_array_ctor(expr, to) {
                 return Ok(v);
             }
@@ -29966,6 +30362,48 @@ fn num_to_char(n: &crate::storage::Numeric, fmt: &str, _name: &str) -> Result<Va
     }
 }
 
+/// v0.93: `to_char` for integer inputs (PG19's `int4_to_char` /
+/// `int8_to_char`; int2 promotes to int4, hence `bits = 32`). With a `V`
+/// (multi) picture PG multiplies in the *input* type —
+/// `value = int4mul(value, dtoi4(10^multi))` — raising 22003 "integer out
+/// of range" on overflow, then grows the picture (`Num.pre +=
+/// Num.multi`). The plain numeric path cannot reproduce that overflow
+/// error, so integers take this checked path whenever `multi > 0` on the
+/// plain (non-roman, non-EEEE) path.
+fn int_to_char(v: i128, bits: u32, fmt: &str) -> Result<Value, ExecError> {
+    let mut desc = match crate::numfmt::parse_numfmt(fmt) {
+        Ok(d) => d,
+        Err(e) => return Err(numfmt_exec_err(e)),
+    };
+    let n = if desc.multi > 0 && !desc.roman && !desc.eeee {
+        // dtoi4/dtoi8(10^multi): an out-of-range multiplier errors too;
+        // 10^k is exact in float8 for k <= 22, so the int4 (k <= 9) and
+        // int8 (k <= 18) multipliers are always exact.
+        let max_multi = if bits == 32 { 9 } else { 18 };
+        if desc.multi > max_multi {
+            return Err(exec_err("22003", "integer out of range"));
+        }
+        let shifted = v * 10i128.pow(desc.multi as u32);
+        let in_range = if bits == 32 {
+            shifted >= i128::from(i32::MIN) && shifted <= i128::from(i32::MAX)
+        } else {
+            shifted >= i128::from(i64::MIN) && shifted <= i128::from(i64::MAX)
+        };
+        if !in_range {
+            return Err(exec_err("22003", "integer out of range"));
+        }
+        desc.pre += desc.multi;
+        desc.multi = 0;
+        crate::storage::Numeric::new(shifted, 0)
+    } else {
+        crate::storage::Numeric::new(v, 0)
+    };
+    match crate::numfmt_tochar::numeric_to_char(&n, &desc) {
+        Ok(s) => Ok(Value::text(s)),
+        Err(e) => Err(numfmt_exec_err(e)),
+    }
+}
+
 /// v0.26: `to_char` for float values (PG's `float8_to_char`).
 fn float_to_char(v: f64, fmt: &str, _name: &str) -> Result<Value, ExecError> {
     let desc = match crate::numfmt::parse_numfmt(fmt) {
@@ -30161,14 +30599,17 @@ fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 Value::Date(d) => (i64::from(*d), 0),
                 Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::split_micros(*m),
                 // v0.26: numeric to_char overloads (PG's numeric_to_char /
-                // float8_to_char); integers widen through numeric.
+                // float8_to_char). v0.93: integer inputs take the checked
+                // int4/int8 path so a `V` (multi) picture reproduces PG's
+                // overflow error instead of silently widening.
                 Value::SmallInt(i) => {
-                    let n = crate::storage::Numeric::new(i128::from(*i), 0);
-                    return num_to_char(&n, fmt, name);
+                    return int_to_char(i128::from(*i), 32, fmt);
                 }
-                Value::Int(i) | Value::BigInt(i) => {
-                    let n = crate::storage::Numeric::new(i128::from(*i), 0);
-                    return num_to_char(&n, fmt, name);
+                Value::Int(i) => {
+                    return int_to_char(i128::from(*i), 32, fmt);
+                }
+                Value::BigInt(i) => {
+                    return int_to_char(i128::from(*i), 64, fmt);
                 }
                 Value::Numeric(n) => return num_to_char(n, fmt, name),
                 Value::Float4(f) => {
@@ -31370,7 +31811,13 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             _ => ("?column?".to_string(), 0),
         },
         Expr::Agg { func, .. } => (func.name().to_string(), 2),
-        Expr::Cast { expr, to } => {
+        Expr::Cast { expr, to, written } => {
+            // v0.93: a func-style cast (`float8(q1)`) is named after the
+            // type name as written (PG19 treats the type-named call like
+            // a function call for output naming).
+            if let Some(w) = written {
+                return (w.clone(), 2);
+            }
             let (inner, s) = expr_col_name_strength(expr);
             if s <= 1 {
                 (to.pg_typname(), 1)
@@ -42350,5 +42797,212 @@ mod v067_math_tests {
             Value::Numeric(n) => assert_eq!(n.to_text(), "3"),
             v => panic!("round(2.5::numeric) must be Numeric(3), got {v:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hash_join_tests {
+    use super::*;
+
+    fn key(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
+        hash_key_part(v, fam)
+    }
+
+    /// v0.93: `=`-equal values hash equal (the hash-consistency
+    /// invariant the hash join's soundness rests on).
+    #[test]
+    fn hash_key_consistency() {
+        // int family mixes with numeric: 4 = 4.0 = 4.00.
+        let k_int = key(&Value::Int(4), HashFam::ExactNum).unwrap();
+        let k_big = key(&Value::BigInt(4), HashFam::ExactNum).unwrap();
+        let k_small = key(&Value::SmallInt(4), HashFam::ExactNum).unwrap();
+        let k_num = key(
+            &Value::Numeric(Numeric::parse("4.00").unwrap()),
+            HashFam::ExactNum,
+        )
+        .unwrap();
+        assert_eq!(k_int, k_big);
+        assert_eq!(k_int, k_small);
+        assert_eq!(k_int, k_num);
+        // different values hash different (no requirement, but sanity).
+        let k5 = key(&Value::Int(5), HashFam::ExactNum).unwrap();
+        assert_ne!(k_int, k5);
+        // negative numerics.
+        let kn1 = key(
+            &Value::Numeric(Numeric::parse("-12.50").unwrap()),
+            HashFam::ExactNum,
+        )
+        .unwrap();
+        let kn2 = key(&Value::Int(-25), HashFam::ExactNum).unwrap();
+        let kn3 = key(
+            &Value::Numeric(Numeric::parse("-12.5").unwrap()),
+            HashFam::ExactNum,
+        )
+        .unwrap();
+        assert_eq!(kn1, kn3);
+        assert_ne!(kn1, kn2);
+        // big numerics (past i128) stay consistent.
+        let big1 = Numeric::parse("123456789012345678901234567890.10").unwrap();
+        let big2 = Numeric::parse("123456789012345678901234567890.1").unwrap();
+        assert_eq!(
+            key(&Value::Numeric(big1), HashFam::ExactNum),
+            key(&Value::Numeric(big2), HashFam::ExactNum)
+        );
+        // floats: f32 widened like cmp_ordering.
+        let f1 = key(&Value::Float4(1.5), HashFam::Float).unwrap();
+        let f2 = key(&Value::Float(1.5), HashFam::Float).unwrap();
+        assert_eq!(f1, f2);
+        // engine semantics: -0.0 != 0.0 (total_cmp), so hashes differ.
+        let fnz = key(&Value::Float(-0.0), HashFam::Float).unwrap();
+        let fz = key(&Value::Float(0.0), HashFam::Float).unwrap();
+        assert_ne!(fnz, fz);
+        // text / bpchar (rtrim) / bool / date / ts / bytea / uuid.
+        assert_eq!(
+            key(&Value::text("x"), HashFam::Text),
+            key(&Value::text("x"), HashFam::Text)
+        );
+        assert_ne!(
+            key(&Value::text("x"), HashFam::Text),
+            key(&Value::text("x "), HashFam::Text)
+        );
+        assert_eq!(
+            key(&Value::BpChar("ab  ".into()), HashFam::BpChar),
+            key(&Value::BpChar("ab".into()), HashFam::BpChar)
+        );
+        assert_eq!(
+            key(&Value::Bool(true), HashFam::Bool),
+            key(&Value::Bool(true), HashFam::Bool)
+        );
+        assert_eq!(
+            key(&Value::Date(42), HashFam::Date),
+            key(&Value::Date(42), HashFam::Date)
+        );
+        assert_eq!(
+            key(&Value::Timestamp(7), HashFam::Ts),
+            key(&Value::Timestamptz(7), HashFam::Ts)
+        );
+        assert_eq!(
+            key(&Value::Bytea(vec![1, 2]), HashFam::Bytea),
+            key(&Value::Bytea(vec![1, 2]), HashFam::Bytea)
+        );
+        assert_eq!(
+            key(&Value::Uuid([9; 16]), HashFam::Uuid),
+            key(&Value::Uuid([9; 16]), HashFam::Uuid)
+        );
+        assert_eq!(
+            key(&Value::SingleChar(b'a'), HashFam::Char),
+            key(&Value::SingleChar(b'a'), HashFam::Char)
+        );
+        assert_eq!(
+            key(&Value::PgLsn(0x0102), HashFam::PgLsn),
+            key(&Value::PgLsn(0x0102), HashFam::PgLsn)
+        );
+        // wrong-variant values decline (caller falls back to nested loop).
+        assert_eq!(key(&Value::text("4"), HashFam::ExactNum), None);
+        assert_eq!(key(&Value::Int(4), HashFam::Text), None);
+        assert_eq!(key(&Value::Null, HashFam::ExactNum), None);
+    }
+
+    /// v0.93: hash_family maps static types to families; exotic types
+    /// decline.
+    #[test]
+    fn hash_family_mapping() {
+        assert_eq!(hash_family(&ColType::Int), Some(HashFam::ExactNum));
+        assert_eq!(hash_family(&ColType::BigInt), Some(HashFam::ExactNum));
+        assert_eq!(
+            hash_family(&ColType::Numeric(None)),
+            Some(HashFam::ExactNum)
+        );
+        assert_eq!(hash_family(&ColType::Float), Some(HashFam::Float));
+        assert_eq!(hash_family(&ColType::Text), Some(HashFam::Text));
+        assert_eq!(hash_family(&ColType::Varchar(Some(3))), Some(HashFam::Text));
+        assert_eq!(hash_family(&ColType::Char(Some(3))), Some(HashFam::BpChar));
+        assert_eq!(hash_family(&ColType::Name), None);
+        assert_eq!(hash_family(&ColType::Regclass), None);
+        assert_eq!(hash_family(&ColType::Json), None);
+        assert_eq!(hash_family(&ColType::Record), None);
+    }
+
+    /// v0.93: key extraction from a resolved ON predicate.
+    #[test]
+    fn hash_join_key_extraction() {
+        use crate::sql::parse_statement;
+        // `select * from t1 a join t2 b on a.id = b.id and a.x = b.y`
+        let stmt =
+            parse_statement("select * from t1 a join t2 b on a.id = b.id and a.x = b.y").unwrap();
+        let (from, where_) = match &stmt {
+            crate::sql::Stmt::Select(s) => (s.from.clone(), s.where_.clone()),
+            _ => panic!("expected select"),
+        };
+        let lschema = vec![
+            QCol {
+                qual: "a".into(),
+                name: "id".into(),
+                ty: ColType::Int,
+                hidden: false,
+                src_ord: 0,
+            },
+            QCol {
+                qual: "a".into(),
+                name: "x".into(),
+                ty: ColType::Text,
+                hidden: false,
+                src_ord: 1,
+            },
+        ];
+        let rschema = vec![
+            QCol {
+                qual: "b".into(),
+                name: "id".into(),
+                ty: ColType::BigInt,
+                hidden: false,
+                src_ord: 0,
+            },
+            QCol {
+                qual: "b".into(),
+                name: "y".into(),
+                ty: ColType::Text,
+                hidden: false,
+                src_ord: 1,
+            },
+        ];
+        let on = match &from[0] {
+            FromItem::Join { on, .. } => on.clone().unwrap(),
+            _ => panic!("expected join"),
+        };
+        let schemas: Vec<&[QCol]> = vec![&lschema, &rschema];
+        let resolved = resolve_predicate_columns(&on, &schemas).unwrap();
+        let keys = hash_join_keys(&resolved, 0, &lschema, &rschema).unwrap();
+        // split_conjuncts is stack-order (reversed); sort for comparison.
+        let mut keys = keys;
+        keys.sort();
+        assert_eq!(keys, vec![(0, 0, HashFam::ExactNum), (1, 1, HashFam::Text)]);
+        // non-equi ON: no keys.
+        let stmt2 = parse_statement("select * from t1 a join t2 b on a.id < b.id").unwrap();
+        let (from2, _) = match &stmt2 {
+            crate::sql::Stmt::Select(s) => (s.from.clone(), s.where_.clone()),
+            _ => panic!("expected select"),
+        };
+        let _ = where_;
+        let on2 = match &from2[0] {
+            FromItem::Join { on, .. } => on.clone().unwrap(),
+            _ => panic!("expected join"),
+        };
+        let resolved2 = resolve_predicate_columns(&on2, &schemas).unwrap();
+        assert_eq!(hash_join_keys(&resolved2, 0, &lschema, &rschema), None);
+        // mixed text/int conjunct is not a key; the int/int one is.
+        let stmt3 =
+            parse_statement("select * from t1 a join t2 b on a.id = b.id and a.x = b.id").unwrap();
+        let from3 = match &stmt3 {
+            crate::sql::Stmt::Select(s) => s.from.clone(),
+            _ => panic!("expected select"),
+        };
+        let on3 = match &from3[0] {
+            FromItem::Join { on, .. } => on.clone().unwrap(),
+            _ => panic!("expected join"),
+        };
+        let resolved3 = resolve_predicate_columns(&on3, &schemas).unwrap();
+        let keys3 = hash_join_keys(&resolved3, 0, &lschema, &rschema).unwrap();
+        assert_eq!(keys3, vec![(0, 0, HashFam::ExactNum)]);
     }
 }

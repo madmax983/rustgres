@@ -2284,6 +2284,15 @@ pub(crate) struct BigUint {
     limbs: Vec<u32>,
 }
 
+// v0.93: Hash for the hash-join key. The limb vector is canonical (no
+// leading zero limbs), so hashing it is consistent with the derived
+// PartialEq — equal BigUints hash equal.
+impl std::hash::Hash for BigUint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.limbs.hash(state);
+    }
+}
+
 impl BigUint {
     /// The value zero.
     pub(crate) fn zero() -> Self {

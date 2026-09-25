@@ -241,7 +241,14 @@ class Server:
         self.proc = None
 
     def start(self):
-        env = dict(os.environ, RUSTGRES_DATA_DIR=self.data_dir)
+        # v0.93: real pg_regress runs with PGDATESTYLE=Postgres,MDY (the
+        # expected .out files were generated that way, e.g. text.out's
+        # `03-09-2010`); the engine honors it since v0.90.
+        env = dict(
+            os.environ,
+            RUSTGRES_DATA_DIR=self.data_dir,
+            PGDATESTYLE="Postgres,MDY",
+        )
         self.proc = subprocess.Popen(
             [BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
