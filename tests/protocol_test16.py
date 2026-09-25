@@ -15,8 +15,10 @@ Groups:
      FETCH n/FETCH ALL/FETCH 0-at-end/CLOSE; 34000 on missing cursor;
      CLOSE ALL; MOVE; FIRST/LAST/ABSOLUTE/RELATIVE positioning;
      WITH HOLD survives COMMIT; cursors die on ROLLBACK.
-  I. savepoint/cursor -- FETCH position rewinds on ROLLBACK TO SAVEPOINT;
-     cursors created after the savepoint are closed by the rollback;
+  I. savepoint/cursor -- FETCH position is NOT rewound by ROLLBACK TO
+     SAVEPOINT (PG19 portalmem.c AtSubAbort_Portals only drops portals
+     created in the aborted subtransaction); cursors created after the
+     savepoint are closed by the rollback;
      cursors die in aborted subtransactions.
   J. error codes       -- arity errors (42883), unknown function (42883),
      FETCH in aborted txn (25P02).
@@ -479,9 +481,11 @@ def t_savepoint_cursors(c):
     _, rows, codes, _ = c.q("FETCH NEXT FROM sv")
     check("i-second", not codes and rows == [("10",)], f"{rows} {codes}")
     c.q("ROLLBACK TO SAVEPOINT x")
-    # FETCH effects are not rolled back: position restored to the savepoint.
+    # v0.94 PG19 parity (portalmem.c AtSubAbort_Portals): a surviving
+    # portal keeps its FETCH position — ROLLBACK TO SAVEPOINT does not
+    # rewind it. The next FETCH hits end-of-data, not ("10",) again.
     _, rows, codes, _ = c.q("FETCH NEXT FROM sv")
-    check("i-rewound", not codes and rows == [("10",)], f"{rows} {codes}")
+    check("i-no-rewind", not codes and rows == [], f"{rows} {codes}")
     # Cursors created after the savepoint die on rollback to it.
     c.q("SAVEPOINT y")
     c.q("DECLARE sv2 CURSOR FOR SELECT 1")

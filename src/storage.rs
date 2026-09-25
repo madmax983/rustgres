@@ -770,6 +770,38 @@ impl Numeric {
         }
     }
 
+    /// v0.94: canonical `(special, negative, magnitude, scale)` for
+    /// hash-join keys. Equal finite numerics (per [`Numeric::cmp`])
+    /// must hash equal: `5`, `5.0`, `5.00`, and int4 `5` all reduce
+    /// to `(Finite, false, 5, 0)` here. All constructors strip
+    /// trailing zeros at build time, but PG19's own `hash_numeric`
+    /// (src/backend/utils/adt/numeric.c) is deliberately "paranoid"
+    /// about it — "Omit any leading or trailing zeros from the input
+    /// to the hash" — so the strip is redone here defensively rather
+    /// than trusting every construction site. Specials hash by
+    /// discriminant alone (PG19 hashes every special to 0, but our
+    /// `cmp` distinguishes NaN/+Inf/-Inf, so the discriminant keeps
+    /// the key consistent with `=`).
+    pub(crate) fn hash_key(&self) -> (u8, bool, BigUint, i32) {
+        if self.special != NumericSpecial::Finite {
+            return (self.special as u8, false, BigUint::zero(), 0);
+        }
+        // Sign lives in `unscaled` on both paths (`from_big` stores
+        // ±1 there when the big mantissa is present).
+        let neg = self.unscaled < 0;
+        let mut mag = self.mag();
+        let mut scale = self.scale.max(0);
+        while scale > 0 {
+            let (q, r) = mag.div_rem_small(10);
+            if r != 0 {
+                break;
+            }
+            mag = q;
+            scale -= 1;
+        }
+        (NumericSpecial::Finite as u8, neg, mag, scale)
+    }
+
     /// v0.63: true when the big-mantissa extension is in use.
     pub(crate) fn is_big(&self) -> bool {
         self.big.is_some()
@@ -1035,14 +1067,15 @@ impl Numeric {
             NumericSpecial::NaN => f64::NAN,
             NumericSpecial::PosInf => f64::INFINITY,
             NumericSpecial::NegInf => f64::NEG_INFINITY,
-            // v0.63: big magnitudes go through BigDec's f64 conversion
-            // (leading-digit based); the i128 path is unchanged.
-            NumericSpecial::Finite => match &self.big {
-                Some(_) => BigDec::from_numeric(self)
-                    .map(|d| d.to_f64())
-                    .unwrap_or(f64::NAN),
-                None => self.unscaled as f64 * 10f64.powi(-self.scale),
-            },
+            // v0.94: PG19 parity (numeric.c numeric_float8): the exact
+            // decimal rendering parsed with a correctly-rounded float
+            // parser (numeric_out -> float8in/strtod). The old
+            // `unscaled as f64 * 10f64.powi(-scale)` double-rounds: e.g.
+            // 1.000000000000000000001 became 0.9999999999999999 instead
+            // of 1.0, so `1.000000000000000000001::numeric = 1::float8`
+            // was false (PG: true). The BigDec leading-digits path had
+            // the same flaw (truncation, not round-to-nearest).
+            NumericSpecial::Finite => self.to_text().parse::<f64>().unwrap_or(f64::NAN),
         }
     }
 
@@ -7055,6 +7088,28 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.94: `Numeric::to_f64` is correctly rounded (PG19 numeric_float8
+    /// does numeric_out -> float8in/strtod). The old
+    /// `unscaled as f64 * 10f64.powi(-scale)` double-rounded, so
+    /// 1.000000000000000000001 became 0.9999999999999999 instead of 1.0.
+    #[test]
+    fn numeric_to_f64_correctly_rounded() {
+        let n = Numeric::parse("1.000000000000000000001").unwrap();
+        assert_eq!(n.to_f64(), 1.0);
+        let n = Numeric::parse("0.1").unwrap();
+        assert_eq!(n.to_f64(), 0.1);
+        let n = Numeric::parse("123456789012345678901234567890").unwrap();
+        assert_eq!(n.to_f64(), 1.2345678901234568e29);
+        assert_eq!(Numeric::parse("NaN").unwrap().to_f64().is_nan(), true);
+        assert_eq!(Numeric::parse("Infinity").unwrap().to_f64(), f64::INFINITY);
+        assert_eq!(
+            Numeric::parse("-Infinity").unwrap().to_f64(),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(Numeric::parse("0").unwrap().to_f64(), 0.0);
+        assert_eq!(Numeric::parse("-0.0").unwrap().to_f64(), 0.0);
+    }
 
     /// v0.57: `namein` truncates at 63 bytes (NAMEDATALEN-1) without
     /// error, staying on a UTF-8 char boundary.

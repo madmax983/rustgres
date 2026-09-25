@@ -10694,8 +10694,15 @@ const fn setop_numeric_rank(t: ColType) -> Option<u8> {
         ColType::Int => Some(1),
         ColType::BigInt => Some(2),
         ColType::Float4 => Some(3),
-        ColType::Float => Some(4),
-        ColType::Numeric(..) => Some(5),
+        // v0.94: PG19 parity (parse_coerce.c select_common_type):
+        // float8 is the PREFERRED type of the numeric category
+        // (pg_type.dat typispreferred), numeric->float8 is an implicit
+        // cast while float8->numeric is assignment-only, so float8
+        // beats numeric in common-type resolution (CASE, UNION, ...).
+        // The old order ranked numeric above float8, mistyping e.g.
+        // `CASE ... THEN 'NaN'::float8 ... ELSE -0.0 END` as numeric.
+        ColType::Numeric(..) => Some(4),
+        ColType::Float => Some(5),
         _ => None,
     }
 }
@@ -10723,13 +10730,15 @@ fn common_supertype(op_name: &str, a: &ColType, b: &ColType) -> Result<ColType, 
         return Ok(*a);
     }
     if let (Some(ra), Some(rb)) = (setop_numeric_rank(*a), setop_numeric_rank(*b)) {
+        // v0.94: ranks mirror setop_numeric_rank — float8 (rank 5) is
+        // PG19's preferred numeric-category type and beats numeric.
         return Ok(match ra.max(rb) {
             0 => ColType::SmallInt,
             1 => ColType::Int,
             2 => ColType::BigInt,
             3 => ColType::Float4,
-            4 => ColType::Float,
-            _ => ColType::Numeric(None),
+            4 => ColType::Numeric(None),
+            _ => ColType::Float,
         });
     }
     if setop_is_char_family(*a) && setop_is_char_family(*b) {
@@ -14483,11 +14492,16 @@ fn hash_family(ty: &ColType) -> Option<HashFam> {
 /// residual doubt moot.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum HashKeyPart {
-    /// (special as u8, negative, magnitude, scale). `Numeric::new`
-    /// normalizes trailing zeros at build time and `from_big`
-    /// downgrades fitting magnitudes to the i128 path, so equal
-    /// finite numerics share one canonical form.
+    /// (special as u8, negative, magnitude, scale), canonicalized by
+    /// `Numeric::hash_key`: trailing zeros stripped, so `5`, `5.0`,
+    /// `5.00`, int4 `5`, and int8 `5` share one key — exactly `=`
+    /// semantics, and mixed int/numeric conjuncts hash consistently
+    /// (PG19's hashint8 is likewise "compatible with the values
+    /// produced by hashint4 and hashint2 for logically equal
+    /// inputs", src/backend/access/hash/hashfunc.c).
     ExactNum(u8, bool, crate::storage::BigUint, i32),
+    /// Canonicalized f64 bits: `-0.0` -> `0.0`, NaN -> standard NaN
+    /// (see `canon_float_key`).
     Float(u64),
     Text(std::sync::Arc<str>),
     BpChar(std::sync::Arc<str>),
@@ -14500,6 +14514,25 @@ enum HashKeyPart {
     PgLsn(u64),
 }
 
+/// v0.94: PG19 float hash canonicalization
+/// (src/backend/access/hash/hashfunc.c, `hashfloat4`/`hashfloat8`):
+/// "On IEEE-float machines, minus zero and zero have different bit
+/// patterns but should compare as equal. We must ensure that they
+/// have the same hash value" — so `-0.0` hashes as `0.0`; "NaNs can
+/// have different bit patterns but they should all compare as equal.
+/// For backwards-compatibility reasons we force them to have the
+/// hash value of a standard NaN."
+#[inline]
+fn canon_float_key(f: f64) -> u64 {
+    if f.is_nan() {
+        f64::NAN.to_bits()
+    } else if f == 0.0 {
+        0
+    } else {
+        f.to_bits()
+    }
+}
+
 fn hash_key_part(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
     match fam {
         HashFam::ExactNum => {
@@ -14509,16 +14542,19 @@ fn hash_key_part(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
                 Value::Numeric(n) => n.clone(),
                 _ => return None,
             };
-            Some(HashKeyPart::ExactNum(
-                n.special as u8,
-                n.unscaled < 0,
-                n.mag(),
-                n.scale,
-            ))
+            // v0.94: canonicalize defensively (trailing-zero strip),
+            // so `5`, `5.0`, `5.00` share one key — see
+            // `Numeric::hash_key`.
+            let (special, neg, mag, scale) = n.hash_key();
+            Some(HashKeyPart::ExactNum(special, neg, mag, scale))
         }
         HashFam::Float => match v {
-            Value::Float4(f) => Some(HashKeyPart::Float((*f as f64).to_bits())),
-            Value::Float(f) => Some(HashKeyPart::Float(f.to_bits())),
+            // v0.94: PG19 hashfloat4/hashfloat8 canonicalization
+            // (src/backend/access/hash/hashfunc.c): float4 is widened
+            // to float8 first, then `-0.0` hashes as `0` and every NaN
+            // hashes as one standard NaN — matching `=` (float8_eq).
+            Value::Float4(f) => Some(HashKeyPart::Float(canon_float_key(*f as f64))),
+            Value::Float(f) => Some(HashKeyPart::Float(canon_float_key(*f))),
             _ => None,
         },
         HashFam::Text => match v {
@@ -16618,49 +16654,61 @@ fn project_row_expanded(
 // Aggregation (v0.6)
 // ---------------------------------------------------------------------------
 
+/// v0.94: canonical exact-numeric encoding for [`value_key`], via
+/// `Numeric::hash_key`: (special, negative, decimal magnitude digits,
+/// scale). Equal numerics (per `Numeric::cmp`) share one encoding —
+/// `1::int`, `1::bigint`, `1.0::numeric` group together — and NaN /
+/// +Infinity / -Infinity stay distinct, matching PG19's hash_numeric
+/// (trailing zeros omitted from the hash input; specials hashed by
+/// kind).
+fn value_key_numeric(out: &mut Vec<u8>, n: &crate::storage::Numeric) {
+    let (special, neg, mag, scale) = n.hash_key();
+    out.push(special);
+    out.push(neg as u8);
+    let digits = mag.to_decimal_string();
+    out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
+    out.extend_from_slice(digits.as_bytes());
+    out.extend_from_slice(&scale.to_be_bytes());
+}
+
 /// Append a canonical byte key for a value (for GROUP BY / DISTINCT).
-/// Floats use their bit pattern so NaN groups with NaN, like Postgres.
+/// Floats hash canonically so NaN groups with NaN and -0.0 with 0.0,
+/// like Postgres (PG19 hashfloat4/hashfloat8).
 /// Hash key for GROUP BY / DISTINCT. Exact numerics (int2/int4/int8/
-/// numeric) canonicalize to a (tag, unscaled, scale) triple and floats to
-/// f64 bits, so `1::int`, `1::bigint` and `1.0::numeric` group together —
-/// like Postgres' common-type resolution for grouping.
+/// numeric) canonicalize via `Numeric::hash_key` — (special, sign,
+/// magnitude, scale) with trailing zeros stripped — so `1::int`,
+/// `1::bigint` and `1.0::numeric` group together, and NaN/+Inf/-Inf
+/// stay distinct (PG19 hash_numeric semantics).
 fn value_key(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Null => out.push(0),
         Value::SmallInt(i) => {
             out.push(8);
-            out.extend_from_slice(&(*i as i128).to_be_bytes());
-            out.extend_from_slice(&0u32.to_be_bytes());
+            value_key_numeric(out, &crate::storage::Numeric::new(*i as i128, 0));
         }
         Value::Int(i) => {
             out.push(8);
-            out.extend_from_slice(&(*i as i128).to_be_bytes());
-            out.extend_from_slice(&0u32.to_be_bytes());
+            value_key_numeric(out, &crate::storage::Numeric::new(*i as i128, 0));
         }
         Value::BigInt(i) => {
             out.push(8);
-            out.extend_from_slice(&(*i as i128).to_be_bytes());
-            out.extend_from_slice(&0u32.to_be_bytes());
+            value_key_numeric(out, &crate::storage::Numeric::new(*i as i128, 0));
         }
         Value::Numeric(n) => {
-            // v0.63: big-mantissa aware — unscaled holds the sign for
-            // big values, so the exact magnitude bytes disambiguate.
             out.push(8);
-            out.extend_from_slice(&n.unscaled.to_be_bytes());
-            out.extend_from_slice(&n.scale.to_be_bytes());
-            if n.is_big() {
-                let mag = n.mag();
-                out.extend_from_slice(&mag.decimal_digits().to_be_bytes());
-                out.extend_from_slice(mag.to_decimal_string().as_bytes());
-            }
+            value_key_numeric(out, n);
         }
         Value::Float4(f) => {
             out.push(2);
-            out.extend_from_slice(&(*f as f64).to_bits().to_be_bytes());
+            // v0.94: canonicalized like the hash-join key: -0.0
+            // groups with 0.0, all NaNs group together (PG19
+            // hashfloat4).
+            out.extend_from_slice(&canon_float_key(*f as f64).to_be_bytes());
         }
         Value::Float(f) => {
             out.push(2);
-            out.extend_from_slice(&f.to_bits().to_be_bytes());
+            // v0.94: see Float4.
+            out.extend_from_slice(&canon_float_key(*f).to_be_bytes());
         }
         Value::Text(s) => {
             out.push(3);
@@ -21652,10 +21700,11 @@ fn not3(v: Option<bool>) -> Option<bool> {
 
 /// Compare two values: None when either side is NULL (SQL semantics).
 /// Exact numerics (int2/int4/int8/numeric) compare exactly; float
-/// kinds compare by total_cmp; mixed exact/float goes through f64 (a
-/// documented precision caveat). Text is byte-wise (no collations
-/// yet), bools false < true, dates/times/bytea/uuid compare naturally.
-/// Mismatched non-null types are 42883, like Postgres.
+/// kinds compare by `pg_float_ord` (v0.94: PG19 float8_cmp_internal —
+/// NaN sorts last, NaN = NaN, -0.0 == 0.0); mixed exact/float goes
+/// through f64 (a documented precision caveat). Text is byte-wise (no
+/// collations yet), bools false < true, dates/times/bytea/uuid compare
+/// naturally. Mismatched non-null types are 42883, like Postgres.
 /// Date as a timestamp (midnight) for mixed date/timestamp comparisons.
 fn date_as_ts(d: i32) -> i64 {
     d as i64 * 86_400_000_000
@@ -21758,6 +21807,30 @@ fn record_image_eq(fa: &[(String, Value)], fb: &[(String, Value)]) -> bool {
     })
 }
 
+/// v0.94: PG19 float comparison ordering (the `float8_lt`/`float8_eq`
+/// family in src/include/utils/float.h): NaN is greater than
+/// everything (sorts last), NaN = NaN, and `-0.0 == 0.0` (IEEE `==`,
+/// unlike `total_cmp` which distinguishes the signed zeros). Used for
+/// both comparison operators and ORDER BY.
+fn pg_float_ord(a: f64, b: f64) -> Ordering {
+    if a.is_nan() {
+        if b.is_nan() {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        }
+    } else if b.is_nan() {
+        Ordering::Less
+    } else if a == b {
+        // Covers -0.0 == 0.0.
+        Ordering::Equal
+    } else if a < b {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
 fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, ExecError> {
     // v0.82: `*=` (ImageEq) exists only for record operands. PG has no
     // such operator for scalars, so `1 *= 2` is 42883 "operator does
@@ -21782,15 +21855,15 @@ fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, Exe
                 _ => exact_numeric(x).cmp(&exact_numeric(y)),
             }))
         }
-        (Value::Float4(x), Value::Float4(y)) => Ok(Some((*x as f64).total_cmp(&(*y as f64)))),
-        (Value::Float4(x), Value::Float(y)) => Ok(Some((*x as f64).total_cmp(y))),
-        (Value::Float(x), Value::Float4(y)) => Ok(Some(x.total_cmp(&(*y as f64)))),
-        (Value::Float(x), Value::Float(y)) => Ok(Some(x.total_cmp(y))),
+        (Value::Float4(x), Value::Float4(y)) => Ok(Some(pg_float_ord(*x as f64, *y as f64))),
+        (Value::Float4(x), Value::Float(y)) => Ok(Some(pg_float_ord(*x as f64, *y))),
+        (Value::Float(x), Value::Float4(y)) => Ok(Some(pg_float_ord(*x, *y as f64))),
+        (Value::Float(x), Value::Float(y)) => Ok(Some(pg_float_ord(*x, *y))),
         (x, y @ (Value::Float4(_) | Value::Float(_))) if is_exact_numeric(x) => {
-            Ok(Some(exact_to_f64(x).total_cmp(&float_val(y))))
+            Ok(Some(pg_float_ord(exact_to_f64(x), float_val(y))))
         }
         (x @ (Value::Float4(_) | Value::Float(_)), y) if is_exact_numeric(y) => {
-            Ok(Some(float_val(x).total_cmp(&exact_to_f64(y))))
+            Ok(Some(pg_float_ord(float_val(x), exact_to_f64(y))))
         }
         (Value::Text(x), Value::Text(y)) => Ok(Some(x.cmp(y))),
         // v0.35: PG's bpcharcmp ignores trailing spaces (bcTruelen):
@@ -22032,8 +22105,9 @@ fn is_nan_val(v: &Value) -> bool {
 
 /// v0.48: shared `IS [NOT] DISTINCT FROM` value logic for the row
 /// and grouped evaluators (PG19): NULLs compare equal and never
-/// produce unknown; NaN compares equal to NaN (unlike `=`); otherwise
-/// the negation of `=`.
+/// produce unknown; NaN compares equal to NaN (like `=` since v0.94 —
+/// PG19 `float8_eq`/`cmp_numerics` treat NaN as equal to NaN);
+/// otherwise the negation of `=`.
 fn eval_is_distinct_from(l: Value, r: Value, neg: bool) -> Result<Value, ExecError> {
     let distinct = match (&l, &r) {
         (Value::Null, Value::Null) => false,
@@ -22077,35 +22151,38 @@ fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
         Some((ac, bc)) => (ac, bc),
         None => (a, b),
     };
-    // v0.18: PG semantics: NaN != NaN (NaN is not equal to itself).
-    // This applies to = and <>; ORDER BY still sorts NaN last via cmp().
-    let a_is_nan = matches!(a, Value::Numeric(n) if n.is_nan());
-    let b_is_nan = matches!(b, Value::Numeric(n) if n.is_nan());
+    // v0.94: PG19 NaN equality. The old comment here ("NaN != NaN")
+    // was wrong: `src/include/utils/float.h` defines
+    // `float8_eq(a,b)` as `isnan(a) ? isnan(b) : ...` (NaN = NaN is
+    // TRUE, NaN <> NaN is FALSE), and numeric.c `cmp_numerics`
+    // says "We consider all NANs to be equal". This covers float
+    // and numeric NaNs alike (mixed pairs coerce as usual); ORDER BY
+    // still sorts NaN last via cmp_ordering.
+    let a_is_nan = is_nan_val(a);
+    let b_is_nan = is_nan_val(b);
     if a_is_nan || b_is_nan {
-        return Ok(Value::Bool(match op {
-            CmpOp::Eq => false,
-            CmpOp::Ne => true,
-            // For ordering ops with NaN, fall through to cmp (NaN sorts last).
-            _ => {
-                return match cmp_ordering(a, b, op)? {
-                    None => Ok(Value::Null),
-                    Some(ord) => Ok(Value::Bool(match op {
-                        CmpOp::Lt => ord == Ordering::Less,
-                        CmpOp::Le => ord != Ordering::Greater,
-                        CmpOp::Gt => ord == Ordering::Greater,
-                        CmpOp::Ge => ord != Ordering::Less,
-                        // Eq/Ne are handled above; any other operator is an
-                        // internal error, never a panic.
-                        _ => {
-                            return Err(exec_err(
-                                "XX000",
-                                "internal error: unexpected comparison operator",
-                            ));
-                        }
-                    })),
-                };
-            }
-        }));
+        if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+            let eq = a_is_nan && b_is_nan;
+            return Ok(Value::Bool(if op == CmpOp::Eq { eq } else { !eq }));
+        }
+        // For ordering ops with NaN, fall through to cmp (NaN sorts last).
+        return match cmp_ordering(a, b, op)? {
+            None => Ok(Value::Null),
+            Some(ord) => Ok(Value::Bool(match op {
+                CmpOp::Lt => ord == Ordering::Less,
+                CmpOp::Le => ord != Ordering::Greater,
+                CmpOp::Gt => ord == Ordering::Greater,
+                CmpOp::Ge => ord != Ordering::Less,
+                // Eq/Ne are handled above; any other operator is an
+                // internal error, never a panic.
+                _ => {
+                    return Err(exec_err(
+                        "XX000",
+                        "internal error: unexpected comparison operator",
+                    ));
+                }
+            })),
+        };
     }
     match cmp_ordering(a, b, op)? {
         None => Ok(Value::Null),
@@ -31015,7 +31092,8 @@ fn func_result_type(
 }
 
 /// Compare two values for ORDER BY. Exact numerics (int2/int4/int8/
-/// numeric) compare exactly; float4/float8 compare by `total_cmp`;
+/// numeric) compare exactly; float4/float8 compare by `pg_float_ord`
+/// (v0.94: PG19 float8_cmp_internal — NaN sorts last, -0.0 == 0.0);
 /// mixed exact/float goes through f64 (a documented precision caveat).
 /// Text compares byte-wise (no collation support yet), bools order
 /// false < true, dates/times/bytea/uuid compare naturally. Mismatched
@@ -31051,15 +31129,15 @@ fn compare_values(
                 _ => exact_numeric(x).cmp(&exact_numeric(y)),
             }
         }
-        (Value::Float4(x), Value::Float4(y)) => (*x as f64).total_cmp(&(*y as f64)),
-        (Value::Float4(x), Value::Float(y)) => (*x as f64).total_cmp(y),
-        (Value::Float(x), Value::Float4(y)) => x.total_cmp(&(*y as f64)),
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Float4(x), Value::Float4(y)) => pg_float_ord(*x as f64, *y as f64),
+        (Value::Float4(x), Value::Float(y)) => pg_float_ord(*x as f64, *y),
+        (Value::Float(x), Value::Float4(y)) => pg_float_ord(*x, *y as f64),
+        (Value::Float(x), Value::Float(y)) => pg_float_ord(*x, *y),
         (x, y @ (Value::Float4(_) | Value::Float(_))) if is_exact_numeric(x) => {
-            (exact_to_f64(x)).total_cmp(&float_val(y))
+            pg_float_ord(exact_to_f64(x), float_val(y))
         }
         (x @ (Value::Float4(_) | Value::Float(_)), y) if is_exact_numeric(y) => {
-            float_val(x).total_cmp(&exact_to_f64(y))
+            pg_float_ord(float_val(x), exact_to_f64(y))
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         // v0.35: bpchar ordering ignores trailing spaces (like
@@ -33911,6 +33989,28 @@ mod tests {
     use crate::sql::parse_statement;
     use crate::storage::Table;
 
+    /// v0.94: PG19 `select_common_type` — float8 is the preferred type
+    /// of the numeric category (pg_type.dat typispreferred;
+    /// numeric->float8 is implicit, float8->numeric is assignment-only),
+    /// so float8 beats numeric in CASE/UNION type resolution.
+    #[test]
+    fn v94_common_supertype_float8_beats_numeric() {
+        let f8 = ColType::Float;
+        let num = ColType::Numeric(None);
+        assert_eq!(common_supertype("CASE", &f8, &num).unwrap(), f8);
+        assert_eq!(common_supertype("CASE", &num, &f8).unwrap(), f8);
+        assert_eq!(common_supertype("UNION", &ColType::Int, &num).unwrap(), num);
+        assert_eq!(common_supertype("UNION", &ColType::Int, &f8).unwrap(), f8);
+        assert_eq!(
+            common_supertype("UNION", &ColType::Float4, &num).unwrap(),
+            num
+        );
+        assert_eq!(
+            common_supertype("UNION", &ColType::Float4, &f8).unwrap(),
+            f8
+        );
+    }
+
     /// Engine with two small tables, committed (next_xid past them).
     fn engine() -> Engine {
         let mut eng = Engine::new();
@@ -34375,7 +34475,9 @@ mod tests {
         );
         assert_eq!(rows, vec![vec!["f".to_string()]]);
         let rows = rows_of(run(&mut eng, "SELECT 'nan'::numeric = 'nan'::numeric").unwrap());
-        assert_eq!(rows, vec![vec!["f".to_string()]]);
+        // v0.94: PG19 cmp_numerics considers all NaNs equal, so `=`
+        // is TRUE (was "f" under the old, incorrect NaN != NaN rule).
+        assert_eq!(rows, vec![vec!["t".to_string()]]);
     }
 
     /// v0.48: `IS DISTINCT FROM` works in WHERE and in the grouped
@@ -35376,6 +35478,52 @@ mod tests {
         );
         assert_eq!(err_code(&mut eng, "SELECT asind(1.5)"), "22003");
         assert_eq!(err_code(&mut eng, "SELECT acosd(-2.0::float8)"), "22003");
+    }
+
+    // v0.94: PG19 float/numeric NaN and signed-zero comparison parity,
+    // grounded in REL_19_STABLE: src/include/utils/float.h
+    // (`float8_eq`: `isnan(a) ? isnan(b) : ...` — NaN = NaN is TRUE,
+    // NaN <> NaN is FALSE) and numeric.c `cmp_numerics` ("We consider
+    // all NANs to be equal"). -0.0 = 0.0 is TRUE (IEEE `==`).
+    #[test]
+    fn v94_nan_signed_zero_cmp() {
+        let mut eng = engine();
+        let one = |eng: &mut _, sql: &str| rows_of(run(eng, sql).unwrap())[0][0].clone();
+        // NaN = NaN is TRUE (float and numeric); <> is FALSE.
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 = 'nan'::float8"), "t");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 <> 'nan'::float8"), "f");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float4 = 'nan'::float4"), "t");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::numeric = 'nan'::numeric"), "t");
+        assert_eq!(
+            one(&mut eng, "SELECT 'nan'::numeric <> 'nan'::numeric"),
+            "f"
+        );
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 = 'nan'::numeric"), "t");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 = '1'::float8"), "f");
+        // -0.0 = 0.0 is TRUE; -0.0 < 0.0 is FALSE.
+        assert_eq!(one(&mut eng, "SELECT '-0.0'::float8 = '0.0'::float8"), "t");
+        assert_eq!(one(&mut eng, "SELECT '-0.0'::float8 < '0.0'::float8"), "f");
+        assert_eq!(one(&mut eng, "SELECT '-0.0'::float4 = '0'::float4"), "t");
+        // NaN ordering (float8_lt/gt): NaN sorts after everything.
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 > '1e308'::float8"), "t");
+        assert_eq!(one(&mut eng, "SELECT '1'::float8 < 'nan'::float8"), "t");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::float8 < '1'::float8"), "f");
+        assert_eq!(one(&mut eng, "SELECT 'nan'::numeric > '1'::numeric"), "t");
+        // IS DISTINCT FROM: NaN is still not distinct from NaN.
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT 'nan'::float8 IS DISTINCT FROM 'nan'::float8"
+            ),
+            "f"
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "SELECT 'nan'::float8 IS DISTINCT FROM '1'::float8"
+            ),
+            "t"
+        );
     }
 
     #[test]
@@ -42852,10 +43000,76 @@ mod hash_join_tests {
         let f1 = key(&Value::Float4(1.5), HashFam::Float).unwrap();
         let f2 = key(&Value::Float(1.5), HashFam::Float).unwrap();
         assert_eq!(f1, f2);
-        // engine semantics: -0.0 != 0.0 (total_cmp), so hashes differ.
+        // v0.94 PG19 parity (hashfloat8): -0.0 hashes as 0.0, all
+        // NaNs hash as one standard NaN — matching `=` (float8_eq).
         let fnz = key(&Value::Float(-0.0), HashFam::Float).unwrap();
         let fz = key(&Value::Float(0.0), HashFam::Float).unwrap();
-        assert_ne!(fnz, fz);
+        assert_eq!(fnz, fz);
+        let fnan1 = key(&Value::Float(f64::NAN), HashFam::Float).unwrap();
+        let fnan2 = key(&Value::Float(-f64::NAN), HashFam::Float).unwrap();
+        assert_eq!(fnan1, fnan2);
+        assert_eq!(
+            fnan1,
+            key(&Value::Float4(f32::NAN), HashFam::Float).unwrap()
+        );
+        // v0.94: cross-scale / cross-width exact numerics share one
+        // key (PG19 hash_numeric omits trailing zeros; hashint8 is
+        // compatible with hashint4/hashint2).
+        let k5 = key(&Value::Int(5), HashFam::ExactNum).unwrap();
+        assert_eq!(
+            k5,
+            key(
+                &Value::Numeric(Numeric::parse("5.0").unwrap()),
+                HashFam::ExactNum
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            k5,
+            key(
+                &Value::Numeric(Numeric::parse("5.00").unwrap()),
+                HashFam::ExactNum
+            )
+            .unwrap()
+        );
+        assert_eq!(k5, key(&Value::BigInt(5), HashFam::ExactNum).unwrap());
+        assert_eq!(k5, key(&Value::SmallInt(5), HashFam::ExactNum).unwrap());
+        // v0.94: specials — NaN = NaN, distinct from the infinities
+        // (PG19 cmp_numerics considers all NaNs equal).
+        let knan = key(
+            &Value::Numeric(Numeric::parse("NaN").unwrap()),
+            HashFam::ExactNum,
+        )
+        .unwrap();
+        assert_eq!(
+            knan,
+            key(
+                &Value::Numeric(Numeric::parse("nan").unwrap()),
+                HashFam::ExactNum
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            knan,
+            key(
+                &Value::Numeric(Numeric::parse("Infinity").unwrap()),
+                HashFam::ExactNum
+            )
+            .unwrap()
+        );
+        let kinf = key(
+            &Value::Numeric(Numeric::parse("Infinity").unwrap()),
+            HashFam::ExactNum,
+        )
+        .unwrap();
+        assert_eq!(
+            kinf,
+            key(
+                &Value::Numeric(Numeric::parse("inf").unwrap()),
+                HashFam::ExactNum
+            )
+            .unwrap()
+        );
         // text / bpchar (rtrim) / bool / date / ts / bytea / uuid.
         assert_eq!(
             key(&Value::text("x"), HashFam::Text),

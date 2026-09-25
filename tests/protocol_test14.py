@@ -427,13 +427,14 @@ def t_txn_syntax(c):
     _, _, codes, _ = c.q("START TRANSACTION READ WRITE")
     check("k-start-rw", not codes, f"{codes}")
     c.q("ROLLBACK")
-    # COMMIT AND CHAIN with no open transaction: still COMMIT tag, and a
-    # chained transaction is now open (next INSERT must be committable).
+    # v0.94: PG19 parity (xact.c EndTransactionBlock): COMMIT AND CHAIN
+    # with no open transaction raises 25001 "can only be used in
+    # transaction blocks" (plain COMMIT only warns). No chained txn opens.
     tags, _, codes, _ = c.q("COMMIT AND CHAIN")
-    check("k-chain-no-txn", not codes, f"{codes}")
-    check("k-chain-no-txn-tag", tags == ["COMMIT"], f"{tags}")
+    check("k-chain-no-txn", codes == ["25001"], f"{codes}")
+    check("k-chain-no-txn-tag", tags == [], f"{tags}")
+    # Session is still idle: INSERT autocommits, no COMMIT needed.
     c.q("INSERT INTO t_txn VALUES (6)")
-    c.q("COMMIT")
     _, rows, codes, _ = c.q("SELECT x FROM t_txn WHERE x = 6")
     check("k-chain-no-txn-rows", not codes and rows == [("6",)], f"{rows} {codes}")
     c.q("DROP TABLE t_txn")

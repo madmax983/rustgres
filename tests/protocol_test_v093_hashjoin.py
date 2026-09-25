@@ -11,8 +11,8 @@ residuals, ordering).
 
 Plus targeted expected-value checks:
 - duplicates (n x m fan-out within a key group), NULL keys never match
-- mixed int/numeric keys, float keys (-0.0 vs 0.0 engine semantics),
-  NaN keys never match
+- mixed int/numeric keys, float keys (-0.0 = 0.0 and NaN = NaN per
+  v0.94 PG19 parity; previously -0.0 != 0.0 and NaN never matched)
 - text/varchar/bpchar (trailing-space) keys, bool/date/timestamp/
   timestamptz/bytea/uuid/"char"/pg_lsn keys
 - multi-key equi joins, equi + residual conjuncts, same-side equalities
@@ -115,7 +115,7 @@ QUERIES = [
     "select x.v, y.v from hja x join hja y on x.id = y.id order by 1,2;",
     # mixed int = numeric
     "select a.v, n.v from hja a join hjn n on a.id = n.id order by 1,2;",
-    # float keys; engine: -0.0 != 0.0 (total_cmp), NaN never matches
+    # float keys; v0.94 PG19 parity: -0.0 = 0.0 (IEEE ==), NaN = NaN
     "select f.v, g.w from hjf f join hjf2 g on f.id = g.id order by 1,2;",
     # text / varchar
     "select t.v, v.v from hjt t join hjv v on t.k = v.k order by 1,2;",
@@ -160,9 +160,10 @@ EXPECTED = {
     "select a.v, n.v from hja a join hjn n on a.id = n.id order by 1,2;": [
         ["a2", "n2"], ["a2b", "n2"], ["a3", "n3"],
     ],
-    # float: 1.5=1.5; -0.0 matches -0.0 only; 0.0 matches 0.0 only; NaN never
+    # float: 1.5=1.5; -0.0 = 0.0 (PG19 hashfloat8/-0.0 canonicalization);
+    # NaN = NaN would match but hjf2 has no NaN row
     "select f.v, g.w from hjf f join hjf2 g on f.id = g.id order by 1,2;": [
-        ["f1", "g1"], ["fn", "gn"], ["fz", "gz"],
+        ["f1", "g1"], ["fn", "gn"], ["fn", "gz"], ["fz", "gn"], ["fz", "gz"],
     ],
     # bpchar: 'a' = 'a  ', 'ab' = 'ab '
     "select c.v, c2.v from hjc c join hjc2 c2 on c.k = c2.k order by 1,2;": [
