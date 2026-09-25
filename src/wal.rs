@@ -23,6 +23,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
+//! Format version 18 (`RGSWAL18` / `RGSCHK15`) is NOT compatible with v0.98
+//! or earlier: v0.99 WAL-logs and checkpoints the sequence data type
+//! (`WalSequence.seq_type`). Like every format bump, old data directories
+//! are refused with a clear error instead of being misread.
+//!
 //! Format version 17 (`RGSWAL17` / `RGSCHK14`) is NOT compatible with v0.97
 //! or earlier: v0.98 WAL-logs and checkpoints the sequence CACHE size
 //! (`WalSequence.cache`). Like every format bump, old data directories
@@ -142,7 +147,7 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK14";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK15";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
@@ -195,9 +200,9 @@ const CHKPT_VERSION: u32 = 17;
 /// v0.96: `RGSWAL16` — `CreateTable`/`AlterTable` carry the
 /// inheritance parent links (`inherits`). Old `RGSWAL15` files are
 /// refused loudly.
-/// v0.98: `RGSWAL17` — sequence records carry the CACHE size.
-/// Old `RGSWAL16` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL17";
+/// v0.99: `RGSWAL18` — sequence records carry the data type.
+/// Old `RGSWAL17` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL18";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -688,6 +693,8 @@ impl WalRole {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalSequence {
     pub name: String,
+    /// v0.99: sequence data type (0 = smallint, 1 = integer, 2 = bigint).
+    pub seq_type: u8,
     pub start: i64,
     pub increment: i64,
     pub min_value: i64,
@@ -711,6 +718,11 @@ impl WalSequence {
     pub fn of(s: &crate::storage::Sequence) -> Self {
         WalSequence {
             name: s.name.clone(),
+            seq_type: match s.seq_type {
+                crate::sql::SeqType::SmallInt => 0,
+                crate::sql::SeqType::Integer => 1,
+                crate::sql::SeqType::BigInt => 2,
+            },
             start: s.start,
             increment: s.increment,
             min_value: s.min_value,
@@ -729,6 +741,11 @@ impl WalSequence {
     pub fn into_sequence(self, created_xmin: u64) -> crate::storage::Sequence {
         crate::storage::Sequence {
             name: self.name,
+            seq_type: match self.seq_type {
+                0 => crate::sql::SeqType::SmallInt,
+                1 => crate::sql::SeqType::Integer,
+                _ => crate::sql::SeqType::BigInt,
+            },
             start: self.start,
             increment: self.increment,
             min_value: self.min_value,
@@ -1930,6 +1947,8 @@ impl Enc {
 
     fn sequence(&mut self, s: &WalSequence) {
         self.str(&s.name);
+        // v0.99: sequence data type.
+        self.u8(s.seq_type);
         self.i64(s.start);
         self.i64(s.increment);
         self.i64(s.min_value);
@@ -2751,6 +2770,8 @@ impl<'a> Dec<'a> {
 
     fn sequence(&mut self) -> Result<WalSequence, String> {
         let name = self.str()?;
+        // v0.99: sequence data type.
+        let seq_type = self.u8()?;
         let start = self.i64()?;
         let increment = self.i64()?;
         let min_value = self.i64()?;
@@ -2779,6 +2800,7 @@ impl<'a> Dec<'a> {
         };
         Ok(WalSequence {
             name,
+            seq_type,
             start,
             increment,
             min_value,

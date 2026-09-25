@@ -1875,10 +1875,16 @@ pub enum AlterAction {
 /// (ALTER) or the Postgres default (CREATE).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SequenceOpts {
+    /// v0.99: explicit `AS smallint | int | bigint` (PG19; default bigint).
+    pub seq_type: Option<SeqType>,
     pub start: Option<i64>,
     pub increment: Option<i64>,
     pub min_value: Option<i64>,
     pub max_value: Option<i64>,
+    /// v0.99: `NO MINVALUE` / `NO MAXVALUE` — reset to the type default
+    /// (PG19 init_params). Distinct from `None` (keep current on ALTER).
+    pub reset_min: bool,
+    pub reset_max: bool,
     pub cycle: Option<bool>,
     pub restart: Option<i64>,
     /// v0.98: `CACHE n` (Postgres default 1).
@@ -1886,6 +1892,40 @@ pub struct SequenceOpts {
     /// v0.98: `OWNED BY table.col` / `OWNED BY NONE`. `None` =
     /// unspecified (ALTER keeps the current owner link).
     pub owned_by: Option<OwnedBySpec>,
+}
+
+/// v0.99: explicit sequence data type (`AS smallint | int | bigint`,
+/// PG19; anything else is 22023 "sequence type must be smallint,
+/// integer, or bigint").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqType {
+    SmallInt,
+    Integer,
+    BigInt,
+}
+
+impl SeqType {
+    pub fn pg_name(self) -> &'static str {
+        match self {
+            SeqType::SmallInt => "smallint",
+            SeqType::Integer => "integer",
+            SeqType::BigInt => "bigint",
+        }
+    }
+    pub fn min_value(self) -> i64 {
+        match self {
+            SeqType::SmallInt => i64::from(i16::MIN),
+            SeqType::Integer => i64::from(i32::MIN),
+            SeqType::BigInt => i64::MIN,
+        }
+    }
+    pub fn max_value(self) -> i64 {
+        match self {
+            SeqType::SmallInt => i64::from(i16::MAX),
+            SeqType::Integer => i64::from(i32::MAX),
+            SeqType::BigInt => i64::MAX,
+        }
+    }
 }
 
 /// v0.98: `OWNED BY` target in CREATE/ALTER SEQUENCE (PG19
@@ -1897,14 +1937,6 @@ pub enum OwnedBySpec {
 }
 
 impl SequenceOpts {
-    /// `NO MINVALUE` / `NO MAXVALUE` sentinel: Postgres uses 1 /
-    /// 2^63-1 for ascending sequences.
-    pub fn no_minvalue() -> i64 {
-        1
-    }
-    pub fn no_maxvalue() -> i64 {
-        i64::MAX
-    }
     /// Bare `RESTART` (no WITH value) resets to the sequence's start.
     pub const RESTART_SENTINEL: i64 = i64::MIN;
 }
@@ -4444,7 +4476,9 @@ impl Parser {
             let mut columns = Vec::new();
             loop {
                 // v0.88: `(expr)` is an index expression; anything else
-                // must be a plain column name.
+                // must be a plain column name. v0.99: a bare function
+                // call (`expensivefunc(x)`) is also an expression (PG19
+                // index_elem: ColId | func_expr | (a_expr)).
                 let (name_opt, expr_opt) = if matches!(self.peek(), Token::LParen) {
                     self.next(); // consume the expression's '('
                     let start = self.pos;
@@ -4453,7 +4487,18 @@ impl Parser {
                     self.expect(Token::RParen, "')'")?;
                     (None, Some(src))
                 } else {
-                    (Some(self.expect_ident()?), None)
+                    let start = self.pos;
+                    let name = self.expect_ident()?;
+                    if matches!(self.peek(), Token::LParen) {
+                        // Function call: rewind and capture the full
+                        // expression source.
+                        self.pos = start;
+                        let _ = self.parse_or()?;
+                        let src = tokens_to_sql(&self.tokens[start..self.pos]);
+                        (None, Some(src))
+                    } else {
+                        (Some(name), None)
+                    }
                 };
                 let desc = if self.eat_keyword("desc") {
                     true
@@ -5743,6 +5788,29 @@ impl Parser {
                 volatility = FuncVolatility::Volatile;
             } else if self.eat_keyword("strict") {
                 strict = true;
+            } else if self.eat_keyword("cost") {
+                // v0.99: COST is a planner hint (PG19); parsed and
+                // validated but not stored (the executor has no
+                // cost-based planner).
+                match self.next() {
+                    Token::Number(raw) => {
+                        let v: f64 = raw.parse().map_err(|_| {
+                            err(format!("invalid COST value: {}", raw))
+                        })?;
+                        if v <= 0.0 {
+                            return Err(err(format!(
+                                "COST must be positive, got {}",
+                                raw
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected number after COST, found {:?}",
+                            other
+                        )));
+                    }
+                }
             } else if self.eat_keyword("as") {
                 match self.next() {
                     Token::Str(s) => {
@@ -6202,7 +6270,14 @@ impl Parser {
     fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {
         let mut opts = SequenceOpts::default();
         loop {
-            if self.eat_keyword("start") {
+            if self.eat_keyword("as") {
+                // v0.99: `AS smallint | int | bigint` (PG19; anything
+                // else is a 22023 at execution).
+                if opts.seq_type.is_some() {
+                    return Err(err("syntax error: duplicate AS in sequence options".to_string()));
+                }
+                opts.seq_type = Some(self.parse_seq_type()?);
+            } else if self.eat_keyword("start") {
                 // v0.98: PG19 is START [ WITH ] start — bare START n is legal.
                 let _ = self.eat_keyword("with");
                 opts.start = Some(self.parse_seq_int("START")?);
@@ -6216,9 +6291,9 @@ impl Parser {
                 opts.min_value = Some(self.parse_seq_int("MINVALUE")?);
             } else if self.eat_keyword("no") {
                 if self.eat_keyword("minvalue") {
-                    opts.min_value = Some(SequenceOpts::no_minvalue());
+                    opts.reset_min = true;
                 } else if self.eat_keyword("maxvalue") {
-                    opts.max_value = Some(SequenceOpts::no_maxvalue());
+                    opts.reset_max = true;
                 } else if self.eat_keyword("cycle") {
                     opts.cycle = Some(false);
                 } else {
@@ -6255,6 +6330,23 @@ impl Parser {
             }
         }
         Ok(opts)
+    }
+
+    fn parse_seq_type(&mut self) -> Result<SeqType, SqlError> {
+        // PG19 accepts smallint / integer / int / bigint here; anything
+        // else is 22023 (invalid_parameter_value), not a syntax error.
+        if self.eat_keyword("smallint") {
+            Ok(SeqType::SmallInt)
+        } else if self.eat_keyword("bigint") {
+            Ok(SeqType::BigInt)
+        } else if self.eat_keyword("integer") || self.eat_keyword("int") {
+            Ok(SeqType::Integer)
+        } else {
+            Err(SqlError {
+                message: "sequence type must be smallint, integer, or bigint".to_string(),
+                code: "22023",
+            })
+        }
     }
 
     fn parse_seq_int(&mut self, what: &str) -> Result<i64, SqlError> {

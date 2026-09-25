@@ -270,7 +270,7 @@ def main():
         check("I2 alter missing errors", err == "42P01", f"err={err}")
         rows, err, _ = c.q(
             "select schemaname, sequencename, sequenceowner, data_type, start_value, "
-            "min_value, max_value, increment_by, cycle_option, cache_size, last_value "
+            "min_value, max_value, increment_by, cycle, cache_size, last_value "
             "from pg_sequences where sequencename='v98_cache';")
         check("I3 pg_sequences full row",
               rows == [["public", "v98_cache", "postgres", "bigint", "1", "1",
@@ -370,8 +370,8 @@ def main():
         rows, err, _ = c.q(
             "select start_value, min_value, max_value, increment_by "
             "from pg_sequences where sequencename='v98_neg';")
-        check("D2 descending defaults (PG19: min -(2^63-1))",
-              rows == [["-1", "-9223372036854775807", "-1", "-1"]],
+        check("D2 descending defaults (PG19: min -2^63)",
+              rows == [["-1", "-9223372036854775808", "-1", "-1"]],
               f"rows={rows} err={err}")
         rows, err, _ = c.q("select nextval('v98_neg'), nextval('v98_neg');")
         check("D3 descending nextval", rows == [["-1", "-2"]],

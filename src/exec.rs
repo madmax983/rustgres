@@ -673,6 +673,12 @@ fn create_serial_sequence(
     }
     let mut seq = Sequence::new(
         name.clone(),
+        // v0.99: serial kinds are typed sequences (PG19).
+        match kind {
+            SerialKind::SmallSerial => crate::sql::SeqType::SmallInt,
+            SerialKind::Serial => crate::sql::SeqType::Integer,
+            SerialKind::BigSerial => crate::sql::SeqType::BigInt,
+        },
         1, // start
         1, // increment
         1, // min_value
@@ -10059,9 +10065,11 @@ fn pg_inherits_scan(
 // v0.98: pg_sequences (virtual). A real table by the same name takes
 // precedence, like pg_class. Exposes PG19's pg_sequences view columns:
 // sequencename, sequenceowner, data_type, start_value, min_value,
-// max_value, increment_by, cycle_option, cache_size, last_value.
-// data_type follows PG19's sequence data-type choice (smallint when the
-// bounds fit int16, integer when they fit int32, else bigint).
+// max_value, increment_by, cycle, cache_size, last_value.
+// v0.99: the column is `cycle` (PG19); the v0.98 `cycle_option` name was
+// wrong (that name belongs to information_schema.sequences).
+// data_type is the stored sequence type (PG19 seqtypid), not inferred
+// from bounds.
 // last_value is NULL until the sequence is first called in any session,
 // matching pg_sequence_last_value().
 // ---------------------------------------------------------------------------
@@ -10076,7 +10084,7 @@ fn pg_sequences_schema() -> Vec<QCol> {
         ("min_value", ColType::BigInt),
         ("max_value", ColType::BigInt),
         ("increment_by", ColType::BigInt),
-        ("cycle_option", ColType::Bool),
+        ("cycle", ColType::Bool),
         ("cache_size", ColType::BigInt),
         ("last_value", ColType::BigInt),
     ]
@@ -10108,17 +10116,8 @@ fn pg_sequences_scan(
         else {
             continue;
         };
-        // PG19's data-type choice for the sequence (sequence.c
-        // select_seq_type): the narrowest of smallint/integer/bigint
-        // whose bounds contain [min_value, max_value].
-        let data_type = if s.min_value >= i64::from(i16::MIN) && s.max_value <= i64::from(i16::MAX)
-        {
-            "smallint"
-        } else if s.min_value >= i64::from(i32::MIN) && s.max_value <= i64::from(i32::MAX) {
-            "integer"
-        } else {
-            "bigint"
-        };
+        // v0.99: data_type is the stored sequence type (PG19 seqtypid).
+        let data_type = s.seq_type.pg_name();
         rows.push(QRow {
             cells: Row::new(vec![
                 // v0.98: single-schema engine; PG19's schemaname is
@@ -15935,6 +15934,10 @@ fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecError> {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
         // v0.79: unnest's single output column is named for the function.
         "unnest" => Ok(vec![name.to_string()]),
+        // v0.99: parse_ident as a scalar function in FROM yields one row
+        // with the text[] value (PG19: a scalar function in FROM is a
+        // one-row table).
+        "parse_ident" => Ok(vec![name.to_string()]),
         "pg_input_error_info" => Ok(["message", "detail", "hint", "sql_error_code"]
             .iter()
             .map(|s| s.to_string())
@@ -15954,6 +15957,8 @@ fn table_function_col_types(name: &str, vals: &[Value]) -> Result<Vec<ColType>, 
     match name {
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
+        // v0.99: parse_ident returns text[] (see eval_str_func).
+        "parse_ident" => Ok(vec![ColType::Array(crate::storage::ArrayElem::Text)]),
         "generate_series" => {
             // PG resolves mixed int/numeric to the numeric signature and
             // int4/int8 mixes to int8 (implicit casts); all-NULL (strict,
@@ -27709,6 +27714,13 @@ fn eval_table_function(
                 .collect();
             Ok((vec![name.to_string()], rows))
         }
+        // v0.99: parse_ident as a scalar function in FROM — one row
+        // holding the text[] value (PG19: a scalar function in FROM is
+        // a one-row table).
+        "parse_ident" => {
+            let v = eval_str_func(name, vals)?;
+            Ok((vec![name.to_string()], vec![vec![v]]))
+        }
         _ => Err(exec_err(
             "42883",
             format!(
@@ -32495,10 +32507,24 @@ fn from_schemas(
     from: &[FromItem],
     visible: &[CteDef],
     bindings: &[Rc<CteBinding>],
+    // v0.99: enclosing query's schemas, for correlated references inside
+    // derived tables (PG19: a FROM-subquery sees enclosing ranges, but
+    // not same-level FROM siblings).
+    outer_schemas: &[&[QCol]],
 ) -> Result<Vec<Vec<QCol>>, ExecError> {
     let mut out = Vec::new();
     for item in from {
-        from_schema_item(eng, snap, own, session, item, &mut out, visible, bindings)?;
+        from_schema_item(
+            eng,
+            snap,
+            own,
+            session,
+            item,
+            &mut out,
+            visible,
+            bindings,
+            outer_schemas,
+        )?;
     }
     Ok(out)
 }
@@ -32512,6 +32538,7 @@ fn from_schema_item(
     out: &mut Vec<Vec<QCol>>,
     visible: &[CteDef],
     bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
 ) -> Result<(), ExecError> {
     match item {
         FromItem::Table {
@@ -32763,7 +32790,12 @@ fn from_schema_item(
             alias,
             col_aliases,
         } => {
-            let cols = describe_select_outer(eng, snap, own, session, sub, visible, &[], &[])?;
+            // v0.99: a FROM-subquery's correlated references resolve
+            // against the enclosing query's schemas (PG19); same-level
+            // FROM siblings stay invisible (they are not in
+            // `outer_schemas`).
+            let cols =
+                describe_select_outer(eng, snap, own, session, sub, visible, &[], outer_schemas)?;
             // v0.23: more column aliases than output columns is 42601.
             check_col_alias_arity(alias, cols.len(), col_aliases)?;
             out.push(
@@ -32863,7 +32895,9 @@ fn from_schema_item(
             // v0.23: a join contributes a single merged schema (same layout
             // as the executor builds), not two side-by-side schemas.
             let mut l: Vec<Vec<QCol>> = Vec::new();
-            from_schema_item(eng, snap, own, session, left, &mut l, visible, bindings)?;
+            from_schema_item(
+                eng, snap, own, session, left, &mut l, visible, bindings, outer_schemas,
+            )?;
             let lflat: Vec<QCol> = l.into_iter().flatten().collect();
             // v0.46: implicit LATERAL (comma joins parse into CROSS
             // JOINs): a right-side table function referencing left
@@ -32892,7 +32926,9 @@ fn from_schema_item(
                 }
                 _ => {
                     let mut r: Vec<Vec<QCol>> = Vec::new();
-                    from_schema_item(eng, snap, own, session, right, &mut r, visible, bindings)?;
+                    from_schema_item(
+                        eng, snap, own, session, right, &mut r, visible, bindings, outer_schemas,
+                    )?;
                     r.into_iter().flatten().collect()
                 }
             };
@@ -33044,7 +33080,7 @@ fn describe_select_outer(
             outer_schemas,
         );
     }
-    let schemas = from_schemas(eng, snap, own, session, &stmt.from, &visible, bindings)?;
+    let schemas = from_schemas(eng, snap, own, session, &stmt.from, &visible, bindings, outer_schemas)?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
     for item in &stmt.items {
@@ -34174,8 +34210,10 @@ fn infer_from(
 ) -> Result<(), ExecError> {
     match f {
         FromItem::Table { .. } => Ok(()),
-        // Derived tables are uncorrelated (no LATERAL): no outer schemas.
-        FromItem::Derived { sub, .. } => infer_select(sub, eng, snap, own, session, &[], out),
+        // v0.99: derived tables may be correlated to enclosing scopes
+        // (PG19); a superset is fine for param pinning, which only fires
+        // on unambiguous matches.
+        FromItem::Derived { sub, .. } => infer_select(sub, eng, snap, own, session, schemas, out),
         // v0.14: VALUES rows are uncorrelated constants.
         FromItem::Values { rows, .. } => {
             for row in rows {
@@ -34231,7 +34269,7 @@ fn infer_select(
     // v0.10: this level's own CTEs are visible to the FROM clause.
     let visible: Vec<CteDef> = s.with.clone();
     let own_schemas =
-        from_schemas(eng, snap, own, session, &s.from, &visible, &[]).unwrap_or_default();
+        from_schemas(eng, snap, own, session, &s.from, &visible, &[], outer).unwrap_or_default();
     let mut refs: Vec<&[QCol]> = Vec::with_capacity(outer.len() + own_schemas.len());
     refs.extend_from_slice(outer);
     refs.extend(own_schemas.iter().map(|s| s.as_slice()));
@@ -34335,7 +34373,7 @@ pub fn infer_param_types(
         // not break Bind (from_schemas' unwrap_or_default rule).
         let uqual = alias.as_deref().unwrap_or(table);
         let uextra: Vec<Vec<QCol>> =
-            from_schemas(eng, snap, own, session, from, with, &[]).unwrap_or_default();
+            from_schemas(eng, snap, own, session, from, with, &[], &[]).unwrap_or_default();
         if let Some(t) = eng.db.find_table(table, snap, own, session) {
             let mut combined: Vec<QCol> = uextra.iter().flatten().cloned().collect();
             combined.extend(t.columns.iter().map(|(n, ty)| QCol {
@@ -34389,7 +34427,7 @@ pub fn infer_param_types(
             // visible too (PG19).
             let qual = alias.as_deref().unwrap_or(table);
             let dextra: Vec<Vec<QCol>> =
-                from_schemas(eng, snap, own, session, using, with, &[]).unwrap_or_default();
+                from_schemas(eng, snap, own, session, using, with, &[], &[]).unwrap_or_default();
             if let Some(w) = where_ {
                 if let Some(t) = eng.db.find_table(table, snap, own, session) {
                     let mut combined: Vec<QCol> = dextra.iter().flatten().cloned().collect();
@@ -35175,7 +35213,7 @@ pub fn describe_columns(
             if returning.is_empty() {
                 Ok(None)
             } else {
-                let extra = from_schemas(eng, snap, own, session, from, with, &[])?;
+                let extra = from_schemas(eng, snap, own, session, from, with, &[], &[])?;
                 Ok(Some(describe_returning(
                     eng,
                     snap,
@@ -35202,7 +35240,7 @@ pub fn describe_columns(
             if returning.is_empty() {
                 Ok(None)
             } else {
-                let extra = from_schemas(eng, snap, own, session, using, with, &[])?;
+                let extra = from_schemas(eng, snap, own, session, using, with, &[], &[])?;
                 Ok(Some(describe_returning(
                     eng,
                     snap,
@@ -35572,6 +35610,37 @@ mod tests {
                 vec!["cid".to_string(), "0".to_string()],
             ]
         );
+    }
+
+    /// v0.99: a FROM-subquery inside a scalar subquery resolves
+    /// correlated references against the enclosing query's scopes
+    /// (PG19), while same-level FROM siblings stay invisible without
+    /// LATERAL.
+    #[test]
+    fn v99_derived_table_sees_enclosing_scope_not_sibling() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT name, (SELECT r FROM (SELECT id AS q2) x, (SELECT id AS r) y) FROM users ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["ann".to_string(), "1".to_string()],
+                vec!["bob".to_string(), "2".to_string()],
+                vec!["cid".to_string(), "3".to_string()],
+            ]
+        );
+        // Same-level sibling reference without LATERAL is 42703.
+        let err = run(
+            &mut eng,
+            "SELECT * FROM (SELECT 1 AS a) x, (SELECT a AS b) y",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42703");
     }
 
     #[test]
@@ -40378,7 +40447,8 @@ mod tests {
     }
 
     /// Exhaustion is PG19 22000 (not 55000); CYCLE wraps to the bound;
-    /// descending defaults are start -1 / min -(2^63-1) / max -1.
+    /// descending defaults are start -1 / min PG_INT64_MIN / max -1
+    /// (PG19 init_params; v0.99 corrected the old -(2^63-1) default).
     #[test]
     fn v98_sequence_overflow_and_cycle() {
         let mut eng = engine();
@@ -40411,7 +40481,7 @@ mod tests {
             rows_of(r),
             vec![vec![
                 "-1".to_string(),
-                "-9223372036854775807".to_string(),
+                "-9223372036854775808".to_string(),
                 "-1".to_string(),
                 "-1".to_string(),
             ]]
@@ -40465,6 +40535,112 @@ mod tests {
                 "2".to_string(),
                 "0".to_string(),
                 "NO".to_string(),
+            ]]
+        );
+    }
+
+    /// v0.99: explicit `AS` sequence types (PG19 init_params).
+    #[test]
+    fn v99_sequence_explicit_types() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE t_small AS smallint").unwrap();
+        run(&mut eng, "CREATE SEQUENCE t_int AS int").unwrap();
+        run(&mut eng, "CREATE SEQUENCE t_big AS bigint").unwrap();
+        // descending smallint: type-driven defaults (max -1, min
+        // type-min, start max).
+        run(
+            &mut eng,
+            "CREATE SEQUENCE t_desc AS smallint INCREMENT BY -1",
+        )
+        .unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT sequencename, data_type, min_value, max_value, start_value \
+             FROM pg_sequences WHERE sequencename LIKE 't_%' ORDER BY 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![
+                    "t_big".to_string(),
+                    "bigint".to_string(),
+                    "1".to_string(),
+                    "9223372036854775807".to_string(),
+                    "1".to_string(),
+                ],
+                vec![
+                    "t_desc".to_string(),
+                    "smallint".to_string(),
+                    "-32768".to_string(),
+                    "-1".to_string(),
+                    "-1".to_string(),
+                ],
+                vec![
+                    "t_int".to_string(),
+                    "integer".to_string(),
+                    "1".to_string(),
+                    "2147483647".to_string(),
+                    "1".to_string(),
+                ],
+                vec![
+                    "t_small".to_string(),
+                    "smallint".to_string(),
+                    "1".to_string(),
+                    "32767".to_string(),
+                    "1".to_string(),
+                ],
+            ]
+        );
+        // Explicit bounds outside the type range are 22023.
+        let e = run(&mut eng, "CREATE SEQUENCE t_bad AS smallint MAXVALUE 100000")
+            .unwrap_err();
+        assert_eq!(e.code, "22023");
+        // pg_sequences exposes `cycle`, not `cycle_option`.
+        let r = run(
+            &mut eng,
+            "SELECT cycle FROM pg_sequences WHERE sequencename = 't_small'",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["f".to_string()]]);
+        let e = run(&mut eng, "SELECT cycle_option FROM pg_sequences").unwrap_err();
+        assert_eq!(e.code, "42703");
+    }
+
+    /// v0.99: ALTER ... AS resets default bounds, keeps explicit ones.
+    #[test]
+    fn v99_alter_sequence_as_resets_default_bounds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE a_dflt").unwrap();
+        run(&mut eng, "ALTER SEQUENCE a_dflt AS smallint").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT data_type, min_value, max_value FROM pg_sequences \
+             WHERE sequencename = 'a_dflt'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "smallint".to_string(),
+                "1".to_string(),
+                "32767".to_string(),
+            ]]
+        );
+        run(&mut eng, "CREATE SEQUENCE a_exp MAXVALUE 1000").unwrap();
+        run(&mut eng, "ALTER SEQUENCE a_exp AS smallint").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT data_type, min_value, max_value FROM pg_sequences \
+             WHERE sequencename = 'a_exp'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "smallint".to_string(),
+                "1".to_string(),
+                "1000".to_string(),
             ]]
         );
     }
@@ -40587,14 +40763,13 @@ fn info_sequences_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, 
         else {
             continue;
         };
-        let (data_type, precision) =
-            if s.min_value >= i64::from(i16::MIN) && s.max_value <= i64::from(i16::MAX) {
-                ("smallint", 16)
-            } else if s.min_value >= i64::from(i32::MIN) && s.max_value <= i64::from(i32::MAX) {
-                ("integer", 32)
-            } else {
-                ("bigint", 64)
-            };
+        // v0.99: data_type/precision follow the stored sequence type
+        // (PG19 seqtypid), not inferred bounds.
+        let (data_type, precision) = match s.seq_type {
+            crate::sql::SeqType::SmallInt => ("smallint", 16),
+            crate::sql::SeqType::Integer => ("integer", 32),
+            crate::sql::SeqType::BigInt => ("bigint", 64),
+        };
         rows.push(QRow {
             cells: Row::new(vec![
                 Value::text("rustgres"),
@@ -40624,29 +40799,113 @@ fn info_sequences_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, 
 /// Postgres defaults: start 1, increment 1, minvalue 1, maxvalue 2^63-1,
 /// no cycle — except descending sequences (increment < 0), which default
 /// to start -1, minvalue -(2^63), maxvalue -1.
+/// v0.99: PG19 init_params semantics. `cur` is the live sequence for
+/// ALTER (None for CREATE): unresolved options fall back to it, and
+/// `AS` on ALTER resets min/max to the new type's bounds only when the
+/// old bounds were the old type's defaults.
 fn sequence_params(
     opts: &SequenceOpts,
-    for_alter: bool,
-) -> Result<(i64, i64, i64, i64, bool, i64, Option<i64>), ExecError> {
+    cur: Option<&crate::storage::Sequence>,
+) -> Result<
+    (
+        crate::sql::SeqType,
+        i64,
+        i64,
+        i64,
+        i64,
+        bool,
+        i64,
+        Option<i64>,
+    ),
+    ExecError,
+> {
+    use crate::sql::SeqType;
     let bad = |m: &str| exec_err("22023", m.to_string());
-    let increment = opts.increment.unwrap_or(1);
+    let increment = opts
+        .increment
+        .or(cur.map(|s| s.increment))
+        .unwrap_or(1);
     if increment == 0 {
         return Err(bad("INCREMENT must not be zero"));
     }
     let descending = increment < 0;
-    // PG19 defaults: ascending (1, 2^63-1, 1); descending
-    // (-(2^63-1), -1, -1).
-    let (dfl_min, dfl_max, dfl_start) = if descending {
-        (i64::MIN + 1, -1, -1)
-    } else {
-        (1, i64::MAX, 1)
+    // AS type: explicit wins; ALTER keeps the current type; CREATE
+    // defaults to bigint (PG19 init_params).
+    let seq_type = opts
+        .seq_type
+        .or(cur.map(|s| s.seq_type))
+        .unwrap_or(SeqType::BigInt);
+    // ALTER ... AS: reset a bound to the new type's bound only when the
+    // old bound was the old type's default (PG19 init_params).
+    let (reset_min, reset_max) = match (opts.seq_type, cur) {
+        (Some(new_t), Some(s)) if new_t != s.seq_type => (
+            s.min_value == s.seq_type.min_value(),
+            s.max_value == s.seq_type.max_value(),
+        ),
+        _ => (false, false),
     };
-    let min_value = opts.min_value.unwrap_or(dfl_min);
-    let max_value = opts.max_value.unwrap_or(dfl_max);
-    let start = opts.start.unwrap_or(dfl_start);
-    let cycle = opts.cycle.unwrap_or(false);
+    // v0.99: NO MAXVALUE / NO MINVALUE explicitly reset to the default.
+    let reset_max = reset_max || opts.reset_max;
+    let reset_min = reset_min || opts.reset_min;
+    // MAXVALUE: explicit wins; ALTER keeps the old max unless the type
+    // change reset it; otherwise the PG19 default (type max ascending,
+    // -1 descending).
+    let max_value = match (opts.max_value, cur) {
+        (Some(v), _) => v,
+        (None, Some(s)) if !reset_max => s.max_value,
+        _ => {
+            if descending {
+                -1
+            } else {
+                seq_type.max_value()
+            }
+        }
+    };
+    // MINVALUE: explicit wins; ALTER keeps the old min unless the type
+    // change reset it; otherwise the PG19 default (type min descending,
+    // 1 ascending).
+    let min_value = match (opts.min_value, cur) {
+        (Some(v), _) => v,
+        (None, Some(s)) if !reset_min => s.min_value,
+        _ => {
+            if descending {
+                seq_type.min_value()
+            } else {
+                1
+            }
+        }
+    };
+    // PG19: explicit bounds outside the sequence type's range are 22023.
+    if max_value < seq_type.min_value() || max_value > seq_type.max_value() {
+        return Err(bad(&format!(
+            "MAXVALUE ({}) is out of range for sequence data type {}",
+            max_value,
+            seq_type.pg_name()
+        )));
+    }
+    if min_value < seq_type.min_value() || min_value > seq_type.max_value() {
+        return Err(bad(&format!(
+            "MINVALUE ({}) is out of range for sequence data type {}",
+            min_value,
+            seq_type.pg_name()
+        )));
+    }
+    // START: explicit wins; ALTER keeps the old start; CREATE defaults
+    // to min (ascending) or max (descending).
+    let start = match (opts.start, cur) {
+        (Some(v), _) => v,
+        (None, Some(s)) => s.start,
+        (None, None) => {
+            if descending {
+                max_value
+            } else {
+                min_value
+            }
+        }
+    };
+    let cycle = opts.cycle.or(cur.map(|s| s.cycle)).unwrap_or(false);
     // v0.98: CACHE (PG19 DefineSequence: 22023 when < 1).
-    let cache = opts.cache.unwrap_or(1);
+    let cache = opts.cache.or(cur.map(|s| s.cache)).unwrap_or(1);
     if let Some(c) = opts.cache {
         if c < 1 {
             return Err(bad(&format!(
@@ -40656,12 +40915,18 @@ fn sequence_params(
         }
     }
     if min_value >= max_value {
-        return Err(bad("MINVALUE must be less than MAXVALUE"));
+        return Err(bad(&format!(
+            "MINVALUE ({}) must be less than MAXVALUE ({})",
+            min_value, max_value
+        )));
     }
     if start < min_value || start > max_value {
-        return Err(bad("START value out of bounds"));
+        return Err(bad(&format!(
+            "START value ({}) cannot be less than MINVALUE ({}) or greater than MAXVALUE ({})",
+            start, min_value, max_value
+        )));
     }
-    if !for_alter {
+    if cur.is_none() {
         if let Some(r) = opts.restart {
             // CREATE SEQUENCE ... RESTART is a Postgres syntax error.
             let _ = r;
@@ -40681,7 +40946,9 @@ fn sequence_params(
             Some(v)
         }
     };
-    Ok((start, increment, min_value, max_value, cycle, cache, restart))
+    Ok((
+        seq_type, start, increment, min_value, max_value, cycle, cache, restart,
+    ))
 }
 
 /// v0.98: validate `OWNED BY table.col` / `OWNED BY NONE`. Returns the
@@ -40747,9 +41014,11 @@ fn exec_create_sequence(
             format!("relation \"{}\" already exists", name),
         ));
     }
-    let (start, increment, min_value, max_value, cycle, cache, _) = sequence_params(opts, false)?;
+    let (seq_type, start, increment, min_value, max_value, cycle, cache, _) =
+        sequence_params(opts, None)?;
     let mut seq = Sequence::new(
         name.to_string(),
+        seq_type,
         start,
         increment,
         min_value,
@@ -40813,23 +41082,15 @@ fn exec_alter_sequence(
             ));
         }
     };
-    // Merge: ALTER supplies only the options it changes.
-    let merged = SequenceOpts {
-        start: opts.start.or(Some(live.start)),
-        increment: opts.increment.or(Some(live.increment)),
-        min_value: opts.min_value.or(Some(live.min_value)),
-        max_value: opts.max_value.or(Some(live.max_value)),
-        cycle: opts.cycle.or(Some(live.cycle)),
-        cache: opts.cache.or(Some(live.cache)),
-        restart: opts.restart,
-        owned_by: opts.owned_by.clone(),
-    };
-    let (start, increment, min_value, max_value, cycle, cache, restart) =
-        sequence_params(&merged, true)?;
+    // v0.99: no pre-merge — sequence_params resolves each option
+    // against the live sequence itself (needed for ALTER ... AS
+    // bound-reset semantics).
+    let (seq_type, start, increment, min_value, max_value, cycle, cache, restart) =
+        sequence_params(opts, Some(live))?;
     // v0.98: OWNED BY is validated (table/column existence) before any
     // version is created.
     let owned_by_update: Option<Option<(String, String, Option<u64>)>> =
-        match &merged.owned_by {
+        match &opts.owned_by {
             None => None,
             Some(owned) => {
                 let temp_session = validate_sequence_owned_by(eng, ctx, owned, &live.owner)?;
@@ -40850,6 +41111,7 @@ fn exec_alter_sequence(
     cur.dropped_xmax = ctx.own;
     let mut next = Sequence::new(
         name.to_string(),
+        seq_type,
         start,
         increment,
         min_value,

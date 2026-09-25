@@ -5149,6 +5149,10 @@ pub struct ViewDef {
 #[derive(Clone, Debug)]
 pub struct Sequence {
     pub name: String,
+    /// v0.99: explicit `AS` data type (PG19 seqtypid); default bigint.
+    /// Stored (not inferred from bounds) so ALTER ... AS can reset
+    /// bounds per PG19 init_params.
+    pub seq_type: crate::sql::SeqType,
     pub start: i64,
     pub increment: i64,
     pub min_value: i64,
@@ -5183,6 +5187,9 @@ pub struct Sequence {
 impl Sequence {
     pub fn new(
         name: String,
+        // v0.99: explicit sequence data type (PG19 `AS`); drives
+        // default bounds and pg_sequences.data_type.
+        seq_type: crate::sql::SeqType,
         start: i64,
         increment: i64,
         min_value: i64,
@@ -5193,6 +5200,7 @@ impl Sequence {
     ) -> Self {
         Sequence {
             name,
+            seq_type,
             start,
             increment,
             min_value,
