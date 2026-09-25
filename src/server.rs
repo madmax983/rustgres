@@ -1969,6 +1969,7 @@ fn read_only_violation(
         Stmt::DropType { .. } => Some("DROP TYPE"),
         // v0.85: domain DDL.
         Stmt::CreateDomain { .. } => Some("CREATE DOMAIN"),
+        Stmt::AlterDomain { .. } => Some("ALTER DOMAIN"),
         Stmt::DropDomain { .. } => Some("DROP DOMAIN"),
         Stmt::CreateRole { .. } => Some("CREATE ROLE"),
         Stmt::AlterRole { .. } => Some("ALTER ROLE"),

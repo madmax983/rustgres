@@ -399,6 +399,8 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             default.as_ref(),
         ),
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
+        // --- v0.97: ALTER DOMAIN ---
+        Stmt::AlterDomain { name, action } => exec_alter_domain(eng, ctx, name, action),
         // --- v0.86: user-defined functions and operators ---
         Stmt::CreateFunction {
             name,
@@ -3282,6 +3284,39 @@ fn check_domain_value(
         }
     }
     Ok(value.clone())
+}
+
+/// v0.97: the domain name for a `pg_typeof(arg)` argument that is
+/// statically domain-typed (PG19 resolves `pg_typeof` at parse
+/// analysis and reports the domain, not the base type). Handles
+/// `pg_typeof('x'::d)` (a `CastNamed` to a domain) and
+/// `pg_typeof(col)` where the column resolves through the scope
+/// chain to a table with a domain-typed column (best-effort: table
+/// aliases do not resolve to the base table, so those fall back to
+/// the base type). Returns None otherwise — the caller falls back
+/// to the value's type name.
+fn pg_typeof_domain_name(q: &Q, scopes: &[Scope], arg: &Expr) -> Option<String> {
+    let is_domain = |n: &str| {
+        q.eng
+            .db
+            .types
+            .get(n)
+            .is_some_and(|st| st.domain.is_some())
+    };
+    match arg {
+        Expr::CastNamed { name, .. } => is_domain(name).then(|| name.clone()),
+        Expr::Column { table, name: col } => {
+            let (si, ci) = resolve_col(scopes, table.as_deref(), col).ok()?;
+            let qual = scopes[si].schema[ci].qual.clone();
+            let t = q
+                .eng
+                .db
+                .find_table(&qual, q.snap, q.own, q.session)?;
+            let idx = t.columns.iter().position(|(n, _)| n == col)?;
+            t.domain_types.get(idx).and_then(Clone::clone)
+        }
+        _ => None,
+    }
 }
 
 /// v0.85: coerce a record value to a named composite by position
@@ -18165,6 +18200,27 @@ fn eval_grouped(
             } else {
                 args
             };
+            // v0.97: pg_typeof static typing (same as the scalar
+            // `eval_func` path): domain-typed arguments report the
+            // domain name. Grouped scopes chain outer scopes plus the
+            // grouping scope, like the regclass coercion below.
+            if name == "pg_typeof" && args.len() == 1 {
+                let gsc = Scope {
+                    schema: gscope.schema,
+                    row: gscope.row,
+                    prov: gscope.prov,
+                };
+                let mut chained: Vec<Scope> = outer.to_vec();
+                chained.push(gsc);
+                if let Some(dname) = pg_typeof_domain_name(q, &chained, &args[0]) {
+                    // PG19 still evaluates the argument; only the
+                    // reported name is static.
+                    eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0])?;
+                    return Ok(Value::text(dname));
+                }
+                let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, &args[0])?;
+                return Ok(Value::text(v.type_name()));
+            }
             // v0.47: an SRF in the select list that is also a GROUP BY
             // key reads the group's key value. PG19 expands such SRFs
             // below the aggregate (ProjectSet under Agg), so the
@@ -25991,6 +26047,21 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     } else {
         args
     };
+    // v0.97: pg_typeof is statically typed (PG19 resolves it at parse
+    // analysis): a cast to a domain, or a reference to a domain-typed
+    // column, reports the domain name — not the base type the runtime
+    // value is stored as (domain identity is erased from `Value`).
+    // Like PG19, the argument is still evaluated (its errors and
+    // volatility side effects happen); only the reported name differs.
+    // Wrong-arity calls fall through to the normal arity check below.
+    if name == "pg_typeof" && args.len() == 1 {
+        if let Some(dname) = pg_typeof_domain_name(q, scopes, &args[0]) {
+            eval_expr(q, scopes, &args[0])?;
+            return Ok(Value::text(dname));
+        }
+        let v = eval_expr(q, scopes, &args[0])?;
+        return Ok(Value::text(v.type_name()));
+    }
     // v0.80: `GROUPING(...)` is only meaningful at group level (handled
     // by `eval_grouped`). Reaching scalar evaluation means it sits in a
     // query without GROUP BY, inside a nested query level, or in a spot
@@ -40270,7 +40341,128 @@ fn exec_drop_domain(
     })
 }
 
-/// v0.86: user-defined functions and operators (CREATE FUNCTION /
+/// v0.97: ALTER DOMAIN (PG19 AlterDomainStmt, bounded). Mutates the
+/// domain definition in place; the old `ShellType` is carried on
+/// `WriteOp::CreateType.prev` so rollback restores it exactly, and the
+/// WAL encoder reads the live type map — so the alteration is
+/// transactional, WAL-logged and checkpointed with no new record
+/// kinds. PG19 does not validate existing stored data when a domain
+/// constraint is added (constraints apply to future writes), and
+/// neither do we.
+fn exec_alter_domain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    action: &crate::sql::AlterDomainAction,
+) -> Result<ExecResult, ExecError> {
+    use crate::sql::AlterDomainAction;
+    let old = eng.db.types.get(name).cloned().ok_or_else(|| {
+        exec_err(
+            "42704",
+            format!("type \"{}\" does not exist", name),
+        )
+    })?;
+    let mut dom = old.domain.clone().ok_or_else(|| {
+        exec_err(
+            "42809",
+            format!("\"{}\" is not a domain", name),
+        )
+    })?;
+    match action {
+        AlterDomainAction::AddConstraint { name: cname, expr } => {
+            // PG19: domain CHECK expressions may only reference VALUE
+            // (same rule as CREATE DOMAIN).
+            let mut refs = Vec::new();
+            crate::sql::collect_col_refs(expr, &mut refs);
+            for (_, r) in &refs {
+                if r != "value" {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "cannot use column reference \"{}\" in domain check constraint",
+                            r
+                        ),
+                    ));
+                }
+            }
+            // Auto-name `<domain>_check[N]` when CONSTRAINT name was
+            // omitted (PG19 ChooseConstraintName, same as CREATE).
+            let cname = cname.clone().unwrap_or_else(|| {
+                let mut n = format!("{}_check", name);
+                let mut i = 1;
+                while dom.checks.iter().any(|c| c.name == n) {
+                    n = format!("{}_check{}", name, i);
+                    i += 1;
+                }
+                n
+            });
+            if dom.checks.iter().any(|c| c.name == cname) {
+                return Err(exec_err(
+                    "42710",
+                    format!(
+                        "constraint \"{}\" of domain \"{}\" already exists",
+                        cname, name
+                    ),
+                ));
+            }
+            dom.checks.push(crate::sql::CheckDef {
+                name: cname,
+                expr: expr.clone(),
+                not_valid: false,
+                kind: crate::sql::CheckKind::Check,
+            });
+        }
+        AlterDomainAction::DropConstraint { name: cname, if_exists } => {
+            let pos = dom.checks.iter().position(|c| &c.name == cname);
+            match pos {
+                Some(i) => {
+                    dom.checks.remove(i);
+                }
+                None => {
+                    if !if_exists {
+                        return Err(exec_err(
+                            "42704",
+                            format!(
+                                "constraint \"{}\" of domain \"{}\" does not exist",
+                                cname, name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        AlterDomainAction::SetNotNull => {
+            dom.not_null = true;
+        }
+        AlterDomainAction::DropNotNull => {
+            dom.not_null = false;
+        }
+        AlterDomainAction::SetDefault(d) => {
+            dom.default = Some(d.clone());
+        }
+        AlterDomainAction::DropDefault => {
+            dom.default = None;
+        }
+    }
+    let prev = old.clone();
+    eng.db.types.insert(
+        name.to_string(),
+        crate::storage::ShellType {
+            like_base: old.like_base,
+            composite: old.composite,
+            domain: Some(dom),
+        },
+    );
+    // Transactional: undo restores `prev`; the WAL encoder reads the
+    // live (new) definition from the type map.
+    ctx.writes.push(WriteOp::CreateType {
+        name: name.to_string(),
+        prev: Some(prev),
+    });
+    Ok(ExecResult::Command {
+        tag: "ALTER DOMAIN".to_string(),
+    })
+}
 /// DROP FUNCTION / CREATE OPERATOR), plus the call paths. SQL-language
 /// bodies are parsed once at CREATE time; named argument references
 /// (`t.col` / `t` where `t` is an argument name) are rewritten to
@@ -40365,8 +40557,18 @@ fn exec_create_function(
     // Parse the SQL body now so a bad body fails at CREATE (like PG's
     // parse analysis), not at first call. Internal functions name a C
     // symbol instead of SQL text.
+    // v0.97: bounded plpgsql — a single-RETURN body desugars to a SQL
+    // SELECT here; anything richer is an honest 0A000.
+    let owned_body: String;
+    let body: &str = if lang == crate::sql::FuncLang::Plpgsql {
+        owned_body = crate::sql::desugar_plpgsql_body(body)
+            .map_err(|e| exec_err("0A000", format!("plpgsql: {}", e)))?;
+        &owned_body
+    } else {
+        body
+    };
     let mut parsed: Option<Stmt> = None;
-    if lang == crate::sql::FuncLang::Sql {
+    if lang == crate::sql::FuncLang::Sql || lang == crate::sql::FuncLang::Plpgsql {
         let mut stmt = crate::sql::parse_statement(body)
             .map_err(|e| exec_err("42601", format!("syntax error in function body: {:?}", e)))?;
         // Only SELECT bodies are supported (bounded: no multi-statement
@@ -44043,6 +44245,285 @@ mod variance_stress_tests {
         assert_ne!(tiny2.to_text(), "0");
         let tiny3 = Numeric::parse("3e-16383").unwrap();
         assert_ne!(tiny3.to_text(), "0");
+    }
+}
+
+#[cfg(test)]
+mod v097_domain_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn ok(sql: &str) -> ExecResult {
+        let mut eng = engine();
+        run(&mut eng, sql).unwrap()
+    }
+
+    fn err_code(eng: &mut Engine, sql: &str) -> &'static str {
+        match run(eng, sql) {
+            Ok(_) => panic!("expected error for {sql}"),
+            Err(e) => e.code,
+        }
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v0.97: ALTER DOMAIN ADD/DROP CONSTRAINT (named).
+    #[test]
+    fn alter_domain_add_drop_constraint() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97 AS int CHECK (VALUE > 0)").unwrap();
+        run(
+            &mut eng,
+            "ALTER DOMAIN d97 ADD CONSTRAINT c_small CHECK (VALUE < 100)",
+        )
+        .unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT '500'::d97"), "23514");
+        assert_eq!(rows_of(run(&mut eng, "SELECT '5'::d97").unwrap()), vec![vec!["5"]]);
+        run(&mut eng, "ALTER DOMAIN d97 DROP CONSTRAINT c_small").unwrap();
+        assert_eq!(rows_of(run(&mut eng, "SELECT '500'::d97").unwrap()), vec![vec!["500"]]);
+        // The original CREATE DOMAIN check still applies.
+        assert_eq!(err_code(&mut eng, "SELECT '-1'::d97"), "23514");
+    }
+
+    /// v0.97: unnamed ADD CONSTRAINT auto-names `<domain>_check[N]`;
+    /// duplicate names are 42710 (PG19).
+    #[test]
+    fn alter_domain_constraint_naming() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97n AS int").unwrap();
+        run(&mut eng, "ALTER DOMAIN d97n ADD CHECK (VALUE > 0)").unwrap();
+        run(&mut eng, "ALTER DOMAIN d97n ADD CHECK (VALUE < 100)").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT '500'::d97n"), "23514");
+        // Auto-names d97n_check and d97n_check1.
+        run(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT d97n_check1").unwrap();
+        assert_eq!(rows_of(run(&mut eng, "SELECT '500'::d97n").unwrap()), vec![vec!["500"]]);
+        // Explicit duplicate name is 42710.
+        run(&mut eng, "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 1)").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER DOMAIN d97n ADD CONSTRAINT dup CHECK (VALUE > 2)"),
+            "42710"
+        );
+        // Dropping a missing constraint is 42704; IF EXISTS is silent.
+        assert_eq!(
+            err_code(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT nosuch"),
+            "42704"
+        );
+        run(&mut eng, "ALTER DOMAIN d97n DROP CONSTRAINT IF EXISTS nosuch").unwrap();
+    }
+
+    /// v0.97: ALTER DOMAIN on a missing name is 42704; on a non-domain
+    /// type is 42809 (PG19).
+    #[test]
+    fn alter_domain_missing_and_not_domain() {
+        let mut eng = engine();
+        assert_eq!(
+            err_code(&mut eng, "ALTER DOMAIN nosuch ADD CHECK (VALUE > 0)"),
+            "42704"
+        );
+        run(&mut eng, "CREATE TYPE t97c AS (a int)").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER DOMAIN t97c SET NOT NULL"),
+            "42809"
+        );
+    }
+
+    /// v0.97: SET/DROP NOT NULL — NULL input is 23502 while set (PG19's
+    /// domain null-violation code).
+    #[test]
+    fn alter_domain_set_drop_not_null() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97nn AS int").unwrap();
+        run(&mut eng, "ALTER DOMAIN d97nn SET NOT NULL").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT NULL::d97nn"), "23502");
+        run(&mut eng, "ALTER DOMAIN d97nn DROP NOT NULL").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT NULL::d97nn").unwrap()),
+            vec![vec!["NULL"]]
+        );
+    }
+
+    /// v0.97: SET/DROP DEFAULT flows into later table defaults.
+    #[test]
+    fn alter_domain_set_drop_default() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97d AS int").unwrap();
+        run(&mut eng, "ALTER DOMAIN d97d SET DEFAULT 42").unwrap();
+        run(&mut eng, "CREATE TABLE t97d (x d97d)").unwrap();
+        run(&mut eng, "INSERT INTO t97d DEFAULT VALUES").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT x FROM t97d").unwrap()),
+            vec![vec!["42"]]
+        );
+        run(&mut eng, "ALTER DOMAIN d97d DROP DEFAULT").unwrap();
+        // New tables see no default afterwards.
+        run(&mut eng, "CREATE TABLE t97d2 (x d97d)").unwrap();
+        run(&mut eng, "INSERT INTO t97d2 (x) VALUES (7)").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT x FROM t97d2").unwrap()),
+            vec![vec!["7"]]
+        );
+    }
+
+    /// v0.97: domain CHECK expressions may only reference VALUE (42601,
+    /// same rule as CREATE DOMAIN).
+    #[test]
+    fn alter_domain_check_value_only() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97v AS int").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER DOMAIN d97v ADD CHECK (other > 0)"),
+            "42601"
+        );
+    }
+
+    /// v0.97: pg_typeof reports the domain for casts and domain-typed
+    /// columns (PG19 static typing); base types are unchanged.
+    #[test]
+    fn pg_typeof_domain_identity() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97t AS text").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT pg_typeof('x'::d97t)").unwrap()),
+            vec![vec!["d97t"]]
+        );
+        run(&mut eng, "CREATE TABLE t97t (a d97t, b int)").unwrap();
+        run(&mut eng, "INSERT INTO t97t VALUES ('x', 1)").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT pg_typeof(a), pg_typeof(b) FROM t97t").unwrap()),
+            vec![vec!["d97t", "integer"]]
+        );
+        // Non-domain behavior unchanged.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT pg_typeof(5)").unwrap()),
+            vec![vec!["integer"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT pg_typeof(NULL)").unwrap()),
+            vec![vec!["unknown"]]
+        );
+        // PG19 still evaluates the argument: a failing domain cast is
+        // 23514, not a type name.
+        run(&mut eng, "CREATE DOMAIN d97p AS int CHECK (VALUE > 0)").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT pg_typeof('x'::d97p)"), "22P02");
+        assert_eq!(err_code(&mut eng, "SELECT pg_typeof('-5'::d97p)"), "23514");
+    }
+
+    /// v0.97: bounded plpgsql — single-RETURN bodies desugar to SQL;
+    /// richer bodies are an honest 0A000; other languages stay 42601.
+    #[test]
+    fn plpgsql_bounded_subset() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION vol97(text) returns text as 'begin return $1; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT vol97('hello')").unwrap()),
+            vec![vec!["hello"]]
+        );
+        // Case-insensitive, whitespace-tolerant.
+        run(
+            &mut eng,
+            "CREATE FUNCTION vol97b(int) returns int as '  BEGIN  RETURN $1 + 1; END  ' language plpgsql",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT vol97b(41)").unwrap()),
+            vec![vec!["42"]]
+        );
+        // Multi-statement bodies are outside the subset: 0A000.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad97() returns int as 'begin x := 1; return 1; end' language plpgsql"
+            ),
+            "0A000"
+        );
+        // C is still unsupported at parse time: 42601.
+        let perr = crate::sql::parse_statement(
+            "CREATE FUNCTION c97() returns int as 'int f(){}' language c",
+        )
+        .unwrap_err();
+        assert_eq!(perr.code, "42601");
+    }
+
+    /// v0.97: desugar_plpgsql_body unit coverage (sql.rs).
+    #[test]
+    fn desugar_plpgsql_body_cases() {
+        use crate::sql::desugar_plpgsql_body;
+        assert_eq!(
+            desugar_plpgsql_body("begin return $1; end").unwrap(),
+            "SELECT $1"
+        );
+        assert_eq!(
+            desugar_plpgsql_body("BEGIN RETURN 1 + 2; END;").unwrap(),
+            "SELECT 1 + 2"
+        );
+        assert_eq!(
+            desugar_plpgsql_body("  begin\n return 'Weekend';\n end ").unwrap(),
+            "SELECT 'Weekend'"
+        );
+        // The word "end" inside the expression must not confuse it.
+        assert_eq!(
+            desugar_plpgsql_body("begin return weekend; end").unwrap(),
+            "SELECT weekend"
+        );
+        assert!(desugar_plpgsql_body("begin x := 1; return 1; end").is_err());
+        assert!(desugar_plpgsql_body("begin return 1; return 2; end").is_err());
+        assert!(desugar_plpgsql_body("begin return; end").is_err());
+        assert!(desugar_plpgsql_body("select 1").is_err());
+        assert!(desugar_plpgsql_body("beginner return 1; end").is_err());
+    }
+
+    /// v0.97: ALTER DOMAIN persists across statements in the same
+    /// engine (transactional rollback/commit is covered over the wire
+    /// in protocol_test86).
+    #[test]
+    fn alter_domain_persists() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE DOMAIN d97r AS int CHECK (VALUE > 0)").unwrap();
+        run(
+            &mut eng,
+            "ALTER DOMAIN d97r ADD CONSTRAINT c1 CHECK (VALUE < 10)",
+        )
+        .unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT '50'::d97r"), "23514");
+        run(&mut eng, "ALTER DOMAIN d97r DROP CONSTRAINT c1").unwrap();
+        assert_eq!(rows_of(run(&mut eng, "SELECT '50'::d97r").unwrap()), vec![vec!["50"]]);
     }
 }
 

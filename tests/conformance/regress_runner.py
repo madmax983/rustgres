@@ -737,7 +737,9 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)\bsillysrf\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.55: vol()/volfoo() are plpgsql functions whose CREATE FUNCTION
     # is masked above — their CASE-test SELECTs fail only because the
-    # functions were never created.
+    # functions were never created. (v0.97: bounded single-RETURN
+    # plpgsql bodies are now supported, so these entries are dormant
+    # for vol/volfoo; they remain for richer plpgsql bodies.)
     (r"(?i)\bvol\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     (r"(?i)\bvolfoo\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.55: no constant-expression folding pass — PG folds `1/0` in a

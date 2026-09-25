@@ -2563,12 +2563,104 @@ pub struct FuncArg {
     pub type_name: String,
 }
 
-/// v0.86: function languages we can execute. Anything else (plpgsql,
-/// C, ...) is rejected at parse time with 42601.
+/// v0.86: function languages we can execute. `plpgsql` is accepted only
+/// for the bounded single-`RETURN` subset (v0.97): a body of the form
+/// `BEGIN RETURN <expr>; END` is desugared to `SELECT <expr>` at CREATE
+/// time (see `desugar_plpgsql_body`); anything else in plpgsql is an
+/// honest 0A000. C and other languages are still rejected at parse
+/// time with 42601.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FuncLang {
     Sql,
     Internal,
+    /// v0.97: bounded plpgsql (single RETURN statement bodies only).
+    Plpgsql,
+}
+
+/// v0.97: one `ALTER DOMAIN` action (PG19 AlterDomainStmt, bounded to
+/// the domain-constraint forms; OWNER/RENAME/SET SCHEMA stay
+/// unsupported). `AddConstraint.name` is `None` when the statement
+/// omitted `CONSTRAINT name` — the executor auto-names it
+/// `<domain>_check[N]` like CREATE DOMAIN does.
+#[derive(Clone, Debug)]
+pub enum AlterDomainAction {
+    AddConstraint {
+        name: Option<String>,
+        expr: Expr,
+    },
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
+    SetNotNull,
+    DropNotNull,
+    SetDefault(DefaultExpr),
+    DropDefault,
+}
+
+/// v0.97: desugar a bounded-plpgsql function body to a SQL SELECT body.
+///
+/// Accepts (case-insensitively, whitespace-tolerant) exactly:
+/// `BEGIN RETURN <expr>; END` — a single RETURN statement. `<expr>` must
+/// not contain a semicolon. Returns `SELECT <expr>` preserving the
+/// expression's original text, or an error describing why the body is
+/// outside the supported subset (the caller maps this to 0A000). This
+/// is deliberately not a plpgsql parser: real plpgsql (variables,
+/// control flow, multi-statement bodies, EXCEPTION blocks, ...) stays
+/// unsupported.
+pub fn desugar_plpgsql_body(body: &str) -> Result<String, String> {
+    let unsupported = || {
+        format!(
+            "only single-RETURN plpgsql bodies (BEGIN RETURN expr; END) are supported, got: {}",
+            body.chars().take(60).collect::<String>()
+        )
+    };
+    /// Strip an ASCII keyword (case-insensitive) from the front of `s`,
+    /// requiring a word boundary after it. Returns the remainder.
+    fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+        let rest = s.get(..kw.len())?;
+        if !rest.eq_ignore_ascii_case(kw) {
+            return None;
+        }
+        let after = s.get(kw.len()..)?;
+        // Word boundary: next char must not be ident-continue. The
+        // keyword itself may be followed by end-of-string.
+        if let Some(c) = after.chars().next() {
+            if c.is_alphanumeric() || c == '_' {
+                return None;
+            }
+        }
+        Some(after)
+    }
+    let t = body.trim();
+    let t = match t.strip_suffix(';') {
+        Some(s) => s.trim_end(),
+        None => t,
+    };
+    let inner = strip_kw(t, "begin").ok_or_else(unsupported)?;
+    // The body must end with the END keyword (word boundary before it).
+    // Find it by scanning from the end: strip trailing whitespace, then
+    // require the last 3 chars to be "end" with a boundary before.
+    let inner = inner.trim_end();
+    if inner.len() < 3 || !inner[inner.len() - 3..].eq_ignore_ascii_case("end") {
+        return Err(unsupported());
+    }
+    let before_end = &inner[..inner.len() - 3];
+    if let Some(c) = before_end.chars().last() {
+        if c.is_alphanumeric() || c == '_' {
+            return Err(unsupported());
+        }
+    }
+    let stmts = before_end.trim();
+    let expr = strip_kw(stmts, "return").ok_or_else(unsupported)?.trim();
+    let expr = match expr.strip_suffix(';') {
+        Some(s) => s.trim_end(),
+        None => expr,
+    };
+    if expr.is_empty() || expr.contains(';') {
+        return Err(unsupported());
+    }
+    Ok(format!("SELECT {}", expr))
 }
 
 /// v0.86: `VOLATILE` / `STABLE` / `IMMUTABLE` markers. Stored for
@@ -2682,10 +2774,16 @@ pub enum Stmt {
         names: Vec<String>,
         if_exists: bool,
     },
+    // --- v0.97: ALTER DOMAIN (PG19 AlterDomainStmt, bounded) ---
+    AlterDomain {
+        name: String,
+        action: AlterDomainAction,
+    },
     // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
-    // functions. Only `LANGUAGE sql` and `LANGUAGE internal` are
-    // supported; any other language (plpgsql, C, ...) is rejected at
-    // parse time with 42601. `args` carries the optional argument
+    // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
+    // desugared to SQL at CREATE). Only `LANGUAGE sql`, `LANGUAGE
+    // plpgsql` and `LANGUAGE internal` are supported; any other
+    // language (C, ...) is rejected at parse time with 42601. `args` carries the optional argument
     // names (for named references like `t.col` in the body) and the
     // declared type names. `body` is the raw function-body string;
     // the executor parses it once at CREATE time. `or_replace`
@@ -3010,6 +3108,7 @@ impl Stmt {
                 | Stmt::CreateType { .. }
                 | Stmt::DropType { .. }
                 | Stmt::CreateDomain { .. }
+                | Stmt::AlterDomain { .. }
                 | Stmt::DropDomain { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }
@@ -3946,11 +4045,12 @@ impl Parser {
             "alter" => match self.peek() {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
+                Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
                 _ => Err(err(
-                    "syntax error: expected TABLE, SEQUENCE or ROLE after ALTER".to_string(),
+                    "syntax error: expected TABLE, SEQUENCE, DOMAIN or ROLE after ALTER".to_string(),
                 )),
             },
             // --- v0.17: SET / SHOW / RESET
@@ -5611,6 +5711,10 @@ impl Parser {
                 lang = Some(match lname.as_str() {
                     "sql" => FuncLang::Sql,
                     "internal" => FuncLang::Internal,
+                    // v0.97: bounded plpgsql (single-RETURN bodies, see
+                    // desugar_plpgsql_body); richer bodies are an honest
+                    // 0A000 at CREATE time.
+                    "plpgsql" => FuncLang::Plpgsql,
                     other => {
                         return Err(err(format!("language \"{}\" is not supported", other)));
                     }
@@ -6004,6 +6108,72 @@ impl Parser {
         let name = self.expect_ident()?;
         let opts = self.parse_sequence_opts()?;
         Ok(Stmt::AlterSequence { name, opts })
+    }
+
+    /// v0.97: `ALTER DOMAIN name <action>` (PG19 AlterDomainStmt,
+    /// bounded). Actions: `ADD [CONSTRAINT name] CHECK (expr)`,
+    /// `DROP CONSTRAINT [IF EXISTS] name`, `SET NOT NULL`,
+    /// `DROP NOT NULL`, `SET DEFAULT expr`, `DROP DEFAULT`.
+    /// OWNER TO / RENAME / SET SCHEMA / VALIDATE CONSTRAINT are not
+    /// supported (honest 0A000 via the fallthrough).
+    fn parse_alter_domain(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("domain")?;
+        let name = self.expect_ident()?;
+        let action = if self.eat_keyword("add") {
+            let cname = if self.eat_keyword("constraint") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect_keyword("check")?;
+            self.expect(Token::LParen, "'('")?;
+            let e = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            validate_constraint_expr(&e, "CHECK")?;
+            AlterDomainAction::AddConstraint { name: cname, expr: e }
+        } else if self.eat_keyword("drop") {
+            if self.eat_keyword("constraint") {
+                let if_exists = if self.eat_keyword("if") {
+                    self.expect_keyword("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let cname = self.expect_ident()?;
+                AlterDomainAction::DropConstraint {
+                    name: cname,
+                    if_exists,
+                }
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                AlterDomainAction::DropNotNull
+            } else if self.eat_keyword("default") {
+                AlterDomainAction::DropDefault
+            } else {
+                return Err(err(
+                    "syntax error: expected CONSTRAINT, NOT NULL or DEFAULT after ALTER DOMAIN ... DROP"
+                        .to_string(),
+                ));
+            }
+        } else if self.eat_keyword("set") {
+            if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                AlterDomainAction::SetNotNull
+            } else if self.eat_keyword("default") {
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                AlterDomainAction::SetDefault(classify_default(e)?)
+            } else {
+                return Err(err(
+                    "syntax error: expected NOT NULL or DEFAULT after ALTER DOMAIN ... SET".to_string(),
+                ));
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected ADD, DROP or SET after ALTER DOMAIN name".to_string(),
+            ));
+        };
+        Ok(Stmt::AlterDomain { name, action })
     }
 
     fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {

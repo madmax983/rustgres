@@ -3118,6 +3118,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             let lang = match lang {
                 0 => crate::sql::FuncLang::Sql,
                 1 => crate::sql::FuncLang::Internal,
+                2 => crate::sql::FuncLang::Plpgsql,
                 _ => return Err(format!("corrupt function language in WAL: {}", lang)),
             };
             let volatility = match volatility {
@@ -4289,6 +4290,11 @@ pub fn records_for_commit(
                         lang: match f.lang {
                             crate::sql::FuncLang::Sql => 0,
                             crate::sql::FuncLang::Internal => 1,
+                            // v0.97: bounded plpgsql (body desugared to
+                            // SQL at CREATE; the lang tag round-trips so
+                            // restored catalogs keep the declared
+                            // language).
+                            crate::sql::FuncLang::Plpgsql => 2,
                         },
                         body: f.body.clone(),
                         volatility: match f.volatility {
@@ -5119,6 +5125,8 @@ impl Wal {
                 img.u8(match f.lang {
                     crate::sql::FuncLang::Sql => 0,
                     crate::sql::FuncLang::Internal => 1,
+                    // v0.97: bounded plpgsql.
+                    crate::sql::FuncLang::Plpgsql => 2,
                 });
                 img.str(&f.body);
                 img.u8(match f.volatility {
@@ -5807,6 +5815,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             let lang = match d.u8().map_err(|e| bad(&e))? {
                 0 => crate::sql::FuncLang::Sql,
                 1 => crate::sql::FuncLang::Internal,
+                2 => crate::sql::FuncLang::Plpgsql,
                 b => return Err(bad(&format!("corrupt function language {}", b))),
             };
             let body = d.str().map_err(|e| bad(&e))?;

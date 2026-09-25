@@ -10,6 +10,10 @@ Covers:
 - DROP DOMAIN [IF EXISTS] [CASCADE|RESTRICT]
 - CREATE DOMAIN over composite / array-of-domain
 - WAL replay + checkpoint preserve domain definitions
+- v0.97: ALTER DOMAIN (ADD/DROP CONSTRAINT, SET/DROP NOT NULL,
+  SET/DROP DEFAULT), transactional rollback, pg_typeof domain
+  identity, bounded plpgsql (single-RETURN bodies), and durability of
+  altered domains + plpgsql functions across restart
 """
 import os, socket, struct, subprocess, sys, tempfile, time
 
@@ -201,6 +205,104 @@ def main():
               ec == "23514" and "posint_check" in (em or ""), f"{ec} {em}")
         rows = datarows(c.q("select a from dt order by a"))
         check("data survives restart", len(rows) >= 2, f"{rows}")
+
+        # 12. v0.97: ALTER DOMAIN
+        ec, em = errinfo(c.q("create domain adint as int"))
+        check("create plain domain", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint add constraint c_small check (value < 100)"))
+        check("alter add named constraint", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select 500::adint"))
+        check("added constraint enforced", ec == "23514", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint add check (value > 0)"))
+        check("alter add unnamed constraint", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select (-5)::adint"))
+        check("unnamed constraint enforced", ec == "23514", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint drop constraint c_small"))
+        check("alter drop constraint", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select 500::adint"))
+        check("dropped constraint not enforced", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint drop constraint c_small"))
+        check("drop missing constraint 42704", ec == "42704", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint drop constraint if exists c_small"))
+        check("drop if exists silent", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint add constraint c_small check (value < 100)"))
+        check("re-add after drop", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint add constraint c_small check (value < 50)"))
+        check("duplicate constraint name 42710", ec == "42710", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain nosuchdomain set not null"))
+        check("alter missing domain 42704", ec == "42704", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint set not null"))
+        check("alter set not null", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select null::adint"))
+        check("not null enforced 23502", ec == "23502", f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint drop not null"))
+        check("alter drop not null", ec is None, f"{ec} {em}")
+        rows = datarows(c.q("select null::adint"))
+        check("null ok after drop not null", rows == [[None]], f"{rows}")
+        ec, em = errinfo(c.q("alter domain adint set default 7"))
+        check("alter set default", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("create table adt (x adint)"))
+        check("table on altered domain", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("insert into adt default values"))
+        check("insert default", ec is None, f"{ec} {em}")
+        rows = datarows(c.q("select x from adt"))
+        check("altered default applied", rows == [["7"]], f"{rows}")
+        ec, em = errinfo(c.q("alter domain adint drop default"))
+        check("alter drop default", ec is None, f"{ec} {em}")
+        # transactional: rollback restores
+        ec, em = errinfo(c.q("begin"))
+        check("begin", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("alter domain adint add constraint c_tmp check (value < 10)"))
+        check("add in txn", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select 50::adint"))
+        check("txn constraint enforced", ec == "23514", f"{ec} {em}")
+        ec, em = errinfo(c.q("rollback"))
+        check("rollback", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("select 50::adint"))
+        check("rollback restores definition", ec is None, f"{ec} {em}")
+
+        # 13. v0.97: pg_typeof reports domains
+        rows = datarows(c.q("select pg_typeof(5::adint)"))
+        check("pg_typeof cast to domain", rows == [["adint"]], f"{rows}")
+        rows = datarows(c.q("select pg_typeof(x) from adt"))
+        check("pg_typeof domain column", rows == [["adint"]], f"{rows}")
+        rows = datarows(c.q("select pg_typeof(5), pg_typeof(null)"))
+        check("pg_typeof base types unchanged", rows == [["integer", "unknown"]], f"{rows}")
+
+        # 14. v0.97: bounded plpgsql (single-RETURN bodies)
+        ec, em = errinfo(c.q(
+            "create function vol(text) returns text as 'begin return $1; end' language plpgsql volatile"))
+        check("create plpgsql function", ec is None, f"{ec} {em}")
+        rows = datarows(c.q("select vol('hello')"))
+        check("plpgsql call", rows == [["hello"]], f"{rows}")
+        rows = datarows(c.q("select vol('a') || vol('b')"))
+        check("plpgsql volatile repeat call", rows == [["ab"]], f"{rows}")
+        ec, em = errinfo(c.q(
+            "create function badpl() returns int as 'begin x := 1; return 1; end' language plpgsql"))
+        check("rich plpgsql body 0A000", ec == "0A000", f"{ec} {em}")
+        # the foodomain cascade from pg_regress domains: plpgsql no
+        # longer aborts the txn, so CREATE DOMAIN succeeds
+        ec, em = errinfo(c.q("begin"))
+        check("begin 2", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q(
+            "create function vol2(text) returns text as 'begin return $1; end' language plpgsql volatile"))
+        check("create plpgsql in txn", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("create domain foodomain as text"))
+        check("domain after plpgsql in txn", ec is None, f"{ec} {em}")
+        ec, em = errinfo(c.q("commit"))
+        check("commit", ec is None, f"{ec} {em}")
+
+        # 15. durability: altered domains + plpgsql functions survive restart
+        ec, em = errinfo(c.q("checkpoint"))
+        check("checkpoint 2", ec is None, f"{ec} {em}")
+        c.close()
+        proc.terminate(); proc.wait(timeout=10)
+        proc = start_server(dd)
+        c = Conn()
+        ec, em = errinfo(c.q("select 500::adint"))
+        check("altered domain enforced after restart", ec == "23514", f"{ec} {em}")
+        rows = datarows(c.q("select vol('hi')"))
+        check("plpgsql function survives restart", rows == [["hi"]], f"{rows}")
 
         c.close()
     finally:
