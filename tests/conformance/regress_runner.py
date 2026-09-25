@@ -76,7 +76,7 @@ TESTS = [
     ("union", True, False, False),
     ("subselect", True, True, True),
     ("join", True, True, False),
-    ("transactions", False, False, False),
+    ("transactions", True, False, False),
     ("insert", False, False, False),
     ("delete", False, False, False),
 ]

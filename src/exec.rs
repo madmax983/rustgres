@@ -332,6 +332,7 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     priv_scopes: Vec::new(),
                     hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                     hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    pending_updates: None,
                 };
                 run_select(&mut q, sel, &[])?
             };
@@ -1709,6 +1710,7 @@ fn eval_partition_key_expr(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
     };
     let scope = Scope {
         schema,
@@ -2832,6 +2834,7 @@ fn eval_default(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
+                pending_updates: None,
             };
             let v = eval_expr(&mut q, &[], e)?;
             coerce_value(v, ctype, cname)
@@ -3021,6 +3024,7 @@ fn check_row_constraints(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
+                pending_updates: None,
             };
             check_domain_value(&mut q, dname, &values[i], is_elem)?;
         }
@@ -3058,6 +3062,7 @@ fn check_row_constraints(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
         };
         let frame = Scope {
             schema: &schema,
@@ -3851,6 +3856,7 @@ fn materialize_dml_ctes(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
     };
     materialize_ctes(&mut q, with)?;
     Ok(q.ctes)
@@ -3927,7 +3933,7 @@ fn project_returning(
     for item in returning {
         if let SelectItem::Expr { expr, .. } = item {
             out.push(eval_dml_expr(
-                eng, snap, own, session, role, scopes, expr, ctes,
+                eng, snap, own, session, role, scopes, expr, ctes, None,
             )?);
         }
     }
@@ -4724,6 +4730,7 @@ fn exec_create_table_as(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
         };
         run_select(&mut q, select, &[])?
     };
@@ -5181,6 +5188,7 @@ fn exec_insert(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
         };
         let out = run_select(&mut q, sel, &[])?;
         Some(out.rows)
@@ -5302,6 +5310,7 @@ fn exec_insert(
                         priv_scopes: Vec::new(),
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                         hashed_in: Rc::new(RefCell::new(Vec::new())),
+                        pending_updates: None,
                     };
                     targets
                         .iter()
@@ -5420,6 +5429,7 @@ fn exec_insert(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
+                pending_updates: None,
             };
             built = Vec::with_capacity(rows.len());
             // v0.72: expand top-level set-returning calls in VALUES
@@ -5788,6 +5798,7 @@ fn exec_insert(
                             &frames,
                             w,
                             &ctes,
+                            None,
                         )?;
                         if v != Value::Bool(true) {
                             continue;
@@ -5804,6 +5815,7 @@ fn exec_insert(
                             &frames,
                             expr,
                             &ctes,
+                            None,
                         )?;
                         let (cname, ctype) = &meta_for_upsert.columns[ci];
                         new_values[ci] = coerce_value(v, ctype, cname)?;
@@ -6164,6 +6176,14 @@ fn exec_update(
     // v0.10: WITH materialization; the CTEs are visible to subqueries in
     // SET/WHERE and in the RETURNING list.
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
+    // v0.89: statement-local UPDATE overlay — rows already planned by
+    // this UPDATE, as (destination leaf table, row-version id, new
+    // values in destination order). Volatile SQL function bodies called
+    // from SET/WHERE see these instead of the statement snapshot
+    // (PG19); stable/immutable functions and plain subqueries do not.
+    // This is a plan, not a mutation: storage is untouched until the
+    // whole UPDATE validates, so statement atomicity is preserved.
+    let pending: Rc<RefCell<Vec<(String, u64, Row)>>> = Rc::new(RefCell::new(Vec::new()));
     // Plan first (validate + conflict-check), mutate after: a failed
     // UPDATE leaves no trace (statement atomicity).
     // v0.70: a partitioned target expands to its leaves. The plan holds
@@ -6276,6 +6296,7 @@ fn exec_update(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
+                pending_updates: None,
             };
             let (fschema, frows) = build_from(&mut q, &[], from, None, false, None, None)?;
             Some((fschema, frows))
@@ -6318,6 +6339,7 @@ fn exec_update(
                                 values,
                                 pred,
                                 &ctes,
+                                Some(pending.clone()),
                             )?;
                             v == Value::Bool(true)
                         }
@@ -6348,6 +6370,7 @@ fn exec_update(
                                     &cvalues,
                                     pred,
                                     &ctes,
+                                    Some(pending.clone()),
                                 )?;
                                 v == Value::Bool(true)
                             }
@@ -6379,6 +6402,7 @@ fn exec_update(
                         values,
                         expr,
                         &ctes,
+                        Some(pending.clone()),
                     )?,
                     Some((fschema, _)) => {
                         let frow = from_row.as_ref().expect("matched row has FROM data");
@@ -6397,6 +6421,7 @@ fn exec_update(
                             &cvalues,
                             expr,
                             &ctes,
+                            Some(pending.clone()),
                         )?
                     }
                 };
@@ -6468,9 +6493,20 @@ fn exec_update(
             let old_src = Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()));
             if dst == *leaf {
                 old_leaf_vals.push((leaf.clone(), old_src));
+                // v0.89: record the planned row in the statement-local
+                // overlay so volatile function bodies later in this
+                // UPDATE see it (PG19); nothing is written yet.
+                pending
+                    .borrow_mut()
+                    .push((leaf.clone(), *id, Row::new(new_dst.clone())));
                 plan.push((leaf.clone(), *id, *xmax, Row::new(new_dst)));
             } else {
                 move_old_vals.push((leaf.clone(), old_src));
+                // v0.89: same for rows moving between partitions,
+                // keyed by the destination leaf.
+                pending
+                    .borrow_mut()
+                    .push((dst.clone(), *id, Row::new(new_dst.clone())));
                 moves.push((leaf.clone(), *id, *xmax, dst, Row::new(new_dst)));
             }
         }
@@ -6866,6 +6902,7 @@ fn exec_delete(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
+                pending_updates: None,
             };
             let (uschema, urows) = build_from(&mut q, &[], using, None, false, None, None)?;
             Some((uschema, urows))
@@ -6898,6 +6935,7 @@ fn exec_delete(
                                 &[(uschema, &urow.cells), (&schema, values)],
                                 pred,
                                 &ctes,
+                                None,
                             )?;
                             if v == Value::Bool(true) {
                                 matched = true;
@@ -6920,6 +6958,7 @@ fn exec_delete(
                             values,
                             pred,
                             &ctes,
+                            None,
                         )?;
                         (v == Value::Bool(true), None)
                     }
@@ -7931,8 +7970,25 @@ fn exec_drop_index(
     names: &[String],
     if_exists: bool,
 ) -> Result<ExecResult, ExecError> {
-    // v0.88: `DROP INDEX a, b, c` drops each in turn; the first missing
-    // name aborts the rest (like PostgreSQL).
+    // v0.89: like PostgreSQL, resolve every name before dropping any: a
+    // missing name anywhere in the list aborts the whole statement with
+    // 42P01 and no index is dropped (the old sequential loop left
+    // earlier names dropped when a later name was missing).
+    for name in names {
+        let temp_hit = eng
+            .db
+            .temp_indexes
+            .get(&ctx.session)
+            .and_then(|m| m.get(name))
+            .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+            .is_some();
+        if !temp_hit && eng.db.find_index(name, ctx.snap, ctx.own).is_none() && !if_exists {
+            return Err(exec_err(
+                "42P01",
+                format!("index \"{}\" does not exist", name),
+            ));
+        }
+    }
     for name in names {
         exec_drop_one_index(eng, ctx, name, if_exists)?;
     }
@@ -10439,6 +10495,16 @@ struct Q<'a, 'b> {
     /// way: previously seen subqueries (by AST equality) and their
     /// materialized outputs.
     hashed_in: Rc<RefCell<Vec<(SelectStmt, Rc<HashedIn>)>>>,
+    /// v0.89: statement-local UPDATE overlay — (destination table,
+    /// row-version id, new cell values) for rows already processed by
+    /// the in-flight UPDATE. Only *volatile* SQL function bodies see
+    /// it (PG19: a volatile function observes the statement's own
+    /// earlier row updates, while stable/immutable ones see the
+    /// statement snapshot). Plain subqueries and stable/immutable
+    /// function bodies always get `None`. The overlay is a plan, not
+    /// a mutation: nothing is written to storage until the whole
+    /// UPDATE succeeds, so statement atomicity is preserved.
+    pending_updates: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 }
 
 /// v0.10: a materialized Common Table Expression: name, output schema and
@@ -14917,6 +14983,68 @@ fn lateral_function_schema(
     function_item_schema(name, &out_names, &col_types, alias, col_aliases)
 }
 
+/// v0.89: apply the statement-local UPDATE overlay to base-table scan
+/// rows. Only volatile SQL function bodies carry a pending overlay;
+/// every other scan gets `None` and returns `rows` untouched. Rows
+/// already planned by the in-flight UPDATE are replaced by their new
+/// cell values, matched by (table, row-version id) from the row
+/// provenance (which the caller forces on whenever an overlay is
+/// present). Nothing here touches storage — the overlay is a plan.
+fn apply_pending_overlay(
+    q: &Q<'_, '_>,
+    scan_name: &str,
+    schema: &[QCol],
+    rows: Vec<QRow>,
+) -> Vec<QRow> {
+    let Some(pending) = q.pending_updates.as_ref() else {
+        return rows;
+    };
+    let pending = pending.borrow();
+    if pending.is_empty() {
+        return rows;
+    }
+    // (table, row id) -> new cells in SCAN column order. Entries for a
+    // partitioned leaf are remapped from leaf order to parent order;
+    // non-partitioned entries already match the scan order.
+    let mut map: std::collections::HashMap<(&str, u64), Row> = std::collections::HashMap::new();
+    for (t, id, cells) in pending.iter() {
+        let ordered = if t == scan_name {
+            cells.clone()
+        } else if let Some(lt) = q.eng.db.find_table(t, q.snap, q.own, q.session) {
+            Row::new(
+                schema
+                    .iter()
+                    .map(|c| {
+                        lt.columns
+                            .iter()
+                            .position(|(ln, _)| ln == &c.name)
+                            .map(|i| cells[i].clone())
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            )
+        } else {
+            continue;
+        };
+        map.insert((t.as_str(), *id), ordered);
+    }
+    if map.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|mut qr| {
+            let hit = qr
+                .prov
+                .iter()
+                .find_map(|(pt, pid)| map.get(&(pt.as_str(), *pid)));
+            if let Some(cells) = hit {
+                qr.cells = cells.clone();
+            }
+            qr
+        })
+        .collect()
+}
+
 fn build_source(
     q: &mut Q,
     outer: &[Scope],
@@ -15164,6 +15292,10 @@ fn build_source(
             }
             // Borrow ends before any recursive call below: everything is
             // cloned out of the table.
+            // v0.89: a volatile function body's scan must carry row
+            // provenance so the UPDATE overlay can match rows by
+            // (table, row-version id), even when not FOR UPDATE.
+            let prov_for_overlay = q.pending_updates.is_some();
             let (schema, rows) = {
                 let t = q
                     .eng
@@ -15228,7 +15360,7 @@ fn build_source(
                                 .collect();
                             all_rows.push(QRow {
                                 cells: Row::new(cells),
-                                prov: if need_prov {
+                                prov: if need_prov || prov_for_overlay {
                                     vec![(leaf_name.clone(), r.id)]
                                 } else {
                                     Vec::new()
@@ -15242,7 +15374,16 @@ fn build_source(
                         .indexes
                         .get(&hint.index)
                         .expect("planned index still present; engine lock held throughout");
-                    index_order_rows(ix, t, name, hint.desc, snap, own, need_prov, early_limit)
+                    index_order_rows(
+                        ix,
+                        t,
+                        name,
+                        hint.desc,
+                        snap,
+                        own,
+                        need_prov || prov_for_overlay,
+                        early_limit,
+                    )
                 } else {
                     match plan_access_path(db, t, name, &qual, where_, snap, own, q.session) {
                         AccessPath::SeqScan => t
@@ -15251,7 +15392,7 @@ fn build_source(
                             .filter(|r| row_visible(r, snap, own))
                             .map(|r| QRow {
                                 cells: r.values.clone(),
-                                prov: if need_prov {
+                                prov: if need_prov || prov_for_overlay {
                                     vec![(name.clone(), r.id)]
                                 } else {
                                     Vec::new()
@@ -15285,7 +15426,7 @@ fn build_source(
                                     if row_visible(r, snap, own) {
                                         rows.push(QRow {
                                             cells: r.values.clone(),
-                                            prov: if need_prov {
+                                            prov: if need_prov || prov_for_overlay {
                                                 vec![(name.clone(), r.id)]
                                             } else {
                                                 Vec::new()
@@ -15300,6 +15441,9 @@ fn build_source(
                 };
                 (schema, rows)
             };
+            // v0.89: volatile function bodies see the in-flight UPDATE's
+            // already-planned rows instead of the statement snapshot.
+            let rows = apply_pending_overlay(q, name, &schema, rows);
             Ok((apply_aliases(schema)?, rows))
         }
         // v0.32: set-returning table function (`regexp_split_to_table`).
@@ -15335,6 +15479,8 @@ fn build_source(
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
                 };
                 run_select(&mut sub_q, sub, &[])?
             };
@@ -19300,6 +19446,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -19336,6 +19484,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -19410,6 +19560,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -20203,6 +20355,8 @@ fn eval_hashed_in(
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -20510,6 +20664,8 @@ fn eval_in(
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             hashed_in: q.hashed_in.clone(),
+            // v0.89: plain subqueries never see the UPDATE overlay.
+            pending_updates: None,
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -20650,6 +20806,8 @@ fn eval_quantified(
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             hashed_in: q.hashed_in.clone(),
+            // v0.89: plain subqueries never see the UPDATE overlay.
+            pending_updates: None,
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -21345,8 +21503,20 @@ fn eval_update_expr(
     values: &[Value],
     e: &Expr,
     ctes: &[Rc<CteBinding>],
+    // v0.89: statement-local UPDATE overlay (volatile functions only).
+    pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 ) -> Result<Value, ExecError> {
-    eval_dml_expr(eng, snap, own, session, role, &[(schema, values)], e, ctes)
+    eval_dml_expr(
+        eng,
+        snap,
+        own,
+        session,
+        role,
+        &[(schema, values)],
+        e,
+        ctes,
+        pending,
+    )
 }
 
 /// v0.10: evaluate a DML expression (UPDATE SET, RETURNING, ON CONFLICT
@@ -21362,6 +21532,8 @@ fn eval_dml_expr(
     frames: &[(&[QCol], &[Value])],
     e: &Expr,
     ctes: &[Rc<CteBinding>],
+    // v0.89: statement-local UPDATE overlay (volatile functions only).
+    pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 ) -> Result<Value, ExecError> {
     let mut lock_ids = Vec::new();
     let mut q = Q {
@@ -21380,6 +21552,7 @@ fn eval_dml_expr(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: pending,
     };
     let scopes: Vec<Scope> = frames
         .iter()
@@ -23988,11 +24161,29 @@ fn coerce_to_type_name(q: &mut Q, v: &Value, type_name: &str) -> Result<Value, E
 
 /// v0.86: run a SQL-language function body with bound arguments.
 /// Returns the raw SELECT output (columns, rows).
+/// v0.89: the statement-local UPDATE overlay a function body may see.
+/// Only VOLATILE functions observe the in-flight UPDATE's already
+/// processed rows (PG19); STABLE and IMMUTABLE bodies see the
+/// statement snapshot, so they get `None`.
+fn volatile_pending(
+    q: &Q,
+    fdef: &crate::storage::FuncDef,
+) -> Option<Rc<RefCell<Vec<(String, u64, Row)>>>> {
+    if fdef.volatility == crate::sql::FuncVolatility::Volatile {
+        q.pending_updates.clone()
+    } else {
+        None
+    }
+}
+
 fn run_func_body(
     q: &mut Q,
     scopes: &[Scope],
     fdef: &crate::storage::FuncDef,
     args: &[Value],
+    // v0.89: statement-local UPDATE overlay, already volatility-gated
+    // by the caller (Some only for volatile functions).
+    pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 ) -> Result<SelectOut, ExecError> {
     // Arity is checked by the caller; coerce each argument to the
     // declared type (PG19 function call coercion, assignment cast).
@@ -24046,6 +24237,10 @@ fn run_func_body(
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
         hashed_in: q.hashed_in.clone(),
+        // v0.89: volatile function bodies see the in-flight UPDATE's
+        // already-processed rows (caller-gated); stable/immutable
+        // bodies see the statement snapshot (None).
+        pending_updates: pending,
     };
     run_select(&mut call_q, &bound, scopes)
 }
@@ -24071,7 +24266,7 @@ fn call_user_function(
             ),
         ));
     }
-    let out = run_func_body(q, scopes, fdef, args)?;
+    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef))?;
     if out.rows.is_empty() && out.columns.is_empty() {
         // STRICT-on-NULL short-circuit from run_func_body.
         return Ok(Value::Null);
@@ -24106,7 +24301,7 @@ fn call_table_function(
             format!("internal function \"{}\" cannot be used in FROM", fdef.name),
         ));
     }
-    let out = run_func_body(q, scopes, fdef, args)?;
+    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef))?;
     if out.rows.is_empty() && out.columns.is_empty() {
         // STRICT-on-NULL: zero rows.
         return Ok((vec![], vec![], vec![]));
@@ -32364,7 +32559,7 @@ pub fn eval_execute_arg(
     role: &str,
     e: &Expr,
 ) -> Result<Value, ExecError> {
-    eval_dml_expr(eng, snap, own, session, role, &[], e, &[])
+    eval_dml_expr(eng, snap, own, session, role, &[], e, &[], None)
 }
 
 /// Replace every `$N` in the statement with its bound value's literal.
@@ -37326,10 +37521,12 @@ mod tests {
     fn v088_drop_index_multi_name() {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t88d (a int)").unwrap();
-        // v0.88: `USING btree` (or another access method) is accepted
-        // and ignored; rustgres only implements btree.
+        // v0.89: `USING btree` is accepted (and ignored — rustgres only
+        // implements btree); any other access method is 0A000.
         run(&mut eng, "CREATE UNIQUE INDEX u88 ON t88d USING btree (a)").unwrap();
         assert!(eng.db.indexes["u88"].def.planner_usable);
+        let err = run(&mut eng, "CREATE INDEX u88h ON t88d USING hash (a)").unwrap_err();
+        assert_eq!(err.code, "0A000");
         run(&mut eng, "CREATE INDEX d1 ON t88d (a)").unwrap();
         run(&mut eng, "CREATE INDEX d2 ON t88d (a)").unwrap();
         run(&mut eng, "DROP INDEX d1, d2").unwrap();
@@ -37338,10 +37535,17 @@ mod tests {
         assert_ne!(eng.db.indexes["d2"].def.dropped_xmax, 0);
         let err = run(&mut eng, "DROP INDEX nope_missing").unwrap_err();
         assert_eq!(err.code, "42P01");
-        // A missing name later in the list still aborts the statement.
+        // A missing name anywhere in the list aborts the whole statement
+        // with 42P01, and (like PostgreSQL) no index is dropped — the
+        // existing-first/missing-later order is the case that caught the
+        // old sequential implementation.
         run(&mut eng, "CREATE INDEX d3 ON t88d (a)").unwrap();
+        let err = run(&mut eng, "DROP INDEX d3, nope_missing").unwrap_err();
+        assert_eq!(err.code, "42P01");
+        assert_eq!(eng.db.indexes["d3"].def.dropped_xmax, 0);
         let err = run(&mut eng, "DROP INDEX nope_missing, d3").unwrap_err();
         assert_eq!(err.code, "42P01");
+        assert_eq!(eng.db.indexes["d3"].def.dropped_xmax, 0);
     }
 
     /// v0.88: the virtual pg_attribute exposes attrelid/attname/attnum;

@@ -120,11 +120,11 @@ def main():
         check("insert", e is None, e)
 
         # A. DESC / NULLS key options
-        e, _ = simple("create index mc88_d on mc88 (a desc)")
+        e, _ = simple("create index mc88_d on mc88 using btree (a desc)")
         check("desc", e is None, e)
-        e, _ = simple("create index mc88_nf on mc88 (b desc nulls first)")
+        e, _ = simple("create index mc88_nf on mc88 using btree (b desc nulls first)")
         check("desc nulls first", e is None, e)
-        e, _ = simple("create index mc88_nl on mc88 (a asc nulls last, b desc)")
+        e, _ = simple("create index mc88_nl on mc88 using btree (a asc nulls last, b desc)")
         check("multi-key", e is None, e)
         e, r = simple("select a from mc88 order by a")
         check("order asc", e is None and r == [["1"], ["2"], ["3"]], (e, r))
@@ -144,7 +144,7 @@ def main():
         check("count back to 3", e is None and r == [["3"]], (e, r))
 
         # C. partial index: catalog-only
-        e, _ = simple("create index mc88_p on mc88 (b) where b > 1")
+        e, _ = simple("create index mc88_p on mc88 using btree (b) where b > 1")
         check("partial create", e is None, e)
         e, _ = simple("insert into mc88 values (5, 5)")
         check("insert with partial", e is None, e)
@@ -181,7 +181,7 @@ def main():
         # G. CREATE INDEX in txn + rollback
         e, _ = simple("begin")
         check("begin", e is None, e)
-        e, _ = simple("create index mc88_rb on mc88 (a desc) where a > 0")
+        e, _ = simple("create index mc88_rb on mc88 using btree (a desc) where a > 0")
         check("create in txn", e is None, e)
         e, _ = simple("rollback")
         check("rollback", e is None, e)
@@ -189,7 +189,7 @@ def main():
         check("rolled back 42P01", e == "42P01", e)
 
         # H. checkpoint with v0.88 metadata present
-        e, _ = simple("create index mc88_c on mc88 (a desc nulls first)")
+        e, _ = simple("create index mc88_c on mc88 using btree (a desc nulls first)")
         check("recreate desc", e is None, e)
         e, _ = simple("create unique index mc88_ce on mc88 ((b + 1))")
         check("recreate expr", e is None, e)

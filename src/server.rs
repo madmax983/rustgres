@@ -326,6 +326,10 @@ impl Session {
 /// materialized (columns + rows + position); FETCH advances `pos`.
 /// (Named `SqlCursor` — `protocol::Cursor` is the wire-protocol cursor.)
 pub(crate) struct SqlCursor {
+    /// v0.89: lazy query — `Some` until the first FETCH materializes
+    /// it (PG19 defers query errors to FETCH, not DECLARE). `None`
+    /// once materialized.
+    query: Option<sql::SelectStmt>,
     cols: Vec<(String, ColType)>,
     rows: Vec<Row>,
     /// Current row index: -1 = before the first row, rows.len() = after
@@ -333,13 +337,19 @@ pub(crate) struct SqlCursor {
     /// retrieved).
     pos: i64,
     with_hold: bool,
+    /// v0.89: set when a FETCH raised an error — the portal is "dead
+    /// to the world" (PG19); further FETCHes get `portal cannot be run`
+    /// instead of re-executing.
+    dead: bool,
 }
 
 /// v0.16: cursor state captured at SAVEPOINT time, kept in lockstep with
 /// `Txn::savepoints`. On ROLLBACK TO, cursor positions rewind and cursors
 /// created after the savepoint are closed — like Postgres.
 struct CursorMark {
-    positions: HashMap<String, i64>,
+    // v0.89: fetch positions are NOT rewound by ROLLBACK TO (PG19
+    // keeps them); only the cursor set is restored, closing cursors
+    // declared after the savepoint.
     names: HashSet<String>,
 }
 
@@ -1731,8 +1741,6 @@ pub(crate) fn cursor_window_for_test(
 }
 
 fn cursor_declare(
-    engine: &Arc<Mutex<Engine>>,
-    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     name: &str,
     query: &sql::SelectStmt,
@@ -1750,48 +1758,88 @@ fn cursor_declare(
             message: format!("cursor \"{}\" already exists", name),
         });
     }
-    let sel = Stmt::Select(query.clone());
-    let result = if session.txn.is_some() {
-        txn_execute(engine, session, &sel)
-    } else {
-        autocommit_execute(
-            engine,
-            wal,
-            session.sid,
-            &session.role,
-            session.default_txn_read_only == Some(true),
-            session.default_toast_compression,
-            &sel,
-        )
-    };
-    match result {
-        Ok(ExecResult::Select { columns, rows }) => {
-            session.cursors.insert(
-                name.to_string(),
-                SqlCursor {
-                    cols: columns,
-                    rows,
-                    pos: -1,
-                    with_hold,
-                },
-            );
-            Ok(cmd("DECLARE CURSOR"))
-        }
-        Ok(_) => Err(ExecError {
-            detail: None,
-            code: "XX000",
-            message: "internal error: DECLARE query did not return rows".to_string(),
-        }),
-        Err(e) => Err(e),
-    }
+    // v0.89: PG19 does not execute the query at DECLARE — the portal is
+    // created lazily and query errors (e.g. division by zero) surface
+    // at the first FETCH, not here.
+    session.cursors.insert(
+        name.to_string(),
+        SqlCursor {
+            query: Some(query.clone()),
+            cols: Vec::new(),
+            rows: Vec::new(),
+            pos: -1,
+            with_hold,
+            dead: false,
+        },
+    );
+    Ok(cmd("DECLARE CURSOR"))
 }
 
 fn cursor_fetch(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     name: &str,
     dir: &FetchDir,
     is_move: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.89: existence and liveness check; take the lazy query out so
+    // the materialization below can borrow `session` mutably.
+    let query = {
+        let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
+            detail: None,
+            code: "34000",
+            message: format!("cursor \"{}\" does not exist", name),
+        })?;
+        if cur.dead {
+            // PG19: a portal that raised an error is "dead to the
+            // world" — it stays present but cannot be run (55000).
+            return Err(ExecError {
+                detail: None,
+                code: "55000",
+                message: format!("portal \"{}\" cannot be run", name),
+            });
+        }
+        cur.query.take()
+    };
+    // v0.89: first FETCH materializes the DECLARE query. An execution
+    // error (e.g. division by zero) marks the portal dead and aborts
+    // the transaction (via txn_execute), like PG19.
+    if let Some(query) = query {
+        let sel = Stmt::Select(query);
+        let result = if session.txn.is_some() {
+            txn_execute(engine, session, &sel)
+        } else {
+            autocommit_execute(
+                engine,
+                wal,
+                session.sid,
+                &session.role,
+                session.default_txn_read_only == Some(true),
+                session.default_toast_compression,
+                &sel,
+            )
+        };
+        let cur = session.cursors.get_mut(name).expect("cursor checked above");
+        match result {
+            Ok(ExecResult::Select { columns, rows }) => {
+                cur.cols = columns;
+                cur.rows = rows;
+            }
+            Ok(_) => {
+                cur.dead = true;
+                return Err(ExecError {
+                    detail: None,
+                    code: "XX000",
+                    message: "internal error: DECLARE query did not return rows".to_string(),
+                });
+            }
+            Err(e) => {
+                cur.dead = true;
+                return Err(e);
+            }
+        }
+    }
     let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
         detail: None,
         code: "34000",
@@ -1863,10 +1911,26 @@ fn effective_read_only(session: &Session) -> bool {
 /// command name for the 25006 error when the statement writes or locks
 /// rows and the session is read-only; None when the statement is a
 /// pure read (or transaction/session control, which must stay usable).
-fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
+/// v0.17: which DML/DDL statements a read-only transaction rejects.
+/// v0.89: PostgreSQL lets a read-only transaction write TEMPORARY
+/// tables (only permanent relations are protected), so statements
+/// whose every written target is a session-temp table are allowed;
+/// `CREATE TEMP TABLE` / `CREATE TEMP ... AS` are allowed too.
+fn read_only_violation(
+    db: &crate::storage::Database,
+    session: &Session,
+    stmt: &Stmt,
+) -> Option<&'static str> {
+    /// Every name in `names` resolves to a session-temp table.
+    fn all_temp(db: &crate::storage::Database, session: &Session, names: &[String]) -> bool {
+        !names.is_empty() && names.iter().all(|n| db.is_temp_table(session.sid, n))
+    }
     match stmt {
+        Stmt::Insert { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Insert { .. } => Some("INSERT"),
+        Stmt::Update { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Update { .. } => Some("UPDATE"),
+        Stmt::Delete { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Delete { .. } => Some("DELETE"),
         // COPY FROM STDIN writes; COPY TO STDOUT is a read.
         Stmt::Copy { to_stdout, .. } => {
@@ -1876,15 +1940,23 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
                 Some("COPY")
             }
         }
+        Stmt::Truncate { tables, .. } if all_temp(db, session, tables) => None,
         Stmt::Truncate { .. } => Some("TRUNCATE"),
         Stmt::Select(s) if s.for_update => Some("SELECT FOR UPDATE"),
         // DDL (schema and privilege changes are writes).
+        Stmt::CreateTable { temp: true, .. } => None,
         Stmt::CreateTable { .. } => Some("CREATE TABLE"),
         // v0.48: CTAS is a write too (PG19: "cannot execute CREATE
         // TABLE AS in a read-only transaction").
+        Stmt::CreateTableAs { temp: true, .. } => None,
         Stmt::CreateTableAs { .. } => Some("CREATE TABLE AS"),
+        Stmt::AlterTable { name, .. } if all_temp(db, session, std::slice::from_ref(name)) => None,
         Stmt::AlterTable { .. } => Some("ALTER TABLE"),
+        Stmt::DropTable { names, .. } if all_temp(db, session, names) => None,
         Stmt::DropTable { .. } => Some("DROP TABLE"),
+        Stmt::CreateIndex { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => {
+            None
+        }
         Stmt::CreateIndex { .. } => Some("CREATE INDEX"),
         Stmt::DropIndex { .. } => Some("DROP INDEX"),
         Stmt::CreateView { .. } => Some("CREATE VIEW"),
@@ -2301,7 +2373,14 @@ fn run_statement(
     // session control stay usable so the mode can always be exited.
     // Like any statement error, this aborts the transaction.
     if effective_read_only(session) {
-        if let Some(cmd) = read_only_violation(stmt) {
+        // v0.89: temp-table awareness needs the catalog, so take the
+        // engine lock briefly (the same lock run_statement would take
+        // for execution anyway).
+        let violation = {
+            let guard = lock_engine(engine);
+            read_only_violation(&guard.db, session, stmt)
+        };
+        if let Some(cmd) = violation {
             if let Some(t) = session.txn.as_mut() {
                 t.failed = true;
             }
@@ -2385,10 +2464,10 @@ fn run_statement(
             name,
             query,
             with_hold,
-        } => cursor_declare(engine, wal, session, name, query, *with_hold),
-        Stmt::Fetch { name, dir } => cursor_fetch(session, name, dir, false),
+        } => cursor_declare(session, name, query, *with_hold),
+        Stmt::Fetch { name, dir } => cursor_fetch(engine, wal, session, name, dir, false),
         Stmt::Close { name } => cursor_close(session, name.as_deref()),
-        Stmt::Move { name, dir } => cursor_fetch(session, name, dir, true),
+        Stmt::Move { name, dir } => cursor_fetch(engine, wal, session, name, dir, true),
         Stmt::Vacuum {
             table,
             verbose,
@@ -2751,18 +2830,21 @@ fn txn_commit(
     session: &mut Session,
     chain: bool,
 ) -> Result<ExecResult, ExecError> {
-    let t = match session.txn.take() {
-        None => {
-            // Postgres: WARNING, no-op. AND CHAIN without a transaction
-            // still starts a new one with default characteristics; the
-            // tag stays COMMIT.
-            if chain {
-                txn_begin(engine, session, IsolationLevel::ReadCommitted, None, None)?;
-            }
-            return Ok(cmd("COMMIT"));
+    if session.txn.is_none() {
+        // v0.89: plain COMMIT outside a transaction is PG's WARNING
+        // no-op, but COMMIT AND CHAIN requires a transaction block
+        // (PG19: 25001 "COMMIT AND CHAIN can only be used in transaction
+        // blocks").
+        if chain {
+            return Err(ExecError {
+                detail: None,
+                code: "25001",
+                message: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
+            });
         }
-        Some(t) => t,
-    };
+        return Ok(cmd("COMMIT"));
+    }
+    let t = session.txn.take().expect("transaction checked above");
     // Remember characteristics for AND CHAIN before the txn is consumed.
     let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
     let mut guard = lock_engine(engine);
@@ -2966,6 +3048,14 @@ fn txn_rollback(
     session: &mut Session,
     chain: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.89: ROLLBACK AND CHAIN outside a transaction block is 25001
+    // in PG19 ("ROLLBACK AND CHAIN can only be used in transaction
+    // blocks"); plain ROLLBACK stays the WARNING no-op.
+    if session.txn.is_none() && chain {
+        return Err(err_25001(
+            "ROLLBACK AND CHAIN can only be used in transaction blocks",
+        ));
+    }
     // Remember characteristics for AND CHAIN before the txn is consumed.
     let chained = if let Some(t) = session.txn.take() {
         let chained = (t.level, t.read_only, t.deferrable);
@@ -2984,10 +3074,11 @@ fn txn_rollback(
     };
     if chain {
         // AND CHAIN: new transaction with the same characteristics as the
-        // just-rolled-back one (or defaults if there was no transaction).
-        // The command tag stays ROLLBACK, like PostgreSQL.
+        // just-rolled-back one (v0.89: chain without a transaction is
+        // rejected above, so `chained` is always `Some` here). The
+        // command tag stays ROLLBACK, like PostgreSQL.
         let (level, read_only, deferrable) =
-            chained.unwrap_or((IsolationLevel::ReadCommitted, None, None));
+            chained.expect("CHAIN without a transaction is rejected above");
         txn_begin(engine, session, level, read_only, deferrable)?;
     }
     Ok(cmd("ROLLBACK"))
@@ -3011,13 +3102,9 @@ fn txn_savepoint(
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
             // effects made after the savepoint (PG19).
             t.guc_marks.push(t.guc_stack.len());
-            // v0.16: also snapshot cursor positions and the cursor set.
+            // v0.16: also snapshot the cursor set (v0.89: positions are
+            // no longer rewound — PG19 keeps them across ROLLBACK TO).
             t.cursor_marks.push(CursorMark {
-                positions: session
-                    .cursors
-                    .iter()
-                    .map(|(k, c)| (k.clone(), c.pos))
-                    .collect(),
                 names: session.cursors.keys().cloned().collect(),
             });
             Ok(cmd("SAVEPOINT"))
@@ -3078,19 +3165,18 @@ fn txn_rollback_to(
     for e in undone {
         restore_saved_guc(session, e.name, e.saved);
     }
-    // v0.16: rewind cursor positions to the savepoint and close cursors
-    // created after it — like Postgres. (NLL: `t` is dead after this.)
-    let mark = session
+    // v0.16: close cursors created after the savepoint (their DECLARE
+    // is undone, like Postgres). v0.89: fetch positions of surviving
+    // cursors are NOT rewound — PG19 keeps the portal position across
+    // ROLLBACK TO SAVEPOINT (verified against the authentic
+    // transactions.out: `FETCH 10 FROM c` returns rows 10-19 after the
+    // rollback, not 0-9 again).
+    let names = session
         .txn
         .as_ref()
         .and_then(|t| t.cursor_marks.get(idx))
-        .map(|m| (m.positions.clone(), m.names.clone()));
-    if let Some((positions, names)) = mark {
-        for (k, c) in session.cursors.iter_mut() {
-            if let Some(p) = positions.get(k) {
-                c.pos = *p;
-            }
-        }
+        .map(|m| m.names.clone());
+    if let Some(names) = names {
         session.cursors.retain(|k, _| names.contains(k));
     }
     session

@@ -4217,11 +4217,18 @@ impl Parser {
             };
             self.expect_keyword("on")?;
             let table = self.expect_ident()?;
-            // v0.88: `USING btree` (or another access method) may appear
-            // between the table and the column list. rustgres only
-            // implements btree; accept and ignore the method name.
+            // v0.88: `USING btree` may appear between the table and the
+            // column list. v0.89: rustgres only implements btree, so any
+            // other access method is 0A000 (feature not supported) rather
+            // than silently misbehaving as a btree.
             if self.eat_keyword("using") {
-                self.expect_ident()?;
+                let method = self.expect_ident()?;
+                if method != "btree" {
+                    return Err(SqlError {
+                        message: format!("index access method \"{method}\" is not supported"),
+                        code: "0A000",
+                    });
+                }
             }
             self.expect(Token::LParen, "'('")?;
             let mut columns = Vec::new();
@@ -9004,27 +9011,18 @@ impl Parser {
     }
 
     fn parse_fetch(&mut self) -> Result<Stmt, SqlError> {
-        // FETCH [ direction ] { FROM | IN } name
+        // v0.89: FETCH [ direction [ FROM | IN ] ] name — PG19 lets the
+        // FROM/IN keywords be omitted (`FETCH ok` == `FETCH NEXT FROM ok`).
         let dir = self.parse_fetch_dir()?;
-        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
-            return Err(err(format!(
-                "syntax error: expected FROM or IN in FETCH, found {:?}",
-                self.peek()
-            )));
-        }
+        let _ = self.eat_keyword("from") || self.eat_keyword("in");
         let name = self.expect_ident()?;
         Ok(Stmt::Fetch { name, dir })
     }
 
     fn parse_move(&mut self) -> Result<Stmt, SqlError> {
-        // MOVE [ direction ] { FROM | IN } name
+        // MOVE [ direction [ FROM | IN ] ] name — FROM/IN optional (PG19).
         let dir = self.parse_fetch_dir()?;
-        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
-            return Err(err(format!(
-                "syntax error: expected FROM or IN in MOVE, found {:?}",
-                self.peek()
-            )));
-        }
+        let _ = self.eat_keyword("from") || self.eat_keyword("in");
         let name = self.expect_ident()?;
         Ok(Stmt::Move { name, dir })
     }
