@@ -4860,6 +4860,39 @@ pub struct ShellType {
     pub domain: Option<DomainDef>,
 }
 
+/// v0.86: a user-defined function definition. `arg_types` / `ret_type`
+/// are stored as written and resolved at call time (so a type created
+/// after the function still resolves). `body` is the raw body string;
+/// `parsed` is the body parsed once at CREATE time (re-parsed from
+/// `body` after WAL replay / checkpoint restore).
+#[derive(Clone, Debug)]
+pub struct FuncDef {
+    pub name: String,
+    pub arg_names: Vec<Option<String>>,
+    pub arg_types: Vec<String>,
+    pub ret_type: String,
+    pub returns_set: bool,
+    pub lang: crate::sql::FuncLang,
+    pub body: String,
+    pub parsed: Option<crate::sql::Stmt>,
+    pub volatility: crate::sql::FuncVolatility,
+    pub strict: bool,
+}
+
+/// v0.86: a user-defined operator definition: `name` (e.g. `=`, `?=`)
+/// mapping to `procedure` for `(leftarg, rightarg)`.
+#[derive(Clone, Debug)]
+pub struct OperDef {
+    pub name: String,
+    pub procedure: String,
+    pub leftarg: Option<String>,
+    pub rightarg: Option<String>,
+    pub commutator: Option<String>,
+    pub negator: Option<String>,
+    pub hashes: bool,
+    pub merges: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     /// Keyed by table name — a short, trusted identifier (whoever is
@@ -4895,6 +4928,16 @@ pub struct Database {
     /// they vanished on restart.) Types carry no xid, so a checkpoint
     /// may snapshot an uncommitted CREATE TYPE — a known minor gap.
     pub types: HashMap<String, ShellType, FxBuildHasher>,
+    /// v0.86: functions by name. A name maps to one definition —
+    /// overloads (same name, different arity) are rejected at CREATE
+    /// time (42723), so the key is the bare name. DDL is
+    /// transactional via WriteOp undo; committed definitions are
+    /// WAL-logged and checkpointed.
+    pub functions: HashMap<String, FuncDef, FxBuildHasher>,
+    /// v0.86: operators by name; each name maps to the (usually
+    /// single) definitions for its arities. Transactional, WAL-logged
+    /// and checkpointed like functions.
+    pub operators: HashMap<String, Vec<OperDef>, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
     pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
@@ -5035,6 +5078,9 @@ impl Database {
             temp_tables: HashMap::default(),
             // v0.22: bounded shell-type registry.
             types: HashMap::default(),
+            // v0.86: user-defined functions and operators.
+            functions: HashMap::default(),
+            operators: HashMap::default(),
             // v0.37: table OIDs for pg_class.
             next_oid: toast_consts::FIRST_USER_OID,
         };
@@ -6368,6 +6414,27 @@ pub enum WriteOp {
         name: String,
         prev: Option<ShellType>,
     },
+    // --- v0.86: CREATE/DROP FUNCTION and CREATE/DROP OPERATOR.
+    // Functions/operators live in `Database::functions` /
+    // `Database::operators` (not the versioned catalog); the op
+    // carries the previous entry so undo restores it exactly.
+    // Committed DDL is WAL-logged and checkpointed.
+    CreateFunction {
+        name: String,
+        prev: Option<FuncDef>,
+    },
+    DropFunction {
+        name: String,
+        prev: Option<FuncDef>,
+    },
+    CreateOperator {
+        name: String,
+        prev: Vec<OperDef>,
+    },
+    DropOperator {
+        name: String,
+        prev: Vec<OperDef>,
+    },
     // --- v0.8: index DDL. DropIndex carries the whole index so undo can
     // restore the definition and its entries exactly.
     CreateIndex {
@@ -6558,6 +6625,24 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 eng.db.types.remove(name);
             }
         },
+        // --- v0.86: function/operator DDL undos. Restore the previous
+        // entry, or remove the name when there was none.
+        WriteOp::CreateFunction { name, prev } | WriteOp::DropFunction { name, prev } => match prev
+        {
+            Some(f) => {
+                eng.db.functions.insert(name.clone(), f.clone());
+            }
+            None => {
+                eng.db.functions.remove(name);
+            }
+        },
+        WriteOp::CreateOperator { name, prev } | WriteOp::DropOperator { name, prev } => {
+            if prev.is_empty() {
+                eng.db.operators.remove(name);
+            } else {
+                eng.db.operators.insert(name.clone(), prev.clone());
+            }
+        }
         WriteOp::CreateIndex { name } => {
             // Undo a CREATE INDEX: drop the definition (and its entries)
             // iff it is still ours — a concurrent DROP INDEX of the same

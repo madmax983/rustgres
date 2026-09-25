@@ -135,6 +135,12 @@ enum Token {
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
     Caret,         // v0.7: `^` exponentiation
     StarEq,        // v0.81: `*=` PG19 record-image equality (record_image_eq)
+    /// v0.86: user-defined operator name starting with `?` (e.g. `?=`).
+    /// Only `?`-led sequences lex here; every other operator character
+    /// already has its own token. Used in `CREATE OPERATOR`'s name
+    /// position; the expression parser rejects it (42601) since custom
+    /// operators are not overloadable into expressions.
+    Op(String),
     EOF,
 }
 
@@ -793,6 +799,24 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                     raw.to_lowercase()
                 };
                 toks.push(Token::Ident(word));
+            }
+            // v0.86: `?`-led operator names (e.g. `?=` in
+            // `CREATE OPERATOR ?=`). `?` previously errored, so no
+            // working statement can contain one; lex `?` plus any
+            // following operator characters as a single Op token.
+            '?' => {
+                let start = i;
+                i += 1;
+                while i < chars.len()
+                    && matches!(
+                        chars[i],
+                        '=' | '?' | '!' | '~' | '@' | '#' | '%' | '^' | '&' | '|'
+                    )
+                {
+                    i += 1;
+                }
+                let op: String = chars[start..i].iter().collect();
+                toks.push(Token::Op(op));
             }
             _ => return Err(err(format!("unexpected character '{}'", c))),
         }
@@ -2394,6 +2418,32 @@ pub enum FetchDir {
     Last,
 }
 
+/// v0.86: a single `CREATE FUNCTION` argument: the optional argument
+/// name and the declared type name as written.
+#[derive(Clone, Debug)]
+pub struct FuncArg {
+    pub name: Option<String>,
+    pub type_name: String,
+}
+
+/// v0.86: function languages we can execute. Anything else (plpgsql,
+/// C, ...) is rejected at parse time with 42601.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuncLang {
+    Sql,
+    Internal,
+}
+
+/// v0.86: `VOLATILE` / `STABLE` / `IMMUTABLE` markers. Stored for
+/// catalog fidelity; the executor does not yet reorder or cache on
+/// volatility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuncVolatility {
+    Volatile,
+    Stable,
+    Immutable,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -2483,6 +2533,51 @@ pub enum Stmt {
     DropDomain {
         names: Vec<String>,
         if_exists: bool,
+    },
+    // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
+    // functions. Only `LANGUAGE sql` and `LANGUAGE internal` are
+    // supported; any other language (plpgsql, C, ...) is rejected at
+    // parse time with 42601. `args` carries the optional argument
+    // names (for named references like `t.col` in the body) and the
+    // declared type names. `body` is the raw function-body string;
+    // the executor parses it once at CREATE time. `or_replace`
+    // implements CREATE OR REPLACE (42723 without it on duplicates).
+    CreateFunction {
+        name: String,
+        args: Vec<FuncArg>,
+        ret_type: String,
+        returns_set: bool,
+        lang: FuncLang,
+        body: String,
+        or_replace: bool,
+        volatility: FuncVolatility,
+        strict: bool,
+    },
+    DropFunction {
+        name: String,
+        arg_types: Vec<String>,
+        if_exists: bool,
+    },
+    /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
+    DropOperator {
+        name: String,
+        leftarg: Option<String>,
+        rightarg: Option<String>,
+        if_exists: bool,
+    },
+    // --- v0.86: CREATE OPERATOR (bounded): registers a user-defined
+    // operator name mapping to a function (`PROCEDURE`). Only the
+    // equality use in `[NOT] IN` subqueries is wired to user operators;
+    // general expression use stays 42601.
+    CreateOperator {
+        name: String,
+        procedure: String,
+        leftarg: Option<String>,
+        rightarg: Option<String>,
+        commutator: Option<String>,
+        negator: Option<String>,
+        hashes: bool,
+        merges: bool,
     },
     // --- v0.11: roles and privileges ---
     CreateRole {
@@ -3925,6 +4020,29 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_create_role();
         }
+        // v0.86: CREATE [OR REPLACE] FUNCTION and CREATE OPERATOR.
+        // OR REPLACE is consumed here (parse_create_function expects
+        // to start at FUNCTION).
+        if matches!(self.peek(), Token::Ident(s) if s == "or") {
+            // Peek past `or` for `replace` without consuming on mismatch.
+            let is_or_replace = matches!(self.peek2(), Token::Ident(s) if s == "replace");
+            if is_or_replace {
+                self.next(); // 'or'
+                self.next(); // 'replace'
+                if matches!(self.peek(), Token::Ident(s) if s == "function") {
+                    return self.parse_create_function(true);
+                }
+                return Err(err(
+                    "syntax error: OR REPLACE is only supported for CREATE FUNCTION".to_string(),
+                ));
+            }
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "function") {
+            return self.parse_create_function(false);
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "operator") {
+            return self.parse_create_operator();
+        }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
         if self.eat_keyword("index") {
@@ -5118,6 +5236,333 @@ impl Parser {
             like_base,
             composite: None,
         })
+    }
+
+    /// v0.86: `CREATE [OR REPLACE] FUNCTION name ([argname] type
+    /// [, ...]) RETURNS [SETOF] type [LANGUAGE lang] [IMMUTABLE |
+    /// STABLE | VOLATILE] [STRICT] AS 'body'` — PG19 CreateFunctionStmt,
+    /// bounded to `LANGUAGE sql` and `LANGUAGE internal`. Any other
+    /// language is rejected here with 42601 (honest unsupported).
+    /// Argument types are stored as written and resolved at execution;
+    /// the body string is parsed once at execution time.
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                args.push(self.parse_func_arg()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        self.expect_keyword("returns")?;
+        let returns_set = self.eat_keyword("setof");
+        let ret_type = self.parse_func_type_name()?;
+        let mut lang: Option<FuncLang> = None;
+        let mut body: Option<String> = None;
+        let mut volatility = FuncVolatility::Volatile;
+        let mut strict = false;
+        loop {
+            if self.eat_keyword("language") {
+                let lname = self.expect_ident()?;
+                lang = Some(match lname.as_str() {
+                    "sql" => FuncLang::Sql,
+                    "internal" => FuncLang::Internal,
+                    other => {
+                        return Err(err(format!("language \"{}\" is not supported", other)));
+                    }
+                });
+            } else if self.eat_keyword("immutable") {
+                volatility = FuncVolatility::Immutable;
+            } else if self.eat_keyword("stable") {
+                volatility = FuncVolatility::Stable;
+            } else if self.eat_keyword("volatile") {
+                volatility = FuncVolatility::Volatile;
+            } else if self.eat_keyword("strict") {
+                strict = true;
+            } else if self.eat_keyword("as") {
+                match self.next() {
+                    Token::Str(s) => {
+                        // PG allows several AS items (body, obj file);
+                        // the first is the body (for LANGUAGE internal,
+                        // the C symbol name).
+                        if body.is_none() {
+                            body = Some(s);
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected function body string, found {:?}",
+                            other
+                        )));
+                    }
+                }
+                // A second `AS '...'` (C obj file) is consumed the same
+                // way on the next loop iteration.
+                if self.eat_keyword("as") {
+                    match self.next() {
+                        Token::Str(_) => {}
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected function body string, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        let lang = lang.unwrap_or(FuncLang::Sql);
+        let body = body.ok_or_else(|| err("syntax error: expected AS 'body'".to_string()))?;
+        Ok(Stmt::CreateFunction {
+            name,
+            args,
+            ret_type,
+            returns_set,
+            lang,
+            body,
+            or_replace,
+            volatility,
+            strict,
+        })
+    }
+
+    /// v0.86: one function argument: `[name] type`. A lone identifier
+    /// followed by `,` or `)` is the type; otherwise the first
+    /// identifier is the argument name. (Limitation: multi-word type
+    /// names like `double precision` require an argument name, except
+    /// `double precision` itself which is special-cased.)
+    fn parse_func_arg(&mut self) -> Result<FuncArg, SqlError> {
+        let w1 = self.expect_ident()?;
+        let bare_type = matches!(self.peek(), Token::Comma | Token::RParen)
+            || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"));
+        if bare_type {
+            let type_name = if w1 == "double" {
+                self.next(); // 'precision'
+                "double precision".to_string()
+            } else {
+                w1
+            };
+            Ok(FuncArg {
+                name: None,
+                type_name,
+            })
+        } else {
+            let type_name = self.parse_func_type_name()?;
+            Ok(FuncArg {
+                name: Some(w1),
+                type_name,
+            })
+        }
+    }
+
+    /// v0.86: a type name as written for function signatures: an
+    /// optionally schema-qualified identifier (`pg_catalog.int4`
+    /// keeps `int4`). Array `[]` suffixes are rejected (bounded).
+    fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
+        let mut name = self.expect_ident()?;
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+            self.next(); // '.'
+            name = self.expect_ident()?;
+        }
+        if *self.peek() == Token::LBracket {
+            return Err(err(
+                "array argument/return types are not supported".to_string()
+            ));
+        }
+        Ok(name)
+    }
+
+    /// v0.86: `DROP FUNCTION [IF EXISTS] name ([type [, ...]])`.
+    /// Argument names are accepted and ignored (PG allows them).
+    fn parse_drop_function(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                let arg = self.parse_func_arg()?;
+                arg_types.push(arg.type_name);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        Ok(Stmt::DropFunction {
+            name,
+            arg_types,
+            if_exists,
+        })
+    }
+
+    /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`
+    /// (PG19 DropOpStmt; `NONE` for a missing side).
+    fn parse_drop_operator(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_operator_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let leftarg = self.parse_op_arg_type()?;
+        self.expect(Token::Comma, "','")?;
+        let rightarg = self.parse_op_arg_type()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(Stmt::DropOperator {
+            name,
+            leftarg,
+            rightarg,
+            if_exists,
+        })
+    }
+
+    /// Parse one side of a DROP OPERATOR signature: a type name or NONE.
+    /// Returns the raw type name text (validation happens at execution).
+    fn parse_op_arg_type(&mut self) -> Result<Option<String>, SqlError> {
+        if matches!(self.peek(), Token::Ident(s) if s == "none") {
+            self.next();
+            return Ok(None);
+        }
+        let first = self.expect_ident()?;
+        // Bounded multiword builtins.
+        let name = match first.as_str() {
+            "double" => {
+                self.expect_keyword("precision")?;
+                "double precision".to_string()
+            }
+            "character" => {
+                self.expect_keyword("varying")?;
+                "character varying".to_string()
+            }
+            _ => first,
+        };
+        Ok(Some(name))
+    }
+
+    /// Parse an operator name: `=` or a `?`-led `Token::Op`.
+    fn parse_operator_name(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Eq => Ok("=".to_string()),
+            Token::Op(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected operator name, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// v0.86: `CREATE OPERATOR name (PROCEDURE = func [, LEFTARG =
+    /// type] [, RIGHTARG = type] [, COMMUTATOR = op] [, NEGATOR = op]
+    /// [, HASHES] [, MERGES])` — PG19 DefineOpStmt, bounded: the name
+    /// is `=` or a `?`-led operator; only PROCEDURE/LEFTARG/RIGHTARG
+    /// affect execution (IN-subquery equality), the rest are stored.
+    fn parse_create_operator(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        let name = self.parse_operator_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut procedure: Option<String> = None;
+        let mut leftarg: Option<String> = None;
+        let mut rightarg: Option<String> = None;
+        let mut commutator: Option<String> = None;
+        let mut negator: Option<String> = None;
+        let mut hashes = false;
+        let mut merges = false;
+        loop {
+            if self.eat_keyword("hashes") {
+                hashes = true;
+            } else if self.eat_keyword("merges") {
+                merges = true;
+            } else {
+                let opt = self.expect_ident()?;
+                self.expect(Token::Eq, "'='")?;
+                match opt.as_str() {
+                    "procedure" => procedure = Some(self.expect_ident()?),
+                    "leftarg" => leftarg = Some(self.parse_func_type_name()?),
+                    "rightarg" => rightarg = Some(self.parse_func_type_name()?),
+                    "commutator" => commutator = Some(self.parse_oper_name()?),
+                    "negator" => negator = Some(self.parse_oper_name()?),
+                    // v0.86: RESTRICT / JOIN selectivity estimators are
+                    // parsed and ignored (bounded: no planner use).
+                    "restrict" | "join" => {
+                        let _ = self.expect_ident()?;
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: unknown operator option \"{}\"",
+                            other
+                        )));
+                    }
+                }
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        let procedure =
+            procedure.ok_or_else(|| err("syntax error: expected PROCEDURE".to_string()))?;
+        Ok(Stmt::CreateOperator {
+            name,
+            procedure,
+            leftarg,
+            rightarg,
+            commutator,
+            negator,
+            hashes,
+            merges,
+        })
+    }
+
+    /// v0.86: an operator name inside CREATE OPERATOR options
+    /// (`=` or a `?`-led name).
+    fn parse_oper_name(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Eq => Ok("=".to_string()),
+            Token::Op(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected operator name, found {:?}",
+                other
+            ))),
+        }
     }
 
     /// v0.85: `CREATE DOMAIN name AS type [CONSTRAINT cname] CHECK
@@ -9493,6 +9938,16 @@ impl Parser {
             }
             self.parse_cascade_opt()?;
             return Ok(Stmt::DropDomain { names, if_exists });
+        }
+        // v0.86: DROP FUNCTION [IF EXISTS] name ([type [, ...]]).
+        // Argument names are accepted and ignored (PG allows them).
+        if matches!(self.peek(), Token::Ident(s) if s == "function") {
+            return self.parse_drop_function();
+        }
+        // v0.86: DROP OPERATOR [IF EXISTS] name (lefttype, righttype)
+        // (PG19; use NONE for a missing side).
+        if matches!(self.peek(), Token::Ident(s) if s == "operator") {
+            return self.parse_drop_operator();
         }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {

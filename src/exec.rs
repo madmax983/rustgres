@@ -397,6 +397,69 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             default.as_ref(),
         ),
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
+        // --- v0.86: user-defined functions and operators ---
+        Stmt::CreateFunction {
+            name,
+            args,
+            ret_type,
+            returns_set,
+            lang,
+            body,
+            or_replace,
+            volatility,
+            strict,
+        } => exec_create_function(
+            eng,
+            ctx,
+            name,
+            args,
+            ret_type,
+            *returns_set,
+            *lang,
+            body,
+            *or_replace,
+            *volatility,
+            *strict,
+        ),
+        Stmt::DropFunction {
+            name,
+            arg_types,
+            if_exists,
+        } => exec_drop_function(eng, ctx, name, arg_types, *if_exists),
+        Stmt::DropOperator {
+            name,
+            leftarg,
+            rightarg,
+            if_exists,
+        } => exec_drop_operator(
+            eng,
+            ctx,
+            name,
+            leftarg.as_deref(),
+            rightarg.as_deref(),
+            *if_exists,
+        ),
+        Stmt::CreateOperator {
+            name,
+            procedure,
+            leftarg,
+            rightarg,
+            commutator,
+            negator,
+            hashes,
+            merges,
+        } => exec_create_operator(
+            eng,
+            ctx,
+            name,
+            procedure,
+            leftarg.as_deref(),
+            rightarg.as_deref(),
+            commutator.as_deref(),
+            negator.as_deref(),
+            *hashes,
+            *merges,
+        ),
         // --- v0.11: roles and privileges ---
         Stmt::CreateRole {
             name,
@@ -14429,6 +14492,18 @@ fn eval_function_item(
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);
     }
+    // v0.86: user-defined functions in FROM (scalar composite-returning
+    // functions expand to their fields; SETOF returns rows).
+    if let Some(fdef) = q.eng.db.functions.get(name).cloned() {
+        if fdef.arg_types.len() != arg_vals.len() {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
+        }
+        let (col_names, col_types, rows) = call_table_function(q, scopes, &fdef, &arg_vals)?;
+        return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
+    }
     let (col_names, row_vals) = eval_table_function(name, &arg_vals)?;
     // v0.46: PG's real output types (generate_series is int4/int8/
     // numeric, so the wire RowDescription carries the right OIDs and
@@ -14484,6 +14559,27 @@ fn eval_function_item(
     Ok((schema, rows))
 }
 
+/// v0.86: finish a user-defined function FROM item: build the output
+/// schema (PG 19 column-alias arity rules) and wrap the rows.
+fn finish_function_item(
+    name: &str,
+    alias: &Option<String>,
+    col_aliases: &[String],
+    col_names: &[String],
+    col_types: &[ColType],
+    rows: Vec<Row>,
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    let schema = function_item_schema(name, col_names, col_types, alias, col_aliases)?;
+    let rows = rows
+        .into_iter()
+        .map(|cells| QRow {
+            cells,
+            prov: Vec::new(),
+        })
+        .collect();
+    Ok((schema, rows))
+}
+
 /// v0.46: true when a function FROM item's argument expressions reference
 /// columns of the FROM items already accumulated to its left. PG treats
 /// `FROM t, f(t.x)` as implicit LATERAL; such functions are re-evaluated
@@ -14520,6 +14616,25 @@ fn lateral_function_schema(
     col_aliases: &[String],
     left: &[QCol],
 ) -> Result<Vec<QCol>, ExecError> {
+    // v0.86: user-defined functions in FROM (Describe path). A scalar
+    // function returning a table rowtype expands to the table's columns.
+    if let Some(fdef) = eng.db.functions.get(name) {
+        if fdef.arg_types.len() == args.len() {
+            if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, own, session) {
+                let mut cols = Vec::with_capacity(t.columns.len());
+                for (idx, (cn, ct)) in t.columns.iter().enumerate() {
+                    cols.push(QCol {
+                        qual: alias.clone().unwrap_or_else(|| name.to_string()),
+                        name: cn.clone(),
+                        ty: ct.clone(),
+                        hidden: false,
+                        src_ord: idx as u32,
+                    });
+                }
+                return Ok(cols);
+            }
+        }
+    }
     let out_names = table_function_col_names(name)?;
     let col_types: Vec<ColType> = if name == "generate_series" {
         let schemas = [left];
@@ -19818,6 +19933,104 @@ fn eval_hashed_in(
     Ok(Some(probe_hashed_in(&cached, v, neg)?))
 }
 
+/// v0.86: user-defined `=` operator lookup for IN-subquery comparison.
+/// Returns the (operator, function) pair when a user-defined `=`
+/// matches the (outer, inner) type pair by canonical type name.
+fn find_user_equality_op(
+    eng: &Engine,
+    outer_ty: &str,
+    inner_ty: &str,
+) -> Option<(crate::storage::OperDef, crate::storage::FuncDef)> {
+    let defs = eng.db.operators.get("=")?;
+    for op in defs {
+        let l = op.leftarg.as_deref().unwrap_or("");
+        let r = op.rightarg.as_deref().unwrap_or("");
+        if canon_func_type_name(l) == canon_func_type_name(outer_ty)
+            && canon_func_type_name(r) == canon_func_type_name(inner_ty)
+        {
+            let f = eng.db.functions.get(&op.procedure)?.clone();
+            return Some((op.clone(), f));
+        }
+    }
+    None
+}
+
+/// v0.86: canonical type name of a runtime value, for operator lookup.
+fn value_op_type_name(v: &Value) -> Option<&'static str> {
+    Some(match v {
+        Value::SmallInt(_) => "smallint",
+        Value::Int(_) => "integer",
+        Value::BigInt(_) => "bigint",
+        Value::Float4(_) => "real",
+        Value::Float(_) => "double precision",
+        Value::Numeric(_) => "numeric",
+        Value::Text(_) | Value::BpChar(_) => "text",
+        Value::Bool(_) => "boolean",
+        Value::Date(_) => "date",
+        Value::Timestamp(_) => "timestamp",
+        Value::Timestamptz(_) => "timestamptz",
+        Value::Bytea(_) => "bytea",
+        Value::Uuid(_) => "uuid",
+        _ => return None,
+    })
+}
+
+/// v0.86: canonical type name of a column type, for operator lookup.
+fn coltype_op_name(ct: &ColType) -> String {
+    match ct {
+        ColType::SmallInt => "smallint".to_string(),
+        ColType::Int => "integer".to_string(),
+        ColType::BigInt => "bigint".to_string(),
+        ColType::Float4 => "real".to_string(),
+        ColType::Float => "double precision".to_string(),
+        ColType::Numeric(_) => "numeric".to_string(),
+        ColType::Text | ColType::Varchar(_) | ColType::Char(_) => "text".to_string(),
+        ColType::Bool => "boolean".to_string(),
+        ColType::Date => "date".to_string(),
+        ColType::Timestamp => "timestamp".to_string(),
+        ColType::Timestamptz => "timestamptz".to_string(),
+        ColType::Bytea => "bytea".to_string(),
+        ColType::Uuid => "uuid".to_string(),
+        _ => format!("{:?}", ct).to_lowercase(),
+    }
+}
+
+/// v0.86: probe one IN pair through a user-defined `=` operator.
+/// Returns None for NULL (unknown), honoring STRICT.
+fn probe_user_eq(
+    q: &mut Q,
+    scopes: &[Scope],
+    op: &crate::storage::OperDef,
+    fdef: &crate::storage::FuncDef,
+    outer: &Value,
+    inner: &Value,
+) -> Result<Option<bool>, ExecError> {
+    if outer == &Value::Null || inner == &Value::Null {
+        // PG: a STRICT operator/function yields NULL on NULL input;
+        // a non-strict one still runs — but SQL function bodies with
+        // NULL args produce NULL here in every corpus case, and the
+        // generic path below handles it. Take the strict shortcut.
+        if fdef.strict {
+            return Ok(None);
+        }
+    }
+    let r = call_user_function(q, scopes, fdef, &[outer.clone(), inner.clone()])?;
+    Ok(match r {
+        Value::Bool(b) => Some(b),
+        Value::Null => None,
+        other => {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "operator {} must return boolean, got {}",
+                    op.name,
+                    other.type_name()
+                ),
+            ));
+        }
+    })
+}
+
 fn eval_in(
     q: &mut Q,
     scopes: &[Scope],
@@ -19826,10 +20039,14 @@ fn eval_in(
     neg: bool,
 ) -> Result<Value, ExecError> {
     let v = eval_expr(q, scopes, e)?;
-    // v0.80: uncorrelated IN-subquery cache — run the subquery once per
-    // statement instead of once per row.
-    if let Some(r) = eval_hashed_in(q, scopes, &v, sub, neg)? {
-        return Ok(r);
+    // v0.86: a user-defined `=` operator disables the hashed IN path
+    // (builtin hashing can't apply custom equality); the nested loop
+    // below probes through the operator instead.
+    let user_eq_defined = q.eng.db.operators.contains_key("=");
+    if !user_eq_defined {
+        if let Some(r) = eval_hashed_in(q, scopes, &v, sub, neg)? {
+            return Ok(r);
+        }
     }
     let out = {
         let mut sub_q = Q {
@@ -19852,9 +20069,29 @@ fn eval_in(
     if out.columns.len() != 1 {
         return Err(exec_err("42601", "subquery must return only one column"));
     }
+    // v0.86: user-defined `=` operator for this (outer, inner) type
+    // pair (e.g. the conformance corpus's `?=` / int8=text equality).
+    let user_op = match (
+        value_op_type_name(&v),
+        out.columns.first().map(|(_, t)| coltype_op_name(t)),
+    ) {
+        (Some(o), Some(i)) => find_user_equality_op(q.eng, o, &i).map(|(op, f)| (op, f)),
+        _ => None,
+    };
     let mut saw_null = false;
     let mut found = false;
     for row in &out.rows {
+        if let Some((op, fdef)) = &user_op {
+            match probe_user_eq(q, scopes, op, fdef, &v, &row[0])? {
+                Some(true) => {
+                    found = true;
+                    break;
+                }
+                Some(false) => {}
+                None => saw_null = true,
+            }
+            continue;
+        }
         match cmp_ordering(&v, &row[0], CmpOp::Eq)? {
             Some(Ordering::Equal) => {
                 found = true;
@@ -22377,16 +22614,31 @@ fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError>
 /// `name` against the type catalog (42704 if unknown, 42846 if not a
 /// composite).
 fn eval_cast_composite_inner(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
-    let st = q
-        .eng
-        .db
-        .types
-        .get(name)
-        .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", name)))?;
-    let fields = st
-        .composite
-        .as_ref()
-        .ok_or_else(|| exec_err("42846", format!("cannot cast type record to {}", name)))?;
+    // v0.86: every table has a rowtype (PG19) — resolve table names to
+    // their columns when the name isn't a catalog composite type.
+    let table_fields: Vec<(String, ColType, Option<String>)>;
+    let fields: &[(String, ColType, Option<String>)] = match q.eng.db.types.get(name) {
+        Some(st) => st
+            .composite
+            .as_ref()
+            .ok_or_else(|| exec_err("42846", format!("cannot cast type record to {}", name)))?,
+        None => match q.eng.db.find_table(name, q.snap, q.own, q.session) {
+            Some(t) => {
+                table_fields = t
+                    .columns
+                    .iter()
+                    .map(|(n, c)| (n.clone(), c.clone(), None))
+                    .collect();
+                &table_fields
+            }
+            None => {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", name),
+                ));
+            }
+        },
+    };
     let src = match v {
         Value::Record(fields) => fields,
         // v0.82: composite text input `'(f1,f2,...)'::mytype` — PG19
@@ -23085,6 +23337,244 @@ fn normalize_func_arg(name: &str, v: Value) -> Value {
     }
 }
 
+/// v0.86: user-defined function call machinery (CREATE FUNCTION).
+///
+/// SQL-language bodies are parsed once at CREATE (stored in
+/// `FuncDef.parsed` with named argument references rewritten to `$n`);
+/// each call coerces the arguments to the declared types, binds them
+/// via the existing `subst_params`, runs the body as a SELECT, and
+/// coerces the result to the declared return type. STRICT functions
+/// return NULL without running the body when any argument is NULL
+/// (PG19). Internal-language functions dispatch to a small table of
+/// C-symbol equivalents (bounded: only symbols the engine implements).
+
+/// v0.86: coerce one call argument to the function's declared type.
+fn coerce_func_arg(q: &mut Q, v: &Value, type_name: &str) -> Result<Value, ExecError> {
+    if v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    coerce_to_type_name(q, v, type_name)
+}
+
+/// v0.86: coerce a value to a declared type name (builtin or named).
+/// Builtin names go through `coltype_by_name` + `eval_cast`; named
+/// composites/domains use `eval_cast_named`.
+fn coerce_to_type_name(q: &mut Q, v: &Value, type_name: &str) -> Result<Value, ExecError> {
+    if let Ok(ct) = crate::sql::coltype_by_name(type_name) {
+        return eval_cast(v, ct);
+    }
+    eval_cast_named(q, v, type_name)
+}
+
+/// v0.86: run a SQL-language function body with bound arguments.
+/// Returns the raw SELECT output (columns, rows).
+fn run_func_body(
+    q: &mut Q,
+    scopes: &[Scope],
+    fdef: &crate::storage::FuncDef,
+    args: &[Value],
+) -> Result<SelectOut, ExecError> {
+    // Arity is checked by the caller; coerce each argument to the
+    // declared type (PG19 function call coercion, assignment cast).
+    let mut coerced = Vec::with_capacity(args.len());
+    for (v, t) in args.iter().zip(fdef.arg_types.iter()) {
+        coerced.push(coerce_func_arg(q, v, t)?);
+    }
+    if fdef.strict && coerced.iter().any(|v| v == &Value::Null) {
+        // PG19: a STRICT function is not called on NULL input; the
+        // scalar result is NULL. (For set-returning STRICT functions PG
+        // returns zero rows; the scalar path below handles NULL.)
+        return Ok(SelectOut {
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+    let body = fdef.parsed.as_ref().ok_or_else(|| {
+        exec_err(
+            "0A000",
+            format!("function \"{}\" has no parsed body", fdef.name),
+        )
+    })?;
+    let Stmt::Select(sel) = body else {
+        return Err(exec_err(
+            "0A000",
+            format!("function \"{}\" body is not a SELECT", fdef.name),
+        ));
+    };
+    let params: Vec<Option<Value>> = coerced.into_iter().map(Some).collect();
+    let mut stmt = Stmt::Select(sel.clone());
+    subst_params(&mut stmt, &params)?;
+    let Stmt::Select(bound) = stmt else {
+        return Err(exec_err(
+            "XX000",
+            "function body lost its SELECT".to_string(),
+        ));
+    };
+    // Run the body one query level deeper (fresh CTE scope, like a
+    // subquery); the caller's scopes stay visible for outer refs.
+    let mut call_q = Q {
+        eng: &mut *q.eng,
+        snap: q.snap,
+        own: q.own,
+        session: q.session,
+        role: q.role,
+        read_only: q.read_only,
+        depth: q.depth + 1,
+        lock_ids: &mut *q.lock_ids,
+        ctes: q.ctes.clone(),
+        wctx: None,
+        priv_scopes: q.priv_scopes.clone(),
+        hashed_exists: q.hashed_exists.clone(),
+        hashed_in: q.hashed_in.clone(),
+    };
+    run_select(&mut call_q, &bound, scopes)
+}
+
+/// v0.86: scalar call of a user function. SQL bodies run via
+/// `run_func_body` (exactly one row, one column expected);
+/// internal bodies dispatch to `eval_internal_function`.
+fn call_user_function(
+    q: &mut Q,
+    scopes: &[Scope],
+    fdef: &crate::storage::FuncDef,
+    args: &[Value],
+) -> Result<Value, ExecError> {
+    if fdef.lang == crate::sql::FuncLang::Internal {
+        return eval_internal_function(&fdef.body, args);
+    }
+    if fdef.returns_set {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "set-returning function \"{}\" used in scalar context",
+                fdef.name
+            ),
+        ));
+    }
+    let out = run_func_body(q, scopes, fdef, args)?;
+    if out.rows.is_empty() && out.columns.is_empty() {
+        // STRICT-on-NULL short-circuit from run_func_body.
+        return Ok(Value::Null);
+    }
+    if out.rows.len() != 1 || out.columns.len() != 1 {
+        return Err(exec_err(
+            "42601",
+            format!(
+                "function \"{}\" must return exactly one row and one column in scalar context",
+                fdef.name
+            ),
+        ));
+    }
+    // Coerce the body result to the declared return type (PG19 casts
+    // the SELECT output to the function's return type).
+    coerce_to_type_name(q, &out.rows[0][0], &fdef.ret_type)
+}
+
+/// v0.86: table-function call (FROM f(...)). Returns
+/// (column names, column types, rows). A scalar function returning a
+/// composite/table rowtype expands to its fields (PG19); a
+/// set-returning function returns its rows directly.
+fn call_table_function(
+    q: &mut Q,
+    scopes: &[Scope],
+    fdef: &crate::storage::FuncDef,
+    args: &[Value],
+) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>), ExecError> {
+    if fdef.lang == crate::sql::FuncLang::Internal {
+        return Err(exec_err(
+            "0A000",
+            format!("internal function \"{}\" cannot be used in FROM", fdef.name),
+        ));
+    }
+    let out = run_func_body(q, scopes, fdef, args)?;
+    if out.rows.is_empty() && out.columns.is_empty() {
+        // STRICT-on-NULL: zero rows.
+        return Ok((vec![], vec![], vec![]));
+    }
+    if !fdef.returns_set {
+        // Scalar function in FROM: PG19 expands a composite result into
+        // columns; a non-composite scalar becomes one column.
+        if out.rows.len() != 1 || out.columns.len() != 1 {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "function \"{}\" must return exactly one row in FROM",
+                    fdef.name
+                ),
+            ));
+        }
+        let cell = coerce_to_type_name(q, &out.rows[0][0], &fdef.ret_type)?;
+        if let Value::Record(fields) = cell {
+            let (names, types) = func_rowtype_fields(q, &fdef.ret_type)?;
+            let mut row = Vec::with_capacity(fields.len());
+            for (_, fval) in &fields {
+                row.push(fval.clone());
+            }
+            return Ok((names, types, vec![Row::new(row)]));
+        }
+        let colname = out.columns[0].0.clone();
+        let coltype = out.columns[0].1.clone();
+        return Ok((vec![colname], vec![coltype], out.rows));
+    }
+    // SETOF: rows as produced; column names from the SELECT output.
+    let names: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
+    Ok((names, types, out.rows))
+}
+
+/// v0.86: resolve a composite/table rowtype name to its
+/// (field name, field type) list — table columns for table names,
+/// declared fields for CREATE TYPE composites.
+fn func_rowtype_fields(
+    q: &mut Q,
+    type_name: &str,
+) -> Result<(Vec<String>, Vec<ColType>), ExecError> {
+    if let Some(t) = q.eng.db.find_table(type_name, q.snap, q.own, q.session) {
+        let names = t.columns.iter().map(|(n, _)| n.clone()).collect();
+        let types = t.columns.iter().map(|(_, c)| c.clone()).collect();
+        return Ok((names, types));
+    }
+    if let Some(st) = q.eng.db.types.get(type_name) {
+        if let Some(fields) = &st.composite {
+            let names = fields.iter().map(|(n, _, _)| n.clone()).collect();
+            let types = fields.iter().map(|(_, c, _)| c.clone()).collect();
+            return Ok((names, types));
+        }
+    }
+    Err(exec_err(
+        "42704",
+        format!("type \"{}\" does not exist", type_name),
+    ))
+}
+
+/// v0.86: internal-language function dispatch. Only a bounded set of C
+/// symbols is implemented (the ones the conformance corpus needs);
+/// anything else is an honest 0A000.
+fn eval_internal_function(symbol: &str, args: &[Value]) -> Result<Value, ExecError> {
+    match symbol {
+        // int4eq(int4, int4) -> bool (PG19 internal equality).
+        "int4eq" => {
+            if args.len() != 2 {
+                return Err(exec_err(
+                    "42883",
+                    format!("function int4eq expects 2 arguments, got {}", args.len()),
+                ));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => {
+                    let ord = cmp_ordering(a, b, CmpOp::Eq)?;
+                    Ok(Value::Bool(ord == Some(Ordering::Equal)))
+                }
+            }
+        }
+        _ => Err(exec_err(
+            "0A000",
+            format!("internal function symbol \"{}\" is not implemented", symbol),
+        )),
+    }
+}
+
 fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
     // v0.80: `GROUPING(...)` is only meaningful at group level (handled
     // by `eval_grouped`). Reaching scalar evaluation means it sits in a
@@ -23127,6 +23617,19 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         }
         check_builtin_arity(name, &vals)?;
         return eval_pg_relation_size(q, &vals);
+    }
+    // v0.86: user-defined functions. A definition matching by name and
+    // arity takes the call (raw argument values; the call coerces to
+    // the declared types). Builtins keep precedence for names with no
+    // user definition.
+    if let Some(fdef) = q.eng.db.functions.get(name).cloned() {
+        if fdef.arg_types.len() == args.len() {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_expr(q, scopes, a)?);
+            }
+            return call_user_function(q, scopes, &fdef, &vals);
+        }
     }
     let mut vals = Vec::with_capacity(args.len());
     for a in args {
@@ -28793,10 +29296,25 @@ fn func_result_type(
             }
             Ok(ty)
         }
-        _ => Err(exec_err(
-            "42883",
-            format!("function {}() does not exist", name),
-        )),
+        // v0.86: user-defined functions resolve their declared return
+        // type here (Describe runs before eval_func).
+        _ => {
+            if let Some(fdef) = eng.db.functions.get(name) {
+                if fdef.arg_types.len() == args.len() {
+                    // Builtin type name -> ColType; table name -> Composite.
+                    if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+                        return Ok(ct);
+                    }
+                    if eng.db.tables.contains_key(&fdef.ret_type) {
+                        return Ok(ColType::Composite);
+                    }
+                }
+            }
+            Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ))
+        }
     }
 }
 
@@ -29708,10 +30226,17 @@ fn expr_type(
                         format!("type \"{}\" does not exist", name),
                     )),
                 },
-                _ => Err(exec_err(
-                    "42704",
-                    format!("type \"{}\" does not exist", name),
-                )),
+                _ => {
+                    // v0.86: table rowtypes (PG19: every table has a
+                    // composite rowtype).
+                    if eng.db.find_table(name, snap, own, session).is_some() {
+                        return Ok(ColType::Composite);
+                    }
+                    Err(exec_err(
+                        "42704",
+                        format!("type \"{}\" does not exist", name),
+                    ))
+                }
             }
         }
         // v0.81: `(expr).field` — on a `ROW(...)` literal the field
@@ -31470,6 +31995,15 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             subst_expr(right, params)?;
         }
         Expr::Cast { expr, .. } => subst_expr(expr, params)?,
+        // v0.86: named casts (e.g. `row($1,$2)::int8_tbl` in function bodies).
+        Expr::CastNamed { expr, .. } => subst_expr(expr, params)?,
+        // v0.86: parameters inside ROW(...) constructors (function
+        // bodies like `select row($1,$2)::t`).
+        Expr::Row(elems) => {
+            for e in elems {
+                subst_expr(e, params)?;
+            }
+        }
         Expr::Func { args, .. } => {
             for a in args {
                 subst_expr(a, params)?;
@@ -36572,6 +37106,370 @@ fn exec_drop_domain(
     Ok(ExecResult::Command {
         tag: "DROP DOMAIN".to_string(),
     })
+}
+
+/// v0.86: user-defined functions and operators (CREATE FUNCTION /
+/// DROP FUNCTION / CREATE OPERATOR), plus the call paths. SQL-language
+/// bodies are parsed once at CREATE time; named argument references
+/// (`t.col` / `t` where `t` is an argument name) are rewritten to
+/// positional `$n` parameters at CREATE time, then bound per call via
+/// the existing `subst_params` machinery.
+
+/// v0.86: canonicalize a type name for function/operator signature
+/// matching: builtin aliases fold together (`int8`/`bigint`,
+/// `int4`/`int`/`integer`, `bool`/`boolean`, ...); anything else
+/// (named composites, domains, table rowtypes) compares by name.
+fn canon_func_type_name(name: &str) -> &str {
+    match name {
+        "int8" | "bigint" => "bigint",
+        "int4" | "int" | "integer" => "integer",
+        "int2" | "smallint" => "smallint",
+        "bool" | "boolean" => "boolean",
+        "float8" | "double precision" => "double precision",
+        "float4" | "real" => "real",
+        "varchar" | "character varying" => "varchar",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamptz" | "timestamp with time zone" => "timestamptz",
+        _ => name,
+    }
+}
+
+/// v0.86: resolve a function signature type name against builtins, the
+/// named-type catalog, and table rowtypes (every table has a rowtype,
+/// like PG19). Returns the ColType; named composites/domains/tables
+/// resolve to `ColType::Composite` (the name itself disambiguates).
+fn resolve_func_type_name(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+) -> Result<ColType, ExecError> {
+    if let Ok(ct) = crate::sql::coltype_by_name(name) {
+        return Ok(ct);
+    }
+    if let Some(st) = eng.db.types.get(name) {
+        if st.composite.is_some() {
+            return Ok(ColType::Composite);
+        }
+        if let Some(dom) = &st.domain {
+            return Ok(dom.base.clone());
+        }
+        // Shell/LIKE types: LIKE-completed aliases resolve to their base.
+        if let Some(base) = &st.like_base {
+            if let Ok(ct) = crate::sql::coltype_by_name(base) {
+                return Ok(ct);
+            }
+        }
+        return Err(exec_err(
+            "42704",
+            format!("type \"{}\" does not exist", name),
+        ));
+    }
+    // Table rowtype (PG19: every table has a composite rowtype).
+    if eng.db.find_table(name, snap, own, session).is_some() {
+        return Ok(ColType::Composite);
+    }
+    Err(exec_err(
+        "42704",
+        format!("type \"{}\" does not exist", name),
+    ))
+}
+
+/// v0.86: `CREATE [OR REPLACE] FUNCTION`. Validates the signature
+/// types resolve (42704), parses the SQL body once (42601 on a bad
+/// body), rewrites named argument references to `$n`, and registers
+/// the definition transactionally. Duplicate names are 42723 unless
+/// OR REPLACE was given.
+#[allow(clippy::too_many_arguments)]
+fn exec_create_function(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    args: &[crate::sql::FuncArg],
+    ret_type: &str,
+    returns_set: bool,
+    lang: crate::sql::FuncLang,
+    body: &str,
+    or_replace: bool,
+    volatility: crate::sql::FuncVolatility,
+    strict: bool,
+) -> Result<ExecResult, ExecError> {
+    // PG19: the return type must exist at CREATE time.
+    resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, ret_type)?;
+    for a in args {
+        resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &a.type_name)?;
+    }
+    // Parse the SQL body now so a bad body fails at CREATE (like PG's
+    // parse analysis), not at first call. Internal functions name a C
+    // symbol instead of SQL text.
+    let mut parsed: Option<Stmt> = None;
+    if lang == crate::sql::FuncLang::Sql {
+        let mut stmt = crate::sql::parse_statement(body)
+            .map_err(|e| exec_err("42601", format!("syntax error in function body: {:?}", e)))?;
+        // Only SELECT bodies are supported (bounded: no multi-statement
+        // bodies, no utility statements inside functions).
+        if !matches!(stmt, Stmt::Select(_)) {
+            return Err(exec_err(
+                "0A000",
+                "only SELECT function bodies are supported".to_string(),
+            ));
+        }
+        rewrite_func_arg_refs(
+            &mut stmt,
+            &args.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+        );
+        parsed = Some(stmt);
+    } else if lang == crate::sql::FuncLang::Internal {
+        // v0.86: validate the internal symbol at CREATE (like PG's
+        // fmgr lookup); unknown symbols are 0A000.
+        if !matches!(body, "int4eq") {
+            return Err(exec_err(
+                "0A000",
+                format!("unsupported internal function \"{}\"", body),
+            ));
+        }
+    }
+    let prev = eng.db.functions.get(name).cloned();
+    if prev.is_some() && !or_replace {
+        return Err(exec_err(
+            "42723",
+            format!("function \"{}\" already exists", name),
+        ));
+    }
+    // PG19: OR REPLACE with a different return type is 42P13.
+    if let Some(p) = &prev {
+        if or_replace
+            && (p.arg_types.len() != args.len()
+                || canon_func_type_name(&p.ret_type) != canon_func_type_name(ret_type))
+        {
+            return Err(exec_err(
+                "42P13",
+                format!(
+                    "cannot change return type of existing function \"{}\"",
+                    name
+                ),
+            ));
+        }
+    }
+    let def = crate::storage::FuncDef {
+        name: name.to_string(),
+        arg_names: args.iter().map(|a| a.name.clone()).collect(),
+        arg_types: args.iter().map(|a| a.type_name.clone()).collect(),
+        ret_type: ret_type.to_string(),
+        returns_set,
+        lang,
+        body: body.to_string(),
+        parsed,
+        volatility,
+        strict,
+    };
+    eng.db.functions.insert(name.to_string(), def);
+    // v0.86's CreateFunction WAL path reads the live function map, so
+    // the definition is WAL-logged (and checkpointed) automatically.
+    ctx.writes.push(WriteOp::CreateFunction {
+        name: name.to_string(),
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE FUNCTION".to_string(),
+    })
+}
+
+/// v0.86: `DROP FUNCTION [IF EXISTS] name (types)`. Signature matching
+/// is by arity and canonical type name (42883 on mismatch, like PG's
+/// "function ... does not exist").
+fn exec_drop_function(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    arg_types: &[String],
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    let prev = eng.db.functions.get(name).cloned();
+    let matched = prev.as_ref().is_some_and(|f| {
+        f.arg_types.len() == arg_types.len()
+            && f.arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+    });
+    if !matched {
+        if !if_exists {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
+        }
+        return Ok(ExecResult::Command {
+            tag: "DROP FUNCTION".to_string(),
+        });
+    }
+    eng.db.functions.remove(name);
+    ctx.writes.push(WriteOp::DropFunction {
+        name: name.to_string(),
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "DROP FUNCTION".to_string(),
+    })
+}
+
+/// v0.86: `CREATE OPERATOR`. The procedure must name an existing
+/// function (42883); the argument types must resolve (42704); a
+/// duplicate (name, argtypes) is 42723.
+#[allow(clippy::too_many_arguments)]
+fn exec_create_operator(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    procedure: &str,
+    leftarg: Option<&str>,
+    rightarg: Option<&str>,
+    commutator: Option<&str>,
+    negator: Option<&str>,
+    hashes: bool,
+    merges: bool,
+) -> Result<ExecResult, ExecError> {
+    if !eng.db.functions.contains_key(procedure) {
+        return Err(exec_err(
+            "42883",
+            format!("function \"{}\" does not exist", procedure),
+        ));
+    }
+    if let Some(t) = leftarg {
+        resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, t)?;
+    }
+    if let Some(t) = rightarg {
+        resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, t)?;
+    }
+    let prev = eng.db.operators.get(name).cloned().unwrap_or_default();
+    let dup = prev
+        .iter()
+        .any(|d| d.leftarg.as_deref() == leftarg && d.rightarg.as_deref() == rightarg);
+    if dup {
+        return Err(exec_err(
+            "42723",
+            format!("operator {} already exists", name),
+        ));
+    }
+    let mut defs = prev.clone();
+    defs.push(crate::storage::OperDef {
+        name: name.to_string(),
+        procedure: procedure.to_string(),
+        leftarg: leftarg.map(|s| s.to_string()),
+        rightarg: rightarg.map(|s| s.to_string()),
+        commutator: commutator.map(|s| s.to_string()),
+        negator: negator.map(|s| s.to_string()),
+        hashes,
+        merges,
+    });
+    eng.db.operators.insert(name.to_string(), defs);
+    ctx.writes.push(WriteOp::CreateOperator {
+        name: name.to_string(),
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE OPERATOR".to_string(),
+    })
+}
+
+/// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
+/// Removes the matching (name, argtypes) definition (42883 when absent
+/// and IF EXISTS was not given, like PG19).
+fn exec_drop_operator(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    leftarg: Option<&str>,
+    rightarg: Option<&str>,
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    let prev = eng.db.operators.get(name).cloned().unwrap_or_default();
+    let pos = prev
+        .iter()
+        .position(|d| d.leftarg.as_deref() == leftarg && d.rightarg.as_deref() == rightarg);
+    match pos {
+        None => {
+            if !if_exists {
+                return Err(exec_err(
+                    "42883",
+                    format!("operator {} does not exist", name),
+                ));
+            }
+        }
+        Some(i) => {
+            let mut next = prev.clone();
+            next.remove(i);
+            if next.is_empty() {
+                eng.db.operators.remove(name);
+            } else {
+                eng.db.operators.insert(name.to_string(), next);
+            }
+            ctx.writes.push(WriteOp::DropOperator {
+                name: name.to_string(),
+                prev,
+            });
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP OPERATOR".to_string(),
+    })
+}
+
+/// v0.86: rewrite named argument references in a parsed SQL function
+/// body to positional parameters: `argname.col` becomes
+/// `FieldAccess(Param(n), col)` and a bare `argname` becomes
+/// `Param(n)`. Only qualifiers/names that exactly match an argument
+/// name are rewritten; real table references are untouched.
+fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
+    fn arg_pos(arg_names: &[Option<String>], name: &str) -> Option<u32> {
+        arg_names
+            .iter()
+            .position(|n| n.as_deref() == Some(name))
+            .map(|i| (i + 1) as u32)
+    }
+    fn rewrite_expr(e: &mut Expr, arg_names: &[Option<String>]) {
+        match e {
+            Expr::Column { table, name } => {
+                if let Some(t) = table {
+                    if let Some(n) = arg_pos(arg_names, t) {
+                        *e = Expr::FieldAccess {
+                            expr: Box::new(Expr::Param(n)),
+                            field: std::mem::take(name),
+                        };
+                        return;
+                    }
+                } else if let Some(n) = arg_pos(arg_names, name) {
+                    *e = Expr::Param(n);
+                    return;
+                }
+            }
+            Expr::FieldAccess { expr, .. } => rewrite_expr(expr, arg_names),
+            Expr::Arith { left, right, .. } => {
+                rewrite_expr(left, arg_names);
+                rewrite_expr(right, arg_names);
+            }
+            Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+                rewrite_expr(left, arg_names);
+                rewrite_expr(right, arg_names);
+            }
+            _ => {}
+        }
+    }
+    // Bodies are SELECTs (validated at CREATE); walk the select list
+    // and WHERE. A full Stmt-wide walk is unnecessary for the bounded
+    // body shapes we accept.
+    if let Stmt::Select(sel) = stmt {
+        for item in &mut sel.items {
+            if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                rewrite_expr(expr, arg_names);
+            }
+        }
+        if let Some(w) = &mut sel.where_ {
+            rewrite_expr(w, arg_names);
+        }
+    }
 }
 
 fn exec_drop_sequence(

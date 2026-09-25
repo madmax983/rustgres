@@ -2695,7 +2695,13 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DropTempTable { .. }
             | WriteOp::AlterTempTable { .. }
             | WriteOp::CreateType { .. }
-            | WriteOp::DropType { .. } => continue,
+            | WriteOp::DropType { .. }
+            // v0.86: function/operator DDL likewise leaves no dead row
+            // versions to reap.
+            | WriteOp::CreateFunction { .. }
+            | WriteOp::DropFunction { .. }
+            | WriteOp::CreateOperator { .. }
+            | WriteOp::DropOperator { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);

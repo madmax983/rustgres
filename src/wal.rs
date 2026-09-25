@@ -23,13 +23,13 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 13 (`RGSWAL13` / `RGSCHK11`) is NOT compatible with v0.84
-//! or earlier: v0.85 WAL-logs domain definitions (`WalDomain` in
-//! `CreateType`) and per-column composite/domain type use in
-//! `CreateTable`/`AlterTable`, and checkpoints the domain catalog. Like
-//! every format bump, old data directories are refused with a clear
-//! error instead of being misread.
-//! v0.82 was `RGSWAL12` / `RGSCHK10`; v0.72 was `RGSWAL11` / `RGSCHK09`.
+//! Format version 14 (`RGSWAL14` / `RGSCHK12`) is NOT compatible with v0.85
+//! or earlier: v0.86 WAL-logs function/operator DDL (`CreateFunction` /
+//! `DropFunction` / `CreateOperator` / `DropOperator`) and checkpoints
+//! the function/operator catalogs. Like every format bump, old data
+//! directories are refused with a clear error instead of being misread.
+//! v0.85 was `RGSWAL13` / `RGSCHK11`; v0.82 was `RGSWAL12` / `RGSCHK10`;
+//! v0.72 was `RGSWAL11` / `RGSCHK09`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
 //! length-prefixed, CRC32-checked frame:
@@ -131,7 +131,7 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK11";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK12";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
@@ -141,7 +141,10 @@ const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK11";
 /// v0.85: version 13 adds domain definitions to the type catalog and
 /// per-column composite/domain type use to table images. v12
 /// checkpoints are refused; remove the data directory to start fresh.
-const CHKPT_VERSION: u32 = 13;
+/// v0.86: version 14 adds the function/operator catalogs
+/// (`eng.db.functions` / `eng.db.operators`). v13 checkpoints are
+/// refused; remove the data directory to start fresh.
+const CHKPT_VERSION: u32 = 14;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -163,7 +166,10 @@ const CHKPT_VERSION: u32 = 13;
 /// (base type + s-expr CHECKs/DEFAULT); `CreateTable`/`AlterTable`
 /// carry per-column `composite_types`/`domain_types`/`domain_elem`.
 /// Old `RGSWAL12` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL13";
+/// v0.86: `RGSWAL14` — function/operator DDL records
+/// (`CreateFunction`/`DropFunction`/`CreateOperator`/`DropOperator`,
+/// tags 24-27). Old `RGSWAL13` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL14";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -461,6 +467,47 @@ pub enum WalRecord {
         name: String,
         xmax: u64,
     },
+    // --- v0.86: function/operator DDL. CREATE carries the full
+    // definition so replay rebuilds the catalog entry exactly; DROP
+    // removes it. The function body travels as the raw string and is
+    // re-parsed on replay.
+    CreateFunction {
+        name: String,
+        arg_names: Vec<Option<String>>,
+        arg_types: Vec<String>,
+        ret_type: String,
+        returns_set: bool,
+        lang: u8,
+        body: String,
+        volatility: u8,
+        strict: bool,
+        xmin: u64,
+    },
+    DropFunction {
+        name: String,
+        xmax: u64,
+    },
+    CreateOperator {
+        name: String,
+        defs: Vec<WalOperDef>,
+        xmin: u64,
+    },
+    DropOperator {
+        name: String,
+        xmax: u64,
+    },
+}
+
+/// v0.86: one operator definition in WAL/checkpoint form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalOperDef {
+    pub procedure: String,
+    pub leftarg: Option<String>,
+    pub rightarg: Option<String>,
+    pub commutator: Option<String>,
+    pub negator: Option<String>,
+    pub hashes: bool,
+    pub merges: bool,
 }
 
 /// One GRANT entry in WAL/checkpoint form (v0.11).
@@ -1628,6 +1675,92 @@ impl Enc {
                 self.str(name);
                 self.u64(*xmax);
             }
+            // v0.86: function/operator DDL (tags 24/25/26/27).
+            WalRecord::CreateFunction {
+                name,
+                arg_names,
+                arg_types,
+                ret_type,
+                returns_set,
+                lang,
+                body,
+                volatility,
+                strict,
+                xmin,
+            } => {
+                self.u8(24);
+                self.str(name);
+                self.u32(arg_names.len() as u32);
+                for n in arg_names {
+                    match n {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                }
+                self.u32(arg_types.len() as u32);
+                for t in arg_types {
+                    self.str(t);
+                }
+                self.str(ret_type);
+                self.u8(if *returns_set { 1 } else { 0 });
+                self.u8(*lang);
+                self.str(body);
+                self.u8(*volatility);
+                self.u8(if *strict { 1 } else { 0 });
+                self.u64(*xmin);
+            }
+            WalRecord::DropFunction { name, xmax } => {
+                self.u8(25);
+                self.str(name);
+                self.u64(*xmax);
+            }
+            WalRecord::CreateOperator { name, defs, xmin } => {
+                self.u8(26);
+                self.str(name);
+                self.u32(defs.len() as u32);
+                for d in defs {
+                    self.str(&d.procedure);
+                    match &d.leftarg {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.rightarg {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.commutator {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.negator {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    self.u8(if d.hashes { 1 } else { 0 });
+                    self.u8(if d.merges { 1 } else { 0 });
+                }
+                self.u64(*xmin);
+            }
+            WalRecord::DropOperator { name, xmax } => {
+                self.u8(27);
+                self.str(name);
+                self.u64(*xmax);
+            }
         }
     }
 
@@ -2403,6 +2536,94 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropType { name, xmax })
             }
+            // v0.86: function/operator DDL.
+            24 => {
+                let name = self.str()?;
+                let n = self.u32()? as usize;
+                let mut arg_names = Vec::with_capacity(n);
+                for _ in 0..n {
+                    arg_names.push(if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    });
+                }
+                let n = self.u32()? as usize;
+                let mut arg_types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    arg_types.push(self.str()?);
+                }
+                let ret_type = self.str()?;
+                let returns_set = self.u8()? != 0;
+                let lang = self.u8()?;
+                let body = self.str()?;
+                let volatility = self.u8()?;
+                let strict = self.u8()? != 0;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateFunction {
+                    name,
+                    arg_names,
+                    arg_types,
+                    ret_type,
+                    returns_set,
+                    lang,
+                    body,
+                    volatility,
+                    strict,
+                    xmin,
+                })
+            }
+            25 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropFunction { name, xmax })
+            }
+            26 => {
+                let name = self.str()?;
+                let n = self.u32()? as usize;
+                let mut defs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let procedure = self.str()?;
+                    let leftarg = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let rightarg = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let commutator = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let negator = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let hashes = self.u8()? != 0;
+                    let merges = self.u8()? != 0;
+                    defs.push(WalOperDef {
+                        procedure,
+                        leftarg,
+                        rightarg,
+                        commutator,
+                        negator,
+                        hashes,
+                        merges,
+                    });
+                }
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateOperator { name, defs, xmin })
+            }
+            27 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropOperator { name, xmax })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -2762,6 +2983,91 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             }
             eng.db.types.remove(name);
         }
+        // v0.86: function/operator DDL replay — rebuild the catalog
+        // entries exactly. The body is re-parsed; a corrupt body fails
+        // replay loudly.
+        WalRecord::CreateFunction {
+            name,
+            arg_names,
+            arg_types,
+            ret_type,
+            returns_set,
+            lang,
+            body,
+            volatility,
+            strict,
+            xmin,
+        } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            let lang = match lang {
+                0 => crate::sql::FuncLang::Sql,
+                1 => crate::sql::FuncLang::Internal,
+                _ => return Err(format!("corrupt function language in WAL: {}", lang)),
+            };
+            let volatility = match volatility {
+                0 => crate::sql::FuncVolatility::Volatile,
+                1 => crate::sql::FuncVolatility::Stable,
+                2 => crate::sql::FuncVolatility::Immutable,
+                _ => {
+                    return Err(format!(
+                        "corrupt function volatility in WAL: {}",
+                        volatility
+                    ));
+                }
+            };
+            let parsed = crate::sql::parse_statement(body)
+                .map_err(|e| format!("corrupt function body in WAL: {:?}", e))
+                .ok();
+            eng.db.functions.insert(
+                name.clone(),
+                crate::storage::FuncDef {
+                    name: name.clone(),
+                    arg_names: arg_names.clone(),
+                    arg_types: arg_types.clone(),
+                    ret_type: ret_type.clone(),
+                    returns_set: *returns_set,
+                    lang,
+                    body: body.clone(),
+                    parsed,
+                    volatility,
+                    strict: *strict,
+                },
+            );
+        }
+        WalRecord::DropFunction { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            eng.db.functions.remove(name);
+        }
+        WalRecord::CreateOperator { name, defs, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            eng.db.operators.insert(
+                name.clone(),
+                defs.iter()
+                    .map(|d| crate::storage::OperDef {
+                        name: name.clone(),
+                        procedure: d.procedure.clone(),
+                        leftarg: d.leftarg.clone(),
+                        rightarg: d.rightarg.clone(),
+                        commutator: d.commutator.clone(),
+                        negator: d.negator.clone(),
+                        hashes: d.hashes,
+                        merges: d.merges,
+                    })
+                    .collect(),
+            );
+        }
+        WalRecord::DropOperator { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            eng.db.operators.remove(name);
+        }
     }
     match r {
         // v0.11: role records are applied by the match above; nothing left
@@ -2771,7 +3077,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::AlterRole { .. }
         | WalRecord::DbAcl { .. }
         | WalRecord::CreateType { .. }
-        | WalRecord::DropType { .. } => {}
+        | WalRecord::DropType { .. }
+        // v0.86: function/operator records likewise.
+        | WalRecord::CreateFunction { .. }
+        | WalRecord::DropFunction { .. }
+        | WalRecord::CreateOperator { .. }
+        | WalRecord::DropOperator { .. } => {}
         // v0.13: replication slot records are applied here.
         WalRecord::ReplSlotCreate {
             name,
@@ -3785,6 +4096,70 @@ pub fn records_for_commit(
                 });
                 i += 1;
             }
+            // v0.86: function/operator DDL is WAL-logged (definitions
+            // survive checkpoint/restart). The new definition is read
+            // from the catalog maps, which the executor updated; absent
+            // means a later DROP in the same txn removed it, so only
+            // the drop is logged.
+            WriteOp::CreateFunction { name, .. } => {
+                if let Some(f) = eng.db.functions.get(name) {
+                    out.push(WalRecord::CreateFunction {
+                        name: name.clone(),
+                        arg_names: f.arg_names.clone(),
+                        arg_types: f.arg_types.clone(),
+                        ret_type: f.ret_type.clone(),
+                        returns_set: f.returns_set,
+                        lang: match f.lang {
+                            crate::sql::FuncLang::Sql => 0,
+                            crate::sql::FuncLang::Internal => 1,
+                        },
+                        body: f.body.clone(),
+                        volatility: match f.volatility {
+                            crate::sql::FuncVolatility::Volatile => 0,
+                            crate::sql::FuncVolatility::Stable => 1,
+                            crate::sql::FuncVolatility::Immutable => 2,
+                        },
+                        strict: f.strict,
+                        xmin: own,
+                    });
+                }
+                i += 1;
+            }
+            WriteOp::DropFunction { name, .. } => {
+                out.push(WalRecord::DropFunction {
+                    name: name.clone(),
+                    xmax: own,
+                });
+                i += 1;
+            }
+            WriteOp::CreateOperator { name, .. } => {
+                if let Some(defs) = eng.db.operators.get(name) {
+                    out.push(WalRecord::CreateOperator {
+                        name: name.clone(),
+                        defs: defs
+                            .iter()
+                            .map(|d| WalOperDef {
+                                procedure: d.procedure.clone(),
+                                leftarg: d.leftarg.clone(),
+                                rightarg: d.rightarg.clone(),
+                                commutator: d.commutator.clone(),
+                                negator: d.negator.clone(),
+                                hashes: d.hashes,
+                                merges: d.merges,
+                            })
+                            .collect(),
+                        xmin: own,
+                    });
+                }
+                i += 1;
+            }
+            WriteOp::DropOperator { name, .. } => {
+                out.push(WalRecord::DropOperator {
+                    name: name.clone(),
+                    xmax: own,
+                });
+                i += 1;
+            }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
                     i += 1;
@@ -4504,6 +4879,90 @@ impl Wal {
             }
         }
 
+        // v0.86: user-defined functions (`eng.db.functions`). Sorted
+        // for a deterministic image. Like types, functions carry no
+        // xid; snapshotting the live map is strictly better than
+        // dropping them (an uncommitted CREATE FUNCTION caught by a
+        // checkpoint is a known minor gap, as with types).
+        let mut f_names: Vec<&String> = eng.db.functions.keys().collect();
+        f_names.sort();
+        img.u32(f_names.len() as u32);
+        for name in f_names {
+            let f = &eng.db.functions[name];
+            img.str(name);
+            img.u32(f.arg_names.len() as u32);
+            for n in &f.arg_names {
+                match n {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+            }
+            img.u32(f.arg_types.len() as u32);
+            for t in &f.arg_types {
+                img.str(t);
+            }
+            img.str(&f.ret_type);
+            img.u8(if f.returns_set { 1 } else { 0 });
+            img.u8(match f.lang {
+                crate::sql::FuncLang::Sql => 0,
+                crate::sql::FuncLang::Internal => 1,
+            });
+            img.str(&f.body);
+            img.u8(match f.volatility {
+                crate::sql::FuncVolatility::Volatile => 0,
+                crate::sql::FuncVolatility::Stable => 1,
+                crate::sql::FuncVolatility::Immutable => 2,
+            });
+            img.u8(if f.strict { 1 } else { 0 });
+        }
+
+        // v0.86: user-defined operators (`eng.db.operators`), same
+        // treatment as functions.
+        let mut o_names: Vec<&String> = eng.db.operators.keys().collect();
+        o_names.sort();
+        img.u32(o_names.len() as u32);
+        for name in o_names {
+            let defs = &eng.db.operators[name];
+            img.str(name);
+            img.u32(defs.len() as u32);
+            for d in defs {
+                img.str(&d.procedure);
+                match &d.leftarg {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.rightarg {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.commutator {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.negator {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                img.u8(if d.hashes { 1 } else { 0 });
+                img.u8(if d.merges { 1 } else { 0 });
+            }
+        }
+
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
         {
@@ -5078,6 +5537,101 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 domain,
             },
         );
+    }
+    // v0.86: user-defined functions.
+    let n_funcs = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_funcs {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut arg_names = Vec::with_capacity(n);
+        for _ in 0..n {
+            arg_names.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            });
+        }
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut arg_types = Vec::with_capacity(n);
+        for _ in 0..n {
+            arg_types.push(d.str().map_err(|e| bad(&e))?);
+        }
+        let ret_type = d.str().map_err(|e| bad(&e))?;
+        let returns_set = d.u8().map_err(|e| bad(&e))? != 0;
+        let lang = match d.u8().map_err(|e| bad(&e))? {
+            0 => crate::sql::FuncLang::Sql,
+            1 => crate::sql::FuncLang::Internal,
+            b => return Err(bad(&format!("corrupt function language {}", b))),
+        };
+        let body = d.str().map_err(|e| bad(&e))?;
+        let volatility = match d.u8().map_err(|e| bad(&e))? {
+            0 => crate::sql::FuncVolatility::Volatile,
+            1 => crate::sql::FuncVolatility::Stable,
+            2 => crate::sql::FuncVolatility::Immutable,
+            b => return Err(bad(&format!("corrupt function volatility {}", b))),
+        };
+        let strict = d.u8().map_err(|e| bad(&e))? != 0;
+        let parsed = crate::sql::parse_statement(&body)
+            .map_err(|e| bad(&format!("corrupt function body: {:?}", e)))
+            .ok();
+        eng.db.functions.insert(
+            name.clone(),
+            crate::storage::FuncDef {
+                name,
+                arg_names,
+                arg_types,
+                ret_type,
+                returns_set,
+                lang,
+                body,
+                parsed,
+                volatility,
+                strict,
+            },
+        );
+    }
+    // v0.86: user-defined operators.
+    let n_ops = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_ops {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut defs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let procedure = d.str().map_err(|e| bad(&e))?;
+            let leftarg = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let rightarg = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let commutator = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let negator = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let hashes = d.u8().map_err(|e| bad(&e))? != 0;
+            let merges = d.u8().map_err(|e| bad(&e))? != 0;
+            defs.push(crate::storage::OperDef {
+                name: name.clone(),
+                procedure,
+                leftarg,
+                rightarg,
+                commutator,
+                negator,
+                hashes,
+                merges,
+            });
+        }
+        eng.db.operators.insert(name, defs);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
