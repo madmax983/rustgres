@@ -966,6 +966,86 @@ class Verdict:
         self.detail = detail
 
 
+def has_top_level_order_by(stmt):
+    """v0.95: detect ORDER BY at the top query level only, ignoring
+    nested parentheses, string literals, comments, and dollar-quoted
+    bodies. The old regex matched ORDER BY inside subqueries, causing
+    false ordered-comparison failures."""
+    i = 0
+    n = len(stmt)
+    depth = 0
+    while i < n:
+        c = stmt[i]
+        # Skip single-quoted strings ('' escapes)
+        if c == "'":
+            i += 1
+            while i < n:
+                if stmt[i] == "'":
+                    if i + 1 < n and stmt[i+1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        # Skip double-quoted identifiers ("" escapes)
+        if c == '"':
+            i += 1
+            while i < n:
+                if stmt[i] == '"':
+                    if i + 1 < n and stmt[i+1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        # Skip line comments
+        if c == '-' and i + 1 < n and stmt[i+1] == '-':
+            i += 2
+            while i < n and stmt[i] != '\n':
+                i += 1
+            continue
+        # Skip block comments
+        if c == '/' and i + 1 < n and stmt[i+1] == '*':
+            i += 2
+            while i + 1 < n and not (stmt[i] == '*' and stmt[i+1] == '/'):
+                i += 1
+            i += 2
+            continue
+        # Skip dollar-quoted strings ($tag$...$tag$)
+        if c == '$':
+            j = i + 1
+            while j < n and (stmt[j].isalnum() or stmt[j] == '_'):
+                j += 1
+            if j < n and stmt[j] == '$':
+                tag = stmt[i:j+1]
+                k = stmt.find(tag, j + 1)
+                if k != -1:
+                    i = k + len(tag)
+                    continue
+            i += 1
+            continue
+        # Track paren depth
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth = max(0, depth - 1)
+        # Check for ORDER BY at depth 0
+        if depth == 0 and (c == 'o' or c == 'O'):
+            # Check if we're at a word boundary and match "order by"
+            if i == 0 or not (stmt[i-1].isalnum() or stmt[i-1] == '_'):
+                j = i + 5
+                if stmt[i:j].lower() == 'order' and j < n and not (stmt[j].isalnum() or stmt[j] == '_'):
+                    # Skip whitespace, check for "by"
+                    k = j
+                    while k < n and stmt[k] in ' \t\n\r':
+                        k += 1
+                    if stmt[k:k+2].lower() == 'by' and (k+2 >= n or not (stmt[k+2].isalnum() or stmt[k+2] == '_')):
+                        return True
+        i += 1
+    return False
+
 def compare(stmt, expected, actual, null_display):
     """Compare expected vs actual wire result. Returns Verdict."""
     if expected.kind == "none":
@@ -1058,7 +1138,7 @@ def compare(stmt, expected, actual, null_display):
                     return False
             return True
 
-        ordered = bool(re.search(r"\border\s+by\b", stmt, re.IGNORECASE))
+        ordered = has_top_level_order_by(stmt)
         if ordered:
             ok = len(exp_rows) == len(act_rows) and all(
                 row_ok(e, a) for e, a in zip(exp_rows, act_rows)

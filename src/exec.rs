@@ -9489,6 +9489,33 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
             prov: Vec::new(),
         });
     }
+    // v0.95: the virtual pg_class catalog lists itself (OID 1259, like
+    // PG19), unless a real table shadows it.
+    if !rows
+        .iter()
+        .any(|r| matches!(&r.cells[1], Value::Text(s) if &**s == "pg_class"))
+    {
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(1259),
+                Value::text("pg_class"),
+                Value::Int(0),
+            ]),
+            prov: Vec::new(),
+        });
+        // Keep deterministic order.
+        rows.sort_by(|a, b| {
+            let an = match &a.cells[1] {
+                Value::Text(s) => &**s,
+                _ => "",
+            };
+            let bn = match &b.cells[1] {
+                Value::Text(s) => &**s,
+                _ => "",
+            };
+            an.cmp(bn)
+        });
+    }
     (schema, rows)
 }
 // ---------------------------------------------------------------------------
@@ -10028,6 +10055,8 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
                 }
                 args.iter().any(expr_uses)
             }
+            // v0.95: named args are transparent to inspection.
+            Expr::NamedArg { expr, .. } => expr_uses(expr),
             // v0.79: array constructors/subscripts/slices recurse into
             // their operands.
             Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
@@ -10376,6 +10405,11 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             name: name.clone(),
             args: args.iter().map(r).collect::<Result<Vec<_>, _>>()?,
         }),
+        // v0.95: named args are transparent to column resolution.
+        Expr::NamedArg { name, expr } => Ok(Expr::NamedArg {
+            name: name.clone(),
+            expr: Box::new(r(expr)?),
+        }),
         Expr::Extract { field, from } => Ok(Expr::Extract {
             field: field.clone(),
             from: Box::new(r(from)?),
@@ -10566,6 +10600,24 @@ struct OutRow {
 /// inner query, then pop the bindings. The bindings live on the shared
 /// query context, so nested subqueries, derived tables and views see them
 /// too; sibling and outer levels are unaffected after the pop.
+/// v0.95: PG19 degenerate grouping — a HAVING clause with no GROUP BY
+/// and no aggregates anywhere. The FROM/WHERE is not evaluated (PG19
+/// planner's `is_degenerate_grouping`); the query produces a single
+/// group iff HAVING is true.
+fn is_degenerate_grouping(stmt: &SelectStmt) -> bool {
+    if stmt.having.is_none() || !stmt.group_by.is_empty() {
+        return false;
+    }
+    let has_agg = stmt
+        .items
+        .iter()
+        .any(|i| matches!(i, SelectItem::Expr { expr, .. } if contains_agg(expr)))
+        || stmt.order_by.iter().any(|o| contains_agg(&o.expr))
+        || stmt.distinct_on.iter().any(|e| contains_agg(e))
+        || stmt.having.as_ref().is_some_and(contains_agg);
+    !has_agg
+}
+
 fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
     let base = q.ctes.len();
     if !stmt.with.is_empty() {
@@ -11563,18 +11615,27 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             _ => None,
         })
     };
+    // v0.95: degenerate grouping (HAVING without GROUP BY or
+    // aggregates) does not evaluate FROM/WHERE (PG19). Skip the WHERE
+    // clause; the scan still produces rows for the single group.
+    let degenerate = is_degenerate_grouping(stmt);
+    let where_clause = if degenerate {
+        None
+    } else {
+        stmt.where_.as_ref()
+    };
     let (schema, rows) = build_from(
         q,
         outer,
         &stmt.from,
-        stmt.where_.as_ref(),
+        where_clause,
         // v0.37: pg_column_compression needs row provenance too (anywhere
         // in the statement, including correlated subqueries).
         stmt.for_update || stmt_uses_pg_column_compression(stmt),
         order_hint.as_ref(),
         early_limit,
     )?;
-    let rows = apply_where(q, outer, &schema, rows, stmt.where_.as_ref())?;
+    let rows = apply_where(q, outer, &schema, rows, where_clause)?;
     // v0.52: `SELECT DISTINCT ON` — PG19 parse analysis
     // (`transformDistinctOnClause`): check the ORDER BY prefix rule
     // (42803) and rewrite ORDER BY to the effective sort order (matching
@@ -12024,6 +12085,8 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
 fn contains_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } => true,
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => contains_agg(expr),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
@@ -12161,6 +12224,10 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 for a in args {
                     stack.push(a);
                 }
+            }
+            // v0.95: named args are transparent to inspection.
+            Expr::NamedArg { expr, .. } => {
+                stack.push(expr);
             }
             Expr::Agg { arg, arg2, .. } => {
                 if let Some(a) = arg {
@@ -12379,6 +12446,8 @@ fn validate_grouping_calls(
 fn contains_window(e: &Expr) -> bool {
     match e {
         Expr::Window { .. } => true,
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => contains_window(expr),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
@@ -12681,6 +12750,8 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)
         }
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => validate_window_expr(expr, in_agg),
         Expr::Cmp { left, right, .. } => {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)
@@ -14185,6 +14256,8 @@ fn filter_rows(
 /// inner scope would shadow it; the slow path keeps exact old semantics.
 fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => collect_column_refs(expr, out),
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
@@ -15919,8 +15992,10 @@ fn build_source(
             alias,
             col_aliases,
         } => {
-            // Derived tables are uncorrelated (no LATERAL support): they
-            // never see the outer scope chain.
+            // v0.95: non-LATERAL derived tables see enclosing query
+            // scopes (PG19), but not same-level FROM siblings (outer
+            // excludes them; LATERAL sibling correlation remains
+            // unsupported).
             let out = {
                 let mut sub_q = Q {
                     eng: &mut *q.eng,
@@ -15939,7 +16014,7 @@ fn build_source(
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
                 };
-                run_select(&mut sub_q, sub, &[])?
+                run_select(&mut sub_q, sub, outer)?
             };
             // v0.23: more column aliases than output columns is 42601.
             check_col_alias_arity(alias, out.columns.len(), col_aliases)?;
@@ -17338,7 +17413,22 @@ fn eval_grouped(
             return Ok(Value::Int(mask));
         }
     }
+    // v0.95: PG19 parse_agg.c — check whole-expression structural
+    // equality against GROUP BY before descending into the expression.
+    // `SELECT lower(c) ... GROUP BY lower(c)` is legal; without this the
+    // evaluator descends into `lower(c)` and rejects the bare `c` with
+    // 42803.
+    for (i, g) in group_by.iter().enumerate() {
+        if e == g {
+            return Ok(key_vals[i].clone());
+        }
+    }
     match e {
+        // v0.95: a NamedArg that reaches evaluation unwraps to its value
+        // (function-call paths resolve named args first).
+        Expr::NamedArg { expr, .. } => eval_grouped(
+            q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+        ),
         Expr::Agg {
             func,
             arg,
@@ -17570,6 +17660,15 @@ fn eval_grouped(
             eval_is_bool(&v, *neg, *val)
         }
         Expr::Func { name, args } => {
+            // v0.95: resolve `name => expr` named arguments to positional
+            // order (PG19). Zero-cost when absent.
+            let __owned: Vec<Expr>;
+            let args: &[Expr] = if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+                __owned = resolve_named_args(q.eng, name, args)?;
+                &__owned
+            } else {
+                args
+            };
             // v0.47: an SRF in the select list that is also a GROUP BY
             // key reads the group's key value. PG19 expands such SRFs
             // below the aggregate (ProjectSet under Agg), so the
@@ -19864,6 +19963,9 @@ fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
 /// Evaluate one expression against the scope chain (params substituted).
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
+        // v0.95: a NamedArg that reaches evaluation unwraps to its value
+        // (function-call paths resolve named args first).
+        Expr::NamedArg { expr, .. } => eval_expr(q, scopes, expr),
         Expr::Column { table, name } => {
             match resolve_col(scopes, table.as_deref(), name) {
                 Ok((si, ci)) => Ok(scopes[si].row[ci].clone()),
@@ -20369,6 +20471,8 @@ fn subplan_col_family(ty: &ColType) -> Option<SubplanFamily> {
 fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => walk_expr(expr, f),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::Literal(_)
@@ -25271,7 +25375,124 @@ fn eval_internal_function(symbol: &str, args: &[Value]) -> Result<Value, ExecErr
     }
 }
 
+/// v0.95: parameter names for builtins that accept `name => expr`
+/// named-argument notation (PG19 `pg_proc.proargnames`). Only functions
+/// with a declared entry (or user functions, whose signatures live in
+/// storage) support named notation; anything else using `=>` gets 42883,
+/// like PG's "function ... does not exist".
+fn builtin_param_names(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        // `parse_ident(qualname text, strict boolean DEFAULT true)`.
+        "parse_ident" => &["qualname", "strict"],
+        _ => return None,
+    })
+}
+
+/// v0.95: resolve `name => expr` named arguments to positional order
+/// (PG19 `reorder_function_arguments`). Positional args must precede
+/// named ones (42601); unknown or duplicate names are 42883. rustgres
+/// has no defaulted parameters except `parse_ident.strict`, which is
+/// filled with `true` when omitted.
+fn resolve_named_args(eng: &Engine, name: &str, args: &[Expr]) -> Result<Vec<Expr>, ExecError> {
+    let mut positional: Vec<&Expr> = Vec::new();
+    let mut named: Vec<(&str, &Expr)> = Vec::new();
+    let mut seen_named = false;
+    for a in args {
+        match a {
+            Expr::NamedArg { name: n, expr } => {
+                seen_named = true;
+                named.push((n.as_str(), expr.as_ref()));
+            }
+            _ => {
+                if seen_named {
+                    return Err(exec_err(
+                        "42601",
+                        "positional argument cannot follow named argument".to_string(),
+                    ));
+                }
+                positional.push(a);
+            }
+        }
+    }
+    // Parameter names: builtin table, else the user-function definition.
+    let params: Vec<Option<String>> = if let Some(ns) = builtin_param_names(name) {
+        ns.iter().map(|s| Some(s.to_string())).collect()
+    } else if let Some(overloads) = eng.db.functions.get(name) {
+        overloads
+            .first()
+            .map(|f| f.arg_names.clone())
+            .unwrap_or_default()
+    } else {
+        return Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        ));
+    };
+    let n = params.len();
+    if positional.len() > n {
+        return Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        ));
+    }
+    let mut out: Vec<Option<&Expr>> = vec![None; n];
+    for (i, e) in positional.iter().enumerate() {
+        out[i] = Some(e);
+    }
+    for (nm, e) in named {
+        let idx = params.iter().position(|p| p.as_deref() == Some(nm));
+        match idx {
+            None => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}({} => ...) does not exist", name, nm),
+                ));
+            }
+            Some(i) => {
+                if out[i].is_some() {
+                    return Err(exec_err(
+                        "42883",
+                        format!("duplicate named argument {}", nm),
+                    ));
+                }
+                out[i] = Some(e);
+            }
+        }
+    }
+    // Every parameter must be supplied, except `parse_ident.strict`,
+    // which defaults to true (PG19).
+    for (i, slot) in out.iter().enumerate() {
+        if slot.is_none() {
+            let is_strict_default = name == "parse_ident" && params[i].as_deref() == Some("strict");
+            if !is_strict_default {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}() does not exist", name),
+                ));
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(n);
+    for slot in out {
+        match slot {
+            Some(e) => result.push(e.clone()),
+            // `parse_ident.strict` default.
+            None => result.push(Expr::Literal(crate::sql::Literal::Bool(true))),
+        }
+    }
+    Ok(result)
+}
+
 fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
+    // v0.95: resolve `name => expr` named arguments to positional order
+    // (PG19 `reorder_function_arguments`). Zero-cost when absent.
+    let owned: Vec<Expr>;
+    let args: &[Expr] = if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        owned = resolve_named_args(q.eng, name, args)?;
+        &owned
+    } else {
+        args
+    };
     // v0.80: `GROUPING(...)` is only meaningful at group level (handled
     // by `eval_grouped`). Reaching scalar evaluation means it sits in a
     // query without GROUP BY, inside a nested query level, or in a spot
@@ -25628,6 +25849,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "regexp_substr" => (2..=6).contains(&n),
         "regexp_replace" => (3..=6).contains(&n),
         "regexp_split_to_array" => (2..=3).contains(&n),
+        // v0.95: `parse_ident(qualname text, strict boolean DEFAULT true)`.
+        "parse_ident" => (1..=2).contains(&n),
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
         "regexp_split_to_table" => (2..=3).contains(&n),
@@ -25714,6 +25937,97 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
 }
 
 /// Dispatch on pre-evaluated argument values (used by the grouped path).
+/// v0.95: port of PG 19 `parse_ident` (misc.c) — split `qualname`
+/// into its component identifiers. Quoted components keep their exact
+/// contents (doubled quotes collapse); unquoted components are
+/// lowercased (never truncated). In non-strict mode, parsing stops at
+/// the first syntax error and returns what was collected; in strict
+/// mode any syntax error is 22P02 ("invalid name syntax").
+fn parse_ident_parts(qualname: &str, strict: bool) -> Result<Vec<String>, ExecError> {
+    fn is_ident_start(b: u8) -> bool {
+        b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+    }
+    fn is_ident_cont(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+    }
+    let bytes = qualname.as_bytes();
+    let n = bytes.len();
+    let mut p = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    // Skip leading whitespace.
+    while p < n && bytes[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    // PG treats a syntax error in non-strict mode as "stop and return
+    // what was parsed"; model it with a local macro-free closure style.
+    let mut syntax_error = false;
+    let mut done = false;
+    while !done && !syntax_error {
+        if p < n && bytes[p] == b'"' {
+            // Quoted identifier: copy verbatim, collapsing "" -> ".
+            p += 1;
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                if p >= n {
+                    syntax_error = true;
+                    break;
+                }
+                if bytes[p] == b'"' {
+                    if p + 1 < n && bytes[p + 1] == b'"' {
+                        buf.push(b'"');
+                        p += 2;
+                    } else {
+                        p += 1; // skip closing quote
+                        break;
+                    }
+                } else {
+                    buf.push(bytes[p]);
+                    p += 1;
+                }
+            }
+            if !syntax_error {
+                out.push(String::from_utf8_lossy(&buf).into_owned());
+            }
+        } else {
+            // Unquoted identifier: must start with letter/underscore.
+            if p >= n || !is_ident_start(bytes[p]) {
+                syntax_error = true;
+            } else {
+                let start = p;
+                while p < n && is_ident_cont(bytes[p]) {
+                    p += 1;
+                }
+                // Downcase (ASCII only, like PG's downcase_identifier for
+                // the common case); never truncate.
+                let mut s = qualname[start..p].to_string();
+                s.make_ascii_lowercase();
+                out.push(s);
+            }
+        }
+        if syntax_error {
+            break;
+        }
+        // Skip trailing whitespace.
+        while p < n && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if p >= n {
+            done = true;
+        } else if bytes[p] == b'.' {
+            p += 1;
+            while p < n && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+        } else {
+            syntax_error = true;
+        }
+    }
+    if syntax_error && strict {
+        return Err(exec_err("22P02", "invalid name syntax".to_string()));
+    }
+    Ok(out)
+}
+
 fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     check_builtin_arity(name, vals)?;
     // v0.16: `substr` is a true alias of `substring` (same semantics).
@@ -25808,7 +26122,9 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "get_byte"
         | "set_byte"
         | "bit_count"
-        | "pg_input_is_valid" => eval_str_func(name, vals),
+        | "pg_input_is_valid"
+        // v0.95: parse_ident returns text[].
+        | "parse_ident" => eval_str_func(name, vals),
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -26749,6 +27065,31 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
             None => Value::Null,
             Some(s) => Value::text(s.to_lowercase()),
         }),
+        // v0.95: `parse_ident(qualname text [, strict bool])` (PG19
+        // misc.c) — split a possibly-qualified identifier into its
+        // component identifiers, as `text[]`.
+        "parse_ident" => {
+            let qual = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let strict = if vals.len() > 1 {
+                match &vals[1] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bool(b) => *b,
+                    other => return Err(func_arg_err(name, other)),
+                }
+            } else {
+                true
+            };
+            let parts = parse_ident_parts(qual, strict)?;
+            Ok(Value::Array(crate::storage::ArrayVal {
+                elem: crate::storage::ArrayElem::Text,
+                dims: vec![parts.len() as i32],
+                lower: vec![1],
+                elems: parts.into_iter().map(Value::text).collect(),
+            }))
+        }
         "length" | "char_length" | "character_length" => {
             // v0.29: length(bytea) returns the byte count (PG).
             if let Value::Bytea(b) = &vals[0] {
@@ -30886,6 +31227,8 @@ fn func_result_type(
         "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches" => {
             Ok(ColType::Text)
         }
+        // v0.95: `parse_ident` returns `text[]` (PG19).
+        "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
@@ -31928,6 +32271,10 @@ fn expr_type(
     e: &Expr,
 ) -> Result<ColType, ExecError> {
     match e {
+        // v0.95: a named arg has its inner expression's type.
+        Expr::NamedArg { expr, .. } => {
+            expr_type(eng, snap, own, session, schemas, outer, ctes, expr)
+        }
         Expr::Column { table, name } => {
             // v0.73: PG19 correlated references — a subquery's expressions
             // resolve against the enclosing query's ranges after its own
@@ -38608,6 +38955,72 @@ mod tests {
         .unwrap();
         assert_eq!(rows_of(r), vec![vec!["pa88".to_string(), "x".to_string()]]);
     }
+
+    /// v0.95: parse_ident identifier parsing (PG19 parse_ident).
+    #[test]
+    fn v95_parse_ident_parts() {
+        // Basic qualified name.
+        assert_eq!(
+            parse_ident_parts("foo.boo", true).unwrap(),
+            vec!["foo".to_string(), "boo".to_string()]
+        );
+        // Unquoted folds to lowercase.
+        assert_eq!(
+            parse_ident_parts("Foo.Boo", true).unwrap(),
+            vec!["foo".to_string(), "boo".to_string()]
+        );
+        // Quoted preserves case.
+        assert_eq!(
+            parse_ident_parts("\"Foo\".\"Boo\"", true).unwrap(),
+            vec!["Foo".to_string(), "Boo".to_string()]
+        );
+        // Doubled quotes collapse.
+        assert_eq!(
+            parse_ident_parts("\"a\"\"b\"", true).unwrap(),
+            vec!["a\"b".to_string()]
+        );
+        // Surrounding whitespace skipped.
+        assert_eq!(
+            parse_ident_parts(" foo. boo ", true).unwrap(),
+            vec!["foo".to_string(), "boo".to_string()]
+        );
+        // Strict rejects trailing garbage.
+        assert!(parse_ident_parts("foo.boo[]", true).is_err());
+        // Non-strict returns the valid prefix.
+        assert_eq!(
+            parse_ident_parts("foo.boo[]", false).unwrap(),
+            vec!["foo".to_string(), "boo".to_string()]
+        );
+        // Empty input is an error in strict mode.
+        assert!(parse_ident_parts("", true).is_err());
+        assert!(parse_ident_parts("", false).unwrap().is_empty());
+    }
+
+    /// v0.95: degenerate grouping detection (HAVING without GROUP BY or
+    /// aggregates).
+    #[test]
+    fn v95_is_degenerate_grouping() {
+        let stmt = parse_statement("SELECT 1 FROM t WHERE 1/a = 1 HAVING 1 < 2").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt {
+            assert!(is_degenerate_grouping(&s));
+        } else {
+            panic!("expected SELECT");
+        }
+        // With an aggregate, not degenerate.
+        let stmt2 = parse_statement("SELECT count(*) FROM t HAVING count(*) > 1").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt2 {
+            assert!(!is_degenerate_grouping(&s));
+        } else {
+            panic!("expected SELECT");
+        }
+        // With GROUP BY, not degenerate.
+        let stmt3 = parse_statement("SELECT a FROM t GROUP BY a HAVING 1 < 2").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt3 {
+            assert!(!is_degenerate_grouping(&s));
+        } else {
+            panic!("expected SELECT");
+        }
+    }
 }
 
 fn info_columns_schema() -> Vec<QCol> {
@@ -40960,6 +41373,8 @@ fn alter_swap(
 /// (no subqueries/aggregates), so a shallow walk suffices.
 fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => rename_col_in_expr(expr, old, new),
         Expr::Column { table, name } => {
             if table.is_none() && name == old {
                 *name = new.to_string();

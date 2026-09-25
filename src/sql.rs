@@ -113,6 +113,7 @@ enum Token {
     Slash,   // v0.7: `/`
     Percent, // v0.7: `%`
     Eq,
+    FatArrow,      // v0.95: `=>` named-argument operator (PG19)
     Dot,           // v0.6: qualified refs (t.col)
     Lt,            // v0.6: <
     Gt,            // v0.6: >
@@ -537,8 +538,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 i += 1;
             }
             '=' => {
-                toks.push(Token::Eq);
-                i += 1;
+                // v0.95: `=>` is the named-argument operator (PG19); a
+                // bare `=` is equality.
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    toks.push(Token::FatArrow);
+                    i += 2;
+                } else {
+                    toks.push(Token::Eq);
+                    i += 1;
+                }
             }
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '<' {
@@ -1129,6 +1137,13 @@ pub enum Expr {
     Func {
         name: String,
         args: Vec<Expr>,
+    },
+    /// v0.95: `name => expr` named function argument (PG19). The parser
+    /// produces this inside `Func.args`; the executor resolves it against
+    /// the function signature before evaluation.
+    NamedArg {
+        name: String,
+        expr: Box<Expr>,
     },
     /// v0.7: `extract(field FROM expr)`.
     Extract {
@@ -2277,6 +2292,8 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
 /// Collect `(qualifier, name)` of every column reference in an expression.
 pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => collect_col_refs(expr, out),
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
@@ -3185,6 +3202,8 @@ fn max_param_from(f: &FromItem) -> usize {
 
 fn max_param_expr(e: &Expr) -> usize {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => max_param_expr(expr),
         Expr::Param(n) => *n as usize,
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
@@ -3417,6 +3436,7 @@ fn tokens_to_sql(toks: &[Token]) -> String {
             Token::Slash => "/".to_string(),
             Token::Percent => "%".to_string(),
             Token::Eq => "=".to_string(),
+            Token::FatArrow => "=>".to_string(),
             Token::Dot => ".".to_string(),
             Token::Lt => "<".to_string(),
             Token::Gt => ">".to_string(),
@@ -8191,11 +8211,24 @@ impl Parser {
             let mut args = Vec::new();
             if *self.peek() != Token::RParen {
                 loop {
+                    // v0.95: `name => expr` named-argument syntax (PG19).
+                    // Stored as `Expr::NamedArg`; the executor resolves
+                    // it against the function signature.
+                    if matches!(self.peek(), Token::Ident(_))
+                        && matches!(self.peek2(), Token::FatArrow)
+                    {
+                        let arg_name = self.expect_ident()?;
+                        self.next(); // consume '=>'
+                        let val = self.parse_or()?;
+                        args.push(Expr::NamedArg {
+                            name: arg_name,
+                            expr: Box::new(val),
+                        });
                     // v0.90: `VARIADIC expr` — marks the argument for
                     // array expansion (PG19). Parsed as a `__variadic`
                     // marker func; exec.rs expands it in function-call
                     // evaluation.
-                    if self.eat_keyword("variadic") {
+                    } else if self.eat_keyword("variadic") {
                         let inner = self.parse_or()?;
                         args.push(Expr::Func {
                             name: "__variadic".to_string(),
@@ -10914,6 +10947,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "substring" | "substr" | "trim" | "position" | "replace" | "split_part"
         | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin"
         | "left" | "right" | "reverse"
+        // v0.95: parse_ident.
+        | "parse_ident"
         // math
         | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod"
         | "sign"
@@ -10977,6 +11012,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "array_ndims" => n == 1,
         "array_lower" | "array_upper" => n == 2,
         "unnest" => n == 1,
+        // v0.95: parse_ident(qualname text [, strict bool]).
+        "parse_ident" => n == 1 || n == 2,
         _ => false,
     };
     if ok {
@@ -11245,6 +11282,11 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 /// and no volatile sequence calls other than the recognized nextval form.
 pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
     match e {
+        // v0.95: named args make no sense in a constraint expression.
+        Expr::NamedArg { .. } => Err(err(format!(
+            "cannot use named argument in {} constraint",
+            what
+        ))),
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
         Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
@@ -11434,6 +11476,8 @@ fn encode_literal(lit: &Literal, out: &mut String) {
 
 fn encode_expr_inner(e: &Expr, out: &mut String) {
     match e {
+        // v0.95: named args encode transparently.
+        Expr::NamedArg { expr, .. } => encode_expr_inner(expr, out),
         Expr::Column { table, name } => {
             out.push_str("(col ");
             sexpr_escape(table.as_deref().unwrap_or(""), out);
