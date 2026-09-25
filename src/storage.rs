@@ -4913,6 +4913,11 @@ pub struct Database {
     /// DDL on them is still statement-atomic via the txn undo log
     /// (`WriteOp::CreateTempTable` / `WriteOp::DropTempTable`).
     pub temp_tables: HashMap<u64, HashMap<String, Table, FxBuildHasher>, FxBuildHasher>,
+    /// v0.87: session-local temporary indexes, keyed by session id then
+    /// index name. Like temp tables, these shadow nothing (index names
+    /// are session-scoped for temp tables) and are dropped when the
+    /// session ends. Never checkpointed, never WAL-logged.
+    pub temp_indexes: HashMap<u64, HashMap<String, Index, FxBuildHasher>, FxBuildHasher>,
     /// Secondary indexes by index name (v0.8). DDL is transactional: each
     /// definition carries creator/deleter xids, and entries for
     /// uncommitted row versions are filtered by visibility at scan time.
@@ -4928,12 +4933,11 @@ pub struct Database {
     /// they vanished on restart.) Types carry no xid, so a checkpoint
     /// may snapshot an uncommitted CREATE TYPE — a known minor gap.
     pub types: HashMap<String, ShellType, FxBuildHasher>,
-    /// v0.86: functions by name. A name maps to one definition —
-    /// overloads (same name, different arity) are rejected at CREATE
-    /// time (42723), so the key is the bare name. DDL is
-    /// transactional via WriteOp undo; committed definitions are
-    /// WAL-logged and checkpointed.
-    pub functions: HashMap<String, FuncDef, FxBuildHasher>,
+    /// v0.87: functions by name; each name maps to its overload list
+    /// (same name, different argument signatures). DDL is transactional
+    /// via WriteOp undo; committed definitions are WAL-logged and
+    /// checkpointed.
+    pub functions: HashMap<String, Vec<FuncDef>, FxBuildHasher>,
     /// v0.86: operators by name; each name maps to the (usually
     /// single) definitions for its arities. Transactional, WAL-logged
     /// and checkpointed like functions.
@@ -5076,6 +5080,7 @@ impl Database {
             db_acl: Vec::new(),
             // v0.22: session-local TEMP tables live here, keyed by session id.
             temp_tables: HashMap::default(),
+            temp_indexes: HashMap::default(),
             // v0.22: bounded shell-type registry.
             types: HashMap::default(),
             // v0.86: user-defined functions and operators.
@@ -5191,6 +5196,8 @@ impl Database {
     /// permanent table, and deleting it would corrupt that table.
     pub fn drop_session_temps(&mut self, session: u64) {
         self.temp_tables.remove(&session);
+        // v0.87: drop the session's temp indexes too.
+        self.temp_indexes.remove(&session);
     }
 
     /// The table version created by `own` (for WAL logging of DDL).
@@ -5312,13 +5319,20 @@ impl Database {
         own: u64,
         session: u64,
     ) -> Vec<&Index> {
-        // v0.22: temp tables never have entries in the global index map
-        // (their PRIMARY KEY / UNIQUE constraints are enforced by a
-        // session-local scan instead), so no index is visible for them.
-        // Without this, a temp table would "see" a same-named permanent
-        // table's indexes and read the wrong rows.
+        // v0.87: temp tables use the session-local temp index map. A temp
+        // table must never see a same-named permanent table's indexes.
         if self.is_temp_table(session, table) {
-            return Vec::new();
+            let mut out: Vec<&Index> = self
+                .temp_indexes
+                .get(&session)
+                .map(|m| {
+                    m.values()
+                        .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, own))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+            return out;
         }
         let mut out: Vec<&Index> = self
             .indexes
@@ -5598,7 +5612,7 @@ impl Database {
 
 /// Index DDL visibility: like a table version, but definitions are stored
 /// flat (one live definition per name at a time — enforced at commit).
-fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
+pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
     let created_ok = def.created_xmin == own
         || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
     if !created_ok {
@@ -6421,6 +6435,8 @@ pub enum WriteOp {
     // Committed DDL is WAL-logged and checkpointed.
     CreateFunction {
         name: String,
+        /// v0.87: the specific overload that was added (for precise undo).
+        added: FuncDef,
         prev: Option<FuncDef>,
     },
     DropFunction {
@@ -6441,6 +6457,17 @@ pub enum WriteOp {
         name: String,
     },
     DropIndex {
+        name: String,
+        index: Index,
+    },
+    /// v0.87: temp index DDL (session-local). Like temp tables, these are
+    /// never WAL-logged and vanish with the session.
+    CreateTempIndex {
+        session: u64,
+        name: String,
+    },
+    DropTempIndex {
+        session: u64,
         name: String,
         index: Index,
     },
@@ -6627,14 +6654,37 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         },
         // --- v0.86: function/operator DDL undos. Restore the previous
         // entry, or remove the name when there was none.
-        WriteOp::CreateFunction { name, prev } | WriteOp::DropFunction { name, prev } => match prev
-        {
-            Some(f) => {
-                eng.db.functions.insert(name.clone(), f.clone());
+        // v0.87: function DDL undo is overload-aware. `prev` is the
+        // specific overload that was replaced (CREATE OR REPLACE) or
+        // dropped (DROP).
+        WriteOp::CreateFunction { name, added, prev } => {
+            let overloads = eng.db.functions.entry(name.clone()).or_default();
+            // Remove the specific overload that was added, by signature.
+            overloads.retain(|e| {
+                !(e.arg_types.len() == added.arg_types.len()
+                    && e.arg_types
+                        .iter()
+                        .zip(added.arg_types.iter())
+                        .all(|(a, b)| a == b))
+            });
+            // Restore the replaced overload, if any.
+            if let Some(f) = prev {
+                overloads.push(f.clone());
             }
-            None => {
+            if overloads.is_empty() {
                 eng.db.functions.remove(name);
             }
+        }
+        WriteOp::DropFunction { name, prev } => match prev {
+            Some(f) => {
+                // Re-insert the dropped overload.
+                eng.db
+                    .functions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(f.clone());
+            }
+            None => {}
         },
         WriteOp::CreateOperator { name, prev } | WriteOp::DropOperator { name, prev } => {
             if prev.is_empty() {
@@ -6668,6 +6718,42 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .unwrap_or(false);
             if ours {
                 eng.db.indexes.insert(name.clone(), index.clone());
+            }
+        }
+        WriteOp::CreateTempIndex { session, name } => {
+            // Undo a CREATE INDEX on a temp table: drop iff still ours.
+            let ours = eng
+                .db
+                .temp_indexes
+                .get(session)
+                .and_then(|m| m.get(name))
+                .map(|ix| ix.def.created_xmin == own)
+                .unwrap_or(false);
+            if ours {
+                if let Some(m) = eng.db.temp_indexes.get_mut(session) {
+                    m.remove(name);
+                }
+            }
+        }
+        WriteOp::DropTempIndex {
+            session,
+            name,
+            index,
+        } => {
+            // Undo a DROP INDEX on a temp table: restore iff still ours.
+            let ours = eng
+                .db
+                .temp_indexes
+                .get(session)
+                .and_then(|m| m.get(name))
+                .map(|ix| ix.def.dropped_xmax == own)
+                .unwrap_or(false);
+            if ours {
+                eng.db
+                    .temp_indexes
+                    .entry(*session)
+                    .or_default()
+                    .insert(name.clone(), index.clone());
             }
         }
         // --- v0.9 undos ---

@@ -2701,7 +2701,10 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::CreateFunction { .. }
             | WriteOp::DropFunction { .. }
             | WriteOp::CreateOperator { .. }
-            | WriteOp::DropOperator { .. } => continue,
+            | WriteOp::DropOperator { .. }
+            // v0.87: temp index DDL leaves no dead row versions to reap.
+            | WriteOp::CreateTempIndex { .. }
+            | WriteOp::DropTempIndex { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);

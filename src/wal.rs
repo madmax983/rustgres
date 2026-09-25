@@ -485,6 +485,8 @@ pub enum WalRecord {
     },
     DropFunction {
         name: String,
+        /// v0.87: the specific overload's argument types.
+        arg_types: Vec<String>,
         xmax: u64,
     },
     CreateOperator {
@@ -1712,9 +1714,17 @@ impl Enc {
                 self.u8(if *strict { 1 } else { 0 });
                 self.u64(*xmin);
             }
-            WalRecord::DropFunction { name, xmax } => {
+            WalRecord::DropFunction {
+                name,
+                arg_types,
+                xmax,
+            } => {
                 self.u8(25);
                 self.str(name);
+                self.u32(arg_types.len() as u32);
+                for t in arg_types {
+                    self.str(t);
+                }
                 self.u64(*xmax);
             }
             WalRecord::CreateOperator { name, defs, xmin } => {
@@ -2575,8 +2585,17 @@ impl<'a> Dec<'a> {
             }
             25 => {
                 let name = self.str()?;
+                let n_args = self.u32()? as usize;
+                let mut arg_types = Vec::with_capacity(n_args);
+                for _ in 0..n_args {
+                    arg_types.push(self.str()?);
+                }
                 let xmax = self.u64()?;
-                Ok(WalRecord::DropFunction { name, xmax })
+                Ok(WalRecord::DropFunction {
+                    name,
+                    arg_types,
+                    xmax,
+                })
             }
             26 => {
                 let name = self.str()?;
@@ -3020,9 +3039,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             let parsed = crate::sql::parse_statement(body)
                 .map_err(|e| format!("corrupt function body in WAL: {:?}", e))
                 .ok();
-            eng.db.functions.insert(
-                name.clone(),
-                crate::storage::FuncDef {
+            // v0.87: replay appends to the overload list (replacing any
+            // existing overload with the same signature).
+            {
+                let def = crate::storage::FuncDef {
                     name: name.clone(),
                     arg_names: arg_names.clone(),
                     arg_types: arg_types.clone(),
@@ -3033,14 +3053,30 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     parsed,
                     volatility,
                     strict: *strict,
-                },
-            );
+                };
+                let overloads = eng.db.functions.entry(name.clone()).or_default();
+                if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
+                    *slot = def;
+                } else {
+                    overloads.push(def);
+                }
+            }
         }
-        WalRecord::DropFunction { name, xmax } => {
+        WalRecord::DropFunction {
+            name,
+            arg_types,
+            xmax,
+        } => {
             if *xmax >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmax + 1;
             }
-            eng.db.functions.remove(name);
+            // v0.87: remove the specific overload by signature.
+            if let Some(overloads) = eng.db.functions.get_mut(name) {
+                overloads.retain(|f| &f.arg_types != arg_types);
+                if overloads.is_empty() {
+                    eng.db.functions.remove(name);
+                }
+            }
         }
         WalRecord::CreateOperator { name, defs, xmin } => {
             if *xmin >= eng.txns.next_xid {
@@ -4101,8 +4137,15 @@ pub fn records_for_commit(
             // from the catalog maps, which the executor updated; absent
             // means a later DROP in the same txn removed it, so only
             // the drop is logged.
-            WriteOp::CreateFunction { name, .. } => {
-                if let Some(f) = eng.db.functions.get(name) {
+            // v0.87: WAL-log the specific overload that was added.
+            WriteOp::CreateFunction { name, added, .. } => {
+                if eng
+                    .db
+                    .functions
+                    .get(name)
+                    .is_some_and(|ovs| ovs.iter().any(|f| f.arg_types == added.arg_types))
+                {
+                    let f = added;
                     out.push(WalRecord::CreateFunction {
                         name: name.clone(),
                         arg_names: f.arg_names.clone(),
@@ -4125,9 +4168,15 @@ pub fn records_for_commit(
                 }
                 i += 1;
             }
-            WriteOp::DropFunction { name, .. } => {
+            // v0.87: WAL-log the specific overload's signature.
+            WriteOp::DropFunction { name, prev, .. } => {
+                let arg_types = prev
+                    .as_ref()
+                    .map(|f| f.arg_types.clone())
+                    .unwrap_or_default();
                 out.push(WalRecord::DropFunction {
                     name: name.clone(),
+                    arg_types,
                     xmax: own,
                 });
                 i += 1;
@@ -4188,6 +4237,12 @@ pub fn records_for_commit(
                     internal: ix.def.internal,
                     xmin: own,
                 });
+            }
+            // v0.87: temp index DDL is never WAL-logged (session-local,
+            // dies with the session, like temp tables).
+            WriteOp::CreateTempIndex { .. } | WriteOp::DropTempIndex { .. } => {
+                i += 1;
+                continue;
             }
             WriteOp::DropIndex { name, .. } => {
                 let won = eng
@@ -4884,39 +4939,43 @@ impl Wal {
         // xid; snapshotting the live map is strictly better than
         // dropping them (an uncommitted CREATE FUNCTION caught by a
         // checkpoint is a known minor gap, as with types).
+        // v0.87: checkpoint each overload.
         let mut f_names: Vec<&String> = eng.db.functions.keys().collect();
         f_names.sort();
         img.u32(f_names.len() as u32);
         for name in f_names {
-            let f = &eng.db.functions[name];
+            let overloads = &eng.db.functions[name];
             img.str(name);
-            img.u32(f.arg_names.len() as u32);
-            for n in &f.arg_names {
-                match n {
-                    Some(s) => {
-                        img.u8(1);
-                        img.str(s);
+            img.u32(overloads.len() as u32);
+            for f in overloads {
+                img.u32(f.arg_names.len() as u32);
+                for n in &f.arg_names {
+                    match n {
+                        Some(s) => {
+                            img.u8(1);
+                            img.str(s);
+                        }
+                        None => img.u8(0),
                     }
-                    None => img.u8(0),
                 }
+                img.u32(f.arg_types.len() as u32);
+                for t in &f.arg_types {
+                    img.str(t);
+                }
+                img.str(&f.ret_type);
+                img.u8(if f.returns_set { 1 } else { 0 });
+                img.u8(match f.lang {
+                    crate::sql::FuncLang::Sql => 0,
+                    crate::sql::FuncLang::Internal => 1,
+                });
+                img.str(&f.body);
+                img.u8(match f.volatility {
+                    crate::sql::FuncVolatility::Volatile => 0,
+                    crate::sql::FuncVolatility::Stable => 1,
+                    crate::sql::FuncVolatility::Immutable => 2,
+                });
+                img.u8(if f.strict { 1 } else { 0 });
             }
-            img.u32(f.arg_types.len() as u32);
-            for t in &f.arg_types {
-                img.str(t);
-            }
-            img.str(&f.ret_type);
-            img.u8(if f.returns_set { 1 } else { 0 });
-            img.u8(match f.lang {
-                crate::sql::FuncLang::Sql => 0,
-                crate::sql::FuncLang::Internal => 1,
-            });
-            img.str(&f.body);
-            img.u8(match f.volatility {
-                crate::sql::FuncVolatility::Volatile => 0,
-                crate::sql::FuncVolatility::Stable => 1,
-                crate::sql::FuncVolatility::Immutable => 2,
-            });
-            img.u8(if f.strict { 1 } else { 0 });
         }
 
         // v0.86: user-defined operators (`eng.db.operators`), same
@@ -5538,46 +5597,47 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             },
         );
     }
-    // v0.86: user-defined functions.
+    // v0.87: user-defined functions (overload lists).
     let n_funcs = d.u32().map_err(|e| bad(&e))? as usize;
     for _ in 0..n_funcs {
         let name = d.str().map_err(|e| bad(&e))?;
-        let n = d.u32().map_err(|e| bad(&e))? as usize;
-        let mut arg_names = Vec::with_capacity(n);
-        for _ in 0..n {
-            arg_names.push(if d.u8().map_err(|e| bad(&e))? != 0 {
-                Some(d.str().map_err(|e| bad(&e))?)
-            } else {
-                None
-            });
-        }
-        let n = d.u32().map_err(|e| bad(&e))? as usize;
-        let mut arg_types = Vec::with_capacity(n);
-        for _ in 0..n {
-            arg_types.push(d.str().map_err(|e| bad(&e))?);
-        }
-        let ret_type = d.str().map_err(|e| bad(&e))?;
-        let returns_set = d.u8().map_err(|e| bad(&e))? != 0;
-        let lang = match d.u8().map_err(|e| bad(&e))? {
-            0 => crate::sql::FuncLang::Sql,
-            1 => crate::sql::FuncLang::Internal,
-            b => return Err(bad(&format!("corrupt function language {}", b))),
-        };
-        let body = d.str().map_err(|e| bad(&e))?;
-        let volatility = match d.u8().map_err(|e| bad(&e))? {
-            0 => crate::sql::FuncVolatility::Volatile,
-            1 => crate::sql::FuncVolatility::Stable,
-            2 => crate::sql::FuncVolatility::Immutable,
-            b => return Err(bad(&format!("corrupt function volatility {}", b))),
-        };
-        let strict = d.u8().map_err(|e| bad(&e))? != 0;
-        let parsed = crate::sql::parse_statement(&body)
-            .map_err(|e| bad(&format!("corrupt function body: {:?}", e)))
-            .ok();
-        eng.db.functions.insert(
-            name.clone(),
-            crate::storage::FuncDef {
-                name,
+        let n_overloads = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut overloads = Vec::with_capacity(n_overloads);
+        for _ in 0..n_overloads {
+            let n = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut arg_names = Vec::with_capacity(n);
+            for _ in 0..n {
+                arg_names.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                    Some(d.str().map_err(|e| bad(&e))?)
+                } else {
+                    None
+                });
+            }
+            let n = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut arg_types = Vec::with_capacity(n);
+            for _ in 0..n {
+                arg_types.push(d.str().map_err(|e| bad(&e))?);
+            }
+            let ret_type = d.str().map_err(|e| bad(&e))?;
+            let returns_set = d.u8().map_err(|e| bad(&e))? != 0;
+            let lang = match d.u8().map_err(|e| bad(&e))? {
+                0 => crate::sql::FuncLang::Sql,
+                1 => crate::sql::FuncLang::Internal,
+                b => return Err(bad(&format!("corrupt function language {}", b))),
+            };
+            let body = d.str().map_err(|e| bad(&e))?;
+            let volatility = match d.u8().map_err(|e| bad(&e))? {
+                0 => crate::sql::FuncVolatility::Volatile,
+                1 => crate::sql::FuncVolatility::Stable,
+                2 => crate::sql::FuncVolatility::Immutable,
+                b => return Err(bad(&format!("corrupt function volatility {}", b))),
+            };
+            let strict = d.u8().map_err(|e| bad(&e))? != 0;
+            let parsed = crate::sql::parse_statement(&body)
+                .map_err(|e| bad(&format!("corrupt function body: {:?}", e)))
+                .ok();
+            overloads.push(crate::storage::FuncDef {
+                name: name.clone(),
                 arg_names,
                 arg_types,
                 ret_type,
@@ -5587,8 +5647,9 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 parsed,
                 volatility,
                 strict,
-            },
-        );
+            });
+        }
+        eng.db.functions.insert(name, overloads);
     }
     // v0.86: user-defined operators.
     let n_ops = d.u32().map_err(|e| bad(&e))? as usize;

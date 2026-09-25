@@ -940,6 +940,21 @@ pub enum CmpOp {
     ImageEq,
 }
 
+/// v0.87: the operator in an `Expr::Quantified` — either a builtin
+/// comparison or a user-defined operator name (e.g. `?=`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuantOp {
+    Cmp(CmpOp),
+    User(String),
+}
+
+/// v0.87: `ANY`/`SOME` (existential) vs `ALL` (universal) quantification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantKind {
+    Any,
+    All,
+}
+
 impl CmpOp {
     pub fn sql(&self) -> &'static str {
         match self {
@@ -1199,11 +1214,31 @@ pub enum Expr {
     WholeRow {
         qual: String,
     },
-    /// `[NOT] IN (subquery)`.
+    /// `[NOT] IN (subquery)`. v0.87: `expr` may be an `Expr::Row` for
+    /// row-wise `[NOT] IN (SELECT ...)` (PG19).
     InSub {
         expr: Box<Expr>,
         sub: Box<SelectStmt>,
         neg: bool,
+    },
+    /// v0.87: quantified comparison `expr op ANY|ALL|SOME (subquery)`
+    /// (PG19) for operators beyond `= ANY`/`<> ALL` (which desugar to
+    /// `InSub`). `left` may be an `Expr::Row` for row-wise quantification.
+    /// `op` is a builtin `CmpOp` or a user-defined operator name.
+    Quantified {
+        left: Box<Expr>,
+        op: QuantOp,
+        quant: QuantKind,
+        sub: Box<SelectStmt>,
+    },
+    /// v0.87: user-defined binary operator `left OP right` (PG19), e.g.
+    /// `?=` from `CREATE OPERATOR`. Resolved at plan time by
+    /// (name, leftarg, rightarg); evaluated by calling the operator's
+    /// procedure.
+    UserOp {
+        op: String,
+        left: Box<Expr>,
+        right: Box<Expr>,
     },
     /// `[NOT] EXISTS (subquery)`.
     Exists {
@@ -1299,13 +1334,17 @@ pub enum FromItem {
         col_aliases: Vec<String>,
     },
     /// v0.32: `func(args) [AS] alias [(cols)]` — set-returning table
-    /// function (currently `regexp_split_to_table`). Correlated (LATERAL)
-    /// references are not supported: args see the outer scope only.
+    /// function. v0.46: a function whose args reference earlier FROM
+    /// items is evaluated once per left row (implicit LATERAL, PG19).
+    /// v0.87: explicit `LATERAL` before a table function is accepted
+    /// (PG19); an uncorrelated function under explicit LATERAL is a
+    /// plain cross join either way.
     Function {
         name: String,
         args: Vec<Expr>,
         alias: Option<String>,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     Join {
         left: Box<FromItem>,
@@ -2305,6 +2344,13 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::ResolvedCol { .. } => {}
+        // v0.87: quantified comparison — the left side is outer-scope
+        // (the subquery has its own scope, like InSub).
+        Expr::Quantified { left, .. } => collect_col_refs(left, out),
+        Expr::UserOp { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
         // v0.79: array expressions — collect from elements/operands.
         Expr::ArrayCtor { elems, .. } => {
             for e in elems {
@@ -2557,6 +2603,8 @@ pub enum Stmt {
         name: String,
         arg_types: Vec<String>,
         if_exists: bool,
+        /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
+        cascade: bool,
     },
     /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
     DropOperator {
@@ -2564,6 +2612,8 @@ pub enum Stmt {
         leftarg: Option<String>,
         rightarg: Option<String>,
         if_exists: bool,
+        /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
+        cascade: bool,
     },
     // --- v0.86: CREATE OPERATOR (bounded): registers a user-defined
     // operator name mapping to a function (`PROCEDURE`). Only the
@@ -3172,6 +3222,9 @@ fn max_param_expr(e: &Expr) -> usize {
         Expr::ScalarSub(s) => max_param_select(s),
         Expr::ArraySubquery(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
+        // v0.87: quantified comparison and user operator.
+        Expr::Quantified { left, sub, .. } => max_param_expr(left).max(max_param_select(sub)),
+        Expr::UserOp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Exists { sub, .. } => max_param_select(sub),
         // v0.10: window functions.
         Expr::Window {
@@ -5418,10 +5471,18 @@ impl Parser {
         } else {
             self.next(); // ')'
         }
+        // v0.87: optional CASCADE / RESTRICT (PG19; RESTRICT default).
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
         Ok(Stmt::DropFunction {
             name,
             arg_types,
             if_exists,
+            cascade,
         })
     }
 
@@ -5441,11 +5502,19 @@ impl Parser {
         self.expect(Token::Comma, "','")?;
         let rightarg = self.parse_op_arg_type()?;
         self.expect(Token::RParen, "')'")?;
+        // v0.87: optional CASCADE / RESTRICT (PG19; RESTRICT default).
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
         Ok(Stmt::DropOperator {
             name,
             leftarg,
             rightarg,
             if_exists,
+            cascade,
         })
     }
 
@@ -6657,8 +6726,15 @@ impl Parser {
                 // v0.54: `IN (VALUES (v1), (v2), ...)` — a VALUES list
                 // desugars exactly like a value list. Each row must hold
                 // one column (like PG's "subquery has too many columns").
+                // v0.87: row-wise `(a, b) IN (VALUES ...)` desugars to an
+                // OR of ANDed equalities (the old parse_row_in logic,
+                // now reached via `Expr::Row`).
                 self.next();
                 let rows = self.parse_values_rows()?;
+                self.expect(Token::RParen, "')'")?;
+                if let Expr::Row(row_items) = &left {
+                    return self.desugar_row_in_values(row_items.clone(), rows, neg);
+                }
                 let mut items = Vec::with_capacity(rows.len());
                 for row in rows {
                     if row.len() != 1 {
@@ -6669,7 +6745,6 @@ impl Parser {
                     }
                     items.push(row.into_iter().next().unwrap());
                 }
-                self.expect(Token::RParen, "')'")?;
                 items
             } else {
                 let mut items = vec![self.parse_or()?];
@@ -6680,6 +6755,25 @@ impl Parser {
                 self.expect(Token::RParen, "')'")?;
                 items
             };
+            // v0.87: row-wise `(a, b) IN ((1, 2), (3, 4))` — the list items
+            // must be row constructors of matching arity; desugars like
+            // the VALUES form.
+            if let Expr::Row(row_items) = &left {
+                let n = row_items.len();
+                let mut rows: Vec<Vec<Expr>> = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Expr::Row(elems) if elems.len() == n => rows.push(elems),
+                        _ => {
+                            return Err(err(
+                                "syntax error: row-wise IN list items must be row constructors of matching arity"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                return self.desugar_row_in_values(row_items.clone(), rows, neg);
+            }
             let mut expr = Expr::Cmp {
                 op: CmpOp::Eq,
                 left: Box::new(left.clone()),
@@ -6700,15 +6794,18 @@ impl Parser {
             }
             return Ok(expr);
         }
-        let op = match self.peek() {
-            Token::Eq => Some(CmpOp::Eq),
-            Token::Neq => Some(CmpOp::Ne),
-            Token::Lt => Some(CmpOp::Lt),
-            Token::LtEq => Some(CmpOp::Le),
-            Token::Gt => Some(CmpOp::Gt),
-            Token::GtEq => Some(CmpOp::Ge),
+        let op: Option<QuantOp> = match self.peek() {
+            Token::Eq => Some(QuantOp::Cmp(CmpOp::Eq)),
+            Token::Neq => Some(QuantOp::Cmp(CmpOp::Ne)),
+            Token::Lt => Some(QuantOp::Cmp(CmpOp::Lt)),
+            Token::LtEq => Some(QuantOp::Cmp(CmpOp::Le)),
+            Token::Gt => Some(QuantOp::Cmp(CmpOp::Gt)),
+            Token::GtEq => Some(QuantOp::Cmp(CmpOp::Ge)),
             // v0.81: `*=` record-image equality.
-            Token::StarEq => Some(CmpOp::ImageEq),
+            Token::StarEq => Some(QuantOp::Cmp(CmpOp::ImageEq)),
+            // v0.87: user-defined operator (e.g. `?=` from CREATE
+            // OPERATOR) in expression position (PG19).
+            Token::Op(name) => Some(QuantOp::User(name.clone())),
             _ => None,
         };
         let mut expr = match op {
@@ -6716,6 +6813,7 @@ impl Parser {
                 self.next();
                 // v0.76: quantified comparisons `op ANY|ALL|SOME (...)`
                 // (PG19). The operand is a subquery or a VALUES list.
+                // v0.87: `op` may be a user-defined operator.
                 if matches!(self.peek(), Token::Ident(s) if s == "any" || s == "all" || s == "some")
                 {
                     let quant = if let Token::Ident(s) = self.next() {
@@ -6725,11 +6823,23 @@ impl Parser {
                     };
                     return self.parse_quantified(left, op, &quant);
                 }
-                let right = self.parse_bitor()?;
-                Expr::Cmp {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
+                match op {
+                    QuantOp::Cmp(cmp) => {
+                        let right = self.parse_bitor()?;
+                        Expr::Cmp {
+                            op: cmp,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    }
+                    QuantOp::User(name) => {
+                        let right = self.parse_bitor()?;
+                        Expr::UserOp {
+                            op: name,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    }
                 }
             }
             None => left,
@@ -6788,15 +6898,51 @@ impl Parser {
     /// quantified comparison (PG19). `ANY`/`SOME` desugar to an OR chain,
     /// `ALL` to an AND chain, preserving PG's three-valued logic. A
     /// `VALUES` list must hold single-column rows. `= ANY (SELECT ...)`
-    /// is `IN`, `<> ALL (SELECT ...)` is `NOT IN`; other operators over
-    /// a subquery are not supported yet.
-    fn parse_quantified(&mut self, left: Expr, op: CmpOp, quant: &str) -> Result<Expr, SqlError> {
+    /// is `IN`, `<> ALL (SELECT ...)` is `NOT IN`.
+    /// v0.87: other operators (and user-defined operators like `?=`)
+    /// over a subquery produce `Expr::Quantified`, evaluated by the
+    /// executor with PG's three-valued logic. `left` may be an
+    /// `Expr::Row` for row-wise quantification.
+    fn parse_quantified(&mut self, left: Expr, op: QuantOp, quant: &str) -> Result<Expr, SqlError> {
+        let quant_kind = if quant == "all" {
+            QuantKind::All
+        } else {
+            QuantKind::Any
+        };
         self.expect(Token::LParen, "'('")?;
         // VALUES list form.
         if matches!(self.peek(), Token::Ident(s) if s == "values") {
             self.next();
             let rows = self.parse_values_rows()?;
             self.expect(Token::RParen, "')'")?;
+            // v0.87: row-wise `(a, b) = ANY (VALUES ...)` desugars via
+            // the row-IN path; other row-wise ops over VALUES are 0A000.
+            if let Expr::Row(row_items) = &left {
+                match (&op, quant_kind) {
+                    (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
+                        return self.desugar_row_in_values(row_items.clone(), rows, false);
+                    }
+                    (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
+                        return self.desugar_row_in_values(row_items.clone(), rows, true);
+                    }
+                    _ => {
+                        return Err(SqlError {
+                            message: "row-wise quantified comparison over VALUES is not supported"
+                                .to_string(),
+                            code: "0A000",
+                        });
+                    }
+                }
+            }
+            let op = match op {
+                QuantOp::Cmp(c) => c,
+                QuantOp::User(_) => {
+                    return Err(SqlError {
+                        message: "user-defined operator over VALUES is not supported".to_string(),
+                        code: "0A000",
+                    });
+                }
+            };
             let mut items = Vec::with_capacity(rows.len());
             for row in rows {
                 if row.len() != 1 {
@@ -6830,7 +6976,7 @@ impl Parser {
             }
             return Ok(expr);
         }
-        // Subquery form: only `= ANY/SOME` and `<> ALL` desugar cleanly.
+        // Subquery form.
         if !matches!(self.peek(), Token::Ident(s) if s == "select") {
             return Err(err(
                 "syntax error: expected SELECT or VALUES after ANY/ALL/SOME".to_string(),
@@ -6838,19 +6984,30 @@ impl Parser {
         }
         let sub = self.parse_subquery()?;
         self.expect(Token::RParen, "')'")?;
-        let is_eq = matches!(op, CmpOp::Eq);
-        let is_ne = matches!(op, CmpOp::Ne);
-        if (quant == "all" && is_ne) || ((quant == "any" || quant == "some") && is_eq) {
-            return Ok(Expr::InSub {
-                expr: Box::new(left),
-                sub: Box::new(sub),
-                neg: quant == "all",
-            });
+        // `= ANY/SOME` is `IN`, `<> ALL` is `NOT IN` (scalar or row-wise).
+        match (&op, quant_kind) {
+            (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
+                return Ok(Expr::InSub {
+                    expr: Box::new(left),
+                    sub: Box::new(sub),
+                    neg: false,
+                });
+            }
+            (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
+                return Ok(Expr::InSub {
+                    expr: Box::new(left),
+                    sub: Box::new(sub),
+                    neg: true,
+                });
+            }
+            _ => {}
         }
-        Err(err(format!(
-            "quantified comparison with operator {:?} over a subquery is not supported",
-            op
-        )))
+        Ok(Expr::Quantified {
+            left: Box::new(left),
+            op,
+            quant: quant_kind,
+            sub: Box::new(sub),
+        })
     }
 
     /// `SELECT ...` inside parentheses (the `SELECT` keyword not yet consumed).
@@ -7207,10 +7364,12 @@ impl Parser {
                         self.allow_similar_to = save_similar;
                         let first = first?;
                         if *self.peek() == Token::Comma {
-                            // v0.54: row constructor `(e1, e2, ...)`. The
-                            // only supported use is row-wise
-                            // `[NOT] IN (VALUES ...)`, desugared here;
-                            // anything else is a syntax error.
+                            // v0.87: row constructor `(e1, e2, ...)` (PG19).
+                            // Produces `Expr::Row`; the `[NOT] IN`,
+                            // `ANY`/`ALL` handlers deal with it (row-wise
+                            // comparisons). Previously this only allowed
+                            // row-wise `[NOT] IN (VALUES ...)` and errored
+                            // otherwise.
                             let mut items = vec![first];
                             while *self.peek() == Token::Comma {
                                 self.next();
@@ -7221,7 +7380,7 @@ impl Parser {
                                 items.push(e?);
                             }
                             self.expect(Token::RParen, "')'")?;
-                            return self.parse_row_in(items);
+                            return Ok(Expr::Row(items));
                         }
                         self.expect(Token::RParen, "')'")?;
                         Ok(first)
@@ -7440,23 +7599,18 @@ impl Parser {
     /// three-valued row-comparison logic. Any other use of a row
     /// constructor — including row-wise `IN (subquery)` — is a syntax
     /// error here.
-    fn parse_row_in(&mut self, items: Vec<Expr>) -> Result<Expr, SqlError> {
-        let neg = if self.eat_keyword("not") {
-            self.expect_keyword("in")?;
-            true
-        } else {
-            self.expect_keyword("in")?;
-            false
-        };
-        self.expect(Token::LParen, "'('")?;
-        if !matches!(self.peek(), Token::Ident(s) if s == "values") {
-            return Err(err(
-                "syntax error: row-wise IN with a subquery is not supported".to_string(),
-            ));
-        }
-        self.next();
-        let rows = self.parse_values_rows()?;
-        self.expect(Token::RParen, "')'")?;
+    /// v0.87: row-wise `(a, b, ...) [NOT] IN (VALUES ...)` desugared to
+    /// an OR of ANDed equalities, preserving PG's three-valued logic
+    /// (NULL comparisons propagate through AND/OR). Refactored from the
+    /// v0.54 `parse_row_in` (which consumed the `IN (VALUES ...)` itself);
+    /// the row now arrives as `Expr::Row` and the VALUES rows are parsed
+    /// by the caller.
+    fn desugar_row_in_values(
+        &mut self,
+        items: Vec<Expr>,
+        rows: Vec<Vec<Expr>>,
+        neg: bool,
+    ) -> Result<Expr, SqlError> {
         let n = items.len();
         let mut expr: Option<Expr> = None;
         for row in rows {
@@ -8818,6 +8972,16 @@ impl Parser {
         };
         let mut items = Vec::new();
         loop {
+            // v0.87: zero-target-list SELECT (`SELECT WHERE false`): if no
+            // items yet and WHERE follows, stop (PG19 allows it). Other
+            // clauses (FROM/GROUP/etc.) still require a target list.
+            if items.is_empty() {
+                if let Token::Ident(kw) = self.peek() {
+                    if kw.as_str() == "where" {
+                        break;
+                    }
+                }
+            }
             // `*`
             if *self.peek() == Token::Star {
                 self.next();
@@ -8848,8 +9012,13 @@ impl Parser {
             }
             break;
         }
+        // v0.87: PG19 allows a zero-target-list SELECT (`SELECT WHERE
+        // false`); the empty list is only valid if WHERE follows.
         if items.is_empty() {
-            return Err(err("syntax error: SELECT requires a select list"));
+            let ok = matches!(self.peek(), Token::Ident(s) if s.as_str() == "where");
+            if !ok {
+                return Err(err("syntax error: SELECT requires a select list"));
+            }
         }
         let from = if self.eat_keyword("from") {
             self.parse_from()?
@@ -9572,6 +9741,10 @@ impl Parser {
     }
 
     fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
+        // v0.87: explicit `LATERAL` (PG19). Only table functions are
+        // supported under it; LATERAL derived tables / plain tables get
+        // an honest 0A000 below.
+        let lateral = self.eat_keyword("lateral");
         if *self.peek() == Token::LParen {
             self.next();
             // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
@@ -9741,6 +9914,14 @@ impl Parser {
                 // non-parenthesized branch with alias already set).
                 FromItem::Function { .. } => {}
             }
+            // v0.87: explicit LATERAL only supports table functions;
+            // `LATERAL (subquery)` / `LATERAL (VALUES ...)` is 0A000.
+            if lateral {
+                return Err(SqlError {
+                    message: "LATERAL is only supported on table functions".to_string(),
+                    code: "0A000",
+                });
+            }
             Ok(item)
         } else {
             let name = self.expect_ident()?;
@@ -9774,11 +9955,20 @@ impl Parser {
                     args,
                     alias,
                     col_aliases,
+                    lateral,
                 });
             }
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
             let col_aliases = self.parse_col_alias_list()?;
+            // v0.87: explicit LATERAL is only supported on table
+            // functions; `LATERAL tbl` / `LATERAL (subquery)` is 0A000.
+            if lateral {
+                return Err(SqlError {
+                    message: "LATERAL is only supported on table functions".to_string(),
+                    code: "0A000",
+                });
+            }
             Ok(FromItem::Table {
                 name,
                 alias,
@@ -10799,9 +10989,12 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
     match e {
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
-            Err(err(format!("cannot use subquery in {} constraint", what)))
-        }
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
+        | Expr::Exists { .. } => Err(err(format!("cannot use subquery in {} constraint", what))),
         Expr::Param(_) => Err(err(format!("cannot use parameter in {} constraint", what))),
         Expr::ResolvedCol { .. } => Err(err(format!("invalid expression in {}", what))),
         Expr::Column { .. } | Expr::WholeRow { .. } | Expr::Literal(_) => Ok(()),
@@ -11259,6 +11452,8 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
         | Expr::Exists { .. }
         | Expr::Window { .. }
         | Expr::ResolvedCol { .. } => {

@@ -40,15 +40,16 @@ use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertIndirection,
-    InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm,
-    SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
-    TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
+    InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, QuantKind,
+    QuantOp, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
+    Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
     parse_statement, validate_constraint_expr,
 };
+use crate::storage::index_visible;
 use crate::storage::{
-    ArrayElem, ArrayVal, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row,
-    RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp,
-    row_visible, toast_consts, toast_storage,
+    ArrayElem, ArrayVal, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial,
+    OperDef, Row, RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef,
+    WriteOp, row_visible, toast_consts, toast_storage,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -425,12 +426,14 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             name,
             arg_types,
             if_exists,
-        } => exec_drop_function(eng, ctx, name, arg_types, *if_exists),
+            cascade,
+        } => exec_drop_function(eng, ctx, name, arg_types, *if_exists, *cascade),
         Stmt::DropOperator {
             name,
             leftarg,
             rightarg,
             if_exists,
+            cascade,
         } => exec_drop_operator(
             eng,
             ctx,
@@ -438,6 +441,7 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             leftarg.as_deref(),
             rightarg.as_deref(),
             *if_exists,
+            *cascade,
         ),
         Stmt::CreateOperator {
             name,
@@ -7756,17 +7760,19 @@ fn exec_create_index(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
-    // v0.22: the global index map is keyed by table *name* and cannot
-    // represent a session-local temp table's indexes without colliding
-    // with a same-named permanent table's. Reject honestly rather than
-    // corrupt.
-    if eng.db.is_temp_table(ctx.session, table) {
-        return Err(exec_err(
-            "0A000",
-            "CREATE INDEX on temporary tables is not supported in this version",
-        ));
-    }
-    if eng.db.find_index(name, ctx.snap, ctx.own).is_some() {
+    // v0.87: temp tables use the session-local temp index map.
+    let is_temp = eng.db.is_temp_table(ctx.session, table);
+    let exists = if is_temp {
+        eng.db
+            .temp_indexes
+            .get(&ctx.session)
+            .and_then(|m| m.get(name))
+            .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+            .is_some()
+    } else {
+        eng.db.find_index(name, ctx.snap, ctx.own).is_some()
+    };
+    if exists {
         if if_not_exists {
             return Ok(ExecResult::Command {
                 tag: "CREATE INDEX".to_string(),
@@ -7859,10 +7865,22 @@ fn exec_create_index(
     }
     // `t`'s borrow ends at its last use above; the insert below needs
     // `eng.db` mutably.
-    eng.db.indexes.insert(name.to_string(), ix);
-    ctx.writes.push(WriteOp::CreateIndex {
-        name: name.to_string(),
-    });
+    if is_temp {
+        eng.db
+            .temp_indexes
+            .entry(ctx.session)
+            .or_default()
+            .insert(name.to_string(), ix);
+        ctx.writes.push(WriteOp::CreateTempIndex {
+            session: ctx.session,
+            name: name.to_string(),
+        });
+    } else {
+        eng.db.indexes.insert(name.to_string(), ix);
+        ctx.writes.push(WriteOp::CreateIndex {
+            name: name.to_string(),
+        });
+    }
     Ok(ExecResult::Command {
         tag: "CREATE INDEX".to_string(),
     })
@@ -7874,6 +7892,31 @@ fn exec_drop_index(
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.87: check session-local temp indexes first.
+    let temp_snapshot = eng
+        .db
+        .temp_indexes
+        .get(&ctx.session)
+        .and_then(|m| m.get(name))
+        .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+        .cloned();
+    if let Some(snapshot) = temp_snapshot {
+        // v0.11: dropping an index needs its table's owner (or a superuser).
+        require_table_owner(eng, ctx, &snapshot.def.table.clone())?;
+        if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+            if let Some(ix) = m.get_mut(name) {
+                ix.def.dropped_xmax = ctx.own;
+            }
+        }
+        ctx.writes.push(WriteOp::DropTempIndex {
+            session: ctx.session,
+            name: name.to_string(),
+            index: snapshot,
+        });
+        return Ok(ExecResult::Command {
+            tag: "DROP INDEX".to_string(),
+        });
+    }
     // Snapshot the definition first: the write log's undo restores it on
     // ROLLBACK, and the WAL replays the drop on commit.
     // v0.11: dropping an index needs its table's owner (or a superuser).
@@ -8667,10 +8710,13 @@ fn plan_from_item(
                     hi,
                     cond,
                 } => {
+                    // v0.87: temp indexes live in the session-local map.
                     let ix = eng
                         .db
-                        .indexes
-                        .get(&index)
+                        .temp_indexes
+                        .get(&session)
+                        .and_then(|m| m.get(&index))
+                        .or_else(|| eng.db.indexes.get(&index))
                         .expect("planned index still present; engine lock held throughout");
                     let rows = est_index_rows(
                         &eng.db,
@@ -9844,6 +9890,11 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::InSub { expr, sub, .. } => {
                 expr_uses(expr) || stmt_uses_pg_column_compression(sub)
             }
+            // v0.87: quantified comparison and user operator.
+            Expr::Quantified { left, sub, .. } => {
+                expr_uses(left) || stmt_uses_pg_column_compression(sub)
+            }
+            Expr::UserOp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Exists { sub, .. } => stmt_uses_pg_column_compression(sub),
             Expr::Window {
                 args,
@@ -10019,6 +10070,24 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
         Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
             Ok(pred.clone())
         }
+        // v0.87: quantified comparison — resolve the outer `left`, leave
+        // the subquery for runtime resolution (like InSub).
+        Expr::Quantified {
+            left,
+            op,
+            quant,
+            sub,
+        } => Ok(Expr::Quantified {
+            left: Box::new(r(left)?),
+            op: op.clone(),
+            quant: *quant,
+            sub: sub.clone(),
+        }),
+        Expr::UserOp { op, left, right } => Ok(Expr::UserOp {
+            op: op.clone(),
+            left: Box::new(r(left)?),
+            right: Box::new(r(right)?),
+        }),
         Expr::Arith { op, left, right } => Ok(Expr::Arith {
             op: *op,
             left: Box::new(r(left)?),
@@ -11781,6 +11850,10 @@ fn contains_agg(e: &Expr) -> bool {
         Expr::Func { name, args } => name == "grouping" || args.iter().any(contains_agg),
         Expr::Extract { from, .. } => contains_agg(from),
         Expr::InSub { expr, .. } => contains_agg(expr),
+        // v0.87: quantified comparison (aggregate in `left` counts; the
+        // subquery is its own level) and user operator.
+        Expr::Quantified { left, .. } => contains_agg(left),
+        Expr::UserOp { left, right, .. } => contains_agg(left) || contains_agg(right),
         // ScalarSub / ArraySubquery / Exists are separate query levels.
         Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
         // v0.10: a window counts as an aggregate when any of its input
@@ -11890,6 +11963,13 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 }
             }
             Expr::InSub { expr, .. } => stack.push(expr),
+            // v0.87: quantified comparison visits `left` (subquery is its
+            // own level); user operator visits both operands.
+            Expr::Quantified { left, .. } => stack.push(left),
+            Expr::UserOp { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
             Expr::Window {
                 args,
                 partition_by,
@@ -12126,6 +12206,10 @@ fn contains_window(e: &Expr) -> bool {
         }
         Expr::Extract { from, .. } => contains_window(from),
         Expr::InSub { expr, .. } => contains_window(expr),
+        // v0.87: quantified comparison (window in `left` counts; the
+        // subquery is its own level) and user operator.
+        Expr::Quantified { left, .. } => contains_window(left),
+        Expr::UserOp { left, right, .. } => contains_window(left) || contains_window(right),
         // Subqueries are separate query levels.
         Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
     }
@@ -12450,6 +12534,12 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
         }
         Expr::Extract { from, .. } => validate_window_expr(from, in_agg),
         Expr::InSub { expr, .. } => validate_window_expr(expr, in_agg),
+        // v0.87: quantified comparison and user operator.
+        Expr::Quantified { left, .. } => validate_window_expr(left, in_agg),
+        Expr::UserOp { left, right, .. } => {
+            validate_window_expr(left, in_agg)?;
+            validate_window_expr(right, in_agg)
+        }
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
@@ -13951,6 +14041,15 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_column_refs(expr, out);
             collect_stmt_refs(sub, out);
         }
+        // v0.87: quantified comparison and user operator.
+        Expr::Quantified { left, sub, .. } => {
+            collect_column_refs(left, out);
+            collect_stmt_refs(sub, out);
+        }
+        Expr::UserOp { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
         Expr::Exists { sub, .. } => collect_stmt_refs(sub, out),
         // v0.10: collect column refs from window inputs.
         Expr::Window {
@@ -14494,13 +14593,8 @@ fn eval_function_item(
     }
     // v0.86: user-defined functions in FROM (scalar composite-returning
     // functions expand to their fields; SETOF returns rows).
-    if let Some(fdef) = q.eng.db.functions.get(name).cloned() {
-        if fdef.arg_types.len() != arg_vals.len() {
-            return Err(exec_err(
-                "42883",
-                format!("function {}() does not exist", name),
-            ));
-        }
+    // v0.87: resolve the best overload by (name, arg count, arg types).
+    if let Some(fdef) = resolve_function_overload(q.eng, name, &arg_vals) {
         let (col_names, col_types, rows) = call_table_function(q, scopes, &fdef, &arg_vals)?;
         return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
     }
@@ -14618,21 +14712,25 @@ fn lateral_function_schema(
 ) -> Result<Vec<QCol>, ExecError> {
     // v0.86: user-defined functions in FROM (Describe path). A scalar
     // function returning a table rowtype expands to the table's columns.
-    if let Some(fdef) = eng.db.functions.get(name) {
-        if fdef.arg_types.len() == args.len() {
-            if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, own, session) {
-                let mut cols = Vec::with_capacity(t.columns.len());
-                for (idx, (cn, ct)) in t.columns.iter().enumerate() {
-                    cols.push(QCol {
-                        qual: alias.clone().unwrap_or_else(|| name.to_string()),
-                        name: cn.clone(),
-                        ty: ct.clone(),
-                        hidden: false,
-                        src_ord: idx as u32,
-                    });
-                }
-                return Ok(cols);
+    // v0.87: resolve overload by arity for the describe path.
+    if let Some(fdef) = eng
+        .db
+        .functions
+        .get(name)
+        .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
+    {
+        if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, own, session) {
+            let mut cols = Vec::with_capacity(t.columns.len());
+            for (idx, (cn, ct)) in t.columns.iter().enumerate() {
+                cols.push(QCol {
+                    qual: alias.clone().unwrap_or_else(|| name.to_string()),
+                    name: cn.clone(),
+                    ty: ct.clone(),
+                    hidden: false,
+                    src_ord: idx as u32,
+                });
             }
+            return Ok(cols);
         }
     }
     let out_names = table_function_col_names(name)?;
@@ -15008,9 +15106,12 @@ fn build_source(
                             hi,
                             ..
                         } => {
+                            // v0.87: temp indexes live in the session-local map.
                             let ix = db
-                                .indexes
-                                .get(&index)
+                                .temp_indexes
+                                .get(&q.session)
+                                .and_then(|m| m.get(&index))
+                                .or_else(|| db.indexes.get(&index))
                                 .expect("planned index still present; engine lock held throughout");
                             let ids = index_scan_ids(
                                 ix,
@@ -15051,6 +15152,7 @@ fn build_source(
             args,
             alias,
             col_aliases,
+            ..
         } => eval_function_item(q, outer, name, args, alias, col_aliases),
         FromItem::Derived {
             sub,
@@ -15207,7 +15309,8 @@ fn build_source(
                             args,
                             alias: falias,
                             col_aliases,
-                        } if function_args_lateral(args, &lschema0) => Some((
+                            lateral,
+                        } if *lateral || function_args_lateral(args, &lschema0) => Some((
                             name.as_str(),
                             args.as_slice(),
                             falias,
@@ -16493,7 +16596,12 @@ fn eval_grouped(
         )),
         // Subqueries are their own query level: evaluate normally, with
         // the group's first row available for correlation.
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
+        | Expr::Exists { .. } => {
             let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
             scopes.extend_from_slice(outer);
             scopes.push(gscope);
@@ -19113,6 +19221,14 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             }
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
+        // v0.87: quantified comparisons and user-defined operators.
+        Expr::Quantified {
+            left,
+            op,
+            quant,
+            sub,
+        } => eval_quantified(q, scopes, left, op, *quant, sub),
+        Expr::UserOp { op, left, right } => eval_user_op(q, scopes, op, left, right),
         Expr::Exists { sub, neg } => {
             // v0.80: hashed correlated-EXISTS fast path — a simple
             // equality-correlated subquery builds its inner key set once
@@ -19411,6 +19527,15 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         Expr::InSub { expr, sub, .. } => {
             walk_expr(expr, f);
             walk_select(sub, f);
+        }
+        // v0.87: quantified comparison and user operator.
+        Expr::Quantified { left, sub, .. } => {
+            walk_expr(left, f);
+            walk_select(sub, f);
+        }
+        Expr::UserOp { left, right, .. } => {
+            walk_expr(left, f);
+            walk_expr(right, f);
         }
         Expr::Exists { sub, .. } => walk_select(sub, f),
     }
@@ -19933,6 +20058,140 @@ fn eval_hashed_in(
     Ok(Some(probe_hashed_in(&cached, v, neg)?))
 }
 
+/// v0.87: three-valued row-wise comparison of two row values with a
+/// builtin `CmpOp`, following PG19's row-wise comparison rules:
+/// - `=`: true iff every pair is equal; false iff any pair is definitely
+///   unequal; else NULL.
+/// - `<>`: true iff any pair is definitely unequal; false iff every pair
+///   is equal; else NULL.
+/// - `<`, `<=`, `>`, `>=`: lexicographic — pairs compared left to right,
+///   stopping at the first unequal or NULL pair (a NULL pair yields NULL
+///   unless an earlier pair already decided).
+/// Returns `Ok(None)` for NULL (unknown). `*=` on rows is 0A000.
+fn eval_row_cmp(op: CmpOp, l: &[Value], r: &[Value]) -> Result<Option<bool>, ExecError> {
+    match op {
+        CmpOp::Eq => {
+            let mut saw_null = false;
+            for (a, b) in l.iter().zip(r.iter()) {
+                match eval_cmp_vals(CmpOp::Eq, a, b)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => return Ok(Some(false)),
+                    Value::Null => saw_null = true,
+                    _ => {
+                        return Err(exec_err(
+                            "XX000",
+                            "internal error: non-boolean row comparison",
+                        ));
+                    }
+                }
+            }
+            Ok(if saw_null { None } else { Some(true) })
+        }
+        CmpOp::Ne => {
+            let mut saw_null = false;
+            for (a, b) in l.iter().zip(r.iter()) {
+                match eval_cmp_vals(CmpOp::Eq, a, b)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => return Ok(Some(true)),
+                    Value::Null => saw_null = true,
+                    _ => {
+                        return Err(exec_err(
+                            "XX000",
+                            "internal error: non-boolean row comparison",
+                        ));
+                    }
+                }
+            }
+            Ok(if saw_null { None } else { Some(false) })
+        }
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+            for (a, b) in l.iter().zip(r.iter()) {
+                if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                    return Ok(None);
+                }
+                match cmp_ordering(a, b, CmpOp::Eq)? {
+                    Some(std::cmp::Ordering::Equal) => continue,
+                    Some(ord) => {
+                        let result = match op {
+                            CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                            CmpOp::Ge => ord != std::cmp::Ordering::Less,
+                            CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                            CmpOp::Le => ord != std::cmp::Ordering::Greater,
+                            _ => unreachable!(),
+                        };
+                        return Ok(Some(result));
+                    }
+                    None => return Ok(None),
+                }
+            }
+            // All pairs equal.
+            Ok(Some(matches!(op, CmpOp::Le | CmpOp::Ge)))
+        }
+        CmpOp::ImageEq => Err(exec_err(
+            "0A000",
+            "row-wise *= comparison is not supported".to_string(),
+        )),
+    }
+}
+
+/// v0.87: resolve a user-defined function call to the best overload.
+/// Matches by arity, preferring overloads where each argument's runtime
+/// type name canonically equals the declared parameter type. Falls back
+/// to the first arity match (the call site coerces). Returns None if no
+/// overload has the right arity.
+fn resolve_function_overload(
+    eng: &Engine,
+    name: &str,
+    arg_vals: &[Value],
+) -> Option<crate::storage::FuncDef> {
+    let overloads = eng.db.functions.get(name)?;
+    let mut arity_match: Option<&crate::storage::FuncDef> = None;
+    for fdef in overloads {
+        if fdef.arg_types.len() != arg_vals.len() {
+            continue;
+        }
+        if arity_match.is_none() {
+            arity_match = Some(fdef);
+        }
+        // Prefer exact type matches.
+        let exact = fdef
+            .arg_types
+            .iter()
+            .zip(arg_vals.iter())
+            .all(|(decl, val)| match value_op_type_name(val) {
+                Some(actual) => canon_func_type_name(decl) == canon_func_type_name(actual),
+                None => false,
+            });
+        if exact {
+            return Some(fdef.clone());
+        }
+    }
+    arity_match.cloned()
+}
+
+/// v0.87: resolve a function by (name, declared argument type names) for
+/// DROP FUNCTION and CREATE OR REPLACE. Matches by arity and canonical
+/// type name, like PG19.
+fn find_function_by_signature(
+    eng: &Engine,
+    name: &str,
+    arg_types: &[String],
+) -> Option<crate::storage::FuncDef> {
+    let overloads = eng.db.functions.get(name)?;
+    for fdef in overloads {
+        if fdef.arg_types.len() == arg_types.len()
+            && fdef
+                .arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+        {
+            return Some(fdef.clone());
+        }
+    }
+    None
+}
+
 /// v0.86: user-defined `=` operator lookup for IN-subquery comparison.
 /// Returns the (operator, function) pair when a user-defined `=`
 /// matches the (outer, inner) type pair by canonical type name.
@@ -19948,7 +20207,36 @@ fn find_user_equality_op(
         if canon_func_type_name(l) == canon_func_type_name(outer_ty)
             && canon_func_type_name(r) == canon_func_type_name(inner_ty)
         {
-            let f = eng.db.functions.get(&op.procedure)?.clone();
+            // v0.87: the procedure may be overloaded; match its signature
+            // to the operator's argument types.
+            let f =
+                find_function_by_signature(eng, &op.procedure, &[l.to_string(), r.to_string()])?;
+            return Some((op.clone(), f));
+        }
+    }
+    None
+}
+
+/// v0.87: resolve a user-defined binary operator by (name, left type,
+/// right type) names, like PG19's oper() lookup. Returns the operator
+/// definition and its procedure's function definition.
+fn resolve_user_operator(
+    eng: &Engine,
+    name: &str,
+    left_ty: &str,
+    right_ty: &str,
+) -> Option<(crate::storage::OperDef, crate::storage::FuncDef)> {
+    let defs = eng.db.operators.get(name)?;
+    for op in defs {
+        let l = op.leftarg.as_deref().unwrap_or("");
+        let r = op.rightarg.as_deref().unwrap_or("");
+        if canon_func_type_name(l) == canon_func_type_name(left_ty)
+            && canon_func_type_name(r) == canon_func_type_name(right_ty)
+        {
+            // v0.87: the procedure may be overloaded; match its signature
+            // to the operator's argument types.
+            let f =
+                find_function_by_signature(eng, &op.procedure, &[l.to_string(), r.to_string()])?;
             return Some((op.clone(), f));
         }
     }
@@ -20066,7 +20354,24 @@ fn eval_in(
         };
         run_select(&mut sub_q, sub, scopes)?
     };
-    if out.columns.len() != 1 {
+    // v0.87: row-wise IN — a row constructor on the left requires the
+    // subquery to return the same number of columns.
+    let left_vals: Vec<Value> = match &v {
+        Value::Record(fields) => fields.iter().map(|(_, x)| x.clone()).collect(),
+        x => vec![x.clone()],
+    };
+    let is_row = left_vals.len() > 1 || matches!(&v, Value::Record(_));
+    if is_row {
+        if out.columns.len() != left_vals.len() {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "subquery must return {} columns for row-wise IN",
+                    left_vals.len()
+                ),
+            ));
+        }
+    } else if out.columns.len() != 1 {
         return Err(exec_err("42601", "subquery must return only one column"));
     }
     // v0.86: user-defined `=` operator for this (outer, inner) type
@@ -20081,6 +20386,18 @@ fn eval_in(
     let mut saw_null = false;
     let mut found = false;
     for row in &out.rows {
+        // v0.87: row-wise IN compares row values with three-valued logic.
+        if is_row {
+            match eval_row_cmp(CmpOp::Eq, &left_vals, row)? {
+                Some(true) => {
+                    found = true;
+                    break;
+                }
+                Some(false) => {}
+                None => saw_null = true,
+            }
+            continue;
+        }
         if let Some((op, fdef)) = &user_op {
             match probe_user_eq(q, scopes, op, fdef, &v, &row[0])? {
                 Some(true) => {
@@ -20113,6 +20430,150 @@ fn eval_in(
         Some(b) => Value::Bool(b),
         None => Value::Null,
     })
+}
+
+/// v0.87: evaluate a user-defined binary operator `left op right`
+/// (e.g. `?=` from the conformance corpus). The operator is resolved by
+/// (name, left type, right type) like PG19's oper() lookup; NULL handling
+/// follows STRICT (via probe_user_eq).
+fn eval_user_op(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Value, ExecError> {
+    let lv = eval_expr(q, scopes, left)?;
+    let rv = eval_expr(q, scopes, right)?;
+    let lty = value_op_type_name(&lv).unwrap_or("");
+    let rty = value_op_type_name(&rv).unwrap_or("");
+    let (_odef, fdef) = resolve_user_operator(q.eng, name, lty, rty)
+        .ok_or_else(|| exec_err("42883", format!("operator does not exist: {}", name)))?;
+    if lv == Value::Null || rv == Value::Null {
+        if fdef.strict {
+            return Ok(Value::Null);
+        }
+    }
+    Ok(call_user_function(q, scopes, &fdef, &[lv, rv])?)
+}
+
+/// v0.87: evaluate a quantified comparison `left op ANY/ALL (subquery)`
+/// with PG19 three-valued logic. `left` may be a scalar or a row
+/// constructor; the subquery must return one column (scalar) or the same
+/// number of columns (row-wise). `op` is a builtin `CmpOp` or a
+/// user-defined operator name.
+fn eval_quantified(
+    q: &mut Q,
+    scopes: &[Scope],
+    left: &Expr,
+    op: &QuantOp,
+    quant: QuantKind,
+    sub: &SelectStmt,
+) -> Result<Value, ExecError> {
+    let lv = eval_expr(q, scopes, left)?;
+    let left_vals: Vec<Value> = match &lv {
+        Value::Record(fields) => fields.iter().map(|(_, v)| v.clone()).collect(),
+        v => vec![v.clone()],
+    };
+    let is_row = left_vals.len() > 1 || matches!(&lv, Value::Record(_));
+    let out = {
+        let mut sub_q = Q {
+            eng: &mut *q.eng,
+            snap: q.snap,
+            own: q.own,
+            session: q.session,
+            role: q.role,
+            read_only: q.read_only,
+            depth: q.depth + 1,
+            lock_ids: &mut *q.lock_ids,
+            ctes: q.ctes.clone(),
+            wctx: None,
+            priv_scopes: q.priv_scopes.clone(),
+            hashed_exists: q.hashed_exists.clone(),
+            hashed_in: q.hashed_in.clone(),
+        };
+        run_select(&mut sub_q, sub, scopes)?
+    };
+    let arity = out.columns.len();
+    if is_row {
+        if arity != left_vals.len() {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "subquery must return {} columns for row-wise comparison",
+                    left_vals.len()
+                ),
+            ));
+        }
+    } else if arity != 1 {
+        return Err(exec_err(
+            "42601",
+            "subquery must return only one column".to_string(),
+        ));
+    }
+    // Resolve a user-defined operator once, if needed.
+    let user_op: Option<(crate::storage::OperDef, crate::storage::FuncDef)> = match op {
+        QuantOp::User(name) => {
+            let (lty, rty) = if is_row {
+                // Row-wise user operators are not supported (0A000).
+                return Err(exec_err(
+                    "0A000",
+                    "row-wise user-defined quantified operators are not supported".to_string(),
+                ));
+            } else {
+                let inner_ty = out
+                    .columns
+                    .first()
+                    .map(|(_, t)| coltype_op_name(t))
+                    .unwrap_or_default();
+                (value_op_type_name(&left_vals[0]).unwrap_or(""), inner_ty)
+            };
+            Some(
+                resolve_user_operator(q.eng, name, lty, &rty).ok_or_else(|| {
+                    exec_err("42883", format!("operator does not exist: {}", name))
+                })?,
+            )
+        }
+        QuantOp::Cmp(_) => None,
+    };
+    // PG19: ANY is true if any comparison is true, else NULL if any is
+    // NULL, else false. ALL is false if any comparison is false, else
+    // NULL if any is NULL, else true.
+    let mut saw_null = false;
+    for row in &out.rows {
+        let cmp: Option<bool> = match (&user_op, op) {
+            (Some((odef, fdef)), _) => {
+                probe_user_eq(q, scopes, odef, fdef, &left_vals[0], &row[0])?
+            }
+            (None, QuantOp::Cmp(cop)) => {
+                if is_row {
+                    eval_row_cmp(*cop, &left_vals, row)?
+                } else {
+                    match eval_cmp_vals(*cop, &left_vals[0], &row[0])? {
+                        Value::Bool(b) => Some(b),
+                        Value::Null => None,
+                        _ => {
+                            return Err(exec_err(
+                                "XX000",
+                                "internal error: non-boolean quantified comparison",
+                            ));
+                        }
+                    }
+                }
+            }
+            (None, QuantOp::User(_)) => unreachable!(),
+        };
+        match (quant, cmp) {
+            (QuantKind::Any, Some(true)) => return Ok(Value::Bool(true)),
+            (QuantKind::All, Some(false)) => return Ok(Value::Bool(false)),
+            (_, None) => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(matches!(quant, QuantKind::All)))
 }
 
 fn not3(v: Option<bool>) -> Option<bool> {
@@ -23622,13 +24083,18 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     // arity takes the call (raw argument values; the call coerces to
     // the declared types). Builtins keep precedence for names with no
     // user definition.
-    if let Some(fdef) = q.eng.db.functions.get(name).cloned() {
-        if fdef.arg_types.len() == args.len() {
-            let mut vals = Vec::with_capacity(args.len());
-            for a in args {
-                vals.push(eval_expr(q, scopes, a)?);
-            }
-            return call_user_function(q, scopes, &fdef, &vals);
+    // v0.87: user-defined functions — resolve the best overload by
+    // (name, arg count, arg types). A definition matching by name and
+    // arity takes the call (raw argument values; the call coerces to
+    // the declared types). Builtins keep precedence for names with no
+    // user definition.
+    {
+        let mut raw_vals = Vec::with_capacity(args.len());
+        for a in args {
+            raw_vals.push(eval_expr(q, scopes, a)?);
+        }
+        if let Some(fdef) = resolve_function_overload(q.eng, name, &raw_vals) {
+            return call_user_function(q, scopes, &fdef, &raw_vals);
         }
     }
     let mut vals = Vec::with_capacity(args.len());
@@ -29299,15 +29765,19 @@ fn func_result_type(
         // v0.86: user-defined functions resolve their declared return
         // type here (Describe runs before eval_func).
         _ => {
-            if let Some(fdef) = eng.db.functions.get(name) {
-                if fdef.arg_types.len() == args.len() {
-                    // Builtin type name -> ColType; table name -> Composite.
-                    if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
-                        return Ok(ct);
-                    }
-                    if eng.db.tables.contains_key(&fdef.ret_type) {
-                        return Ok(ColType::Composite);
-                    }
+            // v0.87: resolve overload by arity for type inference.
+            if let Some(fdef) = eng
+                .db
+                .functions
+                .get(name)
+                .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
+            {
+                // Builtin type name -> ColType; table name -> Composite.
+                if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+                    return Ok(ct);
+                }
+                if eng.db.tables.contains_key(&fdef.ret_type) {
+                    return Ok(ColType::Composite);
                 }
             }
             Err(exec_err(
@@ -29775,6 +30245,7 @@ fn from_schema_item(
             args,
             alias,
             col_aliases,
+            ..
         } => {
             let left: Vec<QCol> = out.iter().flatten().cloned().collect();
             let cols = lateral_function_schema(
@@ -29858,12 +30329,13 @@ fn from_schema_item(
                         args,
                         alias: falias,
                         col_aliases: fca,
+                        lateral,
                     },
                 ) if using.is_empty()
                     && !natural
                     && using_alias.is_none()
                     && alias.is_none()
-                    && function_args_lateral(args, &lflat) =>
+                    && (*lateral || function_args_lateral(args, &lflat)) =>
                 {
                     lateral_function_schema(
                         eng, snap, own, session, name, args, falias, fca, &lflat,
@@ -30338,7 +30810,18 @@ fn expr_type(
         | Expr::Regex { .. }
         | Expr::Between { .. }
         | Expr::InSub { .. }
+        | Expr::Quantified { .. }
         | Expr::Exists { .. } => Ok(ColType::Bool),
+        // v0.87: user-defined operator — the return type comes from the
+        // operator's procedure function.
+        Expr::UserOp { op, left, right } => {
+            let lt = expr_type(eng, snap, own, session, schemas, outer, ctes, left)?;
+            let rt = expr_type(eng, snap, own, session, schemas, outer, ctes, right)?;
+            let (_, fdef) =
+                resolve_user_operator(eng, op, &coltype_op_name(&lt), &coltype_op_name(&rt))
+                    .ok_or_else(|| exec_err("42883", format!("operator does not exist: {}", op)))?;
+            resolve_func_type_name(eng, snap, own, session, &fdef.ret_type)
+        }
         Expr::Func { name, args } => {
             func_result_type(name, args, eng, snap, own, session, schemas, outer, ctes)
         }
@@ -37230,7 +37713,10 @@ fn exec_create_function(
             ));
         }
     }
-    let prev = eng.db.functions.get(name).cloned();
+    // v0.87: overload-aware CREATE. `prev` is the specific overload
+    // being replaced (by signature), if any.
+    let new_arg_types: Vec<String> = args.iter().map(|a| a.type_name.clone()).collect();
+    let prev = find_function_by_signature(eng, name, &new_arg_types);
     if prev.is_some() && !or_replace {
         return Err(exec_err(
             "42723",
@@ -37239,10 +37725,7 @@ fn exec_create_function(
     }
     // PG19: OR REPLACE with a different return type is 42P13.
     if let Some(p) = &prev {
-        if or_replace
-            && (p.arg_types.len() != args.len()
-                || canon_func_type_name(&p.ret_type) != canon_func_type_name(ret_type))
-        {
+        if or_replace && canon_func_type_name(&p.ret_type) != canon_func_type_name(ret_type) {
             return Err(exec_err(
                 "42P13",
                 format!(
@@ -37264,11 +37747,46 @@ fn exec_create_function(
         volatility,
         strict,
     };
-    eng.db.functions.insert(name.to_string(), def);
-    // v0.86's CreateFunction WAL path reads the live function map, so
+    // v0.87: insert or replace the specific overload.
+    {
+        let overloads = eng.db.functions.entry(name.to_string()).or_default();
+        if let Some(p) = &prev {
+            if let Some(slot) = overloads.iter_mut().find(|f| {
+                f.arg_types.len() == p.arg_types.len()
+                    && f.arg_types
+                        .iter()
+                        .zip(p.arg_types.iter())
+                        .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+            }) {
+                *slot = def;
+            } else {
+                overloads.push(def);
+            }
+        } else {
+            overloads.push(def);
+        }
+    }
+    // v0.87: the CreateFunction WAL path reads the live function map, so
     // the definition is WAL-logged (and checkpointed) automatically.
+    // `added` is the specific overload for precise undo.
+    let added = eng
+        .db
+        .functions
+        .get(name)
+        .and_then(|ovs| {
+            ovs.iter().find(|f| {
+                f.arg_types.len() == new_arg_types.len()
+                    && f.arg_types
+                        .iter()
+                        .zip(new_arg_types.iter())
+                        .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+            })
+        })
+        .cloned()
+        .expect("overload just inserted");
     ctx.writes.push(WriteOp::CreateFunction {
         name: name.to_string(),
+        added,
         prev,
     });
     Ok(ExecResult::Command {
@@ -37279,22 +37797,22 @@ fn exec_create_function(
 /// v0.86: `DROP FUNCTION [IF EXISTS] name (types)`. Signature matching
 /// is by arity and canonical type name (42883 on mismatch, like PG's
 /// "function ... does not exist").
+/// v0.87: `DROP FUNCTION [IF EXISTS] name (types) [CASCADE|RESTRICT]`.
+/// Signature matching is by arity and canonical type name (42883 on
+/// mismatch). PG19 RESTRICT (the default) fails with 2BP01 if an operator
+/// still uses the function as its procedure; CASCADE drops those
+/// operators too.
 fn exec_drop_function(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
     arg_types: &[String],
     if_exists: bool,
+    cascade: bool,
 ) -> Result<ExecResult, ExecError> {
-    let prev = eng.db.functions.get(name).cloned();
-    let matched = prev.as_ref().is_some_and(|f| {
-        f.arg_types.len() == arg_types.len()
-            && f.arg_types
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
-    });
-    if !matched {
+    // v0.87: drop the specific overload by signature.
+    let prev = find_function_by_signature(eng, name, arg_types);
+    let Some(dropped) = prev else {
         if !if_exists {
             return Err(exec_err(
                 "42883",
@@ -37304,11 +37822,75 @@ fn exec_drop_function(
         return Ok(ExecResult::Command {
             tag: "DROP FUNCTION".to_string(),
         });
+    };
+    // v0.87: PG19 dependency checking — an operator whose procedure is
+    // this function blocks RESTRICT (2BP01); CASCADE drops it.
+    let dependent_ops: Vec<(String, OperDef)> = eng
+        .db
+        .operators
+        .iter()
+        .flat_map(|(op_name, defs)| {
+            defs.iter()
+                .filter(|d| {
+                    d.procedure == name
+                        && find_function_by_signature(eng, name, arg_types)
+                            .is_some_and(|f| f.arg_types == dropped.arg_types)
+                })
+                .map(|d| (op_name.clone(), d.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if !dependent_ops.is_empty() && !cascade {
+        return Err(exec_err(
+            "2BP01",
+            format!(
+                "cannot drop function {}() because operator {} depends on it",
+                name, dependent_ops[0].0,
+            ),
+        ));
     }
-    eng.db.functions.remove(name);
+    // CASCADE: drop the dependent operators first.
+    for (op_name, op_def) in &dependent_ops {
+        let prev_ops = eng.db.operators.get(op_name).cloned().unwrap_or_default();
+        let next: Vec<OperDef> = prev_ops
+            .iter()
+            .filter(|d| {
+                !(d.procedure == name
+                    && d.leftarg == op_def.leftarg
+                    && d.rightarg == op_def.rightarg)
+            })
+            .cloned()
+            .collect();
+        if next.is_empty() {
+            eng.db.operators.remove(op_name);
+        } else {
+            eng.db.operators.insert(op_name.clone(), next);
+        }
+        ctx.writes.push(WriteOp::DropOperator {
+            name: op_name.clone(),
+            prev: prev_ops,
+        });
+    }
+    {
+        let overloads = eng
+            .db
+            .functions
+            .get_mut(name)
+            .expect("overload found above");
+        overloads.retain(|f| {
+            !(f.arg_types.len() == dropped.arg_types.len()
+                && f.arg_types
+                    .iter()
+                    .zip(dropped.arg_types.iter())
+                    .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b)))
+        });
+        if overloads.is_empty() {
+            eng.db.functions.remove(name);
+        }
+    }
     ctx.writes.push(WriteOp::DropFunction {
         name: name.to_string(),
-        prev,
+        prev: Some(dropped),
     });
     Ok(ExecResult::Command {
         tag: "DROP FUNCTION".to_string(),
@@ -37331,11 +37913,20 @@ fn exec_create_operator(
     hashes: bool,
     merges: bool,
 ) -> Result<ExecResult, ExecError> {
-    if !eng.db.functions.contains_key(procedure) {
-        return Err(exec_err(
-            "42883",
-            format!("function \"{}\" does not exist", procedure),
-        ));
+    // v0.87: the procedure must exist with a signature matching the
+    // operator's argument types (PG19).
+    {
+        let proc_args: Vec<String> = [leftarg, rightarg]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_string())
+            .collect();
+        if find_function_by_signature(eng, procedure, &proc_args).is_none() {
+            return Err(exec_err(
+                "42883",
+                format!("function \"{}\" does not exist", procedure),
+            ));
+        }
     }
     if let Some(t) = leftarg {
         resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, t)?;
@@ -37377,6 +37968,10 @@ fn exec_create_operator(
 /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
 /// Removes the matching (name, argtypes) definition (42883 when absent
 /// and IF EXISTS was not given, like PG19).
+/// v0.87: `DROP OPERATOR [IF EXISTS] name (ltype, rtype) [CASCADE|RESTRICT]`.
+/// PG19 RESTRICT (the default) fails with 2BP01 if dependent objects exist;
+/// CASCADE drops them. (Operators currently have no dependents in the
+/// catalog, so RESTRICT and CASCADE behave the same.)
 fn exec_drop_operator(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -37384,6 +37979,7 @@ fn exec_drop_operator(
     leftarg: Option<&str>,
     rightarg: Option<&str>,
     if_exists: bool,
+    _cascade: bool,
 ) -> Result<ExecResult, ExecError> {
     let prev = eng.db.operators.get(name).cloned().unwrap_or_default();
     let pos = prev
@@ -38914,7 +39510,12 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             }
         }
         Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } | Expr::Agg { .. } => {}
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {}
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
+        | Expr::Exists { .. } => {}
         // v0.10: windows cannot appear in constraints; nothing to rename.
         Expr::Window { .. } => {}
     }
