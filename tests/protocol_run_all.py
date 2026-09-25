@@ -125,6 +125,11 @@ def main():
                 continue
             results[p] = r
             print(f"[phase1] {os.path.basename(p):42s} {r[0]:7s} {r[1][:110]}")
+            # v0.98: SELF suites each bind their own port; give the just-
+            # stopped server a moment to release it before the next suite
+            # binds (avoids transient "port already in use" flakes when
+            # two consecutive suites share a port).
+            time.sleep(2)
 
     if 2 in phases:
         datadir = "/tmp/rg_proto_phase2"

@@ -1881,6 +1881,19 @@ pub struct SequenceOpts {
     pub max_value: Option<i64>,
     pub cycle: Option<bool>,
     pub restart: Option<i64>,
+    /// v0.98: `CACHE n` (Postgres default 1).
+    pub cache: Option<i64>,
+    /// v0.98: `OWNED BY table.col` / `OWNED BY NONE`. `None` =
+    /// unspecified (ALTER keeps the current owner link).
+    pub owned_by: Option<OwnedBySpec>,
+}
+
+/// v0.98: `OWNED BY` target in CREATE/ALTER SEQUENCE (PG19
+/// SequenceOptions / AlterSeqStmt).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OwnedBySpec {
+    Table { table: String, column: String },
+    None_,
 }
 
 impl SequenceOpts {
@@ -2733,6 +2746,9 @@ pub enum Stmt {
     },
     AlterSequence {
         name: String,
+        // v0.98: IF EXISTS was parsed but dropped before; now honored
+        // (missing sequence -> NOTICE, like PG19).
+        if_exists: bool,
         opts: SequenceOpts,
     },
     DropSequence {
@@ -6099,15 +6115,22 @@ impl Parser {
         })
     }
 
-    /// ALTER SEQUENCE name [options...] — all options optional.
+    /// ALTER SEQUENCE name [IF EXISTS] [options...] — all options optional.
     fn parse_alter_sequence(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("sequence")?;
-        if self.eat_keyword("if") {
+        let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
-        }
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
         let opts = self.parse_sequence_opts()?;
-        Ok(Stmt::AlterSequence { name, opts })
+        Ok(Stmt::AlterSequence {
+            name,
+            if_exists,
+            opts,
+        })
     }
 
     /// v0.97: `ALTER DOMAIN name <action>` (PG19 AlterDomainStmt,
@@ -6180,11 +6203,9 @@ impl Parser {
         let mut opts = SequenceOpts::default();
         loop {
             if self.eat_keyword("start") {
-                if self.eat_keyword("with") {
-                    opts.start = Some(self.parse_seq_int("START")?);
-                } else {
-                    return Err(err("syntax error: expected WITH after START".to_string()));
-                }
+                // v0.98: PG19 is START [ WITH ] start — bare START n is legal.
+                let _ = self.eat_keyword("with");
+                opts.start = Some(self.parse_seq_int("START")?);
             } else if self.eat_keyword("increment") {
                 if self.eat_keyword("by") {
                     opts.increment = Some(self.parse_seq_int("INCREMENT")?);
@@ -6209,6 +6230,20 @@ impl Parser {
                 opts.max_value = Some(self.parse_seq_int("MAXVALUE")?);
             } else if self.eat_keyword("cycle") {
                 opts.cycle = Some(true);
+            } else if self.eat_keyword("cache") {
+                // v0.98: CACHE n (PG19; validated in sequence_params).
+                opts.cache = Some(self.parse_seq_int("CACHE")?);
+            } else if self.eat_keyword("owned") {
+                // v0.98: OWNED BY table.col / OWNED BY NONE (PG19).
+                self.expect_keyword("by")?;
+                if self.eat_keyword("none") {
+                    opts.owned_by = Some(OwnedBySpec::None_);
+                } else {
+                    let table = self.expect_ident()?;
+                    self.expect(Token::Dot, "'.'")?;
+                    let column = self.expect_ident()?;
+                    opts.owned_by = Some(OwnedBySpec::Table { table, column });
+                }
             } else if self.eat_keyword("restart") {
                 if self.eat_keyword("with") {
                     opts.restart = Some(self.parse_seq_int("RESTART")?);
@@ -11243,6 +11278,39 @@ pub fn split_statements(input: &str) -> Vec<String> {
             i += 2;
             continue;
         }
+        if c == '$' {
+            // v0.98: dollar-quoted string: $tag$ ... $tag$, where the tag
+            // follows identifier rules (or is empty for `$$`). A `$`
+            // followed by a digit (e.g. `$1`) is a parameter reference,
+            // not a quote opener.
+            let mut j = i + 1;
+            let tag_start = j;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let tag: String = chars[tag_start..j].iter().collect();
+            let valid_tag = j < chars.len()
+                && chars[j] == '$'
+                && (tag.is_empty()
+                    || tag
+                        .chars()
+                        .next()
+                        .is_some_and(|c0| c0.is_alphabetic() || c0 == '_'));
+            if valid_tag {
+                let closer: Vec<char> =
+                    format!("${}$", tag).chars().collect();
+                i = j + 1; // past the opening $tag$
+                while i + closer.len() <= chars.len()
+                    && chars[i..i + closer.len()] != closer[..]
+                {
+                    i += 1;
+                }
+                i += closer.len(); // past the closing $tag$ (or EOF)
+                continue;
+            }
+            // Not a quote opener (e.g. `$1`); fall through to normal
+            // handling below.
+        }
         if c == ';' {
             let seg: String = chars[start..i].iter().collect();
             if !seg.trim().is_empty() {
@@ -11286,7 +11354,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         // conditional
         | "coalesce" | "nullif" | "greatest" | "least"
         // v0.9: sequence functions
-        | "nextval" | "currval" | "setval"
+        // v0.98: lastval()
+        | "nextval" | "currval" | "setval" | "lastval"
         // v0.14: PostgreSQL internal operator-function aliases
         | "booleq" | "boolne" | "int4eq" | "texteq"
         // v0.73: row_to_json(record) -> json (json.c).
@@ -11325,6 +11394,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.9: setval(name, value [, is_called])
         "nextval" | "currval" => n == 1,
+        // v0.98: lastval() takes no arguments.
+        "lastval" => n == 0,
         "setval" => n == 2 || n == 3,
         // v0.14: PostgreSQL internal operator-function aliases
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
@@ -11721,7 +11792,9 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::Func { name, args } => {
             // v0.9: nextval is allowed in DEFAULT (Postgres auto-increment),
             // but no sequence functions in CHECK (must be immutable).
-            if name == "nextval" || name == "currval" || name == "setval" {
+            // v0.98: lastval joins the volatile sequence functions barred
+            // from constraints.
+            if name == "nextval" || name == "currval" || name == "setval" || name == "lastval" {
                 if what != "DEFAULT" || name != "nextval" {
                     return Err(err(format!(
                         "cannot use sequence function in {} constraint",

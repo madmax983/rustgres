@@ -5154,6 +5154,10 @@ pub struct Sequence {
     pub min_value: i64,
     pub max_value: i64,
     pub cycle: bool,
+    /// v0.98: CACHE size (PG19 `seqcache`; default 1). Stored for
+    /// catalog fidelity (pg_sequences.cache_size); the engine hands
+    /// out values one at a time.
+    pub cache: i64,
     /// Last value returned by nextval; None = never called.
     pub current: Option<i64>,
     /// Postgres `is_called`: false after setval(v,false) means the next
@@ -5184,6 +5188,7 @@ impl Sequence {
         min_value: i64,
         max_value: i64,
         cycle: bool,
+        cache: i64,
         created_xmin: u64,
     ) -> Self {
         Sequence {
@@ -5193,6 +5198,7 @@ impl Sequence {
             min_value,
             max_value,
             cycle,
+            cache,
             current: None,
             is_called: false,
             created_xmin,
@@ -5913,6 +5919,10 @@ pub struct Engine {
     /// (nextval/setval). Drained into `WriteOp::SeqAdvance` markers by the
     /// server after a successful statement, for commit-time WAL logging.
     pub seq_advanced: Vec<String>,
+    /// v0.98: session-local `lastval` state: session id -> most recent
+    /// `nextval` result in that session (any sequence). Like
+    /// `seq_currval`, kept for the session lifetime.
+    pub seq_lastval: HashMap<u64, i64>,
     /// v0.13: replication slots by name. Cluster-global, non-transactional;
     /// WAL-logged (ReplSlot* records) and checkpointed for durability.
     pub repl_slots: HashMap<String, ReplSlot>,
@@ -5941,6 +5951,7 @@ impl Engine {
             },
             seq_currval: HashMap::new(),
             seq_advanced: Vec::new(),
+            seq_lastval: HashMap::new(),
             // v0.13: replication slots.
             repl_slots: HashMap::new(),
             // v0.81: catalog epoch for parse-cache invalidation.

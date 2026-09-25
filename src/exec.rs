@@ -367,7 +367,11 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
             if_not_exists,
             opts,
         } => exec_create_sequence(eng, ctx, name, *if_not_exists, opts),
-        Stmt::AlterSequence { name, opts } => exec_alter_sequence(eng, ctx, name, opts),
+        Stmt::AlterSequence {
+            name,
+            if_exists,
+            opts,
+        } => exec_alter_sequence(eng, ctx, name, *if_exists, opts),
         Stmt::DropSequence { names, if_exists } => exec_drop_sequence(eng, ctx, names, *if_exists),
         // v0.75: CREATE STATISTICS is a validated no-op.
         Stmt::CreateStatistics => Ok(ExecResult::Command {
@@ -678,6 +682,7 @@ fn create_serial_sequence(
             SerialKind::BigSerial => i64::MAX,
         },
         false, // cycle
+        1,     // v0.98: cache (Postgres default)
         ctx.own,
     );
     // v0.65: explicit serial ownership (PG's DEPENDENCY_AUTO via OWNED
@@ -9156,7 +9161,10 @@ fn plan_from_item(
                 });
             }
             // v0.9: information_schema virtual tables plan as scans.
-            if name == "information_schema.tables" || name == "information_schema.columns" {
+            if name == "information_schema.tables"
+                || name == "information_schema.columns"
+                || name == "information_schema.sequences"
+            {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
                     filter: None,
@@ -9228,6 +9236,17 @@ fn plan_from_item(
                     table: name.clone(),
                     filter: None,
                     rows: eng.repl_slots.len() as u64,
+                });
+            }
+            // v0.98: pg_sequences is virtual too; the estimate is the
+            // live sequence count.
+            if name.as_str() == "pg_sequences"
+                && eng.db.find_table(name, snap, own, session).is_none()
+            {
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    filter: None,
+                    rows: eng.db.sequences.len() as u64,
                 });
             }
             let t = eng.db.find_table(name, snap, own, session).ok_or_else(|| {
@@ -10033,6 +10052,91 @@ fn pg_inherits_scan(
                 prov: Vec::new(),
             });
         }
+    }
+    (schema, rows)
+}
+// ---------------------------------------------------------------------------
+// v0.98: pg_sequences (virtual). A real table by the same name takes
+// precedence, like pg_class. Exposes PG19's pg_sequences view columns:
+// sequencename, sequenceowner, data_type, start_value, min_value,
+// max_value, increment_by, cycle_option, cache_size, last_value.
+// data_type follows PG19's sequence data-type choice (smallint when the
+// bounds fit int16, integer when they fit int32, else bigint).
+// last_value is NULL until the sequence is first called in any session,
+// matching pg_sequence_last_value().
+// ---------------------------------------------------------------------------
+
+fn pg_sequences_schema() -> Vec<QCol> {
+    [
+        ("schemaname", ColType::Text),
+        ("sequencename", ColType::Text),
+        ("sequenceowner", ColType::Text),
+        ("data_type", ColType::Text),
+        ("start_value", ColType::BigInt),
+        ("min_value", ColType::BigInt),
+        ("max_value", ColType::BigInt),
+        ("increment_by", ColType::BigInt),
+        ("cycle_option", ColType::Bool),
+        ("cache_size", ColType::BigInt),
+        ("last_value", ColType::BigInt),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_sequences".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn pg_sequences_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_sequences_schema();
+    let mut rows = Vec::new();
+    let mut names: Vec<&String> = db.sequences.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(s) = db
+            .sequences
+            .get(name)
+            .and_then(|vs| vs.iter().find(|s| crate::storage::seq_visible(s, snap, own)))
+        else {
+            continue;
+        };
+        // PG19's data-type choice for the sequence (sequence.c
+        // select_seq_type): the narrowest of smallint/integer/bigint
+        // whose bounds contain [min_value, max_value].
+        let data_type = if s.min_value >= i64::from(i16::MIN) && s.max_value <= i64::from(i16::MAX)
+        {
+            "smallint"
+        } else if s.min_value >= i64::from(i32::MIN) && s.max_value <= i64::from(i32::MAX) {
+            "integer"
+        } else {
+            "bigint"
+        };
+        rows.push(QRow {
+            cells: Row::new(vec![
+                // v0.98: single-schema engine; PG19's schemaname is
+                // always "public" here.
+                Value::text("public"),
+                Value::text(name.as_str()),
+                Value::text(s.owner.as_str()),
+                Value::text(data_type),
+                Value::BigInt(s.start),
+                Value::BigInt(s.min_value),
+                Value::BigInt(s.max_value),
+                Value::BigInt(s.increment),
+                Value::Bool(s.cycle),
+                Value::BigInt(s.cache),
+                s.current.map(Value::BigInt).unwrap_or(Value::Null),
+            ]),
+            prov: Vec::new(),
+        });
     }
     (schema, rows)
 }
@@ -14521,7 +14625,7 @@ fn build_from(
         )?;
         let quals: HashSet<String> = s2.iter().map(|c| c.qual.clone()).collect();
         let no_quals = HashSet::new();
-        let push = pushdown_for(where_, &quals, &no_quals, &s2, &[]);
+        let push = pushdown_for(&q.eng.db, where_, &quals, &no_quals, &s2, &[]);
         let r2 = filter_rows(q, outer, &s2, r2, &push)?;
         return Ok((s2, r2));
     }
@@ -14542,7 +14646,7 @@ fn build_from(
         // raises the same error it always did.)
         let quals: HashSet<String> = s2.iter().map(|c| c.qual.clone()).collect();
         let acc_quals: HashSet<String> = acc_schema.iter().map(|c| c.qual.clone()).collect();
-        let push = pushdown_for(where_, &quals, &acc_quals, &s2, &acc_schema);
+        let push = pushdown_for(&q.eng.db, where_, &quals, &acc_quals, &s2, &acc_schema);
         r2 = filter_rows(q, outer, &s2, r2, &push)?;
         let mut schema = Vec::with_capacity(acc_schema.len() + s2.len());
         schema.extend(acc_schema.iter().cloned());
@@ -14632,13 +14736,151 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
     }
 }
 
+/// v0.98: true when evaluating `e` can produce different values on
+/// repeated calls with the same row (Postgres VOLATILE). The sequence
+/// functions (nextval/currval/setval/lastval) advance or read session
+/// sequence state; random/setseed drive the PRNG; now()/clock_timestamp()
+/// and friends call `now_micros()` per evaluation in this engine (PG
+/// marks now() stable, but the implementation is per-call, so it is
+/// behaviorally volatile here). A user-defined function is volatile when
+/// any arity-matching overload declares VOLATILE (PG's default when the
+/// volatility is not specified); an unresolvable name is conservatively
+/// volatile. Subqueries are conservatively volatile (they were never
+/// pushable anyway: `pushable_columns` returns false for them).
+fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
+    // Behaviorally-volatile builtins in this engine: repeated
+    // evaluation with identical arguments can return different values.
+    fn volatile_builtin(name: &str) -> bool {
+        matches!(
+            name,
+            "nextval"
+                | "currval"
+                | "setval"
+                | "lastval"
+                | "random"
+                | "setseed"
+                | "now"
+                | "current_timestamp"
+                | "clock_timestamp"
+                | "statement_timestamp"
+                | "transaction_timestamp"
+                | "current_date"
+        )
+    }
+    fn any_volatile(db: &Database, es: &[Expr]) -> bool {
+        es.iter().any(|x| expr_is_volatile(db, x))
+    }
+    match e {
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) | Expr::WholeRow { .. } | Expr::ResolvedCol { .. } => false,
+        Expr::Arith { left, right, .. }
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. } => {
+            expr_is_volatile(db, left) || expr_is_volatile(db, right)
+        }
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            expr_is_volatile(db, a) || expr_is_volatile(db, b)
+        }
+        Expr::Cast { expr, .. }
+        | Expr::CastNamed { expr, .. }
+        | Expr::FieldAccess { expr, .. }
+        | Expr::Not(expr)
+        | Expr::BitNot(expr)
+        | Expr::Neg(expr)
+        | Expr::IsNull { expr, .. }
+        | Expr::IsBool { expr, .. }
+        | Expr::Extract { from: expr, .. }
+        | Expr::NamedArg { expr, .. } => expr_is_volatile(db, expr),
+        Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
+            expr_is_volatile(db, expr) || expr_is_volatile(db, pattern)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_is_volatile(db, expr) || expr_is_volatile(db, low) || expr_is_volatile(db, high)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_ref().is_some_and(|o| expr_is_volatile(db, o))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_is_volatile(db, w) || expr_is_volatile(db, t))
+                || else_.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+        }
+        Expr::Row(elems) => any_volatile(db, elems),
+        Expr::ArrayCtor { elems, .. } => any_volatile(db, elems),
+        Expr::Subscript { array, indices } => {
+            expr_is_volatile(db, array) || any_volatile(db, indices)
+        }
+        Expr::Slice { array, bounds } => {
+            expr_is_volatile(db, array)
+                || bounds.iter().any(|(l, u)| {
+                    l.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+                        || u.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+                })
+        }
+        Expr::Agg {
+            arg,
+            arg2,
+            agg_order_by,
+            ..
+        } => {
+            arg.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+                || arg2.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+                || agg_order_by.iter().any(|o| expr_is_volatile(db, &o.expr))
+        }
+        Expr::Func { name, args } => {
+            if any_volatile(db, args) {
+                return true;
+            }
+            if volatile_builtin(name) {
+                return true;
+            }
+            // Mirror eval_func's dispatch: the special-cased builtins
+            // above are handled; a user definition shadows any other
+            // builtin when name+arity resolve.
+            if let Some(overloads) = db.functions.get(name) {
+                let mut arity_match = false;
+                for fdef in overloads {
+                    if fdef.arg_types.len() == args.len() {
+                        arity_match = true;
+                        if fdef.volatility == crate::sql::FuncVolatility::Volatile {
+                            return true;
+                        }
+                    }
+                }
+                // No arity-matching overload: the call cannot resolve to
+                // a calmer function; PG's default volatility is VOLATILE.
+                return !arity_match;
+            }
+            false
+        }
+        // Subqueries and window calls are conservatively volatile.
+        // (Subquery conjuncts were never pushable: `pushable_columns`
+        // returns false for them, so this changes nothing there.)
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::Exists { .. }
+        | Expr::Window { .. } => true,
+    }
+}
+
 /// The WHERE conjuncts that mention only `own`'s columns and may therefore
 /// filter `own`'s rows before the join. A qualified ref must name a
 /// qualifier of `own` and of no table in `other_quals`; an unqualified ref
 /// must resolve to a column of `own` and of no column of `other`. Anything
 /// ambiguous is left for the post-join WHERE, which reports it exactly as
 /// before — pushdown never changes which queries error.
+/// v0.98: volatile conjuncts are never pushed. The pre-join filter plus
+/// the post-join full-WHERE pass would evaluate them twice per row;
+/// Postgres evaluates a volatile qual exactly once per row (the
+/// `nextval('ts1')` conformance case: the final nextval must be 11, not
+/// 21). Non-volatile pushdown is unchanged (pure optimization).
 fn pushdown_for<'a>(
+    db: &Database,
     where_: Option<&'a Expr>,
     own_quals: &HashSet<String>,
     other_quals: &HashSet<String>,
@@ -14651,6 +14893,9 @@ fn pushdown_for<'a>(
     split_conjuncts(w)
         .into_iter()
         .filter(|c| {
+            if expr_is_volatile(db, c) {
+                return false;
+            }
             let mut cols = Vec::new();
             if !pushable_columns(c, &mut cols) {
                 return false;
@@ -16105,6 +16350,18 @@ fn build_source(
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v0.98: information_schema.sequences.
+            if name == "information_schema.sequences" {
+                let (schema, rows) = info_sequences_scan(&q.eng.db, q.snap, q.own);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.9: a view name expands to its stored SELECT. Views are
             // checked before tables (a table would have blocked CREATE VIEW).
             if let Some(view) = q.eng.db.find_view(name, q.snap, q.own).cloned() {
@@ -16220,6 +16477,23 @@ fn build_source(
                     })
                     .collect();
                 let (_, rows) = pg_inherits_scan(&q.eng.db, q.snap, q.own, q.session);
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v0.98: pg_sequences is virtual too (sequence catalog).
+            if name == "pg_sequences"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, q.own, q.session)
+                    .is_none()
+            {
+                let schema: Vec<QCol> = pg_sequences_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_sequences_scan(&q.eng.db, q.snap, q.own);
                 return Ok((apply_aliases(schema)?, rows));
             }
             // v0.11: the role catalogs are virtual too.
@@ -16809,7 +17083,7 @@ fn build_source(
                     left.as_ref(),
                     FromItem::Table { .. } | FromItem::Derived { .. }
                 ) {
-                let push = pushdown_for(where_, &lquals, &rquals, &lschema, &rschema);
+                let push = pushdown_for(&q.eng.db, where_, &lquals, &rquals, &lschema, &rschema);
                 filter_rows(q, outer, &lschema, lrows, &push)?
             } else {
                 lrows
@@ -16819,7 +17093,7 @@ fn build_source(
                     right.as_ref(),
                     FromItem::Table { .. } | FromItem::Derived { .. }
                 ) {
-                let push = pushdown_for(where_, &rquals, &lquals, &rschema, &lschema);
+                let push = pushdown_for(&q.eng.db, where_, &rquals, &lquals, &rschema, &lschema);
                 filter_rows(q, outer, &rschema, rrows, &push)?
             } else {
                 rrows
@@ -18287,7 +18561,8 @@ fn eval_grouped(
             }
             // v0.9: sequence functions need engine access; they cannot
             // go through the pure eval_func_vals path.
-            if matches!(name.as_str(), "nextval" | "currval" | "setval") {
+            // v0.98: lastval() also needs engine access (session state).
+            if matches!(name.as_str(), "nextval" | "currval" | "setval" | "lastval") {
                 check_builtin_arity(name, &vals)?;
                 let (eng, snap, own, session) = (&mut *q.eng, &*q.snap, q.own, q.session);
                 return eval_sequence_func(
@@ -21340,7 +21615,10 @@ fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
     if q.ctes.iter().any(|b| b.name == name) {
         return false;
     }
-    if name == "information_schema.tables" || name == "information_schema.columns" {
+    if name == "information_schema.tables"
+        || name == "information_schema.columns"
+        || name == "information_schema.sequences"
+    {
         return false;
     }
     if q.eng.db.find_view(name, q.snap, q.own).is_some() {
@@ -26085,7 +26363,7 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     }
     // v0.9: sequence functions need engine + snapshot + session access;
     // they cannot go through the pure eval_func_vals path.
-    if matches!(name, "nextval" | "currval" | "setval") {
+    if matches!(name, "nextval" | "currval" | "setval" | "lastval") {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(eval_expr(q, scopes, a)?);
@@ -26486,6 +26764,7 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
         // v0.9: sequence functions.
         "nextval" | "currval" => n == 1,
+        "lastval" => n == 0,
         "setval" => n == 2 || n == 3,
         // EXTRACT and friends validate their own shapes; unknown names
         // fall through to the dispatch below which raises 42883.
@@ -31950,7 +32229,8 @@ fn func_result_type(
         },
         "coalesce" | "nullif" | "greatest" | "least" => arg0(),
         // v0.9: sequence functions return bigint (INT here).
-        "nextval" | "currval" | "setval" => Ok(ColType::Int),
+        // v0.98: lastval() returns bigint like the other sequence functions.
+        "nextval" | "currval" | "setval" | "lastval" => Ok(ColType::Int),
         // v0.14: PostgreSQL internal operator-function aliases return boolean.
         "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
         // v0.45: format() returns text.
@@ -32327,6 +32607,19 @@ fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v0.98: information_schema.sequences.
+            if name == "information_schema.sequences" {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = info_sequences_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.9: views describe as their stored SELECT's schema.
             if let Some(view) = eng.db.find_view(name, snap, own) {
                 let stmt = parse_statement(&view.query).map_err(sql_err)?;
@@ -32400,6 +32693,19 @@ fn from_schema_item(
             if name == "pg_inherits" && eng.db.find_table(name, snap, own, session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_inherits_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v0.98: pg_sequences is virtual too (sequence catalog).
+            if name == "pg_sequences" && eng.db.find_table(name, snap, own, session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_sequences_schema()
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();
@@ -39807,6 +40113,361 @@ mod tests {
             panic!("expected SELECT");
         }
     }
+    // v0.98: PostgreSQL 19 sequence parity
+    // ========================================================================
+
+    /// The subselect.sql regression: a volatile predicate (nextval) must
+    /// not be pushed down and evaluated twice. Ten rows survive, each
+    /// advancing the sequence once; the final nextval is 11 (PG19), not 21.
+    #[test]
+    fn v98_volatile_predicate_not_pushed_down() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t10(x int)").unwrap();
+        for i in 0..10 {
+            run(&mut eng, &format!("INSERT INTO t10 VALUES ({})", i)).unwrap();
+        }
+        run(&mut eng, "CREATE SEQUENCE ts1").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT * FROM (SELECT DISTINCT x FROM t10) ss WHERE x < 10 + nextval('ts1') ORDER BY 1",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 10);
+        let r = run(&mut eng, "SELECT nextval('ts1')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["11".to_string()]]);
+        let r = run(&mut eng, "SELECT currval('ts1')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["11".to_string()]]);
+    }
+
+    /// A volatile SQL-language UDF wrapping nextval is also evaluated
+    /// once per surviving row, never pushed down and doubled.
+    #[test]
+    fn v98_volatile_udf_not_pushed_down() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t10(x int)").unwrap();
+        for i in 0..10 {
+            run(&mut eng, &format!("INSERT INTO t10 VALUES ({})", i)).unwrap();
+        }
+        run(&mut eng, "CREATE SEQUENCE uvs").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION unv() RETURNS bigint VOLATILE LANGUAGE sql AS $$ SELECT nextval('uvs') $$",
+        )
+        .unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT * FROM (SELECT DISTINCT x FROM t10) ss WHERE x < 10 + unv() ORDER BY 1",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r).len(), 10);
+        let r = run(&mut eng, "SELECT nextval('uvs')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["11".to_string()]]);
+    }
+
+    /// currval: 55000 before the first nextval in the session.
+    #[test]
+    fn v98_currval_undefined_before_nextval() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE cuv").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT currval('cuv')"), "55000");
+        run(&mut eng, "SELECT nextval('cuv')").unwrap();
+        let r = run(&mut eng, "SELECT currval('cuv')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
+    /// lastval: 55000 before any nextval; tracks the most recent nextval
+    /// across sequences; setval never touches it.
+    #[test]
+    fn v98_lastval_tracks_most_recent_nextval() {
+        let mut eng = engine();
+        assert_eq!(err_code(&mut eng, "SELECT lastval()"), "55000");
+        run(&mut eng, "CREATE SEQUENCE la START WITH 100").unwrap();
+        run(&mut eng, "CREATE SEQUENCE lb START WITH 200").unwrap();
+        run(&mut eng, "SELECT nextval('la')").unwrap();
+        let r = run(&mut eng, "SELECT lastval()").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        run(&mut eng, "SELECT nextval('lb')").unwrap();
+        let r = run(&mut eng, "SELECT lastval()").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["200".to_string()]]);
+        run(&mut eng, "SELECT setval('la', 500)").unwrap();
+        let r = run(&mut eng, "SELECT lastval()").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["200".to_string()]]);
+    }
+
+    /// setval(n, true): next nextval returns n + increment.
+    /// setval(n, false): next nextval returns n itself.
+    #[test]
+    fn v98_setval_is_called_semantics() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE sv").unwrap();
+        let r = run(&mut eng, "SELECT setval('sv', 41)").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["41".to_string()]]);
+        let r = run(&mut eng, "SELECT nextval('sv')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["42".to_string()]]);
+        let r = run(&mut eng, "SELECT setval('sv', 77, false)").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["77".to_string()]]);
+        let r = run(&mut eng, "SELECT nextval('sv')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["77".to_string()]]);
+    }
+
+    /// PG19: setval(n, false) does NOT change the value reported by currval
+    /// — a defined currval keeps its old value, an undefined one stays
+    /// undefined (55000). (Docs: "the value reported by currval is not
+    /// changed in this case".)
+    #[test]
+    fn v98_setval_false_leaves_currval() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE cf").unwrap();
+        run(&mut eng, "SELECT nextval('cf')").unwrap(); // currval = 1
+        let r = run(&mut eng, "SELECT setval('cf', 77, false)").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["77".to_string()]]);
+        let r = run(&mut eng, "SELECT currval('cf')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+        // Never-called sequence: currval stays undefined after setval false.
+        run(&mut eng, "CREATE SEQUENCE cu").unwrap();
+        run(&mut eng, "SELECT setval('cu', 77, false)").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT currval('cu')"), "55000");
+    }
+
+    /// setval outside [min_value, max_value] is 22003 (PG19 sequence.c
+    /// do_setval), not a silent clamp.
+    #[test]
+    fn v98_setval_out_of_bounds_is_22003() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE bd MINVALUE 1 MAXVALUE 10 START WITH 1").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT setval('bd', 99)"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT setval('bd', 0)"), "22003");
+        // Boundary values are fine.
+        run(&mut eng, "SELECT setval('bd', 10)").unwrap();
+        run(&mut eng, "SELECT setval('bd', 1)").unwrap();
+    }
+
+    /// ALTER SEQUENCE ... RESTART WITH outside [min,max] is 22023
+    /// (PG19: "RESTART value (n) cannot be greater than MAXVALUE (max)").
+    #[test]
+    fn v98_restart_out_of_bounds_is_22023() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE rs MINVALUE 1 MAXVALUE 10 START WITH 1").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER SEQUENCE rs RESTART WITH 99"),
+            "22023"
+        );
+        assert_eq!(
+            err_code(&mut eng, "ALTER SEQUENCE rs RESTART WITH 0"),
+            "22023"
+        );
+        run(&mut eng, "ALTER SEQUENCE rs RESTART WITH 5").unwrap();
+        let r = run(&mut eng, "SELECT nextval('rs')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["5".to_string()]]);
+    }
+
+    /// CACHE is accepted on CREATE/ALTER and surfaced in pg_sequences;
+    /// CACHE < 1 is 22023.
+    #[test]
+    fn v98_cache_option() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE cs CACHE 20").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cs'",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["20".to_string()]]);
+        run(&mut eng, "ALTER SEQUENCE cs CACHE 50").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cs'",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["50".to_string()]]);
+        assert_eq!(
+            err_code(&mut eng, "CREATE SEQUENCE cs0 CACHE 0"),
+            "22023"
+        );
+        // Bare START n is legal PG19 (START [ WITH ] n).
+        run(&mut eng, "CREATE SEQUENCE cs1 START 7").unwrap();
+        let r = run(&mut eng, "SELECT nextval('cs1')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["7".to_string()]]);
+    }
+
+    /// OWNED BY: the sequence is dropped with the owning table; a bad
+    /// target errors and leaves no leaked sequence behind.
+    #[test]
+    fn v98_owned_by_drop_dependency() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE own_t(a int)").unwrap();
+        run(&mut eng, "CREATE SEQUENCE own_s OWNED BY own_t.a").unwrap();
+        run(&mut eng, "DROP TABLE own_t").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT nextval('own_s')"), "42P01");
+        // Invalid target: error, and nothing leaks.
+        assert!(err_code(&mut eng, "CREATE SEQUENCE own_bad OWNED BY nosuch_t.a") != "00000");
+        let r = run(
+            &mut eng,
+            "SELECT sequencename FROM pg_sequences WHERE sequencename = 'own_bad'",
+        )
+        .unwrap();
+        assert!(rows_of(r).is_empty());
+        // OWNED BY NONE clears the link; the sequence survives the drop.
+        run(&mut eng, "CREATE TABLE own_t2(a int, b int)").unwrap();
+        run(&mut eng, "CREATE SEQUENCE own_s2").unwrap();
+        run(&mut eng, "ALTER SEQUENCE own_s2 OWNED BY own_t2.b").unwrap();
+        run(&mut eng, "ALTER SEQUENCE own_s2 OWNED BY NONE").unwrap();
+        run(&mut eng, "DROP TABLE own_t2").unwrap();
+        let r = run(&mut eng, "SELECT nextval('own_s2')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
+    /// DROP COLUMN drops the sequences owned by that column only
+    /// (PG19 AUTO dependency); other columns' sequences survive.
+    #[test]
+    fn v98_owned_by_drop_column() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE dco_t(a int, b int)").unwrap();
+        run(&mut eng, "CREATE SEQUENCE dco_a OWNED BY dco_t.a").unwrap();
+        run(&mut eng, "CREATE SEQUENCE dco_b OWNED BY dco_t.b").unwrap();
+        run(&mut eng, "ALTER TABLE dco_t DROP COLUMN a").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT nextval('dco_a')"), "42P01");
+        let r = run(&mut eng, "SELECT nextval('dco_b')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+        run(&mut eng, "ALTER TABLE dco_t DROP COLUMN b CASCADE").unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT nextval('dco_b')"), "42P01");
+    }
+
+    /// OWNED BY requires the table and sequence to share an owner
+    /// (PG19 42832 "sequence must have same owner and schema as table");
+    /// same-owner links are accepted, and a refused CREATE leaks nothing.
+    #[test]
+    fn v98_owned_by_owner_restriction() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE ROLE owr_r").unwrap();
+        run(&mut eng, "CREATE TABLE owr_t(a int)").unwrap();
+        run(&mut eng, "CREATE SEQUENCE owr_s").unwrap();
+        // Same owner: fine.
+        run(&mut eng, "ALTER SEQUENCE owr_s OWNED BY owr_t.a").unwrap();
+        // Transfer the table away: re-linking is refused with 42832.
+        run(&mut eng, "ALTER TABLE owr_t OWNER TO owr_r").unwrap();
+        run(&mut eng, "ALTER SEQUENCE owr_s OWNED BY NONE").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER SEQUENCE owr_s OWNED BY owr_t.a"),
+            "42832"
+        );
+        // CREATE with a mismatched owner is refused and leaks nothing.
+        assert_eq!(
+            err_code(&mut eng, "CREATE SEQUENCE owr_s2 OWNED BY owr_t.a"),
+            "42832"
+        );
+        let r = run(
+            &mut eng,
+            "SELECT sequencename FROM pg_sequences WHERE sequencename = 'owr_s2'",
+        )
+        .unwrap();
+        assert!(rows_of(r).is_empty());
+    }
+
+    /// ALTER SEQUENCE IF EXISTS on a missing sequence is a no-op;
+    /// without IF EXISTS it is 42P01.
+    #[test]
+    fn v98_alter_sequence_if_exists() {
+        let mut eng = engine();
+        run(&mut eng, "ALTER SEQUENCE IF EXISTS nosuch RESTART").unwrap();
+        assert_eq!(
+            err_code(&mut eng, "ALTER SEQUENCE nosuch RESTART"),
+            "42P01"
+        );
+    }
+
+    /// Exhaustion is PG19 22000 (not 55000); CYCLE wraps to the bound;
+    /// descending defaults are start -1 / min -(2^63-1) / max -1.
+    #[test]
+    fn v98_sequence_overflow_and_cycle() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE ov_s START WITH 9 MAXVALUE 10").unwrap();
+        let r = run(&mut eng, "SELECT nextval('ov_s'), nextval('ov_s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["9".to_string(), "10".to_string()]]);
+        assert_eq!(err_code(&mut eng, "SELECT nextval('ov_s')"), "22000");
+        run(
+            &mut eng,
+            "CREATE SEQUENCE cy_s START WITH 9 MINVALUE 1 MAXVALUE 10 CYCLE",
+        )
+        .unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT nextval('cy_s'), nextval('cy_s'), nextval('cy_s')",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["9".to_string(), "10".to_string(), "1".to_string()]]
+        );
+        run(&mut eng, "CREATE SEQUENCE dn_s INCREMENT BY -1").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT start_value, min_value, max_value, increment_by \
+             FROM pg_sequences WHERE sequencename = 'dn_s'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "-1".to_string(),
+                "-9223372036854775807".to_string(),
+                "-1".to_string(),
+                "-1".to_string(),
+            ]]
+        );
+        let r = run(&mut eng, "SELECT nextval('dn_s'), nextval('dn_s')").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["-1".to_string(), "-2".to_string()]]);
+    }
+
+    /// pg_sequences exposes the PG19 column shape, including schemaname
+    /// and cache_size; information_schema.sequences likewise.
+    #[test]
+    fn v98_sequence_catalogs() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE cat_s CACHE 9").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT schemaname, sequencename, sequenceowner, data_type, \
+             start_value, min_value, max_value, increment_by, cache_size \
+             FROM pg_sequences WHERE sequencename = 'cat_s'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "public".to_string(),
+                "cat_s".to_string(),
+                "postgres".to_string(),
+                "bigint".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                "9223372036854775807".to_string(),
+                "1".to_string(),
+                "9".to_string(),
+            ]]
+        );
+        let r = run(
+            &mut eng,
+            "SELECT sequence_catalog, sequence_schema, sequence_name, data_type, \
+             numeric_precision, numeric_precision_radix, numeric_scale, cycle_option \
+             FROM information_schema.sequences WHERE sequence_name = 'cat_s'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![
+                "rustgres".to_string(),
+                "public".to_string(),
+                "cat_s".to_string(),
+                "bigint".to_string(),
+                "64".to_string(),
+                "2".to_string(),
+                "0".to_string(),
+                "NO".to_string(),
+            ]]
+        );
+    }
 }
 
 fn info_columns_schema() -> Vec<QCol> {
@@ -39876,6 +40537,85 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
     (schema, rows)
 }
 
+// ---------------------------------------------------------------------------
+// v0.98: information_schema.sequences (virtual). PG19's information_schema
+// sequences view: sequence_catalog, sequence_schema, sequence_name,
+// data_type, numeric_precision, numeric_precision_radix, numeric_scale,
+// start_value, minimum_value, maximum_value, increment, cycle_option.
+// numeric_precision follows the sequence data type (16/32/64); radix is 2
+// (binary) and scale 0 for the exact integer types, matching PG19's
+// information_schema. cycle_option is 'YES'/'NO'.
+// ---------------------------------------------------------------------------
+
+fn info_sequences_schema() -> Vec<QCol> {
+    [
+        ("sequence_catalog", ColType::Text),
+        ("sequence_schema", ColType::Text),
+        ("sequence_name", ColType::Text),
+        ("data_type", ColType::Text),
+        ("numeric_precision", ColType::Int),
+        ("numeric_precision_radix", ColType::Int),
+        ("numeric_scale", ColType::Int),
+        ("start_value", ColType::Text),
+        ("minimum_value", ColType::Text),
+        ("maximum_value", ColType::Text),
+        ("increment", ColType::Text),
+        ("cycle_option", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "information_schema.sequences".to_string(),
+        name: n.to_string(),
+        ty,
+
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn info_sequences_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_sequences_schema();
+    let mut rows = Vec::new();
+    let mut names: Vec<&String> = db.sequences.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(s) = db
+            .sequences
+            .get(name)
+            .and_then(|vs| vs.iter().find(|s| crate::storage::seq_visible(s, snap, own)))
+        else {
+            continue;
+        };
+        let (data_type, precision) =
+            if s.min_value >= i64::from(i16::MIN) && s.max_value <= i64::from(i16::MAX) {
+                ("smallint", 16)
+            } else if s.min_value >= i64::from(i32::MIN) && s.max_value <= i64::from(i32::MAX) {
+                ("integer", 32)
+            } else {
+                ("bigint", 64)
+            };
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(name.as_str()),
+                Value::text(data_type),
+                Value::Int(precision),
+                Value::Int(2),
+                Value::Int(0),
+                Value::text(s.start.to_string()),
+                Value::text(s.min_value.to_string()),
+                Value::text(s.max_value.to_string()),
+                Value::text(s.increment.to_string()),
+                Value::text(if s.cycle { "YES" } else { "NO" }),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
 // ============================================================================
 // v0.9: sequences.
 // ============================================================================
@@ -39887,15 +40627,17 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
 fn sequence_params(
     opts: &SequenceOpts,
     for_alter: bool,
-) -> Result<(i64, i64, i64, i64, bool, Option<i64>), ExecError> {
+) -> Result<(i64, i64, i64, i64, bool, i64, Option<i64>), ExecError> {
     let bad = |m: &str| exec_err("22023", m.to_string());
     let increment = opts.increment.unwrap_or(1);
     if increment == 0 {
         return Err(bad("INCREMENT must not be zero"));
     }
     let descending = increment < 0;
+    // PG19 defaults: ascending (1, 2^63-1, 1); descending
+    // (-(2^63-1), -1, -1).
     let (dfl_min, dfl_max, dfl_start) = if descending {
-        (i64::MIN, -1, -1)
+        (i64::MIN + 1, -1, -1)
     } else {
         (1, i64::MAX, 1)
     };
@@ -39903,6 +40645,16 @@ fn sequence_params(
     let max_value = opts.max_value.unwrap_or(dfl_max);
     let start = opts.start.unwrap_or(dfl_start);
     let cycle = opts.cycle.unwrap_or(false);
+    // v0.98: CACHE (PG19 DefineSequence: 22023 when < 1).
+    let cache = opts.cache.unwrap_or(1);
+    if let Some(c) = opts.cache {
+        if c < 1 {
+            return Err(bad(&format!(
+                "CACHE value {} must be greater than zero",
+                c
+            )));
+        }
+    }
     if min_value >= max_value {
         return Err(bad("MINVALUE must be less than MAXVALUE"));
     }
@@ -39929,7 +40681,52 @@ fn sequence_params(
             Some(v)
         }
     };
-    Ok((start, increment, min_value, max_value, cycle, restart))
+    Ok((start, increment, min_value, max_value, cycle, cache, restart))
+}
+
+/// v0.98: validate `OWNED BY table.col` / `OWNED BY NONE`. Returns the
+/// temp-session tag to store in `Sequence.owned_by` (Some(session) when
+/// the table resolves to a session temp table, else None — the same
+/// shape `create_serial_sequence` writes, which `owned_seqs_of` matches
+/// at DROP TABLE).
+fn validate_sequence_owned_by(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    owned: &crate::sql::OwnedBySpec,
+    seq_owner: &str,
+) -> Result<Option<u64>, ExecError> {
+    match owned {
+        crate::sql::OwnedBySpec::None_ => Ok(None),
+        crate::sql::OwnedBySpec::Table { table, column } => {
+            let t = eng
+                .db
+                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", table))
+                })?;
+            if !t.columns.iter().any(|(c, _)| c == column) {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", column, table),
+                ));
+            }
+            // v0.98: PG19 requires the owned-by table to have the same
+            // owner as the sequence (same schema too — vacuous here: the
+            // engine is single-schema `public`).
+            if t.owner != seq_owner {
+                return Err(exec_err(
+                    "42832",
+                    "sequence must have same owner and schema as table".to_string(),
+                ));
+            }
+            let is_temp = eng
+                .db
+                .temp_tables
+                .get(&ctx.session)
+                .is_some_and(|m| m.contains_key(table.as_str()));
+            Ok(if is_temp { Some(ctx.session) } else { None })
+        }
+    }
 }
 
 fn exec_create_sequence(
@@ -39950,7 +40747,7 @@ fn exec_create_sequence(
             format!("relation \"{}\" already exists", name),
         ));
     }
-    let (start, increment, min_value, max_value, cycle, _) = sequence_params(opts, false)?;
+    let (start, increment, min_value, max_value, cycle, cache, _) = sequence_params(opts, false)?;
     let mut seq = Sequence::new(
         name.to_string(),
         start,
@@ -39958,10 +40755,24 @@ fn exec_create_sequence(
         min_value,
         max_value,
         cycle,
+        cache,
         ctx.own,
     );
     // v0.11: the creating role owns the sequence.
     seq.owner = ctx.role.to_string();
+    // v0.98: OWNED BY table.col / OWNED BY NONE. Validate BEFORE inserting
+    // so a bad target errors without leaving a leaked sequence behind;
+    // the link is set on the new version directly (one insert, one
+    // WriteOp::CreateSequence).
+    if let Some(owned) = &opts.owned_by {
+        let temp_session = validate_sequence_owned_by(eng, ctx, owned, &ctx.role)?;
+        seq.owned_by = match owned {
+            crate::sql::OwnedBySpec::None_ => None,
+            crate::sql::OwnedBySpec::Table { table, column } => {
+                Some((table.clone(), column.clone(), temp_session))
+            }
+        };
+    }
     eng.db
         .sequences
         .entry(name.to_string())
@@ -39979,14 +40790,29 @@ fn exec_alter_sequence(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
+    if_exists: bool,
     opts: &SequenceOpts,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: only the owner (or a superuser) may alter a sequence.
     require_seq_owner(eng, ctx, name)?;
-    let live = eng
-        .db
-        .find_sequence(name, ctx.snap, ctx.own)
-        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let live = match eng.db.find_sequence(name, ctx.snap, ctx.own) {
+        Some(s) => s,
+        None if if_exists => {
+            // v0.98: ALTER SEQUENCE IF EXISTS on a missing sequence
+            // skips (PG19 emits NOTICE "relation ... does not exist,
+            // skipping"; the executor has no notice channel, like the
+            // CREATE ... IF NOT EXISTS path above).
+            return Ok(ExecResult::Command {
+                tag: "ALTER SEQUENCE".to_string(),
+            });
+        }
+        None => {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", name),
+            ));
+        }
+    };
     // Merge: ALTER supplies only the options it changes.
     let merged = SequenceOpts {
         start: opts.start.or(Some(live.start)),
@@ -39994,9 +40820,27 @@ fn exec_alter_sequence(
         min_value: opts.min_value.or(Some(live.min_value)),
         max_value: opts.max_value.or(Some(live.max_value)),
         cycle: opts.cycle.or(Some(live.cycle)),
+        cache: opts.cache.or(Some(live.cache)),
         restart: opts.restart,
+        owned_by: opts.owned_by.clone(),
     };
-    let (start, increment, min_value, max_value, cycle, restart) = sequence_params(&merged, true)?;
+    let (start, increment, min_value, max_value, cycle, cache, restart) =
+        sequence_params(&merged, true)?;
+    // v0.98: OWNED BY is validated (table/column existence) before any
+    // version is created.
+    let owned_by_update: Option<Option<(String, String, Option<u64>)>> =
+        match &merged.owned_by {
+            None => None,
+            Some(owned) => {
+                let temp_session = validate_sequence_owned_by(eng, ctx, owned, &live.owner)?;
+                Some(match owned {
+                    crate::sql::OwnedBySpec::None_ => None,
+                    crate::sql::OwnedBySpec::Table { table, column } => {
+                        Some((table.clone(), column.clone(), temp_session))
+                    }
+                })
+            }
+        };
     let prev = live.clone();
     let versions = eng.db.sequences.get_mut(name).expect("visible above");
     let cur = versions
@@ -40011,6 +40855,7 @@ fn exec_alter_sequence(
         min_value,
         max_value,
         cycle,
+        cache,
         ctx.own,
     );
     // ALTER SEQUENCE changes parameters, not the position: carry the
@@ -40020,9 +40865,33 @@ fn exec_alter_sequence(
     // v0.11: ALTER SEQUENCE preserves owner and grants.
     next.owner = prev.owner.clone();
     next.acl = prev.acl.clone();
-    // v0.65: ALTER SEQUENCE preserves serial ownership.
-    next.owned_by = prev.owned_by.clone();
+    // v0.65: ALTER SEQUENCE preserves serial ownership; v0.98: an
+    // explicit OWNED BY clause replaces it.
+    next.owned_by = match owned_by_update {
+        Some(link) => link,
+        None => prev.owned_by.clone(),
+    };
     if let Some(r) = restart {
+        // v0.98: PostgreSQL validates RESTART against the (possibly new)
+        // [min_value, max_value] with SQLSTATE 22023.
+        if r < next.min_value {
+            return Err(exec_err(
+                "22023",
+                format!(
+                    "RESTART value ({}) cannot be less than MINVALUE ({})",
+                    r, next.min_value
+                ),
+            ));
+        }
+        if r > next.max_value {
+            return Err(exec_err(
+                "22023",
+                format!(
+                    "RESTART value ({}) cannot be greater than MAXVALUE ({})",
+                    r, next.max_value
+                ),
+            ));
+        }
         // v0.66: RESTART is setval(r, false): the next nextval RETURNS r
         // (PG19 ALTER SEQUENCE docs: "equivalent to calling the setval
         // function with is_called = false").
@@ -41049,7 +41918,7 @@ pub fn seq_nextval(
         Some(v) => {
             let n = v.checked_add(cur.increment).ok_or_else(|| {
                 exec_err(
-                    "55000",
+                    "22000",
                     format!(
                         "nextval: reached {} value of sequence \"{}\"",
                         if cur.increment > 0 {
@@ -41075,7 +41944,7 @@ pub fn seq_nextval(
                     }
                 } else {
                     return Err(exec_err(
-                        "55000",
+                        "22000",
                         format!(
                             "nextval: reached {} value of sequence \"{}\" ({})",
                             if cur.increment > 0 {
@@ -41100,6 +41969,8 @@ pub fn seq_nextval(
     cur.current = Some(next);
     cur.is_called = true;
     eng.seq_currval.insert((session, name.to_string()), next);
+    // v0.98: lastval() tracks the most recent nextval of any sequence.
+    eng.seq_lastval.insert(session, next);
     if !eng.seq_advanced.contains(&name.to_string()) {
         eng.seq_advanced.push(name.to_string());
     }
@@ -41146,6 +42017,18 @@ pub fn seq_currval(
         })
 }
 
+/// v0.98: `lastval()` — the value most recently returned by `nextval`
+/// for any sequence in this session (PG19 sequence_functions). Unlike
+/// currval it needs no sequence name; PG checks no privilege on it.
+pub fn seq_lastval(eng: &Engine, session: u64) -> Result<i64, ExecError> {
+    eng.seq_lastval.get(&session).copied().ok_or_else(|| {
+        exec_err(
+            "55000",
+            "lastval is not yet defined in this session".to_string(),
+        )
+    })
+}
+
 pub fn seq_setval(
     eng: &mut Engine,
     snap: &Snapshot,
@@ -41170,15 +42053,29 @@ pub fn seq_setval(
         .db
         .find_sequence_mut(name, snap, own)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // v0.98: PostgreSQL validates setval against [min_value, max_value]
+    // (SQLSTATE 22003, "setval: value n is out of bounds for sequence
+    // \"s\" (min..max)").
+    if value < cur.min_value || value > cur.max_value {
+        return Err(exec_err(
+            "22003",
+            format!(
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value, name, cur.min_value, cur.max_value
+            ),
+        ));
+    }
     cur.current = Some(value);
     // setval(v, true): is_called=true, next nextval returns v + increment.
     // setval(v, false): is_called=false, next nextval returns v itself.
     cur.is_called = is_called;
     if is_called {
         eng.seq_currval.insert((session, name.to_string()), value);
-    } else {
-        eng.seq_currval.remove(&(session, name.to_string()));
     }
+    // v0.98: PG19 — setval with is_called=false does NOT change the value
+    // reported by currval ("the value reported by currval is not changed in
+    // this case", functions-sequence). A defined currval keeps its old
+    // value; an undefined one stays undefined (55000).
     if !eng.seq_advanced.contains(&name.to_string()) {
         eng.seq_advanced.push(name.to_string());
     }
@@ -42078,6 +42975,7 @@ fn eval_sequence_func(
                 eng, snap, own, session, role, &s,
             )?))
         }
+        "lastval" => Ok(Value::BigInt(seq_lastval(eng, session)?)),
         "setval" => {
             // v0.17: like nextval, setting a sequence is a write.
             if read_only {
@@ -42974,6 +43872,28 @@ fn alter_drop_column(
         .collect();
     let _ = t;
     // CASCADE: drop dependent objects.
+    // v0.98: sequences OWNED BY this column are dropped with it (PG19:
+    // the OWNED BY link is an AUTO dependency — the sequence goes away
+    // with the column, with or without CASCADE).
+    let own_sess = if is_temp { Some(ctx.session) } else { None };
+    let owned_here: Vec<String> = eng
+        .db
+        .sequences
+        .iter()
+        .filter_map(|(sname, vs)| {
+            vs.iter()
+                .find(|s| crate::storage::seq_visible(s, ctx.snap, ctx.own))
+                .filter(|s| {
+                    s.owned_by
+                        .as_ref()
+                        .is_some_and(|(t, c, ss)| t == name && c == col && *ss == own_sess)
+                })
+                .map(|_| sname.clone())
+        })
+        .collect();
+    for sname in &owned_here {
+        drop_serial_sequence(eng, ctx, sname)?;
+    }
     // Views first (they only read).
     for v in &dep_views {
         drop_view_internal(eng, ctx, v)?;
@@ -43960,6 +44880,7 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
     }
     (schema, rows)
 }
+    // ========================================================================
 
 #[cfg(test)]
 mod variance_stress_tests {
@@ -44246,7 +45167,9 @@ mod variance_stress_tests {
         let tiny3 = Numeric::parse("3e-16383").unwrap();
         assert_ne!(tiny3.to_text(), "0");
     }
+
 }
+
 
 #[cfg(test)]
 mod v097_domain_tests {

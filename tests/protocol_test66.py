@@ -143,7 +143,7 @@ def main():
         expect_ok(s, "SELECT setval('t66c_s_seq', 32767, false)", [["32767"]])
         expect_ok(s, "SELECT nextval('t66c_s_seq')", [["32767"]],
                     "smallserial seq max 32767")
-        expect_err(s, "SELECT nextval('t66c_s_seq')", "55000",
+        expect_err(s, "SELECT nextval('t66c_s_seq')", "22000",
                    "smallserial seq exhausts at 32767")
         expect_ok(s, "SELECT setval('t66c_b_seq', 2147483648, false)", [["2147483648"]])
         expect_ok(s, "SELECT nextval('t66c_b_seq')", [["2147483648"]],

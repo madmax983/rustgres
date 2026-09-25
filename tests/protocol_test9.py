@@ -472,7 +472,7 @@ def test_sequences():
         c.q("SELECT nextval('b')")
         c.q("SELECT nextval('b')")
         t, r, e = c.q("SELECT nextval('b')")
-        check("maxvalue", e == ["55000"], f"{e}")
+        check("maxvalue", e == ["22000"], f"{e}")
 
         # CYCLE wraps.
         c.q("CREATE SEQUENCE cy START WITH 1 MAXVALUE 2 CYCLE")
@@ -603,6 +603,9 @@ def test_durability():
                 break
             except OSError:
                 time.sleep(0.05)
+        else:
+            proc.kill()
+            raise RuntimeError("durability server did not start")
         c.q("CREATE TABLE t (a INT PRIMARY KEY, b INT DEFAULT 5, CHECK (b > 0))")
         c.q("INSERT INTO t VALUES (1, 10)")
         c.q("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'x'")
@@ -618,12 +621,15 @@ def test_durability():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        for _ in range(100):
+        for _ in range(200):
             try:
                 c = Conn(port)
                 break
             except OSError:
-                time.sleep(0.05)
+                time.sleep(0.1)
+        else:
+            proc.kill()
+            raise RuntimeError("durability server did not restart after kill -9")
         t, r, e = c.q("SELECT a, b, c FROM t ORDER BY a")
         check("table survives", r == [["1", "10", "x"]], f"{r} {e}")
         t, r, e = c.q("SELECT * FROM v")

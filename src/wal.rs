@@ -23,6 +23,11 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
+//! Format version 17 (`RGSWAL17` / `RGSCHK14`) is NOT compatible with v0.97
+//! or earlier: v0.98 WAL-logs and checkpoints the sequence CACHE size
+//! (`WalSequence.cache`). Like every format bump, old data directories
+//! are refused with a clear error instead of being misread.
+//!
 //! Format version 16 (`RGSWAL16` / `RGSCHK13`) is NOT compatible with v0.95
 //! or earlier: v0.96 WAL-logs table inheritance links (`inherits` on
 //! `CreateTable`/`AlterTable`) and checkpoints them in table images.
@@ -137,7 +142,7 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK13";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK14";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
@@ -156,7 +161,10 @@ const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK13";
 /// v0.96: version 16 adds the inheritance parent links (`inherits`) to
 /// table images. v15 checkpoints are refused; remove the data
 /// directory to start fresh.
-const CHKPT_VERSION: u32 = 16;
+/// v0.98: version 17 adds the sequence CACHE size to sequence
+/// images. v16 checkpoints are refused; remove the data directory
+/// to start fresh.
+const CHKPT_VERSION: u32 = 17;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -187,7 +195,9 @@ const CHKPT_VERSION: u32 = 16;
 /// v0.96: `RGSWAL16` — `CreateTable`/`AlterTable` carry the
 /// inheritance parent links (`inherits`). Old `RGSWAL15` files are
 /// refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL16";
+/// v0.98: `RGSWAL17` — sequence records carry the CACHE size.
+/// Old `RGSWAL16` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL17";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -683,6 +693,9 @@ pub struct WalSequence {
     pub min_value: i64,
     pub max_value: i64,
     pub cycle: bool,
+    /// v0.98: CACHE size (Postgres default 1). Stored for catalog
+    /// fidelity; the engine hands out values one at a time.
+    pub cache: i64,
     /// Last value returned by nextval; i64::MIN sentinel = never called.
     pub current: i64,
     pub current_is_set: bool,
@@ -703,6 +716,7 @@ impl WalSequence {
             min_value: s.min_value,
             max_value: s.max_value,
             cycle: s.cycle,
+            cache: s.cache,
             current: s.current.unwrap_or(i64::MIN),
             current_is_set: s.current.is_some(),
             is_called: s.is_called,
@@ -720,6 +734,7 @@ impl WalSequence {
             min_value: self.min_value,
             max_value: self.max_value,
             cycle: self.cycle,
+            cache: self.cache,
             current: if self.current_is_set {
                 Some(self.current)
             } else {
@@ -1920,6 +1935,8 @@ impl Enc {
         self.i64(s.min_value);
         self.i64(s.max_value);
         self.u8(s.cycle as u8);
+        // v0.98: sequence cache size.
+        self.i64(s.cache);
         self.i64(s.current);
         self.u8(s.current_is_set as u8);
         self.u8(s.is_called as u8);
@@ -2739,6 +2756,8 @@ impl<'a> Dec<'a> {
         let min_value = self.i64()?;
         let max_value = self.i64()?;
         let cycle = self.u8()? != 0;
+        // v0.98: sequence cache size.
+        let cache = self.i64()?;
         let current = self.i64()?;
         let current_is_set = self.u8()? != 0;
         let is_called = self.u8()? != 0;
@@ -2765,6 +2784,7 @@ impl<'a> Dec<'a> {
             min_value,
             max_value,
             cycle,
+            cache,
             current,
             current_is_set,
             is_called,
