@@ -16883,12 +16883,12 @@ fn order_key(
 fn cast_empty_array_ctor(expr: &Expr, to: &ColType) -> Option<Value> {
     match (expr, to) {
         (Expr::ArrayCtor { elems, .. }, ColType::Array(elem)) if elems.is_empty() => {
-            Some(Value::Array(ArrayVal {
+            Some(Value::Array(Box::new(ArrayVal {
                 elem: *elem,
                 dims: Vec::new(),
                 lower: Vec::new(),
                 elems: Vec::new(),
-            }))
+            })))
         }
         _ => None,
     }
@@ -16928,7 +16928,7 @@ fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecErr
         let mut rows: Vec<ArrayVal> = Vec::with_capacity(vals.len());
         for v in vals {
             match v {
-                Value::Array(a) => rows.push(a),
+                Value::Array(a) => rows.push(*a),
                 Value::Null => {
                     return Err(exec_err(
                         "22P02",
@@ -16965,12 +16965,12 @@ fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecErr
         let mut lower = Vec::with_capacity(first.lower.len() + 1);
         lower.push(1);
         lower.extend(first.lower.iter().cloned());
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem: first.elem,
             dims,
             lower,
             elems: flat,
-        }));
+        })));
     }
     // Common element type, skipping NULLs (PG's unknown literals don't
     // constrain select_common_type; all-unknown resolves to text).
@@ -16991,12 +16991,12 @@ fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecErr
     for v in vals {
         out.push(eval_cast(&v, elem_ty)?);
     }
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem,
         dims: vec![out.len() as i32],
         lower: vec![1],
         elems: out,
-    }))
+    })))
 }
 
 /// v0.79: coerce an array subscript/slice-bound value to an integer, like
@@ -17079,12 +17079,12 @@ fn eval_slice_vals(
     // PG19 array_get_slice: more subscripts than dimensions is the
     // empty array, not an error.
     if bounds.len() > a.ndim() {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem: a.elem,
             dims: Vec::new(),
             lower: Vec::new(),
             elems: Vec::new(),
-        }));
+        })));
     }
     let bound = |v: Option<&Value>, dflt: i64| -> Result<i64, ExecError> {
         match v {
@@ -17107,12 +17107,12 @@ fn eval_slice_vals(
             (arr_lo, arr_hi)
         };
         if hi < lo {
-            return Ok(Value::Array(ArrayVal {
+            return Ok(Value::Array(Box::new(ArrayVal {
                 elem: a.elem,
                 dims: Vec::new(),
                 lower: Vec::new(),
                 elems: Vec::new(),
-            }));
+            })));
         }
         ranges.push(((lo - arr_lo) as usize, (hi - lo + 1) as usize));
     }
@@ -17141,12 +17141,12 @@ fn eval_slice_vals(
             pos[d] = 0;
         }
     }
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: a.elem,
         dims: ranges.iter().map(|(_, c)| *c as i32).collect(),
         lower: vec![1i32; ndim],
         elems,
-    }))
+    })))
 }
 
 /// v0.79: `=` / `<>` on arrays — PG19 `array_eq` semantics. Dimensions
@@ -17244,20 +17244,20 @@ fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecError> {
     // PG: concatenating with an empty (0-dim) array yields the other
     // side (retyped to the common element type).
     if x.ndim() == 0 {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem,
             dims: y.dims.clone(),
             lower: y.lower.clone(),
             elems: cast_all(y)?,
-        }));
+        })));
     }
     if y.ndim() == 0 {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem,
             dims: x.dims.clone(),
             lower: x.lower.clone(),
             elems: cast_all(x)?,
-        }));
+        })));
     }
     if x.ndim() != y.ndim() || x.dims[1..] != y.dims[1..] {
         return Err(exec_err("2202E", "cannot concatenate incompatible arrays"));
@@ -17266,12 +17266,12 @@ fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecError> {
     elems.extend(cast_all(y)?);
     let mut dims = x.dims.clone();
     dims[0] += y.dims[0];
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem,
         dims,
         lower: x.lower.clone(),
         elems,
-    }))
+    })))
 }
 
 fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
@@ -17294,12 +17294,12 @@ fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
     } else {
         (vec![x.dims[0] + 1], x.lower.clone())
     };
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: x.elem,
         dims,
         lower,
         elems,
-    }))
+    })))
 }
 
 fn array_prepend_elem(y: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
@@ -17328,12 +17328,12 @@ fn array_prepend_elem(y: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> 
         // prepend"), so `0 || '{1,2}'::int[]` is `{0,1,2}`.
         (vec![y.dims[0] + 1], vec![y.lower[0]])
     };
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: y.elem,
         dims,
         lower,
         elems,
-    }))
+    })))
 }
 
 /// v0.79: scalar array functions (PG19 arrayfuncs.c). NULL array (or
@@ -18244,12 +18244,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     // Empty subquery over an array column: PG yields an
                     // empty array of the (flattened) element type.
                     let elem = crate::storage::ArrayElem::of(&col_ty);
-                    return Ok(Value::Array(ArrayVal {
+                    return Ok(Value::Array(Box::new(ArrayVal {
                         elem,
                         dims: Vec::new(),
                         lower: Vec::new(),
                         elems: Vec::new(),
-                    }));
+                    })));
                 }
                 array_ctor_from_vals(vals, true)
             } else {
@@ -18259,12 +18259,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                 for v in vals {
                     elems.push(eval_cast(&v, ty)?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims: vec![elems.len() as i32],
                     lower: vec![1],
                     elems,
-                }))
+                })))
             }
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
@@ -21903,19 +21903,21 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // PG); array-to-array casts retype element-wise, preserving
         // dims, lower bounds, and NULL elements.
         ColType::Array(elem) => match v {
-            Value::Text(s) | Value::BpChar(s) => parse_array_literal(s, elem).map(Value::Array),
+            Value::Text(s) | Value::BpChar(s) => {
+                parse_array_literal(s, elem).map(|a| Value::Array(Box::new(a)))
+            }
             Value::Array(a) => {
                 let ty = elem_scalar_type(elem);
                 let mut out = Vec::with_capacity(a.elems.len());
                 for e in &a.elems {
                     out.push(eval_cast(e, ty)?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims: a.dims.clone(),
                     lower: a.lower.clone(),
                     elems: out,
-                }))
+                })))
             }
             other => Err(cast_err(other, &to.sql_name())),
         },

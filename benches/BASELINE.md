@@ -2,6 +2,140 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Value::Array` embeds `ArrayVal` (3 Vecs) inline, inflating every `Value` to 80 bytes — fix — 2026-09-25
+
+Fixes the target identified in the baseline entry immediately below this
+one. `storage::Value` (`src/storage.rs`) boxes its `Array` variant:
+
+```rust
+pub enum Value {
+    SmallInt(i16),
+    ...
+    Array(Box<ArrayVal>),   // was: Array(ArrayVal)
+    Null,
+}
+```
+
+`ArrayVal` (`elem: ArrayElem`, plus `dims`/`lower`/`elems: Vec<_>` — 3
+Vecs inline) was, at 80 bytes, the single largest field any `Value`
+variant carried — larger than `Numeric` (48 bytes) and far larger than
+every scalar variant (`SmallInt`, `Bool`, `Date`, ...). Because a Rust
+enum is sized to its largest variant plus a discriminant, embedding
+`ArrayVal` by value forced `size_of::<Value>()` to 80 bytes for *every*
+`Value` in the system, including the overwhelming majority that never
+touch an array. `Box<ArrayVal>` is one pointer (8 bytes), so the `Array`
+variant no longer sets `Value`'s size; the new largest variant is
+`Numeric` (48 bytes), and `size_of::<Value>()` drops to 48 bytes (see
+`size_of` probe output in the Measurement section) — confirmed with
+`std::mem::size_of::<Value>()` before/after via a temporary unit test.
+
+**Why this is exact, not approximate**: this is a pure representation
+change, not a semantic one. Every site that previously held an owned
+`ArrayVal` inside `Value::Array(..)` now holds a `Box<ArrayVal>` holding
+the identical `ArrayVal`; `Box<T>: Deref<Target = T>`, so every read
+site (`a.elem`, `a.dims`, `a.elems.clone()`, passing `&a` to a `&ArrayVal`
+parameter, etc. — the overwhelming majority of the ~40 call sites across
+`src/exec.rs`, `src/wal.rs`, `src/index.rs`) compiles and behaves
+identically through auto-deref, with zero source change needed. The only
+sites that needed an edit were ones constructing a `Value::Array` from a
+freshly-built `ArrayVal` (wrapped in `Box::new(..)`, ~15 sites), one
+`Iterator::map(Value::Array)` used as a bare function reference (rewritten
+as a closure that boxes its argument), and one `Vec<ArrayVal>::push(a)`
+where `a` is now a `Box<ArrayVal>` (changed to `push(*a)`, moving the
+`ArrayVal` out of its box — `Vec<ArrayVal>` still stores unboxed
+`ArrayVal`s, only `Value::Array`'s own field is boxed). `ArrayVal` itself
+is unchanged (still `#[derive(Clone, Debug, PartialEq)]`, still owns 3
+heap-allocated `Vec`s internally), so an actual array value now costs
+exactly one more pointer indirection and one more small heap allocation
+than before — negligible next to the 3 `Vec` allocations `ArrayVal`
+already pays for — while every non-array `Value` (the common case in any
+workload without array columns, including the join/groupby workload this
+round measures) gets smaller and cheaper to move, clone, and drop, with
+no change to which bytes it carries or how it compares/casts/serializes.
+
+**Measurement** (Callgrind `Ir`, `benches/profile_join.py --count 100`,
+same 20x2000 join+filter+GROUP BY workload as the `coerce_regclass_cmp`
+baseline/fix rounds, same machine, this session; two runs each side to
+confirm determinism):
+
+| | Ir |
+|---|---|
+| before (HEAD, baseline entry below), run 1 | 8,000,015,251 |
+| before, run 2 | 7,999,975,246 |
+| before (average) | 7,999,995,248.5 |
+| after, run 1 | 7,352,848,234 |
+| after, run 2 | 7,352,856,222 |
+| after (average) | 7,352,852,228 |
+
+(before runs agree to within 0.0005%, after runs to within 0.0001%)
+
+**Delta: -8.09%** total instructions (-647,143,020.5 Ir) — over 1.6x the
+5%-of-profile impact floor, on a workload where the target (the combined
+`__memcpy_avx_unaligned_erms` cost driven by `Value` moves throughout
+`eval_expr`/`eval_cmp_vals`/`Result::branch`/`coerce_text_numeric`/
+`build_source`) was independently measured at 21.68% of the baseline
+profile (see the baseline entry below) — the join/groupby workload
+touches no array columns at all, so this entire delta comes from shrinking
+every *non*-array `Value` move, exactly as the mechanism predicts.
+
+**DHAT** (same workload, same machine, single run each side — allocation
+counts are deterministic in this harness, as every prior DHAT round in
+this file has confirmed):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 212,279 | 212,279 | 0 (unchanged) |
+| Total bytes allocated | 53,625,303 | 45,516,503 | **-15.12%** |
+
+Block count is unchanged, as expected: this workload allocates no arrays,
+so no allocation site's *count* changes. Total *bytes* drops 15.12%
+because `Vec<Value>` allocations (row buffers, group-key/output-cell
+buffers) scale directly with `size_of::<Value>()`, which this change
+shrinks from 80 to 48 bytes for every such allocation — clearing the
+≥10%-bytes-allocated impact floor independently of the Ir floor above.
+
+**Behavior**: unchanged. `cargo build` clean. `cargo test --all-features`
+— 298 passed, 0 failed, identical to the pre-change tree. `cargo fmt --all
+-- --check` is clean. `cargo clippy --all-targets --all-features -- -D
+warnings` fails to compile with the same pre-existing ~360 errors on both
+the pre-change and post-change tree (confirmed via `git stash`: 362
+before, 361 after — the one-error difference and every changed line
+number is fully explained by this diff's own added lines shifting
+downstream line numbers, the same toolchain/lint-version mismatch noted
+in every prior Bolt round in this file), no new clippy findings
+attributable to this change. Array-specific suites
+`tests/protocol_test75.py` (39/39) and `tests/protocol_test81.py` (35/35)
+— covering `ARRAY[...]` construction, subscripting, slicing, `||`
+concat/append/prepend, casts, `unnest`, equality, and the v0.78 WAL
+`Value`/`ColType` array round-trip already covered by
+`wal::tests::v078_array_coltype_roundtrip` — all pass unchanged.
+`tests/protocol_test.py` (40/40) and `tests/protocol_test2.py` (91/91)
+are unchanged.
+
+**Reproduce**:
+```bash
+git checkout <this-branch>
+cargo build && cargo test --all-features
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_join.py --count 100 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,21p'   # PROGRAM TOTALS Ir
+```
+
+Compare against the baseline commit (`src/storage.rs`/`src/exec.rs`/
+`src/wal.rs` before this fix) rebuilt the same way, for the before
+numbers. For DHAT, swap `--tool=callgrind ... --cache-sim=yes` for
+`--tool=dhat` and sum `tb`/`tbk` over the `pps` array in the resulting
+`dhat.out.<pid>`, as in every prior DHAT round in this file.
+
+Before/after profiles committed: `benches/profiles/callgrind.out.valuebox-base-2026-09-25`,
+`benches/profiles/callgrind.out.valuebox-after-2026-09-25`,
+`benches/profiles/dhat.out.valuebox-base-2026-09-25`,
+`benches/profiles/dhat.out.valuebox-after-2026-09-25`.
+
 ## Bolt: `Value::Array` embeds `ArrayVal` (3 Vecs) inline, inflating every `Value` to 80 bytes — baseline — 2026-09-25
 
 **Why this workload**: `benches/bench.py --workload all --seconds 3` was

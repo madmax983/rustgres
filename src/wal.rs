@@ -1840,12 +1840,12 @@ impl<'a> Dec<'a> {
                 for _ in 0..nelems {
                     elems.push(self.value()?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims,
                     lower,
                     elems,
-                }))
+                })))
             }
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
