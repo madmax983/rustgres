@@ -6859,6 +6859,11 @@ impl Parser {
             "position" => return self.parse_position(),
             "substring" => return self.parse_substring(),
             "overlay" => return self.parse_overlay(),
+            // v0.80: `GROUPING(...)` is PG19's grouping-set mask function
+            // (a dedicated grammar production, not a regular function).
+            // Quoted variants (e.g. `"Grouping"(...)`) keep the generic
+            // path — only the folded keyword form is special.
+            "grouping" => return self.parse_grouping(),
             _ => {}
         }
         let agg = match name.as_str() {
@@ -7182,6 +7187,33 @@ impl Parser {
         Ok(Expr::Func {
             name: "position".to_string(),
             args: vec![a, b],
+        })
+    }
+
+    /// v0.80: `GROUPING(a, b, ...)` — PG19's grouping-set mask function.
+    /// The grammar production takes a non-empty expression list, so zero
+    /// arguments are a syntax error (42601), like Postgres. Represented
+    /// as `Func { name: "grouping" }`; argument validation (fewer than 32
+    /// arguments, each matching a grouping expression of the query level)
+    /// and mask evaluation happen at group level in exec.
+    fn parse_grouping(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        if *self.peek() == Token::RParen {
+            return Err(err("syntax error: GROUPING requires at least one argument"));
+        }
+        let mut args = Vec::new();
+        loop {
+            args.push(self.parse_or()?);
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "grouping".to_string(),
+            args,
         })
     }
 

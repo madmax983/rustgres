@@ -49,6 +49,7 @@ use crate::storage::{
     RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef, WriteOp,
     row_visible, toast_consts, toast_storage,
 };
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
@@ -327,6 +328,8 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
                     ctes: Vec::new(),
                     wctx: None,
                     priv_scopes: Vec::new(),
+                    hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    hashed_in: Rc::new(RefCell::new(Vec::new())),
                 };
                 run_select(&mut q, sel, &[])?
             };
@@ -1614,6 +1617,8 @@ fn eval_partition_key_expr(
         role,
         read_only: false,
         priv_scopes: Vec::new(),
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
     };
     let scope = Scope {
         schema,
@@ -2638,6 +2643,8 @@ fn eval_default(
                 ctes: Vec::new(),
                 wctx: None,
                 priv_scopes: Vec::new(),
+                hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                hashed_in: Rc::new(RefCell::new(Vec::new())),
             };
             let v = eval_expr(&mut q, &[], e)?;
             coerce_value(v, ctype, cname)
@@ -2699,6 +2706,8 @@ fn check_row_constraints(
             ctes: Vec::new(),
             wctx: None,
             priv_scopes: Vec::new(),
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
         };
         let frame = Scope {
             schema: &schema,
@@ -3484,6 +3493,8 @@ fn materialize_dml_ctes(
         ctes: Vec::new(),
         wctx: None,
         priv_scopes: Vec::new(),
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
     };
     materialize_ctes(&mut q, with)?;
     Ok(q.ctes)
@@ -4355,6 +4366,8 @@ fn exec_create_table_as(
             ctes: Vec::new(),
             wctx: None,
             priv_scopes: Vec::new(),
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
         };
         run_select(&mut q, select, &[])?
     };
@@ -4474,6 +4487,8 @@ fn exec_insert(
             ctes: ctes.clone(),
             wctx: None,
             priv_scopes: Vec::new(),
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
         };
         let out = run_select(&mut q, sel, &[])?;
         Some(out.rows)
@@ -4650,6 +4665,8 @@ fn exec_insert(
                 ctes: ctes.clone(),
                 wctx: None,
                 priv_scopes: Vec::new(),
+                hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                hashed_in: Rc::new(RefCell::new(Vec::new())),
             };
             built = Vec::with_capacity(rows.len());
             // v0.72: expand top-level set-returning calls in VALUES
@@ -5438,6 +5455,8 @@ fn exec_update(
                 ctes: ctes.clone(),
                 wctx: None,
                 priv_scopes: Vec::new(),
+                hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                hashed_in: Rc::new(RefCell::new(Vec::new())),
             };
             let (fschema, frows) = build_from(&mut q, &[], from, None, false, None, None)?;
             Some((fschema, frows))
@@ -6021,6 +6040,8 @@ fn exec_delete(
                 ctes: ctes.clone(),
                 wctx: None,
                 priv_scopes: Vec::new(),
+                hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                hashed_in: Rc::new(RefCell::new(Vec::new())),
             };
             let (uschema, urows) = build_from(&mut q, &[], using, None, false, None, None)?;
             Some((uschema, urows))
@@ -9360,6 +9381,15 @@ struct Q<'a, 'b> {
     /// last), for the column-privilege pre-pass. `None` = not a base
     /// table (view/CTE/derived); those are checked at their own level.
     priv_scopes: Vec<Vec<(String, Option<String>)>>,
+    /// v0.80: hashed EXISTS subplan cache, shared across nested query
+    /// levels by Rc (like CTE bindings): (table, column) -> materialized
+    /// inner key set. Built lazily on first probe; the statement
+    /// snapshot is fixed so one build serves every row.
+    hashed_exists: Rc<RefCell<HashMap<(String, String), Rc<HashedExists>>>>,
+    /// v0.80: uncorrelated IN-subquery result cache, shared the same
+    /// way: previously seen subqueries (by AST equality) and their
+    /// materialized outputs.
+    hashed_in: Rc<RefCell<Vec<(SelectStmt, Rc<HashedIn>)>>>,
 }
 
 /// v0.10: a materialized Common Table Expression: name, output schema and
@@ -10603,6 +10633,14 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
     // v0.10: window-function placement rules.
     validate_windows(stmt)?;
     if let Some(w) = &stmt.where_ {
+        // v0.80: PG19 reports misplaced grouping operations with its own
+        // 42803 text, not the aggregate one.
+        if contains_grouping(w) {
+            return Err(exec_err(
+                "42803",
+                "grouping operations are not allowed in WHERE",
+            ));
+        }
         if contains_agg(w) {
             return Err(exec_err(
                 "42803",
@@ -10618,6 +10656,13 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
         validate_expr(w)?;
     }
     for g in stmt.group_by.iter().flatten() {
+        // v0.80: PG19's own 42803 text for misplaced grouping operations.
+        if contains_grouping(g) {
+            return Err(exec_err(
+                "42803",
+                "grouping operations are not allowed in GROUP BY",
+            ));
+        }
         if contains_agg(g) {
             return Err(exec_err("42803", "aggregates are not allowed in GROUP BY"));
         }
@@ -10632,6 +10677,14 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
     for item in &stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
             validate_expr(expr)?;
+            // v0.80: `GROUPING(...)` nested inside an aggregate or window
+            // call is rejected at analysis, like PG19 (42803).
+            if let Some(what) = grouping_misplaced(expr) {
+                return Err(exec_err(
+                    "42803",
+                    format!("grouping operations are not allowed in {what}"),
+                ));
+            }
         }
     }
     for f in &stmt.from {
@@ -10645,9 +10698,25 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
             ));
         }
         validate_expr(h)?;
+        // v0.80: `GROUPING(...)` nested inside an aggregate or window
+        // call is rejected at analysis, like PG19 (42803).
+        if let Some(what) = grouping_misplaced(h) {
+            return Err(exec_err(
+                "42803",
+                format!("grouping operations are not allowed in {what}"),
+            ));
+        }
     }
     for o in &stmt.order_by {
         validate_expr(&o.expr)?;
+        // v0.80: `GROUPING(...)` nested inside an aggregate or window
+        // call is rejected at analysis, like PG19 (42803).
+        if let Some(what) = grouping_misplaced(&o.expr) {
+            return Err(exec_err(
+                "42803",
+                format!("grouping operations are not allowed in {what}"),
+            ));
+        }
     }
     // v0.52: `SELECT DISTINCT ON` shape rules. Aggregates and window
     // functions are legal inside DISTINCT ON expressions (PG19 allows
@@ -10709,6 +10778,13 @@ fn validate_from(f: &FromItem) -> Result<(), ExecError> {
             validate_from(left)?;
             validate_from(right)?;
             if let Some(p) = on {
+                // v0.80: PG19's own 42803 text for misplaced grouping operations.
+                if contains_grouping(p) {
+                    return Err(exec_err(
+                        "42803",
+                        "grouping operations are not allowed in JOIN conditions",
+                    ));
+                }
                 if contains_agg(p) {
                     return Err(exec_err(
                         "42803",
@@ -10859,7 +10935,9 @@ fn contains_agg(e: &Expr) -> bool {
         }
         Expr::IsDistinctFrom { left, right, .. } => contains_agg(left) || contains_agg(right),
         Expr::Cast { expr, .. } => contains_agg(expr),
-        Expr::Func { args, .. } => args.iter().any(contains_agg),
+        // v0.80: `GROUPING(...)` behaves like an aggregate for placement
+        // and dispatch (PG19's transformGroupingFunc sets p_hasAggs).
+        Expr::Func { name, args } => name == "grouping" || args.iter().any(contains_agg),
         Expr::Extract { from, .. } => contains_agg(from),
         Expr::InSub { expr, .. } => contains_agg(expr),
         // ScalarSub / ArraySubquery / Exists are separate query levels.
@@ -10877,6 +10955,265 @@ fn contains_agg(e: &Expr) -> bool {
                 || order_by.iter().any(|o| contains_agg(&o.expr))
         }
     }
+}
+
+/// v0.80: pre-order traversal of an expression tree, visiting every node
+/// once. Subquery bodies (`ScalarSub`, the `sub` of `InSub`, `Exists`,
+/// `ArraySubquery`) are separate query levels and are never descended
+/// into — the same level discipline as `contains_agg`.
+fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
+    let mut stack: Vec<&'a Expr> = vec![e];
+    while let Some(x) = stack.pop() {
+        visit(x);
+        match x {
+            Expr::Arith { left, right, .. }
+            | Expr::Cmp { left, right, .. }
+            | Expr::IsDistinctFrom { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Not(x) | Expr::BitNot(x) | Expr::Neg(x) => stack.push(x),
+            Expr::IsNull { expr: x, .. } | Expr::IsBool { expr: x, .. } => stack.push(x),
+            Expr::Cast { expr: x, .. } | Expr::Extract { from: x, .. } => stack.push(x),
+            Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
+                stack.push(expr);
+                stack.push(pattern);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                stack.push(expr);
+                stack.push(low);
+                stack.push(high);
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                if let Some(o) = operand {
+                    stack.push(o);
+                }
+                for (k, v) in whens {
+                    stack.push(k);
+                    stack.push(v);
+                }
+                if let Some(el) = else_ {
+                    stack.push(el);
+                }
+            }
+            Expr::Func { args, .. } => {
+                for a in args {
+                    stack.push(a);
+                }
+            }
+            Expr::Agg { arg, arg2, .. } => {
+                if let Some(a) = arg {
+                    stack.push(a);
+                }
+                if let Some(a) = arg2 {
+                    stack.push(a);
+                }
+            }
+            Expr::ArrayCtor { elems, .. } => {
+                for el in elems {
+                    stack.push(el);
+                }
+            }
+            Expr::Subscript { array, indices } => {
+                stack.push(array);
+                for i in indices {
+                    stack.push(i);
+                }
+            }
+            Expr::Slice { array, bounds } => {
+                stack.push(array);
+                for (l, u) in bounds {
+                    if let Some(l) = l {
+                        stack.push(l);
+                    }
+                    if let Some(u) = u {
+                        stack.push(u);
+                    }
+                }
+            }
+            Expr::InSub { expr, .. } => stack.push(expr),
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for a in args {
+                    stack.push(a);
+                }
+                for p in partition_by {
+                    stack.push(p);
+                }
+                for o in order_by {
+                    stack.push(&o.expr);
+                }
+            }
+            // Leaves, plus subquery levels (never descended into).
+            Expr::Column { .. }
+            | Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_)
+            | Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::Exists { .. } => {}
+        }
+    }
+}
+
+/// v0.80: true for PG19's `GROUPING(...)` mask call, parsed as
+/// `Func { name: "grouping" }`.
+fn is_grouping_call(e: &Expr) -> bool {
+    matches!(e, Expr::Func { name, .. } if name == "grouping")
+}
+
+/// v0.80: true when the expression contains a `GROUPING(...)` call at
+/// this query level.
+fn contains_grouping(e: &Expr) -> bool {
+    let mut found = false;
+    expr_walk(e, &mut |x| found = found || is_grouping_call(x));
+    found
+}
+
+/// v0.80: argument lists of every `GROUPING(...)` call at this query
+/// level, in pre-order.
+fn collect_grouping_calls<'a>(e: &'a Expr, out: &mut Vec<&'a [Expr]>) {
+    expr_walk(e, &mut |x| {
+        if let Expr::Func { name, args } = x {
+            if name == "grouping" {
+                out.push(args.as_slice());
+            }
+        }
+    });
+}
+
+/// v0.80: a `GROUPING(...)` nested inside an aggregate or window call at
+/// this query level — PG19 rejects it at analysis (42803). Returns the
+/// construct name for the error message.
+fn grouping_misplaced(e: &Expr) -> Option<&'static str> {
+    let mut hit: Option<&'static str> = None;
+    expr_walk(e, &mut |x| {
+        if hit.is_some() {
+            return;
+        }
+        hit = match x {
+            Expr::Agg { arg, arg2, .. } => {
+                let bad = arg.as_deref().is_some_and(contains_grouping)
+                    || arg2.as_deref().is_some_and(contains_grouping);
+                bad.then_some("aggregate function calls")
+            }
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                let bad = args.iter().any(contains_grouping)
+                    || partition_by.iter().any(contains_grouping)
+                    || order_by.iter().any(|o| contains_grouping(&o.expr));
+                bad.then_some("window function calls")
+            }
+            _ => None,
+        };
+    });
+    hit
+}
+
+/// v0.80: whether a `GROUPING(...)` argument denotes the same grouping
+/// expression as a grouping key — PG19's `finalize_grouping_exprs` match
+/// (equal Vars, else structurally equal expressions). Plain columns
+/// resolve through the FROM schema, so `t.a`, `a`, and ordinal-expanded
+/// keys compare by (range, column) rather than by text. Outer references
+/// never resolve against this level's schema, so they never match —
+/// like PG, which disallows them here.
+fn grouping_arg_matches(schema: &[QCol], arg: &Expr, key: &Expr) -> bool {
+    if let (
+        Expr::Column {
+            table: at,
+            name: an,
+        },
+        Expr::Column {
+            table: gt,
+            name: gn,
+        },
+    ) = (arg, key)
+    {
+        let gscope = Scope {
+            schema,
+            row: &[],
+            prov: None,
+        };
+        match (
+            resolve_col(&[gscope], at.as_deref(), an),
+            resolve_col(&[gscope], gt.as_deref(), gn),
+        ) {
+            (Ok((asi, aci)), Ok((gsi, gci))) => asi == gsi && aci == gci,
+            _ => false,
+        }
+    } else {
+        arg == key
+    }
+}
+
+/// v0.80: PG19 `GROUPING(...)` analysis (parse_agg.c
+/// `transformGroupingFunc` / `finalize_grouping_exprs`): every call takes
+/// fewer than 32 arguments (54023), and every argument matches a grouping
+/// expression of this query level — the union of all grouping sets
+/// (42803).
+fn validate_grouping_calls(
+    stmt: &SelectStmt,
+    schema: &[QCol],
+    sets: &[Vec<Expr>],
+) -> Result<(), ExecError> {
+    let mut calls: Vec<&[Expr]> = Vec::new();
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_grouping_calls(expr, &mut calls);
+        }
+    }
+    if let Some(h) = &stmt.having {
+        collect_grouping_calls(h, &mut calls);
+    }
+    for o in &stmt.order_by {
+        collect_grouping_calls(&o.expr, &mut calls);
+    }
+    for e in &stmt.distinct_on {
+        collect_grouping_calls(e, &mut calls);
+    }
+    if calls.is_empty() {
+        return Ok(());
+    }
+    for args in calls {
+        if args.len() > 31 {
+            return Err(exec_err(
+                "54023",
+                "GROUPING must have fewer than 32 arguments",
+            ));
+        }
+        for a in args {
+            let ok = sets
+                .iter()
+                .flatten()
+                .any(|k| grouping_arg_matches(schema, a, k));
+            if !ok {
+                return Err(exec_err(
+                    "42803",
+                    "arguments to GROUPING must be grouping expressions of the associated query level",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v0.10: true when the expression contains a window function (at any
@@ -13803,6 +14140,8 @@ fn build_source(
                     ctes: q.ctes.clone(),
                     wctx: None,
                     priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
                 };
                 run_select(&mut sub_q, sub, &[])?
             };
@@ -14710,6 +15049,11 @@ fn exec_agg(
     windows: &[ExecWindow],
 ) -> Result<Vec<OutRow>, ExecError> {
     let sets = resolve_grouping_sets(stmt)?;
+    // v0.80: `GROUPING(...)` analysis — fewer than 32 arguments, each
+    // matching a grouping expression of this query level (PG19
+    // parse_agg.c). Validated once per statement, before any per-set
+    // aggregation.
+    validate_grouping_calls(stmt, schema, &sets)?;
     if !stmt.group_by_sets {
         debug_assert!(sets.len() <= 1);
         let set = sets.into_iter().next().unwrap_or_default();
@@ -15149,6 +15493,23 @@ fn eval_grouped(
     group_by: &[Expr],
     e: &Expr,
 ) -> Result<Value, ExecError> {
+    // v0.80: `GROUPING(...)` — PG19's grouping-set mask. The i-th
+    // argument (left to right) contributes bit (n-1-i): 1 when the
+    // argument is absent from the current grouping set, 0 when it is
+    // present. Arguments were validated against the union of all sets in
+    // `exec_agg`, so only the current set matters here.
+    if let Expr::Func { name, args } = e {
+        if name == "grouping" {
+            let n = args.len();
+            let mut mask: i64 = 0;
+            for (i, a) in args.iter().enumerate() {
+                if !group_by.iter().any(|k| grouping_arg_matches(schema, a, k)) {
+                    mask |= 1i64 << (n - 1 - i);
+                }
+            }
+            return Ok(Value::Int(mask));
+        }
+    }
     match e {
         Expr::Agg {
             func,
@@ -17457,6 +17818,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     ctes: q.ctes.clone(),
                     wctx: None,
                     priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -17491,6 +17854,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     ctes: q.ctes.clone(),
                     wctx: None,
                     priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -17536,6 +17901,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
         Expr::Exists { sub, neg } => {
+            // v0.80: hashed correlated-EXISTS fast path — a simple
+            // equality-correlated subquery builds its inner key set once
+            // per statement instead of re-running per outer row.
+            if let Some(b) = eval_hashed_exists(q, scopes, sub, *neg)? {
+                return Ok(Value::Bool(b));
+            }
             let out = {
                 let mut sub_q = Q {
                     eng: &mut *q.eng,
@@ -17549,6 +17920,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     ctes: q.ctes.clone(),
                     wctx: None,
                     priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -17573,6 +17946,770 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
 
 /// `[NOT] IN (subquery)` with SQL three-valued logic: TRUE if any equal
 /// value, else NULL if NULLs were involved, else FALSE.
+/// v0.80: hashed correlated-EXISTS / uncorrelated-IN subplans.
+///
+/// A correlated `EXISTS (SELECT ... FROM t k WHERE k.c = <outer>)`
+/// re-runs the inner query once per outer row. When the subquery has
+/// the simple shape `SELECT ... FROM <single base table> [AS k] WHERE
+/// k.c = <outer expr>` (no CTEs, grouping, limit, or set ops; no
+/// aggregates/windows in the select list), the inner side is
+/// row-independent: the set of `k.c` values is built once per
+/// statement (one MVCC scan under the statement snapshot) and each
+/// outer row probes it. Likewise an uncorrelated `IN (SELECT ...)`
+/// runs its subquery once per statement instead of once per row.
+///
+/// Soundness rules — anything else falls back to the row-by-row
+/// executor, which is always correct:
+/// - the inner range resolves exactly as the executor's own FROM
+///   resolution would: a shadowing CTE, view, or information_schema
+///   name falls back; partitioned parents fall back;
+/// - the hashed column's type is one whose equality is bytewise on
+///   the stored form (int2/int4/int8, text, bool, date, timestamp,
+///   timestamptz, bytea, uuid); a probe of another family (e.g.
+///   numeric against int, date against timestamp) falls back so
+///   `cmp_ordering` keeps its exact cross-type semantics;
+/// - NULL inner values never match; a NULL probe never matches;
+/// - the probe expression may not reference the inner range (it is
+///   evaluated in the outer scopes, where such a reference would not
+///   resolve) and may not contain a subquery;
+/// - the SELECT privilege check the table scan would perform runs
+///   when the set is built (same 42501).
+/// The caches are shared across nested query levels by Rc (like CTE
+/// bindings); the statement snapshot is fixed, so one build serves
+/// every row. A volatile function inside a cached IN subquery
+/// evaluates once per statement — Postgres materializes uncorrelated
+/// subplans the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SubplanFamily {
+    Int,
+    Text,
+    Bool,
+    Date,
+    Timestamp,
+    Timestamptz,
+    Bytea,
+    Uuid,
+}
+
+/// A hashable cell value. Only built for values whose family matches
+/// the hashed column's family, so set membership agrees exactly with
+/// `cmp_ordering`'s `Eq`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SubplanKey {
+    Int(i64),
+    Text(String),
+    Bool(bool),
+    Date(i32),
+    Timestamp(i64),
+    Timestamptz(i64),
+    Bytea(Vec<u8>),
+    Uuid([u8; 16]),
+}
+
+/// Materialized inner key set for one hashable EXISTS pattern.
+struct HashedExists {
+    family: SubplanFamily,
+    set: HashSet<SubplanKey>,
+}
+
+/// Cached output of one uncorrelated IN subquery: the first-column
+/// values, plus the probe set when every value was hash-safe.
+struct HashedIn {
+    values: Vec<Value>,
+    saw_null: bool,
+    set: Option<(SubplanFamily, HashSet<SubplanKey>)>,
+}
+
+fn subplan_key(v: &Value) -> Option<SubplanKey> {
+    match v {
+        Value::SmallInt(x) => Some(SubplanKey::Int(*x as i64)),
+        Value::Int(x) => Some(SubplanKey::Int(*x)),
+        Value::BigInt(x) => Some(SubplanKey::Int(*x)),
+        Value::Text(x) => Some(SubplanKey::Text(x.to_string())),
+        Value::Bool(x) => Some(SubplanKey::Bool(*x)),
+        Value::Date(x) => Some(SubplanKey::Date(*x)),
+        Value::Timestamp(x) => Some(SubplanKey::Timestamp(*x)),
+        Value::Timestamptz(x) => Some(SubplanKey::Timestamptz(*x)),
+        Value::Bytea(x) => Some(SubplanKey::Bytea(x.clone())),
+        Value::Uuid(x) => Some(SubplanKey::Uuid(*x)),
+        _ => None,
+    }
+}
+
+fn subplan_key_family(k: &SubplanKey) -> SubplanFamily {
+    match k {
+        SubplanKey::Int(_) => SubplanFamily::Int,
+        SubplanKey::Text(_) => SubplanFamily::Text,
+        SubplanKey::Bool(_) => SubplanFamily::Bool,
+        SubplanKey::Date(_) => SubplanFamily::Date,
+        SubplanKey::Timestamp(_) => SubplanFamily::Timestamp,
+        SubplanKey::Timestamptz(_) => SubplanFamily::Timestamptz,
+        SubplanKey::Bytea(_) => SubplanFamily::Bytea,
+        SubplanKey::Uuid(_) => SubplanFamily::Uuid,
+    }
+}
+
+/// Column types whose stored values always land in one hash family.
+/// Char/varchar are excluded: their values may be `BpChar`, whose
+/// trailing-space-insensitive equality is not bytewise.
+fn subplan_col_family(ty: &ColType) -> Option<SubplanFamily> {
+    match ty {
+        ColType::SmallInt | ColType::Int | ColType::BigInt => Some(SubplanFamily::Int),
+        ColType::Text => Some(SubplanFamily::Text),
+        ColType::Bool => Some(SubplanFamily::Bool),
+        ColType::Date => Some(SubplanFamily::Date),
+        ColType::Timestamp => Some(SubplanFamily::Timestamp),
+        ColType::Timestamptz => Some(SubplanFamily::Timestamptz),
+        ColType::Bytea => Some(SubplanFamily::Bytea),
+        ColType::Uuid => Some(SubplanFamily::Uuid),
+        _ => None,
+    }
+}
+
+/// Visit `e` and all its child expressions, depth-first.
+fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::WholeRow { .. } => {}
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::IsDistinctFrom { left, right, .. } => {
+            walk_expr(left, f);
+            walk_expr(right, f);
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Not(expr)
+        | Expr::BitNot(expr)
+        | Expr::Neg(expr)
+        | Expr::IsNull { expr, .. }
+        | Expr::IsBool { expr, .. }
+        | Expr::Extract { from: expr, .. } => walk_expr(expr, f),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            walk_expr(expr, f);
+            walk_expr(pattern, f);
+            if let Some(esc) = escape {
+                walk_expr(esc, f);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            walk_expr(expr, f);
+            walk_expr(pattern, f);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr(expr, f);
+            walk_expr(low, f);
+            walk_expr(high, f);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+            ..
+        } => {
+            if let Some(o) = operand {
+                walk_expr(o, f);
+            }
+            for (k, r) in whens {
+                walk_expr(k, f);
+                walk_expr(r, f);
+            }
+            if let Some(el) = else_ {
+                walk_expr(el, f);
+            }
+        }
+        Expr::Agg { arg, arg2, .. } => {
+            if let Some(a) = arg {
+                walk_expr(a, f);
+            }
+            if let Some(a) = arg2 {
+                walk_expr(a, f);
+            }
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            for el in elems {
+                walk_expr(el, f);
+            }
+        }
+        Expr::Subscript { array, indices, .. } => {
+            walk_expr(array, f);
+            for i in indices {
+                walk_expr(i, f);
+            }
+        }
+        Expr::Slice { array, bounds, .. } => {
+            walk_expr(array, f);
+            for (lo, hi) in bounds {
+                if let Some(b) = lo {
+                    walk_expr(b, f);
+                }
+                if let Some(b) = hi {
+                    walk_expr(b, f);
+                }
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+            for p in partition_by {
+                walk_expr(p, f);
+            }
+            for t in order_by {
+                walk_expr(&t.expr, f);
+            }
+        }
+        Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) => {
+            walk_select(sub, f);
+        }
+        Expr::InSub { expr, sub, .. } => {
+            walk_expr(expr, f);
+            walk_select(sub, f);
+        }
+        Expr::Exists { sub, .. } => walk_select(sub, f),
+    }
+}
+
+/// Visit every expression in the statement positions that can carry a
+/// column reference: select items, WHERE, GROUP BY, HAVING, ORDER BY.
+fn walk_select(s: &SelectStmt, f: &mut impl FnMut(&Expr)) {
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk_expr(expr, f);
+        }
+    }
+    if let Some(w) = &s.where_ {
+        walk_expr(w, f);
+    }
+    for g in s.group_by.iter().flatten() {
+        walk_expr(g, f);
+    }
+    if let Some(h) = &s.having {
+        walk_expr(h, f);
+    }
+    for t in &s.order_by {
+        walk_expr(&t.expr, f);
+    }
+}
+
+/// True iff every column reference in `e` is qualified with a qualifier
+/// other than `inner_qual`. Fails closed (false) on anything that
+/// could hide an inner-range reference — notably nested subqueries,
+/// which may correlate to the inner range, and unqualified columns,
+/// which would resolve to the inner range in the row-by-row executor.
+fn expr_refs_only_outer(e: &Expr, inner_qual: &str) -> bool {
+    let mut ok = true;
+    walk_expr(e, &mut |x| {
+        if !ok {
+            return;
+        }
+        match x {
+            Expr::Column { table, .. } => {
+                if !matches!(table, Some(q) if q != inner_qual) {
+                    ok = false;
+                }
+            }
+            Expr::WholeRow { qual } => {
+                if qual != inner_qual {
+                    ok = false;
+                }
+            }
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::InSub { .. }
+            | Expr::Exists { .. }
+            | Expr::ResolvedCol { .. } => {
+                ok = false;
+            }
+            _ => {}
+        }
+    });
+    ok
+}
+
+/// The matched shape of a hashable EXISTS subquery.
+struct HashableExists<'a> {
+    table: &'a str,
+    inner_col: &'a str,
+    outer: &'a Expr,
+}
+
+/// Match `EXISTS (SELECT ... FROM <table> [AS q] WHERE q.c = <outer>)`.
+/// Returns None for any other shape; the caller falls back to the
+/// row-by-row executor.
+fn match_hashable_exists(sub: &SelectStmt) -> Option<HashableExists<'_>> {
+    if sub.set_op.is_some()
+        || !sub.group_by.is_empty()
+        || sub.having.is_some()
+        || sub.limit.is_some()
+        || sub.offset.is_some()
+        || !sub.with.is_empty()
+    {
+        return None;
+    }
+    let [from] = sub.from.as_slice() else {
+        return None;
+    };
+    let FromItem::Table {
+        name,
+        alias,
+        col_aliases,
+    } = from
+    else {
+        return None;
+    };
+    if !col_aliases.is_empty() {
+        return None;
+    }
+    // No aggregates or window functions: they change what "existence"
+    // means (e.g. an aggregate without GROUP BY always yields one row).
+    for item in &sub.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if contains_agg(expr) || contains_window(expr) {
+                return None;
+            }
+        }
+    }
+    let w = sub.where_.as_ref()?;
+    let Expr::Cmp {
+        op: CmpOp::Eq,
+        left,
+        right,
+    } = w
+    else {
+        return None;
+    };
+    let inner_qual = alias.as_deref().unwrap_or(name.as_str());
+    // Exactly one side is a column of the inner range; the other side is
+    // the per-row probe.
+    let (inner_col, outer) = match (left.as_ref(), right.as_ref()) {
+        (
+            Expr::Column {
+                table: Some(t),
+                name,
+            },
+            outer,
+        ) if t == inner_qual => {
+            expr_refs_only_outer(outer, inner_qual).then_some((name.as_str(), outer))?
+        }
+        (
+            outer,
+            Expr::Column {
+                table: Some(t),
+                name,
+            },
+        ) if t == inner_qual => {
+            expr_refs_only_outer(outer, inner_qual).then_some((name.as_str(), outer))?
+        }
+        _ => return None,
+    };
+    Some(HashableExists {
+        table: name.as_str(),
+        inner_col,
+        outer,
+    })
+}
+
+/// The SELECT privilege check the inner table scan would perform,
+/// mirrored for the hashed build (same 42501).
+fn check_subplan_table_privs(q: &Q, table: &str) -> Result<(), ExecError> {
+    let db = &q.eng.db;
+    if let Some(t) = db.find_table(table, q.snap, q.own, q.session) {
+        let have = crate::storage::table_privs(db, q.role, t, q.snap, q.own);
+        let select_ok = have & crate::storage::PRIV_SELECT == crate::storage::PRIV_SELECT
+            || crate::storage::has_col_priv(
+                db,
+                q.role,
+                t,
+                crate::storage::PRIV_SELECT,
+                q.snap,
+                q.own,
+            );
+        if !select_ok {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied for table \"{}\" (needs SELECT)", table),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// True iff `name` resolves to something other than a base table under
+/// the executor's own FROM resolution order (CTE, then
+/// information_schema, then view, then table).
+fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
+    if q.ctes.iter().any(|b| b.name == name) {
+        return false;
+    }
+    if name == "information_schema.tables" || name == "information_schema.columns" {
+        return false;
+    }
+    if q.eng.db.find_view(name, q.snap, q.own).is_some() {
+        return false;
+    }
+    true
+}
+
+/// Probe a materialized EXISTS set with one outer-row probe value.
+fn probe_hashed_exists(
+    q: &mut Q,
+    scopes: &[Scope],
+    h: &HashedExists,
+    outer: &Expr,
+    neg: bool,
+) -> Result<Option<bool>, ExecError> {
+    let ov = eval_expr(q, scopes, outer)?;
+    if ov == Value::Null {
+        // A NULL probe never matches; NOT EXISTS over no match is true.
+        return Ok(Some(neg));
+    }
+    let Some(k) = subplan_key(&ov) else {
+        // Unhashable probe type: the slow path for this row, where
+        // `cmp_ordering` applies its exact semantics.
+        return Ok(None);
+    };
+    if subplan_key_family(&k) != h.family {
+        // Cross-family probe (e.g. numeric against int, date against
+        // timestamp): `cmp_ordering` may still call it equal — slow path.
+        return Ok(None);
+    }
+    let exists = h.set.contains(&k);
+    Ok(Some(if neg { !exists } else { exists }))
+}
+
+/// Try the hashed fast path for `EXISTS (sub)`. Returns `Ok(None)`
+/// when the shape is not hashable (or this row's probe is not): the
+/// caller runs the regular row-by-row subquery.
+fn eval_hashed_exists(
+    q: &mut Q,
+    scopes: &[Scope],
+    sub: &SelectStmt,
+    neg: bool,
+) -> Result<Option<bool>, ExecError> {
+    let pat = match match_hashable_exists(sub) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    if !subplan_inner_is_base_table(q, pat.table) {
+        return Ok(None);
+    }
+    let key = (pat.table.to_string(), pat.inner_col.to_string());
+    // The RefCell borrow is scoped: probing and building both recurse
+    // into eval_expr, which must be free to use the cache.
+    let hit = { q.hashed_exists.borrow().get(&key).cloned() };
+    if let Some(h) = hit {
+        return probe_hashed_exists(q, scopes, &h, pat.outer, neg);
+    }
+    check_subplan_table_privs(q, pat.table)?;
+    // Build the set: one MVCC scan of the inner column under the
+    // statement snapshot.
+    let h = {
+        let db = &q.eng.db;
+        let t = match db.find_table(pat.table, q.snap, q.own, q.session) {
+            Some(t) => t,
+            // Gone between the base-table check and now: the slow path
+            // reports it exactly as before (42P01).
+            None => return Ok(None),
+        };
+        // Partitioned parents fan out to leaves; keep the slow path.
+        let is_partitioned = t
+            .partition
+            .as_ref()
+            .map(|p| !p.children.is_empty())
+            .unwrap_or(false);
+        if is_partitioned {
+            return Ok(None);
+        }
+        let idx = match t.columns.iter().position(|(n, _)| n == pat.inner_col) {
+            Some(i) => i,
+            // 42703 surfaces via the slow path.
+            None => return Ok(None),
+        };
+        let family = match subplan_col_family(&t.columns[idx].1) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let mut set = HashSet::new();
+        for r in t.rows.iter().filter(|r| row_visible(r, q.snap, q.own)) {
+            let v = &r.values[idx];
+            if *v == Value::Null {
+                continue;
+            }
+            let Some(k) = subplan_key(v) else {
+                // A value outside the column's family should not happen;
+                // fail closed to the slow path.
+                return Ok(None);
+            };
+            if subplan_key_family(&k) != family {
+                return Ok(None);
+            }
+            set.insert(k);
+        }
+        Rc::new(HashedExists { family, set })
+    };
+    q.hashed_exists.borrow_mut().insert(key, h.clone());
+    probe_hashed_exists(q, scopes, &h, pat.outer, neg)
+}
+
+/// Match `IN (SELECT <single expr> FROM <table> [AS q] ...)` — the
+/// uncorrelated single-range shape whose output can be materialized
+/// once. Correlation is checked separately.
+fn match_hashable_in(sub: &SelectStmt) -> Option<(&str, &str)> {
+    if sub.set_op.is_some() || sub.limit.is_some() || sub.offset.is_some() || !sub.with.is_empty() {
+        return None;
+    }
+    let [from] = sub.from.as_slice() else {
+        return None;
+    };
+    let FromItem::Table {
+        name,
+        alias,
+        col_aliases,
+    } = from
+    else {
+        return None;
+    };
+    if !col_aliases.is_empty() {
+        return None;
+    }
+    let [item] = sub.items.as_slice() else {
+        return None;
+    };
+    if !matches!(item, SelectItem::Expr { .. }) {
+        return None;
+    }
+    Some((name.as_str(), alias.as_deref().unwrap_or(name.as_str())))
+}
+
+/// True iff every column reference in the IN subquery resolves inside
+/// the subquery's own single range: qualified refs must name the inner
+/// qualifier, and unqualified refs must name one of the inner table's
+/// own columns (the innermost scope wins, so they resolve inside).
+/// Nested subqueries fail closed — they could correlate past the inner
+/// range to an outer scope.
+fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, inner_qual: &str, table: &str) -> bool {
+    let cols: Vec<String> = match q.eng.db.find_table(table, q.snap, q.own, q.session) {
+        Some(t) => t.columns.iter().map(|(n, _)| n.clone()).collect(),
+        None => return false,
+    };
+    let mut ok = true;
+    walk_select(sub, &mut |x| {
+        if !ok {
+            return;
+        }
+        match x {
+            Expr::Column { table: t, name } => match t {
+                Some(qq) => {
+                    if qq != inner_qual {
+                        ok = false;
+                    }
+                }
+                None => {
+                    if !cols.iter().any(|c| c == name) {
+                        ok = false;
+                    }
+                }
+            },
+            Expr::WholeRow { qual } => {
+                if qual != inner_qual {
+                    ok = false;
+                }
+            }
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::InSub { .. }
+            | Expr::Exists { .. }
+            | Expr::ResolvedCol { .. } => {
+                ok = false;
+            }
+            _ => {}
+        }
+    });
+    ok
+}
+
+/// Materialize one uncorrelated IN subquery's first-column values.
+fn build_hashed_in(rows: &[Row]) -> HashedIn {
+    let mut values = Vec::with_capacity(rows.len());
+    let mut saw_null = false;
+    let mut set: Option<HashSet<SubplanKey>> = Some(HashSet::new());
+    let mut family: Option<SubplanFamily> = None;
+    for row in rows {
+        let v = row[0].clone();
+        if v == Value::Null {
+            saw_null = true;
+        } else if let Some(s) = set.as_mut() {
+            match subplan_key(&v) {
+                Some(k) => {
+                    let f = subplan_key_family(&k);
+                    if family.map_or(true, |ff| ff == f) {
+                        family = Some(f);
+                        s.insert(k);
+                    } else {
+                        set = None;
+                    }
+                }
+                None => {
+                    set = None;
+                }
+            }
+        }
+        values.push(v);
+    }
+    let set = match (set, family) {
+        (Some(s), Some(f)) => Some((f, s)),
+        _ => None,
+    };
+    HashedIn {
+        values,
+        saw_null,
+        set,
+    }
+}
+
+/// The row-by-row three-valued scan, over cached rows instead of a
+/// re-executed subquery. Used when the probe is not hash-safe.
+fn scan_in_values(values: &[Value], v: &Value) -> Result<Option<bool>, ExecError> {
+    let mut saw_null = false;
+    let mut found = false;
+    for rv in values {
+        match cmp_ordering(v, rv, CmpOp::Eq)? {
+            Some(Ordering::Equal) => {
+                found = true;
+                break;
+            }
+            Some(_) => {}
+            None => saw_null = true,
+        }
+    }
+    Ok(if found {
+        Some(true)
+    } else if saw_null {
+        None
+    } else {
+        Some(false)
+    })
+}
+
+/// Probe a cached IN-subquery result with one LHS value, preserving
+/// the exact three-valued logic of the row-by-row executor.
+fn probe_hashed_in(cached: &HashedIn, v: &Value, neg: bool) -> Result<Value, ExecError> {
+    let result: Option<bool> = if *v == Value::Null {
+        // NULL probe: unknown only when the set holds a NULL that could
+        // match; over an empty or NULL-free set it is determinately
+        // false (IN) / true (NOT IN).
+        if cached.saw_null { None } else { Some(false) }
+    } else if let Some((family, set)) = &cached.set {
+        match subplan_key(v) {
+            Some(k) if subplan_key_family(&k) == *family => {
+                if set.contains(&k) {
+                    Some(true)
+                } else if cached.saw_null {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            // Cross-family probe: `cmp_ordering` may still call it
+            // equal (int vs numeric) — scan with exact semantics.
+            _ => scan_in_values(&cached.values, v)?,
+        }
+    } else {
+        scan_in_values(&cached.values, v)?
+    };
+    let result = if neg { not3(result) } else { result };
+    Ok(match result {
+        Some(b) => Value::Bool(b),
+        None => Value::Null,
+    })
+}
+
+/// Try the cached fast path for `IN (subquery)`: run an uncorrelated
+/// subquery once per statement instead of once per row. Returns
+/// `Ok(None)` when the shape is not cacheable; the caller runs the
+/// regular per-row subquery.
+fn eval_hashed_in(
+    q: &mut Q,
+    scopes: &[Scope],
+    v: &Value,
+    sub: &SelectStmt,
+    neg: bool,
+) -> Result<Option<Value>, ExecError> {
+    let (table, inner_qual) = match match_hashable_in(sub) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    if !subplan_inner_is_base_table(q, table) {
+        return Ok(None);
+    }
+    if !subquery_refs_only_inner(q, sub, inner_qual, table) {
+        return Ok(None);
+    }
+    // The RefCell borrow is scoped: building runs the subquery, which
+    // recurses into eval_expr and must be free to use the cache.
+    let hit = {
+        q.hashed_in
+            .borrow()
+            .iter()
+            .find(|(s, _)| s == sub)
+            .map(|(_, c)| c.clone())
+    };
+    let cached = match hit {
+        Some(c) => c,
+        None => {
+            let out = {
+                let mut sub_q = Q {
+                    eng: &mut *q.eng,
+                    snap: q.snap,
+                    own: q.own,
+                    session: q.session,
+                    role: q.role,
+                    read_only: q.read_only,
+                    depth: q.depth + 1,
+                    lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
+                };
+                run_select(&mut sub_q, sub, scopes)?
+            };
+            if out.columns.len() != 1 {
+                return Err(exec_err("42601", "subquery must return only one column"));
+            }
+            let cached = Rc::new(build_hashed_in(&out.rows));
+            q.hashed_in.borrow_mut().push((sub.clone(), cached.clone()));
+            cached
+        }
+    };
+    Ok(Some(probe_hashed_in(&cached, v, neg)?))
+}
+
 fn eval_in(
     q: &mut Q,
     scopes: &[Scope],
@@ -17581,6 +18718,11 @@ fn eval_in(
     neg: bool,
 ) -> Result<Value, ExecError> {
     let v = eval_expr(q, scopes, e)?;
+    // v0.80: uncorrelated IN-subquery cache — run the subquery once per
+    // statement instead of once per row.
+    if let Some(r) = eval_hashed_in(q, scopes, &v, sub, neg)? {
+        return Ok(r);
+    }
     let out = {
         let mut sub_q = Q {
             eng: &mut *q.eng,
@@ -17594,6 +18736,8 @@ fn eval_in(
             ctes: q.ctes.clone(),
             wctx: None,
             priv_scopes: q.priv_scopes.clone(),
+            hashed_exists: q.hashed_exists.clone(),
+            hashed_in: q.hashed_in.clone(),
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -18149,6 +19293,8 @@ fn eval_dml_expr(
         ctes: ctes.to_vec(),
         wctx: None,
         priv_scopes: Vec::new(),
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
     };
     let scopes: Vec<Scope> = frames
         .iter()
@@ -20618,6 +21764,16 @@ fn normalize_func_arg(name: &str, v: Value) -> Value {
 }
 
 fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
+    // v0.80: `GROUPING(...)` is only meaningful at group level (handled
+    // by `eval_grouped`). Reaching scalar evaluation means it sits in a
+    // query without GROUP BY, inside a nested query level, or in a spot
+    // validation missed — PG19 rejects all of these at analysis (42803).
+    if name == "grouping" {
+        return Err(exec_err(
+            "42803",
+            "arguments to GROUPING must be grouping expressions of the associated query level",
+        ));
+    }
     // v0.9: sequence functions need engine + snapshot + session access;
     // they cannot go through the pure eval_func_vals path.
     if matches!(name, "nextval" | "currval" | "setval") {
@@ -26133,6 +27289,8 @@ fn func_result_type(
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
+        // v0.80: `GROUPING(...)` returns integer (int4), like PG19.
+        "grouping" => Ok(ColType::Int),
         "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches" => {
             Ok(ColType::Text)
         }
@@ -33124,6 +34282,222 @@ mod tests {
         )
         .unwrap();
         assert!(!rows_of(r).is_empty());
+    }
+
+    #[test]
+    fn v80_grouping_function() {
+        // v0.80: PG19's GROUPING() mask function (parse_agg.c
+        // transformGroupingFunc / finalize_grouping_exprs): bit (n-1-i)
+        // is 1 when argument i is absent from the current grouping set.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE grp (a int, b int)").unwrap();
+        run(&mut eng, "INSERT INTO grp VALUES (1, 10), (1, 20), (2, 30)").unwrap();
+        // ROLLUP(a): per-group rows mask 0, grand total masks 1.
+        let r = run(
+            &mut eng,
+            "SELECT a, grouping(a) FROM grp GROUP BY ROLLUP (a) ORDER BY 1, 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "0".to_string()],
+                vec!["2".to_string(), "0".to_string()],
+                vec!["NULL".to_string(), "1".to_string()],
+            ]
+        );
+        // Multi-argument bit order: rightmost argument is the LSB.
+        // ROLLUP(a, b) yields sets (a,b), (a), () -> masks 0, 1, 3.
+        let r = run(
+            &mut eng,
+            "SELECT grouping(a, b) FROM grp GROUP BY ROLLUP (a, b) ORDER BY 1",
+        )
+        .unwrap();
+        let masks: Vec<String> = rows_of(r).into_iter().map(|row| row[0].clone()).collect();
+        assert_eq!(masks, vec!["0", "0", "0", "1", "1", "3"]);
+        // CUBE(a,b): all four masks appear.
+        let r = run(
+            &mut eng,
+            "SELECT DISTINCT grouping(a, b) FROM grp \
+             GROUP BY CUBE (a, b) ORDER BY 1",
+        )
+        .unwrap();
+        let masks: Vec<String> = rows_of(r).into_iter().map(|row| row[0].clone()).collect();
+        assert_eq!(masks, vec!["0", "1", "2", "3"]);
+        // Plain GROUP BY: every argument present, mask 0. GROUPING()
+        // reports int4, like PG19.
+        let r = run(&mut eng, "SELECT grouping(a) FROM grp GROUP BY a").unwrap();
+        let ExecResult::Select { columns, rows } = r else {
+            panic!("SELECT returns rows");
+        };
+        assert_eq!(columns[0].1, ColType::Int);
+        assert_eq!(rows.len(), 2);
+        // Qualified and complex expression arguments match grouping keys.
+        let r = run(
+            &mut eng,
+            "SELECT count(*), grouping(grp.a), grouping(a * 2) FROM grp GROUP BY grp.a, a * 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["2".to_string(), "0".to_string(), "0".to_string()],
+                vec!["1".to_string(), "0".to_string(), "0".to_string()],
+            ]
+        );
+        // GROUPING() is legal in HAVING and ORDER BY.
+        let r = run(
+            &mut eng,
+            "SELECT a FROM grp GROUP BY ROLLUP (a) HAVING grouping(a) = 1",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["NULL".to_string()]]);
+        // An argument that is not a grouping expression: 42803 (PG19's
+        // exact message).
+        let err = run(&mut eng, "SELECT grouping(b) FROM grp GROUP BY a").unwrap_err();
+        assert_eq!(err.code, "42803");
+        assert!(
+            err.message
+                .contains("grouping expressions of the associated query level"),
+            "got: {}",
+            err.message
+        );
+        // No GROUP BY at all: 42803.
+        let err = run(&mut eng, "SELECT grouping(a) FROM grp").unwrap_err();
+        assert_eq!(err.code, "42803");
+        // GROUPING() inside an aggregate: 42803.
+        let err = run(&mut eng, "SELECT sum(grouping(a)) FROM grp GROUP BY a").unwrap_err();
+        assert_eq!(err.code, "42803");
+        // GROUPING() in WHERE / GROUP BY: PG19's 42803 placement texts.
+        let err = run(
+            &mut eng,
+            "SELECT a FROM grp WHERE grouping(a) = 0 GROUP BY a",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+        assert!(
+            err.message.contains("not allowed in WHERE"),
+            "got: {}",
+            err.message
+        );
+        let err = run(&mut eng, "SELECT a FROM grp GROUP BY grouping(a)").unwrap_err();
+        assert_eq!(err.code, "42803");
+        // Zero arguments: syntax error, like PG19's expr_list.
+        let err = run(&mut eng, "SELECT grouping() FROM grp GROUP BY a").unwrap_err();
+        assert_eq!(err.code, "42601");
+        // More than 31 arguments: 54023, PG19's exact message.
+        let many = vec!["a"; 32].join(", ");
+        let err = run(
+            &mut eng,
+            &format!("SELECT grouping({many}) FROM grp GROUP BY a"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "54023");
+        assert_eq!(err.message, "GROUPING must have fewer than 32 arguments");
+        // A column named `grouping` still parses as a column reference
+        // (GROUPING is unreserved in PG19).
+        let r = run(&mut eng, "SELECT grouping FROM (SELECT 1 AS grouping) s").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn v80_hashed_subplans() {
+        // v0.80: hashed correlated-EXISTS and cached uncorrelated-IN
+        // subplans — one inner build per statement instead of one
+        // subquery execution per outer row.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE h1(a int, b int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO h1 SELECT g, g % 2 FROM generate_series(1, 200) g",
+        )
+        .unwrap();
+        run(&mut eng, "CREATE TABLE h2(x int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO h2 SELECT g FROM generate_series(1, 100) g",
+        )
+        .unwrap();
+        // Correlated EXISTS over the equality shape -> hashed.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE EXISTS (SELECT 1 FROM h2 k WHERE k.x = h1.a)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        // NOT EXISTS.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE NOT EXISTS (SELECT 1 FROM h2 k WHERE k.x = h1.a)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        // Probe on the left, and inside OR (the PG19 subselect shape).
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 t WHERE (EXISTS (SELECT 1 FROM h2 k WHERE t.a = k.x) OR t.b < 0)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        // NULL probe never matches.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM (SELECT NULL::int AS z) s WHERE EXISTS (SELECT 1 FROM h2 k WHERE k.x = s.z)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["0".to_string()]]);
+        // Uncorrelated IN -> single subquery execution.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE a IN (SELECT x FROM h2)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE a NOT IN (SELECT x FROM h2)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["100".to_string()]]);
+        // Three-valued logic through the cache: NULL in the output and
+        // a missed probe -> NULL, not false.
+        let r = run(
+            &mut eng,
+            "SELECT 9999 IN (SELECT x FROM h2 UNION ALL SELECT NULL::int)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["NULL".to_string()]]);
+        // Non-hashable shapes still work via the slow path.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE EXISTS (SELECT 1 FROM h2 k WHERE k.x = h1.a AND k.x > 10)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["90".to_string()]]);
+        // Correlated IN is not cached but stays correct: h1.b is 0/1,
+        // so the subquery yields {1} and only a = 1 matches.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM h1 WHERE a IN (SELECT x FROM h2 WHERE x = h1.b)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+        // v0.80 regression: NULL probe against an empty / NULL-free
+        // set. `NULL NOT IN (empty)` is true, `NULL IN (empty)` false.
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM (SELECT NULL::int AS a UNION ALL SELECT 1) s \
+             WHERE a NOT IN (SELECT x FROM h2 WHERE x > 100000)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["2".to_string()]]);
+        let r = run(
+            &mut eng,
+            "SELECT count(*) FROM (SELECT NULL::int AS a UNION ALL SELECT 1) s \
+             WHERE a IN (SELECT x FROM h2 WHERE x > 100000)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["0".to_string()]]);
     }
 
     #[test]
