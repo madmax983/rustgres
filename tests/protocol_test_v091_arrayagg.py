@@ -2,10 +2,12 @@
 r"""v0.91 protocol tests: array_agg aggregate + op ANY/ALL/SOME (array_expr).
 
 Covers the v0.91 behavior changes:
-- `array_agg(x)`: collects non-null inputs in row order into a 1-D array
-  (`{1,2,3}` text form); NULL inputs skipped; zero non-null inputs -> NULL;
-  `DISTINCT` dedupes; `pg_typeof` -> `integer[]` etc.; multidimensional
-  when the input is an array (`{{1,2},{2,3}}`); works as a window function.
+- `array_agg(x)`: collects inputs in row order into a 1-D array
+  (`{1,2,3}` text form); NULL inputs KEPT per PG19 ("including nulls");
+  zero input rows -> NULL; `DISTINCT` dedupes (one NULL survives);
+  `pg_typeof` -> `integer[]` etc.; multidimensional when the input is
+  an array (`{{1,2},{2,3}}`); works as a window function.
+  (v0.92 correction: v0.91 wrongly skipped NULLs.)
 - `expr op ANY|ALL|SOME (array_expr)`: PG19 ScalarArrayOp with
   three-valued logic (NULL array -> NULL, `{}` -> false/true for ANY/ALL,
   NULL elements participate in 3VL, non-array right side -> 42821),
@@ -113,16 +115,19 @@ def main():
         check("A1 basic", rows == [["{1,2,3,4,5}"]], f"rows={rows} err={err}")
 
         rows, err = c.q("select array_agg(i) from (values (1),(null),(3)) v(i);")
-        check("A2 nulls skipped", rows == [["{1,3}"]], f"rows={rows} err={err}")
+        check("A2 nulls kept", rows == [["{1,NULL,3}"]], f"rows={rows} err={err}")
 
         rows, err = c.q("select array_agg(i) from (select 1 as i where false) t;")
         check("A3 empty -> NULL", rows == [[None]], f"rows={rows} err={err}")
 
         rows, err = c.q("select array_agg(i) from (values (null),(null)) v(i);")
-        check("A3b all-null -> NULL", rows == [[None]], f"rows={rows} err={err}")
+        check("A3b all-null -> {NULL,NULL}", rows == [["{NULL,NULL}"]], f"rows={rows} err={err}")
 
         rows, err = c.q("select array_agg(distinct i) from (values (1),(2),(1)) v(i);")
         check("A4 distinct", rows == [["{1,2}"]], f"rows={rows} err={err}")
+
+        rows, err = c.q("select array_agg(distinct i) from (values (1),(null),(1),(null)) v(i);")
+        check("A4b distinct keeps one NULL", rows == [["{1,NULL}"]], f"rows={rows} err={err}")
 
         rows, err = c.q("select pg_typeof(array_agg(i)) from generate_series(1,3) g(i);")
         check("A5 typeof integer[]", rows == [["integer[]"]], f"rows={rows} err={err}")
@@ -135,6 +140,9 @@ def main():
 
         rows, err = c.q("select array_agg(i) over () from generate_series(1,3) g(i);")
         check("A8 window", rows == [["{1,2,3}"]] * 3, f"rows={rows} err={err}")
+
+        rows, err = c.q("select array_agg(i) over () from (values (1),(null),(3)) v(i);")
+        check("A8b window nulls kept", rows == [["{1,NULL,3}"]] * 3, f"rows={rows} err={err}")
 
         rows, err = c.q("select array_agg(1.5::numeric);")
         check("A9 numeric", rows == [["{1.5}"]], f"rows={rows} err={err}")

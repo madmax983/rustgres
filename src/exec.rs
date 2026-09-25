@@ -10418,11 +10418,23 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             arg,
             distinct,
             arg2,
+            agg_order_by,
         } => Ok(Expr::Agg {
             func: *func,
             arg: arg.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
             distinct: *distinct,
             arg2: arg2.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
+            // v0.92: resolve columns in the in-aggregate ORDER BY.
+            agg_order_by: agg_order_by
+                .iter()
+                .map(|o| {
+                    Ok(OrderTerm {
+                        expr: r(&o.expr)?,
+                        desc: o.desc,
+                        nulls_first: o.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         }),
         // v0.10: resolve columns inside window inputs.
         Expr::Window {
@@ -12605,9 +12617,10 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             }
             check_window_arity(func, args.len())?;
             if *distinct {
+                // v0.92: PG19 parse_func.c message, verbatim.
                 return Err(exec_err(
                     "0A000",
-                    "DISTINCT is not supported in window functions",
+                    "DISTINCT is not implemented for window functions",
                 ));
             }
             for a in args {
@@ -12632,12 +12645,22 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             // Frame bounds must be constant.
             Ok(())
         }
-        Expr::Agg { arg, arg2, .. } => {
+        Expr::Agg {
+            arg,
+            arg2,
+            agg_order_by,
+            ..
+        } => {
             if let Some(a) = arg {
                 validate_window_expr(a, true)?;
             }
             if let Some(a) = arg2 {
                 validate_window_expr(a, true)?;
+            }
+            // v0.92: the in-aggregate ORDER BY expressions are
+            // per-row inputs like the arguments.
+            for o in agg_order_by {
+                validate_window_expr(&o.expr, true)?;
             }
             Ok(())
         }
@@ -13819,18 +13842,32 @@ fn compute_partition(
                     };
                 }
             } else {
+                // v0.92: static array_agg overload probe for the windowed
+                // path (schema-free: array ctors and casts to array).
+                let array_input = *f == AggFunc::ArrayAgg
+                    && spec
+                        .args
+                        .first()
+                        .is_some_and(|a| expr_is_statically_array(a, None));
                 for j in 0..n {
                     let (s, e) = resolve_frame(spec, input, idxs, j)?;
                     let mut vals: Vec<Value> = Vec::new();
                     if s <= e {
                         for p in s..=e {
                             let v = arg(p, 0);
-                            if !matches!(v, Value::Null) {
+                            // v0.92: array_agg keeps NULL inputs (PG19:
+                            // "Collects all the input values, including
+                            // nulls, into an array"); other aggregates
+                            // skip nulls, like their grouped
+                            // counterparts. (PG19 rejects ORDER BY
+                            // inside windowed aggregates with 0A000, so
+                            // no sort key applies here.)
+                            if *f == AggFunc::ArrayAgg || !matches!(v, Value::Null) {
                                 vals.push(v);
                             }
                         }
                     }
-                    out[j] = eval_window_agg(*f, &vals)?;
+                    out[j] = eval_window_agg(*f, &vals, array_input)?;
                 }
             }
         }
@@ -13839,7 +13876,7 @@ fn compute_partition(
 }
 
 /// v0.10: evaluate a windowed aggregate over frame values.
-fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
+fn eval_window_agg(f: AggFunc, vals: &[Value], array_input: bool) -> Result<Value, ExecError> {
     match f {
         AggFunc::Count => {
             // count(x): non-null inputs; count(*): all rows. (NULLs are
@@ -13877,15 +13914,12 @@ fn eval_window_agg(f: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
             "0A000",
             "string_agg is not supported as a window function",
         )),
-        // v0.91: PG19 supports array_agg as a window function. NULLs
-        // are filtered by the caller, exactly like the grouped path.
-        AggFunc::ArrayAgg => {
-            if vals.is_empty() {
-                return Ok(Value::Null);
-            }
-            let nested = matches!(vals.first(), Some(Value::Array(_)));
-            array_ctor_from_vals(vals.to_vec(), nested)
-        }
+        // v0.92: PG19 supports array_agg as a window function; NULLs
+        // are kept for array_agg (see array_agg_final) — the caller
+        // only filters them for the other aggregates. The static arg
+        // type picks the overload (schema-free probe: array ctors and
+        // casts; the windowed path has no query schema handy).
+        AggFunc::ArrayAgg => array_agg_final(vals.to_vec(), array_input),
     }
 }
 
@@ -16866,6 +16900,7 @@ fn eval_grouped(
             arg,
             distinct,
             arg2,
+            agg_order_by,
         } => eval_agg_func(
             q,
             outer,
@@ -16876,6 +16911,7 @@ fn eval_grouped(
             arg.as_deref(),
             *distinct,
             arg2.as_deref(),
+            agg_order_by,
         ),
         Expr::Column { table, name } => {
             let qual = table.as_deref().unwrap_or("");
@@ -16994,7 +17030,7 @@ fn eval_grouped(
                     q, outer, gscope, schema, rows, idxs, key_vals, group_by, e,
                 )?);
             }
-            array_ctor_from_vals(vals, *nested)
+            array_ctor_from_vals(vals, *nested, false)
         }
         Expr::Subscript { array, indices } => {
             let va = eval_grouped(
@@ -17553,17 +17589,59 @@ fn eval_agg_func(
     arg: Option<&Expr>,
     distinct: bool,
     arg2: Option<&Expr>,
+    // v0.92: ORDER BY inside the aggregate call (PG19 docs §4.2.7).
+    order_by: &[OrderTerm],
 ) -> Result<Value, ExecError> {
     if func == AggFunc::Count && arg.is_none() {
         return Ok(Value::BigInt(idxs.len() as i64));
     }
     let a = arg.expect("non-COUNT aggregates take an argument");
+    // v0.92: ORDER BY inside the aggregate — evaluate the sort keys
+    // per input row, then visit rows in sorted order (PG sorts the
+    // aggregate's input before accumulation). Stable: ties keep input
+    // row order.
+    let mut visit: Vec<usize> = idxs.to_vec();
+    if !order_by.is_empty() {
+        let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(idxs.len());
+        for &i in idxs {
+            let frame = Scope {
+                schema,
+                row: &rows[i].cells,
+                prov: None,
+            };
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            let mut keys = Vec::with_capacity(order_by.len());
+            for o in order_by {
+                keys.push(eval_expr(q, &buf, &o.expr)?);
+            }
+            keyed.push((keys, i));
+        }
+        let mut sort_err: Option<ExecError> = None;
+        keyed.sort_by(|(ak, _), (bk, _)| {
+            if sort_err.is_some() {
+                return Ordering::Equal;
+            }
+            match compare_window_keys(ak, bk, order_by) {
+                Ok(o) => o,
+                Err(e) => {
+                    sort_err = Some(e);
+                    Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+        visit = keyed.into_iter().map(|(_, i)| i).collect();
+    }
     let mut vals: Vec<Value> = Vec::new();
     // string_agg evaluates (value, delimiter) per row; the delimiter
     // may be NULL per-row (then it defaults to "") while a NULL value
     // still skips the row, like Postgres.
     let mut delims: Vec<Value> = Vec::new();
-    for &i in idxs {
+    for &i in &visit {
         let frame = Scope {
             schema,
             row: &rows[i].cells,
@@ -17592,20 +17670,30 @@ fn eval_agg_func(
             delims.push(d);
         // v0.73: a whole-row value counts as null iff every field is
         // null (PG19: `count(t.*)` skips null-extended outer-join rows).
-        } else if !crate::storage::value_is_null(&v) {
+        // v0.92: array_agg keeps NULL inputs — PG19 "Collects all the
+        // input values, including nulls, into an array".
+        } else if func == AggFunc::ArrayAgg || !crate::storage::value_is_null(&v) {
             vals.push(v);
         }
     }
-    // DISTINCT: dedupe on the canonical grouping key (NULLs already
-    // removed above, so this matches Postgres' "DISTINCT treats NULLs
-    // as equal" trivially). For string_agg, dedupe on the value alone,
-    // like Postgres deduplicates the input rows.
+    // DISTINCT: dedupe on the canonical grouping key. NULLs were
+    // removed above for every aggregate except array_agg (which keeps
+    // them per PG19); the NULL key is deterministic, so multiple NULLs
+    // still collapse to one — Postgres' "DISTINCT treats NULLs as
+    // equal". v0.92: Postgres deduplicates DISTINCT aggregate input
+    // ROWS, so for string_agg the key is (value, delimiter), not the
+    // value alone.
     if distinct {
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut kept: Vec<usize> = Vec::new();
         for (i, v) in vals.iter().enumerate() {
             let mut k = Vec::new();
             value_key(v, &mut k);
+            if func == AggFunc::StringAgg {
+                if let Some(d) = delims.get(i) {
+                    value_key(d, &mut k);
+                }
+            }
             if !seen.contains(&k) {
                 seen.push(k);
                 kept.push(i);
@@ -17686,18 +17774,15 @@ fn eval_agg_func(
             }
             Ok(Value::text(out))
         }
-        // v0.91: `array_agg(x)` — PG19 collects the non-null inputs in
-        // row order into a 1-D array (multidimensional when the input
-        // is itself an array); zero non-null inputs -> NULL.
-        // `array_ctor_from_vals` already implements PG's common-type
+        // v0.92: `array_agg(x)` — PG19 semantics live in
+        // array_agg_final (NULLs kept for scalar input; 22004/2202E
+        // errors for bad array inputs); zero input rows -> NULL.
+        // `array_ctor_from_vals` implements PG's common-type
         // resolution and per-value coercion for ARRAY[...] literals.
-        AggFunc::ArrayAgg => {
-            if vals.is_empty() {
-                return Ok(Value::Null);
-            }
-            let nested = matches!(vals.first(), Some(Value::Array(_)));
-            array_ctor_from_vals(vals, nested)
-        }
+        // The static argument type picks the overload (PG resolves
+        // array_agg(anyarray) statically); the query schema lets
+        // column references resolve to array types.
+        AggFunc::ArrayAgg => array_agg_final(vals, expr_is_statically_array(a, Some(schema))),
     }
 }
 
@@ -18219,7 +18304,7 @@ fn eval_array_ctor(
     for e in elems {
         vals.push(eval_expr(q, scopes, e)?);
     }
-    array_ctor_from_vals(vals, nested)
+    array_ctor_from_vals(vals, nested, false)
 }
 
 /// v0.79: `ARRAY[...]` from already-evaluated element values — shared by
@@ -18229,17 +18314,86 @@ fn eval_array_ctor(
 /// `ARRAY[[...],[...]]` form requires every element to be an array with
 /// identical element type and dims (PG's "multidimensional arrays must
 /// have array expressions with matching dimensions", 22P02); dims stack.
-fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecError> {
+/// v0.92: shared `array_agg` finalization for the grouped and windowed
+/// paths. PG semantics (PG19 docs §9.21; PG17 REL_17_STABLE arrayfuncs.c
+/// `array_agg_transfn` / `accumArrayResultArr` — the PG19 tree on disk
+/// lacks utils/adt, so the C grounding is PG17):
+/// - zero input rows -> NULL;
+/// - scalar input: NULLs are kept — "Collects all the input values,
+///   including nulls, into an array";
+/// - array input: each input array becomes one sub-array of the
+///   (n+1)-dimensional result; a NULL input is 22004 "cannot
+///   accumulate null arrays", an empty first input is 2202E "cannot
+///   accumulate empty arrays" (a later empty input fails the
+///   dimensionality check instead), and inputs whose dimension
+///   count, dimension lengths, or lower bounds differ are 2202E
+///   "cannot accumulate arrays of different dimensionality".
+/// v0.92: static array-type probe for `array_agg` overload resolution.
+/// PG picks `array_agg(anyarray)` vs `array_agg(anynonarray)` by the
+/// argument's STATIC type. When every runtime value is NULL there is no
+/// `Value::Array` to inspect, so consult the resolved expression:
+/// array constructors and casts to an array type are statically arrays.
+/// Column references need the query schema (grouped path passes it);
+/// anything else falls back to the runtime-value heuristic.
+fn expr_is_statically_array(e: &Expr, schema: Option<&[QCol]>) -> bool {
+    match e {
+        Expr::ArrayCtor { .. } => true,
+        Expr::Cast { to, .. } => matches!(to, ColType::Array(_)),
+        Expr::Column { table, name } => schema.is_some_and(|s| {
+            s.iter().any(|c| {
+                &c.name == name
+                    && table.as_deref().is_none_or(|t| c.qual == t)
+                    && matches!(c.ty, ColType::Array(_))
+            })
+        }),
+        _ => false,
+    }
+}
+
+fn array_agg_final(vals: Vec<Value>, is_array_input: bool) -> Result<Value, ExecError> {
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // PG overload resolution is static: an array-typed argument selects
+    // the array-input variant even when every runtime value is NULL (no
+    // Value::Array to inspect). Otherwise, any array value in the input
+    // selects it (the static argument type is uniform, so a leading NULL
+    // must not hide it).
+    let nested = is_array_input || vals.iter().any(|v| matches!(v, Value::Array(_)));
+    array_ctor_from_vals(vals, nested, true)
+}
+
+fn array_ctor_from_vals(
+    vals: Vec<Value>,
+    nested: bool,
+    // v0.92: true when called for array_agg (PG's "cannot accumulate
+    // ..." errors); false for ARRAY[...] literals (PG's 22P02
+    // "multidimensional arrays ..." errors).
+    for_agg: bool,
+) -> Result<Value, ExecError> {
     if nested {
         let mut rows: Vec<ArrayVal> = Vec::with_capacity(vals.len());
-        for v in vals {
+        for (idx, v) in vals.into_iter().enumerate() {
             match v {
-                Value::Array(a) => rows.push(a),
+                Value::Array(a) => {
+                    // v0.92: PG17 accumArrayResultArr raises "cannot
+                    // accumulate empty arrays" (2202E) only when the
+                    // FIRST input is empty; a later empty input fails
+                    // the dimensionality check below, like PG.
+                    if for_agg && idx == 0 && a.ndim() == 0 {
+                        return Err(exec_err("2202E", "cannot accumulate empty arrays"));
+                    }
+                    rows.push(a)
+                }
                 Value::Null => {
-                    return Err(exec_err(
-                        "22P02",
-                        "multidimensional arrays must have array expressions with matching dimensions",
-                    ));
+                    return Err(if for_agg {
+                        exec_err("22004", "cannot accumulate null arrays")
+                    } else {
+                        exec_err(
+                            "22P02",
+                            "multidimensional arrays must have array expressions with matching dimensions",
+                        )
+                    });
                 }
                 other => {
                     return Err(exec_err(
@@ -18254,11 +18408,24 @@ fn array_ctor_from_vals(vals: Vec<Value>, nested: bool) -> Result<Value, ExecErr
         }
         let first = &rows[0];
         for r in &rows[1..] {
-            if r.elem != first.elem || r.dims != first.dims {
-                return Err(exec_err(
-                    "22P02",
-                    "multidimensional arrays must have array expressions with matching dimensions",
-                ));
+            // v0.92: array_agg requires the same dimensionality AND the
+            // same dimension lengths and lower bounds (PG17
+            // accumArrayResultArr); the ARRAY literal keeps its
+            // historical element+dimension check.
+            let dim_mismatch =
+                r.elem != first.elem || r.dims != first.dims || (for_agg && r.lower != first.lower);
+            if dim_mismatch {
+                return Err(if for_agg {
+                    exec_err(
+                        "2202E",
+                        "cannot accumulate arrays of different dimensionality",
+                    )
+                } else {
+                    exec_err(
+                        "22P02",
+                        "multidimensional arrays must have array expressions with matching dimensions",
+                    )
+                });
             }
         }
         let mut flat: Vec<Value> = Vec::new();
@@ -19561,7 +19728,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                         elems: Vec::new(),
                     }));
                 }
-                array_ctor_from_vals(vals, true)
+                array_ctor_from_vals(vals, true, false)
             } else {
                 let elem = crate::storage::ArrayElem::of(&col_ty);
                 let ty = elem_scalar_type(elem);
@@ -31462,6 +31629,7 @@ fn expr_type(
             arg,
             distinct: _,
             arg2,
+            ..
         } => agg_result_type(
             eng,
             snap,
@@ -32063,6 +32231,7 @@ fn hint_type(
             arg,
             distinct: _,
             arg2,
+            ..
         } => agg_result_type(
             eng,
             snap,
@@ -41865,6 +42034,7 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
 #[cfg(test)]
 mod variance_stress_tests {
     use super::Value;
+    use super::array_agg_final;
     use super::array_ctor_from_vals;
     use super::bool_and_vals;
     use super::numeric_to_u64_exact;
@@ -41951,14 +42121,13 @@ mod variance_stress_tests {
         assert!(bool_and_vals(&[Value::Int(1)]).is_err());
     }
 
-    /// v0.91: array_agg's collection core — `array_ctor_from_vals` over
-    /// already null-filtered inputs (the aggregate's empty-input NULL
-    /// is handled by the caller).
+    /// v0.92: array_agg's collection core — `array_agg_final` over the
+    /// aggregate's inputs (NULLs kept for scalar input, per PG19;
+    /// 22004/2202E for bad array inputs); zero inputs -> NULL.
     #[test]
     fn array_agg_collection_core() {
         // ints collect in order
-        let v =
-            array_ctor_from_vals(vec![Value::Int(1), Value::Int(2), Value::Int(3)], false).unwrap();
+        let v = array_agg_final(vec![Value::Int(1), Value::Int(2), Value::Int(3)], false).unwrap();
         match &v {
             Value::Array(a) => {
                 assert_eq!(a.to_literal(), "{1,2,3}");
@@ -41967,8 +42136,25 @@ mod variance_stress_tests {
             }
             other => panic!("expected array, got {:?}", other),
         }
+        // v0.92: scalar NULLs are KEPT (PG19 "including nulls")
+        let v = array_agg_final(vec![Value::Int(1), Value::Null, Value::Int(3)], false).unwrap();
+        match &v {
+            Value::Array(a) => {
+                assert_eq!(a.to_literal(), "{1,NULL,3}");
+                assert_eq!(a.dims, vec![3]);
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+        // all-NULL scalar input -> one NULL per input, not NULL
+        let v = array_agg_final(vec![Value::Null, Value::Null], false).unwrap();
+        match &v {
+            Value::Array(a) => assert_eq!(a.to_literal(), "{NULL,NULL}"),
+            other => panic!("expected array, got {:?}", other),
+        }
+        // zero input rows -> NULL (not an empty array)
+        assert_eq!(array_agg_final(vec![], false).unwrap(), Value::Null);
         // mixed int/bigint resolves the common supertype (bigint)
-        let v = array_ctor_from_vals(vec![Value::Int(1), Value::BigInt(2)], false).unwrap();
+        let v = array_agg_final(vec![Value::Int(1), Value::BigInt(2)], false).unwrap();
         match &v {
             Value::Array(a) => {
                 assert_eq!(a.elem, crate::storage::ArrayElem::BigInt);
@@ -41977,7 +42163,7 @@ mod variance_stress_tests {
             other => panic!("expected array, got {:?}", other),
         }
         // text elements
-        let v = array_ctor_from_vals(vec![Value::text("a"), Value::text("b")], false).unwrap();
+        let v = array_agg_final(vec![Value::text("a"), Value::text("b")], false).unwrap();
         match &v {
             Value::Array(a) => assert_eq!(a.to_literal(), "{a,b}"),
             other => panic!("expected array, got {:?}", other),
@@ -41985,9 +42171,9 @@ mod variance_stress_tests {
         // nested arrays build the multidimensional form (PG flattens
         // array_agg(array[...]) the same way ARRAY[[..],[..]] does)
         let row = |x: i64, y: i64| {
-            array_ctor_from_vals(vec![Value::Int(x), Value::Int(y)], false).unwrap()
+            array_ctor_from_vals(vec![Value::Int(x), Value::Int(y)], false, false).unwrap()
         };
-        let v = array_ctor_from_vals(vec![row(1, 2), row(3, 4)], true).unwrap();
+        let v = array_agg_final(vec![row(1, 2), row(3, 4)], false).unwrap();
         match &v {
             Value::Array(a) => {
                 assert_eq!(a.to_literal(), "{{1,2},{3,4}}");
@@ -41995,17 +42181,104 @@ mod variance_stress_tests {
             }
             other => panic!("expected array, got {:?}", other),
         }
-        // mismatched nested dims are 22P02
-        let v = array_ctor_from_vals(vec![row(1, 2), row(3, 4), row(5, 6)], true).unwrap();
-        assert!(matches!(v, Value::Array(_)));
+        // mismatched nested dims are 2202E for the aggregate ...
+        let wide = array_ctor_from_vals(
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            false,
+            false,
+        )
+        .unwrap();
+        let bad = array_agg_final(vec![row(1, 2), wide], false);
+        assert!(bad.is_err());
+        // ... but 22P02 for the ARRAY literal
         let bad = array_ctor_from_vals(
             vec![
-                array_ctor_from_vals(vec![Value::Int(1)], false).unwrap(),
-                array_ctor_from_vals(vec![Value::Int(2), Value::Int(3)], false).unwrap(),
+                array_ctor_from_vals(vec![Value::Int(1)], false, false).unwrap(),
+                array_ctor_from_vals(vec![Value::Int(2), Value::Int(3)], false, false).unwrap(),
             ],
             true,
+            false,
         );
         assert!(bad.is_err());
+    }
+
+    /// v0.92: array_agg(anyarray) error semantics straight from PG17's
+    /// accumArrayResultArr (PG19 tree on disk lacks utils/adt).
+    #[test]
+    fn array_agg_array_input_errors() {
+        let arr = |x: i64, y: i64| {
+            array_ctor_from_vals(vec![Value::Int(x), Value::Int(y)], false, false).unwrap()
+        };
+        let empty_int_arr = Value::Array(crate::storage::ArrayVal {
+            elem: crate::storage::ArrayElem::Int,
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        });
+        // NULL array input -> 22004 "cannot accumulate null arrays"
+        let e = array_agg_final(vec![arr(1, 2), Value::Null], false).unwrap_err();
+        assert_eq!(e.code, "22004");
+        assert_eq!(e.message, "cannot accumulate null arrays");
+        // leading NULL also selects the array variant -> 22004
+        let e = array_agg_final(vec![Value::Null, arr(1, 2)], false).unwrap_err();
+        assert_eq!(e.code, "22004");
+        // empty first input -> 2202E "cannot accumulate empty arrays"
+        let e = array_agg_final(vec![empty_int_arr.clone(), arr(1, 2)], false).unwrap_err();
+        assert_eq!(e.code, "2202E");
+        assert_eq!(e.message, "cannot accumulate empty arrays");
+        // empty later input -> 2202E "different dimensionality" (like PG)
+        let e = array_agg_final(vec![arr(1, 2), empty_int_arr], false).unwrap_err();
+        assert_eq!(e.code, "2202E");
+        assert_eq!(
+            e.message,
+            "cannot accumulate arrays of different dimensionality"
+        );
+        // different dimension lengths -> 2202E
+        let wide = array_ctor_from_vals(
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            false,
+            false,
+        )
+        .unwrap();
+        let e = array_agg_final(vec![arr(1, 2), wide], false).unwrap_err();
+        assert_eq!(e.code, "2202E");
+        // different lower bounds -> 2202E (PG compares lbs too)
+        let mut lb_shifted = arr(1, 2);
+        if let Value::Array(ref mut a) = lb_shifted {
+            a.lower = vec![0];
+        }
+        let e = array_agg_final(vec![arr(1, 2), lb_shifted], false).unwrap_err();
+        assert_eq!(e.code, "2202E");
+        assert_eq!(
+            e.message,
+            "cannot accumulate arrays of different dimensionality"
+        );
+        // compatible arrays (same dims AND lower bounds) stack fine
+        let v = array_agg_final(vec![arr(1, 2), arr(3, 4)], false).unwrap();
+        match &v {
+            Value::Array(a) => {
+                assert_eq!(a.to_literal(), "{{1,2},{3,4}}");
+                assert_eq!(a.dims, vec![2, 2]);
+                assert_eq!(a.lower, vec![1, 1]);
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// v0.92: static overload discrimination — an all-NULL input with
+    /// the static array flag set (PG's `array_agg(anyarray)` chosen by
+    /// static type) raises 22004, not scalar `{NULL,...}`.
+    #[test]
+    fn array_agg_static_array_flag() {
+        let e = array_agg_final(vec![Value::Null, Value::Null], true).unwrap_err();
+        assert_eq!(e.code, "22004");
+        assert_eq!(e.message, "cannot accumulate null arrays");
+        // Without the flag, the same values are scalar input (NULLs kept).
+        let v = array_agg_final(vec![Value::Null, Value::Null], false).unwrap();
+        match &v {
+            Value::Array(a) => assert_eq!(a.to_literal(), "{NULL,NULL}"),
+            other => panic!("expected array, got {:?}", other),
+        }
     }
 
     /// v0.64: pg_lsn(numeric) — PG19 display and error semantics.

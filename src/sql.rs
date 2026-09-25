@@ -1173,6 +1173,10 @@ pub enum Expr {
         distinct: bool,
         /// v0.7: second argument (string_agg's delimiter).
         arg2: Option<Box<Expr>>,
+        /// v0.92: `ORDER BY` inside the aggregate call (PG19 docs
+        /// §4.2.7: allowed in any aggregate; evaluated per input row
+        /// before accumulation).
+        agg_order_by: Vec<OrderTerm>,
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
@@ -8102,26 +8106,64 @@ impl Parser {
             } else {
                 None
             };
-            self.expect(Token::RParen, "')'")?;
+            // v0.92: `agg(x ORDER BY ...)` — PG19 allows ORDER BY inside
+            // any aggregate call (docs §4.2.7). With DISTINCT, PG
+            // requires every ORDER BY expression to match an aggregate
+            // argument (parse_agg.c).
             let mut args = Vec::new();
             if let Some(a) = arg {
-                args.push(*a);
+                args.push(a);
             }
             if let Some(a) = arg2 {
-                args.push(*a);
+                args.push(a);
             }
+            let agg_order_by = if self.eat_keyword("order") {
+                self.expect_keyword("by")?;
+                let mut terms = Vec::new();
+                loop {
+                    terms.push(self.parse_order_term()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                if distinct && !terms.iter().all(|t| args.iter().any(|a| **a == t.expr)) {
+                    // v0.92: PG19 parse_clause.c transformDistinctClause
+                    // (is_agg=true): 42P10 with this exact message.
+                    return Err(SqlError {
+                        message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list".to_string(),
+                        code: "42P10",
+                    });
+                }
+                terms
+            } else {
+                Vec::new()
+            };
+            self.expect(Token::RParen, "')'")?;
             let mut expr = Expr::Agg {
                 func: func.clone(),
-                arg: args.first().cloned().map(Box::new),
+                arg: args.first().cloned(),
                 distinct,
-                arg2: args.get(1).cloned().map(Box::new),
+                arg2: args.get(1).cloned(),
+                agg_order_by: agg_order_by.clone(),
             };
             // v0.10: `<agg>(...) OVER (...)` — windowed aggregate.
             if self.eat_keyword("over") {
+                // v0.92: PG19 parse_func.c rejects ORDER BY inside a
+                // windowed aggregate call: 0A000 "aggregate ORDER BY is
+                // not implemented for window functions".
+                if !agg_order_by.is_empty() {
+                    return Err(SqlError {
+                        message: "aggregate ORDER BY is not implemented for window functions"
+                            .to_string(),
+                        code: "0A000",
+                    });
+                }
                 let spec = self.parse_window_spec()?;
                 expr = Expr::Window {
                     func: WindowFunc::Agg(func),
-                    args,
+                    args: args.into_iter().map(|a| *a).collect(),
                     distinct,
                     partition_by: spec.partition_by,
                     order_by: spec.order_by,
