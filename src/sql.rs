@@ -1449,6 +1449,31 @@ pub enum InsertValue {
     Expr(Expr),
 }
 
+/// v0.84: one target of an INSERT column list — a column name with
+/// optional PG19 indirection (`f2[1]`, `f3.if2`, `f4[1].if2[1]`).
+/// Empty `indirection` is a whole-column target.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsertTarget {
+    pub name: String,
+    pub indirection: Vec<InsertIndirection>,
+}
+
+/// v0.84: one indirection step on an INSERT target (PG19 gram.y
+/// `opt_indirection` / `indirection_el`, restricted to what INSERT
+/// targets can carry).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertIndirection {
+    /// `[e1][e2]...` — adjacent bracket pairs merge into ONE step with
+    /// several indices (PG19: "Adjacent A_Indices nodes have to be
+    /// treated as a single multidimensional subscript operation").
+    Index(Vec<Expr>),
+    /// `.field`
+    Field(String),
+    /// `[l:u]` slice — parsed so the error can be PG-shaped; rejected
+    /// at execution (0A000, unsupported).
+    Slice,
+}
+
 /// One `ORDER BY` sort key: expression + direction + explicit NULL
 /// placement (v0.7: `NULLS FIRST` / `NULLS LAST`).
 #[derive(Clone, Debug, PartialEq)]
@@ -2478,7 +2503,8 @@ pub enum Stmt {
     },
     Insert {
         table: String,
-        columns: Option<Vec<String>>,
+        /// v0.84: targets carry PG19 indirection (`f2[1]`, `f3.if2`).
+        columns: Option<Vec<InsertTarget>>,
         rows: Vec<Vec<InsertValue>>,
         /// v0.10: `INSERT INTO ... SELECT ...` source (mutually exclusive
         /// with `rows`).
@@ -5202,7 +5228,7 @@ impl Parser {
             self.next();
             let mut cols = Vec::new();
             loop {
-                cols.push(self.expect_ident()?);
+                cols.push(self.parse_insert_target()?);
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -5274,6 +5300,63 @@ impl Parser {
             returning,
             with: Vec::new(),
         })
+    }
+
+    /// v0.84: one INSERT column-list target — a column name with
+    /// optional PG19 indirection (`f2[1]`, `f3.if2`, `f4[1].if2[1]`).
+    /// Adjacent `[..][..]` pairs merge into one multi-index step
+    /// (PG19 gram.y); a `[l:u]` slice parses to `InsertIndirection::Slice`
+    /// so execution can reject it with a PG-shaped 0A000.
+    fn parse_insert_target(&mut self) -> Result<InsertTarget, SqlError> {
+        let name = self.expect_ident()?;
+        let mut indirection = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.next(); // consume '.'
+                    let field = self.expect_ident()?;
+                    indirection.push(InsertIndirection::Field(field));
+                }
+                Token::LBracket => {
+                    self.next(); // consume '['
+                    // Slice form `[l:u]` / `[:u]` / `[l:]` — PG19
+                    // `indirection_el` allows it; not assignable here.
+                    let is_slice = if *self.peek() == Token::Colon {
+                        self.next();
+                        if *self.peek() != Token::RBracket {
+                            let _ = self.parse_or()?;
+                        }
+                        self.expect(Token::RBracket, "']'")?;
+                        true
+                    } else {
+                        let first = self.parse_or()?;
+                        if *self.peek() == Token::Colon {
+                            self.next(); // consume ':'
+                            if *self.peek() != Token::RBracket {
+                                let _ = self.parse_or()?;
+                            }
+                            self.expect(Token::RBracket, "']'")?;
+                            true
+                        } else {
+                            self.expect(Token::RBracket, "']'")?;
+                            // Merge with a preceding adjacent Index step.
+                            match indirection.last_mut() {
+                                Some(InsertIndirection::Index(idxs)) => {
+                                    idxs.push(first);
+                                }
+                                _ => indirection.push(InsertIndirection::Index(vec![first])),
+                            }
+                            false
+                        }
+                    };
+                    if is_slice {
+                        indirection.push(InsertIndirection::Slice);
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(InsertTarget { name, indirection })
     }
 
     /// v0.10: `RETURNING * | expr [, ...]` after INSERT/UPDATE/DELETE.

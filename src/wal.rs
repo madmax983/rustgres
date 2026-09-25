@@ -1217,9 +1217,19 @@ impl Enc {
                     self.value(e);
                 }
             }
-            // v0.73: records never persist (INSERT/CTAS coerce or reject
-            // them first); encoding one is an internal bug.
-            Value::Record(_) => panic!("wal: whole-row record values are never stored"),
+            // v0.84: composite values (tag 18) — field count, then
+            // (name, value) pairs. Reachable for whole-column
+            // composite inserts (the v0.73 panic wrongly assumed
+            // records never persist) and for composite arrays built
+            // by INSERT target indirection.
+            Value::Record(fields) => {
+                self.u8(18);
+                self.u32(fields.len() as u32);
+                for (name, val) in fields {
+                    self.str(name);
+                    self.value(val);
+                }
+            }
         }
     }
 
@@ -1846,6 +1856,17 @@ impl<'a> Dec<'a> {
                     lower,
                     elems,
                 }))
+            }
+            // v0.84: composite values (tag 18; mirrors the encoder).
+            18 => {
+                let n = self.u32()? as usize;
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let name = self.str()?;
+                    let val = self.value()?;
+                    fields.push((name, val));
+                }
+                Ok(Value::Record(fields))
             }
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }

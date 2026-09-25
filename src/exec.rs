@@ -39,10 +39,11 @@
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertValue, IsolationLevel,
-    JoinKind, Literal, OnConflict, OrderTerm, SelectItem, SelectStmt, SequenceOpts, SerialKind,
-    SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, UniqueDef, WindowFrame, WindowFunc,
-    collect_col_refs, collect_table_refs, parse_statement, validate_constraint_expr,
+    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, InsertIndirection,
+    InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm,
+    SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
+    TableDef, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
+    parse_statement, validate_constraint_expr,
 };
 use crate::storage::{
     ArrayElem, ArrayVal, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial, Row,
@@ -2616,6 +2617,9 @@ fn create_constraint_index(
 #[derive(Clone)]
 struct TableMeta {
     columns: Vec<(String, ColType)>,
+    /// v0.84: named composite type per column, parallel to `columns`
+    /// (`Some(name)` iff the ColType is `Composite`).
+    composite_types: Vec<Option<String>>,
     not_null: Vec<bool>,
     defaults: Vec<Option<DefaultExpr>>,
     checks: Vec<CheckDef>,
@@ -2627,6 +2631,7 @@ impl TableMeta {
     fn of(t: &Table) -> Self {
         TableMeta {
             columns: t.columns.clone(),
+            composite_types: t.composite_types.clone(),
             not_null: t.not_null.clone(),
             defaults: t.defaults.clone(),
             checks: t.checks.clone(),
@@ -4474,11 +4479,320 @@ fn exec_create_table_as(
     })
 }
 
+/// v0.84: one evaluated indirection step on an INSERT target
+/// (index expressions are evaluated once per row).
+enum ResolvedIndirection {
+    Index(Vec<i64>),
+    Field(String),
+}
+
+/// v0.84: evaluate the index expressions of an INSERT indirection path.
+/// PG19 coerces `A_Indices` to int4 via assignment coercion
+/// (`array_index_to_i64`); a NULL subscript is 2202E.
+fn resolve_insert_indirection(
+    q: &mut Q,
+    indir: &[InsertIndirection],
+) -> Result<Vec<ResolvedIndirection>, ExecError> {
+    let mut out = Vec::with_capacity(indir.len());
+    for step in indir {
+        match step {
+            InsertIndirection::Index(exprs) => {
+                let mut idxs = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    let v = eval_expr(q, &[], e)?;
+                    if matches!(v, Value::Null) {
+                        return Err(exec_err(
+                            "2202E",
+                            "array subscript in assignment must not be null",
+                        ));
+                    }
+                    idxs.push(array_index_to_i64(&v)?);
+                }
+                out.push(ResolvedIndirection::Index(idxs));
+            }
+            InsertIndirection::Field(f) => out.push(ResolvedIndirection::Field(f.clone())),
+            InsertIndirection::Slice => {
+                return Err(exec_err(
+                    "0A000",
+                    "slice assignment in INSERT target list is not supported yet",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v0.84: reverse of `ArrayElem::of` — the `ColType` of an array's
+/// elements for INSERT indirection recursion. Typmods do not survive
+/// the round trip (numeric/Char/Varchar lose (p,s)/n); assignment
+/// coercion at the leaf still applies the value-level checks.
+fn array_elem_coltype(e: ArrayElem) -> ColType {
+    match e {
+        ArrayElem::Bool => ColType::Bool,
+        ArrayElem::Bytea => ColType::Bytea,
+        ArrayElem::SingleChar => ColType::SingleChar,
+        ArrayElem::Name => ColType::Name,
+        ArrayElem::SmallInt => ColType::SmallInt,
+        ArrayElem::Int => ColType::Int,
+        ArrayElem::Text => ColType::Text,
+        ArrayElem::Char => ColType::Char(None),
+        ArrayElem::Varchar => ColType::Varchar(None),
+        ArrayElem::BigInt => ColType::BigInt,
+        ArrayElem::Float4 => ColType::Float4,
+        ArrayElem::Float => ColType::Float,
+        ArrayElem::Date => ColType::Date,
+        ArrayElem::Timestamp => ColType::Timestamp,
+        ArrayElem::Timestamptz => ColType::Timestamptz,
+        ArrayElem::Numeric => ColType::Numeric(None),
+        ArrayElem::Uuid => ColType::Uuid,
+        ArrayElem::Regclass => ColType::Regclass,
+        ArrayElem::Json => ColType::Json,
+        ArrayElem::Record => ColType::Composite,
+        ArrayElem::PgLsn => ColType::PgLsn,
+    }
+}
+
+/// v0.84: walk an INSERT indirection path from the column type to the
+/// leaf target type. PG19 coerces the assigned value to the type at the
+/// END of the indirection (`transformAssignedExpr`), so the row builder
+/// coerces to this leaf type before the structural assignment.
+/// Returns the leaf `ColType` plus the composite type name when the leaf
+/// is (or is an array of) a named composite.
+fn insert_leaf_type(
+    eng: &Engine,
+    ctype: &ColType,
+    composite: Option<&str>,
+    indir: &[InsertIndirection],
+    col_name: &str,
+    table: &str,
+) -> Result<(ColType, Option<String>), ExecError> {
+    let mut ct = ctype.clone();
+    let mut comp = composite.map(|s| s.to_string());
+    for step in indir {
+        match step {
+            InsertIndirection::Index(_) => match ct {
+                ColType::Array(e) => {
+                    if e != ArrayElem::Record {
+                        comp = None;
+                    }
+                    ct = array_elem_coltype(e);
+                }
+                _ => {
+                    return Err(exec_err(
+                        "42804",
+                        format!(
+                            "column \"{}\" of relation \"{}\" cannot be subscripted",
+                            col_name, table
+                        ),
+                    ));
+                }
+            },
+            InsertIndirection::Field(fname) => {
+                let tname = match ct {
+                    ColType::Composite => comp.clone(),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    exec_err(
+                        "42804",
+                        format!(
+                            "column \"{}\" of relation \"{}\" is not a composite type",
+                            col_name, table
+                        ),
+                    )
+                })?;
+                let fields = eng
+                    .db
+                    .types
+                    .get(&tname)
+                    .and_then(|st| st.composite.clone())
+                    .ok_or_else(|| {
+                        exec_err("42704", format!("type \"{}\" does not exist", tname))
+                    })?;
+                let (_, ftype, nested) =
+                    fields.iter().find(|(n, _, _)| n == fname).ok_or_else(|| {
+                        exec_err(
+                            "42703",
+                            format!("column \"{}\" of type \"{}\" does not exist", fname, tname),
+                        )
+                    })?;
+                ct = ftype.clone();
+                comp = nested.clone();
+            }
+            InsertIndirection::Slice => {
+                return Err(exec_err(
+                    "0A000",
+                    "slice assignment in INSERT target list is not supported yet",
+                ));
+            }
+        }
+    }
+    Ok((ct, comp))
+}
+
+/// v0.84: execute PG19 `transformAssignmentIndirection` — assign `val`
+/// into `base` following `steps`. `base` is the column value accumulated
+/// so far: `Value::Null` for a fresh INSERT row, because PG19 builds the
+/// new column value from a NULL constant of the column type
+/// (parse_target.c `transformAssignedExpr`), not from any existing
+/// tuple. `val` is already coerced to the leaf type. Only 1-D array
+/// expansion is supported; deeper shapes are an honest 0A000.
+fn assign_insert_indirection(
+    eng: &Engine,
+    base: Value,
+    steps: &[ResolvedIndirection],
+    val: Value,
+    ctype: &ColType,
+    composite: Option<&str>,
+    col_name: &str,
+) -> Result<Value, ExecError> {
+    let Some((first, rest)) = steps.split_first() else {
+        return Ok(val);
+    };
+    match first {
+        ResolvedIndirection::Index(idxs) => {
+            let elem = match ctype {
+                ColType::Array(e) => *e,
+                _ => {
+                    return Err(exec_err(
+                        "42804",
+                        format!("cannot subscript type {}", ctype.sql_name()),
+                    ));
+                }
+            };
+            if idxs.len() != 1 {
+                return Err(exec_err(
+                    "0A000",
+                    "multi-dimensional subscript in INSERT target is not supported yet",
+                ));
+            }
+            let mut arr = match base {
+                Value::Null => ArrayVal {
+                    elem,
+                    dims: Vec::new(),
+                    lower: Vec::new(),
+                    elems: Vec::new(),
+                },
+                Value::Array(a) => a,
+                _ => {
+                    return Err(exec_err(
+                        "42804",
+                        format!("cannot subscript type {}", base.type_name()),
+                    ));
+                }
+            };
+            // PG19 `array_set_element` bound expansion for 1-D arrays
+            // (arbitrary lower bounds allowed, gaps fill with NULL).
+            let idx = idxs[0];
+            if arr.dims.is_empty() {
+                arr.dims.push(1);
+                arr.lower.push(idx as i32);
+                arr.elems.push(Value::Null);
+            } else {
+                if arr.dims.len() != 1 {
+                    return Err(exec_err(
+                        "0A000",
+                        "multi-dimensional array assignment in INSERT target is not supported yet",
+                    ));
+                }
+                let l = arr.lower[0] as i64;
+                let n = arr.dims[0] as i64;
+                if idx < l {
+                    let prepend = (l - idx) as usize;
+                    let mut grown = Vec::with_capacity(arr.elems.len() + prepend);
+                    grown.extend(std::iter::repeat(Value::Null).take(prepend));
+                    grown.extend(arr.elems.drain(..));
+                    arr.elems = grown;
+                    arr.lower[0] = idx as i32;
+                    arr.dims[0] += prepend as i32;
+                } else if idx >= l + n {
+                    let append = (idx - l - n + 1) as usize;
+                    arr.elems
+                        .extend(std::iter::repeat(Value::Null).take(append));
+                    arr.dims[0] += append as i32;
+                }
+            }
+            let pos = (idx - arr.lower[0] as i64) as usize;
+            let elem_ct = array_elem_coltype(elem);
+            let elem_comp = if elem == ArrayElem::Record {
+                composite
+            } else {
+                None
+            };
+            let cur_elem = std::mem::replace(&mut arr.elems[pos], Value::Null);
+            arr.elems[pos] =
+                assign_insert_indirection(eng, cur_elem, rest, val, &elem_ct, elem_comp, col_name)?;
+            Ok(Value::Array(arr))
+        }
+        ResolvedIndirection::Field(fname) => {
+            let tname = match ctype {
+                ColType::Composite => composite,
+                _ => None,
+            }
+            .ok_or_else(|| {
+                exec_err(
+                    "42804",
+                    format!(
+                        "cannot access field of non-composite type {}",
+                        ctype.sql_name()
+                    ),
+                )
+            })?;
+            let fields = eng
+                .db
+                .types
+                .get(tname)
+                .and_then(|st| st.composite.clone())
+                .ok_or_else(|| exec_err("42704", format!("type \"{}\" does not exist", tname)))?;
+            let (ftype, nested) = fields
+                .iter()
+                .find(|(n, _, _)| n == fname)
+                .map(|(_, t, n)| (t.clone(), n.clone()))
+                .ok_or_else(|| {
+                    exec_err(
+                        "42703",
+                        format!("column \"{}\" of type \"{}\" does not exist", fname, tname),
+                    )
+                })?;
+            let mut rec = match base {
+                Value::Null => fields
+                    .iter()
+                    .map(|(n, _, _)| (n.clone(), Value::Null))
+                    .collect::<Vec<_>>(),
+                Value::Record(r) => r,
+                _ => {
+                    return Err(exec_err(
+                        "42804",
+                        format!("cannot access field of type {}", base.type_name()),
+                    ));
+                }
+            };
+            let ri = rec.iter().position(|(n, _)| n == fname).ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("column \"{}\" of type \"{}\" does not exist", fname, tname),
+                )
+            })?;
+            let cur = std::mem::replace(&mut rec[ri].1, Value::Null);
+            rec[ri].1 = assign_insert_indirection(
+                eng,
+                cur,
+                rest,
+                val,
+                &ftype,
+                nested.as_deref(),
+                col_name,
+            )?;
+            Ok(Value::Record(rec))
+        }
+    }
+}
+
 fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
-    columns: &Option<Vec<String>>,
+    columns: &Option<Vec<InsertTarget>>,
     rows: &[Vec<InsertValue>],
     select: &Option<SelectStmt>,
     with: &[CteDef],
@@ -4487,21 +4801,45 @@ fn exec_insert(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: INSERT needs INSERT privilege on the table — or, with an
     // explicit column list, on each listed column (like PostgreSQL).
-    if let Some(cols) = columns {
-        require_column_privs(eng, ctx, table, cols, crate::storage::PRIV_INSERT, "INSERT")?;
+    // v0.84: privilege checks apply to the root column of each target
+    // (PG checks the column, not the indirection path).
+    if let Some(targets) = columns {
+        let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+        require_column_privs(
+            eng,
+            ctx,
+            table,
+            &names,
+            crate::storage::PRIV_INSERT,
+            "INSERT",
+        )?;
     } else {
         require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
     }
-    // v0.12: duplicate target columns are 42701 in PostgreSQL
-    // ("multiple assignments to same column"), not silently accepted.
-    if let Some(cols) = columns {
-        let mut seen = std::collections::HashSet::new();
-        for c in cols {
-            if !seen.insert(c) {
+    // v0.12/v0.84: duplicate target columns are 42701 in PostgreSQL —
+    // but only for whole-column duplicates. PG19
+    // (transformInsertTargetList) allows repeated *partial* (indirection)
+    // targets on the same column (`INSERT INTO t (f[1], f[2])`), and
+    // rejects a whole-column target mixed with any other assignment to
+    // the same column: `column "x" specified more than once`.
+    if let Some(targets) = columns {
+        let mut whole = std::collections::HashSet::new();
+        let mut partial = std::collections::HashSet::new();
+        for t in targets {
+            if t.indirection.is_empty() {
+                if !whole.insert(&t.name) || partial.contains(&t.name) {
+                    return Err(exec_err(
+                        "42701",
+                        format!("column \"{}\" specified more than once", t.name),
+                    ));
+                }
+            } else if whole.contains(&t.name) {
                 return Err(exec_err(
                     "42701",
-                    format!("multiple assignments to same column \"{}\"", c),
+                    format!("column \"{}\" specified more than once", t.name),
                 ));
+            } else {
+                partial.insert(&t.name);
             }
         }
     }
@@ -4581,19 +4919,22 @@ fn exec_insert(
         // list, a row shorter than the table targets the first N
         // columns; the rest take defaults. More expressions than
         // columns is still 42601.
-        let targets: Vec<usize> = match columns {
-            Some(names) => names
+        // v0.84: targets keep their indirection slice for the row
+        // builder (`&[]` = whole column on the no-list path).
+        let targets: Vec<(usize, &[InsertIndirection])> = match columns {
+            Some(tgts) => tgts
                 .iter()
-                .map(|n| {
+                .map(|t| {
                     meta.columns
                         .iter()
-                        .position(|(c, _)| c == n)
+                        .position(|(c, _)| c == &t.name)
+                        .map(|idx| (idx, t.indirection.as_slice()))
                         .ok_or_else(|| {
                             exec_err(
                                 "42703",
                                 format!(
                                     "column \"{}\" of relation \"{}\" does not exist",
-                                    n, table
+                                    t.name, table
                                 ),
                             )
                         })
@@ -4615,13 +4956,43 @@ fn exec_insert(
                         "INSERT has more expressions than target columns".to_string(),
                     ));
                 }
-                (0..width).collect()
+                (0..width)
+                    .map(|i| (i, &[][..] as &[InsertIndirection]))
+                    .collect()
             }
         };
         let mut built: Vec<Row> = Vec::new();
         // v0.10: INSERT...SELECT: validate column count and use the
         // SELECT's rows directly (already Values).
         if let Some(srows) = select_rows {
+            // v0.84: indirection index expressions are row-independent —
+            // resolve them once. Only pays for a Q when some target
+            // actually carries indirection.
+            let resolved: Vec<Vec<ResolvedIndirection>> =
+                if targets.iter().any(|(_, indir)| !indir.is_empty()) {
+                    let mut lock_ids = Vec::new();
+                    let mut q = Q {
+                        eng,
+                        snap: ctx.snap,
+                        own: ctx.own,
+                        session: ctx.session,
+                        role: ctx.role,
+                        read_only: ctx.read_only,
+                        depth: 0,
+                        lock_ids: &mut lock_ids,
+                        ctes: ctes.clone(),
+                        wctx: None,
+                        priv_scopes: Vec::new(),
+                        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                        hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    };
+                    targets
+                        .iter()
+                        .map(|(_, indir)| resolve_insert_indirection(&mut q, indir))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    targets.iter().map(|_| Vec::new()).collect()
+                };
             for cells in srows {
                 if cells.len() != targets.len() {
                     // v0.65: same width rule as VALUES above.
@@ -4639,21 +5010,49 @@ fn exec_insert(
                 let mut values = vec![Value::Null; ncols];
                 let mut explicit = vec![false; ncols];
                 for (j, v) in cells.iter().enumerate() {
-                    let ti = targets[j];
-                    let (_, ctype) = &meta.columns[ti];
-                    // v0.60: INSERT...SELECT applies the numeric(p,s)
-                    // typmod like any other assignment (PG's
-                    // apply_typmod); the SELECT's rows are Values, not
-                    // pre-coerced to the target type.
-                    values[ti] = match ctype {
-                        ColType::Numeric(tm) => match v {
-                            Value::Numeric(n) => {
-                                apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric)?
-                            }
+                    let (ti, indir) = targets[j];
+                    let (cname, ctype) = &meta.columns[ti];
+                    if !indir.is_empty() {
+                        // v0.84: indirection target in INSERT...SELECT.
+                        // SELECT rows are Values, so coerce to the leaf
+                        // type (assignment coercion), then build from a
+                        // NULL base like the VALUES path.
+                        let comp = meta.composite_types.get(ti).and_then(|o| o.as_deref());
+                        let (leaf_ct, _) = insert_leaf_type(eng, ctype, comp, indir, cname, table)?;
+                        let coerced = match &leaf_ct {
+                            ColType::Numeric(tm) => match v {
+                                Value::Numeric(n) => {
+                                    apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric)?
+                                }
+                                _ => coerce_value(v.clone(), &leaf_ct, cname)?,
+                            },
+                            _ => coerce_value(v.clone(), &leaf_ct, cname)?,
+                        };
+                        let cur = std::mem::replace(&mut values[ti], Value::Null);
+                        values[ti] = assign_insert_indirection(
+                            eng,
+                            cur,
+                            &resolved[j],
+                            coerced,
+                            ctype,
+                            comp,
+                            cname,
+                        )?;
+                    } else {
+                        // v0.60: INSERT...SELECT applies the numeric(p,s)
+                        // typmod like any other assignment (PG's
+                        // apply_typmod); the SELECT's rows are Values, not
+                        // pre-coerced to the target type.
+                        values[ti] = match ctype {
+                            ColType::Numeric(tm) => match v {
+                                Value::Numeric(n) => {
+                                    apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric)?
+                                }
+                                _ => v.clone(),
+                            },
                             _ => v.clone(),
-                        },
-                        _ => v.clone(),
-                    };
+                        };
+                    }
                     explicit[ti] = true;
                 }
                 // Fill defaults, check constraints (same as VALUES path).
@@ -4730,35 +5129,78 @@ fn exec_insert(
                 }
                 let mut values = vec![Value::Null; ncols];
                 let mut explicit = vec![false; ncols];
-                for (v, &ci) in row.iter().zip(targets.iter()) {
+                for (v, &(ci, indir)) in row.iter().zip(targets.iter()) {
                     let (cname, ctype) = &meta.columns[ci];
-                    values[ci] = match v {
-                        InsertValue::Lit(l) => coerce_literal(l, ctype, cname)?,
-                        InsertValue::Param(n) => {
-                            return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
+                    // v0.84: indirection targets (`f2[1]`, `f3.if2`).
+                    // PG19 rejects DEFAULT into an indirection path
+                    // with 0A000 before evaluating any default, coerces
+                    // the value to the type at the END of the path, and
+                    // builds the column value from a NULL base.
+                    if !indir.is_empty() {
+                        if matches!(v, InsertValue::Default) {
+                            let msg = match &indir[0] {
+                                InsertIndirection::Index(_) => {
+                                    "cannot set an array element to DEFAULT"
+                                }
+                                _ => "cannot set a subfield to DEFAULT",
+                            };
+                            return Err(exec_err("0A000", msg));
                         }
-                        // v0.24: general expressions in VALUES — evaluate,
-                        // then coerce to the column type like PG's
-                        // assignment cast.
-                        InsertValue::Expr(e) => {
-                            let val = eval_expr(&mut q, &[], e)?;
-                            coerce_value(val, ctype, cname)?
-                        }
-                        // v0.9: DEFAULT in VALUES applies the column default.
-                        InsertValue::Default => match &meta.defaults[ci] {
-                            Some(d) => eval_default(
-                                q.eng,
-                                ctx.snap,
-                                ctx.own,
-                                ctx.session,
-                                ctx.role,
-                                d,
-                                ctype,
-                                cname,
-                            )?,
-                            None => Value::Null,
-                        },
-                    };
+                        let comp = meta.composite_types.get(ci).and_then(|o| o.as_deref());
+                        let (leaf_ct, _leaf_comp) =
+                            insert_leaf_type(q.eng, ctype, comp, indir, cname, table)?;
+                        let steps = resolve_insert_indirection(&mut q, indir)?;
+                        let raw = match v {
+                            InsertValue::Lit(l) => coerce_literal(l, &leaf_ct, cname)?,
+                            InsertValue::Param(n) => {
+                                return Err(exec_err(
+                                    "42P02",
+                                    format!("there is no parameter ${}", n),
+                                ));
+                            }
+                            InsertValue::Expr(e) => {
+                                let val = eval_expr(&mut q, &[], e)?;
+                                coerce_value(val, &leaf_ct, cname)?
+                            }
+                            InsertValue::Default => {
+                                unreachable!("v0.84: DEFAULT with indirection rejected above")
+                            }
+                        };
+                        let cur = std::mem::replace(&mut values[ci], Value::Null);
+                        values[ci] =
+                            assign_insert_indirection(q.eng, cur, &steps, raw, ctype, comp, cname)?;
+                    } else {
+                        values[ci] = match v {
+                            InsertValue::Lit(l) => coerce_literal(l, ctype, cname)?,
+                            InsertValue::Param(n) => {
+                                return Err(exec_err(
+                                    "42P02",
+                                    format!("there is no parameter ${}", n),
+                                ));
+                            }
+                            // v0.24: general expressions in VALUES — evaluate,
+                            // then coerce to the column type like PG's
+                            // assignment cast.
+                            InsertValue::Expr(e) => {
+                                let val = eval_expr(&mut q, &[], e)?;
+                                coerce_value(val, ctype, cname)?
+                            }
+                            // v0.9: DEFAULT in VALUES applies the column default.
+                            InsertValue::Default => match &meta.defaults[ci] {
+                                Some(d) => eval_default(
+                                    q.eng,
+                                    ctx.snap,
+                                    ctx.own,
+                                    ctx.session,
+                                    ctx.role,
+                                    d,
+                                    ctype,
+                                    cname,
+                                )?,
+                                None => Value::Null,
+                            },
+                        };
+                    }
                     explicit[ci] = true;
                 }
                 // v0.9: fill defaults for columns not mentioned.
@@ -11433,7 +11875,7 @@ pub fn copy_from_rows(
     rows: Vec<Vec<crate::copy::CopyField>>,
 ) -> Result<u64, ExecError> {
     use crate::copy::CopyField;
-    use crate::sql::Literal;
+    use crate::sql::{InsertTarget, Literal};
     let insert_rows: Vec<Vec<InsertValue>> = rows
         .into_iter()
         .map(|row| {
@@ -11446,13 +11888,23 @@ pub fn copy_from_rows(
         })
         .collect();
     let n = insert_rows.len() as u64;
+    // v0.84: COPY's column list is plain names (PG has no indirection
+    // in COPY) — wrap as whole-column InsertTargets.
+    let targets: Option<Vec<InsertTarget>> = columns.as_ref().map(|cs| {
+        cs.iter()
+            .map(|name| InsertTarget {
+                name: name.clone(),
+                indirection: Vec::new(),
+            })
+            .collect()
+    });
     // Reuse the full INSERT path: coercion, defaults, constraints,
     // unique indexes, foreign keys, WAL — atomically.
     let _ = exec_insert(
         eng,
         ctx,
         table,
-        columns,
+        &targets,
         &insert_rows,
         &None,
         &[],
@@ -29940,8 +30392,13 @@ pub fn infer_param_types(
     {
         if let Some(t) = eng.db.find_table(table, snap, own, session) {
             // Unknown column names are skipped here; execution reports them.
+            // v0.84: targets are InsertTarget (name + indirection); the
+            // indirection path is ignored for type inference.
             let targets: Vec<usize> = match columns {
-                Some(names) => names.iter().filter_map(|n| t.column_index(n)).collect(),
+                Some(names) => names
+                    .iter()
+                    .filter_map(|n| t.column_index(&n.name))
+                    .collect(),
                 None => (0..t.columns.len()).collect(),
             };
             for row in rows {
