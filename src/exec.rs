@@ -15346,15 +15346,20 @@ fn exec_agg_one(
     // Group rows by their GROUP BY key, remembering first-seen order.
     let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    // v0.79: reused scratch buffer for the per-row key encoding -- only a
+    // first-seen group's key needs its own allocation (cloned into
+    // `group_index`); every repeat lookup reuses this same buffer instead
+    // of allocating and growing a fresh `Vec<u8>` per row.
+    let mut key_bytes: Vec<u8> = Vec::new();
     for (i, key_vals) in xkeys.iter().enumerate() {
-        let mut key_bytes = Vec::new();
+        key_bytes.clear();
         for v in key_vals {
             value_key(v, &mut key_bytes);
         }
-        match group_index.get(&key_bytes) {
+        match group_index.get(key_bytes.as_slice()) {
             Some(&gi) => groups[gi].1.push(i),
             None => {
-                group_index.insert(key_bytes, groups.len());
+                group_index.insert(key_bytes.clone(), groups.len());
                 groups.push((key_vals.clone(), vec![i]));
             }
         }
