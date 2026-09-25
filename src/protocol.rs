@@ -57,6 +57,15 @@ impl<'a> Cursor<'a> {
         Ok(self.take(n)?.to_vec())
     }
 
+    /// Read-or-08P01: map a structural payload error ("message truncated",
+    /// "unterminated cstring", bad UTF-8) into a `(code, message)` pair for
+    /// the extended-protocol handlers. PostgreSQL's `pq_getmsgint` raises
+    /// `ERRCODE_PROTOCOL_VIOLATION` on the same condition and the connection
+    /// survives; without this mapping the io error would kill the connection.
+    pub fn or_08p01<T>(r: io::Result<T>) -> Result<T, (String, String)> {
+        r.map_err(|_| ("08P01".to_string(), "invalid message format".to_string()))
+    }
+
     /// Read a NUL-terminated UTF-8 string.
     pub fn read_cstring(&mut self) -> io::Result<String> {
         let end = self.buf[self.pos..]

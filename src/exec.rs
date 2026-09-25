@@ -32162,7 +32162,7 @@ mod tests {
         );
         assert_eq!(
             cursor_window_for_test(&FetchDir::Forward(None), 2, 4),
-            (3, 4, 3)
+            (3, 4, 4)
         );
         // Past the end: empty, parked after the last row.
         assert_eq!(
@@ -32194,6 +32194,11 @@ mod tests {
         );
         assert_eq!(cursor_window_for_test(&FetchDir::First, 2, 4), (0, 1, 0));
         assert_eq!(cursor_window_for_test(&FetchDir::Last, 2, 4), (3, 4, 3));
+        // v0.83: BACKWARD ALL from after-the-end parks before the first row.
+        assert_eq!(
+            cursor_window_for_test(&FetchDir::Backward(None), 4, 4),
+            (0, 4, -1)
+        );
     }
 
     // ====================================================================

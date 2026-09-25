@@ -973,6 +973,28 @@ fn protocol_error(
     Ok(())
 }
 
+/// Parse an extended-protocol message payload with `parse`; a structural
+/// failure (payload shorter than its counts claim, unterminated cstring)
+/// becomes a PG-style 08P01 protocol-violation ErrorResponse with the
+/// connection surviving — PostgreSQL's `pq_getmsgint` raises
+/// ERRCODE_PROTOCOL_VIOLATION the same way instead of dropping the
+/// connection. Returns `Ok(None)` after sending the error.
+fn parse_msg<T>(
+    stream: &mut Writer,
+    session: &mut Session,
+    payload: &[u8],
+    parse: impl FnOnce(&mut Cursor) -> Result<T, (String, String)>,
+) -> io::Result<Option<T>> {
+    let mut cur = Cursor::new(payload);
+    match parse(&mut cur) {
+        Ok(v) => Ok(Some(v)),
+        Err((code, msg)) => {
+            protocol_error(stream, session, &code, &msg)?;
+            Ok(None)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Simple query protocol (v0.1 behavior + v0.5 MVCC transactions)
 // ---------------------------------------------------------------------------
@@ -1675,8 +1697,25 @@ fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usize, i64) {
         return (0, 0, new);
     }
     let new = match kind {
-        Kind::Fwd => e - 1,
-        Kind::Bwd => s,
+        // v0.83: PG leaves the cursor AFTER the last row when a forward
+        // fetch/move runs to the end (e == n), not ON the last row —
+        // otherwise a following BACKWARD ALL would miss the last row.
+        Kind::Fwd => {
+            if e == n {
+                n
+            } else {
+                e - 1
+            }
+        }
+        // v0.83: PG leaves the cursor BEFORE the first row when a backward
+        // fetch/move runs to the start (s == 0), not ON the first row.
+        Kind::Bwd => {
+            if s == 0 {
+                -1
+            } else {
+                s
+            }
+        }
         Kind::At => e - 1,
     };
     (s as usize, e as usize, new)
@@ -1759,7 +1798,11 @@ fn cursor_fetch(
         message: format!("cursor \"{}\" does not exist", name),
     })?;
     let (s, e, new_pos) = cursor_window(dir, cur.pos, cur.rows.len());
-    let rows: Vec<Row> = cur.rows[s..e].to_vec();
+    let mut rows: Vec<Row> = cur.rows[s..e].to_vec();
+    // v0.83: PG returns BACKWARD fetch rows in reverse (newest-first) order.
+    if matches!(dir, FetchDir::Backward(_)) {
+        rows.reverse();
+    }
     let cols = cur.cols.clone();
     cur.pos = new_pos;
     let n = rows.len();
@@ -3069,17 +3112,27 @@ fn handle_parse(
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut cur = Cursor::new(payload);
-    let name = cur.read_cstring()?;
-    let query = cur.read_cstring()?;
-    let ntypes = cur.read_i16()?;
-    if ntypes < 0 {
-        return protocol_error(stream, session, "08P01", "invalid parameter-type count");
-    }
-    let mut declared_oids = Vec::with_capacity(ntypes as usize);
-    for _ in 0..ntypes {
-        declared_oids.push(cur.read_i32()?);
-    }
+    // v0.83: structural payload errors become 08P01 with the connection
+    // surviving (see handle_bind).
+    let parsed = parse_msg(stream, session, payload, |cur| {
+        let name = Cursor::or_08p01(cur.read_cstring())?;
+        let query = Cursor::or_08p01(cur.read_cstring())?;
+        let ntypes = Cursor::or_08p01(cur.read_i16())?;
+        if ntypes < 0 {
+            return Err((
+                "08P01".to_string(),
+                "invalid parameter-type count".to_string(),
+            ));
+        }
+        let mut declared_oids = Vec::with_capacity(ntypes as usize);
+        for _ in 0..ntypes {
+            declared_oids.push(Cursor::or_08p01(cur.read_i32())?);
+        }
+        Ok((name, query, declared_oids))
+    })?;
+    let Some((name, query, declared_oids)) = parsed else {
+        return Ok(()); // 08P01 already sent
+    };
 
     // v0.81: parsed-AST cache via `Session::cached_parse`. A hit
     // clones the cached Stmt — parameter substitution still happens
@@ -3128,42 +3181,69 @@ fn handle_bind(
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut cur = Cursor::new(payload);
-    let portal_name = cur.read_cstring()?;
-    let stmt_name = cur.read_cstring()?;
+    // v0.83: structural payload errors become 08P01 with the connection
+    // surviving (PG's pq_getmsgint raises ERRCODE_PROTOCOL_VIOLATION the
+    // same way); previously a short payload killed the connection with an
+    // io "message truncated" error.
+    let parsed = parse_msg(stream, session, payload, |cur| {
+        let portal_name = Cursor::or_08p01(cur.read_cstring())?;
+        let stmt_name = Cursor::or_08p01(cur.read_cstring())?;
 
-    let nformats = cur.read_i16()?;
-    if nformats < 0 {
-        return protocol_error(stream, session, "08P01", "invalid format-code count");
-    }
-    let mut pformats = Vec::with_capacity(nformats as usize);
-    for _ in 0..nformats {
-        pformats.push(cur.read_i16()?);
-    }
-
-    let nparams = cur.read_i16()?;
-    if nparams < 0 {
-        return protocol_error(stream, session, "08P01", "invalid parameter count");
-    }
-    let mut raw: Vec<Option<Vec<u8>>> = Vec::with_capacity(nparams as usize);
-    for _ in 0..nparams {
-        let len = cur.read_i32()?;
-        if len == -1 {
-            raw.push(None); // NULL
-        } else if len < -1 {
-            return protocol_error(stream, session, "08P01", "invalid parameter length");
-        } else {
-            raw.push(Some(cur.read_bytes(len as usize)?));
+        let nformats = Cursor::or_08p01(cur.read_i16())?;
+        if nformats < 0 {
+            return Err(("08P01".to_string(), "invalid format-code count".to_string()));
         }
-    }
+        let mut pformats = Vec::with_capacity(nformats as usize);
+        for _ in 0..nformats {
+            pformats.push(Cursor::or_08p01(cur.read_i16())?);
+        }
 
-    let nresults = cur.read_i16()?;
-    if nresults < 0 {
-        return protocol_error(stream, session, "08P01", "invalid result-format count");
-    }
-    let mut rformats = Vec::with_capacity(nresults as usize);
-    for _ in 0..nresults {
-        rformats.push(cur.read_i16()?);
+        let nparams = Cursor::or_08p01(cur.read_i16())?;
+        if nparams < 0 {
+            return Err(("08P01".to_string(), "invalid parameter count".to_string()));
+        }
+        let mut raw: Vec<Option<Vec<u8>>> = Vec::with_capacity(nparams as usize);
+        for _ in 0..nparams {
+            let len = Cursor::or_08p01(cur.read_i32())?;
+            if len == -1 {
+                raw.push(None); // NULL
+            } else if len < -1 {
+                return Err(("08P01".to_string(), "invalid parameter length".to_string()));
+            } else {
+                raw.push(Some(Cursor::or_08p01(cur.read_bytes(len as usize))?));
+            }
+        }
+
+        let nresults = Cursor::or_08p01(cur.read_i16())?;
+        if nresults < 0 {
+            return Err((
+                "08P01".to_string(),
+                "invalid result-format count".to_string(),
+            ));
+        }
+        let mut rformats = Vec::with_capacity(nresults as usize);
+        for _ in 0..nresults {
+            rformats.push(Cursor::or_08p01(cur.read_i16())?);
+        }
+        Ok((portal_name, stmt_name, pformats, raw, rformats))
+    })?;
+    let Some((portal_name, stmt_name, pformats, raw, rformats)) = parsed else {
+        return Ok(()); // 08P01 already sent
+    };
+
+    // PG19 (postgres.c exec_bind_message): more than one format code must
+    // match the parameter count; a single code applies to all parameters.
+    if pformats.len() > 1 && pformats.len() != raw.len() {
+        return protocol_error(
+            stream,
+            session,
+            "08P01",
+            &format!(
+                "bind message has {} parameter formats but {} parameters",
+                pformats.len(),
+                raw.len()
+            ),
+        );
     }
 
     let prep = match session.stmts.get(&stmt_name).cloned() {
@@ -3267,9 +3347,16 @@ fn handle_describe(
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut cur = Cursor::new(payload);
-    let kind = cur.read_u8()?;
-    let name = cur.read_cstring()?;
+    // v0.83: structural payload errors become 08P01 with the connection
+    // surviving (see handle_bind).
+    let parsed = parse_msg(stream, session, payload, |cur| {
+        let kind = Cursor::or_08p01(cur.read_u8())?;
+        let name = Cursor::or_08p01(cur.read_cstring())?;
+        Ok((kind, name))
+    })?;
+    let Some((kind, name)) = parsed else {
+        return Ok(()); // 08P01 already sent
+    };
 
     let prep: Prepared = match kind {
         b'S' => match session.stmts.get(&name).cloned() {
@@ -3408,9 +3495,16 @@ fn handle_execute(
     session: &mut Session,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut cur = Cursor::new(payload);
-    let portal_name = cur.read_cstring()?;
-    let max_rows = cur.read_i32()?;
+    // v0.83: structural payload errors become 08P01 with the connection
+    // surviving (see handle_bind).
+    let parsed = parse_msg(stream, session, payload, |cur| {
+        let portal_name = Cursor::or_08p01(cur.read_cstring())?;
+        let max_rows = Cursor::or_08p01(cur.read_i32())?;
+        Ok((portal_name, max_rows))
+    })?;
+    let Some((portal_name, max_rows)) = parsed else {
+        return Ok(()); // 08P01 already sent
+    };
 
     if !session.portals.contains_key(&portal_name) {
         return protocol_error(
@@ -3546,23 +3640,29 @@ fn handle_execute(
 /// Close: 'S'/'P' + name → CloseComplete. Closing a nonexistent
 /// statement/portal is silently ignored, like Postgres.
 fn handle_close(stream: &mut Writer, session: &mut Session, payload: &[u8]) -> io::Result<()> {
-    let mut cur = Cursor::new(payload);
-    let kind = cur.read_u8()?;
-    let name = cur.read_cstring()?;
+    // v0.83: structural payload errors become 08P01 with the connection
+    // surviving (see handle_bind).
+    let parsed = parse_msg(stream, session, payload, |cur| {
+        let kind = Cursor::or_08p01(cur.read_u8())?;
+        let name = Cursor::or_08p01(cur.read_cstring())?;
+        if kind != b'S' && kind != b'P' {
+            return Err((
+                "08P01".to_string(),
+                "invalid close target (expected 'S' or 'P')".to_string(),
+            ));
+        }
+        Ok((kind, name))
+    })?;
+    let Some((kind, name)) = parsed else {
+        return Ok(()); // 08P01 already sent
+    };
     match kind {
         b'S' => {
             session.stmts.remove(&name);
         }
-        b'P' => {
-            session.portals.remove(&name);
-        }
         _ => {
-            return protocol_error(
-                stream,
-                session,
-                "08P01",
-                "invalid close target (expected 'S' or 'P')",
-            );
+            // b'P': kind was validated to be S or P above.
+            session.portals.remove(&name);
         }
     }
     MsgBuilder::new(b'3').send(stream)?; // CloseComplete
