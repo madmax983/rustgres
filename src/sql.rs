@@ -1343,6 +1343,9 @@ pub enum FromItem {
         /// v0.20: `FROM tbl [AS] x (a, b, c)` — column aliases rename the
         /// table's output columns positionally.
         col_aliases: Vec<String>,
+        /// v0.96: `FROM ONLY tbl` — scan just the named table, excluding
+        /// inheritance children (PG19; default scans include them).
+        only: bool,
     },
     /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
     /// v0.23: `[(cols)]` column aliases rename the subquery's output
@@ -1722,6 +1725,10 @@ pub struct TableDef {
     /// CREATE time. Querying a parent does NOT yet include children's
     /// rows (no inheritance expansion in scans).
     pub inherits: Vec<String>,
+    /// v0.96: table-constraint `NOT NULL` columns that named no local
+    /// column (legal only with `INHERITS`); applied to the merged
+    /// column list at exec, 42703 when still missing.
+    pub deferred_not_null: Vec<String>,
 }
 
 /// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
@@ -1847,6 +1854,20 @@ pub enum AlterAction {
     AttachPartition {
         child: String,
         bound: PartBoundDef,
+    },
+    /// v0.96: `ALTER TABLE child INHERIT parent` (PG19 table inheritance).
+    /// The parent must exist; every parent column must already exist in
+    /// the child with an exactly matching type, and parent NOT NULL
+    /// columns must be NOT NULL in the child (42804 otherwise). The
+    /// link is recorded; columns are never added or reordered.
+    Inherit {
+        parent: String,
+    },
+    /// v0.96: `ALTER TABLE child NO INHERIT parent` — drops the
+    /// inheritance link only; the child's columns and data are kept.
+    /// A missing link is 42P01, like PostgreSQL.
+    NoInherit {
+        parent: String,
     },
 }
 
@@ -2012,6 +2033,7 @@ impl TableDef {
             likes: Vec::new(),
             reloptions: Vec::new(),
             inherits: Vec::new(),
+            deferred_not_null: Vec::new(),
         }
     }
 }
@@ -2035,10 +2057,16 @@ fn def_add_pkey(
     def: &mut TableDef,
     name: Option<String>,
     cols: &[String],
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check and the NOT NULL marking are deferred to exec,
+    // which validates against the merged column list.
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     if def.pkey.is_some() {
@@ -2048,9 +2076,11 @@ fn def_add_pkey(
     if def_constraint_name_exists(def, &cname) {
         return Err(err(format!("constraint \"{}\" already exists", cname)));
     }
-    for c in cols {
-        let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
-        def.not_null[i] = true;
+    if !defer_col_check {
+        for c in cols {
+            let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
+            def.not_null[i] = true;
+        }
     }
     def.pkey = Some(UniqueDef {
         name: cname,
@@ -2065,10 +2095,15 @@ fn def_add_unique(
     name: Option<String>,
     cols: &[String],
     col: &str,
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check is deferred to exec (see def_add_pkey).
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     let cname = name.unwrap_or_else(|| format!("{}_{}_key", table, col));
@@ -2122,10 +2157,15 @@ fn def_add_fk(
     name: Option<String>,
     cols: &[String],
     tail: ParsedFkTail,
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check is deferred to exec (see def_add_pkey).
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     let cname = name.unwrap_or_else(|| format!("{}_{}_fkey", table, cols[0]));
@@ -2143,7 +2183,15 @@ fn def_add_fk(
     Ok(())
 }
 
-fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlError> {
+/// v0.96: `inherits` (already parsed) relaxes two rules when non-empty:
+/// a column list with no local columns is legal (parents supply them),
+/// and table-constraint column references are validated against the
+/// merged column list at exec instead of here.
+fn build_table_def(
+    table: &str,
+    items: Vec<TableItem>,
+    inherits: &[String],
+) -> Result<TableDef, SqlError> {
     let mut def = TableDef::empty();
     // Pass 1: columns.
     for item in &items {
@@ -2184,7 +2232,7 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
     // PostgreSQL; only a list that intended columns but produced none
     // (and no LIKE) is an error.
     let has_like = items.iter().any(|i| matches!(i, TableItem::Like(_)));
-    if def.columns.is_empty() && !has_like && !items.is_empty() {
+    if def.columns.is_empty() && !has_like && !items.is_empty() && inherits.is_empty() {
         return Err(err(
             "syntax error: table must have at least one column".to_string()
         ));
@@ -2222,10 +2270,15 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                             n.clone(),
                             std::slice::from_ref(&c.name),
                             &c.name,
+                            false,
                         )?,
-                        ColCon::PKey(n) => {
-                            def_add_pkey(table, &mut def, n.clone(), std::slice::from_ref(&c.name))?
-                        }
+                        ColCon::PKey(n) => def_add_pkey(
+                            table,
+                            &mut def,
+                            n.clone(),
+                            std::slice::from_ref(&c.name),
+                            false,
+                        )?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
                         ColCon::Check(n, e) => {
                             def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?
@@ -2241,15 +2294,18 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                                 on_delete: tail.on_delete,
                                 on_update: tail.on_update,
                             },
+                            false,
                         )?,
                     }
                 }
             }
             TableItem::TableCon(tc) => match tc {
-                ParsedTableCon::PKey(n, cols) => def_add_pkey(table, &mut def, n.clone(), cols)?,
+                ParsedTableCon::PKey(n, cols) => {
+                    def_add_pkey(table, &mut def, n.clone(), cols, !inherits.is_empty())?
+                }
                 ParsedTableCon::Unique(n, cols) => {
                     let first = cols[0].clone();
-                    def_add_unique(table, &mut def, n.clone(), cols, &first)?
+                    def_add_unique(table, &mut def, n.clone(), cols, &first, !inherits.is_empty())?
                 }
                 ParsedTableCon::Check(n, e) => {
                     def_add_check(table, &mut def, n.clone(), e.clone(), table)?
@@ -2260,11 +2316,16 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                 ParsedTableCon::NotNull { col, .. } => {
                     if let Some(i) = def.columns.iter().position(|(n, _)| n == col) {
                         def.not_null[i] = true;
-                    } else {
+                    } else if inherits.is_empty() {
                         return Err(err(format!(
                             "syntax error: column \"{}\" of relation \"{}\" does not exist",
                             col, table
                         )));
+                    } else {
+                        // v0.96: with INHERITS the column may come from a
+                        // parent; the NOT NULL is applied to the merged
+                        // columns at exec.
+                        def.deferred_not_null.push(col.clone());
                     }
                 }
                 ParsedTableCon::Fk {
@@ -2282,6 +2343,7 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                         on_delete: tail.on_delete,
                         on_update: tail.on_update,
                     },
+                    !inherits.is_empty(),
                 )?,
             },
         }
@@ -4500,14 +4562,16 @@ impl Parser {
                 }
             }
         } // v0.74: end of non-empty column list; `()` handled above.
-        let mut def = build_table_def(&name, items)?;
-        // v0.77: `INHERITS (parent [, ...])` — table inheritance. The
-        // child copies the parents' columns at exec; recorded in the
-        // def for future inheritance-expansion support.
+        // v0.96: `INHERITS (parent [, ...])` — table inheritance. Parsed
+        // before `build_table_def` so a constraint-only (or empty) column
+        // list is legal when parents supply the columns (PG19 merges the
+        // parents' columns at CREATE time); table-constraint column
+        // references are validated against the merged columns at exec.
+        let mut inherits: Vec<String> = Vec::new();
         if self.eat_keyword("inherits") {
             self.expect(Token::LParen, "'('")?;
             loop {
-                def.inherits.push(self.expect_ident()?);
+                inherits.push(self.expect_ident()?);
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -4520,6 +4584,8 @@ impl Parser {
                 }
             }
         }
+        let mut def = build_table_def(&name, items, &inherits)?;
+        def.inherits = inherits;
         // v0.72: `WITH (storage_parameter = value, ...)` (PG19
         // reloptions). Parsed into the def; exec validates the
         // recognized parameters (fillfactor range) and records them.
@@ -4578,6 +4644,7 @@ impl Parser {
             likes: Vec::new(),
             reloptions: Vec::new(),
             inherits: Vec::new(),
+            deferred_not_null: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -5317,6 +5384,17 @@ impl Parser {
             self.expect_keyword("to")?;
             let new_name = self.expect_ident()?;
             return Ok(AlterAction::RenameTo { new_name });
+        }
+        // v0.96: `ALTER TABLE child INHERIT parent` /
+        // `ALTER TABLE child NO INHERIT parent` (PG19).
+        if self.eat_keyword("inherit") {
+            let parent = self.expect_ident()?;
+            return Ok(AlterAction::Inherit { parent });
+        }
+        if self.eat_keyword("no") {
+            self.expect_keyword("inherit")?;
+            let parent = self.expect_ident()?;
+            return Ok(AlterAction::NoInherit { parent });
         }
         Err(err(
             "syntax error: expected ADD, DROP, ALTER or RENAME".to_string()
@@ -9721,6 +9799,8 @@ impl Parser {
             name,
             alias: None,
             col_aliases: Vec::new(),
+            // v0.96: `TABLE name` never carries ONLY.
+            only: false,
         }];
         sel
     }
@@ -10027,6 +10107,59 @@ impl Parser {
         // supported under it; LATERAL derived tables / plain tables get
         // an honest 0A000 below.
         let lateral = self.eat_keyword("lateral");
+        // v0.96: `FROM ONLY tbl` / `FROM ONLY (tbl)` (PG19) — scan just
+        // the named table, excluding inheritance children. `only` is an
+        // unreserved keyword in PG, so a table literally named `only`
+        // keeps working: the ONLY form is taken when `only` is followed
+        // by `(` or by a non-terminator identifier (the table name). A
+        // bare `FROM only` (followed by WHERE, `,`, `)`, `;`, EOF, or a
+        // join keyword) still parses as a table named `only`. The one
+        // genuinely ambiguous shape, `FROM only t1` (table `only`
+        // aliased `t1`), resolves as the ONLY form, matching PG's
+        // keyword reading.
+        let only = if matches!(self.peek(), Token::Ident(s) if s == "only") {
+            let save = self.pos;
+            self.next(); // 'only'
+            let is_only_form = match self.peek() {
+                Token::LParen => true,
+                Token::Ident(s)
+                    if !(s == "where"
+                        || s == "group"
+                        || s == "order"
+                        || s == "limit"
+                        || s == "offset"
+                        || s == "having"
+                        || s == "window"
+                        || s == "for"
+                        || s == "join"
+                        || s == "inner"
+                        || s == "left"
+                        || s == "right"
+                        || s == "full"
+                        || s == "cross"
+                        || s == "natural"
+                        || s == "on"
+                        || s == "using"
+                        || s == "union"
+                        || s == "intersect"
+                        || s == "except") =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if is_only_form {
+                // Rewind to just after 'only'; the table ref parses next.
+                self.pos = save + 1;
+                true
+            } else {
+                // A table named `only`: fully rewind; parse normally.
+                self.pos = save;
+                false
+            }
+        } else {
+            false
+        };
         if *self.peek() == Token::LParen {
             self.next();
             // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
@@ -10145,6 +10278,12 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     // v0.75: don't clobber an inner alias when the outer
                     // alias is absent (`((query) alias)`).
                     if alias.is_some() || !inner_aliased {
@@ -10159,6 +10298,12 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     // v0.75: don't clobber an inner alias when the outer
                     // alias is absent (`((query) alias)`).
                     if alias.is_some() || !inner_aliased {
@@ -10173,14 +10318,23 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     *a = alias;
                     *c = col_aliases;
                 }
                 FromItem::Table {
                     alias: a,
                     col_aliases: c,
+                    only: o,
                     ..
                 } => {
+                    // v0.96: `FROM ONLY (tbl)`.
+                    *o = only;
                     if a.is_some() && alias.is_some() {
                         return Err(err(format!(
                             "table name \"{}\" specified more than once",
@@ -10255,6 +10409,7 @@ impl Parser {
                 name,
                 alias,
                 col_aliases,
+                only,
             })
         }
     }

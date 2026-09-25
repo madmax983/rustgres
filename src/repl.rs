@@ -1007,6 +1007,7 @@ mod tests {
                 composite_types: vec![],
                 domain_types: vec![],
                 domain_elem: vec![],
+                inherits: vec![],
             },
             WalRecord::InsertRows {
                 table: "t".into(),

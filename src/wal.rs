@@ -23,6 +23,12 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
+//! Format version 16 (`RGSWAL16` / `RGSCHK13`) is NOT compatible with v0.95
+//! or earlier: v0.96 WAL-logs table inheritance links (`inherits` on
+//! `CreateTable`/`AlterTable`) and checkpoints them in table images.
+//! Like every format bump, old data directories are refused with a
+//! clear error instead of being misread.
+//!
 //! Format version 14 (`RGSWAL14` / `RGSCHK12`) is NOT compatible with v0.85
 //! or earlier: v0.86 WAL-logs function/operator DDL (`CreateFunction` /
 //! `DropFunction` / `CreateOperator` / `DropOperator`) and checkpoints
@@ -131,7 +137,7 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK12";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK13";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
@@ -147,7 +153,10 @@ const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK12";
 /// v0.88: version 15 adds per-column direction / null-placement /
 /// expression sources and the partial predicate to index images. v14
 /// checkpoints are refused; remove the data directory to start fresh.
-const CHKPT_VERSION: u32 = 15;
+/// v0.96: version 16 adds the inheritance parent links (`inherits`) to
+/// table images. v15 checkpoints are refused; remove the data
+/// directory to start fresh.
+const CHKPT_VERSION: u32 = 16;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -175,7 +184,10 @@ const CHKPT_VERSION: u32 = 15;
 /// v0.88: `RGSWAL15` — `CreateIndex` carries per-column direction /
 /// null-placement / expression sources plus the partial predicate.
 /// Old `RGSWAL14` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL15";
+/// v0.96: `RGSWAL16` — `CreateTable`/`AlterTable` carry the
+/// inheritance parent links (`inherits`). Old `RGSWAL15` files are
+/// refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL16";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -307,6 +319,9 @@ pub enum WalRecord {
         /// v0.85: domain applies to array elements (`domain_elem`); empty
         /// on old records.
         domain_elem: Vec<bool>,
+        /// v0.96: inheritance parent links (`inherits`); empty on old
+        /// records.
+        inherits: Vec<String>,
         xmin: u64,
     },
     InsertRows {
@@ -395,6 +410,9 @@ pub enum WalRecord {
         /// v0.85: domain applies to array elements (`domain_elem`); empty
         /// on old records.
         domain_elem: Vec<bool>,
+        /// v0.96: inheritance parent links (`inherits`); empty on old
+        /// records.
+        inherits: Vec<String>,
         next_value_id: u32,
         /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
@@ -1362,6 +1380,7 @@ impl Enc {
                 composite_types,
                 domain_types,
                 domain_elem,
+                inherits,
                 xmin,
             } => {
                 self.u8(1);
@@ -1382,6 +1401,8 @@ impl Enc {
                 self.opt_str_list(composite_types);
                 self.opt_str_list(domain_types);
                 self.bool_list(domain_elem);
+                // v0.96: inheritance parent links.
+                self.str_list(inherits);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -1502,6 +1523,7 @@ impl Enc {
                 composite_types,
                 domain_types,
                 domain_elem,
+                inherits,
                 next_value_id,
                 toast_info,
                 xmin,
@@ -1531,6 +1553,8 @@ impl Enc {
                 self.opt_str_list(composite_types);
                 self.opt_str_list(domain_types);
                 self.bool_list(domain_elem);
+                // v0.96: inheritance parent links.
+                self.str_list(inherits);
                 self.u32(*next_value_id);
                 self.u32(toast_info.len() as u32);
                 for (k, c) in toast_info {
@@ -1833,6 +1857,14 @@ impl Enc {
         self.u32(v.len() as u32);
         for b in v {
             self.u8(if *b { 1 } else { 0 });
+        }
+    }
+
+    /// v0.96: encode a `Vec<String>` (inheritance parent links).
+    fn str_list(&mut self, v: &[String]) {
+        self.u32(v.len() as u32);
+        for s in v {
+            self.str(s);
         }
     }
 
@@ -2243,6 +2275,8 @@ impl<'a> Dec<'a> {
                 let composite_types = self.opt_str_list_d()?;
                 let domain_types = self.opt_str_list_d()?;
                 let domain_elem = self.bool_list_d()?;
+                // v0.96: inheritance parent links.
+                let inherits = self.str_list_d()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -2257,6 +2291,7 @@ impl<'a> Dec<'a> {
                     composite_types,
                     domain_types,
                     domain_elem,
+                    inherits,
                     xmin,
                 })
             }
@@ -2382,6 +2417,8 @@ impl<'a> Dec<'a> {
                 let composite_types = self.opt_str_list_d()?;
                 let domain_types = self.opt_str_list_d()?;
                 let domain_elem = self.bool_list_d()?;
+                // v0.96: inheritance parent links.
+                let inherits = self.str_list_d()?;
                 let next_value_id = self.u32()?;
                 let n_ti = self.u32()? as usize;
                 let mut toast_info = Vec::with_capacity(n_ti);
@@ -2405,6 +2442,7 @@ impl<'a> Dec<'a> {
                     composite_types,
                     domain_types,
                     domain_elem,
+                    inherits,
                     next_value_id,
                     toast_info,
                     xmin,
@@ -2768,6 +2806,16 @@ impl<'a> Dec<'a> {
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(self.u8()? != 0);
+        }
+        Ok(out)
+    }
+
+    /// v0.96: decode a `Vec<String>` (inheritance parent links).
+    fn str_list_d(&mut self) -> Result<Vec<String>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.str()?);
         }
         Ok(out)
     }
@@ -3211,6 +3259,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             composite_types,
             domain_types,
             domain_elem,
+            inherits,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
@@ -3221,6 +3270,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // v0.37: restore the table OID and its toast table link.
             t.oid = *oid;
             t.toast_relid = *toast_relid;
+            // v0.96: restore inheritance parent links.
+            t.inherits = inherits.clone();
             // v0.85: restore composite/domain type use (empty vecs on old
             // records mean "no domain use").
             t.composite_types = composite_types.clone();
@@ -3493,6 +3544,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             composite_types,
             domain_types,
             domain_elem,
+            inherits,
             next_value_id,
             toast_info,
             xmin,
@@ -3547,6 +3599,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             t.composite_types = composite_types.clone();
             t.domain_types = domain_types.clone();
             t.domain_elem = domain_elem.clone();
+            // v0.96: restore inheritance parent links.
+            t.inherits = inherits.clone();
             // v0.41: per-column compression methods (0 = default).
             t.col_compression = col_compression
                 .iter()
@@ -3911,6 +3965,8 @@ pub fn records_for_commit(
                     composite_types: ours.composite_types.clone(),
                     domain_types: ours.domain_types.clone(),
                     domain_elem: ours.domain_elem.clone(),
+                    // v0.96: inheritance parent links.
+                    inherits: ours.inherits.clone(),
                     xmin: own,
                 });
             }
@@ -3951,6 +4007,8 @@ pub fn records_for_commit(
                     composite_types: ours.composite_types.clone(),
                     domain_types: ours.domain_types.clone(),
                     domain_elem: ours.domain_elem.clone(),
+                    // v0.96: inheritance parent links.
+                    inherits: ours.inherits.clone(),
                     next_value_id: ours.next_value_id,
                     toast_info: ours
                         .toast_info
@@ -4811,6 +4869,8 @@ impl Wal {
                 } else {
                     body.u8(0);
                 }
+                // v0.96: inheritance parent links.
+                body.str_list(&t.inherits);
                 n_versions += 1;
             }
         }
@@ -5463,6 +5523,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 is_partitioned,
             });
         }
+        // v0.96: inheritance parent links (format version 16).
+        __t.inherits = d.str_list_d().map_err(|e| bad(&e))?;
         eng.db.tables.entry(name).or_default().push(__t);
     }
     // v0.8: index definitions, then rebuild entries from the decoded
@@ -5943,6 +6005,7 @@ mod tests {
                 composite_types: vec![None],
                 domain_types: vec![None],
                 domain_elem: vec![false],
+                inherits: vec![],
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -6032,6 +6095,53 @@ mod tests {
         for c in &cases {
             assert_eq!(&roundtrip(c), c);
         }
+    }
+
+    #[test]
+    fn v96_create_table_inherits_roundtrip() {
+        // v0.96: the `inherits` parent links survive WAL encode/decode
+        // on both CreateTable and AlterTable records.
+        let empty_constraints =
+            "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+        let create = WalRecord::CreateTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints.clone(),
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec!["p1".to_string(), "p2".to_string()],
+            xmin: 3,
+        };
+        assert_eq!(&roundtrip(&create), &create);
+        let alter = WalRecord::AlterTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints,
+            copy_rows: true,
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            toast_target: 0,
+            col_storage: vec![0],
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec!["p1".to_string()],
+            next_value_id: 1,
+            toast_info: vec![],
+            xmin: 4,
+        };
+        assert_eq!(&roundtrip(&alter), &alter);
     }
 
     #[test]
@@ -6158,6 +6268,7 @@ mod tests {
                 composite_types: vec![None],
                 domain_types: vec![None],
                 domain_elem: vec![false],
+                inherits: vec![],
                 xmin: 4,
             },
         )

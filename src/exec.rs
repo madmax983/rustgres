@@ -1488,6 +1488,197 @@ fn attach_partition(
     })
 }
 
+/// v0.96: `ALTER TABLE child INHERIT parent` / `NO INHERIT parent`
+/// (PG19 table inheritance). Only the link is created or dropped —
+/// columns are never added, removed, or reordered (PG19
+/// `MergeAttributesIntoExisting` / `RemoveInheritance`).
+fn alter_inherit(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    child_name: &str,
+    parent_name: &str,
+    link: bool,
+) -> Result<ExecResult, ExecError> {
+    // v0.11: every ALTER TABLE needs owner-or-superuser; PG requires
+    // ownership of the parent too (the child was checked in
+    // `exec_alter_one`).
+    require_table_owner(eng, ctx, parent_name)?;
+    let child = eng
+        .db
+        .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", child_name),
+            )
+        })?
+        .clone();
+    let parent = eng
+        .db
+        .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", parent_name),
+            )
+        })?
+        .clone();
+    // PG19 ATPrepChangeInherit: a partition (or partitioned table)
+    // cannot change inheritance, for INHERIT and NO INHERIT alike.
+    if child
+        .partition
+        .as_ref()
+        .is_some_and(|p| p.is_partitioned || p.parent.is_some())
+    {
+        return Err(exec_err(
+            "42809",
+            "cannot change inheritance of a partition".to_string(),
+        ));
+    }
+    let already = child.inherits.iter().any(|p| p == parent_name);
+    if link {
+        // Duplicate link (PG19 CreateInheritance).
+        if already {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "relation \"{}\" would be inherited from more than once",
+                    parent_name
+                ),
+            ));
+        }
+        // A table cannot inherit from itself (would duplicate every row
+        // in parent scans; PG's own checks don't catch this case).
+        if parent_name == child_name {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "cannot inherit from relation \"{}\" because it is the same relation",
+                    parent_name
+                ),
+            ));
+        }
+        // Circular inheritance (PG19 ATExecAddInherit): the parent must
+        // not already be a descendant of the child.
+        if eng
+            .db
+            .inheritance_descendants(child_name, ctx.snap, ctx.own, ctx.session)
+            .iter()
+            .any(|d| d == parent_name)
+        {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "circular inheritance not allowed: \"{}\" is already a child of \"{}\"",
+                    parent_name, child_name
+                ),
+            ));
+        }
+        // Persistence rules (PG19, 42809 WRONG_OBJECT_TYPE in both the
+        // CREATE and ALTER paths): a permanent table cannot inherit
+        // from a temporary one; a temp child may inherit from a
+        // permanent parent.
+        if !eng.db.is_temp_table(ctx.session, child_name)
+            && eng.db.is_temp_table(ctx.session, parent_name)
+        {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "cannot inherit from temporary relation \"{}\"",
+                    parent_name
+                ),
+            ));
+        }
+        // Partitioned tables cannot be inherited from (PG19
+        // ATExecAddInherit, 42809).
+        if parent.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "cannot inherit from partitioned table \"{}\"",
+                    parent_name
+                ),
+            ));
+        }
+        if parent.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
+            return Err(exec_err(
+                "42809",
+                "cannot inherit from a partition".to_string(),
+            ));
+        }
+        // Column compatibility (PG19 MergeAttributesIntoExisting,
+        // 42804): every parent column must already exist in the child
+        // with exactly the same type (typmod included), and a parent
+        // NOT NULL column must be NOT NULL in the child.
+        for (pi, (pname, ptype)) in parent.columns.iter().enumerate() {
+            let (ci, (_, ctype)) = child
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, (n, _))| n == pname)
+                .ok_or_else(|| {
+                    exec_err(
+                        "42804",
+                        format!("child table is missing column \"{}\"", pname),
+                    )
+                })?;
+            let same_type = ctype == ptype
+                && child.composite_types.get(ci) == parent.composite_types.get(pi)
+                && child.domain_types.get(ci) == parent.domain_types.get(pi)
+                && child.domain_elem.get(ci) == parent.domain_elem.get(pi);
+            if !same_type {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "child table \"{}\" has different type for column \"{}\"",
+                        child_name, pname
+                    ),
+                ));
+            }
+            if parent.not_null.get(pi) == Some(&true) && child.not_null.get(ci) != Some(&true) {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                        pname, child_name
+                    ),
+                ));
+            }
+        }
+        let prev = child.clone();
+        let mut next = child;
+        next.inherits.push(parent_name.to_string());
+        if eng.db.is_temp_table(ctx.session, child_name) {
+            alter_swap_temp(eng, ctx, child_name, None, next, None)?;
+        } else {
+            commit_table_version(eng, ctx, child_name, prev, next);
+        }
+    } else {
+        // NO INHERIT: dropping a link that isn't there is 42P01, like
+        // PostgreSQL's RemoveInheritance.
+        if !already {
+            return Err(exec_err(
+                "42P01",
+                format!(
+                    "relation \"{}\" is not a parent of relation \"{}\"",
+                    parent_name, child_name
+                ),
+            ));
+        }
+        let prev = child.clone();
+        let mut next = child;
+        next.inherits.retain(|p| p != parent_name);
+        if eng.db.is_temp_table(ctx.session, child_name) {
+            alter_swap_temp(eng, ctx, child_name, None, next, None)?;
+        } else {
+            commit_table_version(eng, ctx, child_name, prev, next);
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
 /// v0.69: remap a row from child column order to parent column order.
 fn remap_row_to_parent(
     child_cols: &[(String, ColType)],
@@ -2202,16 +2393,41 @@ fn create_table_from_def(
     // v0.72: validate the recognized `WITH (...)` storage parameters
     // (PG19 reloptions.c); unrecognized ones are accepted and ignored.
     validate_reloptions(&like_def.reloptions)?;
-    // v0.77: expand `INHERITS (parent [, ...])` (PG19
-    // transformInhRelation, column part): the child gets each parent's
-    // columns first (in parent order), then its own. Unlike PARTITION
+    // v0.77/v0.96: expand `INHERITS (parent [, ...])` (PG19
+    // DefineRelation + MergeAttributes): the child gets each parent's
+    // columns first (in parent order), then its own; same-name columns
+    // merge only on exact type compatibility (42804). Unlike PARTITION
     // OF, constraints are not inherited — only the columns with their
     // NOT NULL flags, defaults, and CHECK constraints. Parent scans
-    // including children's rows are not yet implemented.
+    // including children's rows are implemented in scan_table_from.
     if !like_def.inherits.is_empty() {
         let mut merged = TableDef::empty();
         merged.inherits = like_def.inherits.clone();
+        let mut seen_parents: Vec<String> = Vec::new();
+        // v0.96: columns whose inherited defaults conflict across
+        // parents; the child must specify its own default for each
+        // (PG19 MergeAttributes, 42804).
+        let mut conflicting_defaults: Vec<String> = Vec::new();
         for parent_name in &like_def.inherits {
+            // Reject duplications in the list of parents (PG19
+            // DefineRelation, 42P16).
+            if seen_parents.iter().any(|p| p == parent_name) {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "relation \"{}\" would be inherited from more than once",
+                        parent_name
+                    ),
+                ));
+            }
+            // The child does not exist yet, so naming it as its own
+            // parent is an undefined table (PG19).
+            if parent_name == name {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", parent_name),
+                ));
+            }
             let parent = eng
                 .db
                 .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
@@ -2221,8 +2437,72 @@ fn create_table_from_def(
                         format!("relation \"{}\" does not exist", parent_name),
                     )
                 })?;
+            seen_parents.push(parent_name.clone());
+            // Permanent tables cannot inherit from temporary parents
+            // (PG19, 42809); a temp child may inherit from a permanent
+            // parent.
+            if !temp && eng.db.is_temp_table(ctx.session, parent_name) {
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "cannot inherit from temporary relation \"{}\"",
+                        parent_name
+                    ),
+                ));
+            }
+            // Partitioned tables and partitions cannot participate in
+            // regular inheritance (PG19 MergeAttributes, 42809).
+            if parent.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "cannot inherit from partitioned table \"{}\"",
+                        parent_name
+                    ),
+                ));
+            }
+            if parent.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
+                return Err(exec_err(
+                    "42809",
+                    "cannot inherit from a partition".to_string(),
+                ));
+            }
             for (i, (col, ty)) in parent.columns.iter().enumerate() {
-                if merged.columns.iter().any(|(n, _)| n == col) {
+                if let Some(pos) = merged.columns.iter().position(|(n, _)| n == col) {
+                    // Same column inherited from two parents: the types
+                    // must match exactly (PG19 MergeChildAttribute).
+                    let same = merged.columns[pos].1 == *ty
+                        && merged.composite_types[pos]
+                            == parent.composite_types.get(i).cloned().unwrap_or(None)
+                        && merged.domain_types[pos]
+                            == parent.domain_types.get(i).cloned().unwrap_or(None)
+                        && merged.domain_elem[pos]
+                            == parent.domain_elem.get(i).copied().unwrap_or(false);
+                    if !same {
+                        return Err(exec_err(
+                            "42804",
+                            format!("column \"{}\" has a type conflict", col),
+                        ));
+                    }
+                    // NOT NULL accumulates across parents.
+                    if parent.not_null.get(i).copied().unwrap_or(false) {
+                        merged.not_null[pos] = true;
+                    }
+                    // v0.96: conflicting inherited defaults are rejected
+                    // unless the child specifies its own default (PG19
+                    // MergeAttributes, 42804).
+                    let parent_def = parent.defaults.get(i).and_then(|d| d.clone());
+                    match (&merged.defaults[pos], &parent_def) {
+                        (Some(a), Some(b)) if a != b => {
+                            if !conflicting_defaults.contains(col) {
+                                conflicting_defaults.push(col.clone());
+                            }
+                        }
+                        (None, Some(_)) => {
+                            merged.defaults[pos] = parent_def;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 merged.columns.push((col.clone(), ty.clone()));
@@ -2249,48 +2529,78 @@ fn create_table_from_def(
             merged.checks.extend(parent.checks.iter().cloned());
         }
         // The child's own columns; a child column with the same name as
-        // an inherited one keeps the inherited position (PG merges them).
+        // an inherited one merges into the inherited position (PG19
+        // MergeChildAttribute) and is then consumed.
+        let mut local_merged = vec![false; like_def.columns.len()];
         for (i, (col, ty)) in like_def.columns.iter().enumerate() {
-            if let Some(pos) = merged.columns.iter().position(|(n, _)| n == col) {
-                merged.columns[pos] = (col.clone(), ty.clone());
-                merged.composite_types[pos] =
-                    like_def.composite_types.get(i).cloned().unwrap_or(None);
-                merged.domain_types[pos] = like_def.domain_types.get(i).cloned().unwrap_or(None);
-                merged.domain_elem[pos] = like_def.domain_elem.get(i).copied().unwrap_or(false);
-                merged.not_null[pos] = like_def.not_null.get(i).copied().unwrap_or(false);
-                merged.defaults[pos] = like_def.defaults.get(i).cloned().unwrap_or(None);
-                merged.serial[pos] = like_def.serial.get(i).cloned().unwrap_or(None);
-                merged.compression[pos] = like_def.compression.get(i).cloned().unwrap_or(None);
-                merged.storage[pos] = like_def.storage.get(i).cloned().unwrap_or(None);
-            } else {
-                merged.columns.push((col.clone(), ty.clone()));
-                // v0.81: composite type name for the new column.
-                merged
-                    .composite_types
-                    .push(like_def.composite_types.get(i).cloned().unwrap_or(None));
-                // v0.85: domain type use for the new column.
-                merged
-                    .domain_types
-                    .push(like_def.domain_types.get(i).cloned().unwrap_or(None));
-                merged
-                    .domain_elem
-                    .push(like_def.domain_elem.get(i).copied().unwrap_or(false));
-                merged
-                    .not_null
-                    .push(like_def.not_null.get(i).copied().unwrap_or(false));
-                merged
-                    .defaults
-                    .push(like_def.defaults.get(i).cloned().unwrap_or(None));
-                merged
-                    .serial
-                    .push(like_def.serial.get(i).cloned().unwrap_or(None));
-                merged
-                    .compression
-                    .push(like_def.compression.get(i).cloned().unwrap_or(None));
-                merged
-                    .storage
-                    .push(like_def.storage.get(i).cloned().unwrap_or(None));
+            let Some(pos) = merged.columns.iter().position(|(n, _)| n == col) else {
+                continue;
+            };
+            // The local definition must have exactly the same type
+            // (PG19 MergeChildAttribute, 42804).
+            let same = merged.columns[pos].1 == *ty
+                && merged.composite_types[pos]
+                    == like_def.composite_types.get(i).cloned().unwrap_or(None)
+                && merged.domain_types[pos]
+                    == like_def.domain_types.get(i).cloned().unwrap_or(None)
+                && merged.domain_elem[pos]
+                    == like_def.domain_elem.get(i).copied().unwrap_or(false);
+            if !same {
+                return Err(exec_err(
+                    "42804",
+                    format!("column \"{}\" has a type conflict", col),
+                ));
             }
+            // The local column refines the inherited slot: NOT NULL
+            // accumulates, and local default/serial/storage settings win.
+            if like_def.not_null.get(i).copied().unwrap_or(false) {
+                merged.not_null[pos] = true;
+            }
+            if let Some(d) = like_def.defaults.get(i).and_then(|d| d.clone()) {
+                merged.defaults[pos] = Some(d);
+            }
+            if let Some(s) = like_def.serial.get(i).and_then(|s| s.clone()) {
+                merged.serial[pos] = Some(s);
+            }
+            if let Some(c) = like_def.compression.get(i).and_then(|c| c.clone()) {
+                merged.compression[pos] = Some(c);
+            }
+            if let Some(s) = like_def.storage.get(i).and_then(|s| s.clone()) {
+                merged.storage[pos] = Some(s);
+            }
+            local_merged[i] = true;
+        }
+        for (i, (col, ty)) in like_def.columns.iter().enumerate() {
+            if local_merged[i] {
+                continue;
+            }
+            merged.columns.push((col.clone(), ty.clone()));
+            // v0.81: composite type name for the new column.
+            merged
+                .composite_types
+                .push(like_def.composite_types.get(i).cloned().unwrap_or(None));
+            // v0.85: domain type use for the new column.
+            merged
+                .domain_types
+                .push(like_def.domain_types.get(i).cloned().unwrap_or(None));
+            merged
+                .domain_elem
+                .push(like_def.domain_elem.get(i).copied().unwrap_or(false));
+            merged
+                .not_null
+                .push(like_def.not_null.get(i).copied().unwrap_or(false));
+            merged
+                .defaults
+                .push(like_def.defaults.get(i).cloned().unwrap_or(None));
+            merged
+                .serial
+                .push(like_def.serial.get(i).cloned().unwrap_or(None));
+            merged
+                .compression
+                .push(like_def.compression.get(i).cloned().unwrap_or(None));
+            merged
+                .storage
+                .push(like_def.storage.get(i).cloned().unwrap_or(None));
         }
         merged.checks.extend(like_def.checks.iter().cloned());
         merged.uniques = like_def.uniques.clone();
@@ -2299,6 +2609,55 @@ fn create_table_from_def(
         merged.partition = like_def.partition.clone();
         merged.likes = like_def.likes.clone();
         merged.reloptions = like_def.reloptions.clone();
+        // v0.96: conflicting inherited defaults must be resolved by an
+        // explicit child default (PG19 MergeAttributes, 42804).
+        for col in &conflicting_defaults {
+            let overridden = like_def
+                .columns
+                .iter()
+                .zip(like_def.defaults.iter())
+                .any(|((n, _), d)| n == col && d.is_some());
+            if !overridden {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "column \"{}\" inherits conflicting defaults; to resolve the conflict, specify a default explicitly",
+                        col
+                    ),
+                ));
+            }
+        }
+        // v0.96: with `INHERITS`, table-level constraints were allowed
+        // to name columns the parser hadn't seen yet (they may come
+        // from the parents). Validate them against the merged column
+        // list now, and apply the implied NOT NULL markings.
+        let col_pos = |c: &str| {
+            merged
+                .columns
+                .iter()
+                .position(|(n, _)| n == c)
+                .ok_or_else(|| exec_err("42703", format!("column \"{}\" does not exist", c)))
+        };
+        for c in &like_def.deferred_not_null {
+            let i = col_pos(c)?;
+            merged.not_null[i] = true;
+        }
+        if let Some(pk) = &merged.pkey {
+            for c in &pk.cols {
+                let i = col_pos(c)?;
+                merged.not_null[i] = true;
+            }
+        }
+        for u in &merged.uniques {
+            for c in &u.cols {
+                col_pos(c)?;
+            }
+        }
+        for fk in &merged.fks {
+            for c in &fk.cols {
+                col_pos(c)?;
+            }
+        }
         like_def = merged;
     }
     let def = &like_def;
@@ -2366,6 +2725,9 @@ fn create_table_from_def(
         }
         let mut t = Table::with_def(&def, ctx.own);
         t.partition = temp_pinfo;
+        // v0.96: temp tables get real OIDs too (PG assigns OIDs to temp
+        // tables; pg_inherits/pg_class expose them).
+        t.oid = eng.db.alloc_oid();
         // v0.11: the creating role owns the table.
         t.owner = ctx.role.to_string();
         // v0.41: validate each column's COMPRESSION option (PG19
@@ -4787,6 +5149,7 @@ fn exec_create_table_as(
         likes: Vec::new(),
         reloptions: Vec::new(),
         inherits: Vec::new(),
+        deferred_not_null: Vec::new(),
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -9568,6 +9931,68 @@ fn pg_attribute_scan(
                 cells: Row::new(vec![
                     Value::Int(t.oid as i64),
                     Value::text(col_name.as_str()),
+                    Value::Int((i + 1) as i64),
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
+}
+// ---------------------------------------------------------------------------
+// v0.96: pg_inherits (virtual). A real table by the same name takes
+// precedence, like pg_class. Exposes inhrelid (child table OID),
+// inhparent (parent table OID), and inhseqno (1-based position of the
+// parent link in the child's INHERITS list) — the PostgreSQL 19
+// inheritance catalog. Covers both permanent tables and the current
+// session's temp tables, like the real catalog.
+// ---------------------------------------------------------------------------
+
+fn pg_inherits_schema() -> Vec<QCol> {
+    vec![
+        qcol("pg_inherits", "inhrelid", ColType::Int),
+        qcol("pg_inherits", "inhparent", ColType::Int),
+        qcol("pg_inherits", "inhseqno", ColType::Int),
+    ]
+}
+
+fn pg_inherits_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_inherits_schema();
+    let mut rows = Vec::new();
+    // Permanent tables, then this session's temp tables, each in name
+    // order for deterministic output.
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tnames: Vec<&String> = tmps.keys().collect();
+        tnames.sort();
+        names.extend(tnames);
+    }
+    for name in names {
+        let Some(t) = db.find_table(name, snap, own, session) else {
+            continue;
+        };
+        if t.inherits.is_empty() {
+            continue;
+        }
+        let child_oid = t.oid as i64;
+        for (i, parent_name) in t.inherits.iter().enumerate() {
+            // The parent is always visible when the child is (a
+            // permanent child cannot inherit from a temp parent, and a
+            // temp parent lives in this session).
+            let parent_oid = db
+                .find_table(parent_name, snap, own, session)
+                .map(|p| p.oid as i64)
+                .unwrap_or(0);
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int(child_oid),
+                    Value::Int(parent_oid),
                     Value::Int((i + 1) as i64),
                 ]),
                 prov: Vec::new(),
@@ -15598,6 +16023,7 @@ fn build_source(
             name,
             alias,
             col_aliases,
+            only,
         } => {
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             // v0.23: positional column aliases, with PostgreSQL's arity
@@ -15744,6 +16170,23 @@ fn build_source(
                 let (_, rows) = pg_attribute_scan(&q.eng.db, q.snap, q.own, q.session);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v0.96: pg_inherits is virtual too (inheritance catalog).
+            if name == "pg_inherits"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, q.own, q.session)
+                    .is_none()
+            {
+                let schema: Vec<QCol> = pg_inherits_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_inherits_scan(&q.eng.db, q.snap, q.own, q.session);
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -15842,6 +16285,18 @@ fn build_source(
                     .as_ref()
                     .map(|p| !p.children.is_empty())
                     .unwrap_or(false);
+                // v0.96: table inheritance — a plain `FROM t` scans t plus
+                // all recursive inheritance descendants (PG's Append
+                // plan); `FROM ONLY t` scans just t. Inheritance and
+                // partitioning are mutually exclusive, so at most one of
+                // these expansions applies.
+                let inherit_children: Vec<String> = if *only || is_partitioned_parent {
+                    Vec::new()
+                } else {
+                    q.eng
+                        .db
+                        .inheritance_descendants(name, q.snap, q.own, q.session)
+                };
                 let parent_cols: Vec<(String, ColType)> = t.columns.clone();
                 let schema: Vec<QCol> = t
                     .columns
@@ -15892,6 +16347,47 @@ fn build_source(
                                 cells: Row::new(cells),
                                 prov: if need_prov || prov_for_overlay {
                                     vec![(leaf_name.clone(), r.id)]
+                                } else {
+                                    Vec::new()
+                                },
+                            });
+                        }
+                    }
+                    all_rows
+                } else if !inherit_children.is_empty() {
+                    // v0.96: inheritance expansion — the parent's own rows
+                    // first, then each descendant in DFS order, remapped
+                    // to the parent's column order. Provenance keeps the
+                    // actual child table (like partitions keep the leaf).
+                    // Index fast paths are disabled: the scan is an
+                    // append across tables.
+                    let mut all_rows = Vec::new();
+                    let mut tables: Vec<&str> = vec![name.as_str()];
+                    tables.extend(inherit_children.iter().map(|s| s.as_str()));
+                    for tname in tables {
+                        let ct = db
+                            .find_table(tname, snap, own, q.session)
+                            .expect("inheritance child still visible");
+                        let child_cols = ct.columns.clone();
+                        for r in ct.rows.iter().filter(|r| row_visible(r, snap, own)) {
+                            let cells: Vec<Value> = if tname == name.as_str() {
+                                r.values.iter().cloned().collect()
+                            } else {
+                                parent_cols
+                                    .iter()
+                                    .map(|(pn, _)| {
+                                        child_cols
+                                            .iter()
+                                            .position(|(ln, _)| ln == pn)
+                                            .map(|i| r.values[i].clone())
+                                            .unwrap_or(Value::Null)
+                                    })
+                                    .collect()
+                            };
+                            all_rows.push(QRow {
+                                cells: Row::new(cells),
+                                prov: if need_prov || prov_for_overlay {
+                                    vec![(tname.to_string(), r.id)]
                                 } else {
                                     Vec::new()
                                 },
@@ -20699,6 +21195,7 @@ fn match_hashable_exists(sub: &SelectStmt) -> Option<HashableExists<'_>> {
         name,
         alias,
         col_aliases,
+        ..
     } = from
     else {
         return None;
@@ -20911,6 +21408,7 @@ fn match_hashable_in(sub: &SelectStmt) -> Option<(&str, &str)> {
         name,
         alias,
         col_aliases,
+        ..
     } = from
     else {
         return None;
@@ -31669,6 +32167,7 @@ fn from_schema_item(
             name,
             alias,
             col_aliases,
+            ..
         } => {
             // v0.23: `FROM tbl [AS] x (a, b, c)` — positional column
             // renames, applied on every describe sub-path (the executor
@@ -31817,6 +32316,19 @@ fn from_schema_item(
             if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_attribute_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v0.96: pg_inherits is virtual too (inheritance catalog).
+            if name == "pg_inherits" && eng.db.find_table(name, snap, own, session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_inherits_schema()
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();
@@ -38203,8 +38715,9 @@ mod tests {
     #[test]
     fn v77_create_table_inherits_copies_columns() {
         // v0.77: `CREATE TABLE ... INHERITS (parent)` copies the
-        // parent's columns so the child is usable. Parent scans do
-        // not yet include children's rows.
+        // parent's columns so the child is usable.
+        // v0.96: parent scans now include children's rows (PG19); ONLY
+        // restricts the scan to the parent.
         let mut eng = engine();
         run(&mut eng, "CREATE TEMP TABLE inh_p (a int, b int)").unwrap();
         run(&mut eng, "INSERT INTO inh_p VALUES (1, 10)").unwrap();
@@ -38212,12 +38725,214 @@ mod tests {
         run(&mut eng, "INSERT INTO inh_c VALUES (2, 20)").unwrap();
         let child = rows_of(run(&mut eng, "SELECT * FROM inh_c").unwrap());
         assert_eq!(child, vec![vec!["2".to_string(), "20".to_string()]]);
-        // Parent scan does not (yet) include the child's row.
+        // Parent scan includes the child's row (v0.96).
         let parent = rows_of(run(&mut eng, "SELECT * FROM inh_p").unwrap());
-        assert_eq!(parent, vec![vec!["1".to_string(), "10".to_string()]]);
+        assert_eq!(
+            parent,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "20".to_string()]
+            ]
+        );
+        // ONLY restricts the scan to the parent's own rows.
+        let only = rows_of(run(&mut eng, "SELECT * FROM ONLY inh_p").unwrap());
+        assert_eq!(only, vec![vec!["1".to_string(), "10".to_string()]]);
         // Unknown parent is 42P01.
         let err = run(&mut eng, "CREATE TEMP TABLE inh_x () INHERITS (nope)").unwrap_err();
         assert_eq!(err.code, "42P01");
+    }
+
+    #[test]
+    fn v96_alter_table_inherit_no_inherit() {
+        // v0.96: `ALTER TABLE ... INHERIT / NO INHERIT` (PG19). INHERIT
+        // never adds or reorders columns; NO INHERIT removes only the
+        // link, keeping columns and data.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE ai_p (a text, b text)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE ai_c (b text, a text)").unwrap();
+        run(&mut eng, "ALTER TABLE ai_c INHERIT ai_p").unwrap();
+        run(&mut eng, "INSERT INTO ai_c VALUES ('v', 'w')").unwrap();
+        // Parent scan sees the child row, remapped to parent order.
+        let rows = rows_of(run(&mut eng, "SELECT a, b FROM ai_p").unwrap());
+        assert_eq!(rows, vec![vec!["w".to_string(), "v".to_string()]]);
+        // NO INHERIT drops the link; data and columns stay.
+        run(&mut eng, "ALTER TABLE ai_c NO INHERIT ai_p").unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT a, b FROM ai_p").unwrap());
+        assert!(rows.is_empty());
+        let rows = rows_of(run(&mut eng, "SELECT b, a FROM ai_c").unwrap());
+        assert_eq!(rows, vec![vec!["v".to_string(), "w".to_string()]]);
+        // Removing a non-link is 42P01.
+        let err = run(&mut eng, "ALTER TABLE ai_c NO INHERIT ai_p").unwrap_err();
+        assert_eq!(err.code, "42P01");
+        // Re-adding the link works.
+        run(&mut eng, "ALTER TABLE ai_c INHERIT ai_p").unwrap();
+        // Duplicate link is 42P16.
+        let err = run(&mut eng, "ALTER TABLE ai_c INHERIT ai_p").unwrap_err();
+        assert_eq!(err.code, "42P16");
+    }
+
+    #[test]
+    fn v96_inherit_compatibility_errors() {
+        // v0.96: ALTER INHERIT compatibility checks (PG19, 42804).
+        let mut eng = engine();
+        // Missing column.
+        run(&mut eng, "CREATE TEMP TABLE ic_p (a int, b int)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE ic_miss (a int)").unwrap();
+        let err = run(&mut eng, "ALTER TABLE ic_miss INHERIT ic_p").unwrap_err();
+        assert_eq!(err.code, "42804");
+        // Type conflict.
+        run(&mut eng, "CREATE TEMP TABLE ic_type (a text, b int)").unwrap();
+        let err = run(&mut eng, "ALTER TABLE ic_type INHERIT ic_p").unwrap_err();
+        assert_eq!(err.code, "42804");
+        // Parent NOT NULL requires child NOT NULL.
+        run(&mut eng, "CREATE TEMP TABLE ic_nnp (a int NOT NULL, b int)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE ic_nnc (a int, b int)").unwrap();
+        let err = run(&mut eng, "ALTER TABLE ic_nnc INHERIT ic_nnp").unwrap_err();
+        assert_eq!(err.code, "42804");
+        // Child NOT NULL is fine.
+        run(&mut eng, "CREATE TEMP TABLE ic_nnc2 (a int NOT NULL, b int)").unwrap();
+        run(&mut eng, "ALTER TABLE ic_nnc2 INHERIT ic_nnp").unwrap();
+        // Self-inheritance is 42P16.
+        let err = run(&mut eng, "ALTER TABLE ic_p INHERIT ic_p").unwrap_err();
+        assert_eq!(err.code, "42P16");
+        // Circular inheritance is 42P16.
+        run(&mut eng, "CREATE TEMP TABLE ic_a (a int, b int)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE ic_b (a int, b int)").unwrap();
+        run(&mut eng, "ALTER TABLE ic_b INHERIT ic_a").unwrap();
+        let err = run(&mut eng, "ALTER TABLE ic_a INHERIT ic_b").unwrap_err();
+        assert_eq!(err.code, "42P16");
+        // Missing parent is 42P01.
+        let err = run(&mut eng, "ALTER TABLE ic_a INHERIT nope").unwrap_err();
+        assert_eq!(err.code, "42P01");
+    }
+
+    #[test]
+    fn v96_inherit_multiple_parents_and_defaults() {
+        // v0.96: multiple parents merge by column name; conflicting
+        // inherited defaults are 42804 unless the child overrides.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE mp1 (a int, b text)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE mp2 (b text, c int)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE mpc (d text) INHERITS (mp1, mp2)").unwrap();
+        run(&mut eng, "INSERT INTO mpc VALUES (1, 'x', 2, 'y')").unwrap();
+        // The child has all four columns in merge order.
+        let rows = rows_of(run(&mut eng, "SELECT a, b, c, d FROM mpc").unwrap());
+        assert_eq!(
+            rows,
+            vec![vec![
+                "1".to_string(),
+                "x".to_string(),
+                "2".to_string(),
+                "y".to_string()
+            ]]
+        );
+        // Each parent scan sees the child row remapped to its own columns.
+        let rows = rows_of(run(&mut eng, "SELECT a, b FROM mp1").unwrap());
+        assert_eq!(
+            rows,
+            vec![vec!["1".to_string(), "x".to_string()]]
+        );
+        let rows = rows_of(run(&mut eng, "SELECT b, c FROM mp2").unwrap());
+        assert_eq!(
+            rows,
+            vec![vec!["x".to_string(), "2".to_string()]]
+        );
+        // Duplicate parent in one list is 42P16.
+        let err = run(
+            &mut eng,
+            "CREATE TEMP TABLE mpd (z int) INHERITS (mp1, mp1)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42P16");
+        // Conflicting defaults.
+        run(&mut eng, "CREATE TEMP TABLE md1 (a int DEFAULT 1)").unwrap();
+        run(&mut eng, "CREATE TEMP TABLE md2 (a int DEFAULT 2)").unwrap();
+        let err = run(
+            &mut eng,
+            "CREATE TEMP TABLE mdc (z int) INHERITS (md1, md2)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42804");
+        // Explicit child default resolves the conflict.
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE mdok (z int, a int DEFAULT 5) INHERITS (md1, md2)",
+        )
+        .unwrap();
+        // Identical defaults merge silently.
+        run(&mut eng, "CREATE TEMP TABLE md3 (a int DEFAULT 1)").unwrap();
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE mdsame (z int) INHERITS (md1, md3)",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v96_inherit_recursive_scan_and_temp_rules() {
+        // v0.96: scans recurse through grandchildren; temp/permanent
+        // inheritance follows PG's rules.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rp (a int)").unwrap();
+        run(&mut eng, "CREATE TABLE rc (b int) INHERITS (rp)").unwrap();
+        run(&mut eng, "CREATE TABLE rg (c int) INHERITS (rc)").unwrap();
+        run(&mut eng, "INSERT INTO rp VALUES (1)").unwrap();
+        run(&mut eng, "INSERT INTO rc VALUES (2, 20)").unwrap();
+        run(&mut eng, "INSERT INTO rg VALUES (3, 30, 300)").unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT a FROM rp ORDER BY a").unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let rows = rows_of(run(&mut eng, "SELECT a FROM ONLY rp ORDER BY a").unwrap());
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+        // pg_inherits exposes both links.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT inhseqno FROM pg_inherits ORDER BY inhrelid, inhseqno",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+        // Permanent child of a temp parent is 42809.
+        run(&mut eng, "CREATE TEMP TABLE rt_p (a int)").unwrap();
+        let err = run(
+            &mut eng,
+            "CREATE TABLE rt_c (z int) INHERITS (rt_p)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42809");
+        // Temp child of a permanent parent is fine.
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE rt_c2 (z int) INHERITS (rp)",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT a FROM rp ORDER BY a").unwrap());
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn v96_inherit_constraint_only_create() {
+        // v0.96: a constraint-only definition with INHERITS (the
+        // conformance union.sql shape) inherits every parent column.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE co_p (ab text primary key)").unwrap();
+        run(
+            &mut eng,
+            "CREATE TEMP TABLE co_c (primary key (ab)) INHERITS (co_p)",
+        )
+        .unwrap();
+        run(&mut eng, "INSERT INTO co_c VALUES ('xy')").unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT ab FROM co_p").unwrap());
+        assert_eq!(rows, vec![vec!["xy".to_string()]]);
+        let rows = rows_of(run(&mut eng, "SELECT ab FROM ONLY co_p").unwrap());
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -41716,6 +42431,9 @@ fn exec_alter_one(
         AlterAction::AttachPartition { child, bound } => {
             attach_partition(eng, ctx, name, child, bound)
         }
+        // v0.96: table inheritance (PG19).
+        AlterAction::Inherit { parent } => alter_inherit(eng, ctx, name, parent, true),
+        AlterAction::NoInherit { parent } => alter_inherit(eng, ctx, name, parent, false),
     }
 }
 

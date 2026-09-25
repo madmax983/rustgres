@@ -4837,6 +4837,11 @@ pub struct Table {
     pub next_value_id: u32,
     /// v0.69: declarative partitioning metadata (`None` = not partitioned).
     pub partition: Option<PartitionInfo>,
+    /// v0.96: table inheritance parents (PG19 `pg_inherits`), in link
+    /// order. Names are relation names as written at CREATE/ALTER time;
+    /// resolved against the visible catalog on each use. Empty = no
+    /// parents (ordinary table).
+    pub inherits: Vec<String>,
 }
 
 impl Table {
@@ -4879,6 +4884,8 @@ impl Table {
             next_value_id: 1,
             // v0.69: not partitioned by default.
             partition: None,
+            // v0.96: no inheritance parents by default.
+            inherits: Vec::new(),
         }
     }
 
@@ -4891,6 +4898,8 @@ impl Table {
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
         t.fks = def.fks.clone();
+        // v0.96: table inheritance links (pg_inherits equivalent).
+        t.inherits = def.inherits.clone();
         // v0.81: named composite types per column.
         t.composite_types = def.composite_types.clone();
         // v0.85: domain type use per column.
@@ -5390,6 +5399,60 @@ impl Database {
         self.temp_tables
             .get(&session)
             .is_some_and(|m| m.contains_key(name))
+    }
+
+    /// v0.96: all visible tables that inherit (directly or transitively)
+    /// from `parent`, in deterministic depth-first order (parent's own
+    /// name is never included). Cycle-safe: DDL rejects circular links,
+    /// but the visited set keeps a corrupt catalog from looping the
+    /// executor. Both permanent tables and this session's temp tables
+    /// are considered; other sessions' temp tables are invisible.
+    pub fn inheritance_descendants(
+        &self,
+        parent: &str,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> Vec<String> {
+        // Direct children of `name`, sorted for determinism.
+        fn direct(db: &Database, name: &str, snap: &Snapshot, own: u64, session: u64) -> Vec<String> {
+            let mut kids: Vec<String> = Vec::new();
+            let mut consider = |tname: &String, t: &Table| {
+                if t.inherits.iter().any(|p| p == name) && tname != name {
+                    kids.push(tname.clone());
+                }
+            };
+            for (tname, vs) in &db.tables {
+                if let Some(t) = vs.iter().find(|t| table_visible(t, snap, own)) {
+                    consider(tname, t);
+                }
+            }
+            if let Some(tmps) = db.temp_tables.get(&session) {
+                for (tname, t) in tmps {
+                    consider(tname, t);
+                }
+            }
+            kids.sort();
+            kids.dedup();
+            kids
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(parent.to_string());
+        let mut stack: Vec<String> = direct(self, parent, snap, own, session)
+            .into_iter()
+            .rev()
+            .collect();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            out.push(name.clone());
+            let mut kids = direct(self, &name, snap, own, session);
+            kids.reverse();
+            stack.extend(kids);
+        }
+        out
     }
 
     /// v0.22: is `row_id` held by any session's temp table? Row ids are
