@@ -128,10 +128,20 @@ class Conn:
                 return
 
     def q(self, sql):
-        """Returns dict(oids, colnames, rows, err_codes, tag)."""
+        """Returns dict(oids, colnames, rows, err_codes, tag, sets).
+
+        `sets` is the per-result-set breakdown of one simple Query:
+        a list of dict(oids, colnames, rows, err_codes, tag), one entry
+        per RowDescription/DataRow/CommandComplete group (an ErrorResponse
+        attaches to the set it terminates). The top-level keys keep
+        their historical aggregated meaning (rows concatenated, last
+        tag, all error codes) for single-statement callers.
+        """
         self.s.sendall(msg(b"Q", cstr(sql)))
-        oids, names, rows, codes = [], [], [], []
-        tag = ""
+        sets = []
+        cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": ""}
+        all_oids, all_names, all_rows, all_codes = [], [], [], []
+        all_tag = ""
         while True:
             t, p = self._read_msg()
             if t == b"T":
@@ -139,11 +149,13 @@ class Conn:
                 pos = 2
                 for _ in range(n):
                     e = p.index(b"\x00", pos)
-                    names.append(p[pos:e].decode())
+                    all_names.append(p[pos:e].decode())
+                    cur["colnames"].append(p[pos:e].decode())
                     pos = e + 1 + 6  # table oid + attr no
                     (oid,) = struct.unpack("!i", p[pos : pos + 4])
                     pos += 4
-                    oids.append(oid)
+                    all_oids.append(oid)
+                    cur["oids"].append(oid)
                     pos += 2 + 4 + 2  # typlen, typmod, format
             elif t == b"D":
                 (n,) = struct.unpack("!h", p[:2])
@@ -156,23 +168,35 @@ class Conn:
                     else:
                         r.append(p[pos : pos + ln].decode())
                         pos += ln
-                rows.append(r)
+                all_rows.append(r)
+                cur["rows"].append(r)
             elif t == b"E":
                 fields, pos = {}, 0
                 while p[pos] != 0:
                     e = p.index(b"\x00", pos + 1)
                     fields[chr(p[pos])] = p[pos + 1 : e].decode()
                     pos = e + 1
-                codes.append(fields.get("C", "?"))
+                all_codes.append(fields.get("C", "?"))
+                cur["err_codes"].append(fields.get("C", "?"))
             elif t == b"C":
-                tag = p[:-1].decode()
+                all_tag = p[:-1].decode()
+                cur["tag"] = all_tag
+                sets.append(cur)
+                cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": ""}
             elif t == b"Z":
+                # Flush any open set (e.g. an error arrived before any
+                # completion tag); guarantee at least one set.
+                if cur["oids"] or cur["colnames"] or cur["rows"] or cur["err_codes"] or cur["tag"]:
+                    sets.append(cur)
+                if not sets:
+                    sets.append(cur)
                 return {
-                    "oids": oids,
-                    "colnames": names,
-                    "rows": rows,
-                    "err_codes": codes,
-                    "tag": tag,
+                    "oids": all_oids,
+                    "colnames": all_names,
+                    "rows": all_rows,
+                    "err_codes": all_codes,
+                    "tag": all_tag,
+                    "sets": sets,
                 }
 
     def copy_stdin(self, sql, data_lines):
@@ -363,6 +387,18 @@ def split_statements(text):
                 flush()
                 line_start = True
                 continue
+            if c == "\\" and nxt == ";":
+                # v1.04: psql escaped semicolon — NOT a statement
+                # terminator. psql sends the whole thing as one Query
+                # message (unescaping `\;` to `;`), so the splitter must
+                # not break here. The raw `\;` stays in the item text
+                # (the .out echo contains it); run_test unescapes via
+                # psql_unescape() at execution time.
+                buf.append(c)
+                buf.append(nxt)
+                i += 2
+                line_start = False
+                continue
             if c == "-" and nxt == "-":
                 state = "linecomment"
                 i += 2
@@ -458,6 +494,65 @@ def split_statements(text):
     flush()
     return items
 
+
+def psql_unescape(text):
+    """Undo psql's backslash-semicolon escaping outside quoted regions.
+
+    psql does not treat `\\;` as a statement terminator; it sends the
+    Query with the backslash removed (`\\;` -> `;`). Quoted regions
+    (single/double-quoted strings, dollar-quoted bodies) keep their
+    backslashes literally, like psql's query buffer.
+    """
+    out = []
+    i, n = 0, len(text)
+    state = "normal"  # normal | squote | dquote | dollar
+    dollar_tag = ""
+    while i < n:
+        c = text[i]
+        if state == "normal":
+            if c == "\\" and i + 1 < n and text[i + 1] == ";":
+                out.append(";")
+                i += 2
+                continue
+            if c == "'":
+                state = "squote"
+            elif c == '"':
+                state = "dquote"
+            elif c == "$":
+                m = re.match(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$", text[i:])
+                if m:
+                    state = "dollar"
+                    dollar_tag = m.group(0)
+            out.append(c)
+            i += 1
+            continue
+        if state == "squote":
+            out.append(c)
+            i += 1
+            if c == "'":
+                if i < n and text[i] == "'":
+                    out.append("'")
+                    i += 1
+                else:
+                    state = "normal"
+            continue
+        if state == "dquote":
+            out.append(c)
+            if c == '"':
+                state = "normal"
+            i += 1
+            continue
+        # dollar-quoted body: backslashes are literal.
+        if text.startswith(dollar_tag, i):
+            out.append(dollar_tag)
+            i += len(dollar_tag)
+            state = "normal"
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Expected-output parser (psql aligned format)
 # ---------------------------------------------------------------------------
@@ -552,8 +647,13 @@ def parse_expected_block(lines, pos, null_display):
     # The dashes line must be at least as wide as the header: this keeps a
     # following "--" comment line (or the next statement echo) from being
     # misread as a table separator, which used to desync the whole file.
+    # v1.04: the header itself must not be a "--" comment line either —
+    # two consecutive comment lines ("--" / "--") otherwise parse as a
+    # bogus table, which desyncs every later echo lookup (seen in name.out
+    # via parse_expected_blocks' second parse).
     if (
         pos + 1 < n
+        and not line.strip().startswith("--")
         and re.match(r"^-+(\+-+)*$", lines[pos + 1].strip())
         and len(lines[pos + 1].strip()) >= len(line.rstrip())
     ):
@@ -1178,6 +1278,83 @@ def compare(stmt, expected, actual, null_display):
     return Verdict("SKIP", "unknown expected kind")
 
 
+def parse_expected_blocks(lines, pos, null_display):
+    """Parse every result block pg_regress shows for one (possibly
+    multi-statement) Query: repeated table/ERROR blocks, in order. A lone
+    utility statement yields [Expected('noresult')]. Stops at the first
+    parse that finds no block (the next statement's echo or a comment).
+    Returns (blocks, new_pos).
+    """
+    blocks = []
+    while True:
+        exp, new_pos = parse_expected_block(lines, pos, null_display)
+        if exp.kind == "noresult":
+            if not blocks:
+                blocks.append(exp)
+            pos = new_pos
+            break
+        blocks.append(exp)
+        pos = new_pos
+    return blocks, pos
+
+
+def is_quiet_set(s):
+    """A result set pg_regress shows nothing for: a bare command tag
+    with no RowDescription, no rows, and no error. An empty SELECT is
+    NOT quiet — pg_regress shows its table header plus "(0 rows)"."""
+    return not s["err_codes"] and not s["rows"] and not s["colnames"]
+
+
+def compare_multi(stmt, expected_blocks, sets, null_display):
+    """Compare one (possibly multi-statement) Query's expected blocks
+    against its actual result sets, in order. pg_regress omits command
+    tags, so quiet utility sets are skipped when aligning blocks; any
+    leftover row-producing or erroring set is a mismatch.
+    """
+    si = 0
+    for exp in expected_blocks:
+        if exp.kind == "noresult":
+            # Utility statement: pg_regress expects no output. Consume
+            # its quiet command-tag sets; an erroring set is the
+            # utility's own failure — apply the single-statement rule.
+            while si < len(sets) and is_quiet_set(sets[si]):
+                si += 1
+            if si < len(sets) and sets[si]["err_codes"]:
+                code = sets[si]["err_codes"][0]
+                reason = classify_expected_fail(stmt)
+                if reason:
+                    return Verdict("EXPECTED-FAIL", reason + " [sqlstate %s]" % code)
+                return Verdict("REAL-FAIL", "expected success, got SQLSTATE %s" % code)
+            continue
+        while si < len(sets) and is_quiet_set(sets[si]):
+            si += 1
+        if si >= len(sets):
+            reason = classify_expected_fail(stmt)
+            if reason:
+                return Verdict("EXPECTED-FAIL", reason)
+            return Verdict(
+                "REAL-FAIL",
+                "fewer result sets than expected (%d < %d)"
+                % (len(sets), len(expected_blocks)),
+            )
+        v = compare(stmt, exp, sets[si], null_display)
+        if v.status != "PASS":
+            return v
+        si += 1
+    for s in sets[si:]:
+        if not is_quiet_set(s):
+            reason = classify_expected_fail(stmt)
+            detail = "unexpected extra result set (tag=%r rows=%d%s)" % (
+                s["tag"],
+                len(s["rows"]),
+                (" err=%s" % ",".join(s["err_codes"])) if s["err_codes"] else "",
+            )
+            if reason:
+                return Verdict("EXPECTED-FAIL", reason + " [%s]" % detail)
+            return Verdict("REAL-FAIL", detail)
+    return Verdict("PASS")
+
+
 class ServerWedged(Exception):
     """A statement killed the connection (timeout or server death)."""
 
@@ -1267,7 +1444,11 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
         pos = idx + len(stmt)
         # convert char pos to the line AFTER the statement echo
         line_pos = out_text.count("\n", 0, pos) + 1
-        expected, new_line_pos = parse_expected_block(out_lines, line_pos, null_display)
+        # v1.04: one Query can carry several statements (psql `\;`);
+        # parse every result block pg_regress shows for it, in order.
+        expected_blocks, new_line_pos = parse_expected_blocks(
+            out_lines, line_pos, null_display
+        )
         pos = sum(len(l) + 1 for l in out_lines[:new_line_pos])
 
         # cascade guard: statement touches an object that failed to create
@@ -1313,7 +1494,10 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
                 exec_stmt += ";"
 
         try:
-            actual = conn.q(exec_stmt)
+            # v1.04: psql sends `\;`-joined statements as ONE Query with
+            # the backslashes removed; unescape to the exact bytes psql
+            # would send (the .out echo keeps the raw `\;`).
+            actual = conn.q(psql_unescape(exec_stmt))
         except socket.timeout as e:
             raise ServerWedged(stmt, "ran past %ds timeout" % STMT_TIMEOUT)
         except (WireError, OSError) as e:
@@ -1328,13 +1512,16 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
                 else:
                     psql_vars[vname] = cval
 
-        if casc and (actual["err_codes"] or expected.kind == "error"):
+        if casc and (
+            actual["err_codes"]
+            or any(b.kind == "error" for b in expected_blocks)
+        ):
             results.append(
                 (stmt, Verdict("EXPECTED-FAIL", "cascade: %s failed earlier" % casc))
             )
             continue
 
-        v = compare(stmt, expected, actual, null_display)
+        v = compare_multi(stmt, expected_blocks, actual["sets"], null_display)
         # track failed CREATEs for the cascade guard
         if v.status in ("REAL-FAIL", "EXPECTED-FAIL") and re.match(
             r"(?is)^\s*create\s+(?:table\s+)?(\w+)", stmt

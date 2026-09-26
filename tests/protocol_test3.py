@@ -279,15 +279,18 @@ def main():
     r = split(c1.query("SELECT id FROM acct WHERE id = 6"))
     check("recovered row committed", r["rows"] == [["6"]], str(r["rows"]))
 
-    print("== implicit txn: each statement atomic ==")
+    # v1.04: PG19 runs a multi-statement simple Query in ONE implicit
+    # transaction block — the first statement is rolled back when a later
+    # one fails (previously each statement was statement-atomic).
+    print("== implicit txn: whole Query atomic (PG19) ==")
     r = split(c1.query("INSERT INTO acct VALUES (7, 700); INSERT INTO nope VALUES (1)"))
-    check("first statement committed", r["tags"] == ["INSERT 0 1"], str(r["tags"]))
+    check("first statement tag emitted", r["tags"] == ["INSERT 0 1"], str(r["tags"]))
     check("second statement errored",
           r["error"] is not None and r["error"].get("C") == "42P01",
           str(r["error"]))
     check("idle after", r["ready"] == b"I")
     r = split(c1.query("SELECT id FROM acct WHERE id = 7"))
-    check("first statement's row present", r["rows"] == [["7"]], str(r["rows"]))
+    check("first statement's row rolled back", r["rows"] == [], str(r["rows"]))
     r = split(c1.query("INSERT INTO acct VALUES (8, 800), (9, 'xx')"))
     # v0.7: text literals go through the type's input function, so a bad
     # integer literal is 22P02 (like Postgres), not 42804.

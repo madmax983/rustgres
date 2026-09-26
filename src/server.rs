@@ -107,6 +107,9 @@ pub(crate) struct Session {
     /// the protocol handlers drain and send them as NoticeResponse
     /// ('N') before the completion tag.
     pending_notices: Vec<String>,
+    /// v1.04: WARNING-severity notices pending delivery (see
+    /// `queue_warning`); drained alongside `pending_notices`.
+    pending_warnings: Vec<String>,
     /// v0.81: parsed-AST cache for the extended protocol. Keyed by the
     /// exact query text of a Parse message; each entry records the
     /// catalog epoch it was parsed under. A hit (epoch matches) skips
@@ -175,6 +178,13 @@ struct Txn {
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
+    /// v1.04: PG19's implicit transaction block for a multi-statement
+    /// simple Query: the Query's commands run in one transaction that
+    /// commits when the Query string is exhausted. COMMIT/ROLLBACK
+    /// inside it end the block with a WARNING and start a fresh one;
+    /// BEGIN converts it to a regular transaction; savepoint commands
+    /// are rejected, like PostgreSQL.
+    implicit: bool,
     /// v0.66: GUC change stack for SET / SET LOCAL / RESET transaction
     /// semantics (PG19 guc.c: GUC_ACTION_SET persists at commit but
     /// reverts on abort; GUC_ACTION_LOCAL reverts at commit AND abort).
@@ -320,6 +330,7 @@ impl Session {
             default_toast_compression: crate::storage::ToastCompression::default(),
             // v1.00: no pending notices on a fresh session.
             pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parsed-AST cache starts empty.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -961,14 +972,43 @@ pub(crate) fn send_notice(stream: &mut Writer, message: &str) -> io::Result<()> 
     b.send(stream)
 }
 
+/// v1.04: send a NoticeResponse ('N') with WARNING severity and SQLSTATE
+/// 01000, like PG19's warnings (e.g. COMMIT/ROLLBACK with no transaction
+/// in progress inside a multi-statement simple Query).
+pub(crate) fn send_warning(stream: &mut Writer, message: &str) -> io::Result<()> {
+    let mut b = MsgBuilder::new(b'N');
+    b.u8(b'S')
+        .cstr("WARNING")
+        .u8(b'V')
+        .cstr("WARNING")
+        .u8(b'C')
+        .cstr("01000")
+        .u8(b'M')
+        .cstr(message);
+    b.send(stream)
+}
+
 /// v1.00: drain `session.pending_notices`, sending each as a
 /// NoticeResponse. Called before the CommandComplete of a successful
 /// statement (PG sends notices before the completion tag).
+/// v1.04: warnings queued by `queue_warning` go first, with WARNING
+/// severity (a statement never produces both at once).
 fn drain_notices(stream: &mut Writer, session: &mut Session) -> io::Result<()> {
+    for warning in std::mem::take(&mut session.pending_warnings) {
+        send_warning(stream, &warning)?;
+    }
     for notice in std::mem::take(&mut session.pending_notices) {
         send_notice(stream, &notice)?;
     }
     Ok(())
+}
+
+/// v1.04: queue a WARNING-severity notice for the client (drained before
+/// the next CommandComplete). Used for PG19's "there is no transaction
+/// in progress" warning on COMMIT/ROLLBACK inside the implicit
+/// transaction block of a multi-statement simple Query.
+fn queue_warning(session: &mut Session, message: &str) {
+    session.pending_warnings.push(message.to_string());
 }
 
 /// v0.71: ErrorResponse with an optional PG-style DETAIL (`D`) field.
@@ -1043,10 +1083,13 @@ fn parse_msg<T>(
 // ---------------------------------------------------------------------------
 
 /// Run one simple-protocol Query message. The message may hold several
-/// `;`-separated statements; each runs in its own implicit transaction
-/// (statement-atomic), or inside the session's explicit transaction when
-/// one is open. On the first error the remaining statements are skipped,
-/// like Postgres. Exactly one ReadyForQuery closes the message.
+/// `;`-separated statements. v1.04: like Postgres, a Query carrying more
+/// than one statement runs its commands in a single implicit transaction
+/// block (committed when the Query string is exhausted) when the session
+/// has no explicit transaction open; a lone statement keeps the old
+/// statement-atomic behavior. On the first error the remaining statements
+/// are skipped and the implicit block is aborted, like Postgres. Exactly
+/// one ReadyForQuery closes the message.
 fn handle_query(
     reader: &mut TcpStream,
     stream: &mut Writer,
@@ -1062,8 +1105,15 @@ fn handle_query(
         return Ok(());
     }
 
-    for one in sql::split_statements(sql_text) {
-        let stmt = match sql::parse_statement(&one) {
+    let statements = sql::split_statements(sql_text);
+    // v1.04: PG19 implicit transaction block (see Txn::implicit).
+    let implicit = statements.len() > 1 && session.txn.is_none();
+    if implicit {
+        begin_implicit_txn(engine, session);
+    }
+    let last_idx = statements.len().saturating_sub(1);
+    for (idx, one) in statements.iter().enumerate() {
+        let stmt = match sql::parse_statement(one) {
             Err(e) => {
                 let msg = if e.code == "42601" {
                     format!("syntax error: {}", e.message)
@@ -1072,9 +1122,11 @@ fn handle_query(
                 };
                 send_error(stream, e.code, &msg)?;
                 // v0.77: PG aborts the transaction on ANY error —
-                // including a simple-protocol parse error — so mark the
-                // txn failed before skipping the rest of the message.
-                if let Some(t) = session.txn.as_mut() {
+                // including a simple-protocol parse error. In the
+                // implicit block that means aborting the whole block.
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                } else if let Some(t) = session.txn.as_mut() {
                     t.failed = true;
                 }
                 break;
@@ -1087,7 +1139,9 @@ fn handle_query(
             send_exec_error(stream, &e)?;
             // v0.77: same abort rule for the parameter-substitution
             // error as for parse errors above.
-            if let Some(t) = session.txn.as_mut() {
+            if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                abort_implicit_txn(engine, session);
+            } else if let Some(t) = session.txn.as_mut() {
                 t.failed = true;
             }
             break;
@@ -1123,12 +1177,24 @@ fn handle_query(
                 if e.kind() != io::ErrorKind::InvalidData {
                     return Err(e);
                 }
+                // v1.04: a COPY statement error aborts the implicit block
+                // too (like any other statement error).
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                    break;
+                }
             }
             continue;
         }
         match run_statement(engine, wal, session, &stmt) {
             Err(e) => {
                 send_exec_error(stream, &e)?;
+                // v1.04: a statement error aborts PG19's implicit block
+                // (the whole Query is one transaction); an explicit
+                // transaction was already marked failed by run_statement.
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                }
                 break;
             }
             Ok(ExecResult::Select { columns, rows }) => {
@@ -1170,6 +1236,21 @@ fn handle_query(
                 drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
+        }
+        // v1.04: COMMIT/ROLLBACK inside the implicit block ends it (with
+        // a warning); the rest of the Query string runs in a fresh one.
+        if implicit && idx != last_idx && session.txn.is_none() {
+            begin_implicit_txn(engine, session);
+        }
+    }
+
+    // v1.04: a Query string that never saw BEGIN leaves no transaction
+    // behind — commit the surviving implicit block, like Postgres (an
+    // explicit transaction, which BEGIN converted the implicit block
+    // into, stays open past the Query).
+    if implicit && session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if let Err(e) = commit_implicit_txn(engine, wal, session) {
+            send_exec_error(stream, &e)?;
         }
     }
 
@@ -2863,59 +2944,78 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
     }
 }
 
-fn txn_begin(
-    engine: &Arc<Mutex<Engine>>,
-    session: &mut Session,
-    level: IsolationLevel,
-    read_only: Option<bool>,
-    deferrable: Option<bool>,
-) -> Result<ExecResult, ExecError> {
-    if session.txn.is_some() {
-        // Postgres: WARNING "there is already a transaction in progress",
-        // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
-        return Ok(cmd("BEGIN"));
-    }
+/// v1.04: start PG19's implicit transaction block for a multi-statement
+/// simple Query. The block covers the Query's commands and commits when
+/// the Query string is exhausted (unless transaction-control statements
+/// convert or end it first). Read-committed, honoring the session's
+/// default read-only mode like an autocommit statement would.
+fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
     let xid = lock_engine(engine).begin_txn();
     session.txn = Some(Txn {
         xid,
-        level,
-        read_only,
-        deferrable,
+        level: IsolationLevel::ReadCommitted,
+        read_only: session.default_txn_read_only,
+        deferrable: None,
         snapshot: None,
         writes: Vec::new(),
         savepoints: Vec::new(),
         cursor_marks: Vec::new(),
         failed: false,
-        // v0.66: fresh GUC stack per transaction.
+        implicit: true,
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
     });
-    Ok(cmd("BEGIN"))
 }
 
-fn txn_commit(
+/// v1.04: abort PG19's implicit transaction block after a statement
+/// error: undo the staged writes, retire the xid, and leave the session
+/// with no transaction (the rest of the Query string is skipped by the
+/// caller). Cursors die and in-transaction GUC changes revert, exactly
+/// like an aborted explicit transaction.
+fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
+    if let Some(t) = session.txn.take() {
+        debug_assert!(t.implicit, "abort_implicit_txn on explicit txn");
+        let mut guard = lock_engine(engine);
+        undo_all(&mut guard, t.xid, &t.writes);
+        retire_txn(&mut guard, t.xid);
+        auto_vacuum(&mut guard, &t.writes);
+        drop(guard);
+        // v0.16: every cursor dies with the aborted transaction.
+        session.cursors.clear();
+        // v0.66: an aborted transaction reverts every in-transaction GUC
+        // change (SET and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
+    }
+}
+
+/// v1.04: commit the surviving implicit block when the Query string is
+/// exhausted with no explicit transaction left open. Silent (no warning)
+/// — this is the normal end-of-string commit. Returns the commit outcome
+/// for the caller to report if durability failed.
+fn commit_implicit_txn(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
-    chain: bool,
 ) -> Result<ExecResult, ExecError> {
-    if session.txn.is_none() {
-        // v0.89: plain COMMIT outside a transaction is PG's WARNING
-        // no-op, but COMMIT AND CHAIN requires a transaction block
-        // (PG19: 25001 "COMMIT AND CHAIN can only be used in transaction
-        // blocks").
-        if chain {
-            return Err(ExecError {
-                detail: None,
-                code: "25001",
-                message: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
-            });
-        }
-        return Ok(cmd("COMMIT"));
-    }
-    let t = session.txn.take().expect("transaction checked above");
-    // Remember characteristics for AND CHAIN before the txn is consumed.
-    let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
+    let t = session
+        .txn
+        .take()
+        .expect("commit_implicit_txn without a txn");
+    debug_assert!(t.implicit, "commit_implicit_txn on explicit txn");
+    commit_taken_txn(engine, wal, session, t)
+}
+
+/// Commit (or roll back, when already failed) an already-taken
+/// transaction: WAL-log and fsync the staged writes, retire the xid,
+/// and run the commit-time cleanup. Shared by explicit COMMIT and the
+/// v1.04 implicit-block paths. AND CHAIN handling stays with the
+/// callers.
+fn commit_taken_txn(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    t: Txn,
+) -> Result<ExecResult, ExecError> {
     let mut guard = lock_engine(engine);
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
@@ -2929,10 +3029,6 @@ fn txn_commit(
         // v0.66: an aborted transaction reverts every in-transaction
         // GUC change (SET and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
-        if chain {
-            // AND CHAIN: new transaction with the same characteristics.
-            return txn_begin(engine, session, level, read_only, deferrable);
-        }
         return Ok(cmd("ROLLBACK"));
     }
     // Derive the records from the write log and make them durable BEFORE
@@ -2974,14 +3070,104 @@ fn txn_commit(
     // v0.66: SET LOCAL effects end with the transaction (commit or
     // not); plain SET/RESET persist for the session, like PG19.
     revert_guc_stack(session, t.guc_stack, true);
+    Ok(cmd("COMMIT"))
+}
+
+fn txn_begin(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    level: IsolationLevel,
+    read_only: Option<bool>,
+    deferrable: Option<bool>,
+) -> Result<ExecResult, ExecError> {
+    if let Some(t) = session.txn.as_mut() {
+        // v1.04: BEGIN converts PG19's implicit transaction block into
+        // a regular one, which may then extend past the Query string.
+        // Statement options still apply, like PostgreSQL.
+        if t.implicit {
+            t.implicit = false;
+            t.level = level;
+            t.read_only = read_only;
+            t.deferrable = deferrable;
+            return Ok(cmd("BEGIN"));
+        }
+        // Postgres: WARNING "there is already a transaction in progress",
+        // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
+        return Ok(cmd("BEGIN"));
+    }
+    let xid = lock_engine(engine).begin_txn();
+    session.txn = Some(Txn {
+        xid,
+        level,
+        read_only,
+        deferrable,
+        snapshot: None,
+        writes: Vec::new(),
+        savepoints: Vec::new(),
+        cursor_marks: Vec::new(),
+        failed: false,
+        implicit: false,
+        // v0.66: fresh GUC stack per transaction.
+        guc_stack: Vec::new(),
+        guc_marks: Vec::new(),
+    });
+    Ok(cmd("BEGIN"))
+}
+
+fn txn_commit(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    chain: bool,
+) -> Result<ExecResult, ExecError> {
+    if session.txn.is_none() {
+        // v0.89: plain COMMIT outside a transaction is PG's WARNING
+        // no-op, but COMMIT AND CHAIN requires a transaction block
+        // (PG19: 25001 "COMMIT AND CHAIN can only be used in transaction
+        // blocks").
+        if chain {
+            return Err(ExecError {
+                detail: None,
+                code: "25001",
+                message: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
+            });
+        }
+        return Ok(cmd("COMMIT"));
+    }
+    // v1.04: COMMIT inside PG19's implicit transaction block commits
+    // the block but warns — the client never began a transaction. The
+    // caller (handle_query) starts a fresh implicit block for the rest
+    // of the Query string.
+    if session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if chain {
+            return Err(err_25001(
+                "COMMIT AND CHAIN can only be used in transaction blocks",
+            ));
+        }
+        let t = session
+            .txn
+            .take()
+            .expect("implicit transaction checked above");
+        commit_taken_txn(engine, wal, session, t)?;
+        queue_warning(session, "there is no transaction in progress");
+        return Ok(cmd("COMMIT"));
+    }
+    let t = session.txn.take().expect("transaction checked above");
+    // Remember characteristics for AND CHAIN before the txn is consumed.
+    let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
+    let was_failed = t.failed;
+    let out = commit_taken_txn(engine, wal, session, t)?;
     if chain {
         // AND CHAIN: immediately start a new transaction with the same
-        // characteristics as the just-committed one (SQL standard). The
-        // command tag stays COMMIT — PostgreSQL reports the command that
-        // ran, not the implicitly started transaction.
+        // characteristics as the just-committed one (SQL standard).
         txn_begin(engine, session, level, read_only, deferrable)?;
+        // Tag quirk, preserved from the pre-v1.04 code: on an aborted
+        // transaction the reported tag is the new transaction's BEGIN;
+        // otherwise the command tag stays COMMIT — PostgreSQL reports
+        // the command that ran, not the implicitly started transaction.
+        return Ok(if was_failed { cmd("BEGIN") } else { out });
     }
-    Ok(cmd("COMMIT"))
+    Ok(out)
 }
 
 /// Snapshot the committed engine and truncate the WAL.
@@ -3010,9 +3196,7 @@ fn txn_vacuum(
     verbose: bool,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
-        return Err(err_25001(
-            "VACUUM cannot be executed inside a transaction block",
-        ));
+        return Err(err_25001("VACUUM cannot run inside a transaction block"));
     }
     let mut guard = lock_engine(engine);
     // v0.11: VACUUM requires ownership (or superuser), like PostgreSQL.
@@ -3125,6 +3309,33 @@ fn txn_rollback(
             "ROLLBACK AND CHAIN can only be used in transaction blocks",
         ));
     }
+    // v1.04: ROLLBACK inside PG19's implicit transaction block aborts
+    // the block but warns — the client never began a transaction. The
+    // caller (handle_query) starts a fresh implicit block for the rest
+    // of the Query string.
+    if session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if chain {
+            return Err(err_25001(
+                "ROLLBACK AND CHAIN can only be used in transaction blocks",
+            ));
+        }
+        let t = session
+            .txn
+            .take()
+            .expect("implicit transaction checked above");
+        let mut guard = lock_engine(engine);
+        undo_all(&mut guard, t.xid, &t.writes);
+        retire_txn(&mut guard, t.xid);
+        auto_vacuum(&mut guard, &t.writes);
+        drop(guard);
+        // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
+        session.cursors.clear();
+        // v0.66: rollback reverts every in-transaction GUC change (SET
+        // and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
+        queue_warning(session, "there is no transaction in progress");
+        return Ok(cmd("ROLLBACK"));
+    }
     // Remember characteristics for AND CHAIN before the txn is consumed.
     let chained = if let Some(t) = session.txn.take() {
         let chained = (t.level, t.read_only, t.deferrable);
@@ -3163,6 +3374,13 @@ fn txn_savepoint(
             "SAVEPOINT can only be used in transaction blocks",
         )),
         Some(t) => {
+            // v1.04: savepoint commands are rejected in PG19's implicit
+            // transaction block, like PostgreSQL.
+            if t.implicit {
+                return Err(err_25001(
+                    "SAVEPOINT can only be used in transaction blocks",
+                ));
+            }
             // A savepoint is a position in the write log plus the current
             // row-lock count — no copies.
             let xid = t.xid;
@@ -3191,6 +3409,13 @@ fn txn_rollback_to(
         .txn
         .as_mut()
         .ok_or_else(|| err_25001("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"))?;
+    // v1.04: savepoint commands are rejected in PG19's implicit
+    // transaction block, like PostgreSQL.
+    if t.implicit {
+        return Err(err_25001(
+            "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+        ));
+    }
     let idx = t
         .savepoints
         .iter()
@@ -3262,6 +3487,13 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         .txn
         .as_mut()
         .ok_or_else(|| err_25001("RELEASE SAVEPOINT can only be used in transaction blocks"))?;
+    // v1.04: savepoint commands are rejected in PG19's implicit
+    // transaction block, like PostgreSQL.
+    if t.implicit {
+        return Err(err_25001(
+            "RELEASE SAVEPOINT can only be used in transaction blocks",
+        ));
+    }
     let idx = t
         .savepoints
         .iter()
@@ -3949,6 +4181,7 @@ mod tests {
             default_toast_compression: crate::storage::ToastCompression::default(),
             // v1.00: no pending notices.
             pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -3964,6 +4197,7 @@ mod tests {
                 savepoints: Vec::new(),
                 cursor_marks: Vec::new(),
                 failed: false,
+                implicit: false,
                 guc_stack: Vec::new(),
                 guc_marks: Vec::new(),
             }),
@@ -4139,6 +4373,7 @@ mod tests {
             default_toast_compression: crate::storage::ToastCompression::default(),
             // v1.00: no pending notices.
             pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -4479,5 +4714,149 @@ mod tests {
                 sql
             );
         }
+    }
+
+    // v1.04: PG19 implicit transaction block for multi-statement simple
+    // Query strings.
+
+    #[test]
+    fn v104_implicit_begin_and_end_of_string_commit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-commit");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let t = session.txn.as_ref().expect("implicit txn begun");
+        assert!(t.implicit, "implicit flag must be set");
+        commit_implicit_txn(&engine, &wal, &mut session).expect("commits");
+        assert!(session.txn.is_none(), "block ends at end of Query string");
+        assert!(
+            session.pending_warnings.is_empty(),
+            "normal end-of-string commit is silent"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-commit"));
+    }
+
+    #[test]
+    fn v104_implicit_abort_clears_txn() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        abort_implicit_txn(&engine, &mut session);
+        assert!(session.txn.is_none(), "aborted block leaves no txn");
+    }
+
+    #[test]
+    fn v104_begin_converts_implicit_to_explicit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let xid = session.txn.as_ref().unwrap().xid;
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        let t = session.txn.as_ref().expect("still in a transaction");
+        assert!(!t.implicit, "BEGIN converts the implicit block");
+        assert_eq!(t.xid, xid, "conversion keeps the same transaction");
+    }
+
+    #[test]
+    fn v104_commit_inside_implicit_warns_and_ends_block() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-commit-warn");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let out = txn_commit(&engine, &wal, &mut session, false).unwrap();
+        match out {
+            ExecResult::Command { tag } => assert_eq!(tag, "COMMIT"),
+            other => panic!("expected COMMIT tag, got {:?}", other),
+        }
+        assert!(session.txn.is_none(), "in-Q COMMIT ends the block");
+        assert_eq!(
+            session.pending_warnings,
+            vec!["there is no transaction in progress".to_string()],
+            "PG19 warning is queued"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-commit-warn"));
+    }
+
+    #[test]
+    fn v104_rollback_inside_implicit_warns_and_ends_block() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let out = txn_rollback(&engine, &mut session, false).unwrap();
+        match out {
+            ExecResult::Command { tag } => assert_eq!(tag, "ROLLBACK"),
+            other => panic!("expected ROLLBACK tag, got {:?}", other),
+        }
+        assert!(session.txn.is_none(), "in-Q ROLLBACK ends the block");
+        assert_eq!(
+            session.pending_warnings,
+            vec!["there is no transaction in progress".to_string()],
+            "PG19 warning is queued"
+        );
+    }
+
+    #[test]
+    fn v104_savepoint_commands_rejected_in_implicit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        for (name, r) in [
+            ("savepoint", txn_savepoint(&engine, &mut session, "sp")),
+            ("rollback-to", txn_rollback_to(&engine, &mut session, "sp")),
+            ("release", txn_release(&mut session, "sp")),
+        ] {
+            let e = r.expect_err(&format!("{} must fail in implicit block", name));
+            assert_eq!(e.code, "25001", "{} SQLSTATE", name);
+        }
+        assert!(
+            session.txn.as_ref().is_some_and(|t| t.implicit),
+            "rejected savepoint commands leave the block intact"
+        );
+    }
+
+    #[test]
+    fn v104_chain_in_implicit_rejected() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-chain");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let e = txn_commit(&engine, &wal, &mut session, true)
+            .expect_err("COMMIT AND CHAIN must fail in implicit block");
+        assert_eq!(e.code, "25001");
+        let e = txn_rollback(&engine, &mut session, true)
+            .expect_err("ROLLBACK AND CHAIN must fail in implicit block");
+        assert_eq!(e.code, "25001");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-chain"));
+    }
+
+    #[test]
+    fn v104_explicit_txn_has_no_implicit_behavior() {
+        // Regression: ordinary explicit transactions never warn and
+        // never carry the implicit flag.
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-explicit");
+        let mut session = session_no_txn();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!session.txn.as_ref().unwrap().implicit);
+        txn_commit(&engine, &wal, &mut session, false).unwrap();
+        assert!(
+            session.pending_warnings.is_empty(),
+            "no warning on explicit COMMIT"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-explicit"));
     }
 }
