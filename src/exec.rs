@@ -124,6 +124,33 @@ pub struct StmtCtx<'a> {
     pub notices: Vec<String>,
 }
 
+thread_local! {
+    /// v1.02: statement-scoped notice sink. `RAISE NOTICE` inside
+    /// plpgsql *function* bodies has no `&mut StmtCtx` in reach (the
+    /// call chain is `execute -> run_select -> eval_expr ->
+    /// call_user_function -> run_func_body -> run_plpgsql_body ->
+    /// run_plpgsql_stmts`, which only carries `&mut Q`), so notices
+    /// are pushed here and `execute()` drains them into
+    /// `StmtCtx.notices` on exit — the existing v1.00 delivery path
+    /// (server.rs sends them as NoticeResponse before
+    /// CommandComplete). Thread-per-connection makes the thread-local
+    /// statement-scoped in practice; nested `execute()` calls (the
+    /// COPY TO helper) save/restore it. `None` outside a statement
+    /// (unit tests calling the runner directly): notices are dropped.
+    static NOTICE_SINK: RefCell<Option<std::rc::Rc<RefCell<Vec<String>>>>> =
+        const { RefCell::new(None) };
+}
+
+/// v1.02: push a notice into the statement-scoped sink (no-op when no
+/// statement is running).
+fn push_notice(msg: String) {
+    NOTICE_SINK.with(|s| {
+        if let Some(sink) = s.borrow().as_ref() {
+            sink.borrow_mut().push(msg);
+        }
+    });
+}
+
 /// Outcome of executing one statement.
 #[derive(Debug)]
 pub enum ExecResult {
@@ -272,6 +299,31 @@ fn require_view_owner(eng: &Engine, ctx: &StmtCtx, view: &str) -> Result<(), Exe
 }
 
 pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
+    // v1.02: install the statement-scoped notice sink (see
+    // NOTICE_SINK): `RAISE NOTICE` inside plpgsql function bodies
+    // pushes here, and the accumulated messages are drained into
+    // `ctx.notices` on the way out — on both success and error, like
+    // PG19, which emits notices as they are generated even when the
+    // statement later fails. The previous sink is save/restored so a
+    // nested `execute()` (the COPY TO helper) cannot steal the
+    // outer statement's notices.
+    let sink = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let prev = NOTICE_SINK.with(|s| s.borrow_mut().replace(sink.clone()));
+    let r = execute_inner(eng, ctx, stmt);
+    NOTICE_SINK.with(|s| {
+        *s.borrow_mut() = prev;
+    });
+    ctx.notices.extend(sink.borrow_mut().drain(..));
+    r
+}
+
+/// v1.02: `execute` inner — the statement dispatch. Split out so the
+/// notice-sink install/drain in `execute` covers every statement.
+fn execute_inner(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    stmt: &Stmt,
+) -> Result<ExecResult, ExecError> {
     match stmt {
         // v0.74: session-level PREPARE/EXECUTE/DEALLOCATE are resolved in
         // server.rs before reaching the executor.
@@ -26450,6 +26502,37 @@ fn run_plpgsql_stmts(
                 };
                 exec_analyze_core(&mut *q.eng, q.snap, q.own, q.session, q.role, table)?;
             }
+            crate::sql::PlpgsqlStmt::Raise {
+                level,
+                format,
+                args,
+            } => {
+                // v1.02: `RAISE NOTICE|EXCEPTION '<format>', <args>...`
+                // (PG19 `exec_stmt_raise`, pl_exec.c). Each `%` consumes
+                // the next argument in its text-cast form (`%%` is a
+                // literal `%`); the shared `format_raise_message`
+                // evaluator is the same one the v1.00 trigger bodies
+                // use. Arguments are `$n`-substituted (named args were
+                // rewritten at CREATE) and evaluated like any
+                // expression. NOTICE goes to the statement-scoped sink
+                // (`execute()` drains it into `StmtCtx.notices`);
+                // EXCEPTION aborts the call, defaulting to P0001
+                // (raise_exception) like PG, and is trappable by the
+                // v1.01 WHEN handlers.
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let mut e = a.clone();
+                    subst_expr(&mut e, params)?;
+                    vals.push(eval_expr(q, scopes, &e)?);
+                }
+                let msg = format_raise_message(format, &vals);
+                match level {
+                    crate::sql::RaiseLevel::Notice => push_notice(msg),
+                    crate::sql::RaiseLevel::Exception => {
+                        return Err(exec_err("P0001", msg));
+                    }
+                }
+            }
         }
     }
     Err(exec_err(
@@ -35587,6 +35670,72 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             subst_select(sub, params)?;
         }
         Expr::Exists { sub, .. } => subst_select(sub, params)?,
+        // v1.02: the named-arg rewriter (`rewrite_func_arg_expr`)
+        // descends through every scalar form, so the substitutor must
+        // too — otherwise a `Param` produced by the rewrite inside one
+        // of these forms would survive to eval and 42P02. Purely
+        // additive: these positions previously fell through to `_`,
+        // leaving the Param unsubstituted (always an eval error).
+        Expr::FieldAccess { expr, .. } | Expr::NamedArg { expr, .. } => subst_expr(expr, params)?,
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(op) = operand {
+                subst_expr(op, params)?;
+            }
+            for (k, v) in whens {
+                subst_expr(k, params)?;
+                subst_expr(v, params)?;
+            }
+            if let Some(el) = else_ {
+                subst_expr(el, params)?;
+            }
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                subst_expr(e, params)?;
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            subst_expr(array, params)?;
+            for i in indices {
+                subst_expr(i, params)?;
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            subst_expr(array, params)?;
+            for (lo, hi) in bounds {
+                if let Some(l) = lo {
+                    subst_expr(l, params)?;
+                }
+                if let Some(h) = hi {
+                    subst_expr(h, params)?;
+                }
+            }
+        }
+        Expr::UserOp { left, right, .. } => {
+            subst_expr(left, params)?;
+            subst_expr(right, params)?;
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args.iter_mut().chain(partition_by.iter_mut()) {
+                subst_expr(a, params)?;
+            }
+            for o in order_by {
+                subst_expr(&mut o.expr, params)?;
+            }
+        }
+        Expr::Quantified { left, sub, .. } => {
+            subst_expr(left, params)?;
+            subst_select(sub, params)?;
+        }
         _ => {}
     }
     Ok(())
@@ -42214,8 +42363,19 @@ fn exec_create_function(
                     .iter_mut()
                     .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
                 {
-                    if let crate::sql::PlpgsqlStmt::Return(sel) = s {
-                        rewrite_func_arg_refs(sel, &arg_names);
+                    match s {
+                        crate::sql::PlpgsqlStmt::Return(sel) => {
+                            rewrite_func_arg_refs(sel, &arg_names);
+                        }
+                        // v1.02: named-arg -> $n rewrite applies to RAISE
+                        // args too (they are bare Exprs, rewritten via
+                        // the hoisted expression rewriter).
+                        crate::sql::PlpgsqlStmt::Raise { args: rargs, .. } => {
+                            for a in rargs.iter_mut() {
+                                rewrite_func_arg_expr(a, &arg_names);
+                            }
+                        }
+                        crate::sql::PlpgsqlStmt::Utility(_) => {}
                     }
                 }
                 plpgsql_body = Some(pb);
@@ -42673,57 +42833,194 @@ fn exec_drop_operator(
     })
 }
 
-/// v0.86: rewrite named argument references in a parsed SQL function
-/// body to positional parameters: `argname.col` becomes
-/// `FieldAccess(Param(n), col)` and a bare `argname` becomes
-/// `Param(n)`. Only qualifiers/names that exactly match an argument
-/// name are rewritten; real table references are untouched.
-pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
+/// v1.02: rewrite one expression's named argument references to
+/// positional parameters (`argname` -> `Param(n)`; `argname.col` ->
+/// `FieldAccess(Param(n), col)`). Hoisted out of
+/// `rewrite_func_arg_refs` so RAISE args — stored as bare `Expr`s,
+/// not wrapped SELECTs — get the identical rewrite at CREATE and on
+/// WAL-replay rebuild.
+///
+/// v1.02 also widens the recursion: the v1.01 version only descended
+/// into Column/FieldAccess/Arith/And/Or/Concat, so a named arg inside
+/// a comparison (`return x > y`) survived as a column reference and
+/// failed at call time with 42703. The rewriter now descends through
+/// every scalar expression form. Deliberate boundary (unchanged from
+/// v1.01): it does not descend into subqueries (`ScalarSub`,
+/// `InSub.sub`, `Quantified.sub`, `Exists`, `ArraySubquery`) — the
+/// bounded subset keeps those out of reach of the rewrite, and a
+/// `Column` matching an arg name inside a subquery keeps PG's
+/// column-first resolution.
+pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) {
     fn arg_pos(arg_names: &[Option<String>], name: &str) -> Option<u32> {
         arg_names
             .iter()
             .position(|n| n.as_deref() == Some(name))
             .map(|i| (i + 1) as u32)
     }
-    fn rewrite_expr(e: &mut Expr, arg_names: &[Option<String>]) {
-        match e {
-            Expr::Column { table, name } => {
-                if let Some(t) = table {
-                    if let Some(n) = arg_pos(arg_names, t) {
-                        *e = Expr::FieldAccess {
-                            expr: Box::new(Expr::Param(n)),
-                            field: std::mem::take(name),
-                        };
-                        return;
-                    }
-                } else if let Some(n) = arg_pos(arg_names, name) {
-                    *e = Expr::Param(n);
+    match e {
+        Expr::Column { table, name } => {
+            if let Some(t) = table {
+                if let Some(n) = arg_pos(arg_names, t) {
+                    *e = Expr::FieldAccess {
+                        expr: Box::new(Expr::Param(n)),
+                        field: std::mem::take(name),
+                    };
                     return;
                 }
+            } else if let Some(n) = arg_pos(arg_names, name) {
+                *e = Expr::Param(n);
+                return;
             }
-            Expr::FieldAccess { expr, .. } => rewrite_expr(expr, arg_names),
-            Expr::Arith { left, right, .. } => {
-                rewrite_expr(left, arg_names);
-                rewrite_expr(right, arg_names);
-            }
-            Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
-                rewrite_expr(left, arg_names);
-                rewrite_expr(right, arg_names);
-            }
-            _ => {}
         }
+        Expr::FieldAccess { expr, .. } => rewrite_func_arg_expr(expr, arg_names),
+        Expr::Arith { left, right, .. } => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        Expr::Cmp { left, right, .. } => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::BitNot(inner) => {
+            rewrite_func_arg_expr(inner, arg_names);
+        }
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => {
+            rewrite_func_arg_expr(expr, arg_names);
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            rewrite_func_arg_expr(expr, arg_names);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_func_arg_expr(expr, arg_names);
+            rewrite_func_arg_expr(pattern, arg_names);
+            if let Some(esc) = escape {
+                rewrite_func_arg_expr(esc, arg_names);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            rewrite_func_arg_expr(expr, arg_names);
+            rewrite_func_arg_expr(pattern, arg_names);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_func_arg_expr(expr, arg_names);
+            rewrite_func_arg_expr(low, arg_names);
+            rewrite_func_arg_expr(high, arg_names);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rewrite_func_arg_expr(a, arg_names);
+            }
+        }
+        Expr::NamedArg { expr, .. } => rewrite_func_arg_expr(expr, arg_names),
+        Expr::Extract { from, .. } => rewrite_func_arg_expr(from, arg_names),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(op) = operand {
+                rewrite_func_arg_expr(op, arg_names);
+            }
+            for (k, v) in whens {
+                rewrite_func_arg_expr(k, arg_names);
+                rewrite_func_arg_expr(v, arg_names);
+            }
+            if let Some(el) = else_ {
+                rewrite_func_arg_expr(el, arg_names);
+            }
+        }
+        Expr::Row(exprs) => {
+            for x in exprs {
+                rewrite_func_arg_expr(x, arg_names);
+            }
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                rewrite_func_arg_expr(x, arg_names);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            rewrite_func_arg_expr(array, arg_names);
+            for i in indices {
+                rewrite_func_arg_expr(i, arg_names);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            rewrite_func_arg_expr(array, arg_names);
+            for (lo, hi) in bounds {
+                if let Some(l) = lo {
+                    rewrite_func_arg_expr(l, arg_names);
+                }
+                if let Some(h) = hi {
+                    rewrite_func_arg_expr(h, arg_names);
+                }
+            }
+        }
+        Expr::UserOp { left, right, .. } => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        // Subquery forms: rewrite the outer expression only, never
+        // the subquery (see the doc comment above).
+        Expr::InSub { expr, .. } => rewrite_func_arg_expr(expr, arg_names),
+        Expr::Quantified { left, .. } => rewrite_func_arg_expr(left, arg_names),
+        Expr::Agg { arg, arg2, .. } => {
+            if let Some(a) = arg {
+                rewrite_func_arg_expr(a, arg_names);
+            }
+            if let Some(a) = arg2 {
+                rewrite_func_arg_expr(a, arg_names);
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args.iter_mut().chain(partition_by.iter_mut()) {
+                rewrite_func_arg_expr(a, arg_names);
+            }
+            for o in order_by {
+                rewrite_func_arg_expr(&mut o.expr, arg_names);
+            }
+        }
+        _ => {}
     }
+}
+
+/// v0.86: rewrite named argument references in a parsed SQL function
+/// body to positional parameters: `argname.col` becomes
+/// `FieldAccess(Param(n), col)` and a bare `argname` becomes
+/// `Param(n)`. Only qualifiers/names that exactly match an argument
+/// name are rewritten; real table references are untouched.
+pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
     // Bodies are SELECTs (validated at CREATE); walk the select list
     // and WHERE. A full Stmt-wide walk is unnecessary for the bounded
     // body shapes we accept.
     if let Stmt::Select(sel) = stmt {
         for item in &mut sel.items {
             if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                rewrite_expr(expr, arg_names);
+                rewrite_func_arg_expr(expr, arg_names);
             }
         }
         if let Some(w) = &mut sel.where_ {
-            rewrite_expr(w, arg_names);
+            rewrite_func_arg_expr(w, arg_names);
         }
     }
 }
@@ -42748,8 +43045,18 @@ pub(crate) fn rebuild_function_bodies(
                 .iter_mut()
                 .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
             {
-                if let crate::sql::PlpgsqlStmt::Return(sel) = s {
-                    rewrite_func_arg_refs(sel, arg_names);
+                match s {
+                    crate::sql::PlpgsqlStmt::Return(sel) => {
+                        rewrite_func_arg_refs(sel, arg_names);
+                    }
+                    // v1.02: RAISE args get the same named-arg rewrite
+                    // (see the CREATE path above).
+                    crate::sql::PlpgsqlStmt::Raise { args: rargs, .. } => {
+                        for a in rargs.iter_mut() {
+                            rewrite_func_arg_expr(a, arg_names);
+                        }
+                    }
+                    crate::sql::PlpgsqlStmt::Utility(_) => {}
                 }
             }
             return (None, Some(pb));
@@ -46570,6 +46877,314 @@ mod v097_domain_tests {
             rows_of(run(&mut eng, "SELECT '50'::d97r").unwrap()),
             vec![vec!["50"]]
         );
+    }
+}
+
+#[cfg(test)]
+mod v102_raise_notice_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    /// Run one statement, returning the result plus the notices the
+    /// statement produced (the v1.02 statement-scoped sink drained
+    /// into `StmtCtx.notices` by `execute()`).
+    fn run_n(eng: &mut Engine, sql: &str) -> (Result<ExecResult, ExecError>, Vec<String>) {
+        let stmt = crate::sql::parse_statement(sql)
+            .map_err(|e| exec_err(e.code, e.message))
+            .unwrap();
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        let r = execute(eng, &mut ctx, &stmt);
+        let notices = std::mem::take(&mut ctx.notices);
+        (r, notices)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(r: Result<ExecResult, ExecError>) -> (String, String) {
+        match r {
+            Ok(_) => panic!("expected error"),
+            Err(e) => (e.code.to_string(), e.message),
+        }
+    }
+
+    /// v1.02: the verbatim subselect.sql tattle() shape — RAISE NOTICE
+    /// with %-format args, then RETURN. Notices land in
+    /// StmtCtx.notices; the boolean result is correct.
+    #[test]
+    fn tattle_raise_notice() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function tattle102(x int, y int) returns bool volatile language plpgsql as $$
+begin
+  raise notice 'x = %, y = %', x, y;
+  return x > y;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select tattle102(9, 8)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["t"]]);
+        assert_eq!(notices, vec!["x = 9, y = 8".to_string()]);
+        let (r, notices) = run_n(&mut eng, "select tattle102(1, 8)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["f"]]);
+        assert_eq!(notices, vec!["x = 1, y = 8".to_string()]);
+    }
+
+    /// v1.02: %-format edge cases — `%%` escape, missing args (kept
+    /// literally), extra args (ignored), no-arg format, NULL arg.
+    /// PG19 would raise on arity mismatch (pl_gram.y
+    /// `check_raise_parameters`); the shared evaluator stays total by
+    /// design (documented deviation, same as the v1.00 trigger
+    /// bodies). PG renders NULL params as `<NULL>`; the shared
+    /// text-cast renders them empty (same deviation).
+    #[test]
+    fn raise_notice_format_edges() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function fmt102(x int, y int) returns int volatile language plpgsql as $$
+begin
+  raise notice '100%% sure: %', x;
+  raise notice 'missing: % and %', x;
+  raise notice 'extra: %', x, y;
+  raise notice 'plain';
+  raise notice 'null: %', null;
+  return x;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select fmt102(5, 7)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["5"]]);
+        assert_eq!(
+            notices,
+            vec![
+                "100% sure: 5".to_string(),
+                "missing: 5 and %".to_string(),
+                "extra: 5".to_string(),
+                "plain".to_string(),
+                "null: ".to_string(),
+            ]
+        );
+        // Direct evaluator checks (same shared fn the trigger path uses).
+        assert_eq!(
+            format_raise_message("a=% b='%%'", &[Value::Int(1)]),
+            "a=1 b='%'".to_string()
+        );
+        assert_eq!(
+            format_raise_message("% %", &[Value::Bool(true)]),
+            "true %".to_string()
+        );
+    }
+
+    /// v1.02: RAISE EXCEPTION aborts the call with the rendered
+    /// message and P0001 (PG19's default errcode when no
+    /// condition/SQLSTATE is given), and is trappable by the v1.01
+    /// WHEN handlers (by name and by OTHERS).
+    #[test]
+    fn raise_exception_aborts() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function boom102() returns int volatile language plpgsql as $$
+begin
+  raise exception 'kaput %', 42;
+  return 1;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select boom102()");
+        let (code, message) = err_of(r);
+        assert_eq!(code, "P0001");
+        assert_eq!(message, "kaput 42");
+        assert!(notices.is_empty());
+        // Trappable by condition name and by OTHERS.
+        run_n(
+            &mut eng,
+            "create function trap102() returns int volatile language plpgsql as $$
+begin
+  raise exception 'nope';
+  return 1;
+exception when raise_exception then return -1;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, _) = run_n(&mut eng, "select trap102()");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["-1"]]);
+        run_n(
+            &mut eng,
+            "create function trap102b() returns int volatile language plpgsql as $$
+begin
+  raise exception 'nope';
+  return 1;
+exception when others then return -2;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, _) = run_n(&mut eng, "select trap102b()");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["-2"]]);
+    }
+
+    /// v1.02: unsupported RAISE levels (DEBUG/LOG/INFO/WARNING) are an
+    /// honest 0A000 at parse, like the v1.00 trigger bodies.
+    #[test]
+    fn raise_unsupported_level_is_0a000() {
+        let mut eng = engine();
+        for level in ["debug", "log", "info", "warning"] {
+            let (r, _) = run_n(
+                &mut eng,
+                &format!(
+                    "create function lvl102() returns int as 'begin raise {level} ''x''; return 1; end' language plpgsql"
+                ),
+            );
+            let (code, _) = err_of(r);
+            assert_eq!(code, "0A000", "level {level}");
+        }
+    }
+
+    /// v1.02: RAISE parse errors — missing format literal and garbage
+    /// after the format string are 42601.
+    #[test]
+    fn raise_parse_errors() {
+        let mut eng = engine();
+        let (r, _) = run_n(
+            &mut eng,
+            "create function rp102a() returns int as 'begin raise notice; return 1; end' language plpgsql",
+        );
+        assert_eq!(err_of(r).0, "42601");
+        let (r, _) = run_n(
+            &mut eng,
+            "create function rp102b() returns int as 'begin raise notice ''x'' oops; return 1; end' language plpgsql",
+        );
+        assert_eq!(err_of(r).0, "42601");
+    }
+
+    /// v1.02: named arguments in RAISE args rewrite to `$n` at CREATE
+    /// (and would on WAL-replay rebuild), so `x`/`y` resolve to the
+    /// call's parameters, not to columns.
+    #[test]
+    fn raise_named_arg_rewrite() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function narr102(alpha int, beta int) returns int volatile language plpgsql as $$
+begin
+  raise notice '% + % = %', alpha, beta, alpha + beta;
+  return alpha + beta;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select narr102(20, 22)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["42"]]);
+        assert_eq!(notices, vec!["20 + 22 = 42".to_string()]);
+        // The rewrite is visible in the stored parse (Param, not Column).
+        let fns = eng.db.functions.get("narr102").unwrap();
+        let fdef = fns
+            .iter()
+            .find(|f| f.arg_types == vec!["int", "int"])
+            .unwrap();
+        let pb = fdef.plpgsql.as_ref().unwrap();
+        match &pb.stmts[0] {
+            crate::sql::PlpgsqlStmt::Raise { args, .. } => {
+                assert!(matches!(args[0], crate::sql::Expr::Param(1)));
+                assert!(matches!(args[2], crate::sql::Expr::Arith { .. }));
+            }
+            s => panic!("expected Raise, got {s:?}"),
+        }
+    }
+
+    /// v1.02: named args inside CASE / array / subscript forms rewrite
+    /// AND substitute coherently (the substitutor descends through
+    /// the same forms the rewriter does).
+    #[test]
+    fn raise_rewrite_subst_coherent() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function coh102(x int) returns int volatile language plpgsql as $$\nbegin\n  raise notice 'c=%', case when x > 0 then x else 0 - x end;\n  return (array[x, x + 1])[2];\nend$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select coh102(5)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["6"]]);
+        assert_eq!(notices, vec!["c=5".to_string()]);
+        let (r, notices) = run_n(&mut eng, "select coh102(-3)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["-2"]]);
+        assert_eq!(notices, vec!["c=3".to_string()]);
+    }
+
+    /// v1.02: multiple RAISE NOTICE calls in one statement accumulate
+    /// in order.
+    #[test]
+    fn raise_multiple_notices_accumulate() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function multi102(x int) returns int volatile language plpgsql as $$
+begin
+  raise notice 'first %', x;
+  raise notice 'second %', x + 1;
+  return x;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select multi102(1)");
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["1"]]);
+        assert_eq!(notices, vec!["first 1".to_string(), "second 2".to_string()]);
+    }
+
+    /// v1.02: a notice raised before a later error is still delivered
+    /// (PG19 emits notices as generated, even when the statement
+    /// later fails).
+    #[test]
+    fn raise_notice_survives_later_error() {
+        let mut eng = engine();
+        run_n(
+            &mut eng,
+            "create function ne102() returns int volatile language plpgsql as $$
+begin
+  raise notice 'before the fall';
+  return 1/0;
+end$$;",
+        )
+        .0
+        .unwrap();
+        let (r, notices) = run_n(&mut eng, "select ne102()");
+        assert_eq!(err_of(r).0, "22012");
+        assert_eq!(notices, vec!["before the fall".to_string()]);
     }
 }
 

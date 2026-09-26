@@ -2750,6 +2750,17 @@ pub enum PlpgsqlStmt {
     /// A supported utility statement, parsed at CREATE (currently only
     /// `Stmt::Analyze`); executed for side effects, results discarded.
     Utility(Stmt),
+    /// v1.02: `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+    /// Reuses the v1.00 trigger-body [`RaiseLevel`] enum and the shared
+    /// `%-format` evaluator (`format_raise_message` in exec.rs) — the
+    /// parse shape mirrors the trigger-body RAISE. Unsupported levels
+    /// (DEBUG/LOG/INFO/WARNING) are rejected at parse with 0A000, like
+    /// trigger bodies.
+    Raise {
+        level: RaiseLevel,
+        format: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// v1.01: one `WHEN <conditions> THEN <statements>` clause.
@@ -3234,11 +3245,151 @@ fn split_plpgsql_chunks(body: &str) -> Vec<String> {
 /// v1.01: parse one plpgsql statement — `RETURN <expr>` or a supported
 /// utility statement. Anything else is an honest 0A000 (outside the
 /// bounded subset); a malformed RETURN expression is 42601.
+/// v1.02: split `s` on top-level commas: commas inside quotes
+/// (single-quoted with `''` escapes, double-quoted), comments are not
+/// produced here (the body chunker strips them), or nested
+/// `(...)` / `[...]` do not split. Used for the RAISE argument list.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: usize = 0;
+    let mut start: usize = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                let q = c;
+                while let Some((_, d)) = chars.next() {
+                    if d == q {
+                        if chars.peek().is_some_and(|(_, e)| *e == q) {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// v1.02: parse `RAISE <level> '<format>' [, <expr> ...]` (the RAISE
+/// keyword already stripped). PG19 pl_gram.y `stmt_raise`.
+///
+/// Only NOTICE and EXCEPTION are supported in the bounded grammar;
+/// any other level (DEBUG/LOG/INFO/WARNING) is an honest 0A000,
+/// mirroring the v1.00 trigger-body rule. Each argument parses as a
+/// scalar expression via the same `SELECT <expr>` trick the RETURN
+/// path uses, so the named-argument `rewrite_func_arg_refs` machinery
+/// in exec.rs applies to RAISE args unchanged.
+fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let rest = rest.trim_start();
+    // Level word (word boundary, like plpgsql_strip_kw).
+    let mut lvl_len = 0;
+    for (i, c) in rest.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            lvl_len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let (lvl_word, after_lvl) = rest.split_at(lvl_len);
+    let level = match lvl_word.to_ascii_lowercase().as_str() {
+        "notice" => RaiseLevel::Notice,
+        "exception" => RaiseLevel::Exception,
+        _ => {
+            return Err(SqlError {
+                message: format!(
+                    "RAISE level '{}' is not supported in plpgsql function bodies",
+                    lvl_word
+                ),
+                code: "0A000",
+            });
+        }
+    };
+    // Format string: a single-quoted literal with '' escapes.
+    let after_lvl = after_lvl.trim_start();
+    let lit = after_lvl
+        .strip_prefix('\'')
+        .ok_or_else(|| syntax("RAISE requires a format string literal".to_string()))?;
+    let mut format = String::new();
+    let mut chars = lit.char_indices().peekable();
+    let mut end_byte: Option<usize> = None;
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if chars.peek().is_some_and(|(_, d)| *d == '\'') {
+                format.push('\'');
+                chars.next();
+            } else {
+                end_byte = Some(i);
+                break;
+            }
+        } else {
+            format.push(c);
+        }
+    }
+    let end_byte =
+        end_byte.ok_or_else(|| syntax("unterminated string literal in RAISE".to_string()))?;
+    let after_fmt = lit[end_byte + 1..].trim_start();
+    // Optional `, <expr> ...` argument list.
+    let mut args = Vec::new();
+    if !after_fmt.is_empty() {
+        let list = after_fmt
+            .strip_prefix(',')
+            .ok_or_else(|| syntax("expected ',' after RAISE format string".to_string()))?;
+        for part in split_top_level_commas(list) {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(syntax(
+                    "empty expression in RAISE argument list".to_string(),
+                ));
+            }
+            let stmt = parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
+                message: format!("syntax error in RAISE argument: {}", e.message),
+                code: "42601",
+            })?;
+            let Stmt::Select(sel) = stmt else {
+                return Err(SqlError {
+                    message: "internal error: RAISE argument did not parse as SELECT".to_string(),
+                    code: "XX000",
+                });
+            };
+            let mut items = sel.items.into_iter();
+            match (items.next(), items.next()) {
+                (Some(SelectItem::Expr { expr, .. }), None) => args.push(expr),
+                _ => {
+                    return Err(syntax(format!(
+                        "RAISE argument is not a scalar expression: {}",
+                        part.chars().take(40).collect::<String>()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(PlpgsqlStmt::Raise {
+        level,
+        format,
+        args,
+    })
+}
+
 fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     fn unsupported(text: &str) -> SqlError {
         SqlError {
             message: format!(
-                "unsupported statement in plpgsql body (only RETURN and ANALYZE are supported): {}",
+                "unsupported statement in plpgsql body (only RETURN, RAISE, and ANALYZE are supported): {}",
                 text.chars().take(60).collect::<String>()
             ),
             code: "0A000",
@@ -3264,6 +3415,10 @@ fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             });
         }
         return Ok(PlpgsqlStmt::Return(stmt));
+    }
+    // v1.02: `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+    if let Some(rest) = plpgsql_strip_kw(t, "raise") {
+        return parse_plpgsql_raise(rest);
     }
     let stmt = parse_statement(t).map_err(|_| unsupported(t))?;
     match stmt {

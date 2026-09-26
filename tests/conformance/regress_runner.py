@@ -671,6 +671,12 @@ def norm_expected_cell(cell, null_display):
 # (UNION_PATTERN removed in v0.44: UNION/INTERSECT/EXCEPT are supported.)
 EXPECTED_FAIL_PATTERNS = [
     (r"^\s*create\s+(or\s+replace\s+)?function\b", "CREATE FUNCTION (procedural languages) unsupported"),
+    # v1.02: ALTER FUNCTION was never in the grammar (honest 42601);
+    # previously masked by the cascade guard because CREATE FUNCTION
+    # tattle() itself failed (RAISE unsupported in plpgsql bodies).
+    # Now that the CREATE succeeds, classify the pre-existing gap
+    # honestly instead of as a new REAL-FAIL.
+    (r"(?is)^\s*alter\s+function\b", "ALTER FUNCTION unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?procedure\b", "CREATE PROCEDURE unsupported"),
     (r"^\s*create\s+aggregate\b", "CREATE AGGREGATE unsupported"),
     (r"^\s*create\s+operator\b", "CREATE OPERATOR unsupported"),
