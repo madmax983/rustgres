@@ -73,6 +73,16 @@ pub(crate) struct Session {
     /// v0.11: authenticated role name (lowercased). Every statement's
     /// privilege checks key off this.
     role: String,
+    /// v1.07: session user at authentication time (lowercased). `SET
+    /// ROLE` changes `role`; `RESET ROLE` / `SET ROLE NONE` restore it
+    /// (PG19: the role GUC resets to the session user).
+    session_user: String,
+    /// v1.07: validated-but-unmodeled session GUCs (planner knobs like
+    /// `enable_seqscan`, formatting knobs like `extra_float_digits`).
+    /// Values are PG19-validated and stored in canonical text form;
+    /// absence means the compiled default (see `guc_default`). The
+    /// transaction GUC stack reverts in-transaction changes, like PG.
+    gucs: HashMap<String, String>,
     stmts: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
     /// v0.74: SQL-level `PREPARE name AS ...` statements, separate from
@@ -166,6 +176,11 @@ struct Txn {
     deferrable: Option<bool>,
     /// Pinned at the first data statement for RR/SERIALIZABLE.
     snapshot: Option<Snapshot>,
+    /// v1.07: PG19's `FirstSnapshotSet` — set when the first statement
+    /// snapshot is taken inside this transaction. `SET TRANSACTION`'s
+    /// check hooks forbid characteristic changes afterwards (and in a
+    /// subtransaction), like PG19.
+    first_snapshot_set: bool,
     /// Uncommitted writes, in order: the undo log (abort / ROLLBACK TO)
     /// and the commit-time WAL source.
     writes: Vec<WriteOp>,
@@ -194,15 +209,38 @@ struct Txn {
     /// ROLLBACK TO SAVEPOINT cancels SET/SET LOCAL effects made after
     /// the savepoint, like Postgres.
     guc_marks: Vec<usize>,
+    /// v1.07: transaction characteristics (read_only, level,
+    /// deferrable) at each savepoint, in lockstep with `savepoints` —
+    /// PG19 restores the parent's characteristics on both ROLLBACK TO
+    /// and RELEASE SAVEPOINT.
+    txn_char_marks: Vec<(Option<bool>, IsolationLevel, Option<bool>)>,
 }
 
 /// v0.66: snapshot of one stateful GUC's session value, for the
 /// transaction GUC stack.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SavedGuc {
     ReadOnly(Option<bool>),
     ByteaOutput(crate::storage::ByteaOutput),
     Toast(crate::storage::ToastCompression),
+    /// v1.07: validated-but-unmodeled GUCs (planner knobs etc.): the
+    /// pre-change entry of `session.gucs` (None = was at default).
+    Generic(Option<String>),
+    /// v1.07: `SET TRANSACTION` characteristics: pre-change values of
+    /// the current transaction's read-only flag, isolation level and
+    /// deferrable flag. (PG19 routes SET TRANSACTION through the GUC
+    /// stack: ROLLBACK TO SAVEPOINT reverts them.)
+    TxnChars {
+        read_only: Option<bool>,
+        level: IsolationLevel,
+        deferrable: Option<bool>,
+    },
+    /// v1.07: `default_transaction_isolation` session default.
+    DefaultTxnLevel(Option<IsolationLevel>),
+    /// v1.07: `default_transaction_deferrable` session default.
+    DefaultTxnDeferrable(Option<bool>),
+    /// v1.07: `SET ROLE`: the pre-change `session.role`.
+    Role(String),
 }
 
 /// v0.66: one in-transaction GUC change.
@@ -223,6 +261,15 @@ fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
         "default_transaction_read_only" => Some(SavedGuc::ReadOnly(session.default_txn_read_only)),
         "bytea_output" => Some(SavedGuc::ByteaOutput(session.bytea_output)),
         "default_toast_compression" => Some(SavedGuc::Toast(session.default_toast_compression)),
+        // v1.07: unmodeled GUCs live in `session.gucs`.
+        _ if is_generic_guc(name) => Some(SavedGuc::Generic(session.gucs.get(name).cloned())),
+        "default_transaction_isolation" => {
+            Some(SavedGuc::DefaultTxnLevel(session.default_txn_level))
+        }
+        "default_transaction_deferrable" => Some(SavedGuc::DefaultTxnDeferrable(
+            session.default_txn_deferrable,
+        )),
+        "role" => Some(SavedGuc::Role(session.role.clone())),
         _ => None,
     }
 }
@@ -238,6 +285,41 @@ fn restore_saved_guc(session: &mut Session, name: &str, saved: SavedGuc) {
         }
         ("default_toast_compression", SavedGuc::Toast(v)) => {
             session.default_toast_compression = v;
+        }
+        // v1.07: unmodeled GUCs.
+        (n, SavedGuc::Generic(v)) if is_generic_guc(n) => match v {
+            Some(s) => {
+                session.gucs.insert(n.to_string(), s);
+            }
+            None => {
+                session.gucs.remove(n);
+            }
+        },
+        ("default_transaction_isolation", SavedGuc::DefaultTxnLevel(v)) => {
+            session.default_txn_level = v;
+        }
+        ("default_transaction_deferrable", SavedGuc::DefaultTxnDeferrable(v)) => {
+            session.default_txn_deferrable = v;
+        }
+        ("role", SavedGuc::Role(r)) => {
+            session.role = r;
+        }
+        // v1.07: transaction characteristics revert only while the
+        // transaction is still open (ROLLBACK TO SAVEPOINT); at
+        // transaction end the Txn is gone and there is nothing to do.
+        (
+            _,
+            SavedGuc::TxnChars {
+                read_only,
+                level,
+                deferrable,
+            },
+        ) => {
+            if let Some(t) = session.txn.as_mut() {
+                t.read_only = read_only;
+                t.level = level;
+                t.deferrable = deferrable;
+            }
         }
         _ => {}
     }
@@ -313,7 +395,10 @@ impl Session {
     pub(crate) fn new(role: String) -> Self {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
+            session_user: role.clone(),
             role,
+            // v1.07: no unmodeled GUCs set on a fresh session.
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -2141,6 +2226,7 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
                 .txn
                 .as_ref()
                 .map(|t| t.level)
+                .or(session.next_txn_level)
                 .or(session.default_txn_level)
                 .unwrap_or(IsolationLevel::ReadCommitted);
             Some(
@@ -2152,6 +2238,71 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
                 .to_string(),
             )
         }
+        // v1.07: `default_transaction_isolation` (read committed when
+        // unset).
+        "default_transaction_isolation" => Some(
+            match session
+                .default_txn_level
+                .unwrap_or(IsolationLevel::ReadCommitted)
+            {
+                IsolationLevel::ReadCommitted => "read committed",
+                IsolationLevel::RepeatableRead => "repeatable read",
+                IsolationLevel::Serializable => "serializable",
+            }
+            .to_string(),
+        ),
+        // v1.07: `default_transaction_deferrable` (off when unset).
+        "default_transaction_deferrable" => Some(
+            (if session.default_txn_deferrable == Some(true) {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        // v1.07: current-transaction read-only/deferrable (PG19).
+        "transaction_read_only" => Some(
+            (if session
+                .txn
+                .as_ref()
+                .and_then(|t| t.read_only)
+                .or(session.next_txn_read_only)
+                .or(session.default_txn_read_only)
+                .unwrap_or(false)
+            {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        "transaction_deferrable" => Some(
+            (if session
+                .txn
+                .as_ref()
+                .and_then(|t| t.deferrable)
+                .or(session.next_txn_deferrable)
+                .or(session.default_txn_deferrable)
+                .unwrap_or(false)
+            {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        // v1.07: `role` / `session_user` (PG19).
+        "role" => Some(session.role.clone()),
+        "session_user" => Some(session.session_user.clone()),
+        // v1.07: generic validated GUCs (stored value or compiled
+        // default).
+        _ if is_generic_guc(name) => Some(
+            session
+                .gucs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| guc_default(name).to_string()),
+        ),
         _ => None,
     }
 }
@@ -2161,24 +2312,37 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
 /// no-op returning the SET tag (PG would emit a WARNING; we have no
 /// NOTICE channel). Unlike PG we accept it after the first statement;
 /// the new modes apply going forward.
+/// v1.07: PG19 semantics — the modes go through the check hooks
+/// (`check_transaction_read_only/isolation/deferrable`, all 25001):
+/// read-only -> read-write is forbidden in a subtransaction and after
+/// the first snapshot; isolation changes are forbidden after the first
+/// snapshot and in a subtransaction; deferrable changes are forbidden
+/// in a subtransaction and after the first snapshot. Successful changes
+/// push a GUC-stack entry so ROLLBACK TO SAVEPOINT reverts them (PG19
+/// routes SET TRANSACTION through the GUC stack). `SET TRANSACTION
+/// SNAPSHOT 'id'` validates the identifier (22023 on bad chars) and
+/// reports 42704 for a well-formed but unknown snapshot — we do not
+/// implement imported snapshots.
 fn stmt_set_transaction(
     session: &mut Session,
     level: Option<IsolationLevel>,
     read_only: Option<bool>,
     deferrable: Option<bool>,
+    snapshot: Option<String>,
+    local: bool,
 ) -> Result<ExecResult, ExecError> {
-    if let Some(t) = session.txn.as_mut() {
-        // Inside a transaction: apply to the current transaction (PG).
-        if let Some(l) = level {
-            t.level = l;
-        }
-        if let Some(ro) = read_only {
-            t.read_only = Some(ro);
-        }
-        if let Some(d) = deferrable {
-            t.deferrable = Some(d);
-        }
-    } else {
+    // PG19: SET LOCAL is rejected outside a transaction block (the
+    // generic SET LOCAL check in stmt_set_guc does not cover this
+    // path).
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
+    if let Some(id) = snapshot {
+        return stmt_set_transaction_snapshot(session, &id);
+    }
+    let Some(t) = session.txn.as_mut() else {
         // Outside: store for the NEXT transaction (one-shot).
         if level.is_some() {
             session.next_txn_level = level;
@@ -2189,7 +2353,185 @@ fn stmt_set_transaction(
         if deferrable.is_some() {
             session.next_txn_deferrable = deferrable;
         }
+        return Ok(ExecResult::Command {
+            tag: "SET".to_string(),
+        });
+    };
+    // Inside a transaction: run PG19's check hooks.
+    let subtxn = !t.savepoints.is_empty();
+    let snap_set = t.first_snapshot_set;
+    let err_25001 = |msg: &str| ExecError {
+        detail: None,
+        code: "25001",
+        message: msg.to_string(),
+    };
+    // check_transaction_read_only: r/o -> r/w is forbidden in a
+    // subtransaction and after the first snapshot.
+    if let Some(ro) = read_only {
+        let cur_ro = t
+            .read_only
+            .or(session.default_txn_read_only)
+            .unwrap_or(false);
+        if !ro && cur_ro {
+            if subtxn {
+                return Err(err_25001(
+                    "cannot set transaction read-write mode inside a read-only transaction",
+                ));
+            }
+            if snap_set {
+                return Err(err_25001(
+                    "transaction read-write mode must be set before any query",
+                ));
+            }
+        }
     }
+    // check_transaction_isolation: changes forbidden after the first
+    // snapshot; subtransactions may only set the existing value.
+    if let Some(l) = level {
+        if l != t.level {
+            if snap_set {
+                return Err(err_25001(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                ));
+            }
+            if subtxn {
+                return Err(err_25001(
+                    "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                ));
+            }
+        }
+    }
+    // check_transaction_deferrable: forbidden in a subtransaction and
+    // after the first snapshot (PG checks the subtransaction first,
+    // unconditionally).
+    if deferrable.is_some() {
+        if subtxn {
+            return Err(err_25001(
+                "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+            ));
+        }
+        if snap_set {
+            return Err(err_25001(
+                "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+            ));
+        }
+    }
+    // All checks passed: record the pre-change characteristics for
+    // ROLLBACK TO SAVEPOINT, then apply.
+    let changed = level.is_some_and(|l| l != t.level)
+        || read_only.is_some_and(|ro| Some(ro) != t.read_only)
+        || deferrable.is_some_and(|d| Some(d) != t.deferrable);
+    if changed {
+        t.guc_stack.push(GucStackEntry {
+            name: "transaction_characteristics",
+            is_local: local,
+            saved: SavedGuc::TxnChars {
+                read_only: t.read_only,
+                level: t.level,
+                deferrable: t.deferrable,
+            },
+        });
+    }
+    if let Some(l) = level {
+        t.level = l;
+    }
+    if let Some(ro) = read_only {
+        t.read_only = Some(ro);
+    }
+    if let Some(d) = deferrable {
+        t.deferrable = Some(d);
+    }
+    Ok(ExecResult::Command {
+        tag: "SET".to_string(),
+    })
+}
+
+/// v1.07: `SET TRANSACTION SNAPSHOT 'snapshot-id'` (PG19). The
+/// identifier may only contain `0-9`, `A-F` and `-` (22023
+/// "invalid snapshot identifier" otherwise); a well-formed but
+/// unknown id is 42704 ("snapshot ... does not exist") — we do not
+/// implement imported snapshots.
+fn stmt_set_transaction_snapshot(session: &mut Session, id: &str) -> Result<ExecResult, ExecError> {
+    if session.txn.is_none() {
+        // PG19: WarnNoTransactionBlock — a warning, statement succeeds.
+        return Ok(ExecResult::Command {
+            tag: "SET".to_string(),
+        });
+    }
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c) || c == '-')
+    {
+        return Err(ExecError {
+            detail: None,
+            code: "22023",
+            message: format!("invalid snapshot identifier: {:?}", id),
+        });
+    }
+    Err(ExecError {
+        detail: None,
+        code: "42704",
+        message: format!("snapshot {:?} does not exist", id),
+    })
+}
+
+/// v1.07: SET ROLE (the "role" GUC; PG19 `check_role`/`assign_role`).
+/// `None` (RESET ROLE / `SET ROLE NONE`) restores the session user.
+/// Otherwise the target role must exist (42704) and the session user
+/// must be a superuser or a member of it (42501,
+/// "permission denied to set role").
+fn stmt_set_role(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    target: Option<String>,
+    local: bool,
+) -> Result<ExecResult, ExecError> {
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
+    let new_role = match target {
+        None => session.session_user.clone(),
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            let guard = lock_engine(engine);
+            let snap = guard.take_snapshot();
+            if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42704",
+                    message: format!("role \"{}\" does not exist", name),
+                });
+            }
+            // PG19 `member_can_set_role`: a superuser, or the session
+            // user is a member of the target role.
+            let allowed = crate::storage::is_superuser_snap(
+                &guard.db,
+                &session.session_user,
+                &snap,
+                u64::MAX,
+            ) || crate::storage::role_closure(
+                &guard.db,
+                &session.session_user,
+                &snap,
+                u64::MAX,
+            )
+            .iter()
+            .any(|r| r == &name);
+            if !allowed {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42501",
+                    message: format!("permission denied to set role \"{}\"", name),
+                });
+            }
+            name
+        }
+    };
+    push_guc_entry(session, "role", local);
+    session.role = new_role;
     Ok(ExecResult::Command {
         tag: "SET".to_string(),
     })
@@ -2204,7 +2546,278 @@ fn parse_bool_guc(s: &str) -> Option<bool> {
     }
 }
 
-/// v0.17: `SET name = value`. Only `default_transaction_read_only` is
+/// v1.07: isolation-level GUC spellings (`default_transaction_isolation`,
+/// `transaction_isolation`). `read uncommitted` folds to read committed,
+/// like PG19.
+fn parse_isolation_guc(s: &str) -> Option<IsolationLevel> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "serializable" => Some(IsolationLevel::Serializable),
+        "repeatable read" => Some(IsolationLevel::RepeatableRead),
+        "read committed" | "read uncommitted" => Some(IsolationLevel::ReadCommitted),
+        _ => None,
+    }
+}
+
+/// v1.07: GUCs accepted with PG19-compatible validation but no engine
+/// effect (planner knobs, `extra_float_digits`, `work_mem`, ...).
+/// Values are validated like PG19 and stored in canonical text form in
+/// `session.gucs`; absence means the compiled default (`guc_default`).
+/// In-transaction changes revert via the GUC stack, like PG.
+fn is_generic_guc(name: &str) -> bool {
+    matches!(
+        name,
+        "enable_seqscan"
+            | "enable_indexscan"
+            | "enable_bitmapscan"
+            | "enable_indexonlyscan"
+            | "enable_hashagg"
+            | "enable_hashjoin"
+            | "enable_mergejoin"
+            | "enable_nestloop"
+            | "enable_sort"
+            | "enable_memoize"
+            | "enable_partitionwise_join"
+            | "geqo"
+            | "extra_float_digits"
+            | "work_mem"
+            | "geqo_threshold"
+            | "join_collapse_limit"
+            | "from_collapse_limit"
+            | "jit_above_cost"
+            | "parallel_setup_cost"
+            | "parallel_tuple_cost"
+            | "min_parallel_table_scan_size"
+            | "min_parallel_index_scan_size"
+            | "max_parallel_workers_per_gather"
+            | "max_parallel_workers"
+            | "max_worker_processes"
+            | "plan_cache_mode"
+            | "lc_numeric"
+            | "standard_conforming_strings"
+    )
+}
+
+/// v1.07: compiled default of a generic GUC, in canonical text form
+/// (PG19 `boot_val`s).
+fn guc_default(name: &str) -> &'static str {
+    match name {
+        "enable_partitionwise_join" => "off",
+        "extra_float_digits" => "1",
+        "work_mem" => "4MB",
+        "geqo_threshold" => "12",
+        "join_collapse_limit" | "from_collapse_limit" => "8",
+        "jit_above_cost" => "100000",
+        "parallel_setup_cost" => "1000",
+        "parallel_tuple_cost" => "0.1",
+        "min_parallel_table_scan_size" => "1024",
+        "min_parallel_index_scan_size" => "64",
+        "max_parallel_workers_per_gather" => "2",
+        "plan_cache_mode" => "auto",
+        "lc_numeric" => "C",
+        "standard_conforming_strings" => "on",
+        _ => "on",
+    }
+}
+
+/// v1.07: parse a PG19 memory-size GUC value (`work_mem`) into kB.
+/// Accepts a bare integer (kB) or a `kB`/`MB`/`GB` suffix
+/// (case-insensitive, `B` optional).
+fn parse_memory_kb(s: &str) -> Option<i64> {
+    let t = s.trim();
+    // Strip an optional trailing 'B'/'b', then the unit letter.
+    let t = t.strip_suffix(|c| c == 'B' || c == 'b').unwrap_or(t);
+    let (num, mult) = if let Some(n) = t.strip_suffix(|c| c == 'k' || c == 'K') {
+        (n, 1i64)
+    } else if let Some(n) = t.strip_suffix(|c| c == 'm' || c == 'M') {
+        (n, 1024)
+    } else if let Some(n) = t.strip_suffix(|c| c == 'g' || c == 'G') {
+        (n, 1024 * 1024)
+    } else {
+        (t, 1)
+    };
+    num.trim().parse::<i64>().ok()?.checked_mul(mult)
+}
+
+/// v1.07: validate a value for a generic GUC like PG19, returning the
+/// canonical text form. 22023 on invalid/out-of-range values, except
+/// `standard_conforming_strings = off` which is 0A000 (PG19:
+/// "non-standard string literals are not supported").
+fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
+    let invalid = || ExecError {
+        detail: None,
+        code: "22023",
+        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+    };
+    match name {
+        // Boolean planner knobs (PG19: all default on except
+        // enable_partitionwise_join).
+        "enable_seqscan"
+        | "enable_indexscan"
+        | "enable_bitmapscan"
+        | "enable_indexonlyscan"
+        | "enable_hashagg"
+        | "enable_hashjoin"
+        | "enable_mergejoin"
+        | "enable_nestloop"
+        | "enable_sort"
+        | "enable_memoize"
+        | "enable_partitionwise_join"
+        | "geqo" => parse_bool_guc(value)
+            .map(|b| (if b { "on" } else { "off" }).to_string())
+            .ok_or_else(invalid),
+        "extra_float_digits" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(-15..=3).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "work_mem" => {
+            let kb = parse_memory_kb(value).ok_or_else(invalid)?;
+            if kb < 64 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "\"{}\" is outside the valid range for parameter \"work_mem\" (64kB .. 2097151MB)",
+                        value
+                    ),
+                });
+            }
+            Ok(format!("{}kB", kb))
+        }
+        "geqo_threshold" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 2 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"geqo_threshold\" (2 .. 2147483647)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "join_collapse_limit" | "from_collapse_limit" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 1 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\" (1 .. 2147483647)",
+                        value, name
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "jit_above_cost" | "parallel_setup_cost" | "parallel_tuple_cost" => {
+            let f: f64 = value.trim().parse().map_err(|_| invalid())?;
+            let min = if name == "jit_above_cost" { -1.0 } else { 0.0 };
+            if f < min {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(value.trim().to_string())
+        }
+        "min_parallel_table_scan_size"
+        | "min_parallel_index_scan_size"
+        | "max_parallel_workers_per_gather"
+        | "max_parallel_workers"
+        | "max_worker_processes" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 0 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "plan_cache_mode" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "force_generic_plan" | "force_custom_plan" => {
+                Ok(value.trim().to_ascii_lowercase())
+            }
+            _ => Err(invalid()),
+        },
+        // v1.07: locale name; accepted without catalog validation.
+        "lc_numeric" => Ok(value.to_string()),
+        "standard_conforming_strings" => {
+            let b = parse_bool_guc(value).ok_or_else(invalid)?;
+            if !b {
+                return Err(ExecError {
+                    detail: None,
+                    code: "0A000",
+                    message: "non-standard string literals are not supported".to_string(),
+                });
+            }
+            Ok("on".to_string())
+        }
+        _ => Err(ExecError {
+            detail: None,
+            code: "42704",
+            message: format!("unrecognized configuration parameter \"{}\"", name),
+        }),
+    }
+}
+
+/// v1.07: map a generic GUC name to its `&'static str` for the GUC
+/// stack (all generic GUC names are fixed string literals).
+fn name_to_static(name: &str) -> &'static str {
+    match name {
+        "enable_seqscan" => "enable_seqscan",
+        "enable_indexscan" => "enable_indexscan",
+        "enable_bitmapscan" => "enable_bitmapscan",
+        "enable_indexonlyscan" => "enable_indexonlyscan",
+        "enable_hashagg" => "enable_hashagg",
+        "enable_hashjoin" => "enable_hashjoin",
+        "enable_mergejoin" => "enable_mergejoin",
+        "enable_nestloop" => "enable_nestloop",
+        "enable_sort" => "enable_sort",
+        "enable_memoize" => "enable_memoize",
+        "enable_partitionwise_join" => "enable_partitionwise_join",
+        "geqo" => "geqo",
+        "extra_float_digits" => "extra_float_digits",
+        "work_mem" => "work_mem",
+        "geqo_threshold" => "geqo_threshold",
+        "join_collapse_limit" => "join_collapse_limit",
+        "from_collapse_limit" => "from_collapse_limit",
+        "jit_above_cost" => "jit_above_cost",
+        "parallel_setup_cost" => "parallel_setup_cost",
+        "parallel_tuple_cost" => "parallel_tuple_cost",
+        "min_parallel_table_scan_size" => "min_parallel_table_scan_size",
+        "min_parallel_index_scan_size" => "min_parallel_index_scan_size",
+        "max_parallel_workers_per_gather" => "max_parallel_workers_per_gather",
+        "max_parallel_workers" => "max_parallel_workers",
+        "max_worker_processes" => "max_worker_processes",
+        "plan_cache_mode" => "plan_cache_mode",
+        "lc_numeric" => "lc_numeric",
+        "standard_conforming_strings" => "standard_conforming_strings",
+        _ => "unrecognized",
+    }
+}
+
+/// v1.07: `SET name = value`. Only `default_transaction_read_only` is
 /// honored; unknown parameters are 42704 (undefined_object), like PG.
 /// v0.29: `bytea_output` (hex|escape) added.
 /// v0.66: `local` (from `SET LOCAL`) makes the change
@@ -2226,16 +2839,17 @@ fn stmt_set_guc(
     }
     match name {
         "default_transaction_read_only" => {
+            // v1.07: `SET ... TO DEFAULT` is a reset (None), like PG.
             let ro = match value {
-                SetValue::Default => false,
-                SetValue::Str(s) => parse_bool_guc(s).ok_or_else(|| ExecError {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                })?,
+                })?),
             };
             push_guc_entry(session, "default_transaction_read_only", local);
-            session.default_txn_read_only = Some(ro);
+            session.default_txn_read_only = ro;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
@@ -2282,53 +2896,96 @@ fn stmt_set_guc(
                 tag: "SET".to_string(),
             })
         }
-        // v0.64: parallel-planner GUCs are accepted as no-ops (we have
-        // no cost-based planner or parallel scan to tune, but PG
-        // accepts them and regression tests SET them). Values are
-        // validated like PG's where cheap: costs are non-negative
-        // numbers, worker counts are non-negative integers.
-        "parallel_setup_cost" | "parallel_tuple_cost" => match value {
-            SetValue::Default => Ok(ExecResult::Command {
+        // v1.07: `default_transaction_isolation` session default (PG19
+        // enum GUC). `read uncommitted` folds to read committed, like PG.
+        "default_transaction_isolation" => {
+            let level = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            push_guc_entry(session, "default_transaction_isolation", local);
+            session.default_txn_level = level;
+            Ok(ExecResult::Command {
                 tag: "SET".to_string(),
-            }),
-            SetValue::Str(s) => {
-                let ok = s.parse::<f64>().map(|f| f >= 0.0).unwrap_or(false);
-                if ok {
-                    Ok(ExecResult::Command {
-                        tag: "SET".to_string(),
-                    })
-                } else {
-                    Err(ExecError {
-                        detail: None,
-                        code: "22023",
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                    })
+            })
+        }
+        // v1.07: `default_transaction_deferrable` session default (PG19
+        // bool GUC; not directly exercised by the regression files, but
+        // SET SESSION CHARACTERISTICS can set it).
+        "default_transaction_deferrable" => {
+            let d = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            push_guc_entry(session, "default_transaction_deferrable", local);
+            session.default_txn_deferrable = d;
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
+        // v1.07: the current-transaction characteristics as GUCs (PG19
+        // routes SET TRANSACTION through SetPGVariable on these).
+        "transaction_isolation" => {
+            let level = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, level, None, None, None, local)
+        }
+        "transaction_read_only" => {
+            let ro = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, None, ro, None, None, local)
+        }
+        "transaction_deferrable" => {
+            let d = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, None, None, d, None, local)
+        }
+        // v1.07: validated-but-unmodeled GUCs (planner knobs,
+        // `extra_float_digits`, `work_mem`, ...): PG19-validated and
+        // stored; RESET restores the compiled default. `SET ... TO
+        // DEFAULT` is a reset, like PG.
+        _ if is_generic_guc(name) => {
+            match value {
+                SetValue::Default => {
+                    push_guc_entry(session, name_to_static(name), local);
+                    session.gucs.remove(name);
+                }
+                SetValue::Str(s) => {
+                    let canon = validate_generic_guc(name, s)?;
+                    push_guc_entry(session, name_to_static(name), local);
+                    session.gucs.insert(name.to_string(), canon);
                 }
             }
-        },
-        "max_parallel_workers_per_gather"
-        | "max_parallel_workers"
-        | "max_worker_processes"
-        | "min_parallel_table_scan_size"
-        | "min_parallel_index_scan_size" => match value {
-            SetValue::Default => Ok(ExecResult::Command {
+            Ok(ExecResult::Command {
                 tag: "SET".to_string(),
-            }),
-            SetValue::Str(s) => {
-                let ok = s.parse::<i64>().map(|i| i >= 0).unwrap_or(false);
-                if ok {
-                    Ok(ExecResult::Command {
-                        tag: "SET".to_string(),
-                    })
-                } else {
-                    Err(ExecError {
-                        detail: None,
-                        code: "22023",
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                    })
-                }
-            }
-        },
+            })
+        }
         // v0.68: read-only (PGC_INTERNAL, PG19 guc.c) GUCs are known
         // parameters, so SET on them is 55P02
         // ERRCODE_CANT_CHANGE_RUNTIME_PARAM (`parameter "x" cannot be
@@ -2338,6 +2995,14 @@ fn stmt_set_guc(
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
+        // v1.07: generic GUCs reset to their compiled default.
+        _ if is_generic_guc(name) => {
+            push_guc_entry(session, name_to_static(name), false);
+            session.gucs.remove(name);
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             detail: None,
             code: "42704",
@@ -2370,6 +3035,9 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 /// v0.66: RESET inside a transaction pushes a stack entry, like SET —
 /// a RESET in an aborted transaction reverts to the pre-transaction
 /// value (PG19).
+/// v1.07: `RESET transaction_isolation/read_only/deferrable` is 0A000
+/// (GUC_NO_RESET in PG19: "parameter ... cannot be reset");
+/// `RESET role` restores the session user.
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
         "all" => {
@@ -2379,9 +3047,23 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             push_guc_entry(session, "default_transaction_read_only", false);
             push_guc_entry(session, "bytea_output", false);
             push_guc_entry(session, "default_toast_compression", false);
+            push_guc_entry(session, "default_transaction_isolation", false);
+            push_guc_entry(session, "default_transaction_deferrable", false);
+            push_guc_entry(session, "role", false);
             session.default_txn_read_only = None;
             session.bytea_output = crate::storage::ByteaOutput::Hex;
             session.default_toast_compression = crate::storage::ToastCompression::default();
+            session.default_txn_level = None;
+            session.default_txn_deferrable = None;
+            session.role = session.session_user.clone();
+            // v1.07: generic GUCs reset to their compiled defaults.
+            // (PG19's RESET ALL skips GUC_NO_RESET ones; the
+            // transaction_* GUCs are not resettable anyway.)
+            let names: Vec<String> = session.gucs.keys().cloned().collect();
+            for n in &names {
+                push_guc_entry(session, name_to_static(n), false);
+            }
+            session.gucs.clear();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -2389,6 +3071,40 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         "default_transaction_read_only" => {
             push_guc_entry(session, "default_transaction_read_only", false);
             session.default_txn_read_only = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: `default_transaction_isolation` resets to the
+        // compiled default (read committed).
+        "default_transaction_isolation" => {
+            push_guc_entry(session, "default_transaction_isolation", false);
+            session.default_txn_level = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: `default_transaction_deferrable` resets to not set.
+        "default_transaction_deferrable" => {
+            push_guc_entry(session, "default_transaction_deferrable", false);
+            session.default_txn_deferrable = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: the current-transaction GUCs cannot be reset (PG19
+        // GUC_NO_RESET).
+        "transaction_isolation" | "transaction_read_only" | "transaction_deferrable" => {
+            Err(ExecError {
+                detail: None,
+                code: "0A000",
+                message: format!("parameter \"{}\" cannot be reset", name),
+            })
+        }
+        // v1.07: RESET ROLE restores the session user (PG19).
+        "role" => {
+            push_guc_entry(session, "role", false);
+            session.role = session.session_user.clone();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -2416,6 +3132,14 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
+        // v1.07: generic GUCs reset to their compiled default.
+        _ if is_generic_guc(name) => {
+            push_guc_entry(session, name_to_static(name), false);
+            session.gucs.remove(name);
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             detail: None,
             code: "42704",
@@ -2629,26 +3353,52 @@ fn run_statement(
             level,
             read_only,
             deferrable,
-        } => stmt_set_transaction(session, *level, *read_only, *deferrable),
+            snapshot,
+        } => stmt_set_transaction(
+            session,
+            *level,
+            *read_only,
+            *deferrable,
+            snapshot.clone(),
+            false,
+        ),
         Stmt::SetSessionCharacteristics {
             level,
             read_only,
             deferrable,
         } => {
+            // v1.07: PG19 implements this as SET of the three
+            // `default_transaction_*` GUCs (transactional, like PG).
             if let Some(l) = level {
+                push_guc_entry(session, "default_transaction_isolation", false);
                 session.default_txn_level = Some(*l);
             }
             if let Some(ro) = read_only {
+                push_guc_entry(session, "default_transaction_read_only", false);
                 session.default_txn_read_only = Some(*ro);
             }
             if let Some(d) = deferrable {
+                push_guc_entry(session, "default_transaction_deferrable", false);
                 session.default_txn_deferrable = Some(*d);
             }
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
         }
-        Stmt::Set { name, value, local } => stmt_set_guc(session, name, value, *local),
+        Stmt::Set { name, value, local } => {
+            // v1.07: SET ROLE is the "role" GUC (PG19); it needs the
+            // engine for the role-existence/membership check.
+            if name == "role" {
+                let target = match value {
+                    SetValue::Default => None,
+                    SetValue::Str(s) if s.eq_ignore_ascii_case("none") => None,
+                    SetValue::Str(s) => Some(s.clone()),
+                };
+                stmt_set_role(engine, session, target, *local)
+            } else {
+                stmt_set_guc(session, name, value, *local)
+            }
+        }
         Stmt::Show { name } => stmt_show_guc(session, name),
         Stmt::Reset { name } => stmt_reset_guc(session, name),
         _ => {
@@ -2716,6 +3466,9 @@ fn stmt_snapshot(engine: &mut Engine, txn: Option<&mut Txn>) -> (Snapshot, u64, 
                     }
                 },
             };
+            // v1.07: taking a snapshot marks PG19's `FirstSnapshotSet`,
+            // which forbids late `SET TRANSACTION` changes.
+            t.first_snapshot_set = true;
             (snap, xid, level)
         }
         None => (engine.take_snapshot(), 0, IsolationLevel::ReadCommitted),
@@ -2954,12 +3707,25 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
 /// default read-only mode like an autocommit statement would.
 fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
     let xid = lock_engine(engine).begin_txn();
+    // v1.07: apply the one-shot next-transaction characteristics, then
+    // the session defaults, like the explicit BEGIN path (PG19).
     session.txn = Some(Txn {
         xid,
-        level: IsolationLevel::ReadCommitted,
-        read_only: session.default_txn_read_only,
-        deferrable: None,
+        level: session
+            .next_txn_level
+            .take()
+            .or(session.default_txn_level)
+            .unwrap_or(IsolationLevel::ReadCommitted),
+        read_only: session
+            .next_txn_read_only
+            .take()
+            .or(session.default_txn_read_only),
+        deferrable: session
+            .next_txn_deferrable
+            .take()
+            .or(session.default_txn_deferrable),
         snapshot: None,
+        first_snapshot_set: false,
         writes: Vec::new(),
         savepoints: Vec::new(),
         cursor_marks: Vec::new(),
@@ -2967,6 +3733,7 @@ fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         implicit: true,
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
+        txn_char_marks: Vec::new(),
     });
 }
 
@@ -3105,6 +3872,7 @@ fn txn_begin(
         read_only,
         deferrable,
         snapshot: None,
+        first_snapshot_set: false,
         writes: Vec::new(),
         savepoints: Vec::new(),
         cursor_marks: Vec::new(),
@@ -3113,6 +3881,7 @@ fn txn_begin(
         // v0.66: fresh GUC stack per transaction.
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
+        txn_char_marks: Vec::new(),
     });
     Ok(cmd("BEGIN"))
 }
@@ -3392,6 +4161,9 @@ fn txn_savepoint(
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
             // effects made after the savepoint (PG19).
             t.guc_marks.push(t.guc_stack.len());
+            // v1.07: record the transaction characteristics for PG19's
+            // savepoint restore (both ROLLBACK TO and RELEASE).
+            t.txn_char_marks.push((t.read_only, t.level, t.deferrable));
             // v0.16: also snapshot the cursor set (v0.89: positions are
             // no longer rewound — PG19 keeps them across ROLLBACK TO).
             t.cursor_marks.push(CursorMark {
@@ -3457,6 +4229,14 @@ fn txn_rollback_to(
     let guc_to = t.guc_marks[idx];
     let undone: Vec<GucStackEntry> = t.guc_stack.drain(guc_to..).rev().collect();
     t.guc_marks.truncate(idx + 1);
+    // v1.07: PG19 restores the parent transaction's characteristics on
+    // ROLLBACK TO SAVEPOINT (the TxnChars stack entries do this too;
+    // the explicit mark is authoritative).
+    let (mark_ro, mark_level, mark_def) = t.txn_char_marks[idx];
+    t.read_only = mark_ro;
+    t.level = mark_level;
+    t.deferrable = mark_def;
+    t.txn_char_marks.truncate(idx + 1);
     // The GUC borrow ends here (`t` is dead); restore the canceled
     // effects newest-first, like a mini-abort of the savepoint tail.
     for e in undone {
@@ -3514,6 +4294,14 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
     // stacked GUC changes are NOT canceled by RELEASE (PG >= 8.3):
     // they still revert at transaction end.
     t.guc_marks.truncate(idx);
+    // v1.07: PG19 restores the parent transaction's characteristics on
+    // RELEASE SAVEPOINT (subcommit restores XactReadOnly etc.), even
+    // though the generic GUC changes survive.
+    let (mark_ro, mark_level, mark_def) = t.txn_char_marks[idx];
+    t.read_only = mark_ro;
+    t.level = mark_level;
+    t.deferrable = mark_def;
+    t.txn_char_marks.truncate(idx);
     Ok(cmd("RELEASE"))
 }
 
@@ -4169,6 +4957,8 @@ mod tests {
         let session = Session {
             sid: 4242,
             role: "postgres".to_string(),
+            session_user: "postgres".to_string(),
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -4196,6 +4986,7 @@ mod tests {
                 read_only: None,
                 deferrable: None,
                 snapshot: None,
+                first_snapshot_set: false,
                 writes: Vec::new(),
                 savepoints: Vec::new(),
                 cursor_marks: Vec::new(),
@@ -4203,6 +4994,7 @@ mod tests {
                 implicit: false,
                 guc_stack: Vec::new(),
                 guc_marks: Vec::new(),
+                txn_char_marks: Vec::new(),
             }),
         };
         (engine, session)
@@ -4360,6 +5152,8 @@ mod tests {
         Session {
             sid: 4243,
             role: "postgres".to_string(),
+            session_user: "postgres".to_string(),
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -4861,5 +5655,218 @@ mod tests {
             "no warning on explicit COMMIT"
         );
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-explicit"));
+    }
+    // v1.07: generic GUC validation (PG19-compatible).
+    #[test]
+    fn v107_generic_guc_validation() {
+        // Booleans accept PG spellings.
+        assert_eq!(
+            validate_generic_guc("enable_seqscan", "off").unwrap(),
+            "off"
+        );
+        assert_eq!(validate_generic_guc("enable_seqscan", "0").unwrap(), "off");
+        assert_eq!(validate_generic_guc("enable_seqscan", "on").unwrap(), "on");
+        let e = validate_generic_guc("enable_seqscan", "maybe").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // extra_float_digits range.
+        assert_eq!(
+            validate_generic_guc("extra_float_digits", "-1").unwrap(),
+            "-1"
+        );
+        let e = validate_generic_guc("extra_float_digits", "4").unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert!(e.message.contains("-15 .. 3"));
+        // work_mem minimum.
+        assert_eq!(validate_generic_guc("work_mem", "64MB").unwrap(), "65536kB");
+        let e = validate_generic_guc("work_mem", "32kB").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // plan_cache_mode enum.
+        assert_eq!(
+            validate_generic_guc("plan_cache_mode", "force_generic_plan").unwrap(),
+            "force_generic_plan"
+        );
+        let e = validate_generic_guc("plan_cache_mode", "sometimes").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // standard_conforming_strings = off is 0A000.
+        let e = validate_generic_guc("standard_conforming_strings", "off").unwrap_err();
+        assert_eq!(e.code, "0A000");
+    }
+
+    // v1.07: generic GUC SET/SHOW/RESET round-trip.
+    #[test]
+    fn v107_generic_guc_roundtrip() {
+        let mut session = session_no_txn();
+        let set = |s: &mut Session, n: &str, v: &str| {
+            stmt_set_guc(s, n, &SetValue::Str(v.to_string()), false).unwrap();
+        };
+        // Defaults.
+        assert_eq!(show_text(&session, "enable_seqscan"), "on");
+        assert_eq!(show_text(&session, "enable_partitionwise_join"), "off");
+        assert_eq!(show_text(&session, "extra_float_digits"), "1");
+        assert_eq!(show_text(&session, "work_mem"), "4MB");
+        assert_eq!(show_text(&session, "plan_cache_mode"), "auto");
+        // SET + SHOW.
+        set(&mut session, "enable_seqscan", "off");
+        assert_eq!(show_text(&session, "enable_seqscan"), "off");
+        set(&mut session, "extra_float_digits", "-2");
+        assert_eq!(show_text(&session, "extra_float_digits"), "-2");
+        // RESET restores the default.
+        stmt_reset_guc(&mut session, "enable_seqscan").unwrap();
+        assert_eq!(show_text(&session, "enable_seqscan"), "on");
+        stmt_reset_guc(&mut session, "extra_float_digits").unwrap();
+        assert_eq!(show_text(&session, "extra_float_digits"), "1");
+        // Unknown GUC is still 42704.
+        let e = stmt_set_guc(
+            &mut session,
+            "no_such_guc",
+            &SetValue::Str("1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "42704");
+    }
+
+    // v1.07: default_transaction_isolation SET/SHOW/RESET.
+    #[test]
+    fn v107_default_txn_isolation() {
+        let mut session = session_no_txn();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "read committed"
+        );
+        stmt_set_guc(
+            &mut session,
+            "default_transaction_isolation",
+            &SetValue::Str("serializable".into()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "serializable"
+        );
+        stmt_reset_guc(&mut session, "default_transaction_isolation").unwrap();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "read committed"
+        );
+        let e = stmt_set_guc(
+            &mut session,
+            "default_transaction_isolation",
+            &SetValue::Str("chaos".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22023");
+    }
+
+    // v1.07: RESET of current-transaction GUCs is 0A000.
+    #[test]
+    fn v107_reset_current_txn_guc_is_0a000() {
+        let mut session = session_no_txn();
+        for name in [
+            "transaction_isolation",
+            "transaction_read_only",
+            "transaction_deferrable",
+        ] {
+            let e = stmt_reset_guc(&mut session, name).unwrap_err();
+            assert_eq!(e.code, "0A000", "{}", name);
+        }
+    }
+
+    // v1.07: SET TRANSACTION checks (25001) inside a transaction.
+    #[test]
+    fn v107_set_transaction_checks() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        // Isolation change before any snapshot is fine.
+        stmt_set_transaction(
+            &mut session,
+            Some(IsolationLevel::Serializable),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            session.txn.as_ref().unwrap().level,
+            IsolationLevel::Serializable
+        );
+        // Simulate a snapshot having been taken.
+        session.txn.as_mut().unwrap().first_snapshot_set = true;
+        // Isolation change after first snapshot: 25001.
+        let e = stmt_set_transaction(
+            &mut session,
+            Some(IsolationLevel::ReadCommitted),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "25001");
+        // read-write after a read-only transaction has taken a snapshot: 25001.
+        session.txn.as_mut().unwrap().read_only = Some(true);
+        let e =
+            stmt_set_transaction(&mut session, None, Some(false), None, None, false).unwrap_err();
+        assert_eq!(e.code, "25001");
+        assert!(e.message.contains("before any query"));
+    }
+
+    // v1.07: SET TRANSACTION SNAPSHOT identifier validation.
+    #[test]
+    fn v107_set_transaction_snapshot_validation() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        // Outside a transaction: succeeds (PG warns).
+        stmt_set_transaction(&mut session, None, None, None, Some("0003".into()), false).unwrap();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        // Bad characters: 22023.
+        let e = stmt_set_transaction(&mut session, None, None, None, Some("abc".into()), false)
+            .unwrap_err();
+        assert_eq!(e.code, "22023");
+        // Well-formed but unknown: 42704.
+        let e = stmt_set_transaction(
+            &mut session,
+            None,
+            None,
+            None,
+            Some("0003-A1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "42704");
+    }
+
+    // v1.07: SET ROLE / RESET ROLE.
+    #[test]
+    fn v107_set_reset_role() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        // session_user is postgres (superuser); SET ROLE to an unknown role: 42704.
+        let e = stmt_set_role(&engine, &mut session, Some("nosuchrole".into()), false).unwrap_err();
+        assert_eq!(e.code, "42704");
+        // RESET ROLE restores the session user.
+        session.role = "someone".to_string();
+        stmt_set_role(&engine, &mut session, None, false).unwrap();
+        assert_eq!(session.role, "postgres");
+        assert_eq!(show_text(&session, "role"), "postgres");
+        assert_eq!(show_text(&session, "session_user"), "postgres");
     }
 }

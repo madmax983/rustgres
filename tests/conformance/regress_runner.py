@@ -791,9 +791,9 @@ EXPECTED_FAIL_PATTERNS = [
     (r"^\s*listen\b|^\s*notify\b|^\s*unlisten\b", "LISTEN/NOTIFY unsupported"),
     (r"^\s*copy\b", "COPY TO/FROM stdout not covered by this harness"),
     (r"^\s*vacuum\s+full\b", "VACUUM FULL unsupported"),
-    (r"^\s*set\b", "SET unsupported"),
-    (r"^\s*show\b", "SHOW unsupported"),
-    (r"^\s*reset\b", "RESET unsupported"),
+    # v1.07: SET/SHOW/RESET are supported (generic validated GUCs,
+    # transaction characteristics, ROLE). The broad masks are removed;
+    # genuinely unsupported parameters surface as 42704 (like PG).
     (r"::\s*regclass\b|::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
      "reg* pseudotypes unsupported"),
     (r"\bcurrent_setting\s*\(", "current_setting() unsupported"),

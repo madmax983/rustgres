@@ -4721,6 +4721,9 @@ pub enum Stmt {
         level: Option<IsolationLevel>,
         read_only: Option<bool>,
         deferrable: Option<bool>,
+        /// v1.07: `SET TRANSACTION SNAPSHOT 'snapshot-id'` — imported
+        /// snapshot id (PG19 special syntax, not combinable with modes).
+        snapshot: Option<String>,
     },
     /// `SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]` —
     /// defaults for subsequent transactions of this session.
@@ -11010,11 +11013,24 @@ impl Parser {
             } else {
                 break;
             }
-            // Modes are comma-separated; a missing comma ends the list.
+            // v1.07: PG19's `TransactionModeList` accepts comma-separated
+            // AND adjacent modes ("SET TRANSACTION READ WRITE READ ONLY"
+            // is valid PG). A comma is consumed; a following mode keyword
+            // continues the loop; anything else ends the list.
             if *self.peek() == Token::Comma {
                 self.next();
             } else {
-                break;
+                match self.peek() {
+                    Token::Ident(id)
+                        if id == "isolation"
+                            || id == "read"
+                            || id == "not"
+                            || id == "deferrable" =>
+                    {
+                        // Adjacent mode — continue without a comma.
+                    }
+                    _ => break,
+                }
             }
         }
         Ok((level, read_only, deferrable))
@@ -11024,12 +11040,32 @@ impl Parser {
     /// or `SET name = value` / `SET name TO value`.
     fn parse_set(&mut self) -> Result<Stmt, SqlError> {
         if self.eat_keyword("transaction") {
+            // v1.07: SET TRANSACTION SNAPSHOT 'snapshot-id' (PG19 special
+            // syntax, not combinable with other modes).
+            if self.eat_keyword("snapshot") {
+                let id = match self.next() {
+                    Token::Str(s) => s,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected snapshot identifier string, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                return Ok(Stmt::SetTransaction {
+                    level: None,
+                    read_only: None,
+                    deferrable: None,
+                    snapshot: Some(id),
+                });
+            }
             // SET TRANSACTION transaction_mode [, ...]
             let (level, read_only, deferrable) = self.parse_txn_modes()?;
             return Ok(Stmt::SetTransaction {
                 level,
                 read_only,
                 deferrable,
+                snapshot: None,
             });
         }
         if self.eat_keyword("session") {
@@ -11055,6 +11091,21 @@ impl Parser {
             self.eat_keyword("session");
         }
         let name = self.expect_ident()?;
+        // v1.07: SET [LOCAL|SESSION] ROLE name|NONE — PG19 treats this as
+        // the "role" GUC; the bare form (no TO) is the SQL-standard syntax.
+        // `SET ROLE TO 'name'` / `SET role = 'name'` go through the generic
+        // path below.
+        if name == "role"
+            && *self.peek() != Token::Eq
+            && !matches!(self.peek(), Token::Ident(s) if s == "to")
+        {
+            let role_name = self.expect_ident()?;
+            return Ok(Stmt::Set {
+                name,
+                value: SetValue::Str(role_name),
+                local,
+            });
+        }
         if self.eat_keyword("to") {
             // consumed TO
         } else if *self.peek() == Token::Eq {
@@ -11072,6 +11123,31 @@ impl Parser {
                 self.next();
                 SetValue::Str(num)
             }
+            // v1.07: signed numeric values, e.g. `SET extra_float_digits = -1`.
+            Token::Minus => match self.next() {
+                Token::Number(num) => {
+                    self.next();
+                    SetValue::Str(format!("-{}", num))
+                }
+                other => {
+                    return Err(err(format!(
+                        "syntax error: unexpected SET value {:?}",
+                        other
+                    )));
+                }
+            },
+            Token::Plus => match self.next() {
+                Token::Number(num) => {
+                    self.next();
+                    SetValue::Str(num)
+                }
+                other => {
+                    return Err(err(format!(
+                        "syntax error: unexpected SET value {:?}",
+                        other
+                    )));
+                }
+            },
             Token::Ident(kw) => {
                 // A bare keyword value (ON, OFF, TRUE, ...): fold to the
                 // lowercased keyword text. DEFAULT resets the parameter.
@@ -15269,6 +15345,86 @@ mod v72_ddl_tests {
         match parse_statement("alter table t add a int").expect("parses") {
             Stmt::AlterTable { actions, .. } => assert_eq!(actions.len(), 1),
             other => panic!("expected ALTER TABLE, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod v107_set_tests {
+    use super::*;
+
+    #[test]
+    fn set_transaction_adjacent_modes() {
+        // v1.07: PG19 accepts adjacent (comma-less) transaction modes.
+        match parse_statement("SET TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
+            .expect("parses")
+        {
+            Stmt::SetTransaction {
+                level,
+                read_only,
+                snapshot,
+                ..
+            } => {
+                assert_eq!(level, Some(IsolationLevel::Serializable));
+                assert_eq!(read_only, Some(false));
+                assert_eq!(snapshot, None);
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+        match parse_statement("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .expect("parses")
+        {
+            Stmt::SetTransaction {
+                level, read_only, ..
+            } => {
+                assert_eq!(level, Some(IsolationLevel::RepeatableRead));
+                assert_eq!(read_only, Some(true));
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_transaction_snapshot() {
+        // v1.07: SET TRANSACTION SNAPSHOT 'id'.
+        match parse_statement("SET TRANSACTION SNAPSHOT '0003-A1'").expect("parses") {
+            Stmt::SetTransaction {
+                snapshot, level, ..
+            } => {
+                assert_eq!(snapshot, Some("0003-A1".to_string()));
+                assert_eq!(level, None);
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_role_bare() {
+        // v1.07: bare SET ROLE name (PG19).
+        match parse_statement("SET ROLE regress_insert_other_user").expect("parses") {
+            Stmt::Set { name, value, .. } => {
+                assert_eq!(name, "role");
+                match value {
+                    SetValue::Str(s) => assert_eq!(s, "regress_insert_other_user"),
+                    other => panic!("expected Str, got {:?}", other),
+                }
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_signed_numeric_value() {
+        // v1.07: signed numeric SET values (e.g. extra_float_digits = -1).
+        match parse_statement("SET extra_float_digits = -1").expect("parses") {
+            Stmt::Set { name, value, .. } => {
+                assert_eq!(name, "extra_float_digits");
+                match value {
+                    SetValue::Str(s) => assert_eq!(s, "-1"),
+                    other => panic!("expected Str, got {:?}", other),
+                }
+            }
+            other => panic!("expected Set, got {:?}", other),
         }
     }
 }
