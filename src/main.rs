@@ -7,7 +7,7 @@
 mod copy;
 mod crypto;
 mod datetime;
-mod exec;
+pub(crate) mod exec;
 mod fxhash;
 mod index;
 mod net;

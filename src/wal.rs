@@ -3174,9 +3174,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     ));
                 }
             };
-            let parsed = crate::sql::parse_statement(body)
-                .map_err(|e| format!("corrupt function body in WAL: {:?}", e))
-                .ok();
+            let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(lang, arg_names, body);
             // v0.87: replay appends to the overload list (replacing any
             // existing overload with the same signature).
             {
@@ -3189,6 +3187,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     lang,
                     body: body.clone(),
                     parsed,
+                    // v1.01: multi-statement plpgsql bodies.
+                    plpgsql,
                     volatility,
                     strict: *strict,
                 };
@@ -5868,9 +5868,7 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 b => return Err(bad(&format!("corrupt function volatility {}", b))),
             };
             let strict = d.u8().map_err(|e| bad(&e))? != 0;
-            let parsed = crate::sql::parse_statement(&body)
-                .map_err(|e| bad(&format!("corrupt function body: {:?}", e)))
-                .ok();
+            let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(lang, &arg_names, &body);
             overloads.push(crate::storage::FuncDef {
                 name: name.clone(),
                 arg_names,
@@ -5880,6 +5878,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 lang,
                 body,
                 parsed,
+                // v1.01: multi-statement plpgsql bodies.
+                plpgsql,
                 volatility,
                 strict,
             });

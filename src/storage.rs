@@ -5031,6 +5031,12 @@ pub struct FuncDef {
     pub lang: crate::sql::FuncLang,
     pub body: String,
     pub parsed: Option<crate::sql::Stmt>,
+    /// v1.01: parsed multi-statement plpgsql body (statement sequences +
+    /// EXCEPTION blocks). `Some` only when the v0.97 single-RETURN
+    /// desugar did not apply; then `body` holds the original source and
+    /// `parsed` is None. Rebuilt from `body` after WAL replay /
+    /// checkpoint restore.
+    pub plpgsql: Option<crate::sql::PlpgsqlBody>,
     pub volatility: crate::sql::FuncVolatility,
     pub strict: bool,
 }

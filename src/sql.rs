@@ -2709,6 +2709,797 @@ pub fn desugar_plpgsql_body(body: &str) -> Result<String, String> {
     Ok(format!("SELECT {}", expr))
 }
 
+// ---------------------------------------------------------------------------
+// v1.01: bounded PL/pgSQL statement sequences + EXCEPTION blocks.
+//
+// PG19 grounding:
+// - Grammar: `pl_block` / `exception_sect` / `proc_exceptions` /
+//   `proc_conditions` (`src/pl/plpgsql/src/pl_gram.y`).
+// - Condition name -> SQLSTATE: `plpgsql_parse_err_condition`
+//   (`pl_comp.c`) over `exception_label_map` (generated `plerrcodes.h`).
+// - Trap semantics: `exec_stmt_block` / `exception_matches_conditions`
+//   (`pl_exec.c`): the first WHEN clause whose condition list matches
+//   wins; exact SQLSTATE match, category match for `...000` conditions,
+//   OTHERS matches everything except query_canceled (57014) and
+//   assert_failure (P0004); the trapped error aborts the block's
+//   subtransaction; errors raised inside a handler propagate untrapped.
+// - Missing trailing RETURN: `add_dummy_return` (`pl_comp.c`) appends an
+//   implicit `RETURN NULL` outside the exception block.
+//
+// Deliberate deviations from PG19:
+// - No subtransactions: a trapped error does NOT roll back the effects
+//   of statements that ran before it in the body (rustgres has no
+//   subtransaction machinery; ANALYZE — the only supported utility
+//   statement — has no transactional effects to roll back anyway).
+// - No variables: no DECLARE section, no assignments, and no
+//   SQLSTATE/SQLERRM magic variables inside handlers.
+// - Statement subset: each statement is `RETURN <expr>` or a supported
+//   utility statement (currently only ANALYZE). Anything else is an
+//   honest 0A000 at CREATE; a malformed RETURN expression is 42601; an
+//   unknown condition name is 42704 (`unrecognized exception condition`,
+//   like PG's ERRCODE_UNDEFINED_OBJECT).
+// ---------------------------------------------------------------------------
+
+/// v1.01: one statement of a bounded PL/pgSQL body.
+#[derive(Clone, Debug)]
+pub enum PlpgsqlStmt {
+    /// `RETURN <expr>`: stored as the parsed `SELECT <expr>` so the
+    /// executor reuses `subst_params` + `run_select` verbatim. Always
+    /// `Stmt::Select` (enforced at parse).
+    Return(Stmt),
+    /// A supported utility statement, parsed at CREATE (currently only
+    /// `Stmt::Analyze`); executed for side effects, results discarded.
+    Utility(Stmt),
+}
+
+/// v1.01: one `WHEN <conditions> THEN <statements>` clause.
+#[derive(Clone, Debug)]
+pub struct PlpgsqlHandler {
+    /// Trapped SQLSTATEs in source order (one condition name may expand
+    /// to several codes, like PG's `PLpgSQL_condition` list). The
+    /// pseudo-condition OTHERS is stored as the sentinel
+    /// `PLPGSQL_OTHERS_SENTINEL`.
+    pub sqlstates: Vec<String>,
+    pub stmts: Vec<PlpgsqlStmt>,
+}
+
+/// v1.01: a parsed bounded PL/pgSQL body:
+/// `BEGIN <stmts> [EXCEPTION <handlers>] END`.
+#[derive(Clone, Debug)]
+pub struct PlpgsqlBody {
+    pub stmts: Vec<PlpgsqlStmt>,
+    pub handlers: Vec<PlpgsqlHandler>,
+}
+
+/// v1.01: sentinel for the OTHERS pseudo-condition (never a real
+/// SQLSTATE; PG keeps it as the `PLPGSQL_OTHERS` enum value in
+/// `pl_comp.c`).
+const PLPGSQL_OTHERS_SENTINEL: &str = "OTHERS";
+
+static PLPGSQL_CONDITIONS: &[(&str, &str)] = &[
+    ("active_sql_transaction", "25001"),
+    ("admin_shutdown", "57P01"),
+    ("ambiguous_alias", "42P09"),
+    ("ambiguous_column", "42702"),
+    ("ambiguous_function", "42725"),
+    ("ambiguous_parameter", "42P08"),
+    ("array_subscript_error", "2202E"),
+    ("assert_failure", "P0004"),
+    ("bad_copy_file_format", "22P04"),
+    ("branch_transaction_already_active", "25002"),
+    ("cannot_coerce", "42846"),
+    ("cannot_connect_now", "57P03"),
+    ("cant_change_runtime_param", "55P02"),
+    ("cardinality_violation", "21000"),
+    ("case_not_found", "20000"),
+    ("character_not_in_repertoire", "22021"),
+    ("check_violation", "23514"),
+    ("collation_mismatch", "42P21"),
+    ("config_file_error", "F0000"),
+    ("configuration_limit_exceeded", "53400"),
+    ("connection_does_not_exist", "08003"),
+    ("connection_exception", "08000"),
+    ("connection_failure", "08006"),
+    ("containing_sql_not_permitted", "38001"),
+    ("crash_shutdown", "57P02"),
+    ("data_corrupted", "XX001"),
+    ("data_exception", "22000"),
+    ("database_dropped", "57P04"),
+    ("datatype_mismatch", "42804"),
+    ("datetime_field_overflow", "22008"),
+    ("deadlock_detected", "40P01"),
+    ("dependent_objects_still_exist", "2BP01"),
+    ("dependent_privilege_descriptors_still_exist", "2B000"),
+    ("diagnostics_exception", "0Z000"),
+    ("disk_full", "53100"),
+    ("division_by_zero", "22012"),
+    ("duplicate_alias", "42712"),
+    ("duplicate_column", "42701"),
+    ("duplicate_cursor", "42P03"),
+    ("duplicate_database", "42P04"),
+    ("duplicate_file", "58P02"),
+    ("duplicate_function", "42723"),
+    ("duplicate_json_object_key_value", "22030"),
+    ("duplicate_object", "42710"),
+    ("duplicate_prepared_statement", "42P05"),
+    ("duplicate_schema", "42P06"),
+    ("duplicate_table", "42P07"),
+    ("error_in_assignment", "22005"),
+    ("escape_character_conflict", "2200B"),
+    ("event_trigger_protocol_violated", "39P03"),
+    ("exclusion_violation", "23P01"),
+    ("external_routine_exception", "38000"),
+    ("external_routine_invocation_exception", "39000"),
+    ("fdw_column_name_not_found", "HV005"),
+    ("fdw_dynamic_parameter_value_needed", "HV002"),
+    ("fdw_error", "HV000"),
+    ("fdw_function_sequence_error", "HV010"),
+    ("fdw_inconsistent_descriptor_information", "HV021"),
+    ("fdw_invalid_attribute_value", "HV024"),
+    ("fdw_invalid_column_name", "HV007"),
+    ("fdw_invalid_column_number", "HV008"),
+    ("fdw_invalid_data_type", "HV004"),
+    ("fdw_invalid_data_type_descriptors", "HV006"),
+    ("fdw_invalid_descriptor_field_identifier", "HV091"),
+    ("fdw_invalid_handle", "HV00B"),
+    ("fdw_invalid_option_index", "HV00C"),
+    ("fdw_invalid_option_name", "HV00D"),
+    ("fdw_invalid_string_format", "HV00A"),
+    ("fdw_invalid_string_length_or_buffer_length", "HV090"),
+    ("fdw_invalid_use_of_null_pointer", "HV009"),
+    ("fdw_no_schemas", "HV00P"),
+    ("fdw_option_name_not_found", "HV00J"),
+    ("fdw_out_of_memory", "HV001"),
+    ("fdw_reply_handle", "HV00K"),
+    ("fdw_schema_not_found", "HV00Q"),
+    ("fdw_table_not_found", "HV00R"),
+    ("fdw_too_many_handles", "HV014"),
+    ("fdw_unable_to_create_execution", "HV00L"),
+    ("fdw_unable_to_create_reply", "HV00M"),
+    ("fdw_unable_to_establish_connection", "HV00N"),
+    ("feature_not_supported", "0A000"),
+    ("file_name_too_long", "58P03"),
+    ("floating_point_exception", "22P01"),
+    ("foreign_key_violation", "23503"),
+    ("function_executed_no_return_statement", "2F005"),
+    ("generated_always", "428C9"),
+    ("grouping_error", "42803"),
+    ("held_cursor_requires_same_isolation_level", "25008"),
+    ("idle_in_transaction_session_timeout", "25P03"),
+    ("idle_session_timeout", "57P05"),
+    ("in_failed_sql_transaction", "25P02"),
+    ("inappropriate_access_mode_for_branch_transaction", "25003"),
+    (
+        "inappropriate_isolation_level_for_branch_transaction",
+        "25004",
+    ),
+    ("indeterminate_collation", "42P22"),
+    ("indeterminate_datatype", "42P18"),
+    ("index_corrupted", "XX002"),
+    ("indicator_overflow", "22022"),
+    ("insufficient_privilege", "42501"),
+    ("insufficient_resources", "53000"),
+    ("integrity_constraint_violation", "23000"),
+    ("internal_error", "XX000"),
+    ("interval_field_overflow", "22015"),
+    ("invalid_argument_for_logarithm", "2201E"),
+    ("invalid_argument_for_nth_value_function", "22016"),
+    ("invalid_argument_for_ntile_function", "22014"),
+    ("invalid_argument_for_power_function", "2201F"),
+    ("invalid_argument_for_sql_json_datetime_function", "22031"),
+    ("invalid_argument_for_width_bucket_function", "2201G"),
+    ("invalid_argument_for_xquery", "10608"),
+    ("invalid_authorization_specification", "28000"),
+    ("invalid_binary_representation", "22P03"),
+    ("invalid_catalog_name", "3D000"),
+    ("invalid_character_value_for_cast", "22018"),
+    ("invalid_column_definition", "42611"),
+    ("invalid_column_reference", "42P10"),
+    ("invalid_cursor_definition", "42P11"),
+    ("invalid_cursor_name", "34000"),
+    ("invalid_cursor_state", "24000"),
+    ("invalid_database_definition", "42P12"),
+    ("invalid_datetime_format", "22007"),
+    ("invalid_escape_character", "22019"),
+    ("invalid_escape_octet", "2200D"),
+    ("invalid_escape_sequence", "22025"),
+    ("invalid_foreign_key", "42830"),
+    ("invalid_function_definition", "42P13"),
+    ("invalid_grant_operation", "0LP01"),
+    ("invalid_grantor", "0L000"),
+    ("invalid_indicator_parameter_value", "22010"),
+    ("invalid_json_text", "22032"),
+    ("invalid_locator_specification", "0F001"),
+    ("invalid_name", "42602"),
+    ("invalid_object_definition", "42P17"),
+    ("invalid_parameter_value", "22023"),
+    ("invalid_password", "28P01"),
+    ("invalid_preceding_or_following_size", "22013"),
+    ("invalid_prepared_statement_definition", "42P14"),
+    ("invalid_recursion", "42P19"),
+    ("invalid_regular_expression", "2201B"),
+    ("invalid_role_specification", "0P000"),
+    ("invalid_row_count_in_limit_clause", "2201W"),
+    ("invalid_row_count_in_result_offset_clause", "2201X"),
+    ("invalid_savepoint_specification", "3B001"),
+    ("invalid_schema_definition", "42P15"),
+    ("invalid_schema_name", "3F000"),
+    ("invalid_sql_json_subscript", "22033"),
+    ("invalid_sql_statement_name", "26000"),
+    ("invalid_sqlstate_returned", "39001"),
+    ("invalid_table_definition", "42P16"),
+    ("invalid_tablesample_argument", "2202H"),
+    ("invalid_tablesample_repeat", "2202G"),
+    ("invalid_text_representation", "22P02"),
+    ("invalid_time_zone_displacement_value", "22009"),
+    ("invalid_transaction_initiation", "0B000"),
+    ("invalid_transaction_state", "25000"),
+    ("invalid_transaction_termination", "2D000"),
+    ("invalid_use_of_escape_character", "2200C"),
+    ("invalid_xml_comment", "2200S"),
+    ("invalid_xml_content", "2200N"),
+    ("invalid_xml_document", "2200M"),
+    ("invalid_xml_processing_instruction", "2200T"),
+    ("io_error", "58030"),
+    ("locator_exception", "0F000"),
+    ("lock_file_exists", "F0001"),
+    ("lock_not_available", "55P03"),
+    ("modifying_sql_data_not_permitted", "2F002"),
+    ("modifying_sql_data_not_permitted", "38002"),
+    ("more_than_one_sql_json_item", "22034"),
+    ("most_specific_type_mismatch", "2200G"),
+    ("name_too_long", "42622"),
+    ("no_active_sql_transaction", "25P01"),
+    ("no_active_sql_transaction_for_branch_transaction", "25005"),
+    ("no_data_found", "P0002"),
+    ("no_sql_json_item", "22035"),
+    ("non_numeric_sql_json_item", "22036"),
+    ("non_unique_keys_in_a_json_object", "22037"),
+    ("nonstandard_use_of_escape_character", "22P06"),
+    ("not_an_xml_document", "2200L"),
+    ("not_null_violation", "23502"),
+    ("null_value_no_indicator_parameter", "22002"),
+    ("null_value_not_allowed", "22004"),
+    ("null_value_not_allowed", "39004"),
+    ("numeric_value_out_of_range", "22003"),
+    ("object_in_use", "55006"),
+    ("object_not_in_prerequisite_state", "55000"),
+    ("operator_intervention", "57000"),
+    ("out_of_memory", "53200"),
+    ("plpgsql_error", "P0000"),
+    ("program_limit_exceeded", "54000"),
+    ("prohibited_sql_statement_attempted", "2F003"),
+    ("prohibited_sql_statement_attempted", "38003"),
+    ("protocol_violation", "08P01"),
+    ("query_canceled", "57014"),
+    ("raise_exception", "P0001"),
+    ("read_only_sql_transaction", "25006"),
+    ("reading_sql_data_not_permitted", "2F004"),
+    ("reading_sql_data_not_permitted", "38004"),
+    ("reserved_name", "42939"),
+    ("restrict_violation", "23001"),
+    ("savepoint_exception", "3B000"),
+    ("schema_and_data_statement_mixing_not_supported", "25007"),
+    ("sequence_generator_limit_exceeded", "2200H"),
+    ("serialization_failure", "40001"),
+    ("singleton_sql_json_item_required", "22038"),
+    ("sql_json_array_not_found", "22039"),
+    ("sql_json_item_cannot_be_cast_to_target_type", "2203G"),
+    ("sql_json_member_not_found", "2203A"),
+    ("sql_json_number_not_found", "2203B"),
+    ("sql_json_object_not_found", "2203C"),
+    ("sql_json_scalar_required", "2203F"),
+    ("sql_routine_exception", "2F000"),
+    ("sql_statement_not_yet_complete", "03000"),
+    ("sqlclient_unable_to_establish_sqlconnection", "08001"),
+    ("sqlserver_rejected_establishment_of_sqlconnection", "08004"),
+    ("srf_protocol_violated", "39P02"),
+    (
+        "stacked_diagnostics_accessed_without_active_handler",
+        "0Z002",
+    ),
+    ("statement_completion_unknown", "40003"),
+    ("statement_too_complex", "54001"),
+    ("string_data_length_mismatch", "22026"),
+    ("string_data_right_truncation", "22001"),
+    ("substring_error", "22011"),
+    ("syntax_error", "42601"),
+    ("syntax_error_or_access_rule_violation", "42000"),
+    ("system_error", "58000"),
+    ("too_many_arguments", "54023"),
+    ("too_many_columns", "54011"),
+    ("too_many_connections", "53300"),
+    ("too_many_json_array_elements", "2203D"),
+    ("too_many_json_object_members", "2203E"),
+    ("too_many_rows", "P0003"),
+    ("transaction_integrity_constraint_violation", "40002"),
+    ("transaction_resolution_unknown", "08007"),
+    ("transaction_rollback", "40000"),
+    ("transaction_timeout", "25P04"),
+    ("trigger_protocol_violated", "39P01"),
+    ("triggered_action_exception", "09000"),
+    ("triggered_data_change_violation", "27000"),
+    ("trim_error", "22027"),
+    ("undefined_column", "42703"),
+    ("undefined_file", "58P01"),
+    ("undefined_function", "42883"),
+    ("undefined_object", "42704"),
+    ("undefined_parameter", "42P02"),
+    ("undefined_table", "42P01"),
+    ("unique_violation", "23505"),
+    ("unsafe_new_enum_value_usage", "55P04"),
+    ("unterminated_c_string", "22024"),
+    ("untranslatable_character", "22P05"),
+    ("windowing_error", "42P20"),
+    ("with_check_option_violation", "44000"),
+    ("wrong_object_type", "42809"),
+    ("zero_length_character_string", "2200F"),
+];
+
+/// v1.01: resolve one WHEN condition name to its SQLSTATE list (PG19
+/// `plpgsql_parse_err_condition`, `pl_comp.c`). Names are folded to
+/// lowercase like PG's unquoted identifiers; `others` yields the OTHERS
+/// sentinel; one name may map to several codes (duplicate labels in
+/// `errcodes.txt`, e.g. `null_value_not_allowed`). Unknown names are
+/// 42704, mirroring PG's ERRCODE_UNDEFINED_OBJECT `unrecognized
+/// exception condition`.
+fn plpgsql_condition_named(name: &str) -> Result<Vec<String>, SqlError> {
+    let folded = name.to_ascii_lowercase();
+    if folded == "others" {
+        return Ok(vec![PLPGSQL_OTHERS_SENTINEL.to_string()]);
+    }
+    let lo = PLPGSQL_CONDITIONS.partition_point(|e| e.0 < folded.as_str());
+    let mut out = Vec::new();
+    for (n, code) in &PLPGSQL_CONDITIONS[lo..] {
+        if *n != folded.as_str() {
+            break;
+        }
+        out.push((*code).to_string());
+    }
+    if out.is_empty() {
+        return Err(SqlError {
+            message: format!("unrecognized exception condition \"{}\"", name),
+            code: "42704",
+        });
+    }
+    Ok(out)
+}
+
+/// v1.01: does a trapped SQLSTATE match a raised error code? (PG19
+/// `exception_matches_conditions`, `pl_exec.c`: exact match; category
+/// match when the condition is a `...000` class code, i.e. PG's
+/// `ERRCODE_IS_CATEGORY` / `ERRCODE_TO_CATEGORY`; OTHERS matches
+/// everything except 57014 query_canceled and P0004 assert_failure.)
+pub fn plpgsql_condition_matches(condition: &str, code: &str) -> bool {
+    if condition == PLPGSQL_OTHERS_SENTINEL {
+        return code != "57014" && code != "P0004";
+    }
+    if condition == code {
+        return true;
+    }
+    let cb = condition.as_bytes();
+    let eb = code.as_bytes();
+    cb.len() == 5 && eb.len() == 5 && cb[2..] == *b"000" && cb[..2] == eb[..2]
+}
+
+/// Strip an ASCII keyword (case-insensitive) from the front of `s`,
+/// requiring a word boundary after it. Returns the remainder.
+fn plpgsql_strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = s.get(..kw.len())?;
+    if !rest.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let after = s.get(kw.len()..)?;
+    // Word boundary: next char must not be ident-continue. The keyword
+    // itself may be followed by end-of-string.
+    if let Some(c) = after.chars().next() {
+        if c.is_alphanumeric() || c == '_' {
+            return None;
+        }
+    }
+    Some(after)
+}
+
+/// Does `s` start with `kw` (case-insensitive, word boundary)?
+fn plpgsql_starts_with_kw(s: &str, kw: &str) -> bool {
+    plpgsql_strip_kw(s.trim_start(), kw).is_some()
+}
+
+/// Strip a trailing END keyword (word boundary before it) from `s`.
+/// Returns the remainder, or None if `s` does not end with END.
+fn plpgsql_strip_end(s: &str) -> Option<&str> {
+    let t = s.trim_end();
+    if t.len() < 3 || !t[t.len() - 3..].eq_ignore_ascii_case("end") {
+        return None;
+    }
+    let before = &t[..t.len() - 3];
+    if let Some(c) = before.chars().last() {
+        if c.is_alphanumeric() || c == '_' {
+            return None;
+        }
+    }
+    Some(before)
+}
+
+/// v1.01: split a plpgsql body on top-level `;`, respecting
+/// single-quoted strings (`''` escapes), double-quoted identifiers
+/// (`""` escapes), `--` / `/* */` comments, and `$tag$...$tag$`
+/// dollar-quoted strings. `$1`-style parameters are NOT dollar quotes
+/// (the char after `$` must not start a digit-led tag).
+fn split_plpgsql_chunks(body: &str) -> Vec<String> {
+    /// Length of the dollar-quote opening delimiter at `chars[i]`
+    /// (`$$` or `$tag$`), or None if this `$` opens no dollar quote.
+    fn dollar_open_len(chars: &[char], i: usize) -> Option<usize> {
+        if chars[i] != '$' {
+            return None;
+        }
+        let mut j = i + 1;
+        if j < chars.len() && chars[j] == '$' {
+            return Some(2);
+        }
+        let tag_start = j;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == tag_start || chars[tag_start].is_ascii_digit() {
+            return None;
+        }
+        if j < chars.len() && chars[j] == '$' {
+            Some(j - i + 1)
+        } else {
+            None
+        }
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' => {
+                let q = c;
+                cur.push(q);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    cur.push(d);
+                    i += 1;
+                    if d == q {
+                        if i < chars.len() && chars[i] == q {
+                            cur.push(q);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if i + 1 < chars.len() && chars[i + 1] == '-' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                cur.push('/');
+                cur.push('*');
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+                if i + 1 < chars.len() {
+                    cur.push('*');
+                    cur.push('/');
+                    i += 2;
+                }
+            }
+            '$' => match dollar_open_len(&chars, i) {
+                Some(len) => {
+                    // Copy through the matching close delimiter; an
+                    // unterminated quote swallows the rest (the
+                    // statement parse will fail on it later).
+                    let mut j = i + len;
+                    let mut end = chars.len();
+                    while j + len <= chars.len() {
+                        if chars[j..j + len] == chars[i..i + len] {
+                            end = j + len;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    cur.extend(chars[i..end].iter());
+                    i = end;
+                }
+                None => {
+                    cur.push(c);
+                    i += 1;
+                }
+            },
+            ';' => {
+                chunks.push(std::mem::take(&mut cur));
+                i += 1;
+            }
+            _ => {
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    chunks.push(cur);
+    chunks
+}
+
+/// v1.01: parse one plpgsql statement — `RETURN <expr>` or a supported
+/// utility statement. Anything else is an honest 0A000 (outside the
+/// bounded subset); a malformed RETURN expression is 42601.
+fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+    fn unsupported(text: &str) -> SqlError {
+        SqlError {
+            message: format!(
+                "unsupported statement in plpgsql body (only RETURN and ANALYZE are supported): {}",
+                text.chars().take(60).collect::<String>()
+            ),
+            code: "0A000",
+        }
+    }
+    let t = text.trim();
+    if let Some(rest) = plpgsql_strip_kw(t, "return") {
+        let expr = rest.trim();
+        if expr.is_empty() {
+            return Err(SqlError {
+                message: "RETURN requires an expression".to_string(),
+                code: "42601",
+            });
+        }
+        let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+            message: format!("syntax error in RETURN expression: {}", e.message),
+            code: "42601",
+        })?;
+        if !matches!(stmt, Stmt::Select(_)) {
+            return Err(SqlError {
+                message: "internal error: RETURN did not parse as SELECT".to_string(),
+                code: "XX000",
+            });
+        }
+        return Ok(PlpgsqlStmt::Return(stmt));
+    }
+    let stmt = parse_statement(t).map_err(|_| unsupported(t))?;
+    match stmt {
+        Stmt::Analyze { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
+        _ => Err(unsupported(t)),
+    }
+}
+
+/// v1.01: parse one WHEN condition (`name` or `SQLSTATE 'code'`,
+/// PG19 pl_gram.y `proc_condition`). Returns the condition's SQLSTATEs
+/// and the unconsumed remainder.
+fn parse_plpgsql_condition(p: &str) -> Result<(Vec<String>, &str), SqlError> {
+    let p = p.trim_start();
+    if let Some(after) = plpgsql_strip_kw(p, "sqlstate") {
+        let lit = after.trim_start();
+        let rest = lit.strip_prefix('\'').ok_or_else(|| SqlError {
+            message: "SQLSTATE condition requires a string literal".to_string(),
+            code: "42601",
+        })?;
+        let end = rest.find('\'').ok_or_else(|| SqlError {
+            message: "SQLSTATE condition requires a string literal".to_string(),
+            code: "42601",
+        })?;
+        let code = &rest[..end];
+        // PG validates: exactly 5 chars of 0-9A-Z (pl_gram.y).
+        if code.len() != 5
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+        {
+            return Err(SqlError {
+                message: "invalid SQLSTATE code".to_string(),
+                code: "42601",
+            });
+        }
+        return Ok((vec![code.to_string()], &rest[end + 1..]));
+    }
+    let mut id_len = 0;
+    for (i, c) in p.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            id_len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if id_len == 0 {
+        return Err(SqlError {
+            message: "syntax error in WHEN condition".to_string(),
+            code: "42601",
+        });
+    }
+    let (name, restp) = p.split_at(id_len);
+    Ok((plpgsql_condition_named(name)?, restp))
+}
+
+/// v1.01: parse one `WHEN <conditions> THEN <statement>` clause (the
+/// WHEN keyword already stripped; PG19 pl_gram.y `proc_exception`).
+/// Conditions are `cond [OR cond ...]`; each condition is a name or
+/// `SQLSTATE 'code'`.
+fn parse_plpgsql_when(rest: &str) -> Result<PlpgsqlHandler, SqlError> {
+    let mut sqlstates = Vec::new();
+    let mut p = rest;
+    loop {
+        let (codes, restp) = parse_plpgsql_condition(p)?;
+        sqlstates.extend(codes);
+        p = restp.trim_start();
+        if let Some(after) = plpgsql_strip_kw(p, "or") {
+            p = after;
+            continue;
+        }
+        break;
+    }
+    let after = plpgsql_strip_kw(p, "then").ok_or_else(|| SqlError {
+        message: "expected THEN in WHEN clause".to_string(),
+        code: "42601",
+    })?;
+    let stmt_text = after.trim();
+    if stmt_text.is_empty() {
+        return Err(SqlError {
+            message: "WHEN ... THEN requires a statement".to_string(),
+            code: "42601",
+        });
+    }
+    Ok(PlpgsqlHandler {
+        sqlstates,
+        stmts: vec![parse_plpgsql_stmt(stmt_text)?],
+    })
+}
+
+/// v1.01: append an implicit `RETURN NULL` unless the statement list
+/// already ends with RETURN (PG19 `add_dummy_return`, `pl_comp.c`).
+fn plpgsql_ensure_trailing_return(stmts: &mut Vec<PlpgsqlStmt>) -> Result<(), SqlError> {
+    let needs = !matches!(stmts.last(), Some(PlpgsqlStmt::Return(_)));
+    if needs {
+        let null_sel = parse_statement("SELECT NULL").map_err(|e| SqlError {
+            message: format!("internal error building implicit RETURN: {}", e.message),
+            code: "XX000",
+        })?;
+        stmts.push(PlpgsqlStmt::Return(null_sel));
+    }
+    Ok(())
+}
+
+/// v1.01: push a statement onto a bounded statement list, enforcing
+/// that RETURN ends the list: at most one RETURN per list and nothing
+/// may follow it. (PG would treat a second RETURN as dead code; the
+/// bounded subset keeps that case an honest 0A000.)
+fn plpgsql_push_stmt(
+    stmts: &mut Vec<PlpgsqlStmt>,
+    stmt: PlpgsqlStmt,
+    ctx: &str,
+) -> Result<(), SqlError> {
+    if stmts.iter().any(|s| matches!(s, PlpgsqlStmt::Return(_))) {
+        return Err(SqlError {
+            message: format!("statement after RETURN in plpgsql {ctx}"),
+            code: "0A000",
+        });
+    }
+    stmts.push(stmt);
+    Ok(())
+}
+
+/// v1.01: parse a bounded PL/pgSQL body:
+/// `BEGIN <stmts> [EXCEPTION <handlers>] END` (PG19 pl_gram.y
+/// `pl_block` / `exception_sect`; no DECLARE section, no labels).
+///
+/// Each statement is `RETURN <expr>` or a supported utility statement
+/// (currently only ANALYZE); each handler is
+/// `WHEN <cond> [OR <cond> ...] THEN <statement>`, and further
+/// `;`-separated statements after the THEN belong to the same handler
+/// until the next WHEN or END.
+pub fn parse_plpgsql_body(body: &str) -> Result<PlpgsqlBody, SqlError> {
+    let unsupported = |msg: String| SqlError {
+        message: msg,
+        code: "0A000",
+    };
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let mut chunks = split_plpgsql_chunks(body);
+    while chunks.last().is_some_and(|c| c.trim().is_empty()) {
+        chunks.pop();
+    }
+    let n = chunks.len();
+    if n == 0 {
+        return Err(unsupported("empty plpgsql body".to_string()));
+    }
+    // Statement texts in order: first chunk (BEGIN stripped), middle
+    // chunks, last chunk (END stripped).
+    let mut texts: Vec<String> = Vec::with_capacity(n);
+    if n == 1 {
+        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
+            unsupported(format!(
+                "plpgsql body must start with BEGIN, got: {}",
+                chunks[0].trim().chars().take(40).collect::<String>()
+            ))
+        })?;
+        let inner = plpgsql_strip_end(rest)
+            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
+        texts.push(inner.trim().to_string());
+    } else {
+        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
+            unsupported(format!(
+                "plpgsql body must start with BEGIN, got: {}",
+                chunks[0].trim().chars().take(40).collect::<String>()
+            ))
+        })?;
+        texts.push(rest.trim().to_string());
+        for c in &chunks[1..n - 1] {
+            texts.push(c.trim().to_string());
+        }
+        let inner = plpgsql_strip_end(&chunks[n - 1])
+            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
+        texts.push(inner.trim().to_string());
+    }
+    let mut stmts: Vec<PlpgsqlStmt> = Vec::new();
+    let mut handlers: Vec<PlpgsqlHandler> = Vec::new();
+    let mut cur_handler: Option<PlpgsqlHandler> = None;
+    let mut in_exception = false;
+    for text in texts {
+        let t = text.trim();
+        if !in_exception {
+            if let Some(after) = plpgsql_strip_kw(t, "exception") {
+                in_exception = true;
+                let after = after.trim();
+                if after.is_empty() {
+                    continue;
+                }
+                let w = plpgsql_strip_kw(after, "when")
+                    .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
+                cur_handler = Some(parse_plpgsql_when(w)?);
+                continue;
+            }
+            if t.is_empty() {
+                continue;
+            }
+            if plpgsql_starts_with_kw(t, "when") {
+                return Err(syntax("WHEN outside EXCEPTION section".to_string()));
+            }
+            let stmt = parse_plpgsql_stmt(t)?;
+            plpgsql_push_stmt(&mut stmts, stmt, "body")?;
+        } else {
+            if t.is_empty() {
+                continue;
+            }
+            if plpgsql_starts_with_kw(t, "exception") {
+                return Err(syntax("duplicate EXCEPTION section".to_string()));
+            }
+            if let Some(w) = plpgsql_strip_kw(t, "when") {
+                if let Some(h) = cur_handler.take() {
+                    handlers.push(h);
+                }
+                cur_handler = Some(parse_plpgsql_when(w)?);
+                continue;
+            }
+            let h = cur_handler
+                .as_mut()
+                .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
+            let stmt = parse_plpgsql_stmt(t)?;
+            plpgsql_push_stmt(&mut h.stmts, stmt, "WHEN handler")?;
+        }
+    }
+    if let Some(h) = cur_handler.take() {
+        handlers.push(h);
+    }
+    if in_exception && handlers.is_empty() {
+        return Err(syntax("EXCEPTION section without WHEN clause".to_string()));
+    }
+    plpgsql_ensure_trailing_return(&mut stmts)?;
+    for h in &mut handlers {
+        plpgsql_ensure_trailing_return(&mut h.stmts)?;
+    }
+    Ok(PlpgsqlBody { stmts, handlers })
+}
+
 /// v1.00: parse a bounded trigger-function body (`RETURNS trigger`,
 /// `LANGUAGE plpgsql`) into [`TriggerBodyStmt`]s. The grammar is
 /// deliberately small — `BEGIN <stmt>; ... END` where each statement is

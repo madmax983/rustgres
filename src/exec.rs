@@ -10044,28 +10044,29 @@ fn analyze_table(
     }
 }
 
-fn exec_analyze(
+/// v1.01: ANALYZE core shared by the top-level `ANALYZE` statement and
+/// the bounded-plpgsql utility path. The function-body runner only
+/// carries the read-path `Q` (no `StmtCtx`), so the pieces ANALYZE
+/// needs are passed explicitly. Ownership checks and stats computation
+/// are identical; statistics stay non-transactional like Postgres.
+fn exec_analyze_core(
     eng: &mut Engine,
-    ctx: &mut StmtCtx,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    role: &str,
     table: &Option<String>,
-) -> Result<ExecResult, ExecError> {
+) -> Result<(), ExecError> {
     // v0.11: ANALYZE requires ownership (or superuser), like PostgreSQL.
     let is_owner = |eng: &Engine, n: &str| {
         eng.db
-            .find_table(n, ctx.snap, ctx.own, ctx.session)
-            .map(|t| {
-                t.owner == ctx.role
-                    || crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
-            })
+            .find_table(n, snap, own, session)
+            .map(|t| t.owner == role || crate::storage::is_superuser_snap(&eng.db, role, snap, own))
             .unwrap_or(false)
     };
     let names: Vec<String> = match table {
         Some(n) => {
-            if eng
-                .db
-                .find_table(n, ctx.snap, ctx.own, ctx.session)
-                .is_none()
-            {
+            if eng.db.find_table(n, snap, own, session).is_none() {
                 return Err(exec_err(
                     "42P01",
                     format!("relation \"{}\" does not exist", n),
@@ -10092,9 +10093,20 @@ fn exec_analyze(
     // Statistics are not transactional (like Postgres): they are computed
     // and stored without write ops.
     for n in names {
-        let stats = analyze_table(&eng.db, &n, ctx.snap, ctx.own, ctx.session);
+        let stats = analyze_table(&eng.db, &n, snap, own, session);
         eng.db.stats.insert(n, stats);
     }
+    Ok(())
+}
+
+/// v0.8: `ANALYZE [table]` — top-level statement wrapper around
+/// [`exec_analyze_core`].
+fn exec_analyze(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    exec_analyze_core(eng, ctx.snap, ctx.own, ctx.session, ctx.role, table)?;
     Ok(ExecResult::Command {
         tag: "ANALYZE".to_string(),
     })
@@ -26339,12 +26351,22 @@ fn run_func_body(
             rows: vec![],
         });
     }
+    // v1.01: multi-statement plpgsql bodies (statement sequences +
+    // EXCEPTION blocks) run on their own path; the single-SELECT path
+    // below serves SQL-language and v0.97 single-RETURN plpgsql bodies.
+    if let Some(pb) = &fdef.plpgsql {
+        let params: Vec<Option<Value>> = coerced.into_iter().map(Some).collect();
+        return run_plpgsql_body(q, scopes, pb, &params, pending);
+    }
     let body = fdef.parsed.as_ref().ok_or_else(|| {
         exec_err(
             "0A000",
             format!("function \"{}\" has no parsed body", fdef.name),
         )
     })?;
+    // v1.01: multi-statement plpgsql bodies never reach here — they
+    // branch above via `fdef.plpgsql`. Reaching this point with
+    // `parsed == None` is a corrupt catalog entry.
     let Stmt::Select(sel) = body else {
         return Err(exec_err(
             "0A000",
@@ -26382,6 +26404,116 @@ fn run_func_body(
         pending_updates: pending,
     };
     run_select(&mut call_q, &bound, scopes)
+}
+
+/// v1.01: run one statement list of a bounded PL/pgSQL body. Returns
+/// the `RETURN` statement's SELECT output; `RETURN` ends the function
+/// immediately (like PG's `PLPGSQL_RC_RETURN`). Every list ends with a
+/// RETURN — the parser appends an implicit `RETURN NULL` (PG19
+/// `add_dummy_return`, `pl_comp.c`) — so falling off the end is
+/// impossible.
+fn run_plpgsql_stmts(
+    q: &mut Q,
+    scopes: &[Scope],
+    stmts: &[crate::sql::PlpgsqlStmt],
+    params: &[Option<Value>],
+) -> Result<SelectOut, ExecError> {
+    for s in stmts {
+        match s {
+            crate::sql::PlpgsqlStmt::Return(sel) => {
+                let Stmt::Select(inner) = sel else {
+                    return Err(exec_err(
+                        "XX000",
+                        "plpgsql RETURN is not a SELECT".to_string(),
+                    ));
+                };
+                let mut stmt = Stmt::Select(inner.clone());
+                subst_params(&mut stmt, params)?;
+                let Stmt::Select(bound) = stmt else {
+                    return Err(exec_err(
+                        "XX000",
+                        "plpgsql RETURN lost its SELECT".to_string(),
+                    ));
+                };
+                return Ok(run_select(q, &bound, scopes)?);
+            }
+            crate::sql::PlpgsqlStmt::Utility(u) => {
+                // Utility statements execute for side effects; results
+                // are discarded. Only ANALYZE is in the bounded subset
+                // (enforced at CREATE); anything else is a corrupt
+                // catalog entry.
+                let crate::sql::Stmt::Analyze { table } = u else {
+                    return Err(exec_err(
+                        "XX000",
+                        "unsupported utility statement in plpgsql body".to_string(),
+                    ));
+                };
+                exec_analyze_core(&mut *q.eng, q.snap, q.own, q.session, q.role, table)?;
+            }
+        }
+    }
+    Err(exec_err(
+        "XX000",
+        "plpgsql statement list ended without RETURN".to_string(),
+    ))
+}
+
+/// v1.01: run a bounded PL/pgSQL body: statement sequence with
+/// EXCEPTION/WHEN handlers (PG19 `exec_stmt_block`, `pl_exec.c`).
+///
+/// The body runs statement by statement; the first statement raising
+/// an error trapped by a WHEN clause diverts to that clause's
+/// statements (first matching clause wins, PG's
+/// `exception_matches_conditions`). An untrapped error propagates.
+/// Errors raised *inside* a handler propagate untrapped (PG only wraps
+/// the body in PG_TRY, not the handler).
+///
+/// Deliberate deviation from PG19: no subtransaction is opened around
+/// the body, so a trapped error does NOT roll back the effects of
+/// statements that already ran (rustgres has no subtransaction
+/// machinery; ANALYZE has no transactional effects to roll back).
+fn run_plpgsql_body(
+    q: &mut Q,
+    scopes: &[Scope],
+    pb: &crate::sql::PlpgsqlBody,
+    params: &[Option<Value>],
+    pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
+) -> Result<SelectOut, ExecError> {
+    // Run the body one query level deeper (fresh CTE scope, like a
+    // subquery); the caller's scopes stay visible for outer refs.
+    let mut call_q = Q {
+        eng: &mut *q.eng,
+        snap: q.snap,
+        own: q.own,
+        session: q.session,
+        role: q.role,
+        read_only: q.read_only,
+        depth: q.depth + 1,
+        lock_ids: &mut *q.lock_ids,
+        ctes: q.ctes.clone(),
+        wctx: None,
+        priv_scopes: q.priv_scopes.clone(),
+        hashed_exists: q.hashed_exists.clone(),
+        hashed_in: q.hashed_in.clone(),
+        // v0.89: volatile function bodies see the in-flight UPDATE's
+        // already-processed rows (caller-gated); stable/immutable
+        // bodies see the statement snapshot (None).
+        pending_updates: pending,
+    };
+    match run_plpgsql_stmts(&mut call_q, scopes, &pb.stmts, params) {
+        Ok(out) => Ok(out),
+        Err(e) => {
+            let handler = pb.handlers.iter().find(|h| {
+                h.sqlstates
+                    .iter()
+                    .any(|c| crate::sql::plpgsql_condition_matches(c, &e.code))
+            });
+            match handler {
+                Some(h) => run_plpgsql_stmts(&mut call_q, scopes, &h.stmts, params),
+                None => Err(e),
+            }
+        }
+    }
 }
 
 /// v0.86: scalar call of a user function. SQL bodies run via
@@ -42057,22 +42189,46 @@ fn exec_create_function(
     // parse analysis), not at first call. Internal functions name a C
     // symbol instead of SQL text.
     // v0.97: bounded plpgsql — a single-RETURN body desugars to a SQL
-    // SELECT here; anything richer is an honest 0A000.
+    // SELECT here.
+    // v1.01: richer plpgsql bodies (statement sequences + EXCEPTION
+    // blocks) take the multi-statement path: the original body text is
+    // stored and the parsed `PlpgsqlBody` goes in `FuncDef.plpgsql`.
     // v1.00: trigger functions bypass the desugar entirely (their raw
     // body was validated against the trigger grammar above).
     let owned_body: String;
+    let mut plpgsql_body: Option<crate::sql::PlpgsqlBody> = None;
     let body: &str = if is_trigger_fn {
         body
     } else if lang == crate::sql::FuncLang::Plpgsql {
-        owned_body = crate::sql::desugar_plpgsql_body(body)
-            .map_err(|e| exec_err("0A000", format!("plpgsql: {}", e)))?;
-        &owned_body
+        match crate::sql::desugar_plpgsql_body(body) {
+            Ok(sel) => {
+                owned_body = sel;
+                &owned_body
+            }
+            Err(_) => {
+                let mut pb = crate::sql::parse_plpgsql_body(body)
+                    .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
+                let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
+                for s in pb
+                    .stmts
+                    .iter_mut()
+                    .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
+                {
+                    if let crate::sql::PlpgsqlStmt::Return(sel) = s {
+                        rewrite_func_arg_refs(sel, &arg_names);
+                    }
+                }
+                plpgsql_body = Some(pb);
+                body
+            }
+        }
     } else {
         body
     };
     let mut parsed: Option<Stmt> = None;
     if !is_trigger_fn
         && (lang == crate::sql::FuncLang::Sql || lang == crate::sql::FuncLang::Plpgsql)
+        && plpgsql_body.is_none()
     {
         let mut stmt = crate::sql::parse_statement(body)
             .map_err(|e| exec_err("42601", format!("syntax error in function body: {:?}", e)))?;
@@ -42130,6 +42286,9 @@ fn exec_create_function(
         lang,
         body: body.to_string(),
         parsed,
+        // v1.01: multi-statement plpgsql bodies (statement sequences +
+        // EXCEPTION blocks); None for the v0.97 single-RETURN form.
+        plpgsql: plpgsql_body,
         volatility,
         strict,
     };
@@ -42519,7 +42678,7 @@ fn exec_drop_operator(
 /// `FieldAccess(Param(n), col)` and a bare `argname` becomes
 /// `Param(n)`. Only qualifiers/names that exactly match an argument
 /// name are rewritten; real table references are untouched.
-fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
+pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
     fn arg_pos(arg_names: &[Option<String>], name: &str) -> Option<u32> {
         arg_names
             .iter()
@@ -42567,6 +42726,41 @@ fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
             rewrite_expr(w, arg_names);
         }
     }
+}
+
+/// v1.01: rebuild a function's parsed bodies from stored body text
+/// (WAL replay / checkpoint restore). For plpgsql the multi-statement
+/// form (original source) is tried first; the v0.97 single-RETURN form
+/// stores the desugared `SELECT ...` text, which fails the plpgsql
+/// parse and falls through to the plain statement parse. Named
+/// argument references are rewritten to `$n` exactly as CREATE does
+/// (this also closes a v1.00 replay gap where the rewrite was only
+/// applied at CREATE time).
+pub(crate) fn rebuild_function_bodies(
+    lang: crate::sql::FuncLang,
+    arg_names: &[Option<String>],
+    body: &str,
+) -> (Option<Stmt>, Option<crate::sql::PlpgsqlBody>) {
+    if lang == crate::sql::FuncLang::Plpgsql {
+        if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body) {
+            for s in pb
+                .stmts
+                .iter_mut()
+                .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
+            {
+                if let crate::sql::PlpgsqlStmt::Return(sel) = s {
+                    rewrite_func_arg_refs(sel, arg_names);
+                }
+            }
+            return (None, Some(pb));
+        }
+        if let Ok(mut stmt) = crate::sql::parse_statement(body) {
+            rewrite_func_arg_refs(&mut stmt, arg_names);
+            return (Some(stmt), None);
+        }
+        return (None, None);
+    }
+    (crate::sql::parse_statement(body).ok(), None)
 }
 
 fn exec_drop_sequence(
@@ -46199,6 +46393,163 @@ mod v097_domain_tests {
         assert!(desugar_plpgsql_body("begin return; end").is_err());
         assert!(desugar_plpgsql_body("select 1").is_err());
         assert!(desugar_plpgsql_body("beginner return 1; end").is_err());
+    }
+
+    /// v1.01: bounded plpgsql statement sequences + EXCEPTION/WHEN
+    /// (PG19 `pl_exec.c` `exec_stmt_block` semantics).
+    #[test]
+    fn plpgsql_exceptions() {
+        use crate::sql::{parse_plpgsql_body, plpgsql_condition_matches};
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t101a (a int, b text)").unwrap();
+        run(&mut eng, "INSERT INTO t101a VALUES (1, 'x')").unwrap();
+        // Multi-statement body with a division_by_zero trap, inverse()
+        // style: the target conformance case in miniature.
+        run(
+            &mut eng,
+            "CREATE FUNCTION inv101(int) returns float8 as 'begin analyze t101a; return 1::float8/$1; exception when division_by_zero then return 0; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT inv101(2)").unwrap()),
+            vec![vec!["0.5"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT inv101(0)").unwrap()),
+            vec![vec!["0"]]
+        );
+        // The ANALYZE utility actually ran: pg_stats has one row per
+        // column of the analyzed table (t101a: a, b).
+        assert_eq!(
+            rows_of(
+                run(
+                    &mut eng,
+                    "SELECT count(*) FROM pg_stats WHERE tablename = 't101a'"
+                )
+                .unwrap()
+            ),
+            vec![vec!["2"]]
+        );
+        // Untrapped error propagates with its own code.
+        run(
+            &mut eng,
+            "CREATE FUNCTION untrapped101() returns int as 'begin return 1/0; exception when unique_violation then return 9; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT untrapped101()"), "22012");
+        // Category condition (22xxx) and OTHERS match 22012.
+        run(
+            &mut eng,
+            "CREATE FUNCTION cat101() returns int as 'begin return 1/0; exception when data_exception then return 7; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT cat101()").unwrap()),
+            vec![vec!["7"]]
+        );
+        run(
+            &mut eng,
+            "CREATE FUNCTION oth101() returns int as 'begin return 1/0; exception when others then return 9; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT oth101()").unwrap()),
+            vec![vec!["9"]]
+        );
+        // SQLSTATE literal condition.
+        run(
+            &mut eng,
+            "CREATE FUNCTION sq101() returns int as $$begin return 1/0; exception when sqlstate '22012' then return 5; end$$ language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT sq101()").unwrap()),
+            vec![vec!["5"]]
+        );
+        // First matching handler wins.
+        run(
+            &mut eng,
+            "CREATE FUNCTION first101() returns int as 'begin return 1/0; exception when division_by_zero then return 1; when others then return 2; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT first101()").unwrap()),
+            vec![vec!["1"]]
+        );
+        // Errors raised inside a handler propagate untrapped.
+        run(
+            &mut eng,
+            "CREATE FUNCTION herr101() returns int as 'begin return 1/0; exception when division_by_zero then return 1/0; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(err_code(&mut eng, "SELECT herr101()"), "22012");
+        // Implicit RETURN NULL when the sequence has no RETURN.
+        run(
+            &mut eng,
+            "CREATE FUNCTION nullret101() returns int as 'begin analyze t101a; end' language plpgsql volatile",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT nullret101()").unwrap()),
+            vec![vec!["NULL"]]
+        );
+        // Unsupported statements stay honest 0A000.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad101a() returns int as 'begin x := 1; return 1; end' language plpgsql"
+            ),
+            "0A000"
+        );
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad101b() returns int as 'begin return 1; return 2; end' language plpgsql"
+            ),
+            "0A000"
+        );
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad101c() returns int as 'begin insert into t101a values (2, ''y''); return 1; end' language plpgsql"
+            ),
+            "0A000"
+        );
+        // Unknown condition name is 42704; malformed RETURN is 42601.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad101d() returns int as 'begin return 1; exception when nosuchcond then return 0; end' language plpgsql"
+            ),
+            "42704"
+        );
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad101e() returns int as 'begin return; end' language plpgsql"
+            ),
+            "42601"
+        );
+        // Missing EXCEPTION keyword / missing THEN are syntax errors.
+        assert!(parse_plpgsql_body("begin return 1; when others then return 2; end").is_err());
+        assert!(parse_plpgsql_body("begin return 1; exception when others return 2; end").is_err());
+        // Condition matching unit coverage (PG19 pl_exec.c rules).
+        // (The parser normalizes OTHERS to the uppercase sentinel.)
+        assert!(plpgsql_condition_matches("22012", "22012"));
+        assert!(plpgsql_condition_matches("22000", "22012"));
+        assert!(plpgsql_condition_matches("OTHERS", "23505"));
+        assert!(plpgsql_condition_matches("OTHERS", "22012"));
+        // OTHERS does not catch query_canceled (57014) or
+        // assert_failure (P0004).
+        assert!(!plpgsql_condition_matches("OTHERS", "57014"));
+        assert!(!plpgsql_condition_matches("OTHERS", "P0004"));
+        assert!(!plpgsql_condition_matches("22000", "23505"));
+        // Named conditions resolve through the errcodes table.
+        let pb = parse_plpgsql_body(
+            "begin return 1; exception when division_by_zero or unique_violation then return 0; end",
+        )
+        .unwrap();
+        assert_eq!(pb.handlers[0].sqlstates, vec!["22012", "23505"]);
     }
 
     /// v0.97: ALTER DOMAIN persists across statements in the same
