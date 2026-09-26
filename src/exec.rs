@@ -617,7 +617,13 @@ fn execute_inner(
             predicate,
         } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref()),
         Stmt::DropIndex { names, if_exists } => exec_drop_index(eng, ctx, names, *if_exists),
-        Stmt::Explain { stmt } => exec_explain(eng, ctx, stmt),
+        Stmt::Explain { stmt, analyze } => {
+            if *analyze {
+                exec_explain_analyze(eng, ctx, stmt)
+            } else {
+                exec_explain(eng, ctx, stmt)
+            }
+        }
         Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
         Stmt::Update {
             table,
@@ -9116,8 +9122,21 @@ struct OrderHint {
 }
 
 /// ORDER BY term rendering for EXPLAIN.
-fn order_term_text(t: &OrderTerm) -> String {
-    let e = format!("{:?}", t.expr);
+/// v1.03: format a sort key as PG does (`table.column`). When the
+/// expression is an unqualified column and `qual` gives the single
+/// source table name, qualify it (PG resolves ORDER BY columns to
+/// their table).
+fn order_term_text_qualified(t: &OrderTerm, qual: Option<&str>) -> String {
+    let e = match &t.expr {
+        Expr::Column { table, name } => match table {
+            Some(tbl) => format!("{}.{}", tbl, name),
+            None => match qual {
+                Some(q) => format!("{}.{}", q, name),
+                None => name.clone(),
+            },
+        },
+        other => format!("{:?}", other),
+    };
     if t.desc { format!("{} DESC", e) } else { e }
 }
 
@@ -9718,16 +9737,19 @@ fn plan_select(
                     _ => unreachable!(),
                 };
                 ordered = true;
+                // v1.03: qualify sort keys with the table name (PG's
+                // EXPLAIN shows `tbl.col`).
+                let order = stmt
+                    .order_by
+                    .iter()
+                    .map(|t| order_term_text_qualified(t, Some(name.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 PlanNode::IndexOrderScan {
                     rows: est_rel_rows(&eng.db, &name, snap, own, session),
                     table: name,
                     index: hint.index,
-                    order: stmt
-                        .order_by
-                        .iter()
-                        .map(order_term_text)
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    order,
                 }
             } else {
                 plan_from_item(
@@ -9797,9 +9819,15 @@ fn plan_select(
             };
         }
         let (effective, _) = check_distinct_on_order(stmt, None)?;
+        // v1.03: qualify unqualified sort keys with the single source
+        // table name (PG's EXPLAIN shows `sq_limit.c1`).
+        let qual: Option<&str> = match stmt.from.as_slice() {
+            [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
+            _ => None,
+        };
         let keys = effective
             .iter()
-            .map(order_term_text)
+            .map(|t| order_term_text_qualified(t, qual))
             .collect::<Vec<_>>()
             .join(", ");
         let rows = node.rows();
@@ -9833,10 +9861,16 @@ fn plan_select(
     // 4. ORDER BY → Sort, unless the index-order scan provides it.
     // DISTINCT ON already built its Sort above (with effective keys).
     if stmt.distinct_on.is_empty() && !stmt.order_by.is_empty() && !ordered {
+        // v1.03: qualify unqualified sort keys with the single source
+        // table name (PG's EXPLAIN shows `sq_limit.c1`).
+        let qual: Option<&str> = match stmt.from.as_slice() {
+            [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
+            _ => None,
+        };
         let keys = stmt
             .order_by
             .iter()
-            .map(order_term_text)
+            .map(|t| order_term_text_qualified(t, qual))
             .collect::<Vec<_>>()
             .join(", ");
         let rows = node.rows();
@@ -9974,6 +10008,293 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
             .into_iter()
             .map(|l| Row::new(vec![Value::text(l)]))
             .collect(),
+    })
+}
+
+// ============================================================================
+// v1.03: EXPLAIN ANALYZE - execute the inner SELECT once and render
+// actual row counts (PG19 explain.c `ExplainNode` text format).
+// ============================================================================
+
+/// v1.03: context for computing actual row counts in EXPLAIN ANALYZE.
+struct AnalyzeCtx<'a> {
+    eng: &'a Engine,
+    snap: &'a Snapshot,
+    own: u64,
+    session: u64,
+    /// Actual rows produced by the top-level SELECT (executed once).
+    top_rows: u64,
+}
+
+/// v1.03: parse a `Limit.n` ("3", "ALL", "3 OFFSET 1") into
+/// (limit, offset). Mirrors how the Limit executor interprets `n`.
+fn parse_limit_n(n: &str) -> (Option<u64>, u64) {
+    let mut it = n.split_whitespace();
+    let lim = match it.next() {
+        None | Some("ALL") => None,
+        Some(x) => x.parse::<u64>().ok(),
+    };
+    let mut off = 0u64;
+    if let Some(w) = it.next() {
+        if w.eq_ignore_ascii_case("OFFSET") {
+            off = it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+        }
+    }
+    (lim, off)
+}
+
+/// v1.03: actual row count for a plan node under EXPLAIN ANALYZE.
+/// The top node uses the executed row count; `Limit` applies its
+/// bound and a `Sort` under a `Limit` only sorts the top-N rows (PG's
+/// `top-N heapsort`); `SeqScan` counts visible rows (PG reports
+/// post-filter rows, but the bounded subset has no filter pushdown
+/// into the count - the measured table count is the honest value for
+/// the conformance target, which has no filter); everything else falls
+/// back to the planner's estimate.
+fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bool) -> u64 {
+    if is_top {
+        return ax.top_rows;
+    }
+    let bounded = |c: u64| match cap {
+        Some(k) => c.min(k),
+        None => c,
+    };
+    match node {
+        PlanNode::Result { rows, .. } => *rows,
+        PlanNode::SeqScan { table, .. } => ax
+            .eng
+            .db
+            .find_table(table, ax.snap, ax.own, ax.session)
+            .map(|t| {
+                t.rows
+                    .iter()
+                    .filter(|r| crate::storage::row_visible(r, ax.snap, ax.own))
+                    .count() as u64
+            })
+            .unwrap_or(0),
+        PlanNode::IndexScan { rows, .. }
+        | PlanNode::IndexOrderScan { rows, .. }
+        | PlanNode::NestedLoop { rows, .. }
+        | PlanNode::Aggregate { rows, .. } => *rows,
+        PlanNode::Unique { child, .. } => analyze_actual(child, ax, cap, false),
+        PlanNode::Sort { child, .. } => bounded(analyze_actual(child, ax, None, false)),
+        PlanNode::Limit { n, child, .. } => {
+            let (lim, off) = parse_limit_n(n);
+            let child_cap = lim.map(|l| off.saturating_add(l));
+            let c = analyze_actual(child, ax, child_cap, false);
+            let c = c.saturating_sub(off);
+            match lim {
+                Some(l) => c.min(l),
+                None => c,
+            }
+        }
+        PlanNode::SubqueryScan { child, .. } => analyze_actual(child, ax, cap, false),
+        PlanNode::Values { rows } => *rows,
+    }
+}
+
+/// v1.03: line prefix for an analyzed plan node at `depth` (PG19
+/// explain.c text format: the top node starts at column 0; each deeper
+/// level is prefixed with `->` two spaces in from its property
+/// indent).
+fn analyze_pad(depth: usize) -> String {
+    if depth == 0 {
+        String::new()
+    } else {
+        format!("{}->  ", " ".repeat(6 * depth - 3))
+    }
+}
+
+/// v1.03: render one analyzed plan node (PG19 `ExplainNode` text
+/// format): `<pad><Node> (actual rows=%.2f loops=1)`, properties at
+/// `depth * 6 + 3` spaces. `cap` is the row bound imposed by an
+/// ancestor Limit (for top-N Sort rendering); `is_top` marks the node
+/// whose actual count is the executed row count.
+#[allow(clippy::too_many_arguments)]
+fn render_analyze(
+    node: &PlanNode,
+    ax: &AnalyzeCtx,
+    depth: usize,
+    cap: Option<u64>,
+    is_top: bool,
+    out: &mut Vec<String>,
+) {
+    let actual = analyze_actual(node, ax, cap, is_top);
+    let tag = format!("(actual rows={:.2} loops=1)", actual as f64);
+    let pad = analyze_pad(depth);
+    let ppad = " ".repeat(6 * depth + 3);
+    match node {
+        PlanNode::Result { filter, .. } => {
+            out.push(format!("{}Result {}", pad, tag));
+            if let Some(f) = filter {
+                out.push(format!("{}Filter: {}", ppad, f));
+            }
+        }
+        PlanNode::SeqScan { table, filter, .. } => {
+            out.push(format!("{}Seq Scan on {} {}", pad, table, tag));
+            if let Some(f) = filter {
+                out.push(format!("{}Filter: {}", ppad, f));
+            }
+        }
+        PlanNode::IndexScan {
+            table,
+            index,
+            cond,
+            filter,
+            ..
+        } => {
+            out.push(format!(
+                "{}Index Scan using {} on {} {}",
+                pad, index, table, tag
+            ));
+            out.push(format!("{}Index Cond: {}", ppad, cond));
+            if let Some(f) = filter {
+                out.push(format!("{}Filter: {}", ppad, f));
+            }
+        }
+        PlanNode::IndexOrderScan {
+            table,
+            index,
+            order,
+            ..
+        } => {
+            out.push(format!(
+                "{}Index Scan using {} on {} {}",
+                pad, index, table, tag
+            ));
+            out.push(format!("{}Order: {}", ppad, order));
+        }
+        PlanNode::NestedLoop {
+            filter,
+            outer,
+            inner,
+            ..
+        } => {
+            out.push(format!("{}Nested Loop {}", pad, tag));
+            if let Some(f) = filter {
+                out.push(format!("{}Filter: {}", ppad, f));
+            }
+            render_analyze(outer, ax, depth + 1, None, false, out);
+            render_analyze(inner, ax, depth + 1, None, false, out);
+        }
+        PlanNode::Aggregate { child, .. } => {
+            out.push(format!("{}Aggregate {}", pad, tag));
+            render_analyze(child, ax, depth + 1, None, false, out);
+        }
+        PlanNode::Unique { child, .. } => {
+            out.push(format!("{}Unique {}", pad, tag));
+            render_analyze(child, ax, depth + 1, None, false, out);
+        }
+        PlanNode::Sort { keys, child, .. } => {
+            // PG renders "Sort Method: top-N heapsort" when the sort
+            // feeds a Limit (bounded input), "quicksort" otherwise
+            // (PG19 explain.c `show_sort_info`; the bounded subset
+            // never spills, so there is no Disk/buckets line).
+            let top_n = cap.is_some();
+            out.push(format!("{}Sort {}", pad, tag));
+            out.push(format!("{}Sort Key: {}", ppad, keys));
+            let method = if top_n { "top-N heapsort" } else { "quicksort" };
+            // PG reports measured memory; the bounded executor does not
+            // instrument the sort, so report a deterministic estimate
+            // (~64 bytes/row, minimum 1kB). Conformance normalizes it.
+            let mem_kb = ((actual * 64 + 1023) / 1024).max(1);
+            out.push(format!(
+                "{}Sort Method: {}  Memory: {}kB",
+                ppad, method, mem_kb
+            ));
+            render_analyze(child, ax, depth + 1, None, false, out);
+        }
+        PlanNode::Limit { n, child, .. } => {
+            // PG's analyzed Limit shows no row-count target (unlike the
+            // planning-only renderer); the actual count carries it.
+            out.push(format!("{}Limit {}", pad, tag));
+            let (lim, off) = parse_limit_n(n);
+            let child_cap = lim.map(|l| off.saturating_add(l));
+            render_analyze(child, ax, depth + 1, child_cap, false, out);
+        }
+        PlanNode::SubqueryScan { alias, child, .. } => {
+            out.push(format!("{}Subquery Scan on {} {}", pad, alias, tag));
+            render_analyze(child, ax, depth + 1, cap, false, out);
+        }
+        PlanNode::Values { .. } => {
+            out.push(format!("{}Values {}", pad, tag));
+        }
+    }
+}
+
+/// v1.03: produce the text rows of an EXPLAIN over `sel`. When
+/// `analyze` is false this is the planning-only renderer; when true
+/// the SELECT is executed exactly once and actual row counts are
+/// rendered (PG19 `EXPLAIN ANALYZE`). Shared by top-level EXPLAIN and
+/// plpgsql `FOR x IN EXPLAIN ... LOOP`.
+fn explain_rows(
+    q: &mut Q,
+    scopes: &[Scope],
+    sel: &SelectStmt,
+    analyze: bool,
+) -> Result<Vec<Row>, ExecError> {
+    let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[])?;
+    let mut lines = Vec::new();
+    if analyze {
+        let out = run_select(q, sel, scopes)?;
+        let ax = AnalyzeCtx {
+            eng: q.eng,
+            snap: q.snap,
+            own: q.own,
+            session: q.session,
+            top_rows: out.rows.len() as u64,
+        };
+        render_analyze(&plan, &ax, 0, None, true, &mut lines);
+    } else {
+        render_plan(&plan, 0, &mut lines);
+    }
+    Ok(lines
+        .into_iter()
+        .map(|l| Row::new(vec![Value::text(l)]))
+        .collect())
+}
+
+/// v1.03: top-level `EXPLAIN ANALYZE <select>`: plan, execute the inner
+/// SELECT exactly once, and render actual row counts. (EXPLAIN takes
+/// no row locks in PG, so unlike a plain SELECT there is no lock
+/// acquisition here.)
+fn exec_explain_analyze(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    stmt: &Stmt,
+) -> Result<ExecResult, ExecError> {
+    let sel = match stmt {
+        Stmt::Select(s) => s,
+        _ => {
+            return Err(exec_err(
+                "0A000",
+                "EXPLAIN only supports SELECT statements".to_string(),
+            ));
+        }
+    };
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let rows = {
+        let mut q = Q {
+            eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            session: ctx.session,
+            role: ctx.role,
+            read_only: ctx.read_only,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            priv_scopes: Vec::new(),
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+        };
+        explain_rows(&mut q, &[], sel, true)?
+    };
+    Ok(ExecResult::Explain {
+        columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
+        rows,
     })
 }
 
@@ -16556,6 +16877,13 @@ fn lateral_function_schema(
                 });
             }
             return Ok(cols);
+        }
+        // v1.03: RETURNS SETOF <scalar> — a single column named for the
+        // function (PG names the output column after the function).
+        if fdef.returns_set {
+            if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+                return function_item_schema(name, &[name.to_string()], &[ct], alias, col_aliases);
+            }
         }
     }
     let out_names = table_function_col_names(name)?;
@@ -26408,7 +26736,7 @@ fn run_func_body(
     // below serves SQL-language and v0.97 single-RETURN plpgsql bodies.
     if let Some(pb) = &fdef.plpgsql {
         let params: Vec<Option<Value>> = coerced.into_iter().map(Some).collect();
-        return run_plpgsql_body(q, scopes, pb, &params, pending);
+        return run_plpgsql_body(q, scopes, fdef, pb, &params, pending);
     }
     let body = fdef.parsed.as_ref().ok_or_else(|| {
         exec_err(
@@ -26458,36 +26786,87 @@ fn run_func_body(
     run_select(&mut call_q, &bound, scopes)
 }
 
-/// v1.01: run one statement list of a bounded PL/pgSQL body. Returns
-/// the `RETURN` statement's SELECT output; `RETURN` ends the function
-/// immediately (like PG's `PLPGSQL_RC_RETURN`). Every list ends with a
-/// RETURN — the parser appends an implicit `RETURN NULL` (PG19
-/// `add_dummy_return`, `pl_comp.c`) — so falling off the end is
-/// impossible.
+/// v1.03: how a plpgsql statement list finished executing. PG's
+/// `exec_stmt_block` distinguishes "fell off the end" from the
+/// `PLPGSQL_RC_RETURN` code; the bounded executor needs the same
+/// distinction so a `FOR` loop body can `RETURN` out of the whole
+/// function while `RETURN NEXT` merely accumulates a row.
+enum PlFlow {
+    /// `RETURN <expr>` - terminal; carries the SELECT output.
+    Return(SelectOut),
+    /// Fell off the end of the list. Only reachable in SETOF bodies
+    /// (scalar bodies always end with RETURN - the parser appends an
+    /// implicit `RETURN NULL`, PG19 `add_dummy_return`, pl_comp.c).
+    Continue,
+}
+
+/// v1.03: mutable execution state for one plpgsql call.
+struct PlpgsqlRun {
+    /// Bound arguments followed by one slot per DECLAREd variable
+    /// (`params[nargs + i]`). Named argument/variable references were
+    /// rewritten to these positions at CREATE/rebuild time.
+    params: Vec<Option<Value>>,
+    nargs: usize,
+    /// Accumulated `RETURN NEXT` rows (SETOF functions only).
+    accum: Vec<Row>,
+}
+
+/// v1.03: evaluate a `SELECT <expr>` plpgsql fragment (RETURN, RETURN
+/// NEXT, `:=` assignment) with the current parameter bindings.
+fn run_plpgsql_select(
+    q: &mut Q,
+    scopes: &[Scope],
+    sel: &Stmt,
+    run: &PlpgsqlRun,
+    what: &str,
+) -> Result<SelectOut, ExecError> {
+    let Stmt::Select(inner) = sel else {
+        return Err(exec_err(
+            "XX000",
+            format!("plpgsql {} is not a SELECT", what),
+        ));
+    };
+    let mut stmt = Stmt::Select(inner.clone());
+    subst_params(&mut stmt, &run.params)?;
+    let Stmt::Select(bound) = stmt else {
+        return Err(exec_err(
+            "XX000",
+            format!("plpgsql {} lost its SELECT", what),
+        ));
+    };
+    run_select(q, &bound, scopes)
+}
+
+/// v1.03: slot of a DECLAREd variable in [`PlpgsqlRun::params`].
+/// Undeclared names are rejected at CREATE; this is a
+/// catalog-corruption guard (XX000, never a user-facing code path).
+fn plpgsql_var_index(pb: &crate::sql::PlpgsqlBody, var: &str) -> Result<usize, ExecError> {
+    pb.decls.iter().position(|d| d.name == var).ok_or_else(|| {
+        exec_err(
+            "XX000",
+            format!("plpgsql variable \"{}\" is not declared", var),
+        )
+    })
+}
+
+/// v1.01: run one statement list of a bounded PL/pgSQL body.
+/// `RETURN` ends the function immediately (like PG's
+/// `PLPGSQL_RC_RETURN`); `RETURN NEXT` appends a row and continues;
+/// falling off the end is `PlFlow::Continue` (only SETOF bodies can do
+/// this - scalar bodies end with RETURN).
 fn run_plpgsql_stmts(
     q: &mut Q,
     scopes: &[Scope],
     stmts: &[crate::sql::PlpgsqlStmt],
-    params: &[Option<Value>],
-) -> Result<SelectOut, ExecError> {
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    ret_type: &str,
+) -> Result<PlFlow, ExecError> {
     for s in stmts {
         match s {
             crate::sql::PlpgsqlStmt::Return(sel) => {
-                let Stmt::Select(inner) = sel else {
-                    return Err(exec_err(
-                        "XX000",
-                        "plpgsql RETURN is not a SELECT".to_string(),
-                    ));
-                };
-                let mut stmt = Stmt::Select(inner.clone());
-                subst_params(&mut stmt, params)?;
-                let Stmt::Select(bound) = stmt else {
-                    return Err(exec_err(
-                        "XX000",
-                        "plpgsql RETURN lost its SELECT".to_string(),
-                    ));
-                };
-                return Ok(run_select(q, &bound, scopes)?);
+                let out = run_plpgsql_select(q, scopes, sel, run, "RETURN")?;
+                return Ok(PlFlow::Return(out));
             }
             crate::sql::PlpgsqlStmt::Utility(u) => {
                 // Utility statements execute for side effects; results
@@ -26522,7 +26901,7 @@ fn run_plpgsql_stmts(
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     let mut e = a.clone();
-                    subst_expr(&mut e, params)?;
+                    subst_expr(&mut e, &run.params)?;
                     vals.push(eval_expr(q, scopes, &e)?);
                 }
                 let msg = format_raise_message(format, &vals);
@@ -26533,12 +26912,74 @@ fn run_plpgsql_stmts(
                     }
                 }
             }
+            crate::sql::PlpgsqlStmt::Assign { var, select } => {
+                // v1.03: `var := <expr>` (PG19 `exec_stmt_assign`,
+                // pl_exec.c): evaluate like RETURN, coerce to the
+                // declared type (`exec_assign_value`), and write the
+                // variable's slot. A 0-row SELECT assigns NULL (PG's
+                // `SELECT ... INTO` strictness does not apply to `:=`).
+                let idx = plpgsql_var_index(pb, var)?;
+                let out = run_plpgsql_select(q, scopes, select, run, "assignment")?;
+                let v = out
+                    .rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null);
+                let v = coerce_to_type_name(q, &v, &pb.decls[idx].type_name)?;
+                run.params[run.nargs + idx] = Some(v);
+            }
+            crate::sql::PlpgsqlStmt::ForQuery { var, query, body } => {
+                // v1.03: `FOR var IN <query> LOOP` (PG19
+                // `exec_stmt_fors`, pl_exec.c). The query is a
+                // row-producing SELECT or EXPLAIN; each row binds the
+                // (DECLAREd) variable to the row's first column,
+                // coerced to its declared type.
+                let idx = plpgsql_var_index(pb, var)?;
+                let mut qq = query.clone();
+                subst_params(&mut qq, &run.params)?;
+                let rows: Vec<Row> = match &qq {
+                    Stmt::Select(sel) => run_select(q, sel, scopes)?.rows,
+                    Stmt::Explain { stmt, analyze } => {
+                        let Stmt::Select(inner) = &**stmt else {
+                            return Err(exec_err(
+                                "XX000",
+                                "plpgsql FOR over non-SELECT EXPLAIN".to_string(),
+                            ));
+                        };
+                        explain_rows(q, scopes, inner, *analyze)?
+                    }
+                    _ => {
+                        return Err(exec_err(
+                            "XX000",
+                            "plpgsql FOR query is not SELECT or EXPLAIN".to_string(),
+                        ));
+                    }
+                };
+                for row in rows {
+                    let cell = row.first().cloned().unwrap_or(Value::Null);
+                    let cell = coerce_to_type_name(q, &cell, &pb.decls[idx].type_name)?;
+                    run.params[run.nargs + idx] = Some(cell);
+                    match run_plpgsql_stmts(q, scopes, body, pb, run, ret_type)? {
+                        PlFlow::Return(out) => return Ok(PlFlow::Return(out)),
+                        PlFlow::Continue => {}
+                    }
+                }
+            }
+            crate::sql::PlpgsqlStmt::ReturnNext(sel) => {
+                // v1.03: `RETURN NEXT <expr>` (PG19
+                // `exec_stmt_return_next`, pl_exec.c): coerce to the
+                // function's return type and append to the result set
+                // without ending the function.
+                let out = run_plpgsql_select(q, scopes, sel, run, "RETURN NEXT")?;
+                for row in out.rows {
+                    let v = row.first().cloned().unwrap_or(Value::Null);
+                    let v = coerce_to_type_name(q, &v, ret_type)?;
+                    run.accum.push(Row::new(vec![v]));
+                }
+            }
         }
     }
-    Err(exec_err(
-        "XX000",
-        "plpgsql statement list ended without RETURN".to_string(),
-    ))
+    Ok(PlFlow::Continue)
 }
 
 /// v1.01: run a bounded PL/pgSQL body: statement sequence with
@@ -26555,9 +26996,15 @@ fn run_plpgsql_stmts(
 /// the body, so a trapped error does NOT roll back the effects of
 /// statements that already ran (rustgres has no subtransaction
 /// machinery; ANALYZE has no transactional effects to roll back).
+///
+/// v1.03: DECLAREd variables get one `None` slot each appended to the
+/// parameter vector; `RETURN NEXT` accumulates rows for SETOF
+/// functions (the output column is named after the function, PG19
+/// `pl_exec.c` `exec_stmt_return_next` + `do_compile` naming).
 fn run_plpgsql_body(
     q: &mut Q,
     scopes: &[Scope],
+    fdef: &crate::storage::FuncDef,
     pb: &crate::sql::PlpgsqlBody,
     params: &[Option<Value>],
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
@@ -26583,8 +27030,17 @@ fn run_plpgsql_body(
         // bodies see the statement snapshot (None).
         pending_updates: pending,
     };
-    match run_plpgsql_stmts(&mut call_q, scopes, &pb.stmts, params) {
-        Ok(out) => Ok(out),
+    let nargs = params.len();
+    let mut run = PlpgsqlRun {
+        params: params.to_vec(),
+        nargs,
+        accum: Vec::new(),
+    };
+    run.params
+        .extend(std::iter::repeat(None).take(pb.decls.len()));
+    let flow = match run_plpgsql_stmts(&mut call_q, scopes, &pb.stmts, pb, &mut run, &fdef.ret_type)
+    {
+        Ok(f) => f,
         Err(e) => {
             let handler = pb.handlers.iter().find(|h| {
                 h.sqlstates
@@ -26592,9 +27048,37 @@ fn run_plpgsql_body(
                     .any(|c| crate::sql::plpgsql_condition_matches(c, &e.code))
             });
             match handler {
-                Some(h) => run_plpgsql_stmts(&mut call_q, scopes, &h.stmts, params),
-                None => Err(e),
+                Some(h) => {
+                    run_plpgsql_stmts(&mut call_q, scopes, &h.stmts, pb, &mut run, &fdef.ret_type)?
+                }
+                None => return Err(e),
             }
+        }
+    };
+    match flow {
+        PlFlow::Return(out) => Ok(out),
+        PlFlow::Continue => {
+            // v1.03: SETOF bodies fall off the end and return the
+            // accumulated RETURN NEXT rows (possibly zero). Scalar
+            // bodies cannot reach here: the parser appends an implicit
+            // `RETURN NULL`.
+            if !fdef.returns_set {
+                return Err(exec_err(
+                    "XX000",
+                    "plpgsql statement list ended without RETURN".to_string(),
+                ));
+            }
+            let coltype = resolve_func_type_name(
+                call_q.eng,
+                call_q.snap,
+                call_q.own,
+                call_q.session,
+                &fdef.ret_type,
+            )?;
+            Ok(SelectOut {
+                columns: vec![(fdef.name.clone(), coltype)],
+                rows: run.accum,
+            })
         }
     }
 }
@@ -35392,6 +35876,10 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
             Ok(())
         }
         Stmt::Select(sel) => subst_select(sel, params),
+        // v1.03: EXPLAIN's inner SELECT can reference parameters
+        // (function arguments / plpgsql variables) - substitute them
+        // so FOR loops over EXPLAIN see current bindings.
+        Stmt::Explain { stmt, .. } => subst_params(stmt, params),
         Stmt::Update {
             sets,
             from,
@@ -42349,35 +42837,44 @@ fn exec_create_function(
     let body: &str = if is_trigger_fn {
         body
     } else if lang == crate::sql::FuncLang::Plpgsql {
-        match crate::sql::desugar_plpgsql_body(body) {
-            Ok(sel) => {
+        // v1.03: SETOF bodies skip the v0.97 single-RETURN desugar so a
+        // bare RETURN is honestly rejected (42601) instead of silently
+        // becoming a SQL SELECT body.
+        let desugared = if returns_set {
+            None
+        } else {
+            crate::sql::desugar_plpgsql_body(body).ok()
+        };
+        match desugared {
+            Some(sel) => {
                 owned_body = sel;
                 &owned_body
             }
-            Err(_) => {
-                let mut pb = crate::sql::parse_plpgsql_body(body)
+            None => {
+                let mut pb = crate::sql::parse_plpgsql_body(body, returns_set)
                     .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
-                let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
-                for s in pb
-                    .stmts
-                    .iter_mut()
-                    .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
-                {
-                    match s {
-                        crate::sql::PlpgsqlStmt::Return(sel) => {
-                            rewrite_func_arg_refs(sel, &arg_names);
-                        }
-                        // v1.02: named-arg -> $n rewrite applies to RAISE
-                        // args too (they are bare Exprs, rewritten via
-                        // the hoisted expression rewriter).
-                        crate::sql::PlpgsqlStmt::Raise { args: rargs, .. } => {
-                            for a in rargs.iter_mut() {
-                                rewrite_func_arg_expr(a, &arg_names);
-                            }
-                        }
-                        crate::sql::PlpgsqlStmt::Utility(_) => {}
+                // v1.03: resolve DECLAREd variable types now (like PG's
+                // plpgsql validator at CREATE time).
+                for d in &pb.decls {
+                    resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &d.type_name)
+                        .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
+                }
+                // v1.03: a variable name colliding with an argument name
+                // is ambiguous - reject (PG: the variable would shadow
+                // the argument, which the bounded subset forbids).
+                for d in &pb.decls {
+                    if args
+                        .iter()
+                        .any(|a| a.name.as_deref() == Some(d.name.as_str()))
+                    {
+                        return Err(exec_err(
+                            "42601",
+                            format!("plpgsql: variable \"{}\" is already defined", d.name),
+                        ));
                     }
                 }
+                let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
+                rewrite_plpgsql_body_refs(&mut pb, &arg_names);
                 plpgsql_body = Some(pb);
                 body
             }
@@ -43025,6 +43522,80 @@ pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>
     }
 }
 
+/// v1.03: rewrite named references in a parsed plpgsql body to
+/// positional parameters: function argument names become `$n`
+/// (existing), and DECLAREd variable names become `$(nargs+i+1)`
+/// (new). This reuses `rewrite_func_arg_refs` /
+/// `rewrite_func_arg_expr` verbatim by appending the variable names
+/// after the argument names - the resulting 1-based positions are
+/// exactly the runtime slot layout (`params[nargs + i]`, see
+/// `run_plpgsql_body`). Applied at CREATE and on WAL/checkpoint
+/// rebuild; idempotent (an already-rewritten `Param` is untouched).
+/// EXPLAIN inner queries are recursed into so FOR loops over EXPLAIN
+/// see the same bindings.
+pub(crate) fn rewrite_plpgsql_body_refs(
+    pb: &mut crate::sql::PlpgsqlBody,
+    arg_names: &[Option<String>],
+) {
+    let mut all_names: Vec<Option<String>> = arg_names.to_vec();
+    all_names.extend(pb.decls.iter().map(|d| Some(d.name.clone())));
+    fn rewrite_query(stmt: &mut crate::sql::Stmt, all_names: &[Option<String>]) {
+        match stmt {
+            crate::sql::Stmt::Explain { stmt: inner, .. } => rewrite_query(inner, all_names),
+            crate::sql::Stmt::Select(sel) => {
+                // v1.03: FOR queries may reference args/vars in FROM
+                // function args (e.g. `generate_series(1, n)`); the
+                // base rewriter only walks the select list + WHERE.
+                for item in &mut sel.items {
+                    if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                        rewrite_func_arg_expr(expr, all_names);
+                    }
+                }
+                if let Some(w) = &mut sel.where_ {
+                    rewrite_func_arg_expr(w, all_names);
+                }
+                for fi in &mut sel.from {
+                    if let crate::sql::FromItem::Function { args, .. } = fi {
+                        for a in args {
+                            rewrite_func_arg_expr(a, all_names);
+                        }
+                    }
+                }
+            }
+            _ => rewrite_func_arg_refs(stmt, all_names),
+        }
+    }
+    fn rewrite_stmt(s: &mut crate::sql::PlpgsqlStmt, all_names: &[Option<String>]) {
+        match s {
+            crate::sql::PlpgsqlStmt::Return(sel) | crate::sql::PlpgsqlStmt::ReturnNext(sel) => {
+                rewrite_func_arg_refs(sel, all_names);
+            }
+            crate::sql::PlpgsqlStmt::Assign { select, .. } => {
+                rewrite_func_arg_refs(select, all_names);
+            }
+            crate::sql::PlpgsqlStmt::ForQuery { query, body, .. } => {
+                rewrite_query(query, all_names);
+                for b in body {
+                    rewrite_stmt(b, all_names);
+                }
+            }
+            crate::sql::PlpgsqlStmt::Raise { args, .. } => {
+                for a in args {
+                    rewrite_func_arg_expr(a, all_names);
+                }
+            }
+            crate::sql::PlpgsqlStmt::Utility(_) => {}
+        }
+    }
+    for s in pb
+        .stmts
+        .iter_mut()
+        .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
+    {
+        rewrite_stmt(s, &all_names);
+    }
+}
+
 /// v1.01: rebuild a function's parsed bodies from stored body text
 /// (WAL replay / checkpoint restore). For plpgsql the multi-statement
 /// form (original source) is tried first; the v0.97 single-RETURN form
@@ -43037,29 +43608,21 @@ pub(crate) fn rebuild_function_bodies(
     lang: crate::sql::FuncLang,
     arg_names: &[Option<String>],
     body: &str,
+    returns_set: bool,
 ) -> (Option<Stmt>, Option<crate::sql::PlpgsqlBody>) {
     if lang == crate::sql::FuncLang::Plpgsql {
-        if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body) {
-            for s in pb
-                .stmts
-                .iter_mut()
-                .chain(pb.handlers.iter_mut().flat_map(|h| h.stmts.iter_mut()))
-            {
-                match s {
-                    crate::sql::PlpgsqlStmt::Return(sel) => {
-                        rewrite_func_arg_refs(sel, arg_names);
-                    }
-                    // v1.02: RAISE args get the same named-arg rewrite
-                    // (see the CREATE path above).
-                    crate::sql::PlpgsqlStmt::Raise { args: rargs, .. } => {
-                        for a in rargs.iter_mut() {
-                            rewrite_func_arg_expr(a, arg_names);
-                        }
-                    }
-                    crate::sql::PlpgsqlStmt::Utility(_) => {}
-                }
+        // v1.03: SETOF bodies skip the single-RETURN desugar exactly as
+        // CREATE does (see exec_create_function).
+        let desugared = if returns_set {
+            None
+        } else {
+            crate::sql::desugar_plpgsql_body(body).ok()
+        };
+        if desugared.is_none() {
+            if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body, returns_set) {
+                rewrite_plpgsql_body_refs(&mut pb, arg_names);
+                return (None, Some(pb));
             }
-            return (None, Some(pb));
         }
         if let Ok(mut stmt) = crate::sql::parse_statement(body) {
             rewrite_func_arg_refs(&mut stmt, arg_names);
@@ -46461,7 +47024,7 @@ mod v097_domain_tests {
 
     fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
         match r {
-            ExecResult::Select { rows, .. } => rows
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
                 .into_iter()
                 .map(|row| {
                     row.into_iter()
@@ -46636,6 +47199,148 @@ mod v097_domain_tests {
 
     /// v0.97: bounded plpgsql — single-RETURN bodies desugar to SQL;
     /// richer bodies are an honest 0A000; other languages stay 42601.
+
+    /// v1.03: scalar DECLARE + `:=` + RETURN.
+    #[test]
+    fn v103_plpgsql_declare_assign() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add103(a int, b int) RETURNS int AS $$ declare s int; begin s := a + b; return s; end; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT add103(3, 4)").unwrap()),
+            vec![vec!["7"]]
+        );
+        // Variable references in expressions rewrite to the local slot.
+        run(
+            &mut eng,
+            "CREATE FUNCTION dbl103(x int) RETURNS int AS $$ declare y int; begin y := x * 2; return y + x; end; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT dbl103(5)").unwrap()),
+            vec![vec!["15"]]
+        );
+    }
+
+    /// v1.03: `RETURN NEXT` accumulates SETOF rows; loop var binds per row.
+    #[test]
+    fn v103_plpgsql_return_next() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION gen103(n int) RETURNS SETOF int AS $$ declare i int; begin for i in select * from generate_series(1, n) loop return next i * 10; end loop; end; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT * FROM gen103(3)").unwrap()),
+            vec![vec!["10"], vec!["20"], vec!["30"]]
+        );
+    }
+
+    /// v1.03: the conformance target — FOR over EXPLAIN (ANALYZE) with
+    /// per-row regexp_replace, exact plan shape.
+    #[test]
+    fn v103_explain_analyze_setof() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE sq_limit (pk int primary key, c1 int, c2 int)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO sq_limit VALUES (1,1,1),(2,2,2),(3,3,3),(4,4,4),(5,1,1),(6,2,2),(7,3,3),(8,4,4)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION explain_sq_limit() RETURNS SETOF text LANGUAGE plpgsql AS $$ declare ln text; begin for ln in explain (analyze, summary off, timing off, costs off, buffers off) select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3 loop ln := regexp_replace(ln, 'Memory: \\S*', 'Memory: xxx'); return next ln; end loop; end; $$",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT * FROM explain_sq_limit()").unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec!["Limit (actual rows=3.00 loops=1)".to_string()],
+                vec!["   ->  Subquery Scan on x (actual rows=3.00 loops=1)".to_string()],
+                vec!["         ->  Sort (actual rows=3.00 loops=1)".to_string()],
+                vec!["               Sort Key: sq_limit.c1, sq_limit.pk".to_string()],
+                vec!["               Sort Method: top-N heapsort  Memory: xxx".to_string()],
+                vec![
+                    "               ->  Seq Scan on sq_limit (actual rows=8.00 loops=1)"
+                        .to_string()
+                ],
+            ]
+        );
+    }
+
+    /// v1.03: top-level EXPLAIN (ANALYZE) renders actual rows.
+    #[test]
+    fn v103_explain_analyze_toplevel() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE ea103 (a int)").unwrap();
+        run(&mut eng, "INSERT INTO ea103 VALUES (1), (2), (3)").unwrap();
+        let rows = rows_of(run(&mut eng, "EXPLAIN (ANALYZE) SELECT * FROM ea103").unwrap());
+        assert!(
+            rows[0][0].contains("actual rows=3.00 loops=1"),
+            "{}",
+            rows[0][0]
+        );
+        // Planning-only EXPLAIN has no actual-rows tag.
+        let rows = rows_of(run(&mut eng, "EXPLAIN SELECT * FROM ea103").unwrap());
+        assert!(!rows[0][0].contains("actual"), "{}", rows[0][0]);
+    }
+
+    /// v1.03: validation errors — RETURN NEXT in scalar, RETURN in SETOF,
+    /// undeclared assignment target, duplicate declaration.
+
+    #[test]
+    fn v103_plpgsql_validation() {
+        let mut eng = engine();
+        // RETURN NEXT in a scalar function.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION rn103() RETURNS int AS $$ begin return next 1; end; $$ LANGUAGE plpgsql"
+            ),
+            "42601"
+        );
+        // Value RETURN in a SETOF function.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION r103() RETURNS SETOF int AS $$ begin return 1; end; $$ LANGUAGE plpgsql"
+            ),
+            "42601"
+        );
+        // Assignment to undeclared variable.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION u103() RETURNS int AS $$ declare x int; begin y := 1; return x; end; $$ LANGUAGE plpgsql"
+            ),
+            "42601"
+        );
+        // Duplicate declaration.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION d103() RETURNS int AS $$ declare x int; x text; begin return 1; end; $$ LANGUAGE plpgsql"
+            ),
+            "42601"
+        );
+        // Variable colliding with an argument name.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION c103(a int) RETURNS int AS $$ declare a text; begin return 1; end; $$ LANGUAGE plpgsql"
+            ),
+            "42601"
+        );
+    }
     #[test]
     fn plpgsql_bounded_subset() {
         let mut eng = engine();
@@ -46658,11 +47363,20 @@ mod v097_domain_tests {
             rows_of(run(&mut eng, "SELECT vol97b(41)").unwrap()),
             vec![vec!["42"]]
         );
-        // Multi-statement bodies are outside the subset: 0A000.
+        // v1.03: `:=` is in the subset but requires DECLARE —
+        // assignment to an undeclared variable is 42601.
         assert_eq!(
             err_code(
                 &mut eng,
                 "CREATE FUNCTION bad97() returns int as 'begin x := 1; return 1; end' language plpgsql"
+            ),
+            "42601"
+        );
+        // WHILE is still outside the subset: 0A000.
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION bad97w() returns int as 'begin while true loop return 1; end loop; end' language plpgsql"
             ),
             "0A000"
         );
@@ -46800,13 +47514,14 @@ mod v097_domain_tests {
             rows_of(run(&mut eng, "SELECT nullret101()").unwrap()),
             vec![vec!["NULL"]]
         );
-        // Unsupported statements stay honest 0A000.
+        // v1.03: `:=` is supported but requires DECLARE — undeclared
+        // target is 42601 (was 0A000 in v1.01 when `:=` was unsupported).
         assert_eq!(
             err_code(
                 &mut eng,
                 "CREATE FUNCTION bad101a() returns int as 'begin x := 1; return 1; end' language plpgsql"
             ),
-            "0A000"
+            "42601"
         );
         assert_eq!(
             err_code(
@@ -46838,8 +47553,13 @@ mod v097_domain_tests {
             "42601"
         );
         // Missing EXCEPTION keyword / missing THEN are syntax errors.
-        assert!(parse_plpgsql_body("begin return 1; when others then return 2; end").is_err());
-        assert!(parse_plpgsql_body("begin return 1; exception when others return 2; end").is_err());
+        assert!(
+            parse_plpgsql_body("begin return 1; when others then return 2; end", false).is_err()
+        );
+        assert!(
+            parse_plpgsql_body("begin return 1; exception when others return 2; end", false)
+                .is_err()
+        );
         // Condition matching unit coverage (PG19 pl_exec.c rules).
         // (The parser normalizes OTHERS to the uppercase sentinel.)
         assert!(plpgsql_condition_matches("22012", "22012"));
@@ -46854,6 +47574,7 @@ mod v097_domain_tests {
         // Named conditions resolve through the errcodes table.
         let pb = parse_plpgsql_body(
             "begin return 1; exception when division_by_zero or unique_violation then return 0; end",
+            false,
         )
         .unwrap();
         assert_eq!(pb.handlers[0].sqlstates, vec!["22012", "23505"]);

@@ -279,7 +279,9 @@ def main():
         check("plpgsql volatile repeat call", rows == [["ab"]], f"{rows}")
         ec, em = errinfo(c.q(
             "create function badpl() returns int as 'begin x := 1; return 1; end' language plpgsql"))
-        check("rich plpgsql body 0A000", ec == "0A000", f"{ec} {em}")
+        # v1.03: `:=` is supported but requires DECLARE — undeclared
+        # target is 42601 (was 0A000 before v1.03).
+        check("rich plpgsql body 42601", ec == "42601", f"{ec} {em}")
         # the foodomain cascade from pg_regress domains: plpgsql no
         # longer aborts the txn, so CREATE DOMAIN succeeds
         ec, em = errinfo(c.q("begin"))

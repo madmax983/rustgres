@@ -208,7 +208,9 @@ language plpgsql volatile;""")
         # --- Honest errors: 0A000 / 42704 / 42601 ---
         r, e = c.q("""create function bad101a() returns int as
 'begin x := 1; return 1; end' language plpgsql;""")
-        check("0A000: assignment unsupported", e == "0A000", e)
+        # v1.03: `:=` is supported but requires DECLARE — undeclared
+        # target is 42601 (was 0A000 in v1.01).
+        check("42601: assignment needs DECLARE", e == "42601", e)
         r, e = c.q("""create function bad101b() returns int as
 'begin insert into revalidate_bug values (1); return 1; end' language plpgsql;""")
         check("0A000: insert unsupported", e == "0A000", e)
