@@ -5149,10 +5149,19 @@ fn ensure_toast_table(
     ctx.writes.push(WriteOp::CreateTable {
         name: toast_name.clone(),
     });
+    // v1.05: the reltoastrelid link is a catalog mutation like any
+    // other — stage it as its own write op so ROLLBACK restores the
+    // previous link and the WAL replays it (RGSWAL19). Without this the
+    // main table's toast_relid would be lost on crash recovery.
+    ctx.writes.push(WriteOp::SetToastRelid {
+        table: table_name.to_string(),
+        toast_relid: toast_oid,
+        prev: 0,
+    });
     Ok(toast_name)
 }
 
-/// v0.37: apply TOAST to a freshly inserted/updated row. Plans storage
+/// v0.37: apply TOAST to a freshly inserted row. Plans storage
 /// via `toast::plan_toast`, allocates value ids, records `toast_info`,
 /// writes out-of-line chunks to the toast table, and stamps the row's
 /// `toast` flags. Values stay detoasted in the main row (the flags are
@@ -5163,6 +5172,50 @@ fn toast_new_row(
     table_name: &str,
     row_id: u64,
     values: &Row,
+) -> Result<(), ExecError> {
+    toast_row_impl(eng, ctx, table_name, row_id, values, None)
+}
+
+/// v1.05: apply TOAST to an UPDATE's new row version, following PG19's
+/// `heap_update` → `heap_toast_insert_or_update(relation, newtup,
+/// &oldtup)` (`heaptoast.c` / `toast_helper.c`, REL_19_STABLE):
+/// - columns whose datum is unchanged keep the old toast value id
+///   (PG's `TOASTCOL_IGNORE` fast path) — no new chunks are written
+///   and the old ones are not deleted;
+/// - changed columns are re-toasted with fresh value ids, and every
+///   old value id not carried forward has its chunks deleted
+///   (`toast_tuple_cleanup` → `toast_delete_datum`).
+///
+/// `old_values`/`old_toast` are the superseded version's detoasted
+/// values and per-column toast flags in table column order. Both the
+/// new chunks and the deletions are staged as `WriteOp`s, so ROLLBACK
+/// restores the pre-update state exactly and the WAL replays it.
+fn toast_update_row(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+    row_id: u64,
+    old_values: &Row,
+    old_toast: &[u32],
+    values: &Row,
+) -> Result<(), ExecError> {
+    toast_row_impl(
+        eng,
+        ctx,
+        table_name,
+        row_id,
+        values,
+        Some((old_values, old_toast)),
+    )
+}
+
+fn toast_row_impl(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table_name: &str,
+    row_id: u64,
+    values: &Row,
+    old: Option<(&Row, &[u32])>,
 ) -> Result<(), ExecError> {
     // v0.37: temp tables are session-local and skip TOAST (values stay
     // inline, always correct); they never get a toast table, so there
@@ -5178,8 +5231,9 @@ fn toast_new_row(
     // v0.41: compression uses the session's default_toast_compression
     // GUC unless the column has an explicit COMPRESSION method.
     const COMPRESS_OK: bool = true;
-    // Phase 1: plan with a shared borrow.
-    let plan = {
+    // Phase 1: plan with a shared borrow. v1.05: updates also compute
+    // the unchanged-column reuse mask (PG19 TOASTCOL_IGNORE).
+    let (plan, reuse) = {
         let t = eng
             .db
             .find_table(table_name, ctx.snap, ctx.own, ctx.session)
@@ -5189,14 +5243,38 @@ fn toast_new_row(
                     format!("relation \"{}\" does not exist", table_name),
                 )
             })?;
-        crate::toast::plan_toast(t, values, COMPRESS_OK, ctx.default_toast_compression)
+        let reuse: Vec<Option<bool>> = match &old {
+            Some((old_values, old_toast)) => {
+                crate::toast::toast_update_reuse(old_values, old_toast, values, &t.toast_info)
+            }
+            None => vec![None; values.len()],
+        };
+        let plan = crate::toast::plan_toast(
+            t,
+            values,
+            COMPRESS_OK,
+            ctx.default_toast_compression,
+            &reuse,
+        );
+        (plan, reuse)
     };
-    if plan.iter().all(|p| *p == crate::toast::ToastPlan::Plain) {
+    // v1.05: a reused column's preset plan is External, so the all-Plain
+    // early return must not fire when any column is reused (phase 2
+    // still has to stamp the carried-forward flags). It also must not
+    // fire on UPDATE when the old row had out-of-line values: phase 4
+    // has to delete those chunks transactionally (a toasted -> inline
+    // UPDATE would otherwise leave them for the non-WAL-logged vacuum,
+    // resurrecting them on crash recovery).
+    let has_old_toast = old.is_some_and(|(_, old_toast)| old_toast.iter().any(|v| *v != 0));
+    if !has_old_toast
+        && reuse.iter().all(|r| r.is_none())
+        && plan.iter().all(|p| *p == crate::toast::ToastPlan::Plain)
+    {
         return Ok(());
     }
     // Phase 2: allocate value ids, record toast_info, collect chunks,
     // and stamp the row's flags (mutable table borrow).
-    let chunks: Vec<(u32, Vec<u8>)> = {
+    let (chunks, doomed): (Vec<(u32, Vec<u8>)>, Vec<u32>) = {
         let t = eng
             .db
             .find_table_mut(table_name, ctx.snap, ctx.own, ctx.session)
@@ -5204,6 +5282,14 @@ fn toast_new_row(
         let mut flags = vec![0u32; values.len()];
         let mut chunks = Vec::new();
         for (i, p) in plan.iter().enumerate() {
+            // v1.05: unchanged column — keep the old value id, write no
+            // chunks, record no toast_info (PG19 TOASTCOL_IGNORE).
+            if reuse.get(i).copied().flatten().is_some() {
+                flags[i] = old
+                    .and_then(|(_, old_toast)| old_toast.get(i).copied())
+                    .unwrap_or(0);
+                continue;
+            }
             if *p == crate::toast::ToastPlan::Plain {
                 continue;
             }
@@ -5233,7 +5319,18 @@ fn toast_new_row(
                 r.toast = flags;
             }
         }
-        chunks
+        // v1.05: old value ids not carried into the new version lose
+        // their chunks (PG19 toast_tuple_cleanup → toast_delete_datum).
+        let doomed: Vec<u32> = match &old {
+            Some((_, old_toast)) => old_toast
+                .iter()
+                .enumerate()
+                .filter(|(i, vid)| **vid != 0 && reuse.get(*i).copied().flatten().is_none())
+                .map(|(_, vid)| *vid)
+                .collect(),
+            None => Vec::new(),
+        };
+        (chunks, doomed)
     };
     // Phase 3: write chunks to the toast table.
     // Pre-allocate chunk row ids (the table borrow below conflicts).
@@ -5284,6 +5381,14 @@ fn toast_new_row(
                 }
             }
         }
+    }
+    // Phase 4 (v1.05): delete the superseded value ids' chunks, like
+    // PG19's toast_tuple_cleanup at heap_update time. Transactional and
+    // WAL-logged (toast_delete_chunks stages DeleteRow ops), so unlike
+    // the old commit-time vacuum reap the deletions survive crashes
+    // and stay invisible to concurrent snapshots until commit.
+    if !doomed.is_empty() {
+        toast_delete_chunks(eng, ctx, table_name, &doomed)?;
     }
     Ok(())
 }
@@ -6727,7 +6832,7 @@ fn exec_insert(
     for _ in 0..updates.len() {
         update_ids.push(eng.alloc_row_id());
     }
-    let mut indexed: Vec<(String, u64, Row)> = Vec::with_capacity(updates.len());
+    let mut indexed: Vec<(String, u64, Row, Row, Vec<u32>)> = Vec::with_capacity(updates.len());
     for ((utab, old_id, prev_xmax, new_values), new_id) in updates.iter().zip(update_ids) {
         let t = eng
             .db
@@ -6737,7 +6842,10 @@ fn exec_insert(
             .row_pos(*old_id)
             .expect("row version still present; engine lock held throughout");
         // v0.13: UpdateRow carries the old values for logical decoding.
+        // v1.05: the old toast flags ride along too, for PG19 update
+        // toast lifecycle (reuse unchanged pointers, delete the rest).
         let old_values = t.rows[pos].values.clone();
+        let old_toast = t.rows[pos].toast.clone();
         t.rows[pos].xmax = ctx.own;
         t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
         ctx.writes.push(WriteOp::UpdateRow {
@@ -6745,15 +6853,23 @@ fn exec_insert(
             old_id: *old_id,
             new_id,
             prev_xmax: *prev_xmax,
-            old_values,
+            old_values: old_values.clone(),
         });
-        indexed.push((utab.clone(), new_id, new_values.clone()));
+        indexed.push((
+            utab.clone(),
+            new_id,
+            new_values.clone(),
+            old_values,
+            old_toast,
+        ));
     }
-    // v0.37: TOAST the updated rows.
-    for (utab, new_id, new_values) in &indexed {
-        toast_new_row(eng, ctx, utab, *new_id, new_values)?;
+    // v1.05: TOAST the updated rows with PG19 update semantics —
+    // unchanged columns reuse their toast pointers; superseded chunks
+    // are deleted transactionally (not left for vacuum).
+    for (utab, new_id, new_values, old_values, old_toast) in &indexed {
+        toast_update_row(eng, ctx, utab, *new_id, old_values, old_toast, new_values)?;
     }
-    for (utab, new_id, new_values) in &indexed {
+    for (utab, new_id, new_values, _, _) in &indexed {
         eng.db
             .index_insert_row(utab, *new_id, new_values, ctx.session);
     }
@@ -7402,7 +7518,11 @@ fn exec_update(
             }
             // The table borrow ends before index maintenance (both need
             // `eng.db` mutably); collect the new versions' keys meanwhile.
-            let mut indexed: Vec<(u64, Row)> = Vec::with_capacity(rows.len());
+            // v1.05: also carry each superseded version's values and toast
+            // flags, so toast_update_row can reuse unchanged toast
+            // pointers and delete superseded chunks (PG19
+            // heap_toast_insert_or_update).
+            let mut indexed: Vec<(u64, Row, Row, Vec<u32>)> = Vec::with_capacity(rows.len());
             {
                 let t = eng
                     .db
@@ -7414,6 +7534,7 @@ fn exec_update(
                         .expect("row version still present; engine lock held throughout");
                     // v0.13: UpdateRow carries the old values for logical decoding.
                     let old_values = t.rows[pos].values.clone();
+                    let old_toast = t.rows[pos].toast.clone();
                     t.rows[pos].xmax = ctx.own;
                     t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
                     ctx.writes.push(WriteOp::UpdateRow {
@@ -7421,19 +7542,20 @@ fn exec_update(
                         old_id,
                         new_id,
                         prev_xmax,
-                        old_values,
+                        old_values: old_values.clone(),
                     });
-                    indexed.push((new_id, new_values));
+                    indexed.push((new_id, new_values, old_values, old_toast));
                 }
             }
-            // v0.37: TOAST the updated rows, like INSERT does (the new versions
-            // may hold large values even when the old ones did not).
-            for (new_id, new_values) in &indexed {
-                toast_new_row(eng, ctx, leaf, *new_id, new_values)?;
+            // v1.05: TOAST the updated rows with PG19 update semantics —
+            // unchanged columns reuse their toast pointers; superseded
+            // chunks are deleted transactionally (not left for vacuum).
+            for (new_id, new_values, old_values, old_toast) in &indexed {
+                toast_update_row(eng, ctx, leaf, *new_id, old_values, old_toast, new_values)?;
             }
             // v0.8: index the new versions (old versions' entries stay; the
             // version chain's xmax makes them invisible).
-            for (new_id, new_values) in &indexed {
+            for (new_id, new_values, _, _) in &indexed {
                 eng.db
                     .index_insert_row(leaf, *new_id, new_values, ctx.session);
             }
@@ -7453,6 +7575,12 @@ fn exec_update(
         }
         let mut srcs: Vec<String> = by_src.keys().cloned().collect();
         srcs.sort_unstable();
+        // v1.05: collect each deleted source version's toast value ids —
+        // PG19 models a partition move as heap_delete + heap_insert, so
+        // the source version's chunks are deleted eagerly (heap_delete →
+        // heap_toast_delete), not left for vacuum.
+        let mut doomed_by_src: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
         for src in &srcs {
             let t = eng
                 .db
@@ -7462,12 +7590,24 @@ fn exec_update(
                 let pos = t
                     .row_pos(*old_id)
                     .expect("row version still present; engine lock held throughout");
+                doomed_by_src
+                    .entry(src.clone())
+                    .or_default()
+                    .extend(t.rows[pos].toast.iter().copied().filter(|v| *v != 0));
                 t.rows[pos].xmax = ctx.own;
                 ctx.writes.push(WriteOp::DeleteRow {
                     table: src.clone(),
                     row_id: *old_id,
                     prev_xmax: *prev_xmax,
                 });
+            }
+        }
+        // v1.05: delete the moved-away versions' chunks transactionally.
+        for src in &srcs {
+            if let Some(doomed) = doomed_by_src.get(src) {
+                if !doomed.is_empty() {
+                    toast_delete_chunks(eng, ctx, src, doomed)?;
+                }
             }
         }
         let mut dsts: Vec<String> = by_dst.keys().cloned().collect();

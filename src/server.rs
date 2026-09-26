@@ -2933,7 +2933,10 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DropOperator { .. }
             // v0.87: temp index DDL leaves no dead row versions to reap.
             | WriteOp::CreateTempIndex { .. }
-            | WriteOp::DropTempIndex { .. } => continue,
+            | WriteOp::DropTempIndex { .. }
+            // v1.05: the reltoastrelid link is a catalog field update —
+            // no row versions die.
+            | WriteOp::SetToastRelid { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);

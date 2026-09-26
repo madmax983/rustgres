@@ -773,14 +773,35 @@ fn toastable_bytes(v: &Value) -> Option<Vec<u8>> {
 /// order (was: compress-all then externalize-biggest), externalized
 /// columns now count the 20-byte toast pointer (was: zero), and the
 /// limit is `target - hoff` (was: `target`).
+///
+/// v1.05: `reuse` carries the UPDATE fast path from PG19's
+/// `toast_tuple_init` (`TOASTCOL_IGNORE`): `reuse[i] = Some(compressed)`
+/// means column `i`'s datum is unchanged from the old row version, so
+/// the new version keeps the old external toast pointer — the planner
+/// presets `External`/`CompressedExternal` (by the old value's
+/// compression flag) and every round skips the column. The slice must
+/// parallel `values`; `None` toasts normally. Unchanged columns count
+/// the toast-pointer width (not their datum bytes) toward the row
+/// width, exactly as PG19 measures the new tuple.
 pub fn plan_toast(
     table: &Table,
     values: &[Value],
     compress_ok: bool,
     default_method: crate::storage::ToastCompression,
+    reuse: &[Option<bool>],
 ) -> Vec<ToastPlan> {
     let n = values.len();
     let mut plan = vec![ToastPlan::Plain; n];
+    // v1.05: preset reused columns before any round runs.
+    for (i, r) in reuse.iter().enumerate().take(n) {
+        if let Some(compressed) = r {
+            plan[i] = if *compressed {
+                ToastPlan::CompressedExternal
+            } else {
+                ToastPlan::External
+            };
+        }
+    }
     // Only toastable columns with toastable values participate.
     let eligible: Vec<usize> = (0..n)
         .filter(|&i| {
@@ -796,8 +817,20 @@ pub fn plan_toast(
     if eligible.is_empty() {
         return plan;
     }
-    // Row width PG would measure: sum of toastable payloads.
-    let width: usize = eligible.iter().map(|&i| toastable_size(&values[i])).sum();
+    // Row width PG would measure: sum of toastable payloads. v1.05:
+    // reused (unchanged) columns already carry a toast pointer in the
+    // new tuple, so they count the pointer width, not their datum
+    // bytes — mirroring PG19's heap_compute_data_size on the new tuple.
+    let width: usize = eligible
+        .iter()
+        .map(|&i| {
+            if reuse.get(i).copied().flatten().is_some() {
+                TOAST_POINTER_SIZE
+            } else {
+                toastable_size(&values[i])
+            }
+        })
+        .sum();
     if width <= toast_consts::TOAST_TUPLE_THRESHOLD as usize {
         return plan;
     }
@@ -957,6 +990,50 @@ pub fn plan_toast(
     }
 
     plan
+}
+
+/// v1.05: the per-column reuse mask for an UPDATE's new row version —
+/// PG19's unchanged-column fast path in `toast_tuple_init`
+/// (`toast_helper.c`, REL_19_STABLE: columns whose datum is unchanged
+/// keep the old external toast pointer, `TOASTCOL_IGNORE`, instead of
+/// being re-toasted).
+///
+/// `old_values`/`old_toast` are the superseded version's detoasted
+/// values and per-column toast flags in table column order; `values`
+/// is the new version's. Returns `Some(compressed)` for a column whose
+/// old value was toasted, whose detoasted bytes are unchanged, and
+/// whose value id still has provenance in `toast_info` — the bool is
+/// the old value's compression flag, so the planner presets the
+/// matching external plan. All other columns return `None` (toast
+/// normally; their old chunks are deleted by the caller).
+///
+/// Byte-equality is a deliberate, unobservable superset of PG19's rule
+/// (which keys off the column not being in the UPDATE's SET list):
+/// value ids are engine-internal (never exposed in SQL), and a
+/// SET-to-the-identical-bytes value reuses the identical chunk rows,
+/// so no query can distinguish the two.
+pub fn toast_update_reuse(
+    old_values: &[Value],
+    old_toast: &[u32],
+    values: &[Value],
+    toast_info: &std::collections::HashMap<u32, ToastInfo>,
+) -> Vec<Option<bool>> {
+    let n = values.len();
+    (0..n)
+        .map(|i| {
+            let vid = old_toast.get(i).copied().unwrap_or(0);
+            if vid == 0 {
+                return None;
+            }
+            let info = toast_info.get(&vid)?;
+            let old_bytes = old_values.get(i).and_then(toastable_bytes);
+            let new_bytes = values.get(i).and_then(toastable_bytes);
+            match (old_bytes, new_bytes) {
+                (Some(o), Some(nw)) if o == nw => Some(info.compressed),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// PG's `toast_tuple_find_biggest_attribute`: index of the largest
@@ -1330,5 +1407,150 @@ mod tests {
         assert_ne!(p, l);
         assert_eq!(decompress_pglz(&p).unwrap(), data);
         assert_eq!(decompress_lz4(&l).unwrap(), data);
+    }
+    // --- v1.05: UPDATE toast reuse (PG19 TOASTCOL_IGNORE) ---
+
+    fn wide_text(seed: u64, n: usize) -> String {
+        // Deterministic incompressible text (PGLZ gives up on it).
+        let mut x: u64 = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (b'a' + ((x >> 33) % 26) as u8) as char
+            })
+            .collect()
+    }
+
+    fn text_table() -> Table {
+        Table::new(
+            vec![
+                ("a".to_string(), crate::storage::ColType::Text),
+                ("b".to_string(), crate::storage::ColType::Text),
+            ],
+            1,
+        )
+    }
+
+    #[test]
+    fn update_reuse_unchanged_column() {
+        let old_values = vec![
+            Value::Text(wide_text(1, 6000).into()),
+            Value::Text("small".to_string().into()),
+        ];
+        let new_values = vec![
+            Value::Text(wide_text(1, 6000).into()), // identical bytes
+            Value::Text("changed".to_string().into()),
+        ];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&old_values, &[7, 0], &new_values, &info);
+        assert_eq!(reuse, vec![Some(false), None]);
+    }
+
+    #[test]
+    fn update_reuse_changed_column_not_reused() {
+        let old_values = vec![Value::Text(wide_text(1, 6000).into())];
+        let new_values = vec![Value::Text(wide_text(2, 6000).into())];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&old_values, &[7], &new_values, &info);
+        assert_eq!(reuse, vec![None]);
+    }
+
+    #[test]
+    fn update_reuse_missing_provenance_not_reused() {
+        // Value id with no toast_info entry (e.g. metadata already
+        // pruned): never reuse a pointer we cannot describe.
+        let t = text_table();
+        let v = vec![Value::Text(wide_text(1, 6000).into())];
+        let reuse = toast_update_reuse(&v, &[7], &v, &std::collections::HashMap::new());
+        assert_eq!(reuse, vec![None]);
+    }
+
+    #[test]
+    fn update_reuse_compressed_flag_carried() {
+        let v = vec![Value::Text(wide_text(1, 6000).into())];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            9u32,
+            ToastInfo {
+                compressed: true,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&v, &[9], &v, &info);
+        assert_eq!(reuse, vec![Some(true)]);
+    }
+
+    #[test]
+    fn plan_toast_reuse_presets_external_and_skips_rounds() {
+        let t = text_table();
+        // Column 0: 6000 incompressible bytes, unchanged (reuse).
+        // Column 1: 6000 incompressible bytes, changed.
+        let w = wide_text(42, 6000);
+        let values = vec![
+            Value::Text(w.clone().into()),
+            Value::Text(wide_text(43, 6000).into()),
+        ];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[Some(false), None],
+        );
+        // Reused column keeps its external pointer; the changed column
+        // is externalized by the rounds.
+        assert_eq!(plan[0], ToastPlan::External);
+        assert_eq!(plan[1], ToastPlan::External);
+    }
+
+    #[test]
+    fn plan_toast_reuse_counts_pointer_width() {
+        let t = text_table();
+        // Only the reused column is wide; the other is small. The row
+        // must NOT toast the small column: the reused column counts 20
+        // bytes, keeping the width under the threshold.
+        let values = vec![
+            Value::Text(wide_text(7, 6000).into()),
+            Value::Text("tiny".to_string().into()),
+        ];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[Some(false), None],
+        );
+        assert_eq!(plan[0], ToastPlan::External);
+        assert_eq!(plan[1], ToastPlan::Plain);
+    }
+
+    #[test]
+    fn plan_toast_no_reuse_unchanged_behavior() {
+        // Without reuse the planner behaves exactly as before: a wide
+        // incompressible column externalizes.
+        let t = text_table();
+        let values = vec![Value::Text(wide_text(11, 6000).into())];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[None],
+        );
+        assert_eq!(plan[0], ToastPlan::External);
     }
 }

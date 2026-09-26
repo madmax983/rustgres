@@ -23,6 +23,12 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
+//! Format version 19 (`RGSWAL19` / `RGSCHK15`) is NOT compatible with v1.04
+//! or earlier: v1.05 WAL-logs the lazy toast-table reltoastrelid link
+//! (`WalRecord::SetToastRelid`, record tag 28). The checkpoint format is
+//! unchanged. Like every format bump, old data directories are refused
+//! with a clear error instead of being misread.
+//!
 //! Format version 18 (`RGSWAL18` / `RGSCHK15`) is NOT compatible with v0.98
 //! or earlier: v0.99 WAL-logs and checkpoints the sequence data type
 //! (`WalSequence.seq_type`). Like every format bump, old data directories
@@ -201,8 +207,9 @@ const CHKPT_VERSION: u32 = 17;
 /// inheritance parent links (`inherits`). Old `RGSWAL15` files are
 /// refused loudly.
 /// v0.99: `RGSWAL18` — sequence records carry the data type.
-/// Old `RGSWAL17` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL18";
+/// v1.05: `RGSWAL19` — new `SetToastRelid` record (tag 28).
+/// Old `RGSWAL18` files are refused loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL19";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -546,6 +553,16 @@ pub enum WalRecord {
     DropOperator {
         name: String,
         xmax: u64,
+    },
+    // --- v1.05: the lazy toast-table safety net's reltoastrelid link
+    // (`pg_class.reltoastrelid`). Staged by
+    // `WriteOp::SetToastRelid`; replay sets the link on the table's
+    // live version (creating nothing — the toast table itself rides in
+    // its own CreateTable record).
+    SetToastRelid {
+        name: String,
+        toast_relid: u32,
+        xmin: u64,
     },
 }
 
@@ -1859,6 +1876,17 @@ impl Enc {
                 self.str(name);
                 self.u64(*xmax);
             }
+            // v1.05: lazy reltoastrelid link (RGSWAL19).
+            WalRecord::SetToastRelid {
+                name,
+                toast_relid,
+                xmin,
+            } => {
+                self.u8(28);
+                self.str(name);
+                self.u32(*toast_relid);
+                self.u64(*xmin);
+            }
         }
     }
 
@@ -2764,6 +2792,17 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropOperator { name, xmax })
             }
+            // v1.05: lazy reltoastrelid link (RGSWAL19).
+            28 => {
+                let name = self.str()?;
+                let toast_relid = self.u32()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::SetToastRelid {
+                    name,
+                    toast_relid,
+                    xmin,
+                })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -2978,7 +3017,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::DropView { xmax: xmin, .. }
         | WalRecord::CreateSequence { xmin, .. }
         | WalRecord::DropSequence { xmax: xmin, .. }
-        | WalRecord::AlterSequence { xmin, .. } => {
+        | WalRecord::AlterSequence { xmin, .. }
+        // v1.05: the lazy reltoastrelid link carries its xid too.
+        | WalRecord::SetToastRelid { xmin, .. } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
@@ -3755,6 +3796,21 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 ),
             }
         }
+        // v1.05: replay the lazy reltoastrelid link onto the table's
+        // live version. The toast table itself was created by its own
+        // CreateTable record earlier in the log (op order is
+        // preserved), so only the link needs restoring here.
+        WalRecord::SetToastRelid {
+            name, toast_relid, ..
+        } => match live_table(eng, name) {
+            Some(t) => {
+                t.toast_relid = *toast_relid;
+            }
+            None => eprintln!(
+                "WAL replay: skipping SetToastRelid \"{}\": no live table",
+                name
+            ),
+        },
     }
     Ok(())
 }
@@ -4013,6 +4069,27 @@ pub fn records_for_commit(
                     inherits: ours.inherits.clone(),
                     xmin: own,
                 });
+            }
+            // v1.05: the lazy reltoastrelid link. Only log when the
+            // table's live version still carries the link we set
+            // (conditional like the other ops); replay restores it.
+            WriteOp::SetToastRelid {
+                table, toast_relid, ..
+            } => {
+                let linked = eng
+                    .db
+                    .tables
+                    .get(table)
+                    .and_then(|vs| vs.iter().find(|t| t.dropped_xmax == 0))
+                    .is_some_and(|t| t.toast_relid == *toast_relid);
+                if linked {
+                    out.push(WalRecord::SetToastRelid {
+                        name: table.clone(),
+                        toast_relid: *toast_relid,
+                        xmin: own,
+                    });
+                }
+                i += 1;
             }
             // v0.9: ALTER TABLE swaps the table version; log the latest
             // version this transaction created.
@@ -6144,6 +6221,12 @@ mod tests {
                 confirmed_flush_lsn: 0x1_0000_0100,
             },
             WalRecord::ReplSlotDrop { name: "s1".into() },
+            // v1.05: lazy reltoastrelid link.
+            WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 42,
+            },
         ];
         for c in &cases {
             assert_eq!(&roundtrip(c), c);
@@ -6394,6 +6477,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eng.txns.next_xid, 10);
+    }
+
+    #[test]
+    fn v105_set_toast_relid_apply_and_emit() {
+        // v1.05: the lazy reltoastrelid link replays onto the live table
+        // version (and folds its xid), and records_for_commit emits it
+        // from the write op — but skips a stale op whose link moved on.
+        let mut eng = Engine::new();
+        eng.db
+            .tables
+            .entry("t".into())
+            .or_default()
+            .push(Table::new(vec![("a".into(), ColType::Int)], 4));
+        apply_record(
+            &mut eng,
+            &WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 7,
+            },
+        )
+        .unwrap();
+        let t = eng.db.tables["t"]
+            .iter()
+            .find(|t| t.dropped_xmax == 0)
+            .unwrap();
+        assert_eq!(t.toast_relid, 16385);
+        assert!(eng.txns.next_xid >= 8);
+        // Missing table: warning, not an error.
+        apply_record(
+            &mut eng,
+            &WalRecord::SetToastRelid {
+                name: "nope".into(),
+                toast_relid: 1,
+                xmin: 7,
+            },
+        )
+        .unwrap();
+
+        let writes = vec![WriteOp::SetToastRelid {
+            table: "t".into(),
+            toast_relid: 16385,
+            prev: 0,
+        }];
+        let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+        assert_eq!(
+            recs,
+            vec![WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 9,
+            }]
+        );
+        // Stale op: the link no longer matches, so nothing is logged.
+        eng.db
+            .tables
+            .get_mut("t")
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .toast_relid = 0;
+        let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+        assert!(recs.is_empty());
     }
 
     #[test]

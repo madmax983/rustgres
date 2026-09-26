@@ -6131,11 +6131,28 @@ impl Engine {
     /// by the given dead main-table versions' toast flags. No-op when the
     /// table has no toast table or no dead version was toasted.
     fn vacuum_toast_chunks(&mut self, name: &str, dead: &[(u64, Row, Vec<u32>)]) {
-        let vids: Vec<u32> = dead
+        let mut vids: Vec<u32> = dead
             .iter()
             .flat_map(|(_, _, toast)| toast.iter().copied())
             .filter(|v| *v != 0)
             .collect();
+        if vids.is_empty() {
+            return;
+        }
+        // v1.05: a surviving row version may still reference a dead
+        // version's value id (unchanged toasted columns reuse the old
+        // id — PG19's toast_tuple_init TOASTCOL_IGNORE). Only reap ids
+        // no remaining row version references; anything else is live
+        // data, and pruning its toast_info would corrupt
+        // pg_column_compression for the surviving rows.
+        if let Some(versions) = self.db.tables.get(name) {
+            let live: std::collections::HashSet<u32> = versions
+                .iter()
+                .flat_map(|t| t.rows.iter())
+                .flat_map(|v| v.toast.iter().copied())
+                .collect();
+            vids.retain(|v| !live.contains(v));
+        }
         if vids.is_empty() {
             return;
         }
@@ -6180,6 +6197,20 @@ impl Engine {
         // The tables borrow ends here; index cleanup needs `&mut self`.
         for (id, values) in &gone {
             self.db.index_remove_row(&toast_name, *id, values);
+        }
+        // v1.05: prune the reaped value ids' provenance from the main
+        // table's `toast_info`. Stale entries are unreachable through
+        // live row flags, but they would otherwise accumulate forever
+        // (every UPDATE/DELETE mints fresh value ids); pruning keeps
+        // the metadata lifecycle tied to the chunks'. `vids` was already
+        // filtered above to ids no surviving version references, so a
+        // reused value's provenance survives vacuum with its chunks.
+        if let Some(versions) = self.db.tables.get_mut(name) {
+            for t in versions.iter_mut() {
+                for vid in &vids {
+                    t.toast_info.remove(vid);
+                }
+            }
         }
     }
 
@@ -6779,23 +6810,90 @@ pub enum WriteOp {
     DbAcl {
         prev: Vec<AclEntry>,
     },
+    // --- v1.05: the lazy toast-table safety net links the new toast
+    // table OID onto the main table (`pg_class.reltoastrelid`). The
+    // link is a catalog mutation: it is staged as a write op so
+    // ROLLBACK restores the previous link and the WAL replays it
+    // (`WalRecord::SetToastRelid`, RGSWAL19). `prev` is the link the
+    // table had before (0 when the table had no toast table).
+    SetToastRelid {
+        table: String,
+        toast_relid: u32,
+        prev: u32,
+    },
 }
 
 /// Undo a single write op. Each undo is conditional on the version still
 /// being ours: a concurrent transaction may have overwritten xmax after
 /// us (last-writer-wins, no row locking in v0.5), in which case their
 /// op owns the version now and ours must not clobber it.
+///
+/// v1.05: drop `toast_info` entries for value ids that no row version
+/// of `table` references anymore. Called when rolling back an INSERT or
+/// UPDATE: the aborted row version (and its chunks) are physically
+/// removed, and without this the freshly minted value ids would linger
+/// in `toast_info` as unreachable orphans (commit-time vacuum only sees
+/// dead versions, never aborted ones). A vid referenced by ANY remaining
+/// version — live, dead, or still-xmax'd — is kept; vacuum reaps the
+/// dead ones' ids later.
+fn prune_orphan_toast_info(eng: &mut Engine, table: &str, vids: &[u32]) {
+    let mut uniq: Vec<u32> = vids.to_vec();
+    uniq.sort_unstable();
+    uniq.dedup();
+    uniq.retain(|v| *v != 0);
+    if uniq.is_empty() {
+        return;
+    }
+    let Some(versions) = eng.db.tables.get(table) else {
+        return;
+    };
+    // Toast tables never carry toast_info; only main tables do.
+    if versions.iter().all(|t| t.toast_info.is_empty()) {
+        return;
+    }
+    let referenced: std::collections::HashSet<u32> = versions
+        .iter()
+        .flat_map(|t| t.rows.iter())
+        .flat_map(|v| v.toast.iter().copied())
+        .collect();
+    let orphans: Vec<u32> = uniq
+        .into_iter()
+        .filter(|v| !referenced.contains(v))
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    if let Some(versions) = eng.db.tables.get_mut(table) {
+        for t in versions.iter_mut() {
+            for v in &orphans {
+                t.toast_info.remove(v);
+            }
+        }
+    }
+}
+
 pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
     match op {
         WriteOp::InsertRow { table, row_id } => {
             // v0.22: the row may live in a session-local temp table
             // (`remove_own_version` searches both). Only permanent-table
             // rows have global index entries to clean up.
+            // v1.05: capture the toast flags before removal so the
+            // orphan-metadata prune below knows which value ids died
+            // with this version.
+            let doomed: Vec<u32> = eng
+                .db
+                .find_row_version(*row_id)
+                .map(|v| v.toast.clone())
+                .unwrap_or_default();
             if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, own) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *row_id, &values);
                 }
             }
+            // v1.05: an aborted INSERT must not leave its fresh value
+            // ids in toast_info as orphans.
+            prune_orphan_toast_info(eng, table, &doomed);
         }
         WriteOp::DeleteRow {
             table: _,
@@ -6820,6 +6918,13 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
             old_values: _,
         } => {
+            // v1.05: capture the new version's toast flags before
+            // removal for the orphan-metadata prune below.
+            let doomed: Vec<u32> = eng
+                .db
+                .find_row_version(*new_id)
+                .map(|v| v.toast.clone())
+                .unwrap_or_default();
             if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, own) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *new_id, &values);
@@ -6830,6 +6935,10 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                     v.xmax = *prev_xmax;
                 }
             }
+            // v1.05: an aborted UPDATE must not leave its fresh value
+            // ids in toast_info as orphans. (A reused old id is still
+            // referenced by the restored old version, so it is kept.)
+            prune_orphan_toast_info(eng, table, &doomed);
         }
         WriteOp::CreateTable { name } => {
             if let Some(versions) = eng.db.tables.get_mut(name) {
@@ -7183,6 +7292,23 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::DbAcl { prev } => {
             eng.db.db_acl = prev.clone();
+        }
+        // --- v1.05: undo the lazy reltoastrelid link, but only if the
+        // version still carries the value we set (conditional like the
+        // other undos; only the lazy path writes this field, so in
+        // practice the guard always holds).
+        WriteOp::SetToastRelid {
+            table,
+            toast_relid,
+            prev,
+        } => {
+            if let Some(versions) = eng.db.tables.get_mut(table) {
+                for t in versions.iter_mut() {
+                    if t.toast_relid == *toast_relid {
+                        t.toast_relid = *prev;
+                    }
+                }
+            }
         }
     }
 }
@@ -7581,6 +7707,216 @@ mod tests {
         let diff = a.sub(&b);
         let tiny = BigDec::parse_decimal("0.0000000000001").unwrap();
         assert_eq!(diff.cmp(&tiny), Ordering::Equal);
+    }
+
+    // --- v1.05: TOAST lifecycle ---
+    #[test]
+    fn v105_rollback_prunes_orphan_toast_info() {
+        // Rolling back an INSERT removes the row and its chunks; the
+        // fresh value id must not linger in toast_info as an orphan.
+        // A value id still referenced by a surviving version is kept.
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        for vid in [5u32, 6u32] {
+            t.toast_info.insert(
+                vid,
+                ToastInfo {
+                    compressed: false,
+                    method: ToastCompression::Pglz,
+                },
+            );
+        }
+        // Live version referencing vid 6.
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("live".into())]),
+            xmin: 1,
+            xmax: 0,
+            toast: vec![6],
+        });
+        // Aborted insert's version referencing vid 5 (xmin = our xid).
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("doomed".into())]),
+            xmin: 9,
+            xmax: 0,
+            toast: vec![5],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        undo_write_op(
+            &mut eng,
+            9,
+            &WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 2,
+            },
+        );
+        let t = &eng.db.tables["t"][0];
+        assert_eq!(t.rows.len(), 1);
+        assert!(!t.toast_info.contains_key(&5), "orphan vid 5 pruned");
+        assert!(t.toast_info.contains_key(&6), "live vid 6 kept");
+    }
+
+    #[test]
+    fn v105_rollback_update_keeps_reused_vid_info() {
+        // Rolling back an UPDATE that reused the old value id (unchanged
+        // column) must keep that id's toast_info: the restored old
+        // version still references it.
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        t.toast_info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: ToastCompression::Pglz,
+            },
+        );
+        // Old version (xmax'd by our update), new version (reused vid).
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("v".into())]),
+            xmin: 1,
+            xmax: 9,
+            toast: vec![7],
+        });
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("v".into())]),
+            xmin: 9,
+            xmax: 0,
+            toast: vec![7],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        undo_write_op(
+            &mut eng,
+            9,
+            &WriteOp::UpdateRow {
+                table: "t".into(),
+                old_id: 1,
+                new_id: 2,
+                prev_xmax: 0,
+                old_values: Row::new(vec![Value::Text("v".into())]),
+            },
+        );
+        let t = &eng.db.tables["t"][0];
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].xmax, 0);
+        assert!(t.toast_info.contains_key(&7), "reused vid 7 kept");
+    }
+
+    #[test]
+    fn v105_undo_set_toast_relid_restores_prev() {
+        // Undoing the lazy reltoastrelid link restores the previous
+        // link; a version that no longer carries our value is left
+        // alone (conditional like the other undos).
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.toast_relid = 16385;
+        eng.db.tables.insert("t".into(), vec![t]);
+        let op = WriteOp::SetToastRelid {
+            table: "t".into(),
+            toast_relid: 16385,
+            prev: 0,
+        };
+        undo_write_op(&mut eng, 9, &op);
+        assert_eq!(eng.db.tables["t"][0].toast_relid, 0);
+        // Conditional: a changed link is not clobbered.
+        eng.db.tables.get_mut("t").unwrap()[0].toast_relid = 17000;
+        undo_write_op(&mut eng, 9, &op);
+        assert_eq!(eng.db.tables["t"][0].toast_relid, 17000);
+    }
+
+    #[test]
+    fn v105_vacuum_prunes_toast_info_of_reaped_chunks() {
+        // vacuum_toast_chunks removes the dead versions' chunk rows AND
+        // prunes their value ids from the main table's toast_info, so
+        // the metadata lifecycle tracks the chunks'.
+        let mut eng = Engine::new();
+        // Main table with a toast table linked.
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        t.toast_info.insert(
+            5u32,
+            ToastInfo {
+                compressed: false,
+                method: ToastCompression::Pglz,
+            },
+        );
+        t.toast_info.insert(
+            6u32,
+            ToastInfo {
+                compressed: true,
+                method: ToastCompression::Pglz,
+            },
+        );
+        // Dead version (xmax committed, no active snapshots) toasted
+        // with vid 5; live version toasted with vid 6.
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("old".into())]),
+            xmin: 1,
+            xmax: 8,
+            toast: vec![5],
+        });
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("new".into())]),
+            xmin: 8,
+            xmax: 0,
+            toast: vec![6],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        // Toast table with chunks for both vids.
+        let mut tt = Table::new(
+            vec![
+                ("chunk_id".to_string(), ColType::Int),
+                ("chunk_seq".to_string(), ColType::Int),
+                ("chunk_data".to_string(), ColType::Bytea),
+            ],
+            1,
+        );
+        tt.oid = 16385;
+        for (cid, vid) in [(10u64, 5i64), (11u64, 6i64)] {
+            tt.push_version(RowVersion {
+                id: cid,
+                values: Row::new(vec![
+                    Value::Int(vid),
+                    Value::Int(0),
+                    Value::Bytea(vec![1, 2, 3]),
+                ]),
+                xmin: 1,
+                xmax: 0,
+                toast: Vec::new(),
+            });
+        }
+        eng.db
+            .tables
+            .insert("pg_toast.pg_toast_16384".into(), vec![tt]);
+        eng.txns.next_xid = 20;
+
+        // table_name_by_oid must resolve 16385 -> the toast table name.
+        let n = eng.vacuum_table("t");
+        assert_eq!(n, 1);
+        // Dead version gone; its chunk gone; live chunk kept.
+        let tt = &eng.db.tables["pg_toast.pg_toast_16384"][0];
+        let vids: Vec<i64> = tt
+            .rows
+            .iter()
+            .map(|r| match r.values.0[0] {
+                Value::Int(v) => v,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(vids, vec![6]);
+        // toast_info pruned for the reaped vid only.
+        let t = &eng.db.tables["t"][0];
+        assert!(!t.toast_info.contains_key(&5));
+        assert!(t.toast_info.contains_key(&6));
     }
 }
 
