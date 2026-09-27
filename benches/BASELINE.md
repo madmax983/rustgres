@@ -2,6 +2,75 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — fix — 2026-09-27
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec.rs`, `eval_agg_func`, immediately before the row-accumulation
+loop:
+
+```diff
+-    let mut vals: Vec<Value> = Vec::new();
++    let mut vals: Vec<Value> = Vec::with_capacity(visit.len());
+```
+
+`delims` (the `string_agg`-only delimiter accumulator declared on the
+next line) is untouched — it stays `Vec::new()` because it is never
+pushed to for any other aggregate, so giving it a capacity would add a
+wasted allocation to every `sum`/`avg`/`min`/`max`/etc. call instead of
+removing one. `visit.len()` equals `idxs.len()` (the ORDER-BY-inside-
+aggregate branch above only reorders `visit`, never changes its length)
+and is an exact upper bound on how many times `vals.push` can run in the
+loop below, since NULLs only ever skip a push, never add one. No change
+to accumulation order, NULL handling, DISTINCT dedup, or which values
+reach `sum_vals`/`avg_vals`/etc. — same values, same order, same result.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000 --count
+50`), same machine, same session.
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 3,065,100,754 | 1,913,091,840 | **-37.58%** |
+| Total blocks | 14,102,255 | 12,502,245 | **-11.35%** |
+| Target site bytes (`vals`'s allocation, was exec.rs:19905's `push`, now exec.rs:19872's `with_capacity`) | 1,792,000,000 | 640,000,000 | **-64.29%** |
+| Target site blocks | 2,400,000 | 800,000 | **-66.67%** |
+
+Both the whole-workload total (bytes -37.58%, blocks -11.35%) and the
+target site itself clear the ≥10%-allocation-reduction impact floor by a
+wide margin. The site's post-fix byte count (640,000,000 = 800,000 calls
+x 10 elements/call x 80 bytes/`Value`) matches the hypothesis exactly:
+one exactly-sized allocation per `eval_agg_func` call instead of ~3
+reallocations per call.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, same workload,
+same build): 49,965,949,921 -> 49,055,480,985, **-1.82%** — below the
+5%-of-profile floor on its own (this workload's cost is dominated by
+parsing, protocol I/O, and hashing well outside this one site, as the
+baseline entry's function-level breakdown showed), but moving in the
+same direction as DHAT, corroborating the allocation-count evidence
+rather than contradicting it. The shipped-or-not decision here rests on
+the DHAT allocation floor, which clears independently.
+
+`cargo test --all-features`: 400/400 passed, unchanged. `cargo fmt --all
+-- --check`: clean. `cargo clippy --all-targets --all-features -- -D
+warnings`: 448 pre-existing errors on both the pre-change and post-change
+tree (confirmed via `git stash`) — the same toolchain/lint-version
+mismatch noted in every prior Bolt round in this file; zero new
+errors/warnings from this diff.
+
+Before/after profiles committed: `benches/profiles/{dhat,callgrind}.out.aggval-{base,after}-2026-09-27`.
+
+**Reproduce**: apply the one-line diff above to `src/exec.rs`, `cargo
+build`, then repeat the DHAT/Callgrind commands in the baseline entry's
+"Reproduce" section on both the pristine and patched trees.
+
 ## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — baseline — 2026-09-27
 
 **Why this workload**: `benches/profile_agg.py --rows 40000 --groups 4000
