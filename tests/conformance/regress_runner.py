@@ -769,6 +769,24 @@ def norm_expected_cell(cell, null_display):
 # (regex, reason) -- matched against the statement text, case-insensitive.
 # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
 # (UNION_PATTERN removed in v0.44: UNION/INTERSECT/EXCEPT are supported.)
+# v1.09: statements that were EXPECTED-FAIL but are now genuinely
+# supported. Checked BEFORE EXPECTED_FAIL_PATTERNS; a match means the
+# statement must PASS (otherwise it's a REAL-FAIL).
+EXPECTED_PASS_OVERRIDES = [
+    # v1.09: PARALLEL {UNSAFE|RESTRICTED|SAFE} is parsed/validated (planner
+    # hint, like COST). The distinct_func plpgsql bodies are bounded
+    # single-RETURN and now succeed.
+    (r"(?is)^\s*create\s+(or\s+replace\s+)?function\s+distinct_func\b.*\bparallel\s+(unsafe|restricted|safe)\b",
+     "v1.09: PARALLEL option supported"),
+    # v1.09: user-defined SRFs in the SELECT targetlist fan out (PG19
+    # ProjectSet). sillysrf is a SQL-language SRF.
+    (r"(?is)^\s*create\s+(or\s+replace\s+)?function\s+sillysrf\b",
+     "v1.09: SQL SRF CREATE supported"),
+    (r"(?i)\bsillysrf\s*\(", "v1.09: user SRF in targetlist supported"),
+    # v1.09: ALTER FUNCTION ... {VOLATILE|STABLE|IMMUTABLE} is supported.
+    (r"(?is)^\s*alter\s+function\b.*\b(volatile|stable|immutable)\b\s*;?\s*$",
+     "v1.09: ALTER FUNCTION volatility supported"),
+]
 EXPECTED_FAIL_PATTERNS = [
     (r"^\s*create\s+(or\s+replace\s+)?function\b", "CREATE FUNCTION (procedural languages) unsupported"),
     # v1.02: ALTER FUNCTION was never in the grammar (honest 42601);
@@ -776,6 +794,9 @@ EXPECTED_FAIL_PATTERNS = [
     # tattle() itself failed (RAISE unsupported in plpgsql bodies).
     # Now that the CREATE succeeds, classify the pre-existing gap
     # honestly instead of as a new REAL-FAIL.
+    # v1.09: ALTER FUNCTION ... {VOLATILE|STABLE|IMMUTABLE} is now
+    # supported (see EXPECTED_PASS_OVERRIDES); this mask remains for
+    # other actions (STRICT, COST, SET, OWNER TO, RENAME).
     (r"(?is)^\s*alter\s+function\b", "ALTER FUNCTION unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?procedure\b", "CREATE PROCEDURE unsupported"),
     (r"^\s*create\s+aggregate\b", "CREATE AGGREGATE unsupported"),
@@ -836,11 +857,10 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)\bshipped_view\b", "depends on CREATE RULE (unsupported)"),
     # v0.54: inheritance (`FROM person*`) is unsupported; the person tables
     # themselves are never created (PG's test_setup.sql builds them via
-    # CREATE TABLE ... INHERITS). sillysrf is an SQL-language SRF whose
-    # CREATE FUNCTION is masked above — its SELECTs fail only because the
-    # function was never created.
+    # CREATE TABLE ... INHERITS).
+    # v1.09: sillysrf is now supported (SQL SRF + targetlist expansion);
+    # the old mask is removed and the override above requires it to pass.
     (r"(?i)\bperson\s*\*", "table inheritance (FROM tbl*) unsupported"),
-    (r"(?i)\bsillysrf\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.55: vol()/volfoo() are plpgsql functions whose CREATE FUNCTION
     # is masked above — their CASE-test SELECTs fail only because the
     # functions were never created. (v0.97: bounded single-RETURN
@@ -910,6 +930,11 @@ def classify_expected_fail(stmt):
     # v0.14: UNION inside WITH RECURSIVE is genuinely supported; only
     # top-level / subquery UNION is an honest EXPECTED-FAIL.
     # v0.14: UPDATE ... FROM is a real grammar gap (not a subquery FROM).
+    # v1.09: statements in EXPECTED_PASS_OVERRIDES are genuinely
+    # supported now; they must NOT be classified as expected-fail.
+    for pat, _reason in EXPECTED_PASS_OVERRIDES:
+        if re.search(pat, stmt, re.IGNORECASE | re.DOTALL):
+            return None
     if re.match(r"(?is)^\s*update\b", stmt) and _top_level_from(stmt):
         return "UPDATE ... FROM unsupported"
     has_recursive = re.search(r"(?is)\bwith\s+recursive\b", stmt) is not None

@@ -4438,6 +4438,13 @@ pub enum Stmt {
         name: String,
         action: AlterDomainAction,
     },
+    /// v1.09: `ALTER FUNCTION name(argtypes) {VOLATILE|STABLE|IMMUTABLE}`
+    /// (PG19 AlterFunctionStmt, volatility action only).
+    AlterFunction {
+        name: String,
+        arg_types: Vec<String>,
+        volatility: FuncVolatility,
+    },
     // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
     // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
     // desugared to SQL at CREATE). Only `LANGUAGE sql`, `LANGUAGE
@@ -4803,6 +4810,7 @@ impl Stmt {
                 | Stmt::CreateDomain { .. }
                 | Stmt::AlterDomain { .. }
                 | Stmt::DropDomain { .. }
+                | Stmt::AlterFunction { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }
                 | Stmt::CreateStatistics
@@ -5819,11 +5827,12 @@ impl Parser {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
+                Token::Ident(s) if s == "function" => self.parse_alter_function(),
                 Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
                 _ => Err(err(
-                    "syntax error: expected TABLE, SEQUENCE, DOMAIN or ROLE after ALTER"
+                    "syntax error: expected TABLE, SEQUENCE, DOMAIN, FUNCTION or ROLE after ALTER"
                         .to_string(),
                 )),
             },
@@ -7518,6 +7527,20 @@ impl Parser {
                 volatility = FuncVolatility::Volatile;
             } else if self.eat_keyword("strict") {
                 strict = true;
+            } else if self.eat_keyword("parallel") {
+                // v1.09: PARALLEL {UNSAFE|RESTRICTED|SAFE} (PG19). A
+                // planner hint like COST: parsed and validated but not
+                // stored — the executor has no parallel query execution.
+                let kw = self.expect_ident()?;
+                match kw.to_ascii_uppercase().as_str() {
+                    "UNSAFE" | "RESTRICTED" | "SAFE" => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected UNSAFE, RESTRICTED or SAFE after PARALLEL, found {}",
+                            other
+                        )));
+                    }
+                };
             } else if self.eat_keyword("cost") {
                 // v0.99: COST is a planner hint (PG19); parsed and
                 // validated but not stored (the executor has no
@@ -8252,6 +8275,69 @@ impl Parser {
             ));
         };
         Ok(Stmt::AlterDomain { name, action })
+    }
+
+    /// v1.09: `ALTER FUNCTION name([argtype [, ...]])
+    /// {VOLATILE|STABLE|IMMUTABLE}` (PG19 AlterFunctionStmt, volatility
+    /// action only). Other actions (STRICT, COST, ROWS, SET, OWNER TO,
+    /// RENAME) are an honest 0A000.
+    fn parse_alter_function(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                // Argument can be `[name] type`; we only need the type
+                // for signature matching.
+                let first = self.expect_ident()?;
+                let type_name = if *self.peek() != Token::Comma && *self.peek() != Token::RParen {
+                    // Two identifiers: first was the arg name.
+                    let second = self.expect_ident()?;
+                    // Handle multi-word types like "double precision".
+                    if second.eq_ignore_ascii_case("precision")
+                        && first.eq_ignore_ascii_case("double")
+                    {
+                        "double precision".to_string()
+                    } else {
+                        second
+                    }
+                } else {
+                    first
+                };
+                arg_types.push(type_name);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        let volatility = if self.eat_keyword("immutable") {
+            FuncVolatility::Immutable
+        } else if self.eat_keyword("stable") {
+            FuncVolatility::Stable
+        } else if self.eat_keyword("volatile") {
+            FuncVolatility::Volatile
+        } else {
+            return Err(SqlError {
+                message: "only VOLATILE, STABLE and IMMUTABLE actions are supported in ALTER FUNCTION"
+                    .to_string(),
+                code: "0A000",
+            });
+        };
+        Ok(Stmt::AlterFunction {
+            name,
+            arg_types,
+            volatility,
+        })
     }
 
     fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {
@@ -15570,5 +15656,110 @@ mod v108_explain_costs_tests {
             let (_, costs) = explain_costs(sql);
             assert!(!costs, "expected costs=false for {sql}");
         }
+    }
+}
+
+#[cfg(test)]
+mod v109_function_tests {
+    use super::*;
+
+    fn create_fn(sql: &str) -> Stmt {
+        parse_statement(sql).expect("parses")
+    }
+
+    #[test]
+    fn parallel_safe_parses() {
+        // v1.09: PARALLEL SAFE is accepted (planner hint, like COST).
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql IMMUTABLE PARALLEL SAFE AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_restricted_parses() {
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL RESTRICTED AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_unsafe_parses() {
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL UNSAFE AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_bogus_rejected() {
+        // v1.09: invalid PARALLEL value is a syntax error.
+        let err = parse_statement(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL BOGUS AS 'SELECT $1';",
+        )
+        .expect_err("should fail");
+        assert!(
+            err.message.contains("PARALLEL"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn alter_function_immutable_parses() {
+        // v1.09: ALTER FUNCTION ... IMMUTABLE.
+        match create_fn("ALTER FUNCTION f(int) IMMUTABLE;") {
+            Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility,
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(arg_types, vec!["int".to_string()]);
+                assert_eq!(volatility, FuncVolatility::Immutable);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_stable_parses() {
+        match create_fn("ALTER FUNCTION f(text, int) STABLE;") {
+            Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility,
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(arg_types.len(), 2);
+                assert_eq!(volatility, FuncVolatility::Stable);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_volatile_parses() {
+        match create_fn("ALTER FUNCTION f() VOLATILE;") {
+            Stmt::AlterFunction { volatility, .. } => {
+                assert_eq!(volatility, FuncVolatility::Volatile);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_other_action_rejected() {
+        // v1.09: only volatility actions are supported; STRICT etc. are 0A000.
+        let err =
+            parse_statement("ALTER FUNCTION f(int) STRICT;").expect_err("should fail");
+        assert_eq!(err.code, "0A000", "message: {}", err.message);
     }
 }

@@ -463,6 +463,12 @@ fn execute_inner(
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
         // --- v0.97: ALTER DOMAIN ---
         Stmt::AlterDomain { name, action } => exec_alter_domain(eng, ctx, name, action),
+        // --- v1.09: ALTER FUNCTION ---
+        Stmt::AlterFunction {
+            name,
+            arg_types,
+            volatility,
+        } => exec_alter_function(eng, ctx, name, arg_types, *volatility),
         // --- v0.86: user-defined functions and operators ---
         Stmt::CreateFunction {
             name,
@@ -14343,7 +14349,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                 SelectItem::Expr {
                     expr: Expr::Func { name, .. },
                     ..
-                } if is_srf(name)
+                } if is_srf(q.eng, name)
             )
         });
     let mut orows: Vec<OutRow> = if agg {
@@ -19547,12 +19553,16 @@ fn project_item_values(
         SelectItem::Expr { expr, .. } => {
             if expand_srf {
                 if let Expr::Func { name, args } = expr {
-                    if is_srf(name) {
+                    if is_srf(q.eng, name) {
                         let mut vals = Vec::with_capacity(args.len());
                         for a in args {
                             vals.push(eval_expr(q, scopes, a)?);
                         }
-                        return eval_srf_vals(name, &vals);
+                        if is_builtin_srf(name) {
+                            return eval_srf_vals(name, &vals);
+                        }
+                        // v1.09: user-defined RETURNS SETOF function.
+                        return eval_user_srf_vals(q, scopes, name, &vals);
                     }
                 }
             }
@@ -19560,7 +19570,7 @@ fn project_item_values(
             // projection uses a NULL placeholder.
             if srf_placeholder {
                 if let Expr::Func { name, .. } = expr {
-                    if is_srf(name) {
+                    if is_srf(q.eng, name) {
                         return Ok(vec![Value::Null]);
                     }
                 }
@@ -19592,7 +19602,7 @@ fn project_row_expanded(
             SelectItem::Expr {
                 expr: Expr::Func { name, .. },
                 ..
-            } if is_srf(name)
+            } if is_srf(q.eng, name)
         );
         if srf_col {
             cols.push((vals, true));
@@ -19827,7 +19837,7 @@ fn eval_group_key_expanded(
     key: &Expr,
 ) -> Result<Vec<Value>, ExecError> {
     if let Expr::Func { name, args } = key {
-        if is_srf(name) {
+        if is_builtin_srf(name) {
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 vals.push(eval_expr(q, scopes, a)?);
@@ -19994,7 +20004,7 @@ fn exec_agg_one(
     // key position.
     let mut is_srf_key = vec![false; group_keys.len()];
     for (i, g) in group_keys.iter().enumerate() {
-        if matches!(g, Expr::Func { name, .. } if is_srf(name)) {
+        if matches!(g, Expr::Func { name, .. } if is_builtin_srf(name)) {
             is_srf_key[i] = true;
         }
     }
@@ -20607,7 +20617,7 @@ fn eval_grouped(
             // below the aggregate (ProjectSet under Agg), so the
             // targetlist reference is the grouped value, not a fresh
             // scalar call.
-            if is_srf(name) {
+            if is_builtin_srf(name) {
                 for (i, g) in group_by.iter().enumerate() {
                     if e == g {
                         return Ok(key_vals[i].clone());
@@ -30154,7 +30164,21 @@ fn eval_table_function(
 /// `regexp_matches` — PG19's ProjectSet keeps SRFs at the top level of
 /// the targetlist (planner.c `adjust_paths_for_srfs`), which is exactly
 /// what this gate matches. Unknown names are not SRFs.
-fn is_srf(name: &str) -> bool {
+/// v1.09: also recognizes user-defined functions with RETURNS SETOF
+/// (any overload), so `SELECT my_srf(...)` fans out like PG19.
+fn is_srf(eng: &Engine, name: &str) -> bool {
+    is_builtin_srf(name)
+        || eng
+            .db
+            .functions
+            .get(name)
+            .map(|ovs| ovs.iter().any(|f| f.returns_set))
+            .unwrap_or(false)
+}
+
+/// Builtin-only SRF check, for contexts without catalog access
+/// (GROUP BY keys, INSERT ... VALUES) where user SRFs stay 0A000.
+fn is_builtin_srf(name: &str) -> bool {
     matches!(name, "regexp_matches" | "generate_series" | "unnest")
 }
 
@@ -30200,11 +30224,51 @@ fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
     }
 }
 
+/// v1.09: evaluate a user-defined RETURNS SETOF function to its output
+/// values (one per row, first column), for SRF-in-targetlist expansion
+/// (PG19's ProjectSet). The body runs via `run_func_body`; each row's
+/// first column is coerced to the declared return type.
+fn eval_user_srf_vals(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    vals: &[Value],
+) -> Result<Vec<Value>, ExecError> {
+    let fdef = resolve_function_overload(q.eng, name, vals).ok_or_else(|| {
+        exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )
+    })?;
+    if !fdef.returns_set {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "set-returning function \"{}\" used in scalar context",
+                fdef.name
+            ),
+        ));
+    }
+    if fdef.lang == crate::sql::FuncLang::Internal {
+        return Err(exec_err(
+            "0A000",
+            format!("internal function \"{}\" is not set-returning", fdef.name),
+        ));
+    }
+    let out = run_func_body(q, scopes, &fdef, vals, volatile_pending(q, &fdef))?;
+    let mut result = Vec::with_capacity(out.rows.len());
+    for row in out.rows {
+        let v = row.iter().next().cloned().unwrap_or(Value::Null);
+        result.push(coerce_to_type_name(q, &v, &fdef.ret_type)?);
+    }
+    Ok(result)
+}
+
 /// v0.72: is this VALUES cell a top-level set-returning function call?
 /// (INSERT form — `InsertValue::Expr(Expr::Func)`; the SELECT
 /// targetlist has its own SRF handling.)
 fn insert_cell_is_srf(v: &InsertValue) -> bool {
-    matches!(v, InsertValue::Expr(Expr::Func { name, .. }) if is_srf(name))
+    matches!(v, InsertValue::Expr(Expr::Func { name, .. }) if is_builtin_srf(name))
 }
 
 /// v0.72: expand top-level set-returning function calls in
@@ -30233,7 +30297,7 @@ fn expand_insert_srf_rows(
         let mut has_result = false;
         for v in row {
             if let InsertValue::Expr(Expr::Func { name, args, .. }) = v {
-                if is_srf(name) {
+                if is_builtin_srf(name) {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(eval_expr(q, &[], a)?);
@@ -30283,7 +30347,7 @@ fn expand_insert_srf_rows(
 fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, ExecError> {
     if !row
         .iter()
-        .any(|e| matches!(e, Expr::Func { name, .. } if is_srf(name)))
+        .any(|e| matches!(e, Expr::Func { name, .. } if is_builtin_srf(name)))
     {
         return Ok(vec![
             row.iter()
@@ -30296,7 +30360,7 @@ fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, Exe
     let mut has_result = false;
     for e in row {
         if let Expr::Func { name, args, .. } = e {
-            if is_srf(name) {
+            if is_builtin_srf(name) {
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(eval_expr(q, &[], a)?);
@@ -44106,6 +44170,45 @@ fn exec_alter_domain(
 /// (`t.col` / `t` where `t` is an argument name) are rewritten to
 /// positional `$n` parameters at CREATE time, then bound per call via
 /// the existing `subst_params` machinery.
+
+/// v1.09: `ALTER FUNCTION name(argtypes) {VOLATILE|STABLE|IMMUTABLE}`
+/// (PG19 AlterFunctionStmt, volatility action only). Finds the overload
+/// by signature (like DROP FUNCTION) and updates its volatility in
+/// place. The function catalog is checkpointed wholesale, so the change
+/// persists like CREATE FUNCTION.
+fn exec_alter_function(
+    eng: &mut Engine,
+    _ctx: &mut StmtCtx,
+    name: &str,
+    arg_types: &[String],
+    volatility: crate::sql::FuncVolatility,
+) -> Result<ExecResult, ExecError> {
+    let overloads = eng.db.functions.get_mut(name).ok_or_else(|| {
+        exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        )
+    })?;
+    let slot = overloads
+        .iter_mut()
+        .find(|f| {
+            f.arg_types.len() == arg_types.len()
+                && f.arg_types
+                    .iter()
+                    .zip(arg_types.iter())
+                    .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+        })
+        .ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            )
+        })?;
+    slot.volatility = volatility;
+    Ok(ExecResult::Command {
+        tag: "ALTER FUNCTION".to_string(),
+    })
+}
 
 /// v0.86: canonicalize a type name for function/operator signature
 /// matching: builtin aliases fold together (`int8`/`bigint`,
