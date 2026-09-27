@@ -16709,6 +16709,7 @@ fn build_from(
             need_prov,
             order_hint,
             early_limit,
+            &[],
         )?;
         let quals: HashSet<String> = s2.iter().map(|c| c.qual.clone()).collect();
         let no_quals = HashSet::new();
@@ -16724,7 +16725,7 @@ fn build_from(
         // one item. Implicit LATERAL for comma joins (`FROM t, f(t.x)`)
         // is handled in the Join arm of `build_source` below, where the
         // left row is in scope when the function is evaluated.
-        let (s2, mut r2) = build_source(q, outer, item, where_, need_prov, None, None)?;
+        let (s2, mut r2) = build_source(q, outer, item, where_, need_prov, None, None, &[])?;
         // Comma joins are inner joins: a WHERE conjunct that mentions only
         // this item's columns can filter its rows before the cross product.
         // (Qualified refs must name a qualifier from this item and from no
@@ -18229,6 +18230,628 @@ fn function_args_lateral(args: &[Expr], acc_schema: &[QCol]) -> bool {
     })
 }
 
+/// v1.10: does this FROM item contain an explicit-LATERAL Derived,
+/// VALUES, or Function at the current query level? Used for PG19
+/// cross-nest LATERAL visibility (`FROM a, b JOIN LATERAL (SELECT a.x)
+/// ...`): when the right subtree of a join contains a lateral item, the
+/// subtree is rebuilt once per left row with the left row's scope
+/// appended to the prefix. Does not descend into Derived subqueries
+/// (separate query levels with their own prefix).
+fn from_item_has_lateral(item: &FromItem) -> bool {
+    match item {
+        FromItem::Derived { lateral, .. }
+        | FromItem::Values { lateral, .. }
+        | FromItem::Function { lateral, .. } => *lateral,
+        FromItem::Join { left, right, .. } => {
+            from_item_has_lateral(left) || from_item_has_lateral(right)
+        }
+        _ => false,
+    }
+}
+
+/// v1.10: PG19 forbids a CORRELATED lateral reference on RIGHT/FULL
+/// joins (`ERROR: invalid reference to FROM-clause entry for table "a"`,
+/// `DETAIL: The combining JOIN type must be INNER or LEFT for a LATERAL
+/// reference`). Returns true when the lateral item references the
+/// lateral scopes (prefix + immediate left). Uncorrelated LATERAL on
+/// RIGHT/FULL is legal (the keyword is then a noise word).
+fn lateral_is_correlated(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
+    // v1.10: lateral-visible schemas, innermost last (prefix then left).
+    scope_schemas: &[&[QCol]],
+    right: &LateralRight,
+) -> bool {
+    // Does (qual, name) resolve to one of the lateral-visible schemas?
+    // (Conservative: a qualifier matching a lateral schema, or an
+    // unqualified name matching a visible column, counts as a lateral
+    // reference — PG resolves such refs to the innermost scope.)
+    let hits_lateral = |refs: &[(Option<String>, String)]| {
+        refs.iter().any(|(qt, nm)| {
+            scope_schemas.iter().any(|s| match qt {
+                Some(t) => s.iter().any(|c| c.qual == *t),
+                None => s.iter().any(|c| !c.hidden && c.name == *nm),
+            })
+        })
+    };
+    match right {
+        LateralRight::Func { args, .. } => {
+            let mut refs = Vec::new();
+            for a in *args {
+                collect_column_refs(a, &mut refs);
+            }
+            hits_lateral(&refs)
+        }
+        LateralRight::Values { rows, .. } => {
+            let mut refs = Vec::new();
+            for row in *rows {
+                for e in row {
+                    collect_column_refs(e, &mut refs);
+                }
+            }
+            hits_lateral(&refs)
+        }
+        LateralRight::Derived { sub, .. } => {
+            // The subquery is correlated iff it resolves only with the
+            // lateral scopes in the chain.
+            let mut with: Vec<&[QCol]> = Vec::with_capacity(
+                outer_schemas.len() + scope_schemas.len(),
+            );
+            with.extend_from_slice(outer_schemas);
+            with.extend_from_slice(scope_schemas);
+            let without_ok =
+                describe_select(eng, snap, own, session, sub, bindings, outer_schemas).is_ok();
+            let with_ok =
+                describe_select(eng, snap, own, session, sub, bindings, &with).is_ok();
+            !without_ok && with_ok
+        }
+    }
+}
+
+/// v1.10: a right-hand FROM item that must be evaluated once per left
+/// row (PG19's LATERAL rule: the left row's columns are visible as the
+/// innermost scope during evaluation). Explicit `LATERAL (SELECT ...)`
+/// / `LATERAL (VALUES ...)` / `LATERAL func(...)` all arrive here; the
+/// v0.46 implicit-LATERAL case (`FROM t, f(t.x)`) is the `Func` variant
+/// with `explicit` unset in spirit.
+#[derive(Clone, Copy)]
+enum LateralRight<'a> {
+    Func {
+        name: &'a str,
+        args: &'a [Expr],
+        alias: &'a Option<String>,
+        col_aliases: &'a [String],
+    },
+    Derived {
+        sub: &'a SelectStmt,
+        alias: &'a str,
+        col_aliases: &'a [String],
+    },
+    Values {
+        rows: &'a [Vec<Expr>],
+        alias: &'a str,
+        col_aliases: &'a [String],
+    },
+}
+
+/// v1.10: static output schema of a LATERAL right-hand item, inferred
+/// from types only (PG19 fixes the item's rowtype at plan time). Shared
+/// by the executor and the Describe path so wire OIDs agree exactly.
+#[allow(clippy::too_many_arguments)]
+fn lateral_right_schema(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    bindings: &[Rc<CteBinding>],
+    outer_schemas: &[&[QCol]],
+    // v1.10: schemas visible to correlated references, innermost last:
+    // the textually-preceding FROM-item schemas (cross-nest LATERAL)
+    // followed by the immediate left input's schema.
+    scope_schemas: &[&[QCol]],
+    right: &LateralRight,
+) -> Result<Vec<QCol>, ExecError> {
+    match right {
+        LateralRight::Func {
+            name,
+            args,
+            alias,
+            col_aliases,
+        } => lateral_function_schema(
+            eng,
+            snap,
+            own,
+            session,
+            name,
+            args,
+            alias,
+            col_aliases,
+            // v1.10: arg type inference sees the innermost scope (the
+            // immediate left input), as before.
+            scope_schemas.last().copied().unwrap_or(&[]),
+        ),
+        LateralRight::Derived {
+            sub,
+            alias,
+            col_aliases,
+        } => {
+            // Correlated refs resolve against the enclosing schemas
+            // with the left input innermost (PG19); textually-preceding
+            // FROM-item schemas sit between the outer query and the
+            // immediate left (cross-nest LATERAL).
+            let mut schemas: Vec<&[QCol]> =
+                Vec::with_capacity(outer_schemas.len() + scope_schemas.len());
+            schemas.extend_from_slice(outer_schemas);
+            schemas.extend_from_slice(scope_schemas);
+            let cols = describe_select(eng, snap, own, session, sub, bindings, &schemas)?;
+            // v0.23: more column aliases than output columns is 42601.
+            check_col_alias_arity(alias, cols.len(), col_aliases)?;
+            Ok(cols
+                .into_iter()
+                .enumerate()
+                .map(|(i, (n, ty))| QCol {
+                    qual: (*alias).to_string(),
+                    name: col_aliases.get(i).cloned().unwrap_or(n),
+                    ty,
+                    hidden: false,
+                    src_ord: i as u32,
+                })
+                .collect())
+        }
+        LateralRight::Values {
+            rows,
+            alias,
+            col_aliases,
+        } => {
+            let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            check_col_alias_arity(alias, ncols, col_aliases)?;
+            let mut schemas: Vec<&[QCol]> =
+                Vec::with_capacity(outer_schemas.len() + scope_schemas.len());
+            schemas.extend_from_slice(outer_schemas);
+            schemas.extend_from_slice(scope_schemas);
+            Ok((0..ncols)
+                .map(|i| {
+                    // Static type inference (the Describe path shares
+                    // this helper, so both agree); a column no row can
+                    // hint is TEXT, like the non-LATERAL VALUES path.
+                    let ty = rows
+                        .iter()
+                        .filter_map(|r| r.get(i))
+                        .filter_map(|e| {
+                            lateral_values_coltype(
+                                eng, snap, own, session, bindings, &schemas, e,
+                            )
+                        })
+                        .max_by_key(type_rank)
+                        .unwrap_or(ColType::Text);
+                    QCol {
+                        qual: (*alias).to_string(),
+                        name: col_aliases.get(i).cloned().unwrap_or_else(|| {
+                            format!("column{}", i + 1)
+                        }),
+                        ty,
+                        hidden: false,
+                        src_ord: i as u32,
+                    }
+                })
+                .collect())
+        }
+    }
+}
+
+/// v1.10: static type of one LATERAL VALUES cell. `expr_type` needs
+/// parsed CTE defs (unavailable here), so use the Describe-path helper
+/// `hint_type` like `from_schema_item` does — except scalar subqueries,
+/// which are described with the real enclosing scopes so a correlated
+/// `VALUES ((SELECT s.i))` types as its true type, not TEXT.
+fn lateral_values_coltype(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    bindings: &[Rc<CteBinding>],
+    schemas: &[&[QCol]],
+    e: &Expr,
+) -> Option<ColType> {
+    if let Expr::ScalarSub(sub) = e {
+        let cols = describe_select(eng, snap, own, session, sub, bindings, schemas).ok()?;
+        return if cols.len() == 1 {
+            Some(cols[0].1.clone())
+        } else {
+            None
+        };
+    }
+    hint_type(eng, snap, own, session, schemas, e)
+}
+
+/// v1.10: execute a join whose right side is LATERAL: the right item
+/// is evaluated once per left row with the left row as the innermost
+/// scope (PG19's LATERAL rule). The right schema is computed statically
+/// up front, so an empty left input still yields the right columns.
+/// `on`/`using` apply per pair like the normal path; RIGHT/FULL
+/// preserve per-left-row unmatched right rows (each lateral
+/// evaluation's rows are the inner set for their left row).
+#[allow(clippy::too_many_arguments)]
+fn eval_lateral_join(
+    q: &mut Q,
+    outer: &[Scope],
+    // v1.10: scopes of textually-preceding FROM-item rows (cross-nest
+    // LATERAL, PG19): visible to the right item between the outer query
+    // and the immediate left row.
+    prefix: &[Scope],
+    lschema: &[QCol],
+    lrows: &[QRow],
+    right: &LateralRight,
+    kind: JoinKind,
+    on: &Option<Expr>,
+    using: &[String],
+    natural: bool,
+    using_alias: Option<&str>,
+    alias: Option<&str>,
+    col_aliases: &[String],
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+    // Static schemas, innermost last: preceding FROM items, then the
+    // immediate left input.
+    let scope_schemas: Vec<&[QCol]> = prefix
+        .iter()
+        .map(|s| s.schema)
+        .chain(std::iter::once(lschema))
+        .collect();
+    let rschema = lateral_right_schema(
+        &*q.eng,
+        q.snap,
+        q.own,
+        q.session,
+        &q.ctes,
+        &outer_schemas,
+        &scope_schemas,
+        right,
+    )?;
+    // Same merged layout as a regular join, so the describe path and
+    // execution agree exactly.
+    let layout = plan_join(lschema, &rschema, using, natural, using_alias, alias, col_aliases)?;
+    let schema = layout.schema.clone();
+    // USING keys become a merged-key equijoin predicate, exactly like
+    // the normal path; otherwise the explicit ON clause.
+    let on_expr: Option<Expr> = if !layout.keys.is_empty() {
+        let mut cond: Option<Expr> = None;
+        for (li, ri) in &layout.keys {
+            let lc = &lschema[*li];
+            let rc = &rschema[*ri];
+            let eq = Expr::Cmp {
+                op: CmpOp::Eq,
+                left: Box::new(Expr::Column {
+                    table: Some(lc.qual.clone()),
+                    name: lc.name.clone(),
+                }),
+                right: Box::new(Expr::Column {
+                    table: Some(rc.qual.clone()),
+                    name: rc.name.clone(),
+                }),
+            };
+            cond = Some(match cond {
+                None => eq,
+                Some(c) => Expr::And(Box::new(c), Box::new(eq)),
+            });
+        }
+        cond
+    } else {
+        on.clone()
+    };
+    let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    let preserve_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+    let null_l = QRow {
+        cells: Row::new(vec![Value::Null; lschema.len()]),
+        prov: Vec::new(),
+    };
+    let null_r = QRow {
+        cells: Row::new(vec![Value::Null; rschema.len()]),
+        prov: Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for l in lrows {
+        // The left row is the innermost scope when the right side is
+        // evaluated; textually-preceding FROM rows (cross-nest LATERAL)
+        // sit between the enclosing query scopes and the left row.
+        let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + prefix.len() + 1);
+        scopes.extend_from_slice(outer);
+        scopes.extend_from_slice(prefix);
+        scopes.push(Scope {
+            schema: lschema,
+            row: &l.cells,
+            prov: None,
+        });
+        let rrows = eval_lateral_right(q, &scopes, &rschema, right)?;
+        let mut matched_right = vec![false; rrows.len()];
+        let mut matched = false;
+        for (ri, r) in rrows.iter().enumerate() {
+            // The ON clause sees the merged pair, like the normal
+            // path's slow path (ambiguity raises 42702 identically).
+            let pair = combine_join_pair(l, r, &layout, kind);
+            let keep = match &on_expr {
+                None => true,
+                Some(p) => {
+                    let frame = Scope {
+                        schema: &schema,
+                        row: &pair.cells,
+                        prov: None,
+                    };
+                    let mut pscopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                    pscopes.extend_from_slice(outer);
+                    pscopes.push(frame);
+                    check_bool(eval_expr(q, &pscopes, p)?, "join condition")?
+                }
+            };
+            if keep {
+                matched = true;
+                matched_right[ri] = true;
+                rows.push(pair);
+            }
+        }
+        if !matched && preserve_left {
+            rows.push(combine_join_pair(l, &null_r, &layout, kind));
+        }
+        // v0.20 semantics: right rows that never matched are emitted
+        // with NULLs for the left columns — per left row, since each
+        // lateral evaluation's rows are that row's inner set.
+        if preserve_right {
+            for (ri, r) in rrows.iter().enumerate() {
+                if !matched_right[ri] {
+                    rows.push(combine_join_pair(&null_l, r, &layout, kind));
+                }
+            }
+        }
+    }
+    Ok((schema, rows))
+}
+
+/// v1.10: cross-nest LATERAL (`FROM a, b JOIN LATERAL (SELECT a.x) ...`,
+/// PG19). The right subtree contains a lateral item that may reference
+/// the left row, so the subtree is rebuilt once per left row with the
+/// left row's scope appended to the prefix. The merged output schema is
+/// computed statically up front (via the describe path, which shares
+/// `lateral_right_schema`/`plan_join` with execution); combination uses
+/// the same per-pair ON/USING semantics as `eval_lateral_join`, without
+/// the hash-join/pushdown fast paths. `right` is always a `Join` here.
+#[allow(clippy::too_many_arguments)]
+fn eval_cross_nest_join(
+    q: &mut Q,
+    outer: &[Scope],
+    prefix: &[Scope],
+    lschema: &[QCol],
+    lrows: &[QRow],
+    right: &FromItem,
+    kind: JoinKind,
+    on: &Option<Expr>,
+    using: &[String],
+    natural: bool,
+    using_alias: Option<&str>,
+    alias: Option<&str>,
+    col_aliases: &[String],
+    need_prov: bool,
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    // Static right schema (describe path) with the left schema as
+    // preceding-sibling scope, so the merged layout never depends on
+    // row values.
+    let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+    let prefix_schemas: Vec<&[QCol]> = prefix.iter().map(|s| s.schema).collect();
+    let mut rdesc: Vec<Vec<QCol>> = Vec::new();
+    let mut right_prefix: Vec<&[QCol]> = Vec::with_capacity(prefix_schemas.len() + 1);
+    right_prefix.extend_from_slice(&prefix_schemas);
+    right_prefix.push(lschema);
+    from_schema_item(
+        &*q.eng,
+        q.snap,
+        q.own,
+        q.session,
+        right,
+        &mut rdesc,
+        &[],
+        &q.ctes,
+        &outer_schemas,
+        &right_prefix,
+    )?;
+    let rschema: Vec<QCol> = rdesc.into_iter().flatten().collect();
+    // Same merged layout as a regular join, so the describe path and
+    // execution agree exactly.
+    let layout = plan_join(
+        lschema,
+        &rschema,
+        &using,
+        natural,
+        using_alias,
+        alias,
+        col_aliases,
+    )?;
+    let schema = layout.schema.clone();
+    // USING keys become a merged-key equijoin predicate, like the
+    // normal path; otherwise the explicit ON clause.
+    let on_expr: Option<Expr> = if !layout.keys.is_empty() {
+        let mut cond: Option<Expr> = None;
+        for (li, ri) in &layout.keys {
+            let lc = &lschema[*li];
+            let rc = &rschema[*ri];
+            let eq = Expr::Cmp {
+                op: CmpOp::Eq,
+                left: Box::new(Expr::Column {
+                    table: Some(lc.qual.clone()),
+                    name: lc.name.clone(),
+                }),
+                right: Box::new(Expr::Column {
+                    table: Some(rc.qual.clone()),
+                    name: rc.name.clone(),
+                }),
+            };
+            cond = Some(match cond {
+                None => eq,
+                Some(c) => Expr::And(Box::new(c), Box::new(eq)),
+            });
+        }
+        cond
+    } else {
+        on.clone()
+    };
+    let is_cross = kind == JoinKind::Cross;
+    let on_pred: Option<&Expr> = if is_cross { None } else { on_expr.as_ref() };
+    let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    let preserve_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+    let null_l = QRow {
+        cells: Row::new(vec![Value::Null; lschema.len()]),
+        prov: Vec::new(),
+    };
+    let null_r = QRow {
+        cells: Row::new(vec![Value::Null; rschema.len()]),
+        prov: Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for l in lrows {
+        let mut prefix2: Vec<Scope> = Vec::with_capacity(prefix.len() + 1);
+        prefix2.extend_from_slice(prefix);
+        prefix2.push(Scope {
+            schema: lschema,
+            row: &l.cells,
+            prov: None,
+        });
+        let (_, rrows) = build_source(q, outer, right, None, need_prov, None, None, &prefix2)?;
+        let mut matched_right = vec![false; rrows.len()];
+        let mut matched = false;
+        for (ri, r) in rrows.iter().enumerate() {
+            // The ON clause sees the merged pair, like the normal
+            // path's slow path (ambiguity raises 42702 identically).
+            let pair = combine_join_pair(l, r, &layout, kind);
+            let keep = match &on_pred {
+                None => true,
+                Some(p) => {
+                    let frame = Scope {
+                        schema: &schema,
+                        row: &pair.cells,
+                        prov: None,
+                    };
+                    let mut pscopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                    pscopes.extend_from_slice(outer);
+                    pscopes.push(frame);
+                    check_bool(eval_expr(q, &pscopes, p)?, "join condition")?
+                }
+            };
+            if keep {
+                matched = true;
+                matched_right[ri] = true;
+                rows.push(pair);
+            }
+        }
+        if !matched && preserve_left {
+            rows.push(combine_join_pair(l, &null_r, &layout, kind));
+        }
+        // v0.20 semantics: right rows that never matched are emitted
+        // with NULLs for the left columns — per left row, since each
+        // rebuild's rows are that row's inner set.
+        if preserve_right {
+            for (ri, r) in rrows.iter().enumerate() {
+                if !matched_right[ri] {
+                    rows.push(combine_join_pair(&null_l, r, &layout, kind));
+                }
+            }
+        }
+    }
+    Ok((schema, rows))
+}
+
+/// v1.10: evaluate a LATERAL right-hand item for one left row.
+/// `scopes` is the enclosing scopes plus the left row as the innermost
+/// frame (PG19's LATERAL rule). Returned rows are in `rschema` layout;
+/// the schema itself was fixed up front.
+fn eval_lateral_right(
+    q: &mut Q,
+    scopes: &[Scope],
+    rschema: &[QCol],
+    right: &LateralRight,
+) -> Result<Vec<QRow>, ExecError> {
+    match right {
+        LateralRight::Func {
+            name,
+            args,
+            alias,
+            col_aliases,
+        } => {
+            let (_, frows) = eval_function_item(q, scopes, name, args, alias, col_aliases)?;
+            Ok(frows)
+        }
+        LateralRight::Derived { sub, .. } => {
+            // Same evaluation as a plain derived table, but the left
+            // row's scope is visible (PG19 LATERAL). Rows are already
+            // in the statically-computed layout.
+            let out = {
+                let mut sub_q = Q {
+                    eng: &mut *q.eng,
+                    snap: q.snap,
+                    own: q.own,
+                    session: q.session,
+                    role: q.role,
+                    read_only: q.read_only,
+                    depth: q.depth + 1,
+                    lock_ids: &mut *q.lock_ids,
+                    ctes: q.ctes.clone(),
+                    wctx: None,
+                    priv_scopes: q.priv_scopes.clone(),
+                    hashed_exists: q.hashed_exists.clone(),
+                    hashed_in: q.hashed_in.clone(),
+                    // v0.89: plain subqueries never see the UPDATE overlay.
+                    pending_updates: None,
+                };
+                run_select(&mut sub_q, sub, scopes)?
+            };
+            Ok(out
+                .rows
+                .into_iter()
+                .map(|cells| QRow {
+                    cells,
+                    prov: Vec::new(),
+                })
+                .collect())
+        }
+        LateralRight::Values { rows, .. } => {
+            let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut eval_rows: Vec<Vec<Value>> = Vec::new();
+            for row in *rows {
+                // v0.54: ragged VALUES is a syntax error (42601), like
+                // the non-LATERAL path.
+                if row.len() != ncols {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "VALUES lists must all be the same length ({} vs {})",
+                            ncols,
+                            row.len()
+                        ),
+                    ));
+                }
+                // v1.10: row expressions see the left row (LATERAL).
+                eval_rows.extend(expand_values_srf_row(q, scopes, row)?);
+            }
+            // Coerce each cell to the statically-inferred column type,
+            // like the non-LATERAL VALUES arm.
+            let mut out = Vec::with_capacity(eval_rows.len());
+            for vals in eval_rows {
+                let mut cells: Vec<Value> = Vec::with_capacity(vals.len());
+                for (i, v) in vals.into_iter().enumerate() {
+                    let col = &rschema[i];
+                    cells.push(coerce_value(v, &col.ty, &col.name)?);
+                }
+                out.push(QRow {
+                    cells: Row::new(cells),
+                    prov: Vec::new(),
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// v0.46: output schema of a table function in an implicit-LATERAL
 /// position, inferred statically from the argument *types* against the
 /// left input's schema. Row values aren't available (and must not
@@ -18401,6 +19024,11 @@ fn build_source(
     order_hint: Option<&OrderHint>,
     // v0.8: row budget for early termination of the index-order scan.
     early_limit: Option<usize>,
+    // v1.10: scopes of textually-preceding FROM-item rows at the same
+    // query level (cross-nest LATERAL, PG19). Only LATERAL items may see
+    // the prefix; every other FROM item ignores it, so non-LATERAL
+    // sibling visibility is unchanged.
+    prefix: &[Scope],
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     match item {
         FromItem::Table {
@@ -18900,6 +19528,7 @@ fn build_source(
             sub,
             alias,
             col_aliases,
+            ..
         } => {
             // v0.95: non-LATERAL derived tables see enclosing query
             // scopes (PG19), but not same-level FROM siblings (outer
@@ -18958,6 +19587,7 @@ fn build_source(
             rows,
             alias,
             col_aliases,
+            ..
         } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
             // v0.23: more column aliases than VALUES columns is 42601.
@@ -18976,7 +19606,7 @@ fn build_source(
                 }
                 // v0.72: expand top-level set-returning calls (PG19 ROWS
                 // FROM: `VALUES (generate_series(1,3))` is three rows).
-                eval_rows.extend(expand_values_srf_row(q, row)?);
+                eval_rows.extend(expand_values_srf_row(q, &[], row)?);
             }
             let schema: Vec<QCol> = (0..ncols)
                 .map(|i| {
@@ -19036,87 +19666,140 @@ fn build_source(
             alias,
             col_aliases,
         } => {
-            let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None)?;
-            // v0.46: implicit LATERAL. Comma-separated FROM items parse
-            // into CROSS JOINs (`parse_from` in sql.rs), so `FROM t,
-            // f(t.x)` arrives here with the function on the right. When
-            // the right side is a table function whose arguments
-            // reference the left side's columns, PG re-evaluates the
-            // function once per left row (as if LATERAL). Only plain
-            // comma joins qualify: an explicit ON/USING/NATURAL (or a
-            // join-level alias) is a true join, not a comma.
-            let lateral = match (kind, on, using_alias) {
-                (JoinKind::Cross, None, None)
-                    if using.is_empty() && !natural && alias.is_none() =>
-                {
-                    match right.as_ref() {
-                        FromItem::Function {
-                            name,
-                            args,
-                            alias: falias,
-                            col_aliases,
-                            lateral,
-                        } if *lateral || function_args_lateral(args, &lschema0) => Some((
-                            name.as_str(),
-                            args.as_slice(),
-                            falias,
-                            col_aliases.as_slice(),
-                        )),
-                        _ => None,
-                    }
+            let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None, prefix)?;
+            // v1.10: LATERAL evaluation. PG19 (`LATERAL_P
+            // select_with_parens` / `LATERAL_P func_table`) evaluates a
+            // LATERAL right-hand item once per left row, with the left
+            // row's columns visible as the innermost scope; the item's
+            // output rowtype is fixed at plan time. Covers:
+            //  - explicit `LATERAL (SELECT ...)` / `LATERAL (VALUES ...)`
+            //    on any join kind (comma, CROSS/INNER/LEFT/RIGHT/FULL
+            //    JOIN ... ON/USING);
+            //  - explicit `LATERAL func(...)` (a noise word in PG, legal
+            //    on any join kind);
+            //  - v0.46 implicit LATERAL: comma-separated FROM items
+            //    parse into CROSS JOINs, so `FROM t, f(t.x)` arrives here
+            //    with the function on the right; when its arguments
+            //    reference the left side's columns PG re-evaluates once
+            //    per left row. Only plain comma joins qualify for the
+            //    implicit case: an explicit ON/USING/NATURAL (or a
+            //    join-level alias) is a true join, not a comma.
+            //  - cross-nest LATERAL (PG19): a LATERAL item may reference
+            //    any FROM item that precedes it textually, even outside
+            //    its own join nest (`FROM a, b JOIN LATERAL (SELECT a.x)
+            //    ...`). When the right subtree contains a lateral item,
+            //    it is rebuilt once per left row with the left row
+            //    appended to the prefix.
+            let is_comma = matches!((kind, on, using_alias), (JoinKind::Cross, None, None))
+                && using.is_empty()
+                && !natural
+                && alias.is_none();
+            let lateral_right: Option<LateralRight> = match right.as_ref() {
+                FromItem::Function {
+                    name,
+                    args,
+                    alias: falias,
+                    col_aliases,
+                    lateral,
+                } if *lateral || (is_comma && function_args_lateral(args, &lschema0)) => {
+                    Some(LateralRight::Func {
+                        name: name.as_str(),
+                        args: args.as_slice(),
+                        alias: falias,
+                        col_aliases: col_aliases.as_slice(),
+                    })
                 }
+                FromItem::Derived {
+                    sub,
+                    alias,
+                    col_aliases,
+                    lateral: true,
+                } => Some(LateralRight::Derived {
+                    sub,
+                    alias: alias.as_str(),
+                    col_aliases: col_aliases.as_slice(),
+                }),
+                FromItem::Values {
+                    rows,
+                    alias,
+                    col_aliases,
+                    lateral: true,
+                } => Some(LateralRight::Values {
+                    rows: rows.as_slice(),
+                    alias: alias.as_str(),
+                    col_aliases: col_aliases.as_slice(),
+                }),
                 _ => None,
             };
-            if let Some((fname, fargs, falias, fcol_aliases)) = lateral {
-                // Static output schema from the argument *types* against
-                // the left schema (no row values yet — like a declared
-                // return type), so an empty left input still gets the
-                // right schema. Same merged layout as a regular join, so
-                // the describe path and execution agree exactly.
-                let rschema0 = lateral_function_schema(
-                    &*q.eng,
-                    q.snap,
-                    q.own,
-                    q.session,
-                    fname,
-                    fargs,
-                    falias,
-                    fcol_aliases,
+            if let Some(lr) = lateral_right {
+                // v1.10: PG19 forbids a CORRELATED lateral reference on
+                // RIGHT/FULL joins ("The combining JOIN type must be
+                // INNER or LEFT for a LATERAL reference").
+                if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                    let outer_schemas: Vec<&[QCol]> =
+                        outer.iter().map(|s| s.schema).collect();
+                    let scope_schemas: Vec<&[QCol]> = prefix
+                        .iter()
+                        .map(|s| s.schema)
+                        .chain(std::iter::once(lschema0.as_slice()))
+                        .collect();
+                    if lateral_is_correlated(
+                        &*q.eng,
+                        q.snap,
+                        q.own,
+                        q.session,
+                        &q.ctes,
+                        &outer_schemas,
+                        &scope_schemas,
+                        &lr,
+                    ) {
+                        return Err(exec_err(
+                            "42P10",
+                            "invalid reference to FROM-clause entry: \
+                             the combining JOIN type must be INNER or LEFT \
+                             for a LATERAL reference",
+                        ));
+                    }
+                }
+                return eval_lateral_join(
+                    q,
+                    outer,
+                    prefix,
                     &lschema0,
-                )?;
-                let layout = plan_join(
-                    &lschema0,
-                    &rschema0,
+                    &lrows0,
+                    &lr,
+                    *kind,
+                    on,
                     using,
                     *natural,
                     using_alias.as_deref(),
                     alias.as_deref(),
                     col_aliases,
-                )?;
-                let schema = layout.schema.clone();
-                let mut rows = Vec::new();
-                for l in &lrows0 {
-                    // The left row is the innermost scope when the
-                    // function's arguments are evaluated (PG's LATERAL
-                    // semantics); outer scopes stay visible behind it.
-                    let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
-                    scopes.extend_from_slice(outer);
-                    scopes.push(Scope {
-                        schema: &lschema0,
-                        row: &l.cells,
-                        prov: None,
-                    });
-                    let (_, frows) =
-                        eval_function_item(q, &scopes, fname, fargs, falias, fcol_aliases)?;
-                    // Inner-join semantics: a left row whose function
-                    // yields no rows contributes nothing.
-                    for f in &frows {
-                        rows.push(combine_join_pair(l, f, &layout, *kind));
-                    }
-                }
-                return Ok((schema, rows));
+                );
             }
-            let (rschema0, rrows0) = build_source(q, outer, right, where_, need_prov, None, None)?;
+            // v1.10: cross-nest LATERAL — the right subtree contains a
+            // lateral item (but is not itself a direct lateral right),
+            // so it may reference the left row: rebuild per left row.
+            if from_item_has_lateral(right) {
+                return eval_cross_nest_join(
+                    q,
+                    outer,
+                    prefix,
+                    &lschema0,
+                    &lrows0,
+                    right,
+                    *kind,
+                    on,
+                    using,
+                    *natural,
+                    using_alias.as_deref(),
+                    alias.as_deref(),
+                    col_aliases,
+                    need_prov,
+                );
+            }
+            let (rschema0, rrows0) =
+                build_source(q, outer, right, where_, need_prov, None, None, prefix)?;
             // v0.23: resolve merged columns and the output layout (shared
             // with the describe path so both agree exactly).
             let layout = plan_join(
@@ -30344,14 +31027,14 @@ fn expand_insert_srf_rows(
 /// [`expand_insert_srf_rows`], but the cells evaluate straight to
 /// `Value`s for the scan): SRFs zip with NULL padding, scalars repeat,
 /// all-empty SRFs produce no rows.
-fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, ExecError> {
+fn expand_values_srf_row(q: &mut Q, scopes: &[Scope], row: &[Expr]) -> Result<Vec<Vec<Value>>, ExecError> {
     if !row
         .iter()
         .any(|e| matches!(e, Expr::Func { name, .. } if is_builtin_srf(name)))
     {
         return Ok(vec![
             row.iter()
-                .map(|e| eval_expr(q, &[], e))
+                .map(|e| eval_expr(q, scopes, e))
                 .collect::<Result<Vec<_>, _>>()?,
         ]);
     }
@@ -30363,7 +31046,7 @@ fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, Exe
             if is_builtin_srf(name) {
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
-                    arg_vals.push(eval_expr(q, &[], a)?);
+                    arg_vals.push(eval_expr(q, scopes, a)?);
                 }
                 let set = eval_srf_vals(name, &arg_vals)?;
                 has_result |= !set.is_empty();
@@ -30372,7 +31055,7 @@ fn expand_values_srf_row(q: &mut Q, row: &[Expr]) -> Result<Vec<Vec<Value>>, Exe
                 continue;
             }
         }
-        cells.push((vec![eval_expr(q, &[], e)?], false));
+        cells.push((vec![eval_expr(q, scopes, e)?], false));
     }
     if !has_result {
         return Ok(Vec::new());
@@ -34987,6 +35670,9 @@ fn from_schemas(
     // derived tables (PG19: a FROM-subquery sees enclosing ranges, but
     // not same-level FROM siblings).
     outer_schemas: &[&[QCol]],
+    // v1.10: schemas of textually-preceding FROM items (cross-nest
+    // LATERAL, PG19). Only LATERAL items may see the prefix.
+    prefix_schemas: &[&[QCol]],
 ) -> Result<Vec<Vec<QCol>>, ExecError> {
     let mut out = Vec::new();
     for item in from {
@@ -35000,6 +35686,7 @@ fn from_schemas(
             visible,
             bindings,
             outer_schemas,
+            prefix_schemas,
         )?;
     }
     Ok(out)
@@ -35015,6 +35702,9 @@ fn from_schema_item(
     visible: &[CteDef],
     bindings: &[Rc<CteBinding>],
     outer_schemas: &[&[QCol]],
+    // v1.10: schemas of textually-preceding FROM items (cross-nest
+    // LATERAL, PG19). Only LATERAL items may see the prefix.
+    prefix_schemas: &[&[QCol]],
 ) -> Result<(), ExecError> {
     match item {
         FromItem::Table {
@@ -35265,6 +35955,7 @@ fn from_schema_item(
             sub,
             alias,
             col_aliases,
+            ..
         } => {
             // v0.99: a FROM-subquery's correlated references resolve
             // against the enclosing query's schemas (PG19); same-level
@@ -35328,6 +36019,7 @@ fn from_schema_item(
             rows,
             alias,
             col_aliases,
+            ..
         } => {
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
             // v0.23: more column aliases than VALUES columns is 42601.
@@ -35381,35 +36073,111 @@ fn from_schema_item(
                 visible,
                 bindings,
                 outer_schemas,
+                prefix_schemas,
             )?;
             let lflat: Vec<QCol> = l.into_iter().flatten().collect();
-            // v0.46: implicit LATERAL (comma joins parse into CROSS
-            // JOINs): a right-side table function referencing left
-            // columns gets its schema from static arg-type inference
-            // against the left schema — the same helper the executor
-            // uses, so Describe and execution agree.
-            let rflat: Vec<QCol> = match (kind, right.as_ref()) {
-                (
-                    JoinKind::Cross,
-                    FromItem::Function {
-                        name,
-                        args,
+            // v1.10: LATERAL (explicit `LATERAL (SELECT ...)` /
+            // `LATERAL (VALUES ...)` / `LATERAL func(...)`, plus the
+            // v0.46 implicit-LATERAL comma case): the right schema comes
+            // from the same static helper the executor uses, with the
+            // left schema as the innermost enclosing scope — so Describe
+            // and execution agree exactly.
+            let is_comma = matches!(kind, JoinKind::Cross)
+                && using.is_empty()
+                && !natural
+                && using_alias.is_none()
+                && alias.is_none();
+            let lateral_right: Option<LateralRight> = match right.as_ref() {
+                FromItem::Function {
+                    name,
+                    args,
+                    alias: falias,
+                    col_aliases: fca,
+                    lateral,
+                } if *lateral || (is_comma && function_args_lateral(args, &lflat)) => {
+                    Some(LateralRight::Func {
+                        name: name.as_str(),
+                        args: args.as_slice(),
                         alias: falias,
-                        col_aliases: fca,
-                        lateral,
-                    },
-                ) if using.is_empty()
-                    && !natural
-                    && using_alias.is_none()
-                    && alias.is_none()
-                    && (*lateral || function_args_lateral(args, &lflat)) =>
-                {
-                    lateral_function_schema(
-                        eng, snap, own, session, name, args, falias, fca, &lflat,
+                        col_aliases: fca.as_slice(),
+                    })
+                }
+                FromItem::Derived {
+                    sub,
+                    alias,
+                    col_aliases,
+                    lateral: true,
+                } => Some(LateralRight::Derived {
+                    sub,
+                    alias: alias.as_str(),
+                    col_aliases: col_aliases.as_slice(),
+                }),
+                FromItem::Values {
+                    rows,
+                    alias,
+                    col_aliases,
+                    lateral: true,
+                } => Some(LateralRight::Values {
+                    rows: rows.as_slice(),
+                    alias: alias.as_str(),
+                    col_aliases: col_aliases.as_slice(),
+                }),
+                _ => None,
+            };
+            // v1.10: PG19 forbids a CORRELATED lateral reference on
+            // RIGHT/FULL joins (same rule as the executor, so EXPLAIN
+            // agrees).
+            if let Some(lr) = &lateral_right {
+                if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                    let mut scope_schemas: Vec<&[QCol]> =
+                        Vec::with_capacity(prefix_schemas.len() + 1);
+                    scope_schemas.extend_from_slice(prefix_schemas);
+                    scope_schemas.push(&lflat);
+                    if lateral_is_correlated(
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        bindings,
+                        outer_schemas,
+                        &scope_schemas,
+                        lr,
+                    ) {
+                        return Err(exec_err(
+                            "42P10",
+                            "invalid reference to FROM-clause entry: \
+                             the combining JOIN type must be INNER or LEFT \
+                             for a LATERAL reference",
+                        ));
+                    }
+                }
+            }
+            let rflat: Vec<QCol> = match &lateral_right {
+                Some(lr) => {
+                    // v1.10: cross-nest LATERAL sees the prefix schemas
+                    // between the outer query and the immediate left.
+                    let mut scope_schemas: Vec<&[QCol]> =
+                        Vec::with_capacity(prefix_schemas.len() + 1);
+                    scope_schemas.extend_from_slice(prefix_schemas);
+                    scope_schemas.push(&lflat);
+                    lateral_right_schema(
+                        eng, snap, own, session, bindings, outer_schemas, &scope_schemas, lr,
                     )?
                 }
-                _ => {
+                None => {
                     let mut r: Vec<Vec<QCol>> = Vec::new();
+                    // v1.10: a right subtree containing a lateral item
+                    // sees the left schema as preceding-sibling scope
+                    // (cross-nest); a non-lateral right keeps the
+                    // original prefix (siblings stay invisible).
+                    let right_prefix: Vec<&[QCol]> = if from_item_has_lateral(right) {
+                        let mut p: Vec<&[QCol]> = Vec::with_capacity(prefix_schemas.len() + 1);
+                        p.extend_from_slice(prefix_schemas);
+                        p.push(&lflat);
+                        p
+                    } else {
+                        prefix_schemas.to_vec()
+                    };
                     from_schema_item(
                         eng,
                         snap,
@@ -35420,6 +36188,7 @@ fn from_schema_item(
                         visible,
                         bindings,
                         outer_schemas,
+                        &right_prefix,
                     )?;
                     r.into_iter().flatten().collect()
                 }
@@ -35581,6 +36350,7 @@ fn describe_select_outer(
         &visible,
         bindings,
         outer_schemas,
+        &[],
     )?;
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
@@ -36770,7 +37540,8 @@ fn infer_select(
     // v0.10: this level's own CTEs are visible to the FROM clause.
     let visible: Vec<CteDef> = s.with.clone();
     let own_schemas =
-        from_schemas(eng, snap, own, session, &s.from, &visible, &[], outer).unwrap_or_default();
+        from_schemas(eng, snap, own, session, &s.from, &visible, &[], outer, &[])
+            .unwrap_or_default();
     let mut refs: Vec<&[QCol]> = Vec::with_capacity(outer.len() + own_schemas.len());
     refs.extend_from_slice(outer);
     refs.extend(own_schemas.iter().map(|s| s.as_slice()));
@@ -36874,7 +37645,8 @@ pub fn infer_param_types(
         // not break Bind (from_schemas' unwrap_or_default rule).
         let uqual = alias.as_deref().unwrap_or(table);
         let uextra: Vec<Vec<QCol>> =
-            from_schemas(eng, snap, own, session, from, with, &[], &[]).unwrap_or_default();
+            from_schemas(eng, snap, own, session, from, with, &[], &[], &[])
+                .unwrap_or_default();
         if let Some(t) = eng.db.find_table(table, snap, own, session) {
             let mut combined: Vec<QCol> = uextra.iter().flatten().cloned().collect();
             combined.extend(t.columns.iter().map(|(n, ty)| QCol {
@@ -36928,7 +37700,8 @@ pub fn infer_param_types(
             // visible too (PG19).
             let qual = alias.as_deref().unwrap_or(table);
             let dextra: Vec<Vec<QCol>> =
-                from_schemas(eng, snap, own, session, using, with, &[], &[]).unwrap_or_default();
+                from_schemas(eng, snap, own, session, using, with, &[], &[], &[])
+                    .unwrap_or_default();
             if let Some(w) = where_ {
                 if let Some(t) = eng.db.find_table(table, snap, own, session) {
                     let mut combined: Vec<QCol> = dextra.iter().flatten().cloned().collect();
@@ -37784,7 +38557,7 @@ pub fn describe_columns(
             if returning.is_empty() {
                 Ok(None)
             } else {
-                let extra = from_schemas(eng, snap, own, session, from, with, &[], &[])?;
+                let extra = from_schemas(eng, snap, own, session, from, with, &[], &[], &[])?;
                 Ok(Some(describe_returning(
                     eng,
                     snap,
@@ -37811,7 +38584,7 @@ pub fn describe_columns(
             if returning.is_empty() {
                 Ok(None)
             } else {
-                let extra = from_schemas(eng, snap, own, session, using, with, &[], &[])?;
+                let extra = from_schemas(eng, snap, own, session, using, with, &[], &[], &[])?;
                 Ok(Some(describe_returning(
                     eng,
                     snap,
@@ -49875,5 +50648,280 @@ mod v108_costs_off_tests {
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE 'x' = b",
         );
         assert_eq!(plan[1], "  Filter: ('x'::text = b)");
+    }
+}
+
+/// v1.10: explicit LATERAL derived tables and VALUES (PG19 `LATERAL_P
+/// select_with_parens`): the right-hand item is evaluated once per left
+/// row with the left row as the innermost scope.
+#[cfg(test)]
+mod v110_lateral_tests {
+    use super::*;
+    use crate::sql::{parse_statement, FromItem, Stmt};
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    /// users(id int): (1), (2), (3).
+    fn users(eng: &mut Engine) {
+        run(eng, "CREATE TABLE users (id int)").unwrap();
+        run(eng, "INSERT INTO users VALUES (1), (2), (3)").unwrap();
+    }
+
+    /// The parser marks `LATERAL (SELECT ...)` / `LATERAL (VALUES ...)`
+    /// on the FROM item; a relation literally named `lateral` still
+    /// parses as a table (PG19: LATERAL is unreserved); LATERAL before
+    /// a parenthesized join is a PG19 syntax error.
+    #[test]
+    fn parse_marks_derived_and_values() {
+        // Comma-separated items parse into CROSS JOINs; the LATERAL
+        // item is the join's right side.
+        let right_of_comma = |sql: &str| match parse_statement(sql).unwrap() {
+            Stmt::Select(s) => match s.from.into_iter().next().unwrap() {
+                FromItem::Join { right, .. } => *right,
+                other => other,
+            },
+            _ => panic!("expected SELECT"),
+        };
+        assert!(matches!(
+            right_of_comma("SELECT * FROM t, LATERAL (SELECT 1) AS s"),
+            FromItem::Derived { lateral: true, .. }
+        ));
+        assert!(matches!(
+            right_of_comma("SELECT * FROM t, LATERAL (VALUES (1)) AS v"),
+            FromItem::Values { lateral: true, .. }
+        ));
+        assert!(matches!(
+            right_of_comma("SELECT * FROM t, (SELECT 1) AS s"),
+            FromItem::Derived { lateral: false, .. }
+        ));
+        assert!(matches!(
+            parse_statement("SELECT * FROM lateral").unwrap(),
+            Stmt::Select(s) if matches!(&s.from[0], FromItem::Table { name, .. } if name == "lateral")
+        ));
+        let err =
+            parse_statement("SELECT * FROM t, LATERAL ((SELECT 1) CROSS JOIN (SELECT 2)) AS s")
+                .unwrap_err();
+        assert_eq!(err.code, "42601");
+    }
+
+    /// Comma LATERAL correlated subquery re-evaluates per left row.
+    #[test]
+    fn comma_correlated() {
+        let mut eng = engine();
+        users(&mut eng);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, s.d FROM users u, LATERAL (SELECT u.id * 10 AS d) AS s ORDER BY 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "20".to_string()],
+                vec!["3".to_string(), "30".to_string()],
+            ]
+        );
+    }
+
+    /// INNER JOIN LATERAL with ON, and LEFT JOIN LATERAL null-extension
+    /// when the subquery returns no rows.
+    #[test]
+    fn join_on_and_left_null_ext() {
+        let mut eng = engine();
+        users(&mut eng);
+        run(&mut eng, "CREATE TABLE orders (uid int, amt int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO orders VALUES (1, 10), (1, 20), (2, 5)",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, o.amt FROM users u INNER JOIN LATERAL \
+                 (SELECT amt FROM orders WHERE uid = u.id) AS o ON o.amt > 10 \
+                 ORDER BY 1, 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["1".to_string(), "20".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, o.amt FROM users u LEFT JOIN LATERAL \
+                 (SELECT amt FROM orders WHERE uid = u.id AND amt > 100) AS o ON true \
+                 ORDER BY 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "NULL".to_string()],
+                vec!["2".to_string(), "NULL".to_string()],
+                vec!["3".to_string(), "NULL".to_string()],
+            ]
+        );
+    }
+
+    /// LATERAL (VALUES ...) sees the left row; multi-row correlated
+    /// subqueries fan out; uncorrelated LATERAL evaluates per left row.
+    #[test]
+    fn values_and_fanout() {
+        let mut eng = engine();
+        users(&mut eng);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, v.x FROM users u, LATERAL (VALUES (u.id + 100), (u.id + 200)) AS v(x) \
+                 WHERE u.id = 2 ORDER BY 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["2".to_string(), "102".to_string()],
+                vec!["2".to_string(), "202".to_string()],
+            ]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, s.k FROM users u, LATERAL (SELECT 7 AS k) AS s WHERE u.id = 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["3".to_string(), "7".to_string()]]);
+    }
+
+    /// Nested LATERAL sees same-level earlier siblings; an empty left
+    /// input yields no rows but still type-checks.
+    #[test]
+    fn nested_and_empty_left() {
+        let mut eng = engine();
+        users(&mut eng);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, s1.a, s2.b FROM users u, \
+                 LATERAL (SELECT u.id + 1 AS a) AS s1, \
+                 LATERAL (SELECT s1.a + 1 AS b) AS s2 \
+                 WHERE u.id = 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![vec!["1".to_string(), "2".to_string(), "3".to_string()]]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, s.d FROM users u, LATERAL (SELECT u.id * 10 AS d) AS s WHERE false",
+            )
+            .unwrap(),
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cross_nest_lateral() {
+        // PG19: a LATERAL item may reference any FROM item that precedes
+        // it textually, even outside its own join nest.
+        let mut eng = engine();
+        users(&mut eng);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, b.x FROM users u, (SELECT 1 AS one) AS o \
+                 JOIN LATERAL (VALUES (u.id + o.one)) AS b(x) ON true \
+                 WHERE u.id <= 2 ORDER BY u.id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec!["2".to_string(), "3".to_string()],
+            ]
+        );
+        // Non-LATERAL siblings stay invisible (PG19).
+        let err = run(
+            &mut eng,
+            "SELECT u.id FROM users u, (SELECT u.id AS v) AS s WHERE u.id = 1",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42703");
+    }
+
+    #[test]
+    fn right_full_correlated_lateral_rejected() {
+        // PG19: "The combining JOIN type must be INNER or LEFT for a
+        // LATERAL reference." Correlated LATERAL on RIGHT/FULL is an
+        // error; uncorrelated LATERAL is legal.
+        let mut eng = engine();
+        users(&mut eng);
+        for kind in ["RIGHT", "FULL"] {
+            let err = run(
+                &mut eng,
+                &format!(
+                    "SELECT u.id, s.v FROM users u {} JOIN LATERAL \
+                     (SELECT u.id + 1 AS v) AS s ON true WHERE u.id = 1",
+                    kind
+                ),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "42P10", "kind={}", kind);
+        }
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT u.id, s.v FROM users u RIGHT JOIN LATERAL \
+                 (SELECT 42 AS v) AS s ON true WHERE u.id = 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["1".to_string(), "42".to_string()]]);
     }
 }

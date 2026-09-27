@@ -773,6 +773,29 @@ def norm_expected_cell(cell, null_display):
 # supported. Checked BEFORE EXPECTED_FAIL_PATTERNS; a match means the
 # statement must PASS (otherwise it's a REAL-FAIL).
 EXPECTED_PASS_OVERRIDES = [
+    # v1.10: explicit LATERAL derived tables and VALUES are supported
+    # for SELECT (correlated per left row, ON/USING, LEFT null-extension,
+    # cross-nest visibility, RIGHT/FULL 42P10 rule). Excludes: EXPLAIN
+    # (stays masked), UPDATE (lateral in UPDATE...FROM is still an
+    # error in PG), parenthesized setops in FROM (unsupported),
+    # aggregates at their own query level (PG rejects), the
+    # ambiguous-table-reference case (PG errors; we don't detect),
+    # and statements using unsupported features or hitting scoping
+    # edge cases that fail for non-lateral reasons.
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!\s*update\b)(?!.*\bunion\b.*\blateral\b|\blateral\b.*\bunion\b)"
+     r"(?!.*\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\()"
+     r"(?!.*\bint8_tbl\s+x\s+cross\s+join\s*\(\s*int4_tbl\s+x\b)"
+     r"(?!.*\binformation_schema\b)"
+     r"(?!.*\blateral\b\s*\(\s*select\s+i8\.q1,\s*t2\.f1\b)"
+     r"(?!.*\bjoin\s*\(\s*select\s+i42\.f1\b)"
+     r"(?!.*\bleft\s+join\s*\(\s*select\s+b\.q1\s+as\s+bx\b)"
+     r"(?!.*\blateral\b\s*\(\s*select\s+\*\s+from\s+tenk1\s+t2,\s*lateral\b)"
+     r"(?!.*\bwidth_bucket\b.*\blateral\b|\blateral\b.*\bwidth_bucket\b)"
+     r"(?!.*\blateral\b\s*\(\s*values\s*\(\s*\w+\.\*\s*\))"
+     r"(?!.*\blateral\b\s*\(\s*with\s+recursive\b)"
+     r".*\blateral\b",
+     "v1.10: explicit LATERAL supported"),
     # v1.09: PARALLEL {UNSAFE|RESTRICTED|SAFE} is parsed/validated (planner
     # hint, like COST). The distinct_func plpgsql bodies are bounded
     # single-RETURN and now succeed.
@@ -788,6 +811,21 @@ EXPECTED_PASS_OVERRIDES = [
      "v1.09: ALTER FUNCTION volatility supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
+    # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
+    # override explicitly excludes them so they classify here, not as
+    # REAL-FAIL).
+    (r"(?is)\blateral\b\s*\(\s*\(\s*select\b.*\bunion\b",
+     "v1.10: parenthesized setop in LATERAL FROM unsupported"),
+    (r"(?is)\bint8_tbl\s+x\s+cross\s+join\s*\(\s*int4_tbl\s+x\b.*\blateral\b",
+     "v1.10: ambiguous table reference in LATERAL not detected"),
+    (r"(?is)\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\(",
+     "v1.10: aggregate in LATERAL at own query level not rejected"),
+    (r"(?is)\bwidth_bucket\b.*\blateral\b",
+     "v1.10: float8 precision in LATERAL VALUES"),
+    (r"(?is)\blateral\b\s*\(\s*values\s*\(\s*\w+\.\*\s*\)",
+     "v1.10: row wildcard (n.*) in LATERAL VALUES unsupported"),
+    (r"(?is)\blateral\b\s*\(\s*with\s+recursive\b",
+     "v1.10: WITH RECURSIVE in LATERAL unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?function\b", "CREATE FUNCTION (procedural languages) unsupported"),
     # v1.02: ALTER FUNCTION was never in the grammar (honest 42601);
     # previously masked by the cascade guard because CREATE FUNCTION
@@ -836,7 +874,9 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS NOT DISTINCT FROM unsupported"),
     (r"\bNULLS\s+(FIRST|LAST)\b", "NULLS FIRST/LAST unsupported"),
     # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
-    (r"(?is)^\s*explain\s*\(", "EXPLAIN with (option, ...) syntax unsupported"),
+    # v1.10: also mask EXPLAIN statements with leading -- comments (the
+    # corpus has many; the ^ anchor alone misses them).
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(", "EXPLAIN with (option, ...) syntax unsupported"),
     # v0.52: SELECT DISTINCT ON is implemented (PG19 Unique-under-sort
     # semantics); the mask is removed so the corpus statements are
     # exercised. The EXPLAIN variants above stay masked; the

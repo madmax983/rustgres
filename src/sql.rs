@@ -1350,18 +1350,27 @@ pub enum FromItem {
     /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
     /// v0.23: `[(cols)]` column aliases rename the subquery's output
     /// columns positionally (previously parsed but discarded).
+    /// v1.10: `LATERAL (SELECT ...)` — the subquery may reference
+    /// FROM items to its left and is evaluated once per left row
+    /// (PG19 `LATERAL_P select_with_parens`, which also covers
+    /// `LATERAL (VALUES ...)`).
     Derived {
         sub: Box<SelectStmt>,
         alias: String,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
     /// columns `column1`, `column2`, ... when no column aliases are given.
     /// v0.21: `[(col, ...)]` column aliases.
+    /// v1.10: `LATERAL (VALUES ...)` — row expressions may reference
+    /// FROM items to the left (PG19 `select_with_parens` covers
+    /// `VALUES`; PG's own regress suite uses this shape).
     Values {
         rows: Vec<Vec<Expr>>,
         alias: String,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     /// v0.32: `func(args) [AS] alias [(cols)]` — set-returning table
     /// function. v0.46: a function whose args reference earlier FROM
@@ -5435,6 +5444,43 @@ impl Parser {
             self.pos += 1;
         }
         t
+    }
+
+    /// v1.10: consume `lateral` as the FROM-item keyword only where
+    /// PG19's gram.y has a `LATERAL_P` production (`LATERAL_P
+    /// func_table`, `LATERAL_P select_with_parens`). Anywhere else it
+    /// stays an ordinary identifier, so `FROM lateral` (a table named
+    /// `lateral`) keeps working like PG19, where LATERAL is unreserved.
+    fn eat_lateral_keyword(&mut self) -> bool {
+        if !matches!(self.peek(), Token::Ident(s) if s == "lateral") {
+            return false;
+        }
+        let mut j = self.pos + 1;
+        if matches!(self.tokens.get(j), Some(Token::LParen)) {
+            // `LATERAL (` — the keyword only when redundant parens give
+            // way to SELECT/WITH/VALUES (PG's `select_with_parens`
+            // covers `VALUES`, so `LATERAL (VALUES ...)` is legal).
+            loop {
+                j += 1;
+                if !matches!(self.tokens.get(j), Some(Token::LParen)) {
+                    break;
+                }
+            }
+            if matches!(self.tokens.get(j), Some(Token::Ident(s)) if s == "select" || s == "with" || s == "values")
+            {
+                self.pos += 1;
+                return true;
+            }
+            return false;
+        }
+        // `LATERAL func_name (` — the noise-word case.
+        if matches!(self.tokens.get(j), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 1), Some(Token::LParen))
+        {
+            self.pos += 1;
+            return true;
+        }
+        false
     }
 
     fn eat_keyword(&mut self, kw: &str) -> bool {
@@ -12232,6 +12278,8 @@ impl Parser {
             // PG auto-names the VALUES RTE; the name never surfaces.
             alias: "_values".to_string(),
             col_aliases: Vec::new(),
+            // v1.10: desugared top-level VALUES is never LATERAL.
+            lateral: false,
         }];
         sel
     }
@@ -12548,10 +12596,17 @@ impl Parser {
     }
 
     fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
-        // v0.87: explicit `LATERAL` (PG19). Only table functions are
-        // supported under it; LATERAL derived tables / plain tables get
-        // an honest 0A000 below.
-        let lateral = self.eat_keyword("lateral");
+        // v1.10: explicit `LATERAL` (PG19 gram.y `table_ref`:
+        // `LATERAL_P func_table` and `LATERAL_P select_with_parens` —
+        // the latter covers both `(SELECT ...)` and `(VALUES ...)`.
+        // There is NO `LATERAL_P relation_expr` production, so
+        // `LATERAL tbl` is a syntax error in PG. LATERAL is unreserved
+        // in PG19, so a table genuinely named `lateral` keeps working:
+        // the keyword is taken only before `(` opening a
+        // subquery/VALUES, or before `func_name (` (the noise-word
+        // case, since function args may reference earlier FROM items
+        // with or without the keyword).
+        let lateral = self.eat_lateral_keyword();
         // v0.96: `FROM ONLY tbl` / `FROM ONLY (tbl)` (PG19) — scan just
         // the named table, excluding inheritance children. `only` is an
         // unreserved keyword in PG, so a table literally named `only`
@@ -12624,6 +12679,7 @@ impl Parser {
                     rows,
                     alias: String::new(),
                     col_aliases: Vec::new(),
+                    lateral,
                 }
             } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
                 // v0.76: `(WITH ... SELECT ...)` derived tables are now
@@ -12634,6 +12690,7 @@ impl Parser {
                     sub: Box::new(sub),
                     alias: String::new(),
                     col_aliases: Vec::new(),
+                    lateral,
                 }
             } else {
                 // v0.23: parenthesized joined table (or bare table):
@@ -12795,13 +12852,15 @@ impl Parser {
                 // non-parenthesized branch with alias already set).
                 FromItem::Function { .. } => {}
             }
-            // v0.87: explicit LATERAL only supports table functions;
-            // `LATERAL (subquery)` / `LATERAL (VALUES ...)` is 0A000.
-            if lateral {
-                return Err(SqlError {
-                    message: "LATERAL is only supported on table functions".to_string(),
-                    code: "0A000",
-                });
+            // v1.10: `LATERAL` before a parenthesized join has no PG19
+            // production (`LATERAL_P` covers only functions and
+            // `select_with_parens`); PG reports a syntax error. (The
+            // keyword gate above means `lateral` is only true here for
+            // `((SELECT ...) ... JOIN ...)` shapes.)
+            if lateral && matches!(item, FromItem::Join { .. }) {
+                return Err(err(
+                    "syntax error: LATERAL cannot precede a parenthesized join".to_string(),
+                ));
             }
             Ok(item)
         } else {
@@ -12842,14 +12901,10 @@ impl Parser {
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
             let col_aliases = self.parse_col_alias_list()?;
-            // v0.87: explicit LATERAL is only supported on table
-            // functions; `LATERAL tbl` / `LATERAL (subquery)` is 0A000.
-            if lateral {
-                return Err(SqlError {
-                    message: "LATERAL is only supported on table functions".to_string(),
-                    code: "0A000",
-                });
-            }
+            // v1.10: `lateral` is only true here before `func_name (`
+            // (the gate in eat_lateral_keyword); a bare `LATERAL tbl`
+            // never sets it — PG19 has no such production, and the word
+            // falls back to a table named `lateral` instead.
             Ok(FromItem::Table {
                 name,
                 alias,
