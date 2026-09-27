@@ -617,11 +617,13 @@ fn execute_inner(
             predicate,
         } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref()),
         Stmt::DropIndex { names, if_exists } => exec_drop_index(eng, ctx, names, *if_exists),
-        Stmt::Explain { stmt, analyze } => {
+        Stmt::Explain {
+            stmt, analyze, costs, ..
+        } => {
             if *analyze {
-                exec_explain_analyze(eng, ctx, stmt)
+                exec_explain_analyze(eng, ctx, stmt, *costs)
             } else {
-                exec_explain(eng, ctx, stmt)
+                exec_explain(eng, ctx, stmt, *costs)
             }
         }
         Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
@@ -9075,6 +9077,9 @@ enum AccessPath {
         hi: Option<(Value, bool)>,
         /// Human-readable condition for EXPLAIN.
         cond: String,
+        /// v1.08: AND-conjunct indices consumed by `cond` (the rest stay
+        /// residual Filters).
+        used: Vec<usize>,
     },
 }
 
@@ -9097,12 +9102,14 @@ fn plan_access_path(
         Some(w) => w,
         None => return AccessPath::SeqScan,
     };
-    // Gather per-column bounds from the AND-conjuncts.
-    let mut col_bounds: HashMap<usize, Vec<(IndexBoundKind, Value)>> = HashMap::new();
-    for c in split_conjuncts(w) {
+    // Gather per-column bounds from the AND-conjuncts, remembering which
+    // conjunct each bound came from (v1.08: the winner's used set becomes
+    // the Index Cond; the rest stay residual Filters).
+    let mut col_bounds: HashMap<usize, Vec<(IndexBoundKind, Value, usize)>> = HashMap::new();
+    for (ci, c) in split_conjuncts(w).iter().enumerate() {
         if let Some(bs) = conjunct_bounds(c, qual, table_name, &t.columns) {
             for (pos, kind, v) in bs {
-                col_bounds.entry(pos).or_default().push((kind, v));
+                col_bounds.entry(pos).or_default().push((kind, v, ci));
             }
         }
     }
@@ -9120,20 +9127,32 @@ fn plan_access_path(
             continue;
         }
         let mut prefix: Vec<Value> = Vec::new();
-        let mut cond_parts: Vec<String> = Vec::new();
+        // v1.08: (conjunct index, text); sorted by source order for PG.
+        let mut cond_parts: Vec<(usize, String)> = Vec::new();
+        // v1.08: conjunct indices consumed by this candidate's cond.
+        let mut used: Vec<usize> = Vec::new();
+        // v1.08: render one bound like PG19's indexqual deparse
+        // `(col op const)`. Values with no faithful PG spelling fall back
+        // to the legacy bare text (wrong, EXPECTED-FAIL via mask) — the
+        // access path itself (prefix/lo/hi) is never affected by display.
+        let bound_text = |col_name: &str, pos: usize, op: &str, v: &Value| -> String {
+            let (_, ctype) = &t.columns[pos];
+            match pg_value_text(v, *ctype) {
+                Some(val) => format!("({col_name} {op} {val})"),
+                None => format!("({col_name} {op} {})", value_to_text_cast(v)),
+            }
+        };
         let mut i = 0;
         while i < ix.def.cols.len() {
             let cp = ix.def.cols[i];
             let eq_val = col_bounds
                 .get(&cp)
-                .and_then(|bs| bs.iter().find(|(k, _)| matches!(k, IndexBoundKind::Eq)));
+                .and_then(|bs| bs.iter().find(|(k, _, _)| matches!(k, IndexBoundKind::Eq)));
             match eq_val {
-                Some((_, v)) => {
-                    cond_parts.push(format!(
-                        "{} = {}",
-                        ix.def.col_names[i],
-                        value_to_text_cast(v)
-                    ));
+                Some((_, v, ci)) => {
+                    let t = bound_text(&ix.def.col_names[i], cp, "=", v);
+                    cond_parts.push((*ci, t));
+                    used.push(*ci);
                     prefix.push(v.clone());
                     i += 1;
                 }
@@ -9147,26 +9166,20 @@ fn plan_access_path(
         let (mut lo, mut hi): (Option<(Value, bool)>, Option<(Value, bool)>) = (None, None);
         if i < ix.def.cols.len() {
             if let Some(bs) = col_bounds.get(&ix.def.cols[i]) {
-                for (k, v) in bs {
+                for (k, v, ci) in bs {
                     match k {
                         IndexBoundKind::Gt(incl) if lo.is_none() => {
                             let op = if *incl { ">=" } else { ">" };
-                            cond_parts.push(format!(
-                                "{} {} {}",
-                                ix.def.col_names[i],
-                                op,
-                                value_to_text_cast(v)
-                            ));
+                            let t = bound_text(&ix.def.col_names[i], ix.def.cols[i], op, v);
+                            cond_parts.push((*ci, t));
+                            used.push(*ci);
                             lo = Some((v.clone(), *incl));
                         }
                         IndexBoundKind::Lt(incl) if hi.is_none() => {
                             let op = if *incl { "<=" } else { "<" };
-                            cond_parts.push(format!(
-                                "{} {} {}",
-                                ix.def.col_names[i],
-                                op,
-                                value_to_text_cast(v)
-                            ));
+                            let t = bound_text(&ix.def.col_names[i], ix.def.cols[i], op, v);
+                            cond_parts.push((*ci, t));
+                            used.push(*ci);
                             hi = Some((v.clone(), *incl));
                         }
                         _ => {}
@@ -9182,12 +9195,27 @@ fn plan_access_path(
         let score = (i, bound_cols, is_point);
         if score > best_score {
             best_score = score;
+            used.sort_unstable();
+            used.dedup();
             best = Some(AccessPath::IndexScan {
                 index: ix.def.name.clone(),
                 prefix,
                 lo,
                 hi,
-                cond: format!("({})", cond_parts.join(" AND ")),
+                // PG parenthesizes each index qual; a multi-qual cond
+                // wraps the AND list in one more pair, in source order.
+                cond: {
+                    // v1.08: `split_conjuncts` returns reversed source order,
+                    // so sort `ci` descending to restore source order.
+                    cond_parts.sort_by_key(|(ci, _)| std::cmp::Reverse(*ci));
+                    let texts: Vec<&str> = cond_parts.iter().map(|(_, t)| t.as_str()).collect();
+                    if texts.len() == 1 {
+                        texts[0].to_string()
+                    } else {
+                        format!("({})", texts.join(" AND "))
+                    }
+                },
+                used,
             });
         }
     }
@@ -9440,6 +9468,862 @@ fn index_order_rows(
 
 // --- EXPLAIN ---------------------------------------------------------------
 
+// ============================================================================
+// v1.08: Postgres-style EXPLAIN text (EXPLAIN (COSTS OFF) parity).
+//
+// PG19 references: `src/backend/commands/explain.c` (`ExplainNode`,
+// `ExplainIndentText`, `show_scan_qual`, `show_upper_qual`,
+// `show_sort_group_keys`) and `src/backend/utils/adt/ruleutils.c`
+// (`get_const_expr`, `get_oper_expr`, boolean-expression wrapping).
+//
+// The planning-only renderer (`render_plan`) takes a `costs` flag: with
+/// v1.08: PG19 text EXPLAIN node indentation (explain.c): depth 0 has
+/// no arrow; deeper levels get `(6*d-4)` spaces + `"->  "`. Properties get
+/// `(6*d+2)` spaces. This is SEPARATE from `analyze_pad` (v1.03 ANALYZE),
+/// which must not change.
+fn pg_pad(depth: usize) -> String {
+    if depth == 0 {
+        String::new()
+    } else {
+        format!("{}->  ", " ".repeat(6 * depth - 4))
+    }
+}
+
+/// v1.08: PG19 text EXPLAIN property indentation: `(6*d+2)` spaces.
+fn pg_ppad(depth: usize) -> String {
+    " ".repeat(6 * depth + 2)
+}
+
+/// v1.08: `table` or `table alias` for PG EXPLAIN scan lines.
+fn pg_scan_name(table: &str, alias: &Option<String>) -> String {
+    match alias {
+        Some(a) if a != table => format!("{table} {}", pg_quote_ident(a)),
+        _ => table.to_string(),
+    }
+}
+
+// COSTS OFF the `(rows=N)` estimate suffix is omitted from every node
+// line and the node tree is indented exactly like PG19 text EXPLAIN.
+// Expression text (Filter / Index Cond / Sort Key / Join Filter) is
+// deparsed by `pg_expr_text`, which mirrors ruleutils.c for the shapes
+// the planner can produce. Anything without a faithful PG spelling
+// returns `None`; callers then keep the statement honestly masked
+// (EXPECTED-FAIL) instead of printing a wrong plan.
+// ============================================================================
+
+/// Quote an identifier like PG19 `quote_identifier` when it would not
+/// scan as a bare identifier (mixed case, punctuation, ...).
+fn pg_quote_ident(s: &str) -> String {
+    let mut bs = s.bytes();
+    let bare = matches!(bs.next(), Some(b'a'..=b'z' | b'_'))
+        && bs.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$'));
+    if bare && !s.is_empty() {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+}
+
+/// Element-type label for `ColType::Array` (`integer[]`, `text[]`, ...).
+fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
+    Some(match e {
+        ArrayElem::Bool => "boolean",
+        ArrayElem::Bytea => "bytea",
+        ArrayElem::SingleChar => "\"char\"",
+        ArrayElem::Name => "name",
+        ArrayElem::SmallInt => "smallint",
+        ArrayElem::Int => "integer",
+        ArrayElem::Text => "text",
+        ArrayElem::Char => "character",
+        ArrayElem::Varchar => "character varying",
+        ArrayElem::BigInt => "bigint",
+        ArrayElem::Float4 => "real",
+        ArrayElem::Float => "double precision",
+        ArrayElem::Date => "date",
+        ArrayElem::Timestamp => "timestamp without time zone",
+        ArrayElem::Timestamptz => "timestamp with time zone",
+        ArrayElem::Numeric => "numeric",
+        ArrayElem::Uuid => "uuid",
+        ArrayElem::Regclass => "regclass",
+        ArrayElem::Json => "json",
+        ArrayElem::Record => "record",
+        ArrayElem::PgLsn => "pg_lsn",
+    })
+}
+
+/// PG19 `format_type_with_typemod` for the types a deparsed constant can
+/// carry. `None` = no EXPLAIN-text spelling here.
+fn pg_type_label(ty: ColType) -> Option<String> {
+    match ty {
+        ColType::Int => Some("integer".to_string()),
+        ColType::BigInt => Some("bigint".to_string()),
+        ColType::SmallInt => Some("smallint".to_string()),
+        ColType::Float => Some("double precision".to_string()),
+        ColType::Float4 => Some("real".to_string()),
+        ColType::Numeric(None) => Some("numeric".to_string()),
+        ColType::Numeric(Some((p, s))) => Some(format!("numeric({p},{s})")),
+        ColType::Text => Some("text".to_string()),
+        ColType::Char(Some(n)) => Some(format!("character({n})")),
+        ColType::Char(None) => Some("character".to_string()),
+        ColType::Varchar(Some(n)) => Some(format!("character varying({n})")),
+        ColType::Varchar(None) => Some("character varying".to_string()),
+        ColType::SingleChar => Some("\"char\"".to_string()),
+        ColType::Bool => Some("boolean".to_string()),
+        ColType::Date => Some("date".to_string()),
+        ColType::Timestamp => Some("timestamp without time zone".to_string()),
+        ColType::Timestamptz => Some("timestamp with time zone".to_string()),
+        ColType::Bytea => Some("bytea".to_string()),
+        ColType::Uuid => Some("uuid".to_string()),
+        ColType::Name => Some("name".to_string()),
+        ColType::Json => Some("json".to_string()),
+        ColType::Array(e) => Some(format!("{}[]", pg_array_elem_label(e)?)),
+        _ => None,
+    }
+}
+
+/// Render an untyped text literal coerced to `ty`, like PG19's parser
+/// coercing an unknown-type literal to the comparison column's type and
+/// `get_const_expr` deparsing the result. `None` = no faithful spelling.
+fn pg_coerced_text(s: &str, ty: ColType) -> Option<String> {
+    let label = pg_type_label(ty)?;
+    match ty {
+        // Character types: quoted with a label.
+        ColType::Text
+        | ColType::Name
+        | ColType::Char(_)
+        | ColType::Varchar(_)
+        | ColType::SingleChar => Some(format!("{}::{label}", pg_quote_literal(s))),
+        // Integer targets: the text must scan as an integer; then the
+        // coerced INT4/INT8/INT2 constant deparses per its own rules.
+        ColType::Int => {
+            let i: i64 = s.trim().parse().ok()?;
+            Some(if i >= 0 && i <= i32::MAX as i64 {
+                i.to_string()
+            } else {
+                format!("'{i}'::integer")
+            })
+        }
+        ColType::BigInt => {
+            let _: i64 = s.trim().parse().ok()?;
+            Some(format!("{}::bigint", pg_quote_literal(s.trim())))
+        }
+        ColType::SmallInt => {
+            let _: i64 = s.trim().parse().ok()?;
+            Some(format!("{}::smallint", pg_quote_literal(s.trim())))
+        }
+        ColType::Bool => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some("true".to_string()),
+            "false" => Some("false".to_string()),
+            _ => None,
+        },
+        // Numeric: PG19 prints the constant bare iff it looks like a
+        // float (leading digit plus `.`/`e`) without a leading sign.
+        ColType::Numeric(_) => {
+            let t = s.trim();
+            let bare = t.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                && t.bytes().any(|b| b == b'.' || b == b'e' || b == b'E');
+            Some(if bare {
+                t.to_string()
+            } else {
+                format!("{}::numeric", pg_quote_literal(t))
+            })
+        }
+        ColType::Float | ColType::Float4 => {
+            let _: f64 = s.trim().parse().ok()?;
+            Some(format!("{}::{label}", pg_quote_literal(s.trim())))
+        }
+        // Date/time/uuid/bytea/json: quoted with a label.
+        ColType::Date
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Uuid
+        | ColType::Bytea
+        | ColType::Json => Some(format!("{}::{label}", pg_quote_literal(s))),
+        ColType::Array(_) => Some(format!("{}::{label}", pg_quote_literal(s))),
+        _ => None,
+    }
+}
+
+/// Render a `Literal` like PG19 `get_const_expr(..., showtype=0)` (the
+/// EXPLAIN deparse mode). `target` is the coerced type of an untyped
+/// string literal (the column type on the other side of a comparison);
+/// `None` renders the literal's own parsed type. Returns `None` for
+/// shapes with no faithful PG spelling.
+fn pg_literal_text(lit: &Literal, target: Option<ColType>) -> Option<String> {
+    // Untyped string literal: PG19 coerces unknown-type literals to the
+    // comparison target at parse time.
+    if let Literal::Text(s) = lit {
+        let ty = target?;
+        return pg_coerced_text(s, ty);
+    }
+    match lit {
+        // PG19 INT4OID: bare unless negative (`'-n'::integer`).
+        Literal::Int(i) => Some(if *i >= 0 {
+            i.to_string()
+        } else {
+            format!("'{i}'::integer")
+        }),
+        // INT8/INT2 take PG19's default const arm: quoted + label.
+        Literal::BigInt(i) => Some(format!("'{i}'::bigint")),
+        Literal::SmallInt(i) => Some(format!("'{i}'::smallint")),
+        Literal::Float(f) => Some(format!("'{}'::double precision", pg_float_text(*f))),
+        Literal::Real(f) => Some(format!("'{}'::real", pg_float_text(f64::from(*f)))),
+        // PG19 NUMERICOID: bare iff float-looking with a leading digit.
+        Literal::Decimal(s) => {
+            let bare = s.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                && s.bytes().any(|b| b == b'.' || b == b'e' || b == b'E');
+            Some(if bare {
+                s.clone()
+            } else {
+                format!("{}::numeric", pg_quote_literal(s))
+            })
+        }
+        Literal::Bool(b) => Some(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        Literal::Null => Some("NULL".to_string()),
+        // Typed literals only arise from typed params/casts; no
+        // faithful untyped spelling here.
+        _ => None,
+    }
+}
+
+/// Shortest-round-trip float text approximating PG19 `float8out` for
+/// ordinary magnitudes.
+fn pg_float_text(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    format!("{f}")
+}
+
+/// Render a *coerced* `Value` like PG19 `get_const_expr` deparses an
+/// index bound constant, given the column type `ty` it was coerced to.
+/// `None` = no faithful spelling (the plan stays honestly masked).
+fn pg_value_text(v: &Value, ty: ColType) -> Option<String> {
+    match v {
+        Value::Null => Some("NULL".to_string()),
+        Value::Bool(b) => Some(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        // PG19 INT4OID: bare unless negative (`'-n'::integer`).
+        Value::Int(i) => Some(if *i >= 0 {
+            i.to_string()
+        } else {
+            format!("'{i}'::integer")
+        }),
+        Value::SmallInt(i) => Some(format!("'{i}'::smallint")),
+        Value::BigInt(i) => Some(format!("'{i}'::bigint")),
+        Value::Float4(f) => Some(format!("'{}'::real", pg_float_text(f64::from(*f)))),
+        Value::Float(f) => Some(format!("'{}'::double precision", pg_float_text(*f))),
+        // Character-ish values: quoted with the column's type label.
+        Value::Text(s) => {
+            let label = pg_type_label(ty)?;
+            Some(format!("{}::{label}", pg_quote_literal(s)))
+        }
+        // Scalar values with a canonical quoted spelling.
+        Value::Bytea(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Timestamptz(_)
+        | Value::Uuid(_) => {
+            let label = pg_type_label(ty)?;
+            Some(format!("{}::{label}", pg_quote_literal(&pg_value_bare(v)?)))
+        }
+        // Numeric/array/json/interval/...: no faithful short spelling here.
+        _ => None,
+    }
+}
+
+/// Bare (unquoted, unlabelled) text of a scalar `Value` for
+/// `pg_value_text`'s quoted arm.
+fn pg_value_bare(v: &Value) -> Option<String> {
+    match v {
+        Value::Bytea(b) => {
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("\\x");
+            for byte in b {
+                s.push_str(&format!("{byte:02x}"));
+            }
+            Some(s)
+        }
+        Value::Date(d) => Some(format!("{d}")),
+        Value::Timestamp(t) => Some(format!("{t}")),
+        Value::Timestamptz(t) => Some(format!("{t}")),
+        // UUID text needs hyphenated hex; no faithful short spelling here.
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.08: expression deparse (PG19 ruleutils.c style) and helpers.
+// ---------------------------------------------------------------------------
+
+/// v1.08: qualifier names visible for one FROM item (table name + alias;
+/// joins contribute their inputs' qualifiers, like PG19's rtable).
+fn pg_item_quals(item: &FromItem) -> Vec<String> {
+    match item {
+        FromItem::Table { name, alias, .. } => {
+            let mut v = vec![name.clone()];
+            if let Some(a) = alias {
+                if a != name {
+                    v.push(a.clone());
+                }
+            }
+            v
+        }
+        FromItem::Derived { alias, .. } => vec![alias.clone()],
+        FromItem::Values { alias, .. } => vec![alias.clone()],
+        FromItem::Function { alias, .. } => alias.clone().map(|a| vec![a]).unwrap_or_default(),
+        FromItem::Join { left, right, .. } => {
+            let mut v = pg_item_quals(left);
+            v.extend(pg_item_quals(right));
+            v
+        }
+    }
+}
+
+/// Collect every column reference in `e` as (qualifier, column).
+fn pg_expr_tables(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match e {
+        Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Cmp {
+            left: a,
+            right: b,
+            op: _,
+        }
+        | Expr::Arith {
+            left: a, right: b, ..
+        }
+        | Expr::Concat(a, b)
+        | Expr::IsDistinctFrom {
+            left: a, right: b, ..
+        } => {
+            pg_expr_tables(a, out);
+            pg_expr_tables(b, out);
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+            pg_expr_tables(x, out)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            pg_expr_tables(expr, out);
+            pg_expr_tables(low, out);
+            pg_expr_tables(high, out);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            pg_expr_tables(expr, out);
+            pg_expr_tables(pattern, out);
+            if let Some(x) = escape {
+                pg_expr_tables(x, out);
+            }
+        }
+        Expr::Cast { expr, .. } => pg_expr_tables(expr, out),
+        Expr::Func { args, .. } => {
+            for a in args {
+                pg_expr_tables(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render an expression like PG19 `ruleutils.c` deparse (EXPLAIN mode:
+/// not pretty, `showimplicit=false` except sort/group keys). `qualify`
+/// mirrors PG's `varprefix` (true when the plan's rtable has more than
+/// one relation). Returns `None` for shapes with no faithful spelling.
+fn pg_expr_text(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
+    pg_expr_target(e, pctx, qualify, None)
+}
+
+/// v1.08: Try PG-text deparse; fall back to Rust Debug format if the
+/// expression has no faithful PG spelling. The Debug output won't match
+/// PG's expected plan text, so the conformance mask keeps the statement
+/// EXPECTED-FAIL — but unlike an error, this does NOT abort an enclosing
+/// transaction (critical for EXPLAIN inside BEGIN/COMMIT blocks).
+fn pg_expr_text_or_debug(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> String {
+    pg_expr_text(e, pctx, qualify).unwrap_or_else(|| format!("{:?}", e))
+}
+
+/// `pg_expr_text` with a coercion target for a top-level untyped string
+/// literal (used for comparison operands).
+fn pg_expr_target(
+    e: &Expr,
+    pctx: &PgPlanCtx,
+    qualify: bool,
+    target: Option<ColType>,
+) -> Option<String> {
+    match e {
+        Expr::Column { table, name } => {
+            if qualify {
+                let q = pctx.print_qual(table.as_deref(), name)?;
+                Some(format!("{}.{}", q, pg_quote_ident(name)))
+            } else {
+                Some(pg_quote_ident(name))
+            }
+        }
+        Expr::Literal(l) => pg_literal_text(l, target),
+        Expr::Param(n) => Some(format!("${n}")),
+        Expr::Cmp { op, left, right } => {
+            // Untyped string literal takes the other side's column type
+            // (PG19 parser coercion of unknown-type literals). The target
+            // goes to the LITERAL side, not the column side.
+            let tgt_l = match (&**left, &**right) {
+                (Expr::Literal(Literal::Text(_)), Expr::Column { table, name }) => {
+                    pctx.col_type(table.as_deref(), name)
+                }
+                _ => None,
+            };
+            let tgt_r = match (&**left, &**right) {
+                (Expr::Column { table, name }, Expr::Literal(Literal::Text(_))) => {
+                    pctx.col_type(table.as_deref(), name)
+                }
+                _ => None,
+            };
+            let l = pg_expr_target(left, pctx, qualify, tgt_l)?;
+            let r = pg_expr_target(right, pctx, qualify, tgt_r)?;
+            let op = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "<>",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+                CmpOp::ImageEq => return None,
+            };
+            Some(format!("({l} {op} {r})"))
+        }
+        Expr::And(a, b) => Some(format!(
+            "({} AND {})",
+            pg_expr_text(a, pctx, qualify)?,
+            pg_expr_text(b, pctx, qualify)?
+        )),
+        Expr::Or(a, b) => Some(format!(
+            "({} OR {})",
+            pg_expr_text(a, pctx, qualify)?,
+            pg_expr_text(b, pctx, qualify)?
+        )),
+        Expr::Not(x) => Some(format!("(NOT {})", pg_expr_text(x, pctx, qualify)?)),
+        Expr::IsNull { expr, neg } => Some(format!(
+            "({} IS {}NULL)",
+            pg_expr_text(expr, pctx, qualify)?,
+            if *neg { "NOT " } else { "" }
+        )),
+        Expr::Arith { op, left, right } => {
+            let l = pg_expr_text(left, pctx, qualify)?;
+            let r = pg_expr_text(right, pctx, qualify)?;
+            let op = match op {
+                ArithOp::Add => "+",
+                ArithOp::Sub => "-",
+                ArithOp::Mul => "*",
+                ArithOp::Div => "/",
+                ArithOp::Mod => "%",
+                ArithOp::Pow => "^",
+                ArithOp::BitAnd => "&",
+                ArithOp::BitOr => "|",
+                ArithOp::BitXor => "#",
+                ArithOp::Shl => "<<",
+                ArithOp::Shr => ">>",
+            };
+            Some(format!("({l} {op} {r})"))
+        }
+        Expr::Neg(x) => Some(format!("(- {})", pg_expr_text(x, pctx, qualify)?)),
+        Expr::BitNot(x) => Some(format!("(~ {})", pg_expr_text(x, pctx, qualify)?)),
+        Expr::Concat(a, b) => Some(format!(
+            "({} || {})",
+            pg_expr_text(a, pctx, qualify)?,
+            pg_expr_text(b, pctx, qualify)?
+        )),
+        Expr::Cast { expr, to, .. } => {
+            let label = pg_type_label(*to)?;
+            Some(format!("({}::{label})", pg_expr_text(expr, pctx, qualify)?))
+        }
+        Expr::Func { name, args } => {
+            // v1.08: SIMILAR TO is desugared by the parser to similar_to();
+            // PG deparses it as a POSIX regex match (f1 ~ 'regex'::text).
+            if name.eq_ignore_ascii_case("similar_to") && (2..=3).contains(&args.len()) {
+                let expr_text = pg_expr_text(&args[0], pctx, qualify)?;
+                let pat = match &args[1] {
+                    Expr::Literal(Literal::Text(s)) => s.clone(),
+                    _ => return None,
+                };
+                let escape = if args.len() == 3 {
+                    match &args[2] {
+                        Expr::Literal(Literal::Text(s)) => {
+                            let mut ch = s.chars();
+                            let c = ch.next();
+                            // Empty string means "no escape"; single char only.
+                            if c.is_some() && ch.next().is_none() {
+                                c
+                            } else if s.is_empty() {
+                                None
+                            } else {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    // v0.31: omitted ESCAPE defaults to backslash (PG 19).
+                    Some('\\')
+                };
+                let regex = similar_to_regex(&pat, escape).ok()?;
+                // PG renders the regex as a text literal with ::text cast.
+                let lit = format!("{}::text", pg_quote_literal(&regex));
+                return Some(format!("({expr_text} ~ {lit})"));
+            }
+            let mut s = String::new();
+            s.push_str(&pg_quote_ident(name));
+            s.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&pg_expr_text(a, pctx, qualify)?);
+            }
+            s.push(')');
+            Some(s)
+        }
+        Expr::IsDistinctFrom { left, right, neg } => {
+            let l = pg_expr_text(left, pctx, qualify)?;
+            let r = pg_expr_text(right, pctx, qualify)?;
+            Some(if *neg {
+                format!("({l} IS NOT DISTINCT FROM {r})")
+            } else {
+                format!("({l} IS DISTINCT FROM {r})")
+            })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => {
+            let e = pg_expr_text(expr, pctx, qualify)?;
+            let lo = pg_expr_text(low, pctx, qualify)?;
+            let hi = pg_expr_text(high, pctx, qualify)?;
+            Some(if *neg {
+                format!("({e} NOT BETWEEN {lo} AND {hi})")
+            } else {
+                format!("({e} BETWEEN {lo} AND {hi})")
+            })
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+            escape,
+        } => {
+            let e = pg_expr_text(expr, pctx, qualify)?;
+            let p = pg_expr_text(pattern, pctx, qualify)?;
+            let op = match (ilike, not) {
+                (false, false) => "~~",
+                (false, true) => "!~~",
+                (true, false) => "~~*",
+                (true, true) => "!~~*",
+            };
+            let mut s = format!("({e} {op} {p}");
+            if let Some(x) = escape {
+                s.push_str(&format!(" ESCAPE {}", pg_expr_text(x, pctx, qualify)?));
+            }
+            s.push(')');
+            Some(s)
+        }
+        Expr::IsBool { expr, neg, val } => {
+            let e = pg_expr_text(expr, pctx, qualify)?;
+            let v = match val {
+                Some(true) => "TRUE",
+                Some(false) => "FALSE",
+                None => "UNKNOWN",
+            };
+            Some(if *neg {
+                format!("({e} IS NOT {v})")
+            } else {
+                format!("({e} IS {v})")
+            })
+        }
+        // Anything else (subqueries, aggregates, arrays, rows, ...) has
+        // no faithful short spelling here.
+        _ => None,
+    }
+}
+
+/// v1.08: name/type resolution context for PG-style EXPLAIN expression
+/// text, built per query level in `plan_select`.
+struct PgPlanCtx<'a> {
+    /// Per FROM item, in order: qualifier names (table name, then alias)
+    /// and the item's visible columns (name, type).
+    items: Vec<(Vec<String>, Vec<(String, ColType)>)>,
+    _mark: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> PgPlanCtx<'a> {
+    /// Declared type of `qual.col` (or unqualified `col` when it resolves
+    /// to exactly one FROM item).
+    fn col_type(&self, qual: Option<&str>, col: &str) -> Option<ColType> {
+        let mut found = None;
+        for (quals, cols) in &self.items {
+            if let Some(q) = qual {
+                if !quals.iter().any(|x| x == q) {
+                    continue;
+                }
+            }
+            if let Some((_, ty)) = cols.iter().find(|(n, _)| n == col) {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(*ty);
+            }
+            if qual.is_some() {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Qualifier to print for `qual.col` when PG qualifies the column
+    /// (multi-relation deparse context): the qualifier as written, or the
+    /// owning table's name when unqualified and unambiguous.
+    fn print_qual(&self, qual: Option<&str>, col: &str) -> Option<String> {
+        if let Some(q) = qual {
+            return Some(pg_quote_ident(q));
+        }
+        let mut found = None;
+        for (quals, cols) in &self.items {
+            if cols.iter().any(|(n, _)| n == col) {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(quals.first().cloned().unwrap_or_default());
+            }
+        }
+        found.map(|q| pg_quote_ident(&q))
+    }
+}
+
+/// v1.08: build the PG-text name/type context for one query level.
+/// Joins flatten to their inputs (PG19's rtable has no join entries).
+fn pg_plan_ctx<'a>(
+    eng: &'a Engine,
+    items: &[FromItem],
+    snap: &'a Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+) -> PgPlanCtx<'a> {
+    fn push_item<'a>(
+        eng: &'a Engine,
+        item: &FromItem,
+        snap: &'a Snapshot,
+        own: u64,
+        session: u64,
+        ctes: &[CteDef],
+        out: &mut Vec<(Vec<String>, Vec<(String, ColType)>)>,
+    ) {
+        match item {
+            FromItem::Table { name, .. } => {
+                let cols = if ctes.iter().any(|c| c.name == *name) {
+                    Vec::new()
+                } else {
+                    eng.db
+                        .find_table(name, snap, own, session)
+                        .map(|t| t.columns.iter().map(|(n, ty)| (n.clone(), *ty)).collect())
+                        .unwrap_or_default()
+                };
+                out.push((pg_item_quals(item), cols));
+            }
+            FromItem::Join { left, right, .. } => {
+                push_item(eng, left, snap, own, session, ctes, out);
+                push_item(eng, right, snap, own, session, ctes, out);
+            }
+            _ => out.push((pg_item_quals(item), Vec::new())),
+        }
+    }
+    let mut items_out = Vec::new();
+    for item in items {
+        push_item(eng, item, snap, own, session, ctes, &mut items_out);
+    }
+    PgPlanCtx {
+        items: items_out,
+        _mark: std::marker::PhantomData,
+    }
+}
+
+/// v1.08: fold conjuncts into one AND tree (`None` for an empty list).
+fn pg_fold_and(cs: Vec<Expr>) -> Option<Expr> {
+    cs.into_iter()
+        .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+}
+
+/// v1.08: AND-flatten preserving source order (unlike `split_conjuncts`,
+/// which reverses via its stack). Conjunct order is user-visible in
+/// EXPLAIN filter text, so PG-text paths use this.
+fn pg_conjuncts(e: &Expr) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        match x {
+            Expr::And(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            _ => out.push(x),
+        }
+    }
+    out
+}
+
+/// v1.08: per top-level FROM item, the qualifier names and known
+/// column names (joins flatten to their inputs' qualifiers/columns).
+/// Used to distribute WHERE conjuncts over the FROM list.
+fn pg_split_item(
+    eng: &Engine,
+    item: &FromItem,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+) -> (Vec<String>, Vec<String>) {
+    match item {
+        FromItem::Table { name, .. } => {
+            let cols = if ctes.iter().any(|c| c.name == *name) {
+                Vec::new()
+            } else {
+                eng.db
+                    .find_table(name, snap, own, session)
+                    .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default()
+            };
+            (pg_item_quals(item), cols)
+        }
+        FromItem::Join { left, right, .. } => {
+            let (mut q, mut c) = pg_split_item(eng, left, snap, own, session, ctes);
+            let (q2, c2) = pg_split_item(eng, right, snap, own, session, ctes);
+            q.extend(q2);
+            c.extend(c2);
+            (q, c)
+        }
+        _ => (pg_item_quals(item), Vec::new()),
+    }
+}
+
+/// v1.08: distribute a WHERE clause's top-level AND-conjuncts over a
+/// FROM list. Returns `(per_item, join)`: `per_item[i]` holds the
+/// conjuncts referencing only item `i`, `join` holds multi-item (and
+/// constant, for multi-item queries) conjuncts. `split` carries each
+/// item's qualifier and column names. Returns `Err` when a conjunct
+/// references nothing resolvable (honest mask).
+#[allow(clippy::type_complexity)]
+fn pg_split_where(
+    w: &Expr,
+    split: &[(Vec<String>, Vec<String>)],
+) -> Result<(Vec<Vec<Expr>>, Vec<Expr>), ExecError> {
+    let mut per_item: Vec<Vec<Expr>> = vec![Vec::new(); split.len()];
+    let mut join: Vec<Expr> = Vec::new();
+    for c in pg_conjuncts(w) {
+        let mut refs = Vec::new();
+        pg_expr_tables(c, &mut refs);
+        // A conjunct with no column references belongs to the single
+        // item when there is exactly one, else the join level.
+        if refs.is_empty() {
+            if split.len() == 1 {
+                per_item[0].push(c.clone());
+            } else {
+                join.push(c.clone());
+            }
+            continue;
+        }
+        let mut idx: Option<usize> = None;
+        let mut bad = false;
+        let mut multi = false;
+        for (q, col) in &refs {
+            let mut found = None;
+            for (i, (qs, cs)) in split.iter().enumerate() {
+                let matches = match q {
+                    Some(qq) => qs.iter().any(|x| x == qq),
+                    // Unqualified: the unique owning item, if any.
+                    None => cs.iter().any(|x| x == col),
+                };
+                if matches {
+                    if found.is_some() {
+                        // Ambiguous qualifier: no faithful placement.
+                        bad = true;
+                        break;
+                    }
+                    found = Some(i);
+                }
+            }
+            if bad {
+                break;
+            }
+            match found {
+                Some(i) => match idx {
+                    // References to two different sides: join level.
+                    Some(j) if j != i => multi = true,
+                    _ => idx = Some(i),
+                },
+                // Unresolvable reference: no faithful placement.
+                None => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            // Ambiguous/unresolvable: place at join level (wrong, but
+            // EXPECTED-FAIL via mask; does not abort the transaction).
+            join.push(c.clone());
+            continue;
+        }
+        match (multi, idx) {
+            (true, _) => join.push(c.clone()),
+            (false, Some(i)) => per_item[i].push(c.clone()),
+            (false, None) => join.push(c.clone()),
+        }
+    }
+    Ok((per_item, join))
+}
+
+/// v1.08: an ORDER BY term's effective expression: a bare column naming
+/// a SELECT output alias orders by the aliased expression (PG19 orders
+/// by the targetlist entry, and EXPLAIN deparses that).
+fn pg_order_expr(t: &OrderTerm, stmt: &SelectStmt) -> Expr {
+    if let Expr::Column { table: None, name } = &t.expr {
+        for item in &stmt.items {
+            if let SelectItem::Expr {
+                expr,
+                alias: Some(a),
+            } = item
+            {
+                if a.eq_ignore_ascii_case(name) {
+                    return expr.clone();
+                }
+            }
+        }
+    }
+    t.expr.clone()
+}
+
 /// EXPLAIN plan node: mirrors the executor's access-path decisions
 /// without executing anything.
 #[derive(Clone, Debug)]
@@ -9450,11 +10334,15 @@ enum PlanNode {
     },
     SeqScan {
         table: String,
+        // v1.08: table alias for PG EXPLAIN (`Seq Scan on t a`).
+        alias: Option<String>,
         filter: Option<String>,
         rows: u64,
     },
     IndexScan {
         table: String,
+        // v1.08: table alias for PG EXPLAIN.
+        alias: Option<String>,
         index: String,
         cond: String,
         filter: Option<String>,
@@ -9462,12 +10350,16 @@ enum PlanNode {
     },
     IndexOrderScan {
         table: String,
+        // v1.08: table alias for PG EXPLAIN.
+        alias: Option<String>,
         index: String,
         order: String,
         rows: u64,
     },
     NestedLoop {
         filter: Option<String>,
+        /// v1.08: join clauses, rendered as PG19's `Join Filter:`.
+        join_filter: Option<String>,
         rows: u64,
         outer: Box<PlanNode>,
         inner: Box<PlanNode>,
@@ -9519,13 +10411,23 @@ impl PlanNode {
     }
 
     /// Attach a residual filter to a scan-like node.
-    fn set_filter(&mut self, f: String) {
+    /// v1.08: `None` omits the Filter line entirely (PG19 prints no
+    /// Filter when there is no residual predicate).
+    fn set_filter(&mut self, f: Option<String>) {
         match self {
             PlanNode::Result { filter, .. }
             | PlanNode::SeqScan { filter, .. }
             | PlanNode::IndexScan { filter, .. }
-            | PlanNode::NestedLoop { filter, .. } => *filter = Some(f),
+            | PlanNode::NestedLoop { filter, .. } => *filter = f,
             _ => {}
+        }
+    }
+
+    /// v1.08: set the Nested Loop's Join Filter (PG19's `Join Filter:`).
+    /// A no-op on other nodes; the caller only sets it on joins.
+    fn set_join_filter(&mut self, f: Option<String>) {
+        if let PlanNode::NestedLoop { join_filter, .. } = self {
+            *join_filter = f;
         }
     }
 }
@@ -9626,12 +10528,14 @@ fn plan_cte_body(
     snap: &Snapshot,
     own: u64,
     session: u64,
+    // v1.08: PG-text mode for EXPLAIN (COSTS OFF).
+    pg: bool,
 ) -> Result<PlanNode, ExecError> {
     match &cte.body {
-        CteBody::Simple(sel) => plan_select(eng, sel, snap, own, session, visible),
+        CteBody::Simple(sel) => plan_select(eng, sel, snap, own, session, visible, pg),
         CteBody::Union { left, right, all } => {
-            let l = plan_select(eng, left, snap, own, session, visible)?;
-            let r = plan_select(eng, right, snap, own, session, visible)?;
+            let l = plan_select(eng, left, snap, own, session, visible, pg)?;
+            let r = plan_select(eng, right, snap, own, session, visible, pg)?;
             let rows = if *all {
                 l.rows().saturating_add(r.rows())
             } else {
@@ -9652,6 +10556,10 @@ fn plan_from_item(
     // v0.78: effective CTE list (outer ++ this level's, in definition
     // order) so EXPLAIN can resolve CTE references like the executor.
     ctes: &[CteDef],
+    // v1.08: PG-text context for EXPLAIN (COSTS OFF). `None` selects the
+    // legacy Debug filter text. When `Some`, `where_` is the item's own
+    // conjunct slice (already distributed by `pg_split_where`).
+    pctx: Option<&PgPlanCtx>,
 ) -> Result<PlanNode, ExecError> {
     match item {
         FromItem::Table { name, alias, .. } => {
@@ -9668,7 +10576,7 @@ fn plan_from_item(
                 let child = if cte.recursive {
                     PlanNode::Values { rows: 100 }
                 } else {
-                    plan_cte_body(eng, cte, &ctes[..pos], snap, own, session)?
+                    plan_cte_body(eng, cte, &ctes[..pos], snap, own, session, pctx.is_some())?
                 };
                 let rows = child.rows();
                 return Ok(PlanNode::SubqueryScan {
@@ -9684,6 +10592,7 @@ fn plan_from_item(
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
+                    alias: None,
                     filter: None,
                     rows: 100,
                 });
@@ -9693,6 +10602,7 @@ fn plan_from_item(
             if eng.db.find_view(name, snap, own).is_some() {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
+                    alias: None,
                     filter: None,
                     rows: 1000,
                 });
@@ -9701,6 +10611,7 @@ fn plan_from_item(
                 let rows: u64 = eng.db.stats.values().map(|ts| ts.cols.len() as u64).sum();
                 return Ok(PlanNode::SeqScan {
                     table: "pg_stats".to_string(),
+                    alias: None,
                     filter: None,
                     rows,
                 });
@@ -9709,6 +10620,7 @@ fn plan_from_item(
             if name == "pg_class" && eng.db.find_table(name, snap, own, session).is_none() {
                 return Ok(PlanNode::SeqScan {
                     table: "pg_class".to_string(),
+                    alias: None,
                     filter: None,
                     rows: eng.db.tables.len() as u64,
                 });
@@ -9717,6 +10629,7 @@ fn plan_from_item(
             if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
                 return Ok(PlanNode::SeqScan {
                     table: "pg_attribute".to_string(),
+                    alias: None,
                     filter: None,
                     rows: eng
                         .db
@@ -9740,6 +10653,7 @@ fn plan_from_item(
                 let rows = virtual_role_catalog_rows(&eng.db, name, snap, own);
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
+                    alias: None,
                     filter: None,
                     rows,
                 });
@@ -9751,6 +10665,7 @@ fn plan_from_item(
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
+                    alias: None,
                     filter: None,
                     rows: eng.repl_slots.len() as u64,
                 });
@@ -9762,6 +10677,7 @@ fn plan_from_item(
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
+                    alias: None,
                     filter: None,
                     rows: eng.db.sequences.len() as u64,
                 });
@@ -9772,17 +10688,28 @@ fn plan_from_item(
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             let rel_rows = est_rel_rows(&eng.db, name, snap, own, session);
             match plan_access_path(&eng.db, t, name, &qual, where_, snap, own, session) {
-                AccessPath::SeqScan => Ok(PlanNode::SeqScan {
-                    table: name.clone(),
-                    filter: None,
-                    rows: rel_rows,
-                }),
+                AccessPath::SeqScan => {
+                    // v1.08: PG-text Filter (the whole item slice; index
+                    // selection found nothing usable). Falls back to Debug
+                    // format (EXPECTED-FAIL via mask, no txn abort).
+                    let filter = match (pctx, where_) {
+                        (Some(px), Some(w)) => Some(pg_expr_text_or_debug(w, px, false)),
+                        _ => None,
+                    };
+                    Ok(PlanNode::SeqScan {
+                        table: name.clone(),
+                        alias: alias.clone(),
+                        filter,
+                        rows: rel_rows,
+                    })
+                }
                 AccessPath::IndexScan {
                     index,
                     prefix,
                     lo,
                     hi,
                     cond,
+                    used,
                 } => {
                     // v0.87: temp indexes live in the session-local map.
                     let ix = eng
@@ -9803,20 +10730,50 @@ fn plan_from_item(
                         own,
                         session,
                     );
+                    // v1.08: residual Filter = conjuncts the index
+                    // cond did not consume. `used` indexes the reversed
+                    // `split_conjuncts` order; map back to source order
+                    // for the text. Index Cond values with no faithful PG
+                    // spelling render legacy bare text (wrong,
+                    // EXPECTED-FAIL via mask).
+                    let filter = match (pctx, where_) {
+                        (Some(px), Some(w)) => {
+                            let rev = split_conjuncts(w);
+                            let n = rev.len();
+                            // `used` indexes the reversed `split_conjuncts`
+                            // order; collect the unused conjuncts and reverse
+                            // back to source order for the text.
+                            let mut residual: Vec<Expr> = (0..n)
+                                .filter(|i| !used.contains(i))
+                                .map(|i| rev[i].clone())
+                                .collect();
+                            residual.reverse();
+                            match pg_fold_and(residual) {
+                                Some(e) => Some(pg_expr_text_or_debug(&e, px, false)),
+                                None => None,
+                            }
+                        }
+                        _ => None,
+                    };
                     Ok(PlanNode::IndexScan {
                         table: name.clone(),
+                        alias: alias.clone(),
                         index,
                         cond,
-                        filter: None,
+                        filter,
                         rows,
                     })
                 }
             }
         }
         FromItem::Derived { sub, alias, .. } => {
+            // v1.08: a filter slice on a subquery scan: PG would push it
+            // inside, but we render without it (wrong, EXPECTED-FAIL via
+            // mask; does not abort the transaction).
+            let _ = (pctx, where_);
             // v0.78: derived tables see the enclosing CTEs (like the
             // executor's shared CTE bindings).
-            let child = plan_select(eng, sub, snap, own, session, ctes)?;
+            let child = plan_select(eng, sub, snap, own, session, ctes, pctx.is_some())?;
             let rows = child.rows();
             Ok(PlanNode::SubqueryScan {
                 alias: alias.clone(),
@@ -9826,19 +10783,91 @@ fn plan_from_item(
         }
         // v0.32: table function — cardinality is unknown at plan time
         // (args need evaluation), so plan it as a single-row VALUES.
-        FromItem::Function { .. } => Ok(PlanNode::Values { rows: 1 }),
+        FromItem::Function { .. } => {
+            // v1.08: filter on function scan ignored (wrong, EXPECTED-FAIL).
+            let _ = (pctx, where_);
+            Ok(PlanNode::Values { rows: 1 })
+        }
         // v0.14: VALUES rows are uncorrelated constants.
-        FromItem::Values { rows, .. } => Ok(PlanNode::Values {
-            rows: rows.len() as u64,
-        }),
+        FromItem::Values { rows, .. } => {
+            // v1.08: filter on values scan ignored (wrong, EXPECTED-FAIL).
+            let _ = (pctx, where_);
+            Ok(PlanNode::Values {
+                rows: rows.len() as u64,
+            })
+        }
         // The executor runs joins as nested loops; the filter attaches to
         // the outermost Nested Loop node at the top level.
-        FromItem::Join { left, right, .. } => {
-            let outer = plan_from_item(eng, left, None, snap, own, session, ctes)?;
-            let inner = plan_from_item(eng, right, None, snap, own, session, ctes)?;
+        FromItem::Join {
+            left,
+            right,
+            kind,
+            on,
+            using,
+            natural,
+            ..
+        } => {
+            // v1.08: in PG-text mode the join's WHERE slice is split
+            // between the inputs; the ON clause (inner joins only)
+            // becomes the Join Filter. USING/NATURAL and outer joins
+            // have no faithful spelling here → render best-effort
+            // (wrong, EXPECTED-FAIL via mask; does not abort txn).
+            let mut left_where: Option<Expr> = None;
+            let mut right_where: Option<Expr> = None;
+            let mut join_filter: Option<String> = None;
+            if let Some(px) = pctx {
+                // Only inner/cross joins get the full PG-text treatment;
+                // others render without a Join Filter (wrong, masked).
+                let supported = matches!(kind, JoinKind::Inner | JoinKind::Cross)
+                    && using.is_empty()
+                    && !*natural
+                    && !(matches!(kind, JoinKind::Cross) && on.is_some());
+                if supported {
+                // The ON clause is always a join-level predicate; the
+                // WHERE slice (when present) splits between the inputs.
+                let mut jf: Vec<Expr> = Vec::new();
+                if let Some(o) = on {
+                    jf.push(o.clone());
+                }
+                if let Some(w) = where_ {
+                    let l = pg_split_item(eng, left, snap, own, session, ctes);
+                    let r = pg_split_item(eng, right, snap, own, session, ctes);
+                    let (per_item, mid) = pg_split_where(w, &[l, r])?;
+                    let mut it = per_item.into_iter();
+                    left_where = pg_fold_and(it.next().unwrap_or_default());
+                    right_where = pg_fold_and(it.next().unwrap_or_default());
+                    jf.extend(mid);
+                }
+                join_filter = match pg_fold_and(jf) {
+                    Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
+                    None => None,
+                };
+                } // end if supported
+            }
+            let outer = plan_from_item(
+                eng,
+                left,
+                left_where.as_ref(),
+                snap,
+                own,
+                session,
+                ctes,
+                pctx,
+            )?;
+            let inner = plan_from_item(
+                eng,
+                right,
+                right_where.as_ref(),
+                snap,
+                own,
+                session,
+                ctes,
+                pctx,
+            )?;
             let rows = outer.rows().saturating_mul(inner.rows());
             Ok(PlanNode::NestedLoop {
                 filter: None,
+                join_filter,
                 rows,
                 outer: Box::new(outer),
                 inner: Box::new(inner),
@@ -9855,15 +10884,54 @@ fn plan_select(
     session: u64,
     // v0.78: CTEs from enclosing query levels (definition order).
     outer_ctes: &[CteDef],
+    // v1.08: PG-text mode for EXPLAIN (COSTS OFF): filters, index conds
+    // and sort keys are deparsed PG19-style; anything without a faithful
+    // spelling is an honest error (stays masked).
+    pg: bool,
 ) -> Result<PlanNode, ExecError> {
     // v0.78: effective CTE list = outer ++ this level's WITH. Later
     // entries shadow earlier ones on name lookup (rposition).
     let mut eff: Vec<CteDef> = outer_ctes.to_vec();
     eff.extend(stmt.with.iter().cloned());
     let ctes: &[CteDef] = &eff;
+    // v1.08: PG-text name/type context for this query level, plus the
+    // WHERE clause distributed over the FROM items (per-item slices and
+    // the join-level remainder).
+    let _pctx_store;
+    let pctx: Option<&PgPlanCtx> = if pg {
+        _pctx_store = pg_plan_ctx(eng, &stmt.from, snap, own, session, ctes);
+        Some(&_pctx_store)
+    } else {
+        None
+    };
+    let mut item_wheres: Vec<Option<Expr>> = vec![None; stmt.from.len()];
+    let mut join_where: Option<Expr> = None;
+    if pg {
+        if let Some(w) = &stmt.where_ {
+            let split: Vec<(Vec<String>, Vec<String>)> = stmt
+                .from
+                .iter()
+                .map(|it| pg_split_item(eng, it, snap, own, session, ctes))
+                .collect();
+            let (per_item, join) = pg_split_where(w, &split)?;
+            for (i, cs) in per_item.into_iter().enumerate() {
+                item_wheres[i] = pg_fold_and(cs);
+            }
+            join_where = pg_fold_and(join);
+        }
+    }
     // 1. FROM → access paths. A single base table with a usable
     // ORDER BY ... LIMIT hint becomes an index-order scan.
     let mut ordered = false;
+    // v1.08: per-item WHERE slice (PG-text mode) or the whole WHERE
+    // (legacy mode, for index selection).
+    let item_where = |i: usize| -> Option<&Expr> {
+        if pg {
+            item_wheres[i].as_ref()
+        } else {
+            stmt.where_.as_ref()
+        }
+    };
     let mut node = if stmt.from.is_empty() {
         PlanNode::Result {
             rows: 1,
@@ -9888,6 +10956,7 @@ fn plan_select(
                 PlanNode::IndexOrderScan {
                     rows: est_rel_rows(&eng.db, &name, snap, own, session),
                     table: name,
+                    alias: None,
                     index: hint.index,
                     order,
                 }
@@ -9895,40 +10964,47 @@ fn plan_select(
                 plan_from_item(
                     eng,
                     &stmt.from[0],
-                    stmt.where_.as_ref(),
+                    item_where(0),
                     snap,
                     own,
                     session,
                     ctes,
+                    pctx,
                 )?
             }
         } else {
             plan_from_item(
                 eng,
                 &stmt.from[0],
-                stmt.where_.as_ref(),
+                item_where(0),
                 snap,
                 own,
                 session,
                 ctes,
+                pctx,
             )?
         }
     } else {
+        let mut idx = 0usize;
         let mut items = stmt.from.iter();
         let mut node = plan_from_item(
             eng,
             items.next().unwrap(),
-            stmt.where_.as_ref(),
+            item_where(0),
             snap,
             own,
             session,
             ctes,
+            pctx,
         )?;
+        idx += 1;
         for item in items {
-            let inner = plan_from_item(eng, item, stmt.where_.as_ref(), snap, own, session, ctes)?;
+            let inner = plan_from_item(eng, item, item_where(idx), snap, own, session, ctes, pctx)?;
+            idx += 1;
             let rows = node.rows().saturating_mul(inner.rows());
             node = PlanNode::NestedLoop {
                 filter: None,
+                join_filter: None,
                 rows,
                 outer: Box::new(node),
                 inner: Box::new(inner),
@@ -9937,8 +11013,22 @@ fn plan_select(
         node
     };
     // 2. WHERE → residual filter (the index cond is shown separately).
-    if let Some(w) = &stmt.where_ {
-        node.set_filter(format!("{:?}", w));
+    if pg {
+        // v1.08: per-item Filters are already on the scan nodes; the
+        // join-level remainder becomes the top node's Join Filter (or
+        // the Result node's Filter when there is no FROM).
+        if let Some(jw) = join_where {
+            let px = pctx.unwrap();
+            let qualify = px.items.len() > 1;
+            let text = pg_expr_text_or_debug(&jw, px, qualify);
+            if stmt.from.is_empty() {
+                node.set_filter(Some(text));
+            } else {
+                node.set_join_filter(Some(text));
+            }
+        }
+    } else if let Some(w) = &stmt.where_ {
+        node.set_filter(Some(format!("{:?}", w)));
     }
     // 3. Aggregation / DISTINCT.
     // v0.52: DISTINCT ON plans as Unique over Sort (PG19), with the
@@ -9959,17 +11049,37 @@ fn plan_select(
             };
         }
         let (effective, _) = check_distinct_on_order(stmt, None)?;
-        // v1.03: qualify unqualified sort keys with the single source
-        // table name (PG's EXPLAIN shows `sq_limit.c1`).
-        let qual: Option<&str> = match stmt.from.as_slice() {
-            [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
-            _ => None,
+        // v1.08: PG-text mode deparses sort keys PG19-style
+        // (showimplicit, always qualified with the table name).
+        let keys = if pg {
+            let px = pctx.unwrap();
+            effective
+                .iter()
+                .map(|t| {
+                    let e = pg_order_expr(t, stmt);
+                    // v1.08: PG qualifies Sort Key expressions (corpus:
+                    // `Sort Key: ((t2.q1 + 1))`).
+                    let mut s = pg_expr_text_or_debug(&e, px, true);
+                    if t.desc {
+                        s.push_str(" DESC");
+                    }
+                    Ok(s)
+                })
+                .collect::<Result<Vec<_>, ExecError>>()?
+                .join(", ")
+        } else {
+            // v1.03: qualify unqualified sort keys with the single source
+            // table name (PG's EXPLAIN shows `sq_limit.c1`).
+            let qual: Option<&str> = match stmt.from.as_slice() {
+                [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
+                _ => None,
+            };
+            effective
+                .iter()
+                .map(|t| order_term_text_qualified(t, qual))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let keys = effective
-            .iter()
-            .map(|t| order_term_text_qualified(t, qual))
-            .collect::<Vec<_>>()
-            .join(", ");
         let rows = node.rows();
         node = PlanNode::Sort {
             keys,
@@ -10001,18 +11111,35 @@ fn plan_select(
     // 4. ORDER BY → Sort, unless the index-order scan provides it.
     // DISTINCT ON already built its Sort above (with effective keys).
     if stmt.distinct_on.is_empty() && !stmt.order_by.is_empty() && !ordered {
-        // v1.03: qualify unqualified sort keys with the single source
-        // table name (PG's EXPLAIN shows `sq_limit.c1`).
-        let qual: Option<&str> = match stmt.from.as_slice() {
-            [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
-            _ => None,
+        // v1.08: PG-text mode deparses sort keys PG19-style
+        // (always qualified with the table name, like PG).
+        let keys = if pg {
+            let px = pctx.unwrap();
+            stmt.order_by
+                .iter()
+                .map(|t| {
+                    let e = pg_order_expr(t, stmt);
+                    let mut s = pg_expr_text_or_debug(&e, px, true);
+                    if t.desc {
+                        s.push_str(" DESC");
+                    }
+                    Ok(s)
+                })
+                .collect::<Result<Vec<_>, ExecError>>()?
+                .join(", ")
+        } else {
+            // v1.03: qualify unqualified sort keys with the single source
+            // table name (PG's EXPLAIN shows `sq_limit.c1`).
+            let qual: Option<&str> = match stmt.from.as_slice() {
+                [crate::sql::FromItem::Table { name, .. }] => Some(name.as_str()),
+                _ => None,
+            };
+            stmt.order_by
+                .iter()
+                .map(|t| order_term_text_qualified(t, qual))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let keys = stmt
-            .order_by
-            .iter()
-            .map(|t| order_term_text_qualified(t, qual))
-            .collect::<Vec<_>>()
-            .join(", ");
         let rows = node.rows();
         node = PlanNode::Sort {
             keys,
@@ -10041,23 +11168,130 @@ fn plan_select(
     Ok(node)
 }
 
-fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
+/// v1.08: render one planning-only plan node. With `costs=false` the
+/// `(rows=N)` estimate suffix is omitted everywhere and the tree uses
+/// PG19's exact text layout (`pg_pad` node prefix, properties at
+/// `6*depth+2` spaces). With `costs=true` the legacy rustgres shape
+/// (two-space indentation, `(rows=N)` suffixes) is kept unchanged.
+fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>) {
+    if costs {
+        render_plan_costs_on(node, depth, out);
+        return;
+    }
+    let pad = pg_pad(depth);
+    let ppad = pg_ppad(depth);
+    match node {
+        PlanNode::Result { filter, .. } => {
+            out.push(format!("{pad}Result"));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Filter: {f}"));
+            }
+        }
+        PlanNode::SeqScan {
+            table,
+            alias,
+            filter,
+            ..
+        } => {
+            out.push(format!("{pad}Seq Scan on {}", pg_scan_name(table, alias)));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Filter: {f}"));
+            }
+        }
+        PlanNode::IndexScan {
+            table,
+            alias,
+            index,
+            cond,
+            filter,
+            ..
+        } => {
+            out.push(format!(
+                "{pad}Index Scan using {index} on {}",
+                pg_scan_name(table, alias)
+            ));
+            out.push(format!("{ppad}Index Cond: {cond}"));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Filter: {f}"));
+            }
+        }
+        PlanNode::IndexOrderScan {
+            table,
+            alias,
+            index,
+            order,
+            ..
+        } => {
+            out.push(format!(
+                "{pad}Index Scan using {index} on {}",
+                pg_scan_name(table, alias)
+            ));
+            out.push(format!("{ppad}Order: {order}"));
+        }
+        PlanNode::NestedLoop {
+            filter,
+            join_filter,
+            outer,
+            inner,
+            ..
+        } => {
+            out.push(format!("{pad}Nested Loop"));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Filter: {f}"));
+            }
+            if let Some(f) = join_filter {
+                out.push(format!("{ppad}Join Filter: {f}"));
+            }
+            render_plan(outer, depth + 1, costs, out);
+            render_plan(inner, depth + 1, costs, out);
+        }
+        PlanNode::Aggregate { child, .. } => {
+            out.push(format!("{pad}Aggregate"));
+            render_plan(child, depth + 1, costs, out);
+        }
+        PlanNode::Unique { child, .. } => {
+            out.push(format!("{pad}Unique"));
+            render_plan(child, depth + 1, costs, out);
+        }
+        PlanNode::Sort { keys, child, .. } => {
+            out.push(format!("{pad}Sort"));
+            out.push(format!("{ppad}Sort Key: {keys}"));
+            render_plan(child, depth + 1, costs, out);
+        }
+        PlanNode::Limit { child, .. } => {
+            out.push(format!("{pad}Limit"));
+            render_plan(child, depth + 1, costs, out);
+        }
+        PlanNode::SubqueryScan { alias, child, .. } => {
+            out.push(format!("{pad}Subquery Scan on {alias}"));
+            render_plan(child, depth + 1, costs, out);
+        }
+        PlanNode::Values { .. } => {
+            out.push(format!("{pad}Values Scan"));
+        }
+    }
+}
+
+/// v1.08: the pre-v1.08 planning-only rendering (two-space indentation,
+/// `(rows=N)` suffixes), kept for EXPLAIN with COSTS ON (the default).
+fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(depth);
     match node {
         PlanNode::Result { rows, filter } => {
-            out.push(format!("{}Result (rows={})", pad, rows));
+            out.push(format!("{pad}Result (rows={rows})"));
             if let Some(f) = filter {
-                out.push(format!("{}  Filter: {}", pad, f));
+                out.push(format!("{pad}  Filter: {f}"));
             }
         }
         PlanNode::SeqScan {
             table,
             filter,
             rows,
+            ..
         } => {
-            out.push(format!("{}Seq Scan on {} (rows={})", pad, table, rows));
+            out.push(format!("{pad}Seq Scan on {table} (rows={rows})"));
             if let Some(f) = filter {
-                out.push(format!("{}  Filter: {}", pad, f));
+                out.push(format!("{pad}  Filter: {f}"));
             }
         }
         PlanNode::IndexScan {
@@ -10066,14 +11300,14 @@ fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             cond,
             filter,
             rows,
+            ..
         } => {
             out.push(format!(
-                "{}Index Scan using {} on {} (rows={})",
-                pad, index, table, rows
+                "{pad}Index Scan using {index} on {table} (rows={rows})"
             ));
-            out.push(format!("{}  Index Cond: {}", pad, cond));
+            out.push(format!("{pad}  Index Cond: {cond}"));
             if let Some(f) = filter {
-                out.push(format!("{}  Filter: {}", pad, f));
+                out.push(format!("{pad}  Filter: {f}"));
             }
         }
         PlanNode::IndexOrderScan {
@@ -10081,54 +11315,62 @@ fn render_plan(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             index,
             order,
             rows,
+            ..
         } => {
             out.push(format!(
-                "{}Index Scan using {} on {} (rows={})",
-                pad, index, table, rows
+                "{pad}Index Scan using {index} on {table} (rows={rows})"
             ));
-            out.push(format!("{}  Order: {}", pad, order));
+            out.push(format!("{pad}  Order: {order}"));
         }
         PlanNode::NestedLoop {
             filter,
             rows,
             outer,
             inner,
+            ..
         } => {
-            out.push(format!("{}Nested Loop (rows={})", pad, rows));
+            out.push(format!("{pad}Nested Loop (rows={rows})"));
             if let Some(f) = filter {
-                out.push(format!("{}  Filter: {}", pad, f));
+                out.push(format!("{pad}  Filter: {f}"));
             }
-            render_plan(outer, depth + 1, out);
-            render_plan(inner, depth + 1, out);
+            render_plan_costs_on(outer, depth + 1, out);
+            render_plan_costs_on(inner, depth + 1, out);
         }
         PlanNode::Aggregate { rows, child } => {
-            out.push(format!("{}Aggregate (rows={})", pad, rows));
-            render_plan(child, depth + 1, out);
+            out.push(format!("{pad}Aggregate (rows={rows})"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::Unique { rows, child } => {
-            out.push(format!("{}Unique (rows={})", pad, rows));
-            render_plan(child, depth + 1, out);
+            out.push(format!("{pad}Unique (rows={rows})"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::Sort { keys, rows, child } => {
-            out.push(format!("{}Sort (rows={})", pad, rows));
-            out.push(format!("{}  Sort Key: {}", pad, keys));
-            render_plan(child, depth + 1, out);
+            out.push(format!("{pad}Sort (rows={rows})"));
+            out.push(format!("{pad}  Sort Key: {keys}"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::Limit { n, rows, child } => {
-            out.push(format!("{}Limit {} (rows={})", pad, n, rows));
-            render_plan(child, depth + 1, out);
+            out.push(format!("{pad}Limit {n} (rows={rows})"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::SubqueryScan { alias, rows, child } => {
-            out.push(format!("{}Subquery Scan on {} (rows={})", pad, alias, rows));
-            render_plan(child, depth + 1, out);
+            out.push(format!("{pad}Subquery Scan on {alias} (rows={rows})"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::Values { rows } => {
-            out.push(format!("{}Values (rows={})", pad, rows));
+            out.push(format!("{pad}Values (rows={rows})"));
         }
     }
 }
 
-fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecResult, ExecError> {
+/// v1.08: `costs` selects the PG19 text shape (COSTS OFF) versus the
+/// legacy rustgres shape (COSTS ON, the default).
+fn exec_explain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    stmt: &Stmt,
+    costs: bool,
+) -> Result<ExecResult, ExecError> {
     let sel = match stmt {
         Stmt::Select(s) => s,
         _ => {
@@ -10139,9 +11381,10 @@ fn exec_explain(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<Exec
         }
     };
     // Planning only inspects definitions and statistics — nothing runs.
-    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session, &[])?;
+    // v1.08: COSTS OFF selects the PG-text plan rendering.
+    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session, &[], !costs)?;
     let mut lines = Vec::new();
-    render_plan(&plan, 0, &mut lines);
+    render_plan(&plan, 0, costs, &mut lines);
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
         rows: lines
@@ -10367,13 +11610,17 @@ fn render_analyze(
 /// the SELECT is executed exactly once and actual row counts are
 /// rendered (PG19 `EXPLAIN ANALYZE`). Shared by top-level EXPLAIN and
 /// plpgsql `FOR x IN EXPLAIN ... LOOP`.
+/// v1.08: `costs` selects the PG19 text shape (COSTS OFF) versus the
+/// legacy rustgres shape (COSTS ON, the default).
 fn explain_rows(
     q: &mut Q,
     scopes: &[Scope],
     sel: &SelectStmt,
     analyze: bool,
+    costs: bool,
 ) -> Result<Vec<Row>, ExecError> {
-    let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[])?;
+    // v1.08: COSTS OFF selects the PG-text plan rendering.
+    let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs)?;
     let mut lines = Vec::new();
     if analyze {
         let out = run_select(q, sel, scopes)?;
@@ -10386,7 +11633,7 @@ fn explain_rows(
         };
         render_analyze(&plan, &ax, 0, None, true, &mut lines);
     } else {
-        render_plan(&plan, 0, &mut lines);
+        render_plan(&plan, 0, costs, &mut lines);
     }
     Ok(lines
         .into_iter()
@@ -10402,6 +11649,7 @@ fn exec_explain_analyze(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     stmt: &Stmt,
+    costs: bool,
 ) -> Result<ExecResult, ExecError> {
     let sel = match stmt {
         Stmt::Select(s) => s,
@@ -10430,7 +11678,7 @@ fn exec_explain_analyze(
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
         };
-        explain_rows(&mut q, &[], sel, true)?
+        explain_rows(&mut q, &[], sel, true, costs)?
     };
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
@@ -27084,14 +28332,19 @@ fn run_plpgsql_stmts(
                 subst_params(&mut qq, &run.params)?;
                 let rows: Vec<Row> = match &qq {
                     Stmt::Select(sel) => run_select(q, sel, scopes)?.rows,
-                    Stmt::Explain { stmt, analyze } => {
+                    Stmt::Explain {
+                        stmt,
+                        analyze,
+                        costs,
+                        ..
+                    } => {
                         let Stmt::Select(inner) = &**stmt else {
                             return Err(exec_err(
                                 "XX000",
                                 "plpgsql FOR over non-SELECT EXPLAIN".to_string(),
                             ));
                         };
-                        explain_rows(q, scopes, inner, *analyze)?
+                        explain_rows(q, scopes, inner, *analyze, *costs)?
                     }
                     _ => {
                         return Err(exec_err(
@@ -31240,11 +32493,9 @@ fn pg_quote_identifier(s: &str) -> String {
 /// single-quoted with embedded quotes doubled; E'' syntax if the
 /// string contains backslashes.
 fn pg_quote_literal(s: &str) -> String {
-    if s.contains('\\') {
-        format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
-    } else {
-        format!("'{}'", s.replace('\'', "''"))
-    }
+    // v1.08: PG EXPLAIN uses standard_conforming_strings=on; backslashes
+    // are literal in regular '...' strings (no E'' syntax in output).
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Port of PostgreSQL 19 `replace_text_regexp`
@@ -40745,7 +41996,9 @@ mod tests {
         // CTE in a join (the join.sql #19560 shape).
         let r = run(
             &mut eng,
-            "EXPLAIN (COSTS OFF) WITH viewer AS (SELECT 'bob' AS id) \
+            // v1.08: plain EXPLAIN (COSTS ON) — the v1.08 PG-text renderer
+            // honestly masks LEFT JOIN + CTE under COSTS OFF (0A000).
+            "EXPLAIN WITH viewer AS (SELECT 'bob' AS id) \
              SELECT count(*) FROM cte_t LEFT JOIN viewer ON true",
         )
         .unwrap();
@@ -48359,5 +49612,165 @@ mod hash_join_tests {
         let resolved3 = resolve_predicate_columns(&on3, &schemas).unwrap();
         let keys3 = hash_join_keys(&resolved3, 0, &lschema, &rschema).unwrap();
         assert_eq!(keys3, vec![(0, 0, HashFam::ExactNum)]);
+    }
+}
+
+#[cfg(test)]
+mod v108_costs_off_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).expect("parses");
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_cond_single_parens() {
+        // v1.08: single index condition renders one paren pair: `(a = 42)`.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int, b text)").unwrap();
+        run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        let plan = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42");
+        assert_eq!(plan[0], "Index Scan using i1 on t1");
+        assert_eq!(plan[1], "  Index Cond: (a = 42)");
+    }
+
+    #[test]
+    fn index_cond_multi_source_order() {
+        // v1.08: multiple index conds render in source order with AND.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a > 10 AND a < 100",
+        );
+        assert_eq!(plan[1], "  Index Cond: ((a > 10) AND (a < 100))");
+    }
+
+    #[test]
+    fn residual_filter_text_coercion() {
+        // v1.08: residual filter gets planner-coerced type label.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int, b text)").unwrap();
+        run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42 AND b = 'hello'",
+        );
+        assert_eq!(plan[1], "  Index Cond: (a = 42)");
+        assert_eq!(plan[2], "  Filter: (b = 'hello'::text)");
+    }
+
+    #[test]
+    fn alias_rendered_on_scan() {
+        // v1.08: table alias renders on scan lines.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        let plan = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM t1 t WHERE t.a = 1");
+        assert_eq!(plan[0], "Index Scan using i1 on t1 t");
+        assert_eq!(plan[1], "  Index Cond: (a = 1)");
+    }
+
+    #[test]
+    fn where_distribution_join_filter() {
+        // v1.08: source-local predicates stay on scans; multi-source
+        // predicates become the join's Join Filter.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        run(&mut eng, "CREATE TABLE t2 (x int)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 a, t2 b WHERE a.a = b.x AND a.a > 0",
+        );
+        assert_eq!(plan[0], "Nested Loop");
+        assert_eq!(plan[1], "  Join Filter: (a.a = b.x)");
+        assert_eq!(plan[2], "  ->  Seq Scan on t1 a");
+        assert_eq!(plan[3], "        Filter: (a > 0)");
+        assert_eq!(plan[4], "  ->  Seq Scan on t2 b");
+    }
+
+    #[test]
+    fn nested_indentation_exact() {
+        // v1.08: PG19 indentation — depth 0 none, depth 1 `  ->  `,
+        // properties at 2/8 spaces.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        run(&mut eng, "CREATE TABLE t2 (x int)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 a JOIN t2 b ON a.a = b.x WHERE a.a > 0",
+        );
+        // Verify exact spacing with visible markers.
+        assert!(plan[0].starts_with("Nested Loop"));
+        assert!(plan[1].starts_with("  Join Filter:"));
+        assert!(plan[2].starts_with("  ->  Seq Scan"));
+        assert!(plan[3].starts_with("        Filter:"));
+    }
+
+    #[test]
+    fn sort_key_expression() {
+        // v1.08: sort keys render the PG-text expression (qualified, per
+        // PG corpus `Sort Key: ((t2.q1 + 1))`).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 ORDER BY a + 1",
+        );
+        assert_eq!(plan[0], "Sort");
+        assert_eq!(plan[1], "  Sort Key: (t1.a + 1)");
+        assert_eq!(plan[2], "  ->  Seq Scan on t1");
+    }
+
+    #[test]
+    fn limit_no_count() {
+        // v1.08: COSTS OFF renders bare `Limit`, not `Limit N`.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
+        let plan = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM t1 LIMIT 5");
+        assert_eq!(plan[0], "Limit");
+        assert_eq!(plan[1], "  ->  Seq Scan on t1");
+    }
+
+    #[test]
+    fn comparison_coercion_both_directions() {
+        // v1.08: literal gets the column's type label regardless of side.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t1 (b text)").unwrap();
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE 'x' = b",
+        );
+        assert_eq!(plan[1], "  Filter: ('x'::text = b)");
     }
 }

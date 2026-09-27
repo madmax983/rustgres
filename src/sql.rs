@@ -4705,9 +4705,13 @@ pub enum Stmt {
     // --- v0.8: EXPLAIN (planned, never executed)
     // v1.03: `analyze` preserves the ANALYZE option; true means the inner
     // SELECT is executed once and actual row counts are rendered.
+    // v1.08: `costs` preserves the COSTS option (default true, like
+    // Postgres); false omits the `(rows=N)` estimate suffix from every
+    // node line in the planning-only text renderer.
     Explain {
         stmt: Box<Stmt>,
         analyze: bool,
+        costs: bool,
     },
     // --- v0.8: ANALYZE (statistics collection)
     Analyze {
@@ -5666,6 +5670,9 @@ impl Parser {
                 // once and renders actual row counts (bounded: text format
                 // only). Bare EXPLAIN ANALYZE (no parens) remains 0A000.
                 let mut analyze = false;
+                // v1.08: COSTS defaults true (Postgres behavior); an explicit
+                // COSTS OFF/FALSE/0 omits the `(rows=N)` estimates.
+                let mut costs = true;
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("analyze")) {
                     return Err(SqlError {
                         message: "unsupported: bare EXPLAIN ANALYZE (use EXPLAIN (ANALYZE, ...))"
@@ -5674,11 +5681,13 @@ impl Parser {
                     });
                 }
                 // v0.77: EXPLAIN (option, ...) — parse the options; only
-                // ANALYZE affects output (v1.03). The rest (COSTS, VERBOSE,
-                // BUFFERS, TIMING, SUMMARY, SETTINGS, FORMAT) don't affect
-                // rustgres's plan output format, but accepting the syntax
-                // avoids a 42601 that would (correctly) abort an explicit
-                // transaction in the conformance suite.
+                // ANALYZE (v1.03) and COSTS (v1.08) affect output. The rest
+                // (VERBOSE, BUFFERS, TIMING, SUMMARY, SETTINGS, FORMAT)
+                // don't affect rustgres's plan output format, but accepting
+                // the syntax avoids a 42601 that would (correctly) abort an
+                // explicit transaction in the conformance suite. Duplicate
+                // options are accepted with last-wins semantics (Postgres
+                // ParseExplainOptionList behavior).
                 if matches!(self.peek(), Token::LParen) {
                     let _ = self.next(); // consume '('
                     loop {
@@ -5719,6 +5728,53 @@ impl Parser {
                                 _ => false,
                             };
                         }
+                        // v1.08: COSTS [boolean] — bare COSTS means true;
+                        // explicit false/off/0 omits the `(rows=N)` estimate
+                        // suffix. Duplicate COSTS options: last wins.
+                        if opt_name.eq_ignore_ascii_case("costs") {
+                            costs = match opt_val.as_deref() {
+                                None => true,
+                                Some(v)
+                                    if v.eq_ignore_ascii_case("true")
+                                        || v.eq_ignore_ascii_case("on")
+                                        || v == "1" =>
+                                {
+                                    true
+                                }
+                                Some(v)
+                                    if v.eq_ignore_ascii_case("false")
+                                        || v.eq_ignore_ascii_case("off")
+                                        || v == "0" =>
+                                {
+                                    false
+                                }
+                                Some(v) => {
+                                    return Err(err(format!(
+                                        "invalid value \"{v}\" for \"COSTS\""
+                                    )));
+                                }
+                            };
+                        } else if ![
+                            "analyze",
+                            "verbose",
+                            "buffers",
+                            "timing",
+                            "summary",
+                            "settings",
+                            "format",
+                            "wal",
+                            "serialize",
+                            "memory",
+                        ]
+                        .iter()
+                        .any(|k| opt_name.eq_ignore_ascii_case(k))
+                        {
+                            // v1.08: PG19 rejects unknown EXPLAIN options with 42601
+                            // (the `err` helper already uses 42601).
+                            return Err(err(format!(
+                                "unrecognized EXPLAIN option \"{opt_name}\""
+                            )));
+                        }
                         match self.next() {
                             Token::Comma => continue,
                             Token::RParen => break,
@@ -5742,6 +5798,7 @@ impl Parser {
                     Stmt::Select(_) => Ok(Stmt::Explain {
                         stmt: Box::new(inner),
                         analyze,
+                        costs,
                     }),
                     _ => Err(err("EXPLAIN only supports SELECT statements".to_string())),
                 }
@@ -15425,6 +15482,93 @@ mod v107_set_tests {
                 }
             }
             other => panic!("expected Set, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod v108_explain_costs_tests {
+    use super::*;
+
+    fn explain_costs(sql: &str) -> (bool, bool) {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Explain { analyze, costs, .. } => (analyze, costs),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn costs_defaults_true() {
+        let (_, costs) = explain_costs("EXPLAIN SELECT 1");
+        assert!(costs);
+        let (_, costs) = explain_costs("EXPLAIN (VERBOSE) SELECT 1");
+        assert!(costs);
+    }
+
+    #[test]
+    fn costs_off_forms() {
+        for sql in [
+            "EXPLAIN (COSTS OFF) SELECT 1",
+            "EXPLAIN (COSTS FALSE) SELECT 1",
+            "EXPLAIN (COSTS off) SELECT 1",
+            "EXPLAIN (COSTS 0) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(!costs, "expected costs=false for {sql}");
+        }
+    }
+
+    #[test]
+    fn costs_on_forms() {
+        for sql in [
+            "EXPLAIN (COSTS) SELECT 1",
+            "EXPLAIN (COSTS ON) SELECT 1",
+            "EXPLAIN (COSTS TRUE) SELECT 1",
+            "EXPLAIN (COSTS 1) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(costs, "expected costs=true for {sql}");
+        }
+    }
+
+    #[test]
+    fn costs_duplicate_last_wins() {
+        // v1.08: PG19 processes options sequentially; duplicates are valid,
+        // last value wins.
+        let (_, costs) = explain_costs("EXPLAIN (COSTS OFF, COSTS ON) SELECT 1");
+        assert!(costs);
+        let (_, costs) = explain_costs("EXPLAIN (COSTS ON, COSTS OFF) SELECT 1");
+        assert!(!costs);
+    }
+
+    #[test]
+    fn costs_invalid_boolean_errors() {
+        let err = parse_statement("EXPLAIN (COSTS foo) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "42601");
+        assert!(err.message.contains("COSTS"), "message: {}", err.message);
+    }
+
+    #[test]
+    fn unknown_option_errors_42601() {
+        let err = parse_statement("EXPLAIN (FOOBAR) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "42601");
+        assert!(
+            err.message.contains("unrecognized EXPLAIN option"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn known_inert_options_accepted() {
+        // v1.08: known non-COSTS options remain accepted and inert.
+        for sql in [
+            "EXPLAIN (VERBOSE, COSTS OFF) SELECT 1",
+            "EXPLAIN (BUFFERS, COSTS OFF) SELECT 1",
+            "EXPLAIN (TIMING OFF, COSTS OFF) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(!costs, "expected costs=false for {sql}");
         }
     }
 }
