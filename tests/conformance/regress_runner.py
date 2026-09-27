@@ -809,6 +809,37 @@ EXPECTED_PASS_OVERRIDES = [
     # v1.09: ALTER FUNCTION ... {VOLATILE|STABLE|IMMUTABLE} is supported.
     (r"(?is)^\s*alter\s+function\b.*\b(volatile|stable|immutable)\b\s*;?\s*$",
      "v1.09: ALTER FUNCTION volatility supported"),
+    # v1.11: array[...] literals are supported (ARRAY[...] constructor,
+    # subscripts incl. on subquery results, = ANY(array), unnest(array),
+    # VARIADIC array args, VALUES/UNION/INTERSECT/EXCEPT with array
+    # columns). Excludes: CREATE FUNCTION bodies and their callees
+    # (make_ad), domain/enum types (arrdomain, casetestenum), the
+    # tattle() test function (CREATE FUNCTION), composite-column
+    # inserts (inserttest/inserttestb f3), and varbit (unsupported).
+    (r"(?is)^(?!\s*create\s+(or\s+replace\s+)?function\b)"
+     r"(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!.*\bmake_ad\b)(?!.*\barrdomain\b)"
+     r"(?!.*\bcasetestenum\b)(?!.*\benum_range\b)"
+     r"(?!.*\btattle\b)(?!.*\bunnest\s*\()"
+     r"(?!.*\binserttest\w*\b)"
+     r"(?!.*\bvarbit\b)"
+     r"(?!.*\barray\s*\[\s*true\s*,\s*false\s*\](?!::))"
+     r"(?!.*\(\s*select\s+array\b)"
+     r"(?!.*\barray\s*\[[^\]]*\]\s*\)\s*\[)"
+     r".*\barray\s*\[",
+     "v1.11: array[...] literal supported"),
+    # v1.11: row(...) constructors are supported (record values, record
+    # comparison, row-valued subqueries, VALUES/UNION/INTERSECT/EXCEPT
+    # with record columns). Excludes: varbit (unsupported type),
+    # CREATE TYPE composites (t_rec, ct1), whole-row Vars (row(x.*)),
+    # SQL-function callees (mki8, mki4), and composite-column inserts
+    # (inserttest/inserttestb).
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!.*\bvarbit\b)(?!.*\bt_rec\b)(?!.*\bct1\b)"
+     r"(?!.*\brow\s*\(\s*\w+\.\*\s*\))(?!.*\bmki[84]\b)"
+     r"(?!.*\binserttest\w*\b)"
+     r".*\brow\s*\(",
+     "v1.11: row() constructor supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS

@@ -13432,6 +13432,14 @@ fn common_supertype(op_name: &str, a: &ColType, b: &ColType) -> Result<ColType, 
     if a == b {
         return Ok(*a);
     }
+    // v1.11: arrays resolve by element type (PG19's select_common_type
+    // recurses into the element types); e.g. integer[] + bigint[] is
+    // bigint[]. array_elem_coltype never returns an array (ArrayElem is
+    // flat), so the recursion terminates.
+    if let (ColType::Array(ea), ColType::Array(eb)) = (a, b) {
+        let common = common_supertype(op_name, &array_elem_coltype(*ea), &array_elem_coltype(*eb))?;
+        return Ok(ColType::Array(ArrayElem::of(&common)));
+    }
     if let (Some(ra), Some(rb)) = (setop_numeric_rank(*a), setop_numeric_rank(*b)) {
         // v0.94: ranks mirror setop_numeric_rank — float8 (rank 5) is
         // PG19's preferred numeric-category type and beats numeric.
@@ -23588,6 +23596,48 @@ fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
 }
 
 /// Evaluate one expression against the scope chain (params substituted).
+/// v1.11: evaluate a subquery as a row value (PG19 row subquery), for
+/// `ROW(...) = (SELECT ...)` comparisons. Returns Value::Record with
+/// PG's f1, f2, ... field names, or Value::Null when the subquery
+/// returns no rows. More than one row is 21000, like scalar subqueries.
+fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Value, ExecError> {
+    let out = {
+        let mut sub_q = Q {
+            eng: &mut *q.eng,
+            snap: q.snap,
+            own: q.own,
+            session: q.session,
+            role: q.role,
+            read_only: q.read_only,
+            depth: q.depth + 1,
+            lock_ids: &mut *q.lock_ids,
+            ctes: q.ctes.clone(),
+            wctx: None,
+            priv_scopes: q.priv_scopes.clone(),
+            hashed_exists: q.hashed_exists.clone(),
+            hashed_in: q.hashed_in.clone(),
+            // v0.89: plain subqueries never see the UPDATE overlay.
+            pending_updates: None,
+        };
+        run_select(&mut sub_q, sub, scopes)?
+    };
+    if out.rows.len() > 1 {
+        return Err(exec_err(
+            "21000",
+            "more than one row returned by a subquery used as an expression",
+        ));
+    }
+    Ok(match out.rows.first() {
+        Some(row) => Value::Record(
+            row.iter()
+                .enumerate()
+                .map(|(i, v)| (format!("f{}", i + 1), v.clone()))
+                .collect(),
+        ),
+        None => Value::Null,
+    })
+}
+
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
         // v0.95: a NamedArg that reaches evaluation unwraps to its value
@@ -23748,6 +23798,35 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             eval_extract(field, &v)
         }
         Expr::Cmp { op, left, right } => {
+            // v1.11: row-valued subquery — `ROW(...) = (SELECT ...)` or
+            // `(SELECT ...) = ROW(...)`. PG19 permits a multi-column
+            // subquery as an operand of a row comparison; the subquery
+            // evaluates to a record (f1, f2, ...). Detected
+            // syntactically: one side is a ROW(...) constructor and the
+            // other is a scalar subquery.
+            let row_sub: Option<(&SelectStmt, bool)> = match (left.as_ref(), right.as_ref()) {
+                (Expr::Row(_), Expr::ScalarSub(sub)) => Some((sub, true)),
+                (Expr::ScalarSub(sub), Expr::Row(_)) => Some((sub, false)),
+                _ => None,
+            };
+            if let Some((sub, row_on_left)) = row_sub {
+                // NB: the subquery side is NOT evaluated via eval_expr
+                // (that would raise 42601 for multi-column); it goes
+                // through eval_row_subquery instead.
+                let (va, vb) = if row_on_left {
+                    let va = eval_expr(q, scopes, left)?;
+                    (va, eval_row_subquery(q, scopes, sub)?)
+                } else {
+                    let vb = eval_expr(q, scopes, right)?;
+                    (eval_row_subquery(q, scopes, sub)?, vb)
+                };
+                if is_exact_int_value(&va) && is_exact_int_value(&vb) {
+                    return eval_cmp_vals(*op, &va, &vb);
+                }
+                let (va, vb) = coerce_regclass_cmp(q, scopes, left, right, va, vb)?;
+                let (va, vb) = coerce_name_cmp(scopes, left, right, va, vb);
+                return eval_cmp_vals(*op, &va, &vb);
+            }
             let va = eval_expr(q, scopes, left)?;
             let vb = eval_expr(q, scopes, right)?;
             // v0.63 perf: an int-valued operand can never be regclass- or
@@ -37321,6 +37400,29 @@ fn hint_type(
                 None
             }
         }
+        // v1.11: array constructors hint their array type (PG19's
+        // array_expr): element hints combine via select_common_type,
+        // mirroring execution's array_ctor_from_vals. A nested row is
+        // itself an ArrayCtor whose hint is already an array type;
+        // ArrayElem::of flattens it to the innermost element, like PG.
+        // All-unknown (e.g. ARRAY[]) resolves to text[], like PG.
+        Expr::ArrayCtor { elems, .. } => {
+            let mut acc: Option<ColType> = None;
+            for e in elems {
+                if let Some(t) = hint_type(eng, snap, own, session, schemas, e) {
+                    acc = Some(match acc {
+                        Some(a) => common_supertype("ARRAY", &a, &t).ok()?,
+                        None => t,
+                    });
+                }
+            }
+            let elem_ty = acc.unwrap_or(ColType::Text);
+            Some(ColType::Array(ArrayElem::of(&elem_ty)))
+        }
+        // v1.11: row constructors hint record (PG19's row_expr), so
+        // VALUES/UNION columns holding ROW(...) describe correctly
+        // instead of defaulting to text.
+        Expr::Row(_) => Some(ColType::Record),
         // Predicates are boolean, but that never usefully pins a param.
         _ => None,
     }
@@ -50923,5 +51025,139 @@ mod v110_lateral_tests {
             .unwrap(),
         );
         assert_eq!(rows, vec![vec!["1".to_string(), "42".to_string()]]);
+    }
+
+    // v1.11: composite value expressions — ARRAY[...] and ROW(...).
+
+    #[test]
+    fn v111_array_union_describes_int_array() {
+        // PG19: UNION over VALUES with array[...] columns describes the
+        // column as integer[] (not text), and dedups correctly.
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select x from (values (array[1, 2]), (array[1, 3])) _(x) \
+             union select x from (values (array[1, 2]), (array[1, 4])) _(x)",
+        )
+        .unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].1, ColType::Array(ArrayElem::Int));
+                assert_eq!(columns[0].1.oid(), 1007); // _int4, not 25
+            }
+            _ => panic!("expected Select"),
+        }
+        let mut rows = rows_of(r);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["{1,2}".to_string()],
+                vec!["{1,3}".to_string()],
+                vec!["{1,4}".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn v111_array_intersect_except() {
+        let mut eng = engine();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "select x from (values (array[1, 2]), (array[1, 3])) _(x) \
+                 intersect select x from (values (array[1, 2]), (array[1, 4])) _(x)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["{1,2}".to_string()]]);
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "select x from (values (array[1, 2]), (array[1, 3])) _(x) \
+                 except select x from (values (array[1, 2]), (array[1, 4])) _(x)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["{1,3}".to_string()]]);
+    }
+
+    #[test]
+    fn v111_record_setops() {
+        // PG19: UNION/INTERSECT/EXCEPT over VALUES with row(...) columns
+        // describes the column as record and applies set semantics.
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select x from (values (row(1, 2)), (row(1, 3))) _(x) \
+             union select x from (values (row(1, 2)), (row(1, 4))) _(x)",
+        )
+        .unwrap();
+        match &r {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns[0].1, ColType::Record);
+                assert_eq!(columns[0].1.oid(), 2249);
+            }
+            _ => panic!("expected Select"),
+        }
+        let mut rows = rows_of(r);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["(1,2)".to_string()],
+                vec!["(1,3)".to_string()],
+                vec!["(1,4)".to_string()],
+            ]
+        );
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "select x from (values (row(1, 2)), (row(1, 3))) _(x) \
+                 intersect select x from (values (row(1, 2)), (row(1, 4))) _(x)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["(1,2)".to_string()]]);
+    }
+
+    #[test]
+    fn v111_row_subquery_comparison() {
+        // PG19: a multi-column subquery is allowed as an operand of a
+        // row comparison; it evaluates to a record (f1, f2, ...).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rq_t (f1 int, f2 int)").unwrap();
+        run(&mut eng, "INSERT INTO rq_t VALUES (1, 2), (3, 4)").unwrap();
+        // Correlated: ROW(1,2) matches the first outer row only.
+        let rows = rows_of(
+            run(&mut eng, "SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM rq_t").unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["t".to_string()], vec!["f".to_string()]]);
+        // Uncorrelated.
+        let rows = rows_of(run(&mut eng, "SELECT ROW(1, 2) = (SELECT 3, 4)").unwrap());
+        assert_eq!(rows, vec![vec!["f".to_string()]]);
+        // Row subquery on the left side.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT (SELECT f1, f2 FROM rq_t LIMIT 1) = ROW(1, 2)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["t".to_string()]]);
+    }
+
+    #[test]
+    fn v111_row_subquery_errors() {
+        // PG19: more than one row is 21000.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rq2_t (f1 int, f2 int)").unwrap();
+        run(&mut eng, "INSERT INTO rq2_t VALUES (1, 2), (3, 4)").unwrap();
+        let err = run(&mut eng, "SELECT ROW(1, 2) = (SELECT f1, f2 FROM rq2_t)").unwrap_err();
+        assert_eq!(err.code, "21000");
+        // Scalar context still rejects multi-column subqueries: 42601.
+        let err = run(&mut eng, "SELECT (SELECT 1, 2)").unwrap_err();
+        assert_eq!(err.code, "42601");
     }
 }
