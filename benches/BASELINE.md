@@ -2,6 +2,85 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — baseline — 2026-09-27
+
+**Why this workload**: `benches/profile_agg.py --rows 40000 --groups 4000
+--count 50` (added in #26) — the same GROUP BY driver used by the two most
+recent Bolt rounds in this file (`exec_agg_one`'s group-key scratch buffer,
+merged as #28; the exec-cell `Vec::with_capacity` negative result, #27).
+Issue #27's own DHAT profile table, taken on the pre-#28 tree, flagged two
+sites bigger than the one it measured and explicitly deferred them for a
+future round: `exec::value_key` (group-key hashing, 45.9% of blocks — fixed
+by #28) and `exec::eval_agg_func` (aggregate accumulator state, 50.4% of
+bytes — untouched until now). This round re-profiles the same workload on
+top of #28 to confirm `eval_agg_func`'s share on the current tree and act on
+it.
+
+**Profile** (DHAT, valgrind 3.22.0, current HEAD `ce7120c` — #28 merged, #29
+not merged; two independent runs to confirm determinism: 3,065,091,798 /
+14,102,245 vs. 3,065,100,754 / 14,102,255 bytes/blocks, agreeing to within
+0.0003%):
+
+- Total: **3,065,100,754** bytes, **14,102,255** allocation blocks.
+- Target site (`eval_agg_func`, `src/exec.rs:19905`, the `vals.push(v)`
+  inside the per-row accumulation loop that every non-`string_agg`,
+  non-count(*) aggregate — `sum`, `avg`, `min`, `max`, `array_agg`, the
+  variance family — funnels its input values through): **1,792,000,000
+  bytes (58.46% of total) / 2,400,000 blocks (17.02% of total)** — by a wide
+  margin the single largest allocation site in the profile, more than 3x
+  the next-largest by bytes.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes`, same workload, same
+build): **49,965,949,921** total `Ir`. `eval_agg_func`'s own self-cost is
+3.17% of `Ir` (function-level `callgrind_annotate`, not call-graph
+inclusive — the malloc/`push_mut`/`grow_one`/memcpy machinery this site
+drives is attributed to those callees, not to `eval_agg_func` itself, so
+this understates the site's true instruction cost; DHAT is the primary
+gate for this finding).
+
+**Hypothesis**: `eval_agg_func`'s row-accumulation loop (`for &i in &visit`)
+declares `let mut vals: Vec<Value> = Vec::new();` (`src/exec.rs:19868`)
+before looping over `visit`, whose length equals `idxs.len()` — the input
+row count for this group, known before the loop starts — and pushes at
+most one value per iteration (`vals.push(v)`, line 19905, or the
+`string_agg`-only branch at line 19898; NULLs are skipped, only ever
+shrinking the final length below `idxs.len()`, never growing it). `Vec`'s
+default growth (capacity 0 -> 4 -> 8 -> 16 -> ...) means a 10-row group (this
+workload's group size) pays 3 reallocations before its capacity covers all
+10 pushes, and `eval_agg_func` is called once per (non-count aggregate,
+group) pair — 4 aggregates (`sum(a)`, `sum(b)`, `max(c)`, `min(d)`) x 4,000
+groups x 50 iterations = 800,000 calls, x 3 reallocations = 2,400,000
+blocks, matching the profile's block count for this site exactly.
+Passing `Vec::with_capacity(idxs.len())` — an upper bound already available
+as a parameter at the point `vals` is declared — should collapse this to
+one allocation per call (800,000 blocks total, a 3x reduction at the site)
+sized to exactly what's needed for a workload with no NULLs in the grouped
+columns (this one), comfortably clearing the ≥10%-of-total allocation-count
+floor on its own, since the site alone is 17% of the whole profile's block
+count.
+
+Fix (measured next commit): `Vec::new()` -> `Vec::with_capacity(idxs.len())`
+for `vals` only. `delims` (the `string_agg`-only second accumulator,
+declared on the next line) stays `Vec::new()` — it is never populated for
+any of this workload's aggregates, and unconditionally sizing it would add
+a wasted allocation to every non-`string_agg` call instead of removing one.
+
+**Artifacts**: `benches/profiles/dhat.out.aggval-base-2026-09-27`,
+`benches/profiles/callgrind.out.aggval-base-2026-09-27`.
+
+**Reproduce**:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_agg.py --rows 40000 --groups 4000 --count 50
+# SIGTERM the server to flush, then sum tb/tbk over dhat.out's `pps` for
+# the total, and filter frames resolving through
+# `rustgres::exec::eval_agg_func` (exec.rs:19905) for the site-specific
+# share.
+```
+
 ## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — fix — 2026-09-24
 
 Fixes the target identified in the baseline entry immediately below
