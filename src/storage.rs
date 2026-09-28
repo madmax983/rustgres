@@ -70,6 +70,12 @@ pub enum ColType {
     // Number displayed as HIGH/LOW in uppercase hex, LOW zero-padded
     // to 8 digits (e.g. `0/016AE7F8`).
     PgLsn, // OID 3220
+    // v1.17: PG's `xid` transaction-id type (OID 28) — the type of the
+    // `xmin`/`xmax` system columns. Values are carried as `Value::Int`
+    // (engine xids fit in i64); display is unsigned decimal like PG's
+    // xidout, and `=`/`xidin` equality is plain integer equality like
+    // PG's xideq.
+    Xid, // OID 28
     // v0.73: PG's `record` pseudo-type (OID 2249) — the type of a
     // whole-row value (`tbl` / `tbl.*` in expression position). The
     // engine does not track per-table rowtype OIDs (a documented gap);
@@ -122,6 +128,7 @@ pub enum ArrayElem {
     Json,
     Record,
     PgLsn,
+    Xid,
 }
 
 impl ArrayElem {
@@ -153,6 +160,7 @@ impl ArrayElem {
             // v0.81: named composites are not arrayable yet.
             ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
+            ColType::Xid => ArrayElem::Xid,
         }
     }
 
@@ -180,6 +188,7 @@ impl ArrayElem {
             ArrayElem::Json => 199,
             ArrayElem::Record => 2287,
             ArrayElem::PgLsn => 3221,
+            ArrayElem::Xid => 1011,
         }
     }
 
@@ -207,6 +216,7 @@ impl ArrayElem {
             ArrayElem::Json => "json",
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
+            ArrayElem::Xid => "xid",
         }
     }
 
@@ -234,6 +244,7 @@ impl ArrayElem {
             ArrayElem::Json => "json",
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
+            ArrayElem::Xid => "xid",
         }
     }
 }
@@ -250,6 +261,7 @@ impl ColType {
             ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
             ColType::SingleChar => 18,    // "char" (v0.36)
             ColType::PgLsn => 3220,       // PG_LSN (v0.64)
+            ColType::Xid => 28,           // XID (v1.17)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -297,6 +309,7 @@ impl ColType {
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
+            ColType::Xid => "xid",      // v1.17
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
@@ -337,6 +350,7 @@ impl ColType {
             ColType::Bytea => "bytea",
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
+            ColType::Xid => "xid",      // v1.17
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73

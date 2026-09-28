@@ -1287,6 +1287,11 @@ impl Enc {
                 self.u8(21);
                 return;
             }
+            // v1.17: xid; tag appends after v0.81's.
+            ColType::Xid => {
+                self.u8(24);
+                return;
+            }
             // v0.78: array; tag appends after v0.73's, then the PG array
             // OID (which identifies the element type). Arrays never
             // appear as table columns — no DDL support — but the codec
@@ -2132,6 +2137,8 @@ impl<'a> Dec<'a> {
             20 => Ok(ColType::Record),
             // v0.81: named composite marker.
             23 => Ok(ColType::Composite),
+            // v1.17: xid.
+            24 => Ok(ColType::Xid),
             21 => Ok(ColType::Json),
             // v0.78: array, then the PG array OID identifying the
             // element type.
@@ -2158,6 +2165,7 @@ impl<'a> Dec<'a> {
                     199 => ArrayElem::Json,
                     2287 => ArrayElem::Record,
                     3221 => ArrayElem::PgLsn,
+                    1011 => ArrayElem::Xid,
                     t => return Err(self.err(&format!("unknown array element OID {}", t))),
                 };
                 Ok(ColType::Array(elem))

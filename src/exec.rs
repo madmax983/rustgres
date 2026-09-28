@@ -5709,6 +5709,7 @@ fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Json => ColType::Json,
         ArrayElem::Record => ColType::Composite,
         ArrayElem::PgLsn => ColType::PgLsn,
+        ArrayElem::Xid => ColType::Xid,
     }
 }
 
@@ -9439,6 +9440,8 @@ fn index_order_rows(
     ix: &Index,
     t: &Table,
     table_name: &str,
+    // v1.17: range qualifier (alias) for RowProv, so `a.xmin` resolves.
+    qual: &str,
     desc: bool,
     snap: &Snapshot,
     own: u64,
@@ -9466,7 +9469,11 @@ fn index_order_rows(
                     rows.push(QRow {
                         cells: r.values.clone(),
                         prov: if need_prov {
-                            vec![(table_name.to_string(), r.id)]
+                            vec![RowProv {
+                                qual: qual.to_string(),
+                                table: table_name.to_string(),
+                                row_id: r.id,
+                            }]
                         } else {
                             Vec::new()
                         },
@@ -9560,6 +9567,7 @@ fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
         ArrayElem::Json => "json",
         ArrayElem::Record => "record",
         ArrayElem::PgLsn => "pg_lsn",
+        ArrayElem::Xid => "xid",
     })
 }
 
@@ -12686,13 +12694,26 @@ fn json_array_text(vals: &[Value]) -> String {
     out
 }
 
+/// v1.17: one base-table row's provenance: the range qualifier (alias) at
+/// scan time, the table (or partition leaf / inheritance child) holding
+/// the row, and the row-version id. The qualifier lets `a.xmin` pick the
+/// right row when the same table appears twice in the FROM list; the
+/// table name keeps `tableoid`, `FOR UPDATE`, and `pg_column_compression`
+/// working as before.
+#[derive(Clone, Debug)]
+pub struct RowProv {
+    pub qual: String,
+    pub table: String,
+    pub row_id: u64,
+}
+
 /// One working row: cell values parallel to the schema, plus provenance —
-/// (table name, row-version id) of each contributing base-table row —
-/// used by SELECT ... FOR UPDATE.
+/// one [`RowProv`] per contributing base-table row — used by
+/// SELECT ... FOR UPDATE (and, since v1.17, by `tableoid`/`xmin`/`xmax`).
 #[derive(Clone, Debug, Default)]
 pub struct QRow {
     pub cells: Row,
-    pub prov: Vec<(String, u64)>,
+    pub prov: Vec<RowProv>,
 }
 
 /// v0.37: does this statement (or anything nested inside it, including
@@ -12901,6 +12922,98 @@ fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
         })
 }
 
+/// v1.17: does this statement (or anything nested inside it) reference
+/// the `xmin`/`xmax` system columns? Used to decide `need_prov` for the
+/// FROM scan, following the `stmt_uses_tableoid` pattern — the values
+/// vary per row (the row's MVCC version header), so provenance must be
+/// populated when they are referenced.
+fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
+    fn expr_uses(e: &Expr) -> bool {
+        match e {
+            Expr::Column { name, .. } => name == "xmin" || name == "xmax",
+            Expr::Func { args, .. } => args.iter().any(expr_uses),
+            Expr::NamedArg { expr, .. } => expr_uses(expr),
+            Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
+            Expr::Subscript { array, indices } => expr_uses(array) || indices.iter().any(expr_uses),
+            Expr::Slice { array, bounds } => {
+                expr_uses(array)
+                    || bounds.iter().any(|(l, u)| {
+                        l.as_deref().is_some_and(expr_uses) || u.as_deref().is_some_and(expr_uses)
+                    })
+            }
+            Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_) => false,
+            Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Cast { expr, .. } => expr_uses(expr),
+            Expr::CastNamed { expr, .. } => expr_uses(expr),
+            Expr::Row(elems) => elems.iter().any(expr_uses),
+            Expr::FieldAccess { expr, .. } => expr_uses(expr),
+            Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => expr_uses(expr) || expr_uses(pattern) || escape.as_deref().is_some_and(expr_uses),
+            Expr::Regex { expr, pattern, .. } => expr_uses(expr) || expr_uses(pattern),
+            Expr::Between {
+                expr, low, high, ..
+            } => expr_uses(expr) || expr_uses(low) || expr_uses(high),
+            Expr::IsBool { expr, .. } => expr_uses(expr),
+            Expr::Extract { from, .. } => expr_uses(from),
+            Expr::Cmp { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Not(e) | Expr::BitNot(e) | Expr::Neg(e) => expr_uses(e),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_deref().is_some_and(expr_uses)
+                    || whens.iter().any(|(k, r)| expr_uses(k) || expr_uses(r))
+                    || else_.as_deref().is_some_and(expr_uses)
+            }
+            Expr::IsNull { expr, .. } => expr_uses(expr),
+            Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Agg { arg, arg2, .. } => {
+                arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
+            }
+            Expr::ScalarSub(s) => stmt_uses_xmin_xmax(s),
+            Expr::ArraySubquery(s) => stmt_uses_xmin_xmax(s),
+            Expr::InSub { expr, sub, .. } => expr_uses(expr) || stmt_uses_xmin_xmax(sub),
+            Expr::Quantified { left, sub, .. } => expr_uses(left) || stmt_uses_xmin_xmax(sub),
+            Expr::UserOp { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Exists { sub, .. } => stmt_uses_xmin_xmax(sub),
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(expr_uses)
+                    || partition_by.iter().any(expr_uses)
+                    || order_by.iter().any(|o| expr_uses(&o.expr))
+            }
+        }
+    }
+    stmt.items.iter().any(|it| match it {
+        SelectItem::Expr { expr, .. } => expr_uses(expr),
+        _ => false,
+    }) || stmt.where_.as_ref().is_some_and(expr_uses)
+        || stmt.group_by.iter().flatten().any(expr_uses)
+        || stmt.having.as_ref().is_some_and(expr_uses)
+        || stmt.order_by.iter().any(|o| expr_uses(&o.expr))
+        || stmt.distinct_on.iter().any(expr_uses)
+        || stmt.with.iter().any(|c| match &c.body {
+            CteBody::Simple(s) => stmt_uses_xmin_xmax(s),
+            CteBody::Union { left, right, .. } => {
+                stmt_uses_xmin_xmax(left) || stmt_uses_xmin_xmax(right)
+            }
+        })
+}
+
 /// One scope in the column-resolution chain: a FROM source's schema+row,
 /// or an outer query's row for correlated subqueries. Scopes are searched
 /// innermost-first, like Postgres.
@@ -12908,10 +13021,10 @@ fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
 struct Scope<'a> {
     schema: &'a [QCol],
     row: &'a [Value],
-    /// v0.37: (table name, row-version id) provenance, from QRow.prov.
-    /// Used by `pg_column_compression` to find the row's toast flags.
-    /// None for derived/computed scopes.
-    prov: Option<&'a [(String, u64)]>,
+    /// v0.37: row provenance, from QRow.prov. Used by
+    /// `pg_column_compression` to find the row's toast flags, and since
+    /// v1.17 by `tableoid`/`xmin`/`xmax`. None for derived/computed scopes.
+    prov: Option<&'a [RowProv]>,
 }
 
 /// Resolve `qual.name` / `name` across the scope chain (innermost first).
@@ -13332,7 +13445,7 @@ struct SelectOut {
 /// pre-projection cells.
 struct OutRow {
     cells: Row,
-    prov: Vec<(String, u64)>,
+    prov: Vec<RowProv>,
     full: Option<Row>,
     /// Precomputed ORDER BY keys. Aggregated queries fill this in during
     /// exec_agg, where group-level ORDER BY expressions (aggregates, GROUP
@@ -14411,7 +14524,12 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         // in the statement, including correlated subqueries).
         // v1.13: tableoid also needs per-row provenance (the OID varies
         // by partition leaf).
-        stmt.for_update || stmt_uses_pg_column_compression(stmt) || stmt_uses_tableoid(stmt),
+        // v1.17: xmin/xmax need per-row provenance (the MVCC header
+        // varies by row version).
+        stmt.for_update
+            || stmt_uses_pg_column_compression(stmt)
+            || stmt_uses_tableoid(stmt)
+            || stmt_uses_xmin_xmax(stmt),
         order_hint.as_ref(),
         early_limit,
     )?;
@@ -14621,14 +14739,16 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
             Some(tables)
         };
         for o in &orows {
-            for (t, id) in &o.prov {
+            for e in &o.prov {
+                let t = &e.table;
+                let id = e.row_id;
                 if let Some(ref allowed) = targets {
                     if !allowed.iter().any(|a| a == t) {
                         continue;
                     }
                 }
-                if !q.lock_ids.iter().any(|(_, x)| x == id) {
-                    q.lock_ids.push((t.clone(), *id));
+                if !q.lock_ids.iter().any(|(_, x)| *x == id) {
+                    q.lock_ids.push((t.clone(), id));
                 }
             }
         }
@@ -19251,7 +19371,7 @@ fn apply_pending_overlay(
             let hit = qr
                 .prov
                 .iter()
-                .find_map(|(pt, pid)| map.get(&(pt.as_str(), *pid)));
+                .find_map(|e| map.get(&(e.table.as_str(), e.row_id)));
             if let Some(cells) = hit {
                 qr.cells = cells.clone();
             }
@@ -19640,7 +19760,11 @@ fn build_source(
                             all_rows.push(QRow {
                                 cells: Row::new(cells),
                                 prov: if need_prov || prov_for_overlay {
-                                    vec![(leaf_name.clone(), r.id)]
+                                    vec![RowProv {
+                                        qual: qual.clone(),
+                                        table: leaf_name.clone(),
+                                        row_id: r.id,
+                                    }]
                                 } else {
                                     Vec::new()
                                 },
@@ -19681,7 +19805,11 @@ fn build_source(
                             all_rows.push(QRow {
                                 cells: Row::new(cells),
                                 prov: if need_prov || prov_for_overlay {
-                                    vec![(tname.to_string(), r.id)]
+                                    vec![RowProv {
+                                        qual: qual.clone(),
+                                        table: tname.to_string(),
+                                        row_id: r.id,
+                                    }]
                                 } else {
                                     Vec::new()
                                 },
@@ -19698,6 +19826,7 @@ fn build_source(
                         ix,
                         t,
                         name,
+                        &qual,
                         hint.desc,
                         snap,
                         own,
@@ -19713,7 +19842,11 @@ fn build_source(
                             .map(|r| QRow {
                                 cells: r.values.clone(),
                                 prov: if need_prov || prov_for_overlay {
-                                    vec![(name.clone(), r.id)]
+                                    vec![RowProv {
+                                        qual: qual.clone(),
+                                        table: name.clone(),
+                                        row_id: r.id,
+                                    }]
                                 } else {
                                     Vec::new()
                                 },
@@ -19747,7 +19880,11 @@ fn build_source(
                                         rows.push(QRow {
                                             cells: r.values.clone(),
                                             prov: if need_prov || prov_for_overlay {
-                                                vec![(name.clone(), r.id)]
+                                                vec![RowProv {
+                                                    qual: qual.clone(),
+                                                    table: name.clone(),
+                                                    row_id: r.id,
+                                                }]
                                             } else {
                                                 Vec::new()
                                             },
@@ -20396,7 +20533,7 @@ fn project_row(
     // placeholders (the real expansion is deferred until after the
     // first-row-per-group filter).
     srf_placeholder: bool,
-) -> Result<(Row, Vec<(String, u64)>), ExecError> {
+) -> Result<(Row, Vec<RowProv>), ExecError> {
     // Fast path: plain `SELECT *` moves the row through untouched — no
     // scope chain, no per-row allocation at all. Disabled when the schema
     // carries hidden columns (v0.23 merged USING/NATURAL keys): the hidden
@@ -20527,7 +20664,7 @@ fn project_row_expanded(
     schema: &[QCol],
     row: QRow,
     out_ncols: usize,
-) -> Result<Vec<(Row, Vec<(String, u64)>)>, ExecError> {
+) -> Result<Vec<(Row, Vec<RowProv>)>, ExecError> {
     let scopes = projection_scopes(outer, stmt, schema, &row);
     // (values, pad_with_null): SRF columns pad, plain columns repeat.
     let mut cols: Vec<(Vec<Value>, bool)> = Vec::with_capacity(out_ncols);
@@ -21092,7 +21229,7 @@ fn exec_agg_one(
         // Correlated subqueries inside the select list see the first row
         // of the group. Any correlated column must be group-bound for the
         // query to be valid, so every row in the group agrees on it.
-        let (first, first_prov): (&[Value], Option<&[(String, u64)]>) = match idxs.first() {
+        let (first, first_prov): (&[Value], Option<&[RowProv]>) = match idxs.first() {
             Some(&i) => (&rows_eff[i].cells, Some(&rows_eff[i].prov)),
             None => (&[], None),
         };
@@ -21341,6 +21478,30 @@ fn eval_grouped(
                     }
                 }
                 return eval_tableoid(q, &scopes, table.as_deref());
+            }
+            // v1.17: `xmin`/`xmax` in grouped evaluation — resolve from
+            // the group's first row provenance, like `tableoid`.
+            if (name == "xmin" || name == "xmax")
+                && matches!(
+                    resolve_col(&[gscope], table.as_deref(), name),
+                    Err(ref e) if e.code == "42703"
+                )
+            {
+                let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(gscope);
+                // If xmin/xmax is a GROUP BY key, use the computed key value.
+                for (i, g) in group_by.iter().enumerate() {
+                    if *g
+                        == (Expr::Column {
+                            table: table.clone(),
+                            name: name.clone(),
+                        })
+                    {
+                        return Ok(key_vals[i].clone());
+                    }
+                }
+                return eval_xmin_xmax(q, &scopes, table.as_deref(), name);
             }
             grouped_col_value(gscope, group_by, key_vals, qual, name)
         }
@@ -22325,7 +22486,9 @@ fn apply_order(
                     let frame = Scope {
                         schema,
                         row: o.full.as_deref().unwrap_or(&[]),
-                        prov: None,
+                        // v1.17: ORDER BY terms may reference xmin/xmax;
+                        // give the fallback scope the row provenance.
+                        prov: Some(&o.prov),
                     };
                     let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
                     scopes.extend_from_slice(outer);
@@ -23866,6 +24029,7 @@ fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Json => ColType::Json,
         E::Record => ColType::Record,
         E::PgLsn => ColType::PgLsn,
+        E::Xid => ColType::Xid,
     }
 }
 
@@ -23935,12 +24099,18 @@ fn eval_tableoid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Valu
             .last()
             .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?,
     };
-    // The provenance's first entry names the source table. For a
-    // partitioned scan this is the leaf partition holding the row;
-    // for a plain table it is the table itself.
+    // The provenance entry names the source table. For a partitioned
+    // scan this is the leaf partition holding the row; for a plain
+    // table it is the table itself. A qualifier picks its own range's
+    // entry (v1.17: previously the first entry was always used, which
+    // was wrong for `b.tableoid` when `b` was not the first range).
     let table_name = sc
         .prov
-        .and_then(|p| p.first().map(|(t, _)| t.as_str()))
+        .and_then(|p| {
+            p.iter()
+                .find(|e| qual.is_none_or(|qn| e.qual == qn))
+                .map(|e| e.table.as_str())
+        })
         .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?;
     let t = q
         .eng
@@ -23948,6 +24118,71 @@ fn eval_tableoid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Valu
         .find_table(table_name, q.snap, q.own, q.session)
         .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?;
     Ok(Value::Int(t.oid as i64))
+}
+
+/// v1.17: `xmin`/`xmax` system columns — the inserting (or
+/// deleting/updating) transaction's id, read from the row's MVCC
+/// version header (PG19's `HeapTupleHeaderData.t_xmin/t_xmax`). Like
+/// `tableoid`, resolved from row provenance when no real column
+/// matches; a user column named `xmin`/`xmax` wins (resolved above).
+/// Values are carried as `Value::Int` — PG's `xidout` renders them as
+/// unsigned decimal (what `value_text` produces for non-negative
+/// integers) and PG's `xideq` is plain integer equality (what `=`
+/// does). `xmax` is 0 for live rows, exactly like PG.
+fn eval_xmin_xmax(
+    q: &mut Q,
+    scopes: &[Scope],
+    qual: Option<&str>,
+    name: &str,
+) -> Result<Value, ExecError> {
+    let missing = || exec_err("42703", format!("column \"{name}\" does not exist"));
+    // Find the target scope: the one matching the qualifier, or the
+    // innermost scope for an unqualified reference (same as tableoid).
+    let sc = match qual {
+        Some(qual_name) => scopes
+            .iter()
+            .rev()
+            .find(|sc| sc.schema.iter().any(|c| c.qual == qual_name))
+            .ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table \"{qual_name}\""),
+                )
+            })?,
+        None => scopes.last().ok_or_else(missing)?,
+    };
+    let prov = sc.prov.ok_or_else(missing)?;
+    // Pick this range's provenance entry. A qualifier selects its own
+    // range (v1.17 `RowProv.qual`); an unqualified reference with more
+    // than one range is ambiguous in PG (42702).
+    let entry = match qual {
+        Some(qual_name) => prov
+            .iter()
+            .find(|e| e.qual == qual_name)
+            .ok_or_else(missing)?,
+        None => {
+            let mut quals: Vec<&str> = Vec::new();
+            for e in prov {
+                if !quals.contains(&e.qual.as_str()) {
+                    quals.push(e.qual.as_str());
+                }
+            }
+            if quals.len() > 1 {
+                return Err(exec_err(
+                    "42702",
+                    format!("column reference \"{name}\" is ambiguous"),
+                ));
+            }
+            prov.first().ok_or_else(missing)?
+        }
+    };
+    let rv = q
+        .eng
+        .db
+        .find_row_version(entry.row_id)
+        .ok_or_else(missing)?;
+    let xid = if name == "xmax" { rv.xmax } else { rv.xmin };
+    Ok(Value::Int(xid as i64))
 }
 
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
@@ -23966,6 +24201,19 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     if e.code == "42703" && name == "tableoid" {
                         if let Ok(v) = eval_tableoid(q, scopes, table.as_deref()) {
                             return Ok(v);
+                        }
+                    }
+                    // v1.17: `xmin`/`xmax` system columns — the row's
+                    // MVCC version header. Same fallback position as
+                    // `tableoid`: a user column wins (resolved above).
+                    // A 42702 (ambiguous) or other error from the
+                    // system-column path propagates; only a 42703
+                    // (no provenance) falls back to the original error.
+                    if e.code == "42703" && (name == "xmin" || name == "xmax") {
+                        match eval_xmin_xmax(q, scopes, table.as_deref(), name) {
+                            Ok(v) => return Ok(v),
+                            Err(e2) if e2.code == "42703" => {}
+                            Err(e2) => return Err(e2),
                         }
                     }
                     // v0.73: PG19 whole-row fallback — a bare identifier
@@ -28482,6 +28730,32 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             }
             return Err(exec_err("42846", "cannot cast to pg_lsn"));
         }
+        // v1.17: cast to xid (from integer or unsigned-decimal text,
+        // like PG's xidin; `SELECT 123::xid` works in PG).
+        ColType::Xid => {
+            // Identity: already an xid (carried as Value::Int).
+            if let Value::Int(i) = v {
+                return Ok(Value::Int(*i));
+            }
+            // Text: parse unsigned decimal (PG's xidin).
+            if let Value::Text(t) = v {
+                let s = t.to_string();
+                let n = s.parse::<u64>().map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type xid: \"{s}\""),
+                    )
+                })?;
+                return Ok(Value::Int(n as i64));
+            }
+            // SmallInt/BigInt: widen (PG casts int2/int8 to xid).
+            match v {
+                Value::SmallInt(s) => return Ok(Value::Int(*s as i64)),
+                Value::BigInt(b) => return Ok(Value::Int(*b)),
+                _ => {}
+            }
+            return Err(exec_err("42846", "cannot cast to xid"));
+        }
         // v0.35: explicit casts to character(n) / varchar(n): silent
         // truncation of any excess, blank-padding for char. A bpchar
         // source keeps its padding for char targets (PG's bpchar()
@@ -30020,7 +30294,7 @@ fn pg_column_compression_value(
             quals.push(c.qual.as_str());
         }
     }
-    let (table_name, row_id) = match quals
+    let entry = match quals
         .iter()
         .position(|qq| *qq == qcol.qual.as_str())
         .and_then(|pi| prov.get(pi))
@@ -30028,13 +30302,14 @@ fn pg_column_compression_value(
         Some(p) => p,
         None => return Ok(Value::Null),
     };
+    let (table_name, row_id) = (entry.table.as_str(), entry.row_id);
     let t = match q.eng.db.find_table(table_name, q.snap, q.own, q.session) {
         Some(t) => t,
         None => return Ok(Value::Null),
     };
     // The exact row version by id (it is the row under evaluation, so
     // no duplicate-value confusion is possible).
-    let rv = match t.rows.iter().find(|r| r.id == *row_id) {
+    let rv = match t.rows.iter().find(|r| r.id == row_id) {
         Some(rv) => rv,
         None => return Ok(Value::Null),
     };
@@ -37219,6 +37494,11 @@ fn expr_type(
                     if name == "tableoid" {
                         return Ok(ColType::Int);
                     }
+                    // v1.17: `xmin`/`xmax` system columns — typed as xid
+                    // (OID 28), like PG.
+                    if name == "xmin" || name == "xmax" {
+                        return Ok(ColType::Xid);
+                    }
                     match resolve_col(&oscopes, table.as_deref(), name) {
                         Ok((si, ci)) => Ok(outer[si][ci].ty.clone()),
                         Err(e2) => {
@@ -38710,6 +38990,15 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::BigInt)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v1.17: parameter input for xid goes through xidin (unsigned
+        // decimal, like PG).
+        ColType::Xid => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            s.trim()
+                .parse::<u64>()
+                .map(|w| Value::Int(w as i64))
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
         ColType::Float => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
@@ -39224,6 +39513,8 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Regclass => Value::Text("".into()),
         ColType::Name => Value::text(""),  // v0.57
         ColType::PgLsn => Value::PgLsn(0), // v0.64
+        // v1.17: xids are carried as Value::Int.
+        ColType::Xid => Value::Int(0),
         // v0.73: records never appear as parameter types in practice;
         // the empty record is the honest dummy.
         ColType::Record => Value::Record(Vec::new()),
@@ -52228,5 +52519,111 @@ mod v112_empty_select_tests {
             "message={}",
             err.message
         );
+    }
+
+    /// v1.17: `xmin`/`xmax` system columns — the row's MVCC version
+    /// header. `xmin` is the inserting transaction's id, `xmax` is 0
+    /// for live rows (like PG19).
+    #[test]
+    fn v117_xmin_xmax_basic() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE xt (a int);").unwrap();
+        run(&mut eng, "INSERT INTO xt VALUES (1), (2);").unwrap();
+        // xmin is the inserting xid (positive), xmax is 0 for live rows.
+        let r = run(&mut eng, "SELECT xmin, xmax FROM xt ORDER BY a;").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let xmin: i64 = row[0].parse().unwrap();
+            assert!(xmin > 0, "xmin={}", row[0]);
+            assert_eq!(row[1], "0");
+        }
+        // Both rows were inserted by the same statement: same xmin.
+        assert_eq!(rows[0][0], rows[1][0]);
+    }
+
+    /// v1.17: qualified `a.xmin = b.xmin` across a self-join — the
+    /// qualifier picks its own range's row (the three conformance
+    /// statements that motivated v1.17).
+    #[test]
+    fn v117_xmin_self_join_qualified() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE xsj (a int);").unwrap();
+        run(&mut eng, "INSERT INTO xsj VALUES (6), (8), (10), (12);").unwrap();
+        // All rows inserted by one statement: every pair shares xmin.
+        let r = run(
+            &mut eng,
+            "SELECT a.xmin = b.xmin FROM xsj a, xsj b WHERE a.a=6 AND b.a=8;",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["t".to_string()]]);
+        let r = run(
+            &mut eng,
+            "SELECT a.xmin = b.xmin FROM xsj a, xsj b WHERE a.a=10 AND b.a=10;",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["t".to_string()]]);
+        // xmax is 0 for all live rows, so xmax equality holds too.
+        let r = run(
+            &mut eng,
+            "SELECT a.xmax = b.xmax FROM xsj a, xsj b WHERE a.a=6 AND b.a=8;",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec!["t".to_string()]]);
+    }
+
+    /// v1.17: qualifiers distinguish ranges over different tables —
+    /// each side reports its own inserting xid. (The `run` harness uses
+    /// a fixed xid, so rows are built directly with distinct xmins.)
+    #[test]
+    fn v117_xmin_qualifier_picks_range() {
+        use crate::storage::{Row, RowVersion, Table};
+        let mut eng = engine();
+        // The v112 module's engine() leaves next_xid at 1; bump it so
+        // manually-created tables (created_xmin=1) are visible.
+        eng.txns.next_xid = 30;
+        let mut t1 = Table::new(vec![("a".to_string(), ColType::Int)], 1);
+        t1.push_version(RowVersion::plain(100, Row::new(vec![Value::Int(1)]), 11));
+        let mut t2 = Table::new(vec![("b".to_string(), ColType::Int)], 1);
+        t2.push_version(RowVersion::plain(200, Row::new(vec![Value::Int(2)]), 22));
+        eng.db.tables.insert("xq1".to_string(), vec![t1]);
+        eng.db.tables.insert("xq2".to_string(), vec![t2]);
+        // Different inserting xids: xmin equality is false.
+        let r = run(&mut eng, "SELECT a.xmin = b.xmin FROM xq1 a, xq2 b;").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["f".to_string()]]);
+        // Each qualifier reports its own table's xmin.
+        let r = run(&mut eng, "SELECT a.xmin, b.xmin FROM xq1 a, xq2 b;").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["11".to_string(), "22".to_string()]]);
+    }
+
+    /// v1.17: unqualified `xmin` over a join is ambiguous (42702, like
+    /// PG19); a user column named `xmin` wins over the system column.
+    #[test]
+    fn v117_xmin_ambiguous_and_shadowed() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE xa (a int);").unwrap();
+        run(&mut eng, "INSERT INTO xa VALUES (1);").unwrap();
+        let err = run(&mut eng, "SELECT xmin FROM xa p, xa q;").unwrap_err();
+        assert_eq!(err.code, "42702");
+        // A user column named xmin shadows the system column.
+        run(&mut eng, "CREATE TABLE xsh (xmin int);").unwrap();
+        run(&mut eng, "INSERT INTO xsh VALUES (42);").unwrap();
+        let r = run(&mut eng, "SELECT xmin FROM xsh;").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["42".to_string()]]);
+    }
+
+    /// v1.17: `xmax` reflects the deleting transaction — after DELETE,
+    /// the surviving rows still show xmax 0 (like PG19's live tuples).
+    #[test]
+    fn v117_xmax_after_delete() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE xd (a int);").unwrap();
+        run(&mut eng, "INSERT INTO xd VALUES (1), (2);").unwrap();
+        run(&mut eng, "DELETE FROM xd WHERE a = 1;").unwrap();
+        let r = run(&mut eng, "SELECT a, xmax FROM xd;").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "2");
+        assert_eq!(rows[0][1], "0");
     }
 }
