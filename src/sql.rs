@@ -1446,6 +1446,9 @@ pub struct SelectStmt {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub for_update: bool,
+    /// v1.14: `FOR UPDATE OF tbl [, ...]` — the locking targets (PG19).
+    /// Empty when absent or for bare `FOR UPDATE` (which locks all tables).
+    pub for_update_of: Vec<String>,
     /// v0.44: set-operation root when this statement is the carrier of a
     /// `UNION` / `INTERSECT` / `EXCEPT` query. When `Some`, the fields
     /// above are empty/ignored and the query is `set_op`'s branches.
@@ -1479,6 +1482,7 @@ fn empty_select() -> SelectStmt {
         limit: None,
         offset: None,
         for_update: false,
+        for_update_of: Vec::new(),
         set_op: None,
     }
 }
@@ -11933,6 +11937,7 @@ impl Parser {
             limit: None,
             offset: None,
             for_update: false,
+            for_update_of: Vec::new(),
             set_op: None,
         })
     }
@@ -12049,10 +12054,27 @@ impl Parser {
         } else {
             false
         };
+        // v1.14: `FOR UPDATE OF tbl [, ...]` (PG19). The table names are
+        // validated against the FROM items by the executor.
+        let for_update_of = if for_update && self.eat_keyword("of") {
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            names
+        } else {
+            Vec::new()
+        };
         sel.order_by = order_by;
         sel.limit = limit;
         sel.offset = offset;
         sel.for_update = for_update;
+        sel.for_update_of = for_update_of;
         Ok(())
     }
 
@@ -12412,6 +12434,7 @@ impl Parser {
             carrier.limit = tail.limit;
             carrier.offset = tail.offset;
             carrier.for_update = tail.for_update;
+            carrier.for_update_of = tail.for_update_of;
         }
         Ok(carrier)
     }
@@ -13948,11 +13971,13 @@ fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
             )));
         }
     };
-    if sel.for_update {
+    if sel.for_update && sel.for_update_of.is_empty() {
         return Some(Err(err(
             "SELECT FOR UPDATE is not allowed in a view".to_string()
         )));
     }
+    // v1.14: `FOR UPDATE OF tbl` is allowed in a view (PG19); only bare
+    // `FOR UPDATE` is rejected.
     let mut deps = Vec::new();
     collect_table_refs(&sel, &mut deps);
     deps.sort();
@@ -15852,5 +15877,56 @@ mod v109_function_tests {
         // v1.09: only volatility actions are supported; STRICT etc. are 0A000.
         let err = parse_statement("ALTER FUNCTION f(int) STRICT;").expect_err("should fail");
         assert_eq!(err.code, "0A000", "message: {}", err.message);
+    }
+}
+
+#[cfg(test)]
+mod for_update_of_tests {
+    use super::*;
+
+    fn select_stmt(sql: &str) -> SelectStmt {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Select(s) => s,
+            other => panic!("expected SELECT, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_for_update_has_empty_of() {
+        // v1.14: bare FOR UPDATE leaves for_update_of empty.
+        let s = select_stmt("select a from t for update");
+        assert!(s.for_update);
+        assert!(s.for_update_of.is_empty());
+    }
+
+    #[test]
+    fn for_update_of_single_table() {
+        // v1.14: FOR UPDATE OF tbl parses the target list.
+        let s = select_stmt("select a from t1, t2 for update of t1");
+        assert!(s.for_update);
+        assert_eq!(s.for_update_of, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn for_update_of_multiple_tables() {
+        // v1.14: comma-separated OF list.
+        let s = select_stmt("select a from t1, t2 for update of t1, t2");
+        assert!(s.for_update);
+        assert_eq!(s.for_update_of, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[test]
+    fn for_update_of_alias() {
+        // v1.14: OF names may be aliases.
+        let s = select_stmt("select a from t1 as x for update of x");
+        assert_eq!(s.for_update_of, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn no_for_update_no_of() {
+        // v1.14: without FOR UPDATE there is no OF list.
+        let s = select_stmt("select a from t");
+        assert!(!s.for_update);
+        assert!(s.for_update_of.is_empty());
     }
 }

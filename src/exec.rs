@@ -14319,6 +14319,27 @@ fn from_refs_table(f: &FromItem, name: &str) -> bool {
     }
 }
 
+/// v1.14: collect the base table names reachable from FROM items (for
+/// `FOR UPDATE OF` lock targeting). Derived subqueries are expanded
+/// recursively; joins contribute their inner tables.
+fn collect_base_tables(from: &[FromItem], out: &mut Vec<String>) {
+    for item in from {
+        match item {
+            FromItem::Table { name, .. } => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            FromItem::Derived { sub, .. } => collect_base_tables(&sub.from, out),
+            FromItem::Join { left, right, .. } => {
+                collect_base_tables(std::slice::from_ref(left), out);
+                collect_base_tables(std::slice::from_ref(right), out);
+            }
+            FromItem::Values { .. } | FromItem::Function { .. } => {}
+        }
+    }
+}
+
 fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
     if let Some(n) = stmt.limit {
         if n < 0 {
@@ -14552,8 +14573,54 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         orows.truncate(n as usize);
     }
     if stmt.for_update {
+        // v1.14: `FOR UPDATE OF tbl [, ...]` locks only the listed tables'
+        // rows; bare `FOR UPDATE` locks all. OF names are resolved to base
+        // table names (subquery aliases expand to their inner tables).
+        let targets: Option<Vec<String>> = if stmt.for_update_of.is_empty() {
+            None
+        } else {
+            let mut tables = Vec::new();
+            for name in &stmt.for_update_of {
+                let mut stack: Vec<&FromItem> = stmt.from.iter().collect();
+                while let Some(item) = stack.pop() {
+                    match item {
+                        FromItem::Table {
+                            name: tname, alias, ..
+                        } if alias.as_deref().unwrap_or(tname) == name => {
+                            if !tables.contains(tname) {
+                                tables.push(tname.clone());
+                            }
+                        }
+                        FromItem::Derived { alias, sub, .. } if alias == name => {
+                            collect_base_tables(&sub.from, &mut tables);
+                        }
+                        FromItem::Join {
+                            left,
+                            right,
+                            kind,
+                            alias,
+                            using_alias,
+                            ..
+                        } if alias.is_none()
+                            && using_alias.is_none()
+                            && *kind == JoinKind::Cross =>
+                        {
+                            stack.push(left);
+                            stack.push(right);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(tables)
+        };
         for o in &orows {
             for (t, id) in &o.prov {
+                if let Some(ref allowed) = targets {
+                    if !allowed.iter().any(|a| a == t) {
+                        continue;
+                    }
+                }
                 if !q.lock_ids.iter().any(|(_, x)| x == id) {
                     q.lock_ids.push((t.clone(), *id));
                 }
@@ -14699,6 +14766,79 @@ fn validate_select(stmt: &SelectStmt) -> Result<(), ExecError> {
                 "0A000",
                 "FOR UPDATE is not allowed with aggregate functions",
             ));
+        }
+        // v1.14: `FOR UPDATE OF tbl [, ...]` — each name must resolve to
+        // a top-level FROM item; joins cannot be locked (PG19). A comma-
+        // separated FROM list parses as CROSS JOINs, so we recurse into
+        // unaliased CROSS joins to find plain tables.
+        for name in &stmt.for_update_of {
+            let mut found = false;
+            let mut is_join = false;
+            let mut stack: Vec<&FromItem> = stmt.from.iter().collect();
+            while let Some(item) = stack.pop() {
+                match item {
+                    FromItem::Table {
+                        name: tname, alias, ..
+                    } => {
+                        if alias.as_deref().unwrap_or(tname) == name {
+                            found = true;
+                            break;
+                        }
+                    }
+                    FromItem::Derived { alias, .. } => {
+                        if alias == name {
+                            found = true;
+                            break;
+                        }
+                    }
+                    FromItem::Values { alias, .. } => {
+                        if alias == name {
+                            found = true;
+                            break;
+                        }
+                    }
+                    FromItem::Function { alias, .. } => {
+                        if alias.as_deref() == Some(name.as_str()) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    FromItem::Join {
+                        left,
+                        right,
+                        kind,
+                        using_alias,
+                        alias,
+                        ..
+                    } => {
+                        if using_alias.as_deref() == Some(name.as_str())
+                            || alias.as_deref() == Some(name.as_str())
+                        {
+                            found = true;
+                            is_join = true;
+                            break;
+                        }
+                        // Recurse into unaliased CROSS JOINs (comma-separated
+                        // FROM items); an explicitly aliased join is opaque.
+                        if alias.is_none() && using_alias.is_none() && *kind == JoinKind::Cross {
+                            stack.push(left);
+                            stack.push(right);
+                        }
+                    }
+                }
+            }
+            if !found {
+                return Err(exec_err(
+                    "42P01",
+                    format!(
+                        "relation \"{}\" in FOR UPDATE clause not found in FROM clause",
+                        name
+                    ),
+                ));
+            }
+            if is_join {
+                return Err(exec_err("0A000", "FOR UPDATE cannot be applied to a join"));
+            }
         }
     }
     Ok(())
