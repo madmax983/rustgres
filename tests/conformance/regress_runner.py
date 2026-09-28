@@ -882,6 +882,18 @@ EXPECTED_PASS_OVERRIDES = [
     # statement using these functions must pass.
     (r"(?i)\bquote_(ident|literal|nullable)\s*\(",
      "v1.15: quote_*() supported"),
+    # v1.16: declarative partitioning is supported (RANGE/LIST/HASH,
+    # expression keys, defaults, multilevel routing, ATTACH, parent
+    # UPDATE/DELETE, ON CONFLICT, triggers during routing). The four
+    # broad "declarative partitioning unsupported" masks are removed;
+    # any statement using these DDL shapes must pass. Excludes:
+    # EXPLAIN (stays masked), and statements that fail for unrelated
+    # reasons (they classify under their own masks, e.g. the v1.13
+    # pg_attribute/CTE-DML residuals).
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r".*(\bpartition\s+by\b|\battach\s+partition\b"
+     r"|\bpartition\s+of\b|\bfor\s+values\s+(in|from|with)\b)",
+     "v1.16: declarative partitioning supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
@@ -915,10 +927,8 @@ EXPECTED_FAIL_PATTERNS = [
     (r"^\s*create\s+trigger\b", "CREATE TRIGGER unsupported"),
     (r"^\s*create\s+extension\b", "CREATE EXTENSION unsupported"),
     (r"^\s*create\s+tablespace\b", "CREATE TABLESPACE unsupported"),
-    (r"^\s*create\s+table\b.*\bpartition\s+by\b", "declarative partitioning unsupported"),
-    (r"\battach\s+partition\b", "declarative partitioning unsupported"),
-    (r"\bpartition\s+of\b", "declarative partitioning unsupported"),
-    (r"\bfor\s+values\s+in\b", "declarative partitioning unsupported"),
+    # v1.16: the four "declarative partitioning unsupported" masks are
+    # removed; partitioning is supported (see EXPECTED_PASS_OVERRIDES).
     (r"^\s*do\b", "DO blocks (plpgsql) unsupported"),
     (r"^\s*listen\b|^\s*notify\b|^\s*unlisten\b", "LISTEN/NOTIFY unsupported"),
     (r"^\s*copy\b", "COPY TO/FROM stdout not covered by this harness"),

@@ -2391,11 +2391,17 @@ fn find_partition_leaf(
                 )
             };
             if cinfo.children.is_empty() {
-                // v0.72: a childless *partitioned* table holds no rows —
-                // skip it (the row falls through to the DEFAULT
-                // partition or 23514, like PG19).
+                // v1.16: a childless *partitioned* table holds no rows —
+                // but PG19 commits to the matched partition: the 23514
+                // names the matched child (e.g. "no partition of
+                // relation mlparted5_cd found for row"), it does NOT
+                // fall through to siblings or the DEFAULT partition.
+                // (v0.72 used `continue` here, misnaming the parent.)
                 if cinfo.is_partitioned {
-                    continue;
+                    return Err(exec_err(
+                        "23514",
+                        format!("no partition of relation \"{}\" found for row", child_name),
+                    ));
                 }
                 return Ok(child_name.clone());
             }
@@ -52179,5 +52185,48 @@ mod v112_empty_select_tests {
         assert_eq!(one("SELECT pg_size_pretty(1048576);"), "1024 kB");
         assert_eq!(one("SELECT pg_size_pretty(10485760);"), "10 MB");
         assert_eq!(one("SELECT pg_size_pretty(NULL);"), "NULL");
+    }
+
+    /// v1.16: routing into a childless *partitioned* intermediate names
+    /// the matched child in the 23514 (PG19 commits to the matched
+    /// partition; it does not fall through to siblings or DEFAULT).
+    #[test]
+    fn v116_childless_intermediate_names_child() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE mp (a int, b int, c text, d int) PARTITION BY RANGE (a, b);",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE mp5 PARTITION OF mp FOR VALUES FROM (1, 40) TO (1, 50) PARTITION BY RANGE (c);",
+        )
+        .unwrap();
+        // mp5_cd is a partitioned table with no partitions.
+        run(
+            &mut eng,
+            "CREATE TABLE mp5_cd PARTITION OF mp5 FOR VALUES FROM ('c') TO ('e') PARTITION BY LIST (c);",
+        )
+        .unwrap();
+        // Row matches mp5_cd's bound but mp5_cd has no leaves: PG19
+        // reports the matched child, not the parent.
+        let err = run(&mut eng, "INSERT INTO mp VALUES (1, 45, 'c', 1);").unwrap_err();
+        assert_eq!(err.code, "23514");
+        assert!(
+            err.message
+                .contains("no partition of relation \"mp5_cd\" found for row"),
+            "message={}",
+            err.message
+        );
+        // Row matches no child of mp5: the parent is named.
+        let err = run(&mut eng, "INSERT INTO mp VALUES (1, 45, 'f', 1);").unwrap_err();
+        assert_eq!(err.code, "23514");
+        assert!(
+            err.message
+                .contains("no partition of relation \"mp5\" found for row"),
+            "message={}",
+            err.message
+        );
     }
 }
