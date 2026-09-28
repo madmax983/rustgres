@@ -19818,9 +19818,15 @@ fn build_source(
                     }
                     all_rows
                 } else if let Some(hint) = order_hint {
+                    // v1.18: temp indexes live in the session-local map
+                    // (same pattern as the IndexScan arm below); the global
+                    // lookup alone panicked on temp tables, killing the
+                    // connection for `SELECT ... ORDER BY` on a temp index.
                     let ix = db
-                        .indexes
-                        .get(&hint.index)
+                        .temp_indexes
+                        .get(&q.session)
+                        .and_then(|m| m.get(&hint.index))
+                        .or_else(|| db.indexes.get(&hint.index))
                         .expect("planned index still present; engine lock held throughout");
                     index_order_rows(
                         ix,
@@ -43468,6 +43474,91 @@ mod tests {
         let live = pt.last().unwrap();
         assert!(live.column_index("v").is_some());
         assert_eq!(live.rows.len(), 1);
+    }
+
+    /// v1.18: index-ordered scan over a TEMP table's index. The ORDER BY fast
+    /// path (`OrderHint`) looked the planned index up only in the global map,
+    /// but temp indexes live in the session-local map — the lookup returned
+    /// `None` and the server thread panicked, killing the connection
+    /// (select.sql `SELECT * FROM foo ORDER BY f1` wedges).
+    #[test]
+    fn v118_temp_index_order_scan_asc() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t118a (f1 int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO t118a VALUES (42),(3),(10),(7),(null),(null),(1)",
+        )
+        .unwrap();
+        run(&mut eng, "CREATE INDEX t118a_i ON t118a (f1)").unwrap();
+        // ASC with PG-default NULLS LAST, served from the temp index.
+        let got = rows_of(run(&mut eng, "SELECT f1 FROM t118a ORDER BY f1").unwrap());
+        let want: Vec<Vec<String>> = ["1", "3", "7", "10", "42", "NULL", "NULL"]
+            .iter()
+            .map(|s| s.to_string())
+            .map(|s| vec![s])
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// v1.18: temp index-ordered scan, DESC (PG-default NULLS FIRST).
+    /// Second wedging shape in select.sql (`ORDER BY f1 DESC`).
+    #[test]
+    fn v118_temp_index_order_scan_desc() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t118d (f1 int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO t118d VALUES (42),(3),(10),(7),(null),(null),(1)",
+        )
+        .unwrap();
+        run(&mut eng, "CREATE INDEX t118d_i ON t118d (f1)").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT f1 FROM t118d ORDER BY f1 DESC").unwrap());
+        let want: Vec<Vec<String>> = ["NULL", "NULL", "42", "10", "7", "3", "1"]
+            .iter()
+            .map(|s| vec![s.to_string()])
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// v1.18: temp ORDER BY with LIMIT goes through the early-limit
+    /// index-order path (same `OrderHint` arm).
+    #[test]
+    fn v118_temp_index_order_scan_limit() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t118l (f1 int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO t118l VALUES (42),(3),(10),(7),(null),(null),(1)",
+        )
+        .unwrap();
+        run(&mut eng, "CREATE INDEX t118l_i ON t118l (f1)").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT f1 FROM t118l ORDER BY f1 LIMIT 3").unwrap());
+        let want: Vec<Vec<String>> = ["1", "3", "7"]
+            .iter()
+            .map(|s| vec![s.to_string()])
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// v1.18: explicit NULLS FIRST on an ASC temp index — the hint declines
+    /// (null placement mismatch) and the sort fallback stays correct.
+    #[test]
+    fn v118_temp_index_order_scan_nulls_first_fallback() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TEMP TABLE t118n (f1 int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO t118n VALUES (42),(3),(10),(7),(null),(null),(1)",
+        )
+        .unwrap();
+        run(&mut eng, "CREATE INDEX t118n_i ON t118n (f1)").unwrap();
+        let got = rows_of(run(&mut eng, "SELECT f1 FROM t118n ORDER BY f1 NULLS FIRST").unwrap());
+        let want: Vec<Vec<String>> = ["NULL", "NULL", "1", "3", "7", "10", "42"]
+            .iter()
+            .map(|s| vec![s.to_string()])
+            .collect();
+        assert_eq!(got, want);
     }
 
     /// v0.77: quantified comparisons over an empty set — `= ANY` is
