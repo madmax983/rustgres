@@ -102,6 +102,16 @@ fn sql_err(e: SqlError) -> ExecError {
 pub struct StmtCtx<'a> {
     pub snap: &'a Snapshot,
     pub own: u64,
+    /// v1.21: xid to stamp on NEW row versions (xmin/xmax) and DDL MVCC
+    /// fields. Inside a savepoint scope this is the scope's sub-xid
+    /// (PG19's subtransaction xid); otherwise it equals `own`. `own`
+    /// (the top-level xid) remains the visibility identity.
+    pub write_xid: u64,
+    /// v1.21: every xid owned by the transaction (top + sub-xids), for
+    /// visibility checks. A transaction must see rows stamped with any
+    /// of its sub-xids, even under RepeatableRead where the snapshot
+    /// predates the sub-xid allocation.
+    pub all_xids: Vec<u64>,
     pub level: IsolationLevel,
     pub writes: &'a mut Vec<WriteOp>,
     /// v0.9: server-assigned session id, for session-local `currval`.
@@ -204,7 +214,7 @@ fn require_table_priv(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own, ctx.session) {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
         let have = crate::storage::table_privs(&eng.db, ctx.role, t, ctx.snap, ctx.own);
         if have & privs != privs {
             return Err(exec_err(
@@ -230,7 +240,7 @@ fn require_column_privs(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own, ctx.session) {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
         let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
         for c in columns {
             if !t.columns.iter().any(|(n, _)| n == c) {
@@ -255,7 +265,7 @@ fn require_column_privs(
 
 /// Require owner-or-superuser on a table (DDL).
 fn require_table_owner(eng: &Engine, ctx: &StmtCtx, table: &str) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, ctx.own, ctx.session) {
+    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
         if t.owner != ctx.role
             && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
         {
@@ -380,6 +390,7 @@ fn execute_inner(
                     eng,
                     snap: ctx.snap,
                     own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
                     session: ctx.session,
                     role: ctx.role,
                     read_only: ctx.read_only,
@@ -766,7 +777,7 @@ fn create_serial_sequence(
     while eng.db.find_sequence(&name, ctx.snap, ctx.own).is_some()
         || eng
             .db
-            .find_table(&name, ctx.snap, ctx.own, ctx.session)
+            .find_table(&name, ctx.snap, &ctx.all_xids, ctx.session)
             .is_some()
         || eng.db.find_view(&name, ctx.snap, ctx.own).is_some()
     {
@@ -863,7 +874,7 @@ fn build_partition_info(
         // PARTITION OF: inherit method/key/columns from the parent.
         let parent = eng
             .db
-            .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -1189,7 +1200,7 @@ fn check_bound_no_overlap(
     for child_name in &pinfo.children {
         let child = eng
             .db
-            .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("child still visible");
         let cinfo = child.partition.as_ref().expect("child is partitioned");
         let cbound = cinfo.bound.as_ref().expect("child has bound");
@@ -1209,7 +1220,7 @@ fn check_bound_no_overlap(
         for child_name in &pinfo.children {
             let child = eng
                 .db
-                .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("child still visible");
             if child
                 .partition
@@ -1394,7 +1405,7 @@ fn commit_table_version(
     let versions = eng.db.tables.get_mut(name).expect("table still visible");
     let old_live = versions
         .iter_mut()
-        .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+        .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
         .expect("table still visible");
     old_live.dropped_xmax = ctx.own;
     next.rows = std::mem::take(&mut old_live.rows);
@@ -1424,7 +1435,7 @@ fn parent_link_child(
 ) {
     let prev = eng
         .db
-        .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("parent still visible")
         .clone();
     let mut next = prev.clone();
@@ -1455,7 +1466,7 @@ fn attach_partition(
     let (pinfo, parent_cols) = {
         let parent = eng
             .db
-            .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -1476,7 +1487,7 @@ fn attach_partition(
     let (child_cols, child_pinfo) = {
         let child = eng
             .db
-            .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -1524,7 +1535,7 @@ fn attach_partition(
     // Convert and validate the bound.
     let parent_for_bound = eng
         .db
-        .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("parent still visible");
     let bound = convert_part_bound(eng, ctx, bound_def, parent_for_bound, &pinfo)?;
     check_bound_no_overlap(eng, ctx, parent_name, &pinfo, &bound, child_name)?;
@@ -1535,12 +1546,12 @@ fn attach_partition(
         let rows: Vec<Row> = {
             let child = eng
                 .db
-                .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("child still visible");
             child
                 .rows
                 .iter()
-                .filter(|rv| row_visible(rv, ctx.snap, ctx.own))
+                .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
                 .map(|rv| rv.values.clone())
                 .collect()
         };
@@ -1590,7 +1601,7 @@ fn attach_partition(
     };
     let prev = eng
         .db
-        .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("child still visible")
         .clone();
     let mut next = prev.clone();
@@ -1620,7 +1631,7 @@ fn alter_inherit(
     require_table_owner(eng, ctx, parent_name)?;
     let child = eng
         .db
-        .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| {
             exec_err(
                 "42P01",
@@ -1630,7 +1641,7 @@ fn alter_inherit(
         .clone();
     let parent = eng
         .db
-        .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| {
             exec_err(
                 "42P01",
@@ -1862,7 +1873,7 @@ fn collect_partition_leaves(
     let mut leaves = Vec::new();
     let mut stack = vec![table.to_string()];
     while let Some(name) = stack.pop() {
-        if let Some(t) = db.find_table(&name, snap, own, session) {
+        if let Some(t) = db.find_table(&name, snap, &[own], session) {
             if let Some(p) = &t.partition {
                 if p.children.is_empty() {
                     // v0.72: a childless *partitioned* table holds no
@@ -1923,7 +1934,7 @@ fn route_partition_inserts(
     let (pinfo, table_cols) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("target still visible");
         match &t.partition {
             Some(p) => (p.clone(), t.columns.clone()),
@@ -1966,7 +1977,7 @@ fn route_partition_inserts(
         let leaf_cols = {
             let lt = eng
                 .db
-                .find_table(&leaf_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(&leaf_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("leaf still visible");
             lt.columns.clone()
         };
@@ -1996,7 +2007,7 @@ fn route_partition_inserts(
         let leaf_pinfo = {
             let lt = eng
                 .db
-                .find_table(&leaf_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(&leaf_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("leaf still visible");
             lt.partition.clone().expect("leaf is partitioned")
         };
@@ -2044,7 +2055,7 @@ fn fire_before_insert_triggers(
     let firing: Vec<TriggerDef> = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible");
         t.triggers
             .iter()
@@ -2232,6 +2243,7 @@ fn eval_partition_key_expr(
         eng,
         snap,
         own,
+        all_xids: vec![own],
         session,
         depth: 0,
         lock_ids: &mut lock_ids,
@@ -2312,7 +2324,7 @@ fn explicit_sibling_accepts(
         }
         let Some(child) = eng
             .db
-            .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
         else {
             // v0.70: tolerate stale links (a rolled-back CREATE can leave
             // a dangling child name behind).
@@ -2360,7 +2372,7 @@ fn find_partition_leaf(
         for child_name in &pinfo.children {
             let Some(child) = eng
                 .db
-                .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
             else {
                 continue;
             };
@@ -2383,7 +2395,7 @@ fn find_partition_leaf(
             let (cinfo, child_cols) = {
                 let child = eng
                     .db
-                    .find_table(child_name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("child still visible");
                 (
                     child.partition.clone().expect("child still partitioned"),
@@ -2441,7 +2453,7 @@ fn check_leaf_bound(
         let (parent_cols, parent_pinfo) = {
             let parent = eng
                 .db
-                .find_table(&parent_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("parent still visible");
             (
                 parent.columns.clone(),
@@ -2520,7 +2532,7 @@ fn expand_like_clauses(
     for lc in &likes {
         let src = eng
             .db
-            .find_table(&lc.source, ctx.snap, ctx.own, ctx.session)
+            .find_table(&lc.source, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -2777,7 +2789,7 @@ fn create_table_from_def(
             }
             let parent = eng
                 .db
-                .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| {
                     exec_err(
                         "42P01",
@@ -3027,7 +3039,7 @@ fn create_table_from_def(
             if let Some(parent_name) = &pdef.parent {
                 let parent = eng
                     .db
-                    .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                     .ok_or_else(|| {
                         exec_err(
                             "42P01",
@@ -3101,7 +3113,7 @@ fn create_table_from_def(
             if eng.db.is_temp_table(ctx.session, &parent_name) {
                 if let Some(pp) =
                     eng.db
-                        .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+                        .find_table_mut(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 {
                     if let Some(pi) = pp.partition.as_mut() {
                         pi.children.push(name.to_string());
@@ -3131,7 +3143,7 @@ fn create_table_from_def(
     }
     if eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .is_some()
         || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
     {
@@ -3150,7 +3162,7 @@ fn create_table_from_def(
         if let Some(parent_name) = &pdef.parent {
             let parent = eng
                 .db
-                .find_table(parent_name, ctx.snap, ctx.own, ctx.session)
+                .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| {
                     exec_err(
                         "42P01",
@@ -3213,7 +3225,7 @@ fn create_table_from_def(
             if eng.db.is_temp_table(ctx.session, parent_name) {
                 if let Some(pp) = eng
                     .db
-                    .find_table_mut(parent_name, ctx.snap, ctx.own, ctx.session)
+                    .find_table_mut(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 {
                     if let Some(pi) = pp.partition.as_mut() {
                         pi.children.push(name.to_string());
@@ -3283,7 +3295,7 @@ fn validate_fk_def(
 ) -> Result<(), ExecError> {
     let child = eng
         .db
-        .find_table(child_table, ctx.snap, ctx.own, ctx.session)
+        .find_table(child_table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| {
             exec_err(
                 "42P01",
@@ -3303,7 +3315,7 @@ fn validate_fk_def(
     }
     let parent = eng
         .db
-        .find_table(&fk.ref_table, ctx.snap, ctx.own, ctx.session)
+        .find_table(&fk.ref_table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| {
             exec_err(
                 "42P01",
@@ -3398,13 +3410,13 @@ fn create_constraint_index(
 ) -> Result<(), ExecError> {
     let t = eng
         .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("table still visible; engine lock held throughout");
     // v0.70: per-partition index names for partition children (see
     // `constraint_index_name`).
     let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
     let ix_name = constraint_index_name(table, cname, is_child);
-    if eng.db.find_index(&ix_name, ctx.snap, ctx.own).is_some() {
+    if eng.db.find_index(&ix_name, ctx.snap, &ctx.all_xids).is_some() {
         return Err(exec_err(
             "42P07",
             format!("relation \"{}\" already exists", ix_name),
@@ -3528,6 +3540,7 @@ fn eval_default(
                 eng,
                 snap,
                 own,
+                all_xids: vec![own],
                 session,
                 role,
                 // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
@@ -3644,7 +3657,7 @@ fn pg_typeof_domain_name(q: &Q, scopes: &[Scope], arg: &Expr) -> Option<String> 
         Expr::Column { table, name: col } => {
             let (si, ci) = resolve_col(scopes, table.as_deref(), col).ok()?;
             let qual = scopes[si].schema[ci].qual.clone();
-            let t = q.eng.db.find_table(&qual, q.snap, q.own, q.session)?;
+            let t = q.eng.db.find_table(&qual, q.snap, &q.all_xids, q.session)?;
             let idx = t.columns.iter().position(|(n, _)| n == col)?;
             t.domain_types.get(idx).and_then(Clone::clone)
         }
@@ -3742,6 +3755,7 @@ fn check_row_constraints(
                 eng,
                 snap,
                 own,
+                all_xids: vec![own],
                 session,
                 role,
                 // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
@@ -3780,6 +3794,7 @@ fn check_row_constraints(
             eng,
             snap,
             own,
+            all_xids: vec![own],
             session,
             role,
             // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
@@ -3885,7 +3900,7 @@ fn check_fk_child_row(
         }
         let parent = eng
             .db
-            .find_table(&fk.ref_table, snap, own, session)
+            .find_table(&fk.ref_table, snap, &[own], session)
             .expect("fk parent validated at DDL time");
         let parent_meta = TableMeta::of(parent);
         let ref_cols = fk_ref_cols(&parent_meta, fk)?;
@@ -3907,7 +3922,7 @@ fn check_fk_child_row(
         let found = parent
             .rows
             .iter()
-            .filter(|r| row_visible(r, snap, own))
+            .filter(|r| row_visible(r, snap, &[own]))
             .filter(|r| !(self_ref && Some(r.id) == ignore_id))
             .any(|r| matches_key(&r.values))
             || (self_ref && self_new.iter().any(|v| matches_key(v)));
@@ -3937,7 +3952,7 @@ fn fks_referencing(
     for (name, versions) in &eng.db.tables {
         if let Some(t) = versions
             .iter()
-            .find(|t| crate::storage::table_visible(t, snap, own))
+            .find(|t| crate::storage::table_visible(t, snap, &[own]))
         {
             for fk in &t.fks {
                 if fk.ref_table == parent {
@@ -4016,7 +4031,7 @@ fn plan_fk_cascade(
         let child_meta = {
             let t = eng
                 .db
-                .find_table(&child_table, snap, own, session)
+                .find_table(&child_table, snap, &[own], session)
                 .expect("child table visible; engine lock held");
             TableMeta::of(t)
         };
@@ -4049,11 +4064,11 @@ fn plan_fk_cascade(
             let refs: Vec<(u64, u64, Row)> = {
                 let t = eng
                     .db
-                    .find_table(&child_table, snap, own, session)
+                    .find_table(&child_table, snap, &[own], session)
                     .expect("child table visible; engine lock held");
                 t.rows
                     .iter()
-                    .filter(|r| row_visible(r, snap, own))
+                    .filter(|r| row_visible(r, snap, &[own]))
                     .filter(|r| {
                         child_pos
                             .iter()
@@ -4108,7 +4123,7 @@ fn plan_fk_cascade(
                                 &nv,
                                 Some(cid),
                                 snap,
-                                own,
+                                &[own],
                                 session,
                             ) {
                                 return Err(exec_err(
@@ -4200,7 +4215,7 @@ fn plan_fk_cascade(
                             &nv,
                             Some(cid),
                             snap,
-                            own,
+                            &[own],
                             session,
                         ) {
                             return Err(exec_err(
@@ -4254,12 +4269,12 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
     for (table, id, prev_xmax) in &out.deletes {
         let t = eng
             .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible; engine lock held throughout");
         let pos = t
             .row_pos(*id)
             .expect("row version still present; engine lock held throughout");
-        t.rows[pos].xmax = ctx.own;
+        t.rows[pos].xmax = ctx.write_xid;
         ctx.writes.push(WriteOp::DeleteRow {
             table: table.clone(),
             row_id: *id,
@@ -4275,7 +4290,7 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
     for ((table, old_id, prev_xmax, new_values), new_id) in out.updates.iter().zip(new_ids) {
         let t = eng
             .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible; engine lock held throughout");
         let pos = t
             .row_pos(*old_id)
@@ -4283,9 +4298,9 @@ fn apply_fk_cascade(eng: &mut Engine, ctx: &mut StmtCtx, out: FkCascade) -> Resu
         // v0.13: capture the old values for the UpdateRow op (the
         // logical decoder needs them); values never change in place.
         let old_values = t.rows[pos].values.clone();
-        t.rows[pos].xmax = ctx.own;
+        t.rows[pos].xmax = ctx.write_xid;
         let new_values = new_values.clone();
-        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
+        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.write_xid));
         ctx.writes.push(WriteOp::UpdateRow {
             table: table.clone(),
             old_id: *old_id,
@@ -4576,6 +4591,7 @@ fn materialize_dml_ctes(
         eng,
         snap: ctx.snap,
         own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
         session: ctx.session,
         role: ctx.role,
         read_only: ctx.read_only,
@@ -4613,7 +4629,7 @@ fn describe_returning(
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     let t = eng
         .db
-        .find_table(table, snap, own, session)
+        .find_table(table, snap, &[own], session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
     let mut combined: Vec<QCol> = Vec::new();
     for s in extra {
@@ -4710,7 +4726,7 @@ fn plan_upsert(
     // UNIQUE constraints arbitrate ON CONFLICT directly.
     let t = eng
         .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{table}\" does not exist")))?;
     // v0.71: partition children name constraint backing indexes
     // `{table}_{constraint}` (v0.70 convention); the constraint name is
@@ -4735,7 +4751,7 @@ fn plan_upsert(
             out
         } else {
             eng.db
-                .visible_indexes_for(table, ctx.snap, ctx.own, ctx.session)
+                .visible_indexes_for(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .into_iter()
                 .filter(|ix| ix.def.unique && ix.def.planner_usable)
                 .map(|ix| {
@@ -4873,7 +4889,7 @@ fn plan_upsert(
 
 /// v0.10: current values of one row version, by id.
 fn row_values_by_id(eng: &Engine, ctx: &StmtCtx, table: &str, id: u64) -> Option<Row> {
-    let t = eng.db.find_table(table, ctx.snap, ctx.own, ctx.session)?;
+    let t = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session)?;
     let pos = t.row_pos(id)?;
     Some(t.rows[pos].values.clone())
 }
@@ -4902,7 +4918,7 @@ fn find_row_leaf(
     let (pinfo, table_cols) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("target still visible; engine lock held throughout");
         match &t.partition {
             Some(p) => (p.clone(), t.columns.clone()),
@@ -4966,7 +4982,7 @@ fn leaf_upsert_ctx(
     let cols = {
         let lt = eng
             .db
-            .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+            .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("leaf still visible; engine lock held throughout");
         lt.columns.clone()
     };
@@ -4987,7 +5003,7 @@ fn leaf_upsert_ctx(
             // index in this engine.
             let found = con.as_ref().and_then(|_| {
                 eng.db
-                    .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+                    .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                     .into_iter()
                     .filter(|ix| ix.def.unique && ix.def.planner_usable)
                     .find(|ix| ix.def.col_names == *key_names)
@@ -5001,7 +5017,7 @@ fn leaf_upsert_ctx(
     }
     let all_unique: Vec<(String, Vec<usize>)> = eng
         .db
-        .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+        .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
         .into_iter()
         .filter(|ix| ix.def.unique && ix.def.planner_usable)
         .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
@@ -5018,7 +5034,7 @@ fn leaf_upsert_ctx(
 /// rather than the partition's index.
 fn leaf_constraint_name(eng: &Engine, ctx: &StmtCtx, leaf: &str, index_name: &str) -> String {
     if let Some(con) = index_name.strip_prefix(&format!("{leaf}_")) {
-        if let Some(t) = eng.db.find_table(leaf, ctx.snap, ctx.own, ctx.session) {
+        if let Some(t) = eng.db.find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session) {
             let known = t.pkey.as_ref().is_some_and(|p| p.name == con)
                 || t.uniques.iter().any(|u| u.name == con);
             if known {
@@ -5047,7 +5063,7 @@ fn toast_table_name_by_oid(
         .iter()
         .filter_map(|(n, vs)| {
             vs.iter()
-                .find(|v| v.oid == oid && crate::storage::table_visible(v, snap, own))
+                .find(|v| v.oid == oid && crate::storage::table_visible(v, snap, &[own]))
                 .map(|_| n.clone())
         })
         .next()
@@ -5127,7 +5143,7 @@ fn ensure_toast_table(
     let (oid, toast_relid) = {
         let t = eng
             .db
-            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(table_name, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -5156,7 +5172,7 @@ fn ensure_toast_table(
     {
         let t = eng
             .db
-            .find_table_mut(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table_name, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible");
         t.toast_relid = toast_oid;
     }
@@ -5250,7 +5266,7 @@ fn toast_row_impl(
     let (plan, reuse) = {
         let t = eng
             .db
-            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(table_name, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| {
                 exec_err(
                     "42P01",
@@ -5291,7 +5307,7 @@ fn toast_row_impl(
     let (chunks, doomed): (Vec<(u32, Vec<u8>)>, Vec<u32>) = {
         let t = eng
             .db
-            .find_table_mut(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table_name, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible");
         let mut flags = vec![0u32; values.len()];
         let mut chunks = Vec::new();
@@ -5362,7 +5378,7 @@ fn toast_row_impl(
     let has_toastable = {
         let t = eng
             .db
-            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(table_name, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible");
         t.columns.iter().any(|(_, ty)| ty.is_toastable())
     };
@@ -5371,7 +5387,7 @@ fn toast_row_impl(
         if !chunks.is_empty() {
             let tt = eng
                 .db
-                .find_table_mut(&toast_name, ctx.snap, ctx.own, ctx.session)
+                .find_table_mut(&toast_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("toast table just created");
             let mut id_iter = chunk_ids.into_iter();
             for (vid, bytes) in chunks {
@@ -5384,7 +5400,7 @@ fn toast_row_impl(
                             Value::Int(seq as i64),
                             Value::Bytea(chunk.to_vec()),
                         ]),
-                        ctx.own,
+                        ctx.write_xid,
                     ));
                     // v0.37: chunks are real rows — stage the write op so
                     // ROLLBACK removes them and the WAL replays them.
@@ -5425,7 +5441,7 @@ fn toast_delete_chunks(
     let toast_name = {
         let t = match eng
             .db
-            .find_table(table_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(table_name, ctx.snap, &ctx.all_xids, ctx.session)
         {
             Some(t) => t,
             None => return Ok(()),
@@ -5443,7 +5459,7 @@ fn toast_delete_chunks(
     let chunk_rows: Vec<(u64, u64)> =
         match eng
             .db
-            .find_table(&toast_name, ctx.snap, ctx.own, ctx.session)
+            .find_table(&toast_name, ctx.snap, &ctx.all_xids, ctx.session)
         {
             Some(tt) => tt
                 .rows
@@ -5461,13 +5477,13 @@ fn toast_delete_chunks(
     }
     let tt = eng
         .db
-        .find_table_mut(&toast_name, ctx.snap, ctx.own, ctx.session)
+        .find_table_mut(&toast_name, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("toast table still visible; engine lock held throughout");
     for (cid, prev_xmax) in chunk_rows {
         let Some(pos) = tt.row_pos(cid) else {
             continue;
         };
-        tt.rows[pos].xmax = ctx.own;
+        tt.rows[pos].xmax = ctx.write_xid;
         ctx.writes.push(WriteOp::DeleteRow {
             table: toast_name.clone(),
             row_id: cid,
@@ -5489,10 +5505,10 @@ fn apply_row_inserts(
     {
         let t = eng
             .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible; engine lock held throughout");
         for (id, values) in inserts {
-            t.push_version(RowVersion::plain(*id, values.clone(), ctx.own));
+            t.push_version(RowVersion::plain(*id, values.clone(), ctx.write_xid));
             ctx.writes.push(WriteOp::InsertRow {
                 table: table.to_string(),
                 row_id: *id,
@@ -5533,7 +5549,7 @@ fn exec_create_table_as(
     // Existence check first, like CREATE TABLE (42P07).
     if eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .is_some()
         || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
     {
@@ -5555,6 +5571,7 @@ fn exec_create_table_as(
             eng,
             snap: ctx.snap,
             own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
             session: ctx.session,
             role: ctx.role,
             read_only: ctx.read_only,
@@ -6015,6 +6032,7 @@ fn exec_insert(
             eng,
             snap: ctx.snap,
             own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
             session: ctx.session,
             role: ctx.role,
             read_only: ctx.read_only,
@@ -6037,7 +6055,7 @@ fn exec_insert(
     let (meta_for_upsert, partitioned_upsert) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         // v0.71: PG19 implements ON CONFLICT against partitioned tables
         // (route each row to its leaf, then arbitrate per leaf — see the
@@ -6070,7 +6088,7 @@ fn exec_insert(
         let meta = {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| {
                     exec_err("42P01", format!("relation \"{}\" does not exist", table))
                 })?;
@@ -6137,6 +6155,7 @@ fn exec_insert(
                         eng,
                         snap: ctx.snap,
                         own: ctx.own,
+                        all_xids: ctx.all_xids.clone(),
                         session: ctx.session,
                         role: ctx.role,
                         read_only: ctx.read_only,
@@ -6256,6 +6275,7 @@ fn exec_insert(
                 eng,
                 snap: ctx.snap,
                 own: ctx.own,
+                all_xids: ctx.all_xids.clone(),
                 session: ctx.session,
                 role: ctx.role,
                 read_only: ctx.read_only,
@@ -6420,12 +6440,12 @@ fn exec_insert(
         if upsert.is_none() {
             let is_partitioned_parent = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.parent.is_none()));
             if is_partitioned_parent {
                 check_partitioned_insert_unique(eng, ctx, table, &built)?;
             } else {
-                check_insert_unique(&eng.db, table, &built, ctx.snap, ctx.own, ctx.session)?;
+                check_insert_unique(&eng.db, table, &built, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
         }
         // v0.9: child-side foreign keys. Rows inserted earlier in the same
@@ -6455,7 +6475,7 @@ fn exec_insert(
         let target_cols: Vec<(String, ColType)> = {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("target still visible");
             t.columns.clone()
         };
@@ -6476,7 +6496,7 @@ fn exec_insert(
             let meta = {
                 let t = eng
                     .db
-                    .find_table(table, ctx.snap, ctx.own, ctx.session)
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("target still visible");
                 TableMeta::of(t)
             };
@@ -6587,7 +6607,7 @@ fn exec_insert(
                     &cvalues,
                     None,
                     ctx.snap,
-                    ctx.own,
+                    &ctx.all_xids,
                     ctx.session,
                 ) {
                     conflict = Some(id);
@@ -6653,7 +6673,7 @@ fn exec_insert(
                     if !is_planned {
                         let t = eng
                             .db
-                            .find_table(&ctable, ctx.snap, ctx.own, ctx.session)
+                            .find_table(&ctable, ctx.snap, &ctx.all_xids, ctx.session)
                             .expect("table still visible; engine lock held throughout");
                         let pos = t.row_pos(tid).expect("conflict target still present");
                         let r = &t.rows[pos];
@@ -6748,7 +6768,7 @@ fn exec_insert(
                         &store_values,
                         Some(tid),
                         ctx.snap,
-                        ctx.own,
+                        &ctx.all_xids,
                         ctx.session,
                     ) {
                         let vname = if partitioned_upsert {
@@ -6791,7 +6811,7 @@ fn exec_insert(
                     } else {
                         let t = eng
                             .db
-                            .find_table(&ctable, ctx.snap, ctx.own, ctx.session)
+                            .find_table(&ctable, ctx.snap, &ctx.all_xids, ctx.session)
                             .expect("table still visible; engine lock held throughout");
                         t.rows[t.row_pos(tid).expect("conflict target still present")].xmax
                     };
@@ -6851,7 +6871,7 @@ fn exec_insert(
     for ((utab, old_id, prev_xmax, new_values), new_id) in updates.iter().zip(update_ids) {
         let t = eng
             .db
-            .find_table_mut(utab, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(utab, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible; engine lock held throughout");
         let pos = t
             .row_pos(*old_id)
@@ -6861,8 +6881,8 @@ fn exec_insert(
         // toast lifecycle (reuse unchanged pointers, delete the rest).
         let old_values = t.rows[pos].values.clone();
         let old_toast = t.rows[pos].toast.clone();
-        t.rows[pos].xmax = ctx.own;
-        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
+        t.rows[pos].xmax = ctx.write_xid;
+        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.write_xid));
         ctx.writes.push(WriteOp::UpdateRow {
             table: utab.clone(),
             old_id: *old_id,
@@ -7007,7 +7027,7 @@ fn partition_leaves(
         .into_iter()
         .filter_map(|name| {
             eng.db
-                .find_table(&name, ctx.snap, ctx.own, ctx.session)
+                .find_table(&name, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|t| (name, t.columns.clone()))
         })
         .collect()
@@ -7132,7 +7152,7 @@ fn exec_update(
     ) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
         let partitioned = t.partition.is_some();
@@ -7192,9 +7212,13 @@ fn exec_update(
         for (leaf, leaf_cols) in &leaves {
             let lt = eng
                 .db
-                .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("leaf still visible; engine lock held throughout");
-            for r in lt.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+            for r in lt
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+            {
                 let pv = if *leaf == table {
                     r.values.clone()
                 } else {
@@ -7218,6 +7242,7 @@ fn exec_update(
                 eng: &mut *eng,
                 snap: ctx.snap,
                 own: ctx.own,
+                all_xids: ctx.all_xids.clone(),
                 session: ctx.session,
                 role: ctx.role,
                 read_only: ctx.read_only,
@@ -7384,7 +7409,7 @@ fn exec_update(
             let dst_meta = {
                 let dt = eng
                     .db
-                    .find_table(&dst, ctx.snap, ctx.own, ctx.session)
+                    .find_table(&dst, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("destination leaf visible; engine lock held throughout");
                 TableMeta::of(dt)
             };
@@ -7394,7 +7419,7 @@ fn exec_update(
             // atomic.
             if let Some(vname) =
                 eng.db
-                    .unique_violation(&dst, &new_dst, Some(*id), ctx.snap, ctx.own, ctx.session)
+                    .unique_violation(&dst, &new_dst, Some(*id), ctx.snap, &ctx.all_xids, ctx.session)
             {
                 return Err(exec_err(
                     "23505",
@@ -7449,7 +7474,7 @@ fn exec_update(
             let dst_meta = {
                 let dt = eng
                     .db
-                    .find_table(dst, ctx.snap, ctx.own, ctx.session)
+                    .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("destination leaf visible; engine lock held throughout");
                 TableMeta::of(dt)
             };
@@ -7491,7 +7516,7 @@ fn exec_update(
                 let src_meta = {
                     let st = eng
                         .db
-                        .find_table(src, ctx.snap, ctx.own, ctx.session)
+                        .find_table(src, ctx.snap, &ctx.all_xids, ctx.session)
                         .expect("source leaf visible; engine lock held throughout");
                     TableMeta::of(st)
                 };
@@ -7535,7 +7560,7 @@ fn exec_update(
                     .push((*id, *xmax, nv.clone()));
             }
             for (t, p) in &by_table {
-                check_update_unique_pairs(&eng.db, t, p, ctx.snap, ctx.own, ctx.session)?;
+                check_update_unique_pairs(&eng.db, t, p, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
         }
         // Apply the cascade after the unique checks pass.
@@ -7575,7 +7600,7 @@ fn exec_update(
             {
                 let t = eng
                     .db
-                    .find_table_mut(leaf, ctx.snap, ctx.own, ctx.session)
+                    .find_table_mut(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("table still visible; engine lock held throughout");
                 for ((old_id, prev_xmax, new_values), new_id) in rows.iter().cloned().zip(new_ids) {
                     let pos = t
@@ -7584,8 +7609,8 @@ fn exec_update(
                     // v0.13: UpdateRow carries the old values for logical decoding.
                     let old_values = t.rows[pos].values.clone();
                     let old_toast = t.rows[pos].toast.clone();
-                    t.rows[pos].xmax = ctx.own;
-                    t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.own));
+                    t.rows[pos].xmax = ctx.write_xid;
+                    t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.write_xid));
                     ctx.writes.push(WriteOp::UpdateRow {
                         table: leaf.clone(),
                         old_id,
@@ -7633,7 +7658,7 @@ fn exec_update(
         for src in &srcs {
             let t = eng
                 .db
-                .find_table_mut(src, ctx.snap, ctx.own, ctx.session)
+                .find_table_mut(src, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("source leaf visible; engine lock held throughout");
             for (old_id, prev_xmax) in &by_src[src.as_str()] {
                 let pos = t
@@ -7643,7 +7668,7 @@ fn exec_update(
                     .entry(src.clone())
                     .or_default()
                     .extend(t.rows[pos].toast.iter().copied().filter(|v| *v != 0));
-                t.rows[pos].xmax = ctx.own;
+                t.rows[pos].xmax = ctx.write_xid;
                 ctx.writes.push(WriteOp::DeleteRow {
                     table: src.clone(),
                     row_id: *old_id,
@@ -7692,7 +7717,7 @@ fn exec_update(
         let schema: Vec<QCol> = {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("table still visible; engine lock held throughout");
             t.columns
                 .iter()
@@ -7772,7 +7797,7 @@ fn exec_delete(
     ) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
         let partitioned = t.partition.is_some();
@@ -7812,9 +7837,13 @@ fn exec_delete(
             for (leaf, leaf_cols) in &targets {
                 let lt = eng
                     .db
-                    .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                    .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("leaf still visible; engine lock held throughout");
-                for r in lt.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+                for r in lt
+                    .rows
+                    .iter()
+                    .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+                {
                     let pv = if *leaf == table {
                         r.values.clone()
                     } else {
@@ -7848,6 +7877,7 @@ fn exec_delete(
                 eng: &mut *eng,
                 snap: ctx.snap,
                 own: ctx.own,
+                all_xids: ctx.all_xids.clone(),
                 session: ctx.session,
                 role: ctx.role,
                 read_only: ctx.read_only,
@@ -7952,7 +7982,7 @@ fn exec_delete(
                 let leaf_meta = {
                     let lt = eng
                         .db
-                        .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                        .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                         .expect("leaf visible; engine lock held throughout");
                     TableMeta::of(lt)
                 };
@@ -8004,13 +8034,13 @@ fn exec_delete(
         for leaf in leaves {
             let t = eng
                 .db
-                .find_table_mut(leaf, ctx.snap, ctx.own, ctx.session)
+                .find_table_mut(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("table still visible; engine lock held throughout");
             for (id, prev_xmax) in &by_leaf[leaf] {
                 let pos = t
                     .row_pos(*id)
                     .expect("row version still present; engine lock held throughout");
-                t.rows[pos].xmax = ctx.own;
+                t.rows[pos].xmax = ctx.write_xid;
                 ctx.writes.push(WriteOp::DeleteRow {
                     table: leaf.to_string(),
                     row_id: *id,
@@ -8054,7 +8084,7 @@ fn exec_delete(
         let schema: Vec<QCol> = {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("table still visible; engine lock held throughout");
             t.columns
                 .iter()
@@ -8154,7 +8184,7 @@ fn exec_truncate(
         require_table_priv(eng, ctx, t, crate::storage::PRIV_TRUNCATE, "TRUNCATE")?;
         if eng
             .db
-            .find_table(t, ctx.snap, ctx.own, ctx.session)
+            .find_table(t, ctx.snap, &ctx.all_xids, ctx.session)
             .is_none()
         {
             return Err(exec_err(
@@ -8184,7 +8214,7 @@ fn exec_truncate(
     for t in &targets {
         let tr = eng
             .db
-            .find_table(t, ctx.snap, ctx.own, ctx.session)
+            .find_table(t, ctx.snap, &ctx.all_xids, ctx.session)
             .map(|tt| tt.toast_relid)
             .unwrap_or(0);
         if tr != 0 {
@@ -8197,10 +8227,14 @@ fn exec_truncate(
         let plan: Vec<(u64, u64)> = {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("table checked above; engine lock held throughout");
             let mut plan = Vec::new();
-            for rv in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+            for rv in t
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+            {
                 check_write_conflict(eng, rv.xmax, ctx.level)?;
                 check_row_lock(eng, table, rv.id, ctx.own)?;
                 plan.push((rv.id, rv.xmax));
@@ -8209,13 +8243,13 @@ fn exec_truncate(
         };
         let t = eng
             .db
-            .find_table_mut(table, ctx.snap, ctx.own, ctx.session)
+            .find_table_mut(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table checked above; engine lock held throughout");
         for (id, prev_xmax) in plan {
             let pos = t
                 .row_pos(id)
                 .expect("row version still present; engine lock held throughout");
-            t.rows[pos].xmax = ctx.own;
+            t.rows[pos].xmax = ctx.write_xid;
             ctx.writes.push(WriteOp::DeleteRow {
                 table: table.to_string(),
                 row_id: id,
@@ -8320,7 +8354,7 @@ fn drop_one_table(
     // partitioned tables work too.
     let children: Vec<String> = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .and_then(|t| t.partition.as_ref())
         .map(|p| p.children.clone())
         .unwrap_or_default();
@@ -8362,7 +8396,7 @@ fn drop_one_table(
             if eng.db.is_temp_table(ctx.session, &parent_name) {
                 if let Some(pp) =
                     eng.db
-                        .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+                        .find_table_mut(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 {
                     if let Some(pi) = pp.partition.as_mut() {
                         pi.children.retain(|c| c != name);
@@ -8391,7 +8425,7 @@ fn drop_one_table(
     // then mutate. A DROP of a table dropped by a not-yet-visible
     // transaction behaves like the row case (40001 under RR/SERIALIZABLE).
     let prev_xmax = {
-        let t = eng.db.find_table(name, ctx.snap, ctx.own, ctx.session);
+        let t = eng.db.find_table(name, ctx.snap, &ctx.all_xids, ctx.session);
         match t {
             None if if_exists => return Ok(()),
             None => {
@@ -8422,7 +8456,7 @@ fn drop_one_table(
         }
         let Some(ot) = vs
             .iter()
-            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+            .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
         else {
             continue;
         };
@@ -8460,7 +8494,7 @@ fn drop_one_table(
         // earlier CASCADE in this same statement.
         if eng
             .db
-            .find_table(tname, ctx.snap, ctx.own, ctx.session)
+            .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
             .is_some()
         {
             alter_drop_constraint_internal(eng, ctx, tname, fk_name)?;
@@ -8472,7 +8506,7 @@ fn drop_one_table(
     let serial_seqs = owned_seqs_of(eng, ctx, name, None);
     let t = eng
         .db
-        .find_table_mut(name, ctx.snap, ctx.own, ctx.session)
+        .find_table_mut(name, ctx.snap, &ctx.all_xids, ctx.session)
         .expect("table still visible; engine lock held throughout");
     // v0.37: dropping a table drops its toast table too (like PG).
     let toast_relid = t.toast_relid;
@@ -8491,7 +8525,7 @@ fn drop_one_table(
         if eng.db.is_temp_table(ctx.session, &parent_name) {
             if let Some(pp) = eng
                 .db
-                .find_table_mut(&parent_name, ctx.snap, ctx.own, ctx.session)
+                .find_table_mut(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
             {
                 if let Some(pi) = pp.partition.as_mut() {
                     pi.children.retain(|c| c != name);
@@ -8510,10 +8544,10 @@ fn drop_one_table(
         if let Some(tn) = toast_table_name_by_oid(eng, toast_relid, ctx.snap, ctx.own) {
             let tt_prev_xmax = eng
                 .db
-                .find_table(&tn, ctx.snap, ctx.own, ctx.session)
+                .find_table(&tn, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|tt| tt.dropped_xmax)
                 .unwrap_or(0);
-            if let Some(tt) = eng.db.find_table_mut(&tn, ctx.snap, ctx.own, ctx.session) {
+            if let Some(tt) = eng.db.find_table_mut(&tn, ctx.snap, &ctx.all_xids, ctx.session) {
                 tt.dropped_xmax = ctx.own;
                 ctx.writes.push(WriteOp::DropTable {
                     name: tn,
@@ -8527,7 +8561,7 @@ fn drop_one_table(
     // restores them and the WAL replays them.
     let idx_names: Vec<String> = eng
         .db
-        .visible_indexes_for(name, ctx.snap, ctx.own, ctx.session)
+        .visible_indexes_for(name, ctx.snap, &ctx.all_xids, ctx.session)
         .iter()
         .map(|ix| ix.def.name.clone())
         .collect();
@@ -8562,15 +8596,15 @@ fn check_insert_unique(
     table: &str,
     rows: &[Row],
     snap: &Snapshot,
-    own: u64,
+    owns: &[u64],
     session: u64,
 ) -> Result<(), ExecError> {
     // v0.22: temp tables have no backing indexes; their constraints are
     // checked by column positions with index key semantics.
     let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
-        temp_unique_cols(db, table, snap, own, session)
+        temp_unique_cols(db, table, snap, owns, session)
     } else {
-        db.visible_indexes_for(table, snap, own, session)
+        db.visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
@@ -8586,7 +8620,7 @@ fn check_insert_unique(
                 return Err(unique_violation_err(cname));
             }
         }
-        if let Some(name) = db.unique_violation(table, values, None, snap, own, session) {
+        if let Some(name) = db.unique_violation(table, values, None, snap, owns, session) {
             return Err(unique_violation_err(&name));
         }
     }
@@ -8608,7 +8642,7 @@ fn check_partitioned_insert_unique(
     let parent_cols = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("target still visible; engine lock held throughout");
         t.columns.clone()
     };
@@ -8626,13 +8660,13 @@ fn check_partitioned_insert_unique(
         let leaf_cols = {
             let lt = eng
                 .db
-                .find_table(leaf, ctx.snap, ctx.own, ctx.session)
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("leaf still visible; engine lock held throughout");
             lt.columns.clone()
         };
         let uniques: Vec<(String, Vec<usize>)> = eng
             .db
-            .visible_indexes_for(leaf, ctx.snap, ctx.own, ctx.session)
+            .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
@@ -8658,7 +8692,7 @@ fn check_partitioned_insert_unique(
             }
             if let Some(name) =
                 eng.db
-                    .unique_violation(leaf, values, None, ctx.snap, ctx.own, ctx.session)
+                    .unique_violation(leaf, values, None, ctx.snap, &ctx.all_xids, ctx.session)
             {
                 return Err(unique_violation_err(&leaf_constraint_name(
                     eng, ctx, leaf, &name,
@@ -8676,10 +8710,10 @@ fn temp_unique_cols(
     db: &Database,
     table: &str,
     snap: &Snapshot,
-    own: u64,
+    owns: &[u64],
     session: u64,
 ) -> Vec<(String, Vec<usize>)> {
-    let Some(t) = db.find_table(table, snap, own, session) else {
+    let Some(t) = db.find_table(table, snap, owns, session) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -8715,13 +8749,13 @@ fn check_update_unique_pairs(
     table: &str,
     plan: &[(u64, u64, Row)],
     snap: &Snapshot,
-    own: u64,
+    owns: &[u64],
     session: u64,
 ) -> Result<(), ExecError> {
     let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
-        temp_unique_cols(db, table, snap, own, session)
+        temp_unique_cols(db, table, snap, owns, session)
     } else {
-        db.visible_indexes_for(table, snap, own, session)
+        db.visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
@@ -8763,10 +8797,10 @@ fn exec_create_index(
             .temp_indexes
             .get(&ctx.session)
             .and_then(|m| m.get(name))
-            .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+            .filter(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
             .is_some()
     } else {
-        eng.db.find_index(name, ctx.snap, ctx.own).is_some()
+        eng.db.find_index(name, ctx.snap, &ctx.all_xids).is_some()
     };
     if exists {
         if if_not_exists {
@@ -8789,7 +8823,7 @@ fn exec_create_index(
     let (cols, col_names, descs, nulls_firsts, exprs) = {
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let mut cols = Vec::with_capacity(columns.len());
         let mut col_names = Vec::with_capacity(columns.len());
@@ -8846,7 +8880,7 @@ fn exec_create_index(
         col_names,
         unique,
         internal: false,
-        created_xmin: ctx.own,
+        created_xmin: ctx.write_xid,
         dropped_xmax: 0,
         desc: descs,
         nulls_first: nulls_firsts,
@@ -8864,7 +8898,7 @@ fn exec_create_index(
         // all-ascending indexes.
         let t = eng
             .db
-            .find_table(table, ctx.snap, ctx.own, ctx.session)
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("table still visible; engine lock held throughout");
         for r in &t.rows {
             let key = ix.key_for(&r.values);
@@ -8936,9 +8970,9 @@ fn exec_drop_index(
             .temp_indexes
             .get(&ctx.session)
             .and_then(|m| m.get(name))
-            .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+            .filter(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
             .is_some();
-        if !temp_hit && eng.db.find_index(name, ctx.snap, ctx.own).is_none() && !if_exists {
+        if !temp_hit && eng.db.find_index(name, ctx.snap, &ctx.all_xids).is_none() && !if_exists {
             return Err(exec_err(
                 "42P01",
                 format!("index \"{}\" does not exist", name),
@@ -8965,7 +8999,7 @@ fn exec_drop_one_index(
         .temp_indexes
         .get(&ctx.session)
         .and_then(|m| m.get(name))
-        .filter(|ix| index_visible(&ix.def, ctx.snap, ctx.own))
+        .filter(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
         .cloned();
     if let Some(snapshot) = temp_snapshot {
         // v0.11: dropping an index needs its table's owner (or a superuser).
@@ -8985,10 +9019,10 @@ fn exec_drop_one_index(
     // Snapshot the definition first: the write log's undo restores it on
     // ROLLBACK, and the WAL replays the drop on commit.
     // v0.11: dropping an index needs its table's owner (or a superuser).
-    if let Some(ix) = eng.db.find_index(name, ctx.snap, ctx.own) {
+    if let Some(ix) = eng.db.find_index(name, ctx.snap, &ctx.all_xids) {
         require_table_owner(eng, ctx, &ix.def.table.clone())?;
     }
-    let snapshot = match eng.db.find_index(name, ctx.snap, ctx.own) {
+    let snapshot = match eng.db.find_index(name, ctx.snap, &ctx.all_xids) {
         Some(ix) => ix.clone(),
         None => {
             if if_exists {
@@ -9001,7 +9035,7 @@ fn exec_drop_one_index(
         }
     };
     eng.db
-        .find_index_mut(name, ctx.snap, ctx.own)
+        .find_index_mut(name, ctx.snap, &ctx.all_xids)
         .expect("index still present; engine lock held throughout")
         .def
         .dropped_xmax = ctx.own;
@@ -9167,7 +9201,7 @@ fn plan_access_path(
     // and more bound columns beat fewer.
     let mut best: Option<AccessPath> = None;
     let mut best_score = (0usize, 0usize, false);
-    for ix in db.visible_indexes_for(table_name, snap, own, session) {
+    for ix in db.visible_indexes_for(table_name, snap, &[own], session) {
         // v0.88: expression / partial indexes are catalog-only (never
         // built); no scan path may consult them.
         if !ix.def.planner_usable {
@@ -9388,7 +9422,7 @@ fn plan_order_scan(
         | FromItem::Values { .. }
         | FromItem::Function { .. } => return None,
     };
-    let t = eng.db.find_table(table_name, snap, own, session)?;
+    let t = eng.db.find_table(table_name, snap, &[own], session)?;
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a
     // select-list output name resolves to the *output* value (which may be
     // an expression), not the raw column — unless the select item is the
@@ -9448,7 +9482,7 @@ fn plan_order_scan(
     // catalog metadata, so streaming it as if it were ordered would
     // produce wrong row order; those queries fall back to Sort (which is
     // what happened before v0.88 accepted the DDL at all).
-    for ix in eng.db.visible_indexes_for(table_name, snap, own, session) {
+    for ix in eng.db.visible_indexes_for(table_name, snap, &[own], session) {
         if !ix.def.planner_usable
             || ix.def.desc.iter().any(|d| *d)
             || ix.def.nulls_first.iter().any(|n| *n)
@@ -9499,7 +9533,7 @@ fn index_order_rows(
             }
             if let Some(pos) = t.row_pos(id) {
                 let r = &t.rows[pos];
-                if row_visible(r, snap, own) {
+                if row_visible(r, snap, &[own]) {
                     rows.push(QRow {
                         cells: r.values.clone(),
                         prov: if need_prov {
@@ -10200,7 +10234,7 @@ fn pg_plan_ctx<'a>(
                     Vec::new()
                 } else {
                     eng.db
-                        .find_table(name, snap, own, session)
+                        .find_table(name, snap, &[own], session)
                         .map(|t| t.columns.iter().map(|(n, ty)| (n.clone(), *ty)).collect())
                         .unwrap_or_default()
                 };
@@ -10264,7 +10298,7 @@ fn pg_split_item(
                 Vec::new()
             } else {
                 eng.db
-                    .find_table(name, snap, own, session)
+                    .find_table(name, snap, &[own], session)
                     .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
                     .unwrap_or_default()
             };
@@ -10492,8 +10526,13 @@ fn est_rel_rows(db: &Database, table: &str, snap: &Snapshot, own: u64, session: 
     if let Some(ts) = db.stats.get(table) {
         return ts.reltuples.round().max(0.0) as u64;
     }
-    db.find_table(table, snap, own, session)
-        .map(|t| t.rows.iter().filter(|r| row_visible(r, snap, own)).count() as u64)
+    db.find_table(table, snap, &[own], session)
+        .map(|t| {
+            t.rows
+                .iter()
+                .filter(|r| row_visible(r, snap, &[own]))
+                .count() as u64
+        })
         .unwrap_or(0)
 }
 
@@ -10661,7 +10700,7 @@ fn plan_from_item(
                     rows: 1000,
                 });
             }
-            if name == "pg_stats" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_stats" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let rows: u64 = eng.db.stats.values().map(|ts| ts.cols.len() as u64).sum();
                 return Ok(PlanNode::SeqScan {
                     table: "pg_stats".to_string(),
@@ -10671,7 +10710,7 @@ fn plan_from_item(
                 });
             }
             // v0.37: pg_class is virtual (TOAST introspection).
-            if name == "pg_class" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_class" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 return Ok(PlanNode::SeqScan {
                     table: "pg_class".to_string(),
                     alias: None,
@@ -10680,7 +10719,7 @@ fn plan_from_item(
                 });
             }
             // v0.88: pg_attribute is virtual (bounded catalog subset).
-            if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_attribute" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 return Ok(PlanNode::SeqScan {
                     table: "pg_attribute".to_string(),
                     alias: None,
@@ -10702,7 +10741,7 @@ fn plan_from_item(
             if matches!(
                 name.as_str(),
                 "pg_authid" | "pg_roles" | "pg_user" | "pg_auth_members"
-            ) && eng.db.find_table(name, snap, own, session).is_none()
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 let rows = virtual_role_catalog_rows(&eng.db, name, snap, own);
                 return Ok(PlanNode::SeqScan {
@@ -10715,7 +10754,7 @@ fn plan_from_item(
             // v0.13: pg_replication_slots is virtual too; the estimate is
             // the live slot count.
             if name.as_str() == "pg_replication_slots"
-                && eng.db.find_table(name, snap, own, session).is_none()
+                && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
@@ -10727,7 +10766,7 @@ fn plan_from_item(
             // v0.98: pg_sequences is virtual too; the estimate is the
             // live sequence count.
             if name.as_str() == "pg_sequences"
-                && eng.db.find_table(name, snap, own, session).is_none()
+                && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
@@ -10736,7 +10775,7 @@ fn plan_from_item(
                     rows: eng.db.sequences.len() as u64,
                 });
             }
-            let t = eng.db.find_table(name, snap, own, session).ok_or_else(|| {
+            let t = eng.db.find_table(name, snap, &[own], session).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", name))
             })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -11458,6 +11497,8 @@ struct AnalyzeCtx<'a> {
     eng: &'a Engine,
     snap: &'a Snapshot,
     own: u64,
+    /// v1.21: every xid owned by the transaction (top + sub-xids).
+    all_xids: Vec<u64>,
     session: u64,
     /// Actual rows produced by the top-level SELECT (executed once).
     top_rows: u64,
@@ -11501,11 +11542,11 @@ fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bo
         PlanNode::SeqScan { table, .. } => ax
             .eng
             .db
-            .find_table(table, ax.snap, ax.own, ax.session)
+            .find_table(table, ax.snap, &ax.all_xids, ax.session)
             .map(|t| {
                 t.rows
                     .iter()
-                    .filter(|r| crate::storage::row_visible(r, ax.snap, ax.own))
+                    .filter(|r| crate::storage::row_visible(r, ax.snap, &ax.all_xids))
                     .count() as u64
             })
             .unwrap_or(0),
@@ -11682,6 +11723,7 @@ fn explain_rows(
             eng: q.eng,
             snap: q.snap,
             own: q.own,
+            all_xids: q.all_xids.clone(),
             session: q.session,
             top_rows: out.rows.len() as u64,
         };
@@ -11720,6 +11762,7 @@ fn exec_explain_analyze(
             eng,
             snap: ctx.snap,
             own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
             session: ctx.session,
             role: ctx.role,
             read_only: ctx.read_only,
@@ -11794,12 +11837,12 @@ fn analyze_table(
     session: u64,
 ) -> TableStats {
     let t = db
-        .find_table(table, snap, own, session)
+        .find_table(table, snap, &[own], session)
         .expect("table checked visible by caller");
     let vis: Vec<&RowVersion> = t
         .rows
         .iter()
-        .filter(|r| row_visible(r, snap, own))
+        .filter(|r| row_visible(r, snap, &[own]))
         .collect();
     let total = vis.len() as f64;
     let mut cols = HashMap::new();
@@ -11875,13 +11918,13 @@ fn exec_analyze_core(
     // v0.11: ANALYZE requires ownership (or superuser), like PostgreSQL.
     let is_owner = |eng: &Engine, n: &str| {
         eng.db
-            .find_table(n, snap, own, session)
+            .find_table(n, snap, &[own], session)
             .map(|t| t.owner == role || crate::storage::is_superuser_snap(&eng.db, role, snap, own))
             .unwrap_or(false)
     };
     let names: Vec<String> = match table {
         Some(n) => {
-            if eng.db.find_table(n, snap, own, session).is_none() {
+            if eng.db.find_table(n, snap, &[own], session).is_none() {
                 return Err(exec_err(
                     "42P01",
                     format!("relation \"{}\" does not exist", n),
@@ -12029,7 +12072,7 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
     names.sort();
     for name in names {
         // Only the live version is visible in pg_class.
-        let Some(t) = db.find_table(name, snap, own, session) else {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
             continue;
         };
         // Skip the toast tables themselves? No — PG lists them in
@@ -12124,7 +12167,7 @@ fn pg_attribute_scan(
     names.sort();
     for name in names {
         // Only the live version is visible in pg_attribute.
-        let Some(t) = db.find_table(name, snap, own, session) else {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
             continue;
         };
         for (i, (col_name, _)) in t.columns.iter().enumerate() {
@@ -12175,7 +12218,7 @@ fn pg_inherits_scan(
         names.extend(tnames);
     }
     for name in names {
-        let Some(t) = db.find_table(name, snap, own, session) else {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
             continue;
         };
         if t.inherits.is_empty() {
@@ -12187,7 +12230,7 @@ fn pg_inherits_scan(
             // permanent child cannot inherit from a temp parent, and a
             // temp parent lives in this session).
             let parent_oid = db
-                .find_table(parent_name, snap, own, session)
+                .find_table(parent_name, snap, &[own], session)
                 .map(|p| p.oid as i64)
                 .unwrap_or(0);
             rows.push(QRow {
@@ -13405,6 +13448,9 @@ struct Q<'a, 'b> {
     eng: &'a mut Engine,
     snap: &'b Snapshot,
     own: u64,
+    /// v1.21: every xid owned by the transaction (top + sub-xids), for
+    /// visibility. Cloned from the StmtCtx (tiny vec).
+    all_xids: Vec<u64>,
     /// v0.9: server-assigned session id, for session-local `currval`.
     session: u64,
     /// Subquery nesting depth (0 = top level).
@@ -14031,7 +14077,7 @@ fn priv_scope_for(q: &Q, stmt: &SelectStmt) -> Vec<(String, Option<String>)> {
                 } else {
                     q.eng
                         .db
-                        .find_table(name, q.snap, q.own, q.session)
+                        .find_table(name, q.snap, &q.all_xids, q.session)
                         .map(|_| name.clone())
                 };
                 out.push((qual, real));
@@ -14109,7 +14155,7 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
     let has_col = |table: &str, col: &str| {
         q.eng
             .db
-            .find_table(table, q.snap, q.own, q.session)
+            .find_table(table, q.snap, &q.all_xids, q.session)
             .map(|t| t.columns.iter().any(|(n, _)| n == col))
             .unwrap_or(false)
     };
@@ -14117,7 +14163,7 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
         if let Some(level) = levels.last() {
             for (_, real) in level.iter() {
                 if let Some(t) = real {
-                    if let Some(tab) = q.eng.db.find_table(t, q.snap, q.own, q.session) {
+                    if let Some(tab) = q.eng.db.find_table(t, q.snap, &q.all_xids, q.session) {
                         for (cn, _) in &tab.columns {
                             needed.push((t.clone(), cn.clone()));
                         }
@@ -14128,7 +14174,7 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
     }
     for sq in &star_quals {
         if let Some((t, _)) = resolve_priv_qual(&levels, Some(sq)) {
-            if let Some(tab) = q.eng.db.find_table(&t, q.snap, q.own, q.session) {
+            if let Some(tab) = q.eng.db.find_table(&t, q.snap, &q.all_xids, q.session) {
                 for (cn, _) in &tab.columns {
                     needed.push((t.clone(), cn.clone()));
                 }
@@ -14145,7 +14191,7 @@ fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), ExecError> {
         let tab = q
             .eng
             .db
-            .find_table(t, q.snap, q.own, q.session)
+            .find_table(t, q.snap, &q.all_xids, q.session)
             .expect("resolved from a live table above");
         let have =
             crate::storage::column_privs_in(&q.eng.db, q.role, tab, c, &closure, q.snap, q.own);
@@ -15584,7 +15630,7 @@ pub fn copy_ncols(
         // Validate the names while we're at it.
         let t = eng
             .db
-            .find_table(table, snap, own, session)
+            .find_table(table, snap, &[own], session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
         for n in cols {
@@ -15599,7 +15645,7 @@ pub fn copy_ncols(
     } else {
         let t = eng
             .db
-            .find_table(table, snap, own, session)
+            .find_table(table, snap, &[own], session)
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         Ok(TableMeta::of(t).columns.len())
     }
@@ -19197,6 +19243,7 @@ fn eval_lateral_right(
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -19289,7 +19336,7 @@ fn lateral_function_schema(
         .get(name)
         .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
     {
-        if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, own, session) {
+        if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, &[own], session) {
             let mut cols = Vec::with_capacity(t.columns.len());
             for (idx, (cn, ct)) in t.columns.iter().enumerate() {
                 cols.push(QCol {
@@ -19379,7 +19426,7 @@ fn apply_pending_overlay(
     for (t, id, cells) in pending.iter() {
         let ordered = if t == scan_name {
             cells.clone()
-        } else if let Some(lt) = q.eng.db.find_table(t, q.snap, q.own, q.session) {
+        } else if let Some(lt) = q.eng.db.find_table(t, q.snap, &q.all_xids, q.session) {
             Row::new(
                 schema
                     .iter()
@@ -19554,7 +19601,7 @@ fn build_source(
             if name == "pg_stats"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_stats_schema()
@@ -19571,7 +19618,7 @@ fn build_source(
             if name == "pg_class"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_class_schema()
@@ -19588,7 +19635,7 @@ fn build_source(
             if name == "pg_attribute"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_attribute_schema()
@@ -19605,7 +19652,7 @@ fn build_source(
             if name == "pg_inherits"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_inherits_schema()
@@ -19622,7 +19669,7 @@ fn build_source(
             if name == "pg_sequences"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_sequences_schema()
@@ -19642,7 +19689,7 @@ fn build_source(
             ) && q
                 .eng
                 .db
-                .find_table(name, q.snap, q.own, q.session)
+                .find_table(name, q.snap, &q.all_xids, q.session)
                 .is_none()
             {
                 let (schema, rows) = pg_auth_scan(&q.eng.db, q.snap, q.own, q.role, name);
@@ -19660,7 +19707,7 @@ fn build_source(
             if name.as_str() == "pg_replication_slots"
                 && q.eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .is_none()
             {
                 let schema: Vec<QCol> = pg_replication_slots_schema()
@@ -19678,7 +19725,7 @@ fn build_source(
             // still reported as 42P01 when the table is missing.
             {
                 let (eng, snap, own, role) = (&q.eng, q.snap, q.own, q.role);
-                if let Some(t) = eng.db.find_table(name, snap, own, q.session) {
+                if let Some(t) = eng.db.find_table(name, snap, &[own], q.session) {
                     let have = crate::storage::table_privs(&eng.db, role, t, snap, own);
                     // v0.11: table-level SELECT, or any column-level
                     // SELECT grant — the run_select pre-pass enforces
@@ -19721,7 +19768,7 @@ fn build_source(
                 let t = q
                     .eng
                     .db
-                    .find_table(name, q.snap, q.own, q.session)
+                    .find_table(name, q.snap, &q.all_xids, q.session)
                     .ok_or_else(|| {
                         exec_err("42P01", format!("relation \"{}\" does not exist", name))
                     })?;
@@ -19770,16 +19817,18 @@ fn build_source(
                 let db = &q.eng.db;
                 let snap = q.snap;
                 let own = q.own;
+                // v1.21: clone the xid family for visibility (small vec).
+                let all_xids = q.all_xids.clone();
                 let rows: Vec<QRow> = if is_partitioned_parent {
                     // Collect all leaves recursively.
                     let leaves = collect_partition_leaves(db, name, snap, own, q.session);
                     let mut all_rows = Vec::new();
                     for leaf_name in leaves {
                         let lt = db
-                            .find_table(&leaf_name, snap, own, q.session)
+                            .find_table(&leaf_name, snap, &[own], q.session)
                             .expect("leaf still visible");
                         let leaf_cols = lt.columns.clone();
-                        for r in lt.rows.iter().filter(|r| row_visible(r, snap, own)) {
+                        for r in lt.rows.iter().filter(|r| row_visible(r, snap, &all_xids)) {
                             // Remap to parent column order.
                             let cells: Vec<Value> = parent_cols
                                 .iter()
@@ -19818,10 +19867,10 @@ fn build_source(
                     tables.extend(inherit_children.iter().map(|s| s.as_str()));
                     for tname in tables {
                         let ct = db
-                            .find_table(tname, snap, own, q.session)
+                            .find_table(tname, snap, &[own], q.session)
                             .expect("inheritance child still visible");
                         let child_cols = ct.columns.clone();
-                        for r in ct.rows.iter().filter(|r| row_visible(r, snap, own)) {
+                        for r in ct.rows.iter().filter(|r| row_visible(r, snap, &all_xids)) {
                             let cells: Vec<Value> = if tname == name.as_str() {
                                 r.values.iter().cloned().collect()
                             } else {
@@ -19878,7 +19927,7 @@ fn build_source(
                         AccessPath::SeqScan => t
                             .rows
                             .iter()
-                            .filter(|r| row_visible(r, snap, own))
+                            .filter(|r| row_visible(r, snap, &all_xids))
                             .map(|r| QRow {
                                 cells: r.values.clone(),
                                 prov: if need_prov || prov_for_overlay {
@@ -19916,7 +19965,7 @@ fn build_source(
                             for id in ids {
                                 if let Some(pos) = t.row_pos(id) {
                                     let r = &t.rows[pos];
-                                    if row_visible(r, snap, own) {
+                                    if row_visible(r, snap, &all_xids) {
                                         rows.push(QRow {
                                             cells: r.values.clone(),
                                             prov: if need_prov || prov_for_overlay {
@@ -19969,6 +20018,7 @@ fn build_source(
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -24084,6 +24134,7 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
+            all_xids: q.all_xids.clone(),
             session: q.session,
             role: q.role,
             read_only: q.read_only,
@@ -24155,7 +24206,7 @@ fn eval_tableoid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Valu
     let t = q
         .eng
         .db
-        .find_table(table_name, q.snap, q.own, q.session)
+        .find_table(table_name, q.snap, &q.all_xids, q.session)
         .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?;
     Ok(Value::Int(t.oid as i64))
 }
@@ -24512,6 +24563,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -24550,6 +24602,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -24626,6 +24679,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -25075,7 +25129,7 @@ fn match_hashable_exists(sub: &SelectStmt) -> Option<HashableExists<'_>> {
 /// mirrored for the hashed build (same 42501).
 fn check_subplan_table_privs(q: &Q, table: &str) -> Result<(), ExecError> {
     let db = &q.eng.db;
-    if let Some(t) = db.find_table(table, q.snap, q.own, q.session) {
+    if let Some(t) = db.find_table(table, q.snap, &q.all_xids, q.session) {
         let have = crate::storage::table_privs(db, q.role, t, q.snap, q.own);
         let select_ok = have & crate::storage::PRIV_SELECT == crate::storage::PRIV_SELECT
             || crate::storage::has_col_priv(
@@ -25170,7 +25224,7 @@ fn eval_hashed_exists(
     // statement snapshot.
     let h = {
         let db = &q.eng.db;
-        let t = match db.find_table(pat.table, q.snap, q.own, q.session) {
+        let t = match db.find_table(pat.table, q.snap, &q.all_xids, q.session) {
             Some(t) => t,
             // Gone between the base-table check and now: the slow path
             // reports it exactly as before (42P01).
@@ -25195,7 +25249,11 @@ fn eval_hashed_exists(
             None => return Ok(None),
         };
         let mut set = HashSet::new();
-        for r in t.rows.iter().filter(|r| row_visible(r, q.snap, q.own)) {
+        for r in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, q.snap, &q.all_xids))
+        {
             let v = &r.values[idx];
             if *v == Value::Null {
                 continue;
@@ -25278,7 +25336,7 @@ fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, tables: &[(String, String)]
     // v1.19: union of all inner tables' columns, for JOIN support.
     let mut cols: Vec<String> = Vec::new();
     for (table, _) in tables {
-        match q.eng.db.find_table(table, q.snap, q.own, q.session) {
+        match q.eng.db.find_table(table, q.snap, &q.all_xids, q.session) {
             Some(t) => cols.extend(t.columns.iter().map(|(n, _)| n.clone())),
             None => return false,
         }
@@ -25456,6 +25514,7 @@ fn eval_hashed_in(
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
+                    all_xids: q.all_xids.clone(),
                     session: q.session,
                     role: q.role,
                     read_only: q.read_only,
@@ -25765,6 +25824,7 @@ fn eval_in(
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
+            all_xids: q.all_xids.clone(),
             session: q.session,
             role: q.role,
             read_only: q.read_only,
@@ -25907,6 +25967,7 @@ fn eval_quantified(
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
+            all_xids: q.all_xids.clone(),
             session: q.session,
             role: q.role,
             read_only: q.read_only,
@@ -26465,7 +26526,7 @@ fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError> {
                 let t = q
                     .eng
                     .db
-                    .find_table(s, q.snap, q.own, q.session)
+                    .find_table(s, q.snap, &q.all_xids, q.session)
                     .ok_or_else(|| {
                         exec_err("42P01", format!("relation \"{}\" does not exist", s))
                     })?;
@@ -26822,6 +26883,7 @@ fn eval_dml_expr(
         eng,
         snap,
         own,
+        all_xids: vec![own],
         session,
         role,
         // v0.17: DML-only helper — INSERT/UPDATE/DELETE are
@@ -28602,7 +28664,7 @@ fn regclass_display(q: &Q, oid: u32) -> String {
     for (name, versions) in &q.eng.db.tables {
         if versions
             .iter()
-            .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, q.own))
+            .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, &q.all_xids))
         {
             return name.clone();
         }
@@ -28632,7 +28694,7 @@ fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
                 let t = q
                     .eng
                     .db
-                    .find_table(s, q.snap, q.own, q.session)
+                    .find_table(s, q.snap, &q.all_xids, q.session)
                     .ok_or_else(|| {
                         exec_err("42P01", format!("relation \"{}\" does not exist", s))
                     })?;
@@ -28697,7 +28759,7 @@ fn eval_cast_composite_inner(q: &mut Q, v: &Value, name: &str) -> Result<Value, 
             .composite
             .as_ref()
             .ok_or_else(|| exec_err("42846", format!("cannot cast type record to {}", name)))?,
-        None => match q.eng.db.find_table(name, q.snap, q.own, q.session) {
+        None => match q.eng.db.find_table(name, q.snap, &q.all_xids, q.session) {
             Some(t) => {
                 table_fields = t
                     .columns
@@ -29596,6 +29658,7 @@ fn run_func_body(
         eng: &mut *q.eng,
         snap: q.snap,
         own: q.own,
+        all_xids: q.all_xids.clone(),
         session: q.session,
         role: q.role,
         read_only: q.read_only,
@@ -29848,6 +29911,7 @@ fn run_plpgsql_body(
         eng: &mut *q.eng,
         snap: q.snap,
         own: q.own,
+        all_xids: q.all_xids.clone(),
         session: q.session,
         role: q.role,
         read_only: q.read_only,
@@ -30015,7 +30079,7 @@ fn func_rowtype_fields(
     q: &mut Q,
     type_name: &str,
 ) -> Result<(Vec<String>, Vec<ColType>), ExecError> {
-    if let Some(t) = q.eng.db.find_table(type_name, q.snap, q.own, q.session) {
+    if let Some(t) = q.eng.db.find_table(type_name, q.snap, &q.all_xids, q.session) {
         let names = t.columns.iter().map(|(n, _)| n.clone()).collect();
         let types = t.columns.iter().map(|(_, c)| c.clone()).collect();
         return Ok((names, types));
@@ -30371,7 +30435,7 @@ fn pg_column_compression_value(
         None => return Ok(Value::Null),
     };
     let (table_name, row_id) = (entry.table.as_str(), entry.row_id);
-    let t = match q.eng.db.find_table(table_name, q.snap, q.own, q.session) {
+    let t = match q.eng.db.find_table(table_name, q.snap, &q.all_xids, q.session) {
         Some(t) => t,
         None => return Ok(Value::Null),
     };
@@ -30457,8 +30521,9 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
             }
             if found.is_none() {
                 found = q.eng.db.tables.values().find_map(|vs| {
-                    vs.iter()
-                        .find(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, q.own))
+                    vs.iter().find(|t| {
+                        t.oid == oid && crate::storage::table_visible(t, q.snap, &q.all_xids)
+                    })
                 });
             }
             found.ok_or_else(|| {
@@ -30471,14 +30536,14 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
             };
             q.eng
                 .db
-                .find_table(s, q.snap, q.own, q.session)
+                .find_table(s, q.snap, &q.all_xids, q.session)
                 .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", s)))?
         }
     };
     // Sum the estimated stored size of all visible row versions.
     let mut size: i64 = 0;
     for rv in &t.rows {
-        if !crate::storage::row_visible(rv, q.snap, q.own) {
+        if !crate::storage::row_visible(rv, q.snap, &q.all_xids) {
             continue;
         }
         // Rough estimate: sum of value sizes + per-row overhead.
@@ -36825,7 +36890,7 @@ fn from_schema_item(
             }
             // v0.13: pg_replication_slots is virtual too.
             if name.as_str() == "pg_replication_slots"
-                && eng.db.find_table(name, snap, own, session).is_none()
+                && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_replication_slots_schema()
@@ -36894,7 +36959,7 @@ fn from_schema_item(
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
-            if name == "pg_stats" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_stats" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_stats_schema()
                     .into_iter()
@@ -36907,7 +36972,7 @@ fn from_schema_item(
                 return Ok(());
             }
             // v0.37: pg_class is virtual too (TOAST introspection).
-            if name == "pg_class" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_class" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_class_schema()
                     .into_iter()
@@ -36920,7 +36985,7 @@ fn from_schema_item(
                 return Ok(());
             }
             // v0.88: pg_attribute is virtual too (bounded catalog subset).
-            if name == "pg_attribute" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_attribute" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_attribute_schema()
                     .into_iter()
@@ -36933,7 +36998,7 @@ fn from_schema_item(
                 return Ok(());
             }
             // v0.96: pg_inherits is virtual too (inheritance catalog).
-            if name == "pg_inherits" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_inherits" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_inherits_schema()
                     .into_iter()
@@ -36946,7 +37011,7 @@ fn from_schema_item(
                 return Ok(());
             }
             // v0.98: pg_sequences is virtual too (sequence catalog).
-            if name == "pg_sequences" && eng.db.find_table(name, snap, own, session).is_none() {
+            if name == "pg_sequences" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_sequences_schema()
                     .into_iter()
@@ -36962,7 +37027,7 @@ fn from_schema_item(
             if matches!(
                 name.as_str(),
                 "pg_authid" | "pg_roles" | "pg_user" | "pg_auth_members"
-            ) && eng.db.find_table(name, snap, own, session).is_none()
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = match name.as_str() {
@@ -36980,7 +37045,7 @@ fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
-            let t = eng.db.find_table(name, snap, own, session).ok_or_else(|| {
+            let t = eng.db.find_table(name, snap, &[own], session).ok_or_else(|| {
                 exec_err("42P01", format!("relation \"{}\" does not exist", name))
             })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -37635,7 +37700,7 @@ fn expr_type(
                 _ => {
                     // v0.86: table rowtypes (PG19: every table has a
                     // composite rowtype).
-                    if eng.db.find_table(name, snap, own, session).is_some() {
+                    if eng.db.find_table(name, snap, &[own], session).is_some() {
                         return Ok(ColType::Composite);
                     }
                     Err(exec_err(
@@ -38683,7 +38748,7 @@ pub fn infer_param_types(
         ..
     } = stmt
     {
-        if let Some(t) = eng.db.find_table(table, snap, own, session) {
+        if let Some(t) = eng.db.find_table(table, snap, &[own], session) {
             // Unknown column names are skipped here; execution reports them.
             // v0.84: targets are InsertTarget (name + indirection); the
             // indirection path is ignored for type inference.
@@ -38736,7 +38801,7 @@ pub fn infer_param_types(
         let uqual = alias.as_deref().unwrap_or(table);
         let uextra: Vec<Vec<QCol>> =
             from_schemas(eng, snap, own, session, from, with, &[], &[], &[]).unwrap_or_default();
-        if let Some(t) = eng.db.find_table(table, snap, own, session) {
+        if let Some(t) = eng.db.find_table(table, snap, &[own], session) {
             let mut combined: Vec<QCol> = uextra.iter().flatten().cloned().collect();
             combined.extend(t.columns.iter().map(|(n, ty)| QCol {
                 qual: uqual.to_string(),
@@ -38792,7 +38857,7 @@ pub fn infer_param_types(
                 from_schemas(eng, snap, own, session, using, with, &[], &[], &[])
                     .unwrap_or_default();
             if let Some(w) = where_ {
-                if let Some(t) = eng.db.find_table(table, snap, own, session) {
+                if let Some(t) = eng.db.find_table(table, snap, &[own], session) {
                     let mut combined: Vec<QCol> = dextra.iter().flatten().cloned().collect();
                     combined.extend(t.columns.iter().map(|(n, ty)| QCol {
                         qual: qual.to_string(),
@@ -38854,7 +38919,7 @@ fn infer_returning(
     if returning.is_empty() {
         return;
     }
-    if let Some(t) = eng.db.find_table(table, snap, own, session) {
+    if let Some(t) = eng.db.find_table(table, snap, &[own], session) {
         // v0.76: UPDATE ... FROM / DELETE ... USING — RETURNING may
         // reference those tables (PG19); flatten their schemas ahead of
         // the target's, like the describe path.
@@ -38896,7 +38961,7 @@ fn infer_on_conflict(
         ..
     }) = on_conflict
     {
-        if let Some(t) = eng.db.find_table(table, snap, own, session) {
+        if let Some(t) = eng.db.find_table(table, snap, &[own], session) {
             let schemas: Vec<Vec<QCol>> = vec![
                 t.columns
                     .iter()
@@ -39787,6 +39852,8 @@ mod tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -40381,6 +40448,8 @@ mod tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: x1,
+            write_xid: x1,
+            all_xids: vec![x1],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -40398,6 +40467,8 @@ mod tests {
         let mut ctx2 = StmtCtx {
             snap: &snap2,
             own: x2,
+            write_xid: x2,
+            all_xids: vec![x2],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes2,
             session: 0,
@@ -45280,12 +45351,12 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
         .iter()
         .filter(|(_, vs)| {
             vs.iter()
-                .any(|t| crate::storage::table_visible(t, snap, own))
+                .any(|t| crate::storage::table_visible(t, snap, &[own]))
         })
         .map(|(n, vs)| {
             let t = vs
                 .iter()
-                .find(|t| crate::storage::table_visible(t, snap, own))
+                .find(|t| crate::storage::table_visible(t, snap, &[own]))
                 .expect("filtered")
                 .clone();
             (n.clone(), t)
@@ -45563,7 +45634,7 @@ fn validate_sequence_owned_by(
         crate::sql::OwnedBySpec::Table { table, column } => {
             let t = eng
                 .db
-                .find_table(table, ctx.snap, ctx.own, ctx.session)
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| {
                     exec_err("42P01", format!("relation \"{}\" does not exist", table))
                 })?;
@@ -46284,7 +46355,7 @@ fn resolve_func_type_name(
         ));
     }
     // Table rowtype (PG19: every table has a composite rowtype).
-    if eng.db.find_table(name, snap, own, session).is_some() {
+    if eng.db.find_table(name, snap, &[own], session).is_some() {
         return Ok(ColType::Composite);
     }
     Err(exec_err(
@@ -46647,7 +46718,7 @@ fn exec_create_trigger(
     require_table_owner(eng, ctx, table)?;
     let prev = eng
         .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
         .clone();
     // PG19: duplicate trigger names on one table are 42723.
@@ -46703,7 +46774,7 @@ fn exec_drop_trigger(
     require_table_owner(eng, ctx, table)?;
     let prev = eng
         .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
         .clone();
     if !prev.triggers.iter().any(|t| t.name == name) {
@@ -47182,7 +47253,7 @@ fn exec_drop_sequence(
         for (tname, vs) in &eng.db.tables {
             let Some(t) = vs
                 .iter()
-                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+                .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
             else {
                 continue;
             };
@@ -47457,7 +47528,7 @@ fn exec_create_role(
         connlimit: connlimit.unwrap_or(-1),
         memberships: Vec::new(),
         valid_until: valid_until.clone(),
-        created_xmin: ctx.own,
+        created_xmin: ctx.write_xid,
         dropped_xmax: 0,
     };
     eng.db.roles.entry(name.to_string()).or_default().push(role);
@@ -47721,7 +47792,7 @@ fn exec_drop_role(
         let mut owned = Vec::new();
         for (tn, vs) in &eng.db.tables {
             if vs.iter().any(|t| {
-                crate::storage::table_visible(t, ctx.snap, ctx.own) && t.owner == role.name
+                crate::storage::table_visible(t, ctx.snap, &ctx.all_xids) && t.owner == role.name
             }) {
                 owned.push(format!("table {}", tn));
             }
@@ -47854,7 +47925,7 @@ fn exec_grant_revoke(
         GrantObject::Table(name) => {
             let t = eng
                 .db
-                .find_table(name, ctx.snap, ctx.own, ctx.session)
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| {
                     exec_err("42P01", format!("relation \"{}\" does not exist", name))
                 })?;
@@ -48062,7 +48133,7 @@ fn alter_owner_to(
     }
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     let mut next = t;
@@ -48086,7 +48157,7 @@ fn alter_set_storage(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     let col_idx = t
@@ -48171,7 +48242,7 @@ fn alter_set_compression(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     let col_idx = t
@@ -48218,7 +48289,7 @@ fn alter_set_reloptions(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     let mut next = t;
@@ -48441,7 +48512,7 @@ fn alter_swap(
     }
     let prev = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     // v0.37: the per-column TOAST storage must stay parallel to
@@ -48475,7 +48546,7 @@ fn alter_swap(
         {
             let old_live = versions
                 .iter_mut()
-                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+                .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
                 .expect("visible above");
             old_live.dropped_xmax = ctx.own;
             if !rewrite {
@@ -48493,7 +48564,7 @@ fn alter_swap(
         let versions = eng.db.tables.get_mut(name).expect("visible above");
         let old_live = versions
             .iter_mut()
-            .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+            .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
             .expect("visible above");
         old_live.dropped_xmax = ctx.own;
         if !rewrite {
@@ -48712,7 +48783,7 @@ fn exec_alter_one(
             if res.is_ok() {
                 let children: Vec<String> = eng
                     .db
-                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
@@ -48749,7 +48820,7 @@ fn exec_alter_one(
             if res.is_ok() {
                 let children: Vec<String> = eng
                     .db
-                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
@@ -48789,7 +48860,7 @@ fn exec_alter_one(
                     .or(notnull.as_ref().map(|n| n.name.as_str()));
                 let children: Vec<String> = eng
                     .db
-                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
@@ -48803,7 +48874,7 @@ fn exec_alter_one(
                     // (e.g. inherited at CREATE PARTITION OF time).
                     let already = con_name.is_some_and(|n| {
                         eng.db
-                            .find_table(child, ctx.snap, ctx.own, ctx.session)
+                            .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
                             .is_some_and(|t| table_has_constraint(t, n))
                     });
                     if already {
@@ -48827,7 +48898,7 @@ fn exec_alter_one(
             if res.is_ok() {
                 let children: Vec<String> = eng
                     .db
-                    .find_table(name, ctx.snap, ctx.own, ctx.session)
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
@@ -48835,7 +48906,7 @@ fn exec_alter_one(
                     // Skip children that don't carry this constraint.
                     let missing = eng
                         .db
-                        .find_table(child, ctx.snap, ctx.own, ctx.session)
+                        .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
                         .is_some_and(|t| !table_has_constraint(t, con));
                     if missing {
                         continue;
@@ -48893,7 +48964,7 @@ fn alter_add_column(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     if t.column_index(col).is_some() {
         return Err(exec_err(
@@ -48915,7 +48986,10 @@ fn alter_add_column(
     for c in checks {
         validate_constraint_expr(&c.expr, "CHECK").map_err(sql_err)?;
     }
-    let has_rows = t.rows.iter().any(|r| row_visible(r, ctx.snap, ctx.own));
+    let has_rows = t
+        .rows
+        .iter()
+        .any(|r| row_visible(r, ctx.snap, &ctx.all_xids));
     if not_null && default.is_none() && has_rows {
         return Err(exec_err(
             "23502",
@@ -48975,7 +49049,7 @@ fn alter_add_column(
     let old_rows: Vec<(u64, Row, Vec<u32>)> = t
         .rows
         .iter()
-        .filter(|r| row_visible(r, ctx.snap, ctx.own))
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
         .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
     // v0.65: create the serial backing sequence now that `t`'s borrow
@@ -49028,7 +49102,7 @@ fn alter_add_column(
             &nv,
         )?;
         new_rows.push({
-            let mut rv = RowVersion::plain(new_id, Row::new(nv), ctx.own);
+            let mut rv = RowVersion::plain(new_id, Row::new(nv), ctx.write_xid);
             // v0.41: ADD COLUMN must not orphan TOAST metadata — carry
             // the per-cell value ids forward (PG keeps the toast
             // pointers across a rewrite); the new column's flag is 0.
@@ -49088,7 +49162,7 @@ fn alter_drop_column(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let ci = t.column_index(col).ok_or_else(|| {
         exec_err(
@@ -49134,7 +49208,7 @@ fn alter_drop_column(
             }
             let Some(ot) = vs
                 .iter()
-                .find(|t| crate::storage::table_visible(t, ctx.snap, ctx.own))
+                .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
             else {
                 continue;
             };
@@ -49205,7 +49279,7 @@ fn alter_drop_column(
     let old_rows: Vec<(u64, Row, Vec<u32>)> = t
         .rows
         .iter()
-        .filter(|r| row_visible(r, ctx.snap, ctx.own))
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
         .map(|r| (r.id, r.values.clone(), r.toast.clone()))
         .collect();
     let _ = t;
@@ -49332,7 +49406,7 @@ fn alter_drop_column(
                 flags.remove(ci);
             }
         }
-        let mut rv = RowVersion::plain(new_id, Row::new(values), ctx.own);
+        let mut rv = RowVersion::plain(new_id, Row::new(values), ctx.write_xid);
         flags.resize(rv.toast.len(), 0);
         rv.toast = flags;
         new_rows.push(rv);
@@ -49361,7 +49435,7 @@ fn alter_drop_column(
         ));
         let t2 = eng
             .db
-            .find_table(name, ctx.snap, ctx.own, ctx.session)
+            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
             .expect("just altered");
         for r in &t2.rows {
             let key = ix.key_for(&r.values);
@@ -49380,11 +49454,11 @@ fn alter_drop_column(
 fn drop_index_internal(eng: &mut Engine, ctx: &mut StmtCtx, name: &str) -> Result<(), ExecError> {
     let snapshot = eng
         .db
-        .find_index(name, ctx.snap, ctx.own)
+        .find_index(name, ctx.snap, &ctx.all_xids)
         .ok_or_else(|| exec_err("42P01", format!("index \"{}\" does not exist", name)))?
         .clone();
     eng.db
-        .find_index_mut(name, ctx.snap, ctx.own)
+        .find_index_mut(name, ctx.snap, &ctx.all_xids)
         .expect("index still present")
         .def
         .dropped_xmax = ctx.own;
@@ -49415,7 +49489,7 @@ fn temp_unique_dup_check(
 ) -> Result<(), ExecError> {
     let t = eng
         .db
-        .find_table(table, ctx.snap, ctx.own, ctx.session)
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
     let positions: Vec<usize> = cols
         .iter()
@@ -49429,7 +49503,11 @@ fn temp_unique_dup_check(
         })
         .collect::<Result<_, _>>()?;
     let mut seen: Vec<IndexKey> = Vec::new();
-    for r in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+    for r in t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+    {
         let key = temp_key(&positions, &r.values);
         // PG: NULLs are distinct in unique constraints.
         if key.0.iter().any(|v| matches!(v, Value::Null)) {
@@ -49461,7 +49539,7 @@ fn alter_add_constraint(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let mut next = t.clone();
     let meta = TableMeta::of(&next);
@@ -49487,7 +49565,11 @@ fn alter_add_constraint(
             )
         })?;
         if !n.not_valid {
-            for r in t.rows.iter().filter(|r| row_visible(r, ctx.snap, ctx.own)) {
+            for r in t
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+            {
                 if r.values.get(col_idx) == Some(&crate::storage::Value::Null) {
                     return Err(exec_err(
                         "23502",
@@ -49540,7 +49622,7 @@ fn alter_add_constraint(
         let old_rows: Vec<Row> = t
             .rows
             .iter()
-            .filter(|r| row_visible(r, ctx.snap, ctx.own))
+            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
             .map(|r| r.values.clone())
             .collect();
         for values in &old_rows {
@@ -49649,7 +49731,7 @@ fn alter_drop_constraint_internal(
 ) -> Result<(), ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let mut next = t.clone();
     let mut backing_index: Option<String> = None;
@@ -49695,7 +49777,7 @@ fn alter_drop_constraint_internal(
     // same-named permanent table's index when the temp table shadows it.
     if !eng.db.is_temp_table(ctx.session, name) {
         if let Some(ix) = backing_index {
-            if eng.db.find_index(&ix, ctx.snap, ctx.own).is_some() {
+            if eng.db.find_index(&ix, ctx.snap, &ctx.all_xids).is_some() {
                 drop_index_internal(eng, ctx, &ix)?;
             }
         }
@@ -49714,7 +49796,7 @@ fn alter_drop_constraint(
     // (unique/pkey backing an FK). CASCADE: drop those FKs too.
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let is_uniqueish =
         t.uniques.iter().any(|u| u.name == con) || t.pkey.as_ref().is_some_and(|p| p.name == con);
@@ -49729,7 +49811,7 @@ fn alter_drop_constraint(
             }
             let Some(ot) = vs
                 .iter()
-                .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
+                .find(|tt| crate::storage::table_visible(tt, ctx.snap, &ctx.all_xids))
             else {
                 continue;
             };
@@ -49767,7 +49849,7 @@ fn alter_set_default(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     let ci = t.column_index(col).ok_or_else(|| {
         exec_err(
@@ -49795,7 +49877,7 @@ fn alter_rename_column(
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     if t.column_index(old).is_none() {
         return Err(exec_err(
@@ -49900,7 +49982,7 @@ fn alter_rename_to(
 ) -> Result<ExecResult, ExecError> {
     if eng
         .db
-        .find_table(new_name, ctx.snap, ctx.own, ctx.session)
+        .find_table(new_name, ctx.snap, &ctx.all_xids, ctx.session)
         .is_some()
         || eng.db.views.get(new_name).is_some_and(|vs| {
             vs.iter()
@@ -49914,7 +49996,7 @@ fn alter_rename_to(
     }
     let t = eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
     // v0.77: a temp-table rename is session-local — never rewrite other
@@ -49931,7 +50013,7 @@ fn alter_rename_to(
             }
             if let Some(ot) = vs
                 .iter()
-                .find(|tt| crate::storage::table_visible(tt, ctx.snap, ctx.own))
+                .find(|tt| crate::storage::table_visible(tt, ctx.snap, &ctx.all_xids))
             {
                 if ot.fks.iter().any(|fk| fk.ref_table == name) {
                     ref_tables.push(tname.clone());
@@ -49941,7 +50023,7 @@ fn alter_rename_to(
         for tname in ref_tables {
             let ot = eng
                 .db
-                .find_table(&tname, ctx.snap, ctx.own, ctx.session)
+                .find_table(&tname, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("found above")
                 .clone();
             let mut onext = ot.clone();
@@ -50007,7 +50089,7 @@ fn exec_create_view(
     // A table by this name blocks the view (Postgres shares the namespace).
     if eng
         .db
-        .find_table(name, ctx.snap, ctx.own, ctx.session)
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .is_some()
     {
         return Err(exec_err(
@@ -50044,7 +50126,7 @@ fn exec_create_view(
     for d in &deps {
         let is_table = eng
             .db
-            .find_table(d, ctx.snap, ctx.own, ctx.session)
+            .find_table(d, ctx.snap, &ctx.all_xids, ctx.session)
             .is_some();
         let is_view = eng.db.find_view(d, ctx.snap, ctx.own).is_some();
         if !is_table && !is_view {
@@ -50062,7 +50144,7 @@ fn exec_create_view(
         query: query.to_string(),
         col_aliases: col_aliases.to_vec(),
         deps,
-        created_xmin: ctx.own,
+        created_xmin: ctx.write_xid,
         dropped_xmax: 0,
         // v0.11: the creating role owns the view.
         owner: ctx.role.to_string(),
@@ -50179,7 +50261,7 @@ fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec
         .iter()
         .filter(|(_, vs)| {
             vs.iter()
-                .any(|t| crate::storage::table_visible(t, snap, own))
+                .any(|t| crate::storage::table_visible(t, snap, &[own]))
         })
         .map(|(n, _)| n.clone())
         .collect();
@@ -50522,6 +50604,8 @@ mod v097_domain_tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -51144,6 +51228,8 @@ mod v102_raise_notice_tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -51756,6 +51842,8 @@ mod v108_costs_off_tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -51927,6 +52015,8 @@ mod v110_lateral_tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,
@@ -52341,6 +52431,8 @@ mod v112_empty_select_tests {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
             level: IsolationLevel::ReadCommitted,
             writes: &mut writes,
             session: 0,

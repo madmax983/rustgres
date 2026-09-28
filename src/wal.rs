@@ -3879,7 +3879,7 @@ pub fn records_for_commit(
                 // instead of corrupting the unique index.
                 if let Some(cname) = eng
                     .db
-                    .committed_unique_violation(&eng.txns, table, &values, *row_id, own, session)
+                    .committed_unique_violation(&eng.txns, table, &values, *row_id, &[own], session)
                 {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\" \

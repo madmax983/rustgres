@@ -5344,7 +5344,7 @@ impl Database {
         &self,
         name: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<&Table> {
         // v0.22: a session-local temp table shadows the permanent one.
@@ -5353,7 +5353,7 @@ impl Database {
         }
         self.tables
             .get(name)
-            .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, own)))
+            .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, owns)))
     }
 
     /// Mutable variant of [`Database::find_table`].
@@ -5361,7 +5361,7 @@ impl Database {
         &mut self,
         name: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<&mut Table> {
         // v0.22: a session-local temp table shadows the permanent one.
@@ -5374,7 +5374,7 @@ impl Database {
         }
         self.tables
             .get_mut(name)
-            .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, own)))
+            .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, owns)))
     }
 
     /// v0.22: drop all of a session's temp tables (disconnect cleanup).
@@ -5471,7 +5471,7 @@ impl Database {
                 }
             };
             for (tname, vs) in &db.tables {
-                if let Some(t) = vs.iter().find(|t| table_visible(t, snap, own)) {
+                if let Some(t) = vs.iter().find(|t| table_visible(t, snap, &[own])) {
                     consider(tname, t);
                 }
             }
@@ -5516,11 +5516,13 @@ impl Database {
     /// it lives (permanent or temp table). Returns the removed values and
     /// whether the table was a session-local temp table — temp rows have
     /// no global index entries, so callers skip index cleanup for them.
-    fn remove_own_version(&mut self, row_id: u64, own: u64) -> Option<(Row, bool)> {
+    fn remove_own_version(&mut self, row_id: u64, owns: &[u64]) -> Option<(Row, bool)> {
         for vs in self.tables.values_mut() {
             for t in vs {
                 if let Some(pos) = t.row_pos(row_id) {
-                    if t.rows[pos].xmin == own {
+                    // v1.21: a version is ours if its xmin is any xid
+                    // owned by the transaction (top or sub-xid).
+                    if owns.contains(&t.rows[pos].xmin) {
                         let values = t.rows[pos].values.clone();
                         t.swap_remove_version(pos);
                         return Some((values, false));
@@ -5532,7 +5534,7 @@ impl Database {
         for tmps in self.temp_tables.values_mut() {
             for t in tmps.values_mut() {
                 if let Some(pos) = t.row_pos(row_id) {
-                    if t.rows[pos].xmin == own {
+                    if owns.contains(&t.rows[pos].xmin) {
                         let values = t.rows[pos].values.clone();
                         t.swap_remove_version(pos);
                         return Some((values, true));
@@ -5547,17 +5549,17 @@ impl Database {
     // -- v0.8: secondary index maintenance -------------------------------
 
     /// Index definition visible to (`snap`, `own`), if any.
-    pub fn find_index(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Index> {
+    pub fn find_index(&self, name: &str, snap: &Snapshot, owns: &[u64]) -> Option<&Index> {
         self.indexes
             .get(name)
-            .filter(|ix| index_visible(&ix.def, snap, own))
+            .filter(|ix| index_visible(&ix.def, snap, owns))
     }
 
     /// Mutable twin of [`Database::find_index`].
-    pub fn find_index_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Index> {
+    pub fn find_index_mut(&mut self, name: &str, snap: &Snapshot, owns: &[u64]) -> Option<&mut Index> {
         self.indexes
             .get_mut(name)
-            .filter(|ix| index_visible(&ix.def, snap, own))
+            .filter(|ix| index_visible(&ix.def, snap, owns))
     }
 
     /// All index definitions on `table` visible to (`snap`, `own`),
@@ -5566,7 +5568,7 @@ impl Database {
         &self,
         table: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Vec<&Index> {
         // v0.87: temp tables use the session-local temp index map. A temp
@@ -5577,7 +5579,7 @@ impl Database {
                 .get(&session)
                 .map(|m| {
                     m.values()
-                        .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, own))
+                        .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, owns))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -5587,7 +5589,7 @@ impl Database {
         let mut out: Vec<&Index> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, own))
+            .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, owns))
             .collect();
         out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
         out
@@ -5655,18 +5657,18 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<String> {
-        let t = self.find_table(table, snap, own, session)?;
+        let t = self.find_table(table, snap, owns, session)?;
         // v0.22: temp tables have no backing indexes; enforce their
         // PRIMARY KEY / UNIQUE constraints with a session-local scan.
         if self.is_temp_table(session, table) {
             return self
-                .temp_scan_constraint(t, values, exclude_row_id, snap, own, None)
+                .temp_scan_constraint(t, values, exclude_row_id, snap, owns, None)
                 .map(|(name, _)| name);
         }
-        for ix in self.visible_indexes_for(table, snap, own, session) {
+        for ix in self.visible_indexes_for(table, snap, owns, session) {
             if !ix.def.unique {
                 continue;
             }
@@ -5689,10 +5691,10 @@ impl Database {
                 let alive = match t.row_pos(id) {
                     Some(pos) => {
                         let r = &t.rows[pos];
-                        if r.xmax == own {
+                        if owns.contains(&r.xmax) {
                             false // deleted by us: not a conflict
                         } else {
-                            r.xmin == own || row_visible(r, snap, own)
+                            owns.contains(&r.xmin) || row_visible(r, snap, owns)
                         }
                     }
                     None => false, // vacuumed away: cannot conflict
@@ -5717,7 +5719,7 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         only: Option<&str>,
     ) -> Option<(String, u64)> {
         let mut constraints: Vec<&UniqueDef> = t.uniques.iter().collect();
@@ -5739,10 +5741,10 @@ impl Database {
                 if Some(r.id) == exclude_row_id {
                     continue;
                 }
-                let alive = if r.xmax == own {
+                let alive = if owns.contains(&r.xmax) {
                     false // deleted by us: not a conflict
                 } else {
-                    r.xmin == own || row_visible(r, snap, own)
+                    owns.contains(&r.xmin) || row_visible(r, snap, owns)
                 };
                 if !alive {
                     continue;
@@ -5769,19 +5771,19 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<u64> {
-        let t = self.find_table(table, snap, own, session)?;
+        let t = self.find_table(table, snap, owns, session)?;
         // v0.22: temp tables have no backing indexes; match the arbiter
         // against the table's constraint definitions and scan.
         if self.is_temp_table(session, table) {
             return self
-                .temp_scan_constraint(t, values, exclude_row_id, snap, own, Some(index_name))
+                .temp_scan_constraint(t, values, exclude_row_id, snap, owns, Some(index_name))
                 .map(|(_, id)| id);
         }
         let ix = self
-            .visible_indexes_for(table, snap, own, session)
+            .visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .find(|ix| ix.def.name == index_name && ix.def.unique)?;
         let key = ix.key_for(values);
@@ -5796,10 +5798,10 @@ impl Database {
             let alive = match t.row_pos(id) {
                 Some(pos) => {
                     let r = &t.rows[pos];
-                    if r.xmax == own {
+                    if owns.contains(&r.xmax) {
                         false // deleted by us: not a conflict
                     } else {
-                        r.xmin == own || row_visible(r, snap, own)
+                        owns.contains(&r.xmin) || row_visible(r, snap, owns)
                     }
                 }
                 None => false, // vacuumed away: cannot conflict
@@ -5825,11 +5827,11 @@ impl Database {
         table: &str,
         values: &[Value],
         own_row_id: u64,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<String> {
         // Fresh snapshot: everything committed as of now is visible.
-        // `own` is still in `active`; row_visible would accept our own
+        // `owns` are still in `active`; row_visible would accept our own
         // rows, so they are excluded explicitly by id below.
         let fresh = Snapshot {
             active: txns.active.iter().copied().collect(),
@@ -5840,8 +5842,8 @@ impl Database {
         if self.is_temp_table(session, table) {
             return None;
         }
-        let t = self.find_table(table, &fresh, own, session)?;
-        for ix in self.visible_indexes_for(table, &fresh, own, session) {
+        let t = self.find_table(table, &fresh, owns, session)?;
+        for ix in self.visible_indexes_for(table, &fresh, owns, session) {
             if !ix.def.unique {
                 continue;
             }
@@ -5865,7 +5867,7 @@ impl Database {
                     continue; // vacuumed away: cannot conflict
                 };
                 let r = &t.rows[pos];
-                if r.xmin != own && row_visible(r, &fresh, own) {
+                if !owns.contains(&r.xmin) && row_visible(r, &fresh, owns) {
                     return Some(ix.def.name.clone());
                 }
             }
@@ -5876,8 +5878,8 @@ impl Database {
 
 /// Index DDL visibility: like a table version, but definitions are stored
 /// flat (one live definition per name at a time — enforced at commit).
-pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
-    let created_ok = def.created_xmin == own
+pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bool {
+    let created_ok = owns.contains(&def.created_xmin)
         || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
     if !created_ok {
         return false;
@@ -5885,7 +5887,7 @@ pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
     if def.dropped_xmax == 0 {
         return true;
     }
-    if def.dropped_xmax == own {
+    if owns.contains(&def.dropped_xmax) {
         return false;
     }
     !(def.dropped_xmax < snap.next_xid && !snap.active.contains(&def.dropped_xmax))
@@ -6295,23 +6297,34 @@ pub fn version_dead_to_all(txns: &TxnManager, v: &RowVersion) -> bool {
 }
 
 /// Row-version visibility for (`snap`, `own`).
-pub fn row_visible(v: &RowVersion, snap: &Snapshot, own: u64) -> bool {
-    let xmin_ok = v.xmin == own || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
+pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
+    // v1.21: `owns` is every xid owned by the reading transaction (top +
+    // sub-xids). A transaction sees its own sub-xid rows even when the
+    // snapshot predates the sub-xid allocation (RepeatableRead).
+    if owns.len() == 1 && v.xmin == 2 {
+        let bt = std::backtrace::Backtrace::capture();
+        let s = format!("{}", bt);
+        for line in s.lines().take(25) {
+            eprintln!("BT: {}", line);
+        }
+    }
+    let xmin_ok =
+        owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
     if !xmin_ok {
         return false;
     }
     if v.xmax == 0 {
         return true;
     }
-    if v.xmax == own {
+    if owns.contains(&v.xmax) {
         return false;
     }
     !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax))
 }
 
-/// Table-version visibility for (`snap`, `own`).
-pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
-    let created_ok = t.created_xmin == own
+/// Table-version visibility for (`snap`, `owns`).
+pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
+    let created_ok = owns.contains(&t.created_xmin)
         || (t.created_xmin < snap.next_xid && !snap.active.contains(&t.created_xmin));
     if !created_ok {
         return false;
@@ -6319,7 +6332,7 @@ pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
     if t.dropped_xmax == 0 {
         return true;
     }
-    if t.dropped_xmax == own {
+    if owns.contains(&t.dropped_xmax) {
         return false;
     }
     !(t.dropped_xmax < snap.next_xid && !snap.active.contains(&t.dropped_xmax))
@@ -6886,7 +6899,7 @@ fn prune_orphan_toast_info(eng: &mut Engine, table: &str, vids: &[u32]) {
     }
 }
 
-pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
+pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
     match op {
         WriteOp::InsertRow { table, row_id } => {
             // v0.22: the row may live in a session-local temp table
@@ -6900,7 +6913,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .find_row_version(*row_id)
                 .map(|v| v.toast.clone())
                 .unwrap_or_default();
-            if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, own) {
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, owns) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *row_id, &values);
                 }
@@ -6915,7 +6928,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
         } => {
             if let Some(v) = eng.db.find_row_version_mut(*row_id) {
-                if v.xmax == own {
+                if owns.contains(&v.xmax) {
                     v.xmax = *prev_xmax;
                 }
             }
@@ -6939,13 +6952,13 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .find_row_version(*new_id)
                 .map(|v| v.toast.clone())
                 .unwrap_or_default();
-            if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, own) {
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, owns) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *new_id, &values);
                 }
             }
             if let Some(v) = eng.db.find_row_version_mut(*old_id) {
-                if v.xmax == own {
+                if owns.contains(&v.xmax) {
                     v.xmax = *prev_xmax;
                 }
             }
@@ -6956,7 +6969,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::CreateTable { name } => {
             if let Some(versions) = eng.db.tables.get_mut(name) {
-                if let Some(pos) = versions.iter().position(|t| t.created_xmin == own) {
+                if let Some(pos) = versions.iter().position(|t| owns.contains(&t.created_xmin)) {
                     versions.swap_remove(pos);
                 }
                 if versions.is_empty() {
@@ -6966,7 +6979,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::DropTable { name, prev_xmax } => {
             if let Some(versions) = eng.db.tables.get_mut(name) {
-                if let Some(t) = versions.iter_mut().find(|t| t.dropped_xmax == own) {
+                if let Some(t) = versions.iter_mut().find(|t| owns.contains(&t.dropped_xmax)) {
                     t.dropped_xmax = *prev_xmax;
                 }
             }
@@ -7079,7 +7092,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .db
                 .indexes
                 .get(name)
-                .map(|ix| ix.def.created_xmin == own)
+                .map(|ix| owns.contains(&ix.def.created_xmin))
                 .unwrap_or(false);
             if ours {
                 eng.db.indexes.remove(name);
@@ -7092,7 +7105,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .db
                 .indexes
                 .get(name)
-                .map(|ix| ix.def.dropped_xmax == own)
+                .map(|ix| owns.contains(&ix.def.dropped_xmax))
                 .unwrap_or(false);
             if ours {
                 eng.db.indexes.insert(name.clone(), index.clone());
@@ -7105,7 +7118,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .temp_indexes
                 .get(session)
                 .and_then(|m| m.get(name))
-                .map(|ix| ix.def.created_xmin == own)
+                .map(|ix| owns.contains(&ix.def.created_xmin))
                 .unwrap_or(false);
             if ours {
                 if let Some(m) = eng.db.temp_indexes.get_mut(session) {
@@ -7124,7 +7137,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .temp_indexes
                 .get(session)
                 .and_then(|m| m.get(name))
-                .map(|ix| ix.def.dropped_xmax == own)
+                .map(|ix| owns.contains(&ix.def.dropped_xmax))
                 .unwrap_or(false);
             if ours {
                 eng.db
@@ -7145,7 +7158,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // then restore the previous table under its original name.
             let target = renamed_to.as_deref().unwrap_or(name);
             if let Some(versions) = eng.db.tables.get_mut(target) {
-                versions.retain(|t| t.created_xmin != own);
+                versions.retain(|t| !owns.contains(&t.created_xmin));
                 if versions.is_empty() {
                     eng.db.tables.remove(target);
                 }
@@ -7183,7 +7196,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::CreateView { name } => {
             if let Some(versions) = eng.db.views.get_mut(name) {
-                versions.retain(|v| v.created_xmin != own);
+                versions.retain(|v| !owns.contains(&v.created_xmin));
                 if versions.is_empty() {
                     eng.db.views.remove(name);
                 }
@@ -7195,8 +7208,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .views
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|v| v.created_xmin == view.created_xmin && v.dropped_xmax == own)
+                    vs.iter().any(|v| {
+                        v.created_xmin == view.created_xmin && owns.contains(&v.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -7214,7 +7228,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::CreateSequence { name } => {
             if let Some(versions) = eng.db.sequences.get_mut(name) {
-                versions.retain(|s| s.created_xmin != own);
+                versions.retain(|s| !owns.contains(&s.created_xmin));
                 if versions.is_empty() {
                     eng.db.sequences.remove(name);
                 }
@@ -7226,8 +7240,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .sequences
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|s| s.created_xmin == seq.created_xmin && s.dropped_xmax == own)
+                    vs.iter().any(|s| {
+                        s.created_xmin == seq.created_xmin && owns.contains(&s.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -7265,7 +7280,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         // being ours, like the table/version cases above.
         WriteOp::CreateRole { name } => {
             if let Some(versions) = eng.db.roles.get_mut(name) {
-                versions.retain(|r| r.created_xmin != own);
+                versions.retain(|r| !owns.contains(&r.created_xmin));
                 if versions.is_empty() {
                     eng.db.roles.remove(name);
                 }
@@ -7277,8 +7292,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .roles
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|r| r.created_xmin == prev.created_xmin && r.dropped_xmax == own)
+                    vs.iter().any(|r| {
+                        r.created_xmin == prev.created_xmin && owns.contains(&r.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -7446,7 +7462,7 @@ mod tests {
         let eng = engine_with_table();
         let v = &eng.db.tables["t"][0].rows[0];
         // xid 1 committed (below next_xid=10, not active).
-        assert!(row_visible(v, &snap(&[], 10), 99));
+        assert!(row_visible(v, &snap(&[], 10), &[99]));
     }
 
     #[test]
@@ -7455,9 +7471,9 @@ mod tests {
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmin = 7;
         // xid 7 still active: invisible to everyone else...
-        assert!(!row_visible(&v, &snap(&[7], 10), 99));
+        assert!(!row_visible(&v, &snap(&[7], 10), &[99]));
         // ...but visible to its owner.
-        assert!(row_visible(&v, &snap(&[7], 10), 7));
+        assert!(row_visible(&v, &snap(&[7], 10), &[7]));
     }
 
     #[test]
@@ -7465,11 +7481,11 @@ mod tests {
         let eng = engine_with_table();
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmax = 8; // deleter still active: delete not yet visible
-        assert!(row_visible(&v, &snap(&[8], 10), 99));
+        assert!(row_visible(&v, &snap(&[8], 10), &[99]));
         // Deleter committed (gone from active): version invisible.
-        assert!(!row_visible(&v, &snap(&[], 10), 99));
+        assert!(!row_visible(&v, &snap(&[], 10), &[99]));
         // But a snapshot taken while the deleter was active still sees it.
-        assert!(row_visible(&v, &snap(&[8], 10), 99));
+        assert!(row_visible(&v, &snap(&[8], 10), &[99]));
     }
 
     #[test]
@@ -7477,7 +7493,7 @@ mod tests {
         let eng = engine_with_table();
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmax = 7;
-        assert!(!row_visible(&v, &snap(&[7], 10), 7));
+        assert!(!row_visible(&v, &snap(&[7], 10), &[7]));
     }
 
     #[test]
@@ -7533,7 +7549,7 @@ mod tests {
         });
         undo_write_op(
             &mut eng,
-            7,
+            &[7],
             &WriteOp::InsertRow {
                 table: "t".to_string(),
                 row_id: 9,
@@ -7553,11 +7569,11 @@ mod tests {
         };
         // Someone else overwrote xmax after us: our undo must not clobber.
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = 8;
-        undo_write_op(&mut eng, 7, &op);
+        undo_write_op(&mut eng, &[7], &op);
         assert_eq!(eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax, 8);
         // Still ours: restore.
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = 7;
-        undo_write_op(&mut eng, 7, &op);
+        undo_write_op(&mut eng, &[7], &op);
         assert_eq!(eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax, 0);
     }
 
@@ -7761,7 +7777,7 @@ mod tests {
         eng.db.tables.insert("t".into(), vec![t]);
         undo_write_op(
             &mut eng,
-            9,
+            &[9],
             &WriteOp::InsertRow {
                 table: "t".into(),
                 row_id: 2,
@@ -7807,7 +7823,7 @@ mod tests {
         eng.db.tables.insert("t".into(), vec![t]);
         undo_write_op(
             &mut eng,
-            9,
+            &[9],
             &WriteOp::UpdateRow {
                 table: "t".into(),
                 old_id: 1,
@@ -7836,11 +7852,11 @@ mod tests {
             toast_relid: 16385,
             prev: 0,
         };
-        undo_write_op(&mut eng, 9, &op);
+        undo_write_op(&mut eng, &[9], &op);
         assert_eq!(eng.db.tables["t"][0].toast_relid, 0);
         // Conditional: a changed link is not clobbered.
         eng.db.tables.get_mut("t").unwrap()[0].toast_relid = 17000;
-        undo_write_op(&mut eng, 9, &op);
+        undo_write_op(&mut eng, &[9], &op);
         assert_eq!(eng.db.tables["t"][0].toast_relid, 17000);
     }
 

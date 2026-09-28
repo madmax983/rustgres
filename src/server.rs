@@ -188,6 +188,25 @@ struct Txn {
     /// back to a savepoint undoes staged writes AND releases the row locks
     /// taken after it, like Postgres.
     savepoints: Vec<(String, usize, usize)>,
+    /// v1.21: subtransaction xid scopes for PG19 savepoint xmin semantics,
+    /// in lockstep with `savepoints` (one entry per savepoint). Each scope
+    /// gets its own xid (eagerly via `alloc_xid` at SAVEPOINT); writes made
+    /// inside the savepoint stamp this xid as their xmin, like PG19's
+    /// `GetCurrentTransactionId` returning the subtransaction's xid.
+    /// ROLLBACK TO SAVEPOINT replaces the named scope with a fresh xid
+    /// (PG19 aborts the subtransaction and restarts it with the same name),
+    /// so post-rollback writes get a NEW xid. RELEASE drops the scope.
+    /// Sub-xids are deliberately NOT registered in `txns.active` (documented
+    /// v1.21: sub-xid stack for the current savepoint scope, in lockstep
+    /// with `savepoints`. The innermost xid is stamped on new row
+    /// versions (PG19 `GetCurrentTransactionId`). Truncated on RELEASE
+    /// and ROLLBACK TO.
+    sub_xids: Vec<u64>,
+    /// v1.21: every sub-xid ever allocated by this transaction, in
+    /// allocation order. Never truncated until transaction end — a
+    /// released savepoint's rows remain visible to (and undoable by)
+    /// the transaction, so their xids must stay in the ownership set.
+    owned_xids: Vec<u64>,
     /// v0.16: cursor marks in lockstep with `savepoints`.
     cursor_marks: Vec<CursorMark>,
     /// A failed statement aborts the transaction (Postgres semantics):
@@ -214,6 +233,28 @@ struct Txn {
     /// PG19 restores the parent's characteristics on both ROLLBACK TO
     /// and RELEASE SAVEPOINT.
     txn_char_marks: Vec<(Option<bool>, IsolationLevel, Option<bool>)>,
+}
+
+impl Txn {
+    /// v1.21: xid to stamp on new row versions — the innermost savepoint
+    /// scope's sub-xid, or the top-level xid when no savepoint is active.
+    /// Mirrors PG19's `GetCurrentTransactionId` (subtransactions get their
+    /// own xids, which `heap_insert` stamps into xmin).
+    fn write_xid(&self) -> u64 {
+        self.sub_xids.last().copied().unwrap_or(self.xid)
+    }
+
+    /// v1.21: every xid owned by this transaction (top + all allocated
+    /// sub-xids, including released ones), for visibility and undo.
+    /// A released savepoint's rows stay visible to the transaction, and
+    /// a ROLLBACK TO an outer savepoint must undo writes done under
+    /// released inner savepoints.
+    fn all_xids(&self) -> Vec<u64> {
+        let mut v = Vec::with_capacity(self.owned_xids.len() + 1);
+        v.push(self.xid);
+        v.extend_from_slice(&self.owned_xids);
+        v
+    }
 }
 
 /// v0.66: snapshot of one stateful GUC's session value, for the
@@ -1423,9 +1464,17 @@ fn copy_to_fetch(
     if session.txn.is_some() {
         let t = session.txn.as_mut().unwrap();
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+        let write_xid = t.write_xid();
+        eprintln!(
+            "DEBUG txn_execute write_xid={} all_xids={:?}",
+            write_xid,
+            t.all_xids()
+        );
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid,
+            all_xids: t.all_xids(),
             level,
             session: session.sid,
             role: &session.role,
@@ -1449,6 +1498,8 @@ fn copy_to_fetch(
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid: xid,
+                all_xids: vec![xid],
                 level: IsolationLevel::ReadCommitted,
                 session: session.sid,
                 role: &session.role,
@@ -1570,9 +1621,12 @@ fn copy_from_ingest(
         let t = session.txn.as_mut().unwrap();
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
         let r = {
+            let write_xid = t.write_xid();
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid,
+                all_xids: t.all_xids(),
                 level,
                 session: session.sid,
                 role: &session.role,
@@ -1596,6 +1650,8 @@ fn copy_from_ingest(
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid: xid,
+                all_xids: vec![xid],
                 level: IsolationLevel::ReadCommitted,
                 session: session.sid,
                 role: &session.role,
@@ -1613,7 +1669,7 @@ fn copy_from_ingest(
                 let records = match wal::records_for_commit(&guard, xid, &writes, session.sid) {
                     Ok(r) => r,
                     Err(msg) => {
-                        undo_all(&mut guard, xid, &writes);
+                        undo_all(&mut guard, &[xid], &writes);
                         retire_txn(&mut guard, xid);
                         auto_vacuum(&mut guard, &writes);
                         return Err(exec::ExecError {
@@ -1627,7 +1683,7 @@ fn copy_from_ingest(
                     }
                 };
                 if let Err(e) = lock_wal(wal).append_batch(&records) {
-                    undo_all(&mut guard, xid, &writes);
+                    undo_all(&mut guard, &[xid], &writes);
                     retire_txn(&mut guard, xid);
                     auto_vacuum(&mut guard, &writes);
                     return Err(exec::ExecError {
@@ -1641,7 +1697,7 @@ fn copy_from_ingest(
                 Ok(n)
             }
             Err(e) => {
-                undo_all(&mut guard, xid, &writes);
+                undo_all(&mut guard, &[xid], &writes);
                 retire_txn(&mut guard, xid);
                 auto_vacuum(&mut guard, &writes);
                 Err(e)
@@ -3491,9 +3547,12 @@ fn txn_execute(
         .expect("txn_execute called without a transaction");
     let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
     let result = {
+        let write_xid = t.write_xid();
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid,
+            all_xids: t.all_xids(),
             level,
             session: session.sid,
             role: &session.role,
@@ -3556,6 +3615,8 @@ fn autocommit_execute(
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid: xid,
+            all_xids: vec![xid],
             level: IsolationLevel::ReadCommitted,
             session: sid,
             role,
@@ -3585,7 +3646,7 @@ fn autocommit_execute(
     let result = match result {
         Ok(r) => r,
         Err(e) => {
-            undo_all(&mut guard, xid, &writes);
+            undo_all(&mut guard, &[xid], &writes);
             retire_txn(&mut guard, xid);
             return Err(e);
         }
@@ -3599,7 +3660,7 @@ fn autocommit_execute(
     let records = match wal::records_for_commit(&guard, xid, &writes, sid) {
         Ok(r) => r,
         Err(msg) => {
-            undo_all(&mut guard, xid, &writes);
+            undo_all(&mut guard, &[xid], &writes);
             retire_txn(&mut guard, xid);
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
@@ -3614,7 +3675,7 @@ fn autocommit_execute(
     };
     // Lock order is always engine -> wal.
     if let Err(e) = lock_wal(wal).append_batch(&records) {
-        undo_all(&mut guard, xid, &writes);
+        undo_all(&mut guard, &[xid], &writes);
         retire_txn(&mut guard, xid);
         auto_vacuum(&mut guard, &writes);
         return Err(wal_err(e));
@@ -3625,9 +3686,9 @@ fn autocommit_execute(
 }
 
 /// Undo every op, newest first (abort / failed autocommit / WAL failure).
-fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
+fn undo_all(engine: &mut Engine, owns: &[u64], writes: &[WriteOp]) {
     for op in writes.iter().rev() {
-        undo_write_op(engine, own, op);
+        undo_write_op(engine, owns, op);
     }
 }
 
@@ -3637,6 +3698,15 @@ fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
 fn retire_txn(engine: &mut Engine, xid: u64) {
     engine.end_txn(xid);
     engine.release_txn_locks(xid);
+}
+
+/// v1.21: retire the top xid and every owned sub-xid (they were registered
+/// active via begin_txn for isolation).
+fn retire_txn_family(engine: &mut Engine, t: &Txn) {
+    for &sub in &t.owned_xids {
+        engine.end_txn(sub);
+    }
+    retire_txn(engine, t.xid);
 }
 
 /// Best-effort cleanup after a commit or abort: reclaim versions that are
@@ -3728,6 +3798,8 @@ fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         first_snapshot_set: false,
         writes: Vec::new(),
         savepoints: Vec::new(),
+        sub_xids: Vec::new(),
+        owned_xids: Vec::new(),
         cursor_marks: Vec::new(),
         failed: false,
         implicit: true,
@@ -3746,8 +3818,8 @@ fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
     if let Some(t) = session.txn.take() {
         debug_assert!(t.implicit, "abort_implicit_txn on explicit txn");
         let mut guard = lock_engine(engine);
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction.
@@ -3789,8 +3861,8 @@ fn commit_taken_txn(
     let mut guard = lock_engine(engine);
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction
@@ -3832,7 +3904,7 @@ fn commit_taken_txn(
         session.txn = Some(t);
         return Err(wal_err(e));
     }
-    retire_txn(&mut guard, t.xid);
+    retire_txn_family(&mut guard, &t);
     auto_vacuum(&mut guard, &t.writes);
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
@@ -3875,6 +3947,8 @@ fn txn_begin(
         first_snapshot_set: false,
         writes: Vec::new(),
         savepoints: Vec::new(),
+        sub_xids: Vec::new(),
+        owned_xids: Vec::new(),
         cursor_marks: Vec::new(),
         failed: false,
         implicit: false,
@@ -3979,7 +4053,7 @@ fn txn_vacuum(
         next_xid: guard.txns.next_xid,
     };
     let is_owner = |db: &crate::storage::Database, snap: &crate::storage::Snapshot, name: &str| {
-        db.find_table(name, snap, u64::MAX, session.sid)
+        db.find_table(name, snap, &[u64::MAX], session.sid)
             .map(|t| {
                 t.owner == session.role
                     || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
@@ -3991,7 +4065,7 @@ fn txn_vacuum(
         // session's temp tables first, like ANALYZE does.
         if guard
             .db
-            .find_table(name, &snap, u64::MAX, session.sid)
+            .find_table(name, &snap, &[u64::MAX], session.sid)
             .is_none()
         {
             return Err(ExecError {
@@ -4096,8 +4170,8 @@ fn txn_rollback(
             .take()
             .expect("implicit transaction checked above");
         let mut guard = lock_engine(engine);
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
@@ -4112,8 +4186,8 @@ fn txn_rollback(
     let chained = if let Some(t) = session.txn.take() {
         let chained = (t.level, t.read_only, t.deferrable);
         let mut guard = lock_engine(engine);
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
@@ -4156,8 +4230,17 @@ fn txn_savepoint(
             // A savepoint is a position in the write log plus the current
             // row-lock count — no copies.
             let xid = t.xid;
-            let locks = lock_engine(engine).txn_lock_count(xid);
+            let mut guard = lock_engine(engine);
+            let locks = guard.txn_lock_count(xid);
+            // v1.21: the new savepoint scope gets its own sub-xid (PG19
+            // AssignTransactionId, eager — the burn is unobservable).
+            // Registered active via begin_txn so other sessions'
+            // snapshots see it as in-progress (isolation).
+            let sub = guard.begin_txn();
+            drop(guard);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
+            t.sub_xids.push(sub);
+            t.owned_xids.push(sub);
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
             // effects made after the savepoint (PG19).
             t.guc_marks.push(t.guc_stack.len());
@@ -4203,6 +4286,9 @@ fn txn_rollback_to(
     let to = t.savepoints[idx].1;
     let keep_locks = t.savepoints[idx].2;
     let xid = t.xid;
+    // v1.21: undo must recognize versions stamped with any of the
+    // transaction's xids (top or sub-xids from savepoint scopes).
+    let owns = t.all_xids();
     // Undo everything staged after the savepoint, newest first. Each undo
     // is conditional on the version still being ours (see undo_write_op).
     // v0.9: sequence advances are non-transactional — they survive
@@ -4212,7 +4298,7 @@ fn txn_rollback_to(
         if matches!(op, WriteOp::SeqAdvance { .. }) {
             kept_seq.push(op);
         } else {
-            undo_write_op(&mut guard, xid, &op);
+            undo_write_op(&mut guard, &owns, &op);
         }
     }
     t.writes.extend(kept_seq.into_iter().rev());
@@ -4222,6 +4308,14 @@ fn txn_rollback_to(
     // Savepoints established after the named one are destroyed; the named
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
+    // v1.21: PG19 aborts the savepoint's subtransaction and restarts it
+    // with the same name — the surviving scope gets a FRESH sub-xid so
+    // post-rollback writes are distinguishable from pre-rollback ones.
+    // Registered active for isolation (see txn_savepoint).
+    t.sub_xids.truncate(idx);
+    let repl = guard.begin_txn();
+    t.sub_xids.push(repl);
+    t.owned_xids.push(repl);
     t.failed = false;
     // v0.66: SET/SET LOCAL effects after the savepoint are canceled,
     // newest first (PG19). The marks established after the named
@@ -4288,6 +4382,9 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         })?;
     // Destroys the named savepoint and all established after it.
     t.savepoints.truncate(idx);
+    // v1.21: the sub-xid scopes die with their savepoints. The rows keep
+    // their stamped xmins (PG19: released subtransactions keep their xids).
+    t.sub_xids.truncate(idx);
     // v0.16: cursor marks die with their savepoints.
     t.cursor_marks.truncate(idx);
     // v0.66: the GUC marks die with their savepoints too, but the
@@ -4989,6 +5086,8 @@ mod tests {
                 first_snapshot_set: false,
                 writes: Vec::new(),
                 savepoints: Vec::new(),
+                sub_xids: Vec::new(),
+                owned_xids: Vec::new(),
                 cursor_marks: Vec::new(),
                 failed: false,
                 implicit: false,
@@ -5084,7 +5183,7 @@ mod tests {
             }
         }
         assert_eq!(engine.db.tables["t"][0].rows.len(), 2);
-        undo_all(&mut engine, xid, &writes);
+        undo_all(&mut engine, &[xid], &writes);
         assert!(engine.db.tables["t"][0].rows.is_empty());
     }
 
