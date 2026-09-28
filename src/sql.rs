@@ -6097,7 +6097,7 @@ impl Parser {
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
-            "xid" => Ok(ColType::Xid),             // v1.17
+            "xid" => Ok(ColType::Xid),      // v1.17
             // v0.81: not a builtin — treat as a (possibly) named composite
             // type; the name is resolved against the type catalog at
             // execution time (42704 if undefined).
