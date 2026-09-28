@@ -51161,3 +51161,185 @@ mod v110_lateral_tests {
         assert_eq!(err.code, "42601");
     }
 }
+
+/// v1.12: zero-target-list SELECT (PG19 gram.y `opt_target_list` may be
+/// empty in any simple SELECT). The executor produces genuine
+/// zero-column rows: `SELECT;` -> one empty row, `SELECT FROM t` -> one
+/// empty row per input row, through UNION/INTERSECT/EXCEPT and CTEs.
+#[cfg(test)]
+mod v112_empty_select_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    /// (ncols, nrows) of a SELECT result.
+    fn shape(r: ExecResult) -> (usize, usize) {
+        match r {
+            ExecResult::Select { columns, rows, .. } => (columns.len(), rows.len()),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v112_select_bare_empty_list() {
+        // PG19: `SELECT;` returns a single row with zero columns.
+        let mut eng = engine();
+        assert_eq!(shape(run(&mut eng, "SELECT;").unwrap()), (0, 1));
+        // v0.87's `SELECT WHERE false` keeps working (zero rows).
+        assert_eq!(shape(run(&mut eng, "SELECT WHERE false;").unwrap()), (0, 0));
+        assert_eq!(shape(run(&mut eng, "SELECT WHERE true;").unwrap()), (0, 1));
+    }
+
+    #[test]
+    fn v112_select_from_empty_list() {
+        // PG19: `SELECT FROM t` returns one zero-column row per input row.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE es_t (a int, b text)").unwrap();
+        run(&mut eng, "INSERT INTO es_t VALUES (1, 'x'), (2, 'y'), (3, 'z')").unwrap();
+        assert_eq!(shape(run(&mut eng, "SELECT FROM es_t;").unwrap()), (0, 3));
+        assert_eq!(
+            shape(run(&mut eng, "SELECT FROM es_t WHERE a > 1;").unwrap()),
+            (0, 2)
+        );
+        assert_eq!(
+            shape(run(&mut eng, "SELECT FROM generate_series(1, 4);").unwrap()),
+            (0, 4)
+        );
+    }
+
+    #[test]
+    fn v112_empty_select_setops() {
+        // PG19 set-operation semantics over zero-column branches:
+        // UNION dedups the identical empty rows to one; UNION ALL keeps
+        // all; INTERSECT [ALL] / EXCEPT [ALL] use multiset semantics.
+        let mut eng = engine();
+        assert_eq!(shape(run(&mut eng, "SELECT UNION SELECT;").unwrap()), (0, 1));
+        assert_eq!(
+            shape(run(&mut eng, "SELECT INTERSECT SELECT;").unwrap()),
+            (0, 1)
+        );
+        assert_eq!(shape(run(&mut eng, "SELECT EXCEPT SELECT;").unwrap()), (0, 0));
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "SELECT FROM generate_series(1, 5) UNION ALL \
+                     SELECT FROM generate_series(1, 3);"
+                )
+                .unwrap()
+            ),
+            (0, 8)
+        );
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "SELECT FROM generate_series(1, 5) UNION \
+                     SELECT FROM generate_series(1, 3);"
+                )
+                .unwrap()
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "SELECT FROM generate_series(1, 5) INTERSECT ALL \
+                     SELECT FROM generate_series(1, 3);"
+                )
+                .unwrap()
+            ),
+            (0, 3)
+        );
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "SELECT FROM generate_series(1, 5) EXCEPT \
+                     SELECT FROM generate_series(1, 3);"
+                )
+                .unwrap()
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "SELECT FROM generate_series(1, 5) EXCEPT ALL \
+                     SELECT FROM generate_series(1, 3);"
+                )
+                .unwrap()
+            ),
+            (0, 2)
+        );
+    }
+
+    #[test]
+    fn v112_empty_select_cte() {
+        // PG19: zero-target-list over a CTE (the union.sql variation).
+        let mut eng = engine();
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "WITH cte AS MATERIALIZED (SELECT s FROM generate_series(1, 5) s) \
+                     SELECT FROM cte UNION SELECT FROM cte;"
+                )
+                .unwrap()
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            shape(
+                run(
+                    &mut eng,
+                    "WITH cte AS NOT MATERIALIZED (SELECT s FROM generate_series(1, 5) s) \
+                     SELECT FROM cte UNION SELECT FROM cte;"
+                )
+                .unwrap()
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn v112_empty_select_still_rejects_bogus() {
+        // A FROM with no table is still a syntax error (PG19: 42601),
+        // and a dangling comma is not silently swallowed.
+        let mut eng = engine();
+        let err = run(&mut eng, "SELECT FROM;").unwrap_err();
+        assert_eq!(err.code, "42601");
+        let err = run(&mut eng, "SELECT 1 2;").unwrap_err();
+        assert_eq!(err.code, "42601");
+        // DISTINCT over zero columns dedups to a single empty row (PG19).
+        assert_eq!(
+            shape(run(&mut eng, "SELECT DISTINCT FROM generate_series(1, 3);").unwrap()),
+            (0, 1)
+        );
+    }
+}

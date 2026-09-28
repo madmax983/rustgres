@@ -139,12 +139,17 @@ class Conn:
         """
         self.s.sendall(msg(b"Q", cstr(sql)))
         sets = []
-        cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": ""}
+        cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": "",
+               # v1.12: a zero-column SELECT still emits RowDescription (T)
+               # with 0 fields; record that so is_quiet_set can tell it
+               # apart from a utility that emits no RowDescription at all.
+               "saw_desc": False}
         all_oids, all_names, all_rows, all_codes = [], [], [], []
         all_tag = ""
         while True:
             t, p = self._read_msg()
             if t == b"T":
+                cur["saw_desc"] = True
                 (n,) = struct.unpack("!h", p[:2])
                 pos = 2
                 for _ in range(n):
@@ -182,11 +187,12 @@ class Conn:
                 all_tag = p[:-1].decode()
                 cur["tag"] = all_tag
                 sets.append(cur)
-                cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": ""}
+                cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": "",
+                       "saw_desc": False}
             elif t == b"Z":
                 # Flush any open set (e.g. an error arrived before any
                 # completion tag); guarantee at least one set.
-                if cur["oids"] or cur["colnames"] or cur["rows"] or cur["err_codes"] or cur["tag"]:
+                if cur["oids"] or cur["colnames"] or cur["rows"] or cur["err_codes"] or cur["tag"] or cur["saw_desc"]:
                     sets.append(cur)
                 if not sets:
                     sets.append(cur)
@@ -643,6 +649,27 @@ def parse_expected_block(lines, pos, null_display):
             pos += 1
         return Expected("error"), pos
 
+    # v1.12: zero-column result. psql renders a zero-target-list SELECT
+    # as the bare `--` separator line plus `(N rows)` — no header line
+    # and no data rows (e.g. `SELECT;` -> `--` / `(1 row)`). Parse it as
+    # a table with zero columns so row counts are actually verified.
+    # This is unambiguous here: the block is parsed positionally right
+    # after the statement echo, and a `(N rows)` marker only ever
+    # terminates a query result.
+    if line.strip() == "--" and pos + 1 < n:
+        m0 = re.match(r"^\((\d+) rows?\)$", lines[pos + 1].strip())
+        if m0:
+            count0 = int(m0.group(1))
+            return (
+                Expected(
+                    "table",
+                    colnames=[],
+                    rows=[[] for _ in range(count0)],
+                    count=count0,
+                ),
+                pos + 2,
+            )
+
     # psql table: header line, dashes line, data rows, "(N rows)".
     # The dashes line must be at least as wide as the header: this keeps a
     # following "--" comment line (or the next statement echo) from being
@@ -840,6 +867,15 @@ EXPECTED_PASS_OVERRIDES = [
      r"(?!.*\binserttest\w*\b)"
      r".*\brow\s*\(",
      "v1.11: row() constructor supported"),
+    # v1.12: zero-target-list SELECT is supported (PG19 gram.y
+    # opt_target_list may be empty in any simple SELECT): `SELECT;`,
+    # `SELECT FROM ...`, including through UNION/INTERSECT/EXCEPT and
+    # CTEs — the executor produces genuine zero-column rows. Excludes:
+    # EXPLAIN (stays masked), CREATE FUNCTION bodies.
+    (r"(?is)^(?!\s*create\s+(or\s+replace\s+)?function\b)"
+     r"(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r".*(\bselect\s+from\b|\bselect\s+(union|intersect|except)\s+select\b)",
+     "v1.12: zero-target-list SELECT supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
@@ -895,6 +931,11 @@ EXPECTED_FAIL_PATTERNS = [
     # timestamp/timestamptz variants, and empty SELECT lists.
     (r"(?i)\bgenerate_series\s*\([^)]*::\s*(timestamp|timestamptz)\b",
      "generate_series() timestamp variant unsupported"),
+    # v1.12: EXPLAIN of a zero-target-list SELECT stays masked — EXPLAIN
+    # itself is unsupported (the 522-statement EXPLAIN cluster), not the
+    # empty select list. Must precede the generic select-from mask below.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\b.*\bselect\s+from\b",
+     "v1.12: EXPLAIN of zero-target-list SELECT unsupported"),
     (r"(?i)\bselect\s+from\b", "empty SELECT list unsupported"),
     (r"\bgen_random_uuid\s*\(", "gen_random_uuid() unsupported"),
     (r"\bquote_ident\s*\(|\bquote_literal\s*\(", "quote_*() unsupported"),
@@ -1397,8 +1438,10 @@ def parse_expected_blocks(lines, pos, null_display):
 def is_quiet_set(s):
     """A result set pg_regress shows nothing for: a bare command tag
     with no RowDescription, no rows, and no error. An empty SELECT is
-    NOT quiet — pg_regress shows its table header plus "(0 rows)"."""
-    return not s["err_codes"] and not s["rows"] and not s["colnames"]
+    NOT quiet — pg_regress shows its table header plus "(0 rows)".
+    v1.12: a zero-column SELECT emits RowDescription with 0 fields
+    (saw_desc), so it is never quiet even with zero rows/columns."""
+    return not s["err_codes"] and not s["rows"] and not s["saw_desc"]
 
 
 def compare_multi(stmt, expected_blocks, sets, null_display):

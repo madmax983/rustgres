@@ -11789,6 +11789,34 @@ impl Parser {
         })
     }
 
+    /// v1.12: true when the next token can legally follow an (empty)
+    /// select target list, i.e. it starts a following clause, a set
+    /// operation, or terminates the select core. Mirrors PG19 gram.y's
+    /// `opt_target_list` (which may be empty in any simple SELECT).
+    /// Only consulted when no target items have been parsed yet.
+    fn select_core_follows(&mut self) -> bool {
+        match self.peek() {
+            Token::Ident(kw) => matches!(
+                kw.as_str(),
+                "from"
+                    | "where"
+                    | "group"
+                    | "having"
+                    | "order"
+                    | "limit"
+                    | "offset"
+                    | "fetch"
+                    | "for"
+                    | "window"
+                    | "union"
+                    | "intersect"
+                    | "except"
+            ),
+            Token::RParen | Token::Semi | Token::EOF => true,
+            _ => false,
+        }
+    }
+
     /// The body of a SELECT after the `SELECT` keyword was consumed.
     /// v0.44: the SELECT core: `SELECT [DISTINCT] ... HAVING`, without the
     /// trailing `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` (see
@@ -11824,14 +11852,15 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             // v0.87: zero-target-list SELECT (`SELECT WHERE false`): if no
-            // items yet and WHERE follows, stop (PG19 allows it). Other
-            // clauses (FROM/GROUP/etc.) still require a target list.
-            if items.is_empty() {
-                if let Token::Ident(kw) = self.peek() {
-                    if kw.as_str() == "where" {
-                        break;
-                    }
-                }
+            // items yet and WHERE follows, stop (PG19 allows it).
+            // v1.12: PG19's gram.y lets opt_target_list be empty in ANY
+            // simple SELECT (`SELECT;`, `SELECT FROM t`), not just before
+            // WHERE. Break on any clause keyword or select-core
+            // terminator when no items have been parsed yet. (FROM etc.
+            // are reserved words, so no valid expression starts with
+            // them; only the first token is affected.)
+            if items.is_empty() && self.select_core_follows() {
+                break;
             }
             // `*`
             if *self.peek() == Token::Star {
@@ -11863,14 +11892,13 @@ impl Parser {
             }
             break;
         }
-        // v0.87: PG19 allows a zero-target-list SELECT (`SELECT WHERE
-        // false`); the empty list is only valid if WHERE follows.
-        if items.is_empty() {
-            let ok = matches!(self.peek(), Token::Ident(s) if s.as_str() == "where");
-            if !ok {
-                return Err(err("syntax error: SELECT requires a select list"));
-            }
-        }
+        // v1.12: the items loop above already breaks with an empty list
+        // only when a following clause/terminator was seen
+        // (select_core_follows), which PG19's grammar permits for any
+        // simple SELECT: gram.y's opt_target_list has an /* EMPTY */
+        // alternative (~/workspace/pg19src/pg19/src/backend/parser/gram.y,
+        // lines 17540-17542; simple_select at 13201). No post-loop
+        // rejection needed.
         let from = if self.eat_keyword("from") {
             self.parse_from()?
         } else {
@@ -12864,6 +12892,20 @@ impl Parser {
             }
             Ok(item)
         } else {
+            // v1.12: an unquoted reserved keyword (e.g. WHERE, GROUP)
+            // cannot be a table name (PG19 gram.y: relation_expr takes a
+            // qualified name, and reserved words are not valid there).
+            // Quoted identifiers ("where") are still fine. Without this,
+            // `SELECT FROM where` would parse `where` as a table and fail
+            // later with 42P01 instead of the correct 42601 syntax error.
+            if let Token::Ident(s) = self.peek() {
+                if is_reserved(s) {
+                    return Err(err(format!(
+                        "syntax error: \"{}\" is a reserved keyword and cannot be a table name",
+                        s
+                    )));
+                }
+            }
             let name = self.expect_ident()?;
             // v0.9: schema-qualified names, so the information_schema
             // catalog views are reachable (`FROM information_schema.tables`).
