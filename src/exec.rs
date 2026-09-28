@@ -7071,6 +7071,40 @@ fn exec_update(
             }
         }
     }
+    // v1.20: PostgreSQL rejects UPDATE...FROM when the target table's
+    // name appears among the FROM items (42712 "table name specified
+    // more than once"), even under LATERAL or with an alias — the check
+    // is on the relation name, not the alias. Without this we would
+    // wrongly succeed (e.g. `update xx1 ... from xx1, lateral ...`).
+    // Note: parse_from folds comma-separated items into a single
+    // Cross Join, so walk the Join tree to find plain Table items.
+    if !from.is_empty() {
+        fn collect_table_names(item: &FromItem, out: &mut Vec<String>) {
+            match item {
+                FromItem::Table { name, .. } => {
+                    out.push(name.rsplit('.').next().unwrap_or(name).to_string());
+                }
+                FromItem::Join { left, right, .. } => {
+                    collect_table_names(left, out);
+                    collect_table_names(right, out);
+                }
+                _ => {}
+            }
+        }
+        let target = table.rsplit('.').next().unwrap_or(table);
+        let mut names = Vec::new();
+        for item in from {
+            collect_table_names(item, &mut names);
+        }
+        for from_name in names {
+            if from_name.eq_ignore_ascii_case(target) {
+                return Err(exec_err(
+                    "42712",
+                    format!("table name \"{}\" specified more than once", from_name),
+                ));
+            }
+        }
+    }
     // v0.10: WITH materialization; the CTEs are visible to subqueries in
     // SET/WHERE and in the RETURNING list.
     let ctes = materialize_dml_ctes(eng, ctx, with)?;
