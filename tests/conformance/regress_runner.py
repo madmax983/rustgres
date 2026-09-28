@@ -876,6 +876,12 @@ EXPECTED_PASS_OVERRIDES = [
      r"(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
      r".*(\bselect\s+from\b|\bselect\s+(union|intersect|except)\s+select\b)",
      "v1.12: zero-target-list SELECT supported"),
+    # v1.15: quote_ident/quote_literal/quote_nullable are supported
+    # (PG19 quote.c semantics: E'' syntax on backslash, keyword-aware
+    # identifier quoting). The narrow quote_*() mask is removed; any
+    # statement using these functions must pass.
+    (r"(?i)\bquote_(ident|literal|nullable)\s*\(",
+     "v1.15: quote_*() supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
@@ -953,7 +959,6 @@ EXPECTED_FAIL_PATTERNS = [
      "v1.12: EXPLAIN of zero-target-list SELECT unsupported"),
     (r"(?i)\bselect\s+from\b", "empty SELECT list unsupported"),
     (r"\bgen_random_uuid\s*\(", "gen_random_uuid() unsupported"),
-    (r"\bquote_ident\s*\(|\bquote_literal\s*\(", "quote_*() unsupported"),
     (r"\bOVER\s*\(", "window functions in this construct unsupported"),
     (r"\bWITH\s+ORDINALITY\b", "WITH ORDINALITY unsupported"),
     (r"\bTABLESAMPLE\b", "TABLESAMPLE unsupported"),

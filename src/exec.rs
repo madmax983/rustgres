@@ -30291,6 +30291,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         "to_hex" | "to_oct" | "to_bin" | "sign" | "reverse" => n == 1,
         // v0.24: missing string built-ins (pg_regress 42883 cluster).
         "repeat" => n == 2,
+        // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
+        "quote_ident" | "quote_literal" | "quote_nullable" => n == 1,
         "lpad" | "rpad" => n == 2 || n == 3,
         "ascii" | "chr" | "initcap" => n == 1,
         "ltrim" | "rtrim" => n == 1 || n == 2,
@@ -30529,7 +30531,10 @@ fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         | "bit_count"
         | "pg_input_is_valid"
         // v0.95: parse_ident returns text[].
-        | "parse_ident" => eval_str_func(name, vals),
+        // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
+        | "parse_ident" | "quote_ident" | "quote_literal" | "quote_nullable" => {
+            eval_str_func(name, vals)
+        }
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
             eval_math_func(name, vals)
         }
@@ -31521,6 +31526,238 @@ fn expand_values_srf_row(
         .collect())
 }
 
+/// v1.15: PG19 keywords that force `quote_ident` to quote.
+/// Generated from pg19-src/src/include/parser/kwlist.h:
+/// every keyword whose category is not UNRESERVED_KEYWORD
+/// (RESERVED_KEYWORD, COL_NAME_KEYWORD, TYPE_FUNC_NAME_KEYWORD).
+/// `quote_identifier` (ruleutils.c) quotes identifiers that are
+/// any of these words (case-insensitively, but the safe-shape
+/// check already guarantees all-lowercase input). Sorted for
+/// binary_search.
+const QUOTE_IDENT_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// v1.15: PG19 `quote_identifier` (ruleutils.c).
+/// Returns the identifier unchanged when it starts with `[a-z_]` and
+/// contains only `[a-z0-9_]`, and is not a keyword (other than an
+/// unreserved one); otherwise wraps it in double quotes, doubling any
+/// embedded double quotes.
+fn pg_quote_identifier_fn(ident: &str) -> String {
+    let mut bytes = ident.bytes();
+    // PG tests bytes with ASCII-only ctype checks; non-ASCII bytes are
+    // never "safe" and fall through to quoting, same as here.
+    let safe_shape = match bytes.next() {
+        Some(b) if b.is_ascii_lowercase() || b == b'_' => true,
+        _ => false,
+    } && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    // PG's ScanKeywordLookup is case-insensitive, but the safe-shape
+    // check already guarantees all-lowercase ASCII, so an exact match
+    // against the (lowercase) keyword table is equivalent.
+    let needs_quote = !safe_shape || QUOTE_IDENT_KEYWORDS.binary_search(&ident).is_ok();
+    if !needs_quote {
+        return ident.to_string();
+    }
+    let mut out = String::with_capacity(ident.len() + 2);
+    out.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// v1.15: PG19 `quote_literal_cstr` (quote.c).
+/// Wraps the value in single quotes, doubling embedded quotes. When the
+/// value contains a backslash the result is prefixed with `E` (escape
+/// string syntax) and backslashes are doubled, so the output parses on
+/// servers with `standard_conforming_strings = off`.
+/// (Distinct from the pre-existing EXPLAIN-display `pg_quote_literal`,
+/// which deliberately omits the E'' syntax for
+/// standard_conforming_strings=on output.)
+fn pg_quote_literal_cstr(s: &str) -> String {
+    let escape = s.contains('\\');
+    let mut out = String::with_capacity(s.len() + 3);
+    if escape {
+        out.push('E');
+    }
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' || (escape && ch == '\\') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
 fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "upper" => Ok(match str_arg(name, &vals[0])? {
@@ -31556,6 +31793,21 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 elems: parts.into_iter().map(Value::text).collect(),
             }))
         }
+        // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
+        // quote_ident and quote_literal are STRICT (NULL -> NULL);
+        // quote_nullable maps NULL to the text 'NULL'.
+        "quote_ident" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::text(pg_quote_identifier_fn(s)),
+        }),
+        "quote_literal" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::Null,
+            Some(s) => Value::text(pg_quote_literal_cstr(s)),
+        }),
+        "quote_nullable" => Ok(match str_arg(name, &vals[0])? {
+            None => Value::text("NULL"),
+            Some(s) => Value::text(pg_quote_literal_cstr(s)),
+        }),
         "length" | "char_length" | "character_length" => {
             // v0.29: length(bytea) returns the byte count (PG).
             if let Value::Bytea(b) = &vals[0] {
@@ -35666,7 +35918,9 @@ fn func_result_type(
     match name {
         "upper" | "lower" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
         | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "repeat" | "lpad"
-        | "rpad" | "chr" | "initcap" => Ok(ColType::Text),
+        | "rpad" | "chr" | "initcap"
+        // v1.15: quote_ident/quote_literal/quote_nullable return text.
+        | "quote_ident" | "quote_literal" | "quote_nullable" => Ok(ColType::Text),
         // v0.33: substring/overlay/ltrim/rtrim/btrim return bytea for bytea input.
         "substring" | "substr" | "substring_from" | "substring_from_for" | "overlay" | "ltrim"
         | "rtrim" | "btrim" => bytea_if_arg0_bytea(),
@@ -43979,6 +44233,76 @@ mod tests {
         // Empty input is an error in strict mode.
         assert!(parse_ident_parts("", true).is_err());
         assert!(parse_ident_parts("", false).unwrap().is_empty());
+    }
+
+    /// v1.15: quote_ident (PG19 quote_identifier, ruleutils.c).
+    #[test]
+    fn v115_quote_ident() {
+        // Safe shapes pass through unquoted.
+        assert_eq!(pg_quote_identifier_fn("abc"), "abc");
+        assert_eq!(pg_quote_identifier_fn("_foo"), "_foo");
+        assert_eq!(pg_quote_identifier_fn("a1"), "a1");
+        assert_eq!(pg_quote_identifier_fn("a_b_c9"), "a_b_c9");
+        // Unreserved keywords do not need quoting (PG quotes keywords
+        // except unreserved ones).
+        assert_eq!(pg_quote_identifier_fn("abort"), "abort");
+        // Reserved / col_name / type_func_name keywords are quoted.
+        assert_eq!(pg_quote_identifier_fn("select"), "\"select\"");
+        assert_eq!(pg_quote_identifier_fn("all"), "\"all\"");
+        assert_eq!(pg_quote_identifier_fn("user"), "\"user\"");
+        assert_eq!(pg_quote_identifier_fn("between"), "\"between\"");
+        assert_eq!(pg_quote_identifier_fn("natural"), "\"natural\"");
+        // Unsafe shapes are quoted.
+        assert_eq!(pg_quote_identifier_fn("a b"), "\"a b\"");
+        assert_eq!(pg_quote_identifier_fn("Abc"), "\"Abc\"");
+        assert_eq!(pg_quote_identifier_fn("1abc"), "\"1abc\"");
+        assert_eq!(pg_quote_identifier_fn("a$b"), "\"a$b\"");
+        assert_eq!(pg_quote_identifier_fn(""), "\"\"");
+        // Embedded double quotes are doubled.
+        assert_eq!(pg_quote_identifier_fn("a\"b"), "\"a\"\"b\"");
+        // Non-ASCII is never safe (PG's byte-wise ASCII check).
+        assert_eq!(pg_quote_identifier_fn("caf\u{e9}"), "\"caf\u{e9}\"");
+    }
+
+    /// v1.15: quote_literal (PG19 quote_literal_cstr, quote.c).
+    #[test]
+    fn v115_quote_literal() {
+        assert_eq!(pg_quote_literal_cstr(""), "''");
+        assert_eq!(pg_quote_literal_cstr("abc"), "'abc'");
+        // Embedded quotes are doubled.
+        assert_eq!(pg_quote_literal_cstr("abc'"), "'abc'''");
+        assert_eq!(pg_quote_literal_cstr("a'b'c"), "'a''b''c'");
+        // A backslash triggers E'' syntax with doubled backslashes
+        // (works on servers with standard_conforming_strings=off).
+        assert_eq!(pg_quote_literal_cstr("\\"), "E'\\\\'");
+        assert_eq!(pg_quote_literal_cstr("a\\b'c"), "E'a\\\\b''c'");
+        // No backslash: plain quotes even with other escapes.
+        assert_eq!(pg_quote_literal_cstr("a\nb"), "'a\nb'");
+    }
+
+    /// v1.15: quote_nullable NULL handling (strictness per pg_proc.dat).
+    #[test]
+    fn v115_quote_strictness() {
+        // quote_ident / quote_literal are STRICT: NULL -> NULL.
+        let null = vec![Value::Null];
+        assert_eq!(eval_str_func("quote_ident", &null).unwrap(), Value::Null);
+        assert_eq!(eval_str_func("quote_literal", &null).unwrap(), Value::Null);
+        // quote_nullable maps NULL to the text 'NULL'.
+        assert_eq!(
+            eval_str_func("quote_nullable", &null).unwrap(),
+            Value::text("NULL")
+        );
+        // Non-null values quote normally.
+        let v = vec![Value::text("a'b")];
+        assert_eq!(
+            eval_str_func("quote_nullable", &v).unwrap(),
+            Value::text("'a''b'")
+        );
+        let v = vec![Value::text("sel ect")];
+        assert_eq!(
+            eval_str_func("quote_ident", &v).unwrap(),
+            Value::text("\"sel ect\"")
+        );
     }
 
     /// v0.95: degenerate grouping detection (HAVING without GROUP BY or
