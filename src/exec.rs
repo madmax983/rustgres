@@ -53243,10 +53243,15 @@ mod v112_empty_select_tests {
         let r = run(&mut eng, "INSERT INTO rs VALUES (1, 'a') RETURNING *;").unwrap();
         match r {
             ExecResult::Dml { columns, rows, .. } => {
-                assert_eq!(columns, vec![("k".to_string(), ColType::Int), ("v".to_string(), ColType::Text)]);
+                assert_eq!(
+                    columns,
+                    vec![
+                        ("k".to_string(), ColType::Int),
+                        ("v".to_string(), ColType::Text)
+                    ]
+                );
                 assert_eq!(rows.len(), 1);
-                let vals: Vec<String> =
-                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                let vals: Vec<String> = rows[0].iter().map(|v| v.to_text().unwrap()).collect();
                 assert_eq!(vals, vec!["1".to_string(), "a".to_string()]);
             }
             _ => panic!("expected Dml, got {:?}", r),
@@ -53263,8 +53268,7 @@ mod v112_empty_select_tests {
         match r {
             ExecResult::Dml { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                let vals: Vec<String> =
-                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                let vals: Vec<String> = rows[0].iter().map(|v| v.to_text().unwrap()).collect();
                 assert_eq!(vals, vec!["1".to_string(), "z".to_string()]);
             }
             _ => panic!("expected Dml"),
@@ -53273,8 +53277,7 @@ mod v112_empty_select_tests {
         match r {
             ExecResult::Dml { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                let vals: Vec<String> =
-                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                let vals: Vec<String> = rows[0].iter().map(|v| v.to_text().unwrap()).collect();
                 assert_eq!(vals, vec!["2".to_string(), "b".to_string()]);
             }
             _ => panic!("expected Dml"),
@@ -53290,8 +53293,7 @@ mod v112_empty_select_tests {
         match r {
             ExecResult::Dml { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                let vals: Vec<String> =
-                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                let vals: Vec<String> = rows[0].iter().map(|v| v.to_text().unwrap()).collect();
                 assert_eq!(vals, vec!["3".to_string(), "c".to_string()]);
             }
             _ => panic!("expected Dml"),
