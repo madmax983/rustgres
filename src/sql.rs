@@ -5825,9 +5825,7 @@ impl Parser {
                         {
                             // v1.08: PG19 rejects unknown EXPLAIN options with 42601
                             // (the `err` helper already uses 42601).
-                            return Err(err(format!(
-                                "unrecognized EXPLAIN option \"{opt_name}\""
-                            )));
+                            return Err(err(format!("unrecognized EXPLAIN option \"{opt_name}\"")));
                         }
                         match self.next() {
                             Token::Comma => continue,
@@ -8374,8 +8372,9 @@ impl Parser {
             FuncVolatility::Volatile
         } else {
             return Err(SqlError {
-                message: "only VOLATILE, STABLE and IMMUTABLE actions are supported in ALTER FUNCTION"
-                    .to_string(),
+                message:
+                    "only VOLATILE, STABLE and IMMUTABLE actions are supported in ALTER FUNCTION"
+                        .to_string(),
                 code: "0A000",
             });
         };
@@ -15802,11 +15801,7 @@ mod v109_function_tests {
             "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL BOGUS AS 'SELECT $1';",
         )
         .expect_err("should fail");
-        assert!(
-            err.message.contains("PARALLEL"),
-            "message: {}",
-            err.message
-        );
+        assert!(err.message.contains("PARALLEL"), "message: {}", err.message);
     }
 
     #[test]
@@ -15855,8 +15850,7 @@ mod v109_function_tests {
     #[test]
     fn alter_function_other_action_rejected() {
         // v1.09: only volatility actions are supported; STRICT etc. are 0A000.
-        let err =
-            parse_statement("ALTER FUNCTION f(int) STRICT;").expect_err("should fail");
+        let err = parse_statement("ALTER FUNCTION f(int) STRICT;").expect_err("should fail");
         assert_eq!(err.code, "0A000", "message: {}", err.message);
     }
 }
