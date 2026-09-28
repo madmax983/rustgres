@@ -25182,35 +25182,56 @@ fn eval_hashed_exists(
     probe_hashed_exists(q, scopes, &h, pat.outer, neg)
 }
 
-/// Match `IN (SELECT <single expr> FROM <table> [AS q] ...)` — the
-/// uncorrelated single-range shape whose output can be materialized
-/// once. Correlation is checked separately.
-fn match_hashable_in(sub: &SelectStmt) -> Option<(&str, &str)> {
+/// v1.19: collect (table_name, qualifier) for every base table in a FROM
+/// clause, recursing through JOINs. Returns None if the FROM contains
+/// anything other than plain tables and joins (derived tables, VALUES,
+/// etc.) — those fail closed to the slow path.
+fn collect_hashable_tables(from: &[FromItem]) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    fn walk(item: &FromItem, out: &mut Vec<(String, String)>) -> bool {
+        match item {
+            FromItem::Table {
+                name,
+                alias,
+                col_aliases,
+                ..
+            } => {
+                if !col_aliases.is_empty() {
+                    return false;
+                }
+                out.push((name.clone(), alias.clone().unwrap_or_else(|| name.clone())));
+                true
+            }
+            FromItem::Join { left, right, .. } => walk(left, out) && walk(right, out),
+            _ => false,
+        }
+    }
+    for item in from {
+        if !walk(item, &mut out) {
+            return None;
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Match `IN (SELECT <single expr> FROM <tables..> ...)` — the
+/// uncorrelated shape whose output can be materialized once. Correlation
+/// is checked separately. v1.19: accepts JOINs, not just a single table.
+fn match_hashable_in(sub: &SelectStmt) -> Option<Vec<(String, String)>> {
     if sub.set_op.is_some() || sub.limit.is_some() || sub.offset.is_some() || !sub.with.is_empty() {
         return None;
     }
-    let [from] = sub.from.as_slice() else {
-        return None;
-    };
-    let FromItem::Table {
-        name,
-        alias,
-        col_aliases,
-        ..
-    } = from
-    else {
-        return None;
-    };
-    if !col_aliases.is_empty() {
-        return None;
-    }
+    let tables = collect_hashable_tables(&sub.from)?;
     let [item] = sub.items.as_slice() else {
         return None;
     };
     if !matches!(item, SelectItem::Expr { .. }) {
         return None;
     }
-    Some((name.as_str(), alias.as_deref().unwrap_or(name.as_str())))
+    Some(tables)
 }
 
 /// True iff every column reference in the IN subquery resolves inside
@@ -25219,11 +25240,15 @@ fn match_hashable_in(sub: &SelectStmt) -> Option<(&str, &str)> {
 /// own columns (the innermost scope wins, so they resolve inside).
 /// Nested subqueries fail closed — they could correlate past the inner
 /// range to an outer scope.
-fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, inner_qual: &str, table: &str) -> bool {
-    let cols: Vec<String> = match q.eng.db.find_table(table, q.snap, q.own, q.session) {
-        Some(t) => t.columns.iter().map(|(n, _)| n.clone()).collect(),
-        None => return false,
-    };
+fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, tables: &[(String, String)]) -> bool {
+    // v1.19: union of all inner tables' columns, for JOIN support.
+    let mut cols: Vec<String> = Vec::new();
+    for (table, _) in tables {
+        match q.eng.db.find_table(table, q.snap, q.own, q.session) {
+            Some(t) => cols.extend(t.columns.iter().map(|(n, _)| n.clone())),
+            None => return false,
+        }
+    }
     let mut ok = true;
     walk_select(sub, &mut |x| {
         if !ok {
@@ -25232,7 +25257,7 @@ fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, inner_qual: &str, table: &s
         match x {
             Expr::Column { table: t, name } => match t {
                 Some(qq) => {
-                    if qq != inner_qual {
+                    if !tables.iter().any(|(_, qual)| qual == qq) {
                         ok = false;
                     }
                 }
@@ -25243,7 +25268,7 @@ fn subquery_refs_only_inner(q: &Q, sub: &SelectStmt, inner_qual: &str, table: &s
                 }
             },
             Expr::WholeRow { qual } => {
-                if qual != inner_qual {
+                if !tables.iter().any(|(_, q2)| q2 == qual) {
                     ok = false;
                 }
             }
@@ -25367,14 +25392,17 @@ fn eval_hashed_in(
     sub: &SelectStmt,
     neg: bool,
 ) -> Result<Option<Value>, ExecError> {
-    let (table, inner_qual) = match match_hashable_in(sub) {
+    let tables = match match_hashable_in(sub) {
         Some(p) => p,
         None => return Ok(None),
     };
-    if !subplan_inner_is_base_table(q, table) {
-        return Ok(None);
+    // v1.19: all inner tables must be base tables (JOINs allowed).
+    for (table, _) in &tables {
+        if !subplan_inner_is_base_table(q, table) {
+            return Ok(None);
+        }
     }
-    if !subquery_refs_only_inner(q, sub, inner_qual, table) {
+    if !subquery_refs_only_inner(q, sub, &tables) {
         return Ok(None);
     }
     // The RefCell borrow is scoped: building runs the subquery, which

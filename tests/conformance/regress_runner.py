@@ -1090,11 +1090,9 @@ def classify_expected_fail(stmt):
 # conformance data volumes (they wedge the server past STMT_TIMEOUT).
 # EXPECTED-FAIL without executing; the engine gap is real and documented.
 TOO_SLOW_PATTERNS = [
-    (
-        r"\bin\s*\(\s*select\b.*\bfrom\s+tenk1\b",
-        "too slow: IN-subquery over tenk1 re-runs per outer row O(n^2); "
-        "needs a hashed subplan like PostgreSQL",
-    ),
+    # v1.19: IN-subquery hashed path (eval_hashed_in, v0.86/v0.87) now
+    # executes these in O(n); the pre-hashed-path mask is obsolete.
+    # (was: r"\bin\s*\(\s*select\b.*\bfrom\s+tenk1\b")
     (
         r"\bfrom\b[^;]*\btenk1\b[^;]*,\s*tenk1\b",
         "too big: 10k x 10k cartesian product materializes in memory (OOM); "
