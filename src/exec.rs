@@ -21814,7 +21814,11 @@ fn eval_agg_func(
         }
         visit = keyed.into_iter().map(|(_, i)| i).collect();
     }
-    let mut vals: Vec<Value> = Vec::new();
+    // `visit.len() == idxs.len()` is an exact upper bound: the loop
+    // below pushes at most one value per visited row (NULLs are
+    // skipped, never adding to the count), so this avoids the 0->4->8->16
+    // reallocation churn `Vec::new()` would otherwise pay per group.
+    let mut vals: Vec<Value> = Vec::with_capacity(visit.len());
     // string_agg evaluates (value, delimiter) per row; the delimiter
     // may be NULL per-row (then it defaults to "") while a NULL value
     // still skips the row, like Postgres.
