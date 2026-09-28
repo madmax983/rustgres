@@ -920,10 +920,25 @@ EXPECTED_FAIL_PATTERNS = [
     # v1.07: SET/SHOW/RESET are supported (generic validated GUCs,
     # transaction characteristics, ROLE). The broad masks are removed;
     # genuinely unsupported parameters surface as 42704 (like PG).
-    (r"::\s*regclass\b|::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
+    # v1.13: ::regclass is supported (tableoid::regclass, 'name'::regclass);
+    # regproc/regtype/regnamespace remain masked.
+    (r"::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
      "reg* pseudotypes unsupported"),
     (r"\bcurrent_setting\s*\(", "current_setting() unsupported"),
-    (r"\btableoid\b", "tableoid system column unsupported"),
+    # v1.13: tableoid system column is supported; mask removed.
+    # Narrow residuals (not tableoid issues):
+    # - pg_relation_size estimate differs from PG's exact page count
+    (r"pg_size_pretty\s*\(\s*pg_relation_size",
+     "pg_relation_size estimate differs from PG"),
+    # - pg_attribute attnum after DROP/ADD COLUMN (catalog fidelity)
+    (r"from\s+pg_attribute\s+where\s+attname",
+     "pg_attribute attnum catalog fidelity"),
+    # - CTE DML with INSERT...RETURNING (parsing, 42601)
+    (r"with\s+\w+\s*\([^)]*\)\s+as\s*\(\s*insert\s+into\s+mlparted",
+     "CTE DML INSERT...RETURNING parsing"),
+    # - toast reltoastrelid::regclass with \gset (psql meta-command)
+    (r"reltoastrelid::regclass",
+     "toast reltoastrelid::regclass \\gset"),
     (r"\bxmin\b|\bxmax\b", "xmin/xmax system columns unsupported"),
     # v0.46: generate_series(int/int8/numeric) is supported as a
     # FROM-clause table function, including implicit LATERAL

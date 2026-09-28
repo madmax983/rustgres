@@ -10829,25 +10829,25 @@ fn plan_from_item(
                     && !*natural
                     && !(matches!(kind, JoinKind::Cross) && on.is_some());
                 if supported {
-                // The ON clause is always a join-level predicate; the
-                // WHERE slice (when present) splits between the inputs.
-                let mut jf: Vec<Expr> = Vec::new();
-                if let Some(o) = on {
-                    jf.push(o.clone());
-                }
-                if let Some(w) = where_ {
-                    let l = pg_split_item(eng, left, snap, own, session, ctes);
-                    let r = pg_split_item(eng, right, snap, own, session, ctes);
-                    let (per_item, mid) = pg_split_where(w, &[l, r])?;
-                    let mut it = per_item.into_iter();
-                    left_where = pg_fold_and(it.next().unwrap_or_default());
-                    right_where = pg_fold_and(it.next().unwrap_or_default());
-                    jf.extend(mid);
-                }
-                join_filter = match pg_fold_and(jf) {
-                    Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
-                    None => None,
-                };
+                    // The ON clause is always a join-level predicate; the
+                    // WHERE slice (when present) splits between the inputs.
+                    let mut jf: Vec<Expr> = Vec::new();
+                    if let Some(o) = on {
+                        jf.push(o.clone());
+                    }
+                    if let Some(w) = where_ {
+                        let l = pg_split_item(eng, left, snap, own, session, ctes);
+                        let r = pg_split_item(eng, right, snap, own, session, ctes);
+                        let (per_item, mid) = pg_split_where(w, &[l, r])?;
+                        let mut it = per_item.into_iter();
+                        left_where = pg_fold_and(it.next().unwrap_or_default());
+                        right_where = pg_fold_and(it.next().unwrap_or_default());
+                        jf.extend(mid);
+                    }
+                    join_filter = match pg_fold_and(jf) {
+                        Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
+                        None => None,
+                    };
                 } // end if supported
             }
             let outer = plan_from_item(
@@ -12803,6 +12803,98 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
         })
 }
 
+/// v1.13: does this statement (or anything nested inside it) reference the
+/// `tableoid` system column? Used to decide `need_prov` for the FROM scan,
+/// following the `stmt_uses_pg_column_compression` pattern. The `tableoid`
+/// value varies per row (the OID of the partition leaf holding the row),
+/// so provenance must be populated when it is referenced.
+fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
+    fn expr_uses(e: &Expr) -> bool {
+        match e {
+            Expr::Column { name, .. } => name == "tableoid",
+            Expr::Func { args, .. } => args.iter().any(expr_uses),
+            Expr::NamedArg { expr, .. } => expr_uses(expr),
+            Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
+            Expr::Subscript { array, indices } => expr_uses(array) || indices.iter().any(expr_uses),
+            Expr::Slice { array, bounds } => {
+                expr_uses(array)
+                    || bounds.iter().any(|(l, u)| {
+                        l.as_deref().is_some_and(expr_uses) || u.as_deref().is_some_and(expr_uses)
+                    })
+            }
+            Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_) => false,
+            Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Cast { expr, .. } => expr_uses(expr),
+            Expr::CastNamed { expr, .. } => expr_uses(expr),
+            Expr::Row(elems) => elems.iter().any(expr_uses),
+            Expr::FieldAccess { expr, .. } => expr_uses(expr),
+            Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => expr_uses(expr) || expr_uses(pattern) || escape.as_deref().is_some_and(expr_uses),
+            Expr::Regex { expr, pattern, .. } => expr_uses(expr) || expr_uses(pattern),
+            Expr::Between {
+                expr, low, high, ..
+            } => expr_uses(expr) || expr_uses(low) || expr_uses(high),
+            Expr::IsBool { expr, .. } => expr_uses(expr),
+            Expr::Extract { from, .. } => expr_uses(from),
+            Expr::Cmp { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::And(a, b) | Expr::Or(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::Not(e) | Expr::BitNot(e) | Expr::Neg(e) => expr_uses(e),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.as_deref().is_some_and(expr_uses)
+                    || whens.iter().any(|(k, r)| expr_uses(k) || expr_uses(r))
+                    || else_.as_deref().is_some_and(expr_uses)
+            }
+            Expr::IsNull { expr, .. } => expr_uses(expr),
+            Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Agg { arg, arg2, .. } => {
+                arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
+            }
+            Expr::ScalarSub(s) => stmt_uses_tableoid(s),
+            Expr::ArraySubquery(s) => stmt_uses_tableoid(s),
+            Expr::InSub { expr, sub, .. } => expr_uses(expr) || stmt_uses_tableoid(sub),
+            Expr::Quantified { left, sub, .. } => expr_uses(left) || stmt_uses_tableoid(sub),
+            Expr::UserOp { left, right, .. } => expr_uses(left) || expr_uses(right),
+            Expr::Exists { sub, .. } => stmt_uses_tableoid(sub),
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                args.iter().any(expr_uses)
+                    || partition_by.iter().any(expr_uses)
+                    || order_by.iter().any(|o| expr_uses(&o.expr))
+            }
+        }
+    }
+    stmt.items.iter().any(|it| match it {
+        SelectItem::Expr { expr, .. } => expr_uses(expr),
+        _ => false,
+    }) || stmt.where_.as_ref().is_some_and(expr_uses)
+        || stmt.group_by.iter().flatten().any(expr_uses)
+        || stmt.having.as_ref().is_some_and(expr_uses)
+        || stmt.order_by.iter().any(|o| expr_uses(&o.expr))
+        || stmt.distinct_on.iter().any(expr_uses)
+        || stmt.with.iter().any(|c| match &c.body {
+            CteBody::Simple(s) => stmt_uses_tableoid(s),
+            CteBody::Union { left, right, .. } => {
+                stmt_uses_tableoid(left) || stmt_uses_tableoid(right)
+            }
+        })
+}
+
 /// One scope in the column-resolution chain: a FROM source's schema+row,
 /// or an outer query's row for correlated subqueries. Scopes are searched
 /// innermost-first, like Postgres.
@@ -14290,7 +14382,9 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
         where_clause,
         // v0.37: pg_column_compression needs row provenance too (anywhere
         // in the statement, including correlated subqueries).
-        stmt.for_update || stmt_uses_pg_column_compression(stmt),
+        // v1.13: tableoid also needs per-row provenance (the OID varies
+        // by partition leaf).
+        stmt.for_update || stmt_uses_pg_column_compression(stmt) || stmt_uses_tableoid(stmt),
         order_hint.as_ref(),
         early_limit,
     )?;
@@ -18306,15 +18400,13 @@ fn lateral_is_correlated(
         LateralRight::Derived { sub, .. } => {
             // The subquery is correlated iff it resolves only with the
             // lateral scopes in the chain.
-            let mut with: Vec<&[QCol]> = Vec::with_capacity(
-                outer_schemas.len() + scope_schemas.len(),
-            );
+            let mut with: Vec<&[QCol]> =
+                Vec::with_capacity(outer_schemas.len() + scope_schemas.len());
             with.extend_from_slice(outer_schemas);
             with.extend_from_slice(scope_schemas);
             let without_ok =
                 describe_select(eng, snap, own, session, sub, bindings, outer_schemas).is_ok();
-            let with_ok =
-                describe_select(eng, snap, own, session, sub, bindings, &with).is_ok();
+            let with_ok = describe_select(eng, snap, own, session, sub, bindings, &with).is_ok();
             !without_ok && with_ok
         }
     }
@@ -18430,17 +18522,16 @@ fn lateral_right_schema(
                         .iter()
                         .filter_map(|r| r.get(i))
                         .filter_map(|e| {
-                            lateral_values_coltype(
-                                eng, snap, own, session, bindings, &schemas, e,
-                            )
+                            lateral_values_coltype(eng, snap, own, session, bindings, &schemas, e)
                         })
                         .max_by_key(type_rank)
                         .unwrap_or(ColType::Text);
                     QCol {
                         qual: (*alias).to_string(),
-                        name: col_aliases.get(i).cloned().unwrap_or_else(|| {
-                            format!("column{}", i + 1)
-                        }),
+                        name: col_aliases
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("column{}", i + 1)),
                         ty,
                         hidden: false,
                         src_ord: i as u32,
@@ -18522,7 +18613,15 @@ fn eval_lateral_join(
     )?;
     // Same merged layout as a regular join, so the describe path and
     // execution agree exactly.
-    let layout = plan_join(lschema, &rschema, using, natural, using_alias, alias, col_aliases)?;
+    let layout = plan_join(
+        lschema,
+        &rschema,
+        using,
+        natural,
+        using_alias,
+        alias,
+        col_aliases,
+    )?;
     let schema = layout.schema.clone();
     // USING keys become a merged-key equijoin predicate, exactly like
     // the normal path; otherwise the explicit ON clause.
@@ -19674,7 +19773,8 @@ fn build_source(
             alias,
             col_aliases,
         } => {
-            let (lschema0, lrows0) = build_source(q, outer, left, where_, need_prov, None, None, prefix)?;
+            let (lschema0, lrows0) =
+                build_source(q, outer, left, where_, need_prov, None, None, prefix)?;
             // v1.10: LATERAL evaluation. PG19 (`LATERAL_P
             // select_with_parens` / `LATERAL_P func_table`) evaluates a
             // LATERAL right-hand item once per left row, with the left
@@ -19744,8 +19844,7 @@ fn build_source(
                 // RIGHT/FULL joins ("The combining JOIN type must be
                 // INNER or LEFT for a LATERAL reference").
                 if matches!(kind, JoinKind::Right | JoinKind::Full) {
-                    let outer_schemas: Vec<&[QCol]> =
-                        outer.iter().map(|s| s.schema).collect();
+                    let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
                     let scope_schemas: Vec<&[QCol]> = prefix
                         .iter()
                         .map(|s| s.schema)
@@ -20711,7 +20810,8 @@ fn exec_agg_one(
         let frame = Scope {
             schema,
             row: &row.cells,
-            prov: None,
+            // v1.13: tableoid in GROUP BY keys needs row provenance.
+            prov: Some(&row.prov),
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {
@@ -21071,6 +21171,30 @@ fn eval_grouped(
                 scopes.extend_from_slice(outer);
                 scopes.push(gscope);
                 return eval_wholerow(&scopes, name);
+            }
+            // v1.13: `tableoid` in grouped evaluation — resolve from the
+            // group's first row provenance (the key was computed per-row).
+            if name == "tableoid"
+                && matches!(
+                    resolve_col(&[gscope], table.as_deref(), name),
+                    Err(ref e) if e.code == "42703"
+                )
+            {
+                let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                scopes.extend_from_slice(outer);
+                scopes.push(gscope);
+                // If tableoid is a GROUP BY key, use the computed key value.
+                for (i, g) in group_by.iter().enumerate() {
+                    if *g
+                        == (Expr::Column {
+                            table: table.clone(),
+                            name: name.clone(),
+                        })
+                    {
+                        return Ok(key_vals[i].clone());
+                    }
+                }
+                return eval_tableoid(q, &scopes, table.as_deref());
             }
             grouped_col_value(gscope, group_by, key_vals, qual, name)
         }
@@ -23642,6 +23766,44 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
     })
 }
 
+/// v1.13: evaluate the `tableoid` system column. The value is the OID of
+/// the table (partition leaf) that holds the current row, taken from the
+/// scope's row provenance. Returns an error if provenance is unavailable
+/// (e.g. the row comes from a subquery rather than a base table scan).
+fn eval_tableoid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Value, ExecError> {
+    // Find the target scope: the one matching the qualifier, or the
+    // innermost scope for an unqualified reference. Scopes are ordered
+    // outer-to-inner, and resolve_col searches innermost-first.
+    let sc = match qual {
+        Some(qual_name) => scopes
+            .iter()
+            .rev()
+            .find(|sc| sc.schema.iter().any(|c| c.qual == qual_name))
+            .ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table \"{qual_name}\""),
+                )
+            })?,
+        None => scopes
+            .last()
+            .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?,
+    };
+    // The provenance's first entry names the source table. For a
+    // partitioned scan this is the leaf partition holding the row;
+    // for a plain table it is the table itself.
+    let table_name = sc
+        .prov
+        .and_then(|p| p.first().map(|(t, _)| t.as_str()))
+        .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?;
+    let t = q
+        .eng
+        .db
+        .find_table(table_name, q.snap, q.own, q.session)
+        .ok_or_else(|| exec_err("42703", "column \"tableoid\" does not exist".to_string()))?;
+    Ok(Value::Int(t.oid as i64))
+}
+
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
         // v0.95: a NamedArg that reaches evaluation unwraps to its value
@@ -23651,6 +23813,15 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             match resolve_col(scopes, table.as_deref(), name) {
                 Ok((si, ci)) => Ok(scopes[si].row[ci].clone()),
                 Err(e) => {
+                    // v1.13: `tableoid` system column — the OID of the
+                    // table (partition leaf) holding this row. Resolved
+                    // from row provenance when no real column matches.
+                    // A user column named `tableoid` wins (resolved above).
+                    if e.code == "42703" && name == "tableoid" {
+                        if let Ok(v) = eval_tableoid(q, scopes, table.as_deref()) {
+                            return Ok(v);
+                        }
+                    }
                     // v0.73: PG19 whole-row fallback — a bare identifier
                     // that names no column but names a range is a
                     // whole-row Var (`SELECT view_a FROM view_a`,
@@ -29588,6 +29759,15 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
         check_builtin_arity(name, &vals)?;
         return eval_pg_relation_size(q, &vals);
     }
+    // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
+    if name == "pg_size_pretty" {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        check_builtin_arity(name, &vals)?;
+        return eval_pg_size_pretty(&vals);
+    }
     // v0.86: user-defined functions. A definition matching by name and
     // arity takes the call (raw argument values; the call coerces to
     // the declared types). Builtins keep precedence for names with no
@@ -29844,6 +30024,46 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
     Ok(Value::BigInt(size))
 }
 
+/// v1.13: `pg_size_pretty(bigint) -> text` — PG19's human-readable size
+/// formatting (src/backend/utils/adt/misc.c). Thresholds are 10 * 1024^n;
+/// the displayed value is the integer division, like PG.
+fn eval_pg_size_pretty(vals: &[Value]) -> Result<Value, ExecError> {
+    let size: i64 = match &vals[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(i) => *i,
+        Value::BigInt(i) => *i,
+        Value::SmallInt(i) => *i as i64,
+        other => {
+            return Err(exec_err(
+                "42883",
+                format!(
+                    "function pg_size_pretty({}) does not exist",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    // PG19 misc.c pg_size_pretty: negative sizes print as bytes; the
+    // limit starts at 10 KiB and shifts left 10 bits per unit.
+    if size < 0 {
+        return Ok(Value::text(format!("{} bytes", size)));
+    }
+    let mut limit: i64 = 10 * 1024;
+    let mut mult: i64 = 1;
+    let units = ["bytes", "kB", "MB", "GB", "TB"];
+    for unit in units {
+        if size < limit || unit == "TB" {
+            if unit == "bytes" {
+                return Ok(Value::text(format!("{} bytes", size)));
+            }
+            return Ok(Value::text(format!("{} {}", size / mult, unit)));
+        }
+        limit <<= 10;
+        mult <<= 10;
+    }
+    Ok(Value::text(format!("{} TB", size / mult)))
+}
+
 /// Validate argument counts for scalar built-ins. A wrong count is
 /// 42883 (undefined_function), like Postgres — never an index panic.
 fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
@@ -29911,6 +30131,8 @@ fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
         "pg_relation_size" => n == 1 || n == 2,
+        // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
+        "pg_size_pretty" => n == 1,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -31000,12 +31222,8 @@ fn eval_user_srf_vals(
     name: &str,
     vals: &[Value],
 ) -> Result<Vec<Value>, ExecError> {
-    let fdef = resolve_function_overload(q.eng, name, vals).ok_or_else(|| {
-        exec_err(
-            "42883",
-            format!("function {}() does not exist", name),
-        )
-    })?;
+    let fdef = resolve_function_overload(q.eng, name, vals)
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
     if !fdef.returns_set {
         return Err(exec_err(
             "0A000",
@@ -31110,7 +31328,11 @@ fn expand_insert_srf_rows(
 /// [`expand_insert_srf_rows`], but the cells evaluate straight to
 /// `Value`s for the scan): SRFs zip with NULL padding, scalars repeat,
 /// all-empty SRFs produce no rows.
-fn expand_values_srf_row(q: &mut Q, scopes: &[Scope], row: &[Expr]) -> Result<Vec<Vec<Value>>, ExecError> {
+fn expand_values_srf_row(
+    q: &mut Q,
+    scopes: &[Scope],
+    row: &[Expr],
+) -> Result<Vec<Vec<Value>>, ExecError> {
     if !row
         .iter()
         .any(|e| matches!(e, Expr::Func { name, .. } if is_builtin_srf(name)))
@@ -35323,6 +35545,8 @@ fn func_result_type(
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
+        // v1.13: pg_size_pretty(bigint) -> text.
+        "pg_size_pretty" => Ok(ColType::Text),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         // v0.80: `GROUPING(...)` returns integer (int4), like PG19.
         "grouping" => Ok(ColType::Int),
@@ -36244,7 +36468,14 @@ fn from_schema_item(
                     scope_schemas.extend_from_slice(prefix_schemas);
                     scope_schemas.push(&lflat);
                     lateral_right_schema(
-                        eng, snap, own, session, bindings, outer_schemas, &scope_schemas, lr,
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        bindings,
+                        outer_schemas,
+                        &scope_schemas,
+                        lr,
                     )?
                 }
                 None => {
@@ -36582,6 +36813,12 @@ fn expr_type(
             match resolve_col(&scopes, table.as_deref(), name) {
                 Ok((si, ci)) => Ok(schemas[si][ci].ty.clone()),
                 Err(e) if e.code == "42703" => {
+                    // v1.13: `tableoid` system column — typed as integer
+                    // (the OID; PG's `oid` displays as a number, like our
+                    // pg_class.oid). A user column wins (resolved above).
+                    if name == "tableoid" {
+                        return Ok(ColType::Int);
+                    }
                     match resolve_col(&oscopes, table.as_deref(), name) {
                         Ok((si, ci)) => Ok(outer[si][ci].ty.clone()),
                         Err(e2) => {
@@ -37645,9 +37882,8 @@ fn infer_select(
     // Unknown tables are skipped (execution reports them).
     // v0.10: this level's own CTEs are visible to the FROM clause.
     let visible: Vec<CteDef> = s.with.clone();
-    let own_schemas =
-        from_schemas(eng, snap, own, session, &s.from, &visible, &[], outer, &[])
-            .unwrap_or_default();
+    let own_schemas = from_schemas(eng, snap, own, session, &s.from, &visible, &[], outer, &[])
+        .unwrap_or_default();
     let mut refs: Vec<&[QCol]> = Vec::with_capacity(outer.len() + own_schemas.len());
     refs.extend_from_slice(outer);
     refs.extend(own_schemas.iter().map(|s| s.as_slice()));
@@ -37751,8 +37987,7 @@ pub fn infer_param_types(
         // not break Bind (from_schemas' unwrap_or_default rule).
         let uqual = alias.as_deref().unwrap_or(table);
         let uextra: Vec<Vec<QCol>> =
-            from_schemas(eng, snap, own, session, from, with, &[], &[], &[])
-                .unwrap_or_default();
+            from_schemas(eng, snap, own, session, from, with, &[], &[], &[]).unwrap_or_default();
         if let Some(t) = eng.db.find_table(table, snap, own, session) {
             let mut combined: Vec<QCol> = uextra.iter().flatten().cloned().collect();
             combined.extend(t.columns.iter().map(|(n, ty)| QCol {
@@ -45062,12 +45297,11 @@ fn exec_alter_function(
     arg_types: &[String],
     volatility: crate::sql::FuncVolatility,
 ) -> Result<ExecResult, ExecError> {
-    let overloads = eng.db.functions.get_mut(name).ok_or_else(|| {
-        exec_err(
-            "42883",
-            format!("function {}() does not exist", name),
-        )
-    })?;
+    let overloads = eng
+        .db
+        .functions
+        .get_mut(name)
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
     let slot = overloads
         .iter_mut()
         .find(|f| {
@@ -45077,12 +45311,7 @@ fn exec_alter_function(
                     .zip(arg_types.iter())
                     .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
         })
-        .ok_or_else(|| {
-            exec_err(
-                "42883",
-                format!("function {}() does not exist", name),
-            )
-        })?;
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
     slot.volatility = volatility;
     Ok(ExecResult::Command {
         tag: "ALTER FUNCTION".to_string(),
@@ -50640,7 +50869,10 @@ mod v108_costs_off_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int, b text)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
-        let plan = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42");
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42",
+        );
         assert_eq!(plan[0], "Index Scan using i1 on t1");
         assert_eq!(plan[1], "  Index Cond: (a = 42)");
     }
@@ -50678,7 +50910,10 @@ mod v108_costs_off_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
-        let plan = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM t1 t WHERE t.a = 1");
+        let plan = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 t WHERE t.a = 1",
+        );
         assert_eq!(plan[0], "Index Scan using i1 on t1 t");
         assert_eq!(plan[1], "  Index Cond: (a = 1)");
     }
@@ -50763,7 +50998,7 @@ mod v108_costs_off_tests {
 #[cfg(test)]
 mod v110_lateral_tests {
     use super::*;
-    use crate::sql::{parse_statement, FromItem, Stmt};
+    use crate::sql::{FromItem, Stmt, parse_statement};
 
     fn engine() -> Engine {
         Engine::new()
@@ -51135,7 +51370,11 @@ mod v110_lateral_tests {
         run(&mut eng, "INSERT INTO rq_t VALUES (1, 2), (3, 4)").unwrap();
         // Correlated: ROW(1,2) matches the first outer row only.
         let rows = rows_of(
-            run(&mut eng, "SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM rq_t").unwrap(),
+            run(
+                &mut eng,
+                "SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM rq_t",
+            )
+            .unwrap(),
         );
         assert_eq!(rows, vec![vec!["t".to_string()], vec!["f".to_string()]]);
         // Uncorrelated.
@@ -51207,6 +51446,21 @@ mod v112_empty_select_tests {
         }
     }
 
+    /// v1.13: render a SELECT result as strings (NULL -> "NULL").
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
     #[test]
     fn v112_select_bare_empty_list() {
         // PG19: `SELECT;` returns a single row with zero columns.
@@ -51222,7 +51476,11 @@ mod v112_empty_select_tests {
         // PG19: `SELECT FROM t` returns one zero-column row per input row.
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE es_t (a int, b text)").unwrap();
-        run(&mut eng, "INSERT INTO es_t VALUES (1, 'x'), (2, 'y'), (3, 'z')").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO es_t VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+        )
+        .unwrap();
         assert_eq!(shape(run(&mut eng, "SELECT FROM es_t;").unwrap()), (0, 3));
         assert_eq!(
             shape(run(&mut eng, "SELECT FROM es_t WHERE a > 1;").unwrap()),
@@ -51240,12 +51498,18 @@ mod v112_empty_select_tests {
         // UNION dedups the identical empty rows to one; UNION ALL keeps
         // all; INTERSECT [ALL] / EXCEPT [ALL] use multiset semantics.
         let mut eng = engine();
-        assert_eq!(shape(run(&mut eng, "SELECT UNION SELECT;").unwrap()), (0, 1));
+        assert_eq!(
+            shape(run(&mut eng, "SELECT UNION SELECT;").unwrap()),
+            (0, 1)
+        );
         assert_eq!(
             shape(run(&mut eng, "SELECT INTERSECT SELECT;").unwrap()),
             (0, 1)
         );
-        assert_eq!(shape(run(&mut eng, "SELECT EXCEPT SELECT;").unwrap()), (0, 0));
+        assert_eq!(
+            shape(run(&mut eng, "SELECT EXCEPT SELECT;").unwrap()),
+            (0, 0)
+        );
         assert_eq!(
             shape(
                 run(
@@ -51345,5 +51609,111 @@ mod v112_empty_select_tests {
             shape(run(&mut eng, "SELECT DISTINCT FROM generate_series(1, 3);").unwrap()),
             (0, 1)
         );
+    }
+
+    /// v1.13: `tableoid` system column — the OID of the partition leaf
+    /// holding each row, and `::regclass` rendering it as the table name.
+    #[test]
+    fn v113_tableoid_partitioned() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE tp (a text, b int) PARTITION BY LIST (a);",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE tp1 PARTITION OF tp FOR VALUES IN ('x');",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE tp2 PARTITION OF tp FOR VALUES IN ('y');",
+        )
+        .unwrap();
+        run(&mut eng, "INSERT INTO tp VALUES ('x', 1), ('y', 2);").unwrap();
+        // tableoid::regclass names the leaf partition per row.
+        let r = run(&mut eng, "SELECT tableoid::regclass, a FROM tp ORDER BY a;").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 2);
+        // Order by a: 'x' first, then 'y'.
+        assert_eq!(rows[0][1], "x");
+        assert_eq!(rows[1][1], "y");
+        // The regclass names must be the leaf partition names.
+        assert!(rows[0][0] == "tp1" || rows[0][0] == "tp2");
+        assert!(rows[1][0] == "tp1" || rows[1][0] == "tp2");
+        assert_ne!(rows[0][0], rows[1][0]);
+        // Bare tableoid is the numeric OID.
+        let r = run(&mut eng, "SELECT tableoid FROM tp WHERE a = 'x';").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        let oid: u32 = rows[0][0].parse().unwrap();
+        assert!(oid > 0);
+        // And it round-trips through ::regclass to the leaf name.
+        let r = run(&mut eng, "SELECT tableoid::regclass FROM tp WHERE a = 'x';").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "tp1");
+    }
+
+    /// v1.13: `tableoid` works in GROUP BY / ORDER BY and on plain tables.
+    #[test]
+    fn v113_tableoid_group_by_plain() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE pt (a int);").unwrap();
+        run(&mut eng, "INSERT INTO pt VALUES (1), (2);").unwrap();
+        // Plain (non-partitioned) table: tableoid is the table's own OID.
+        let r = run(&mut eng, "SELECT tableoid::regclass FROM pt LIMIT 1;").unwrap();
+        assert_eq!(rows_of(r)[0][0], "pt");
+        // GROUP BY over tableoid::regclass.
+        run(
+            &mut eng,
+            "CREATE TABLE gp (a text, b int) PARTITION BY LIST (a);",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE gp1 PARTITION OF gp FOR VALUES IN ('x');",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE gp2 PARTITION OF gp FOR VALUES IN ('y');",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO gp VALUES ('x', 1), ('x', 2), ('y', 3);",
+        )
+        .unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT tableoid::regclass::text, count(*) FROM gp GROUP BY 1 ORDER BY 1;",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["gp1".to_string(), "2".to_string()]);
+        assert_eq!(rows[1], vec!["gp2".to_string(), "1".to_string()]);
+        // A user column named tableoid shadows the system column (PG19).
+        run(&mut eng, "CREATE TABLE st (tableoid text);").unwrap();
+        run(&mut eng, "INSERT INTO st VALUES ('mine');").unwrap();
+        let r = run(&mut eng, "SELECT tableoid FROM st;").unwrap();
+        assert_eq!(rows_of(r)[0][0], "mine");
+    }
+
+    /// v1.13: `pg_size_pretty(bigint)` formatting (PG19 misc.c thresholds).
+    #[test]
+    fn v113_pg_size_pretty() {
+        let mut eng = engine();
+        let mut one = |sql: &str| rows_of(run(&mut eng, sql).unwrap())[0][0].clone();
+        assert_eq!(one("SELECT pg_size_pretty(0);"), "0 bytes");
+        assert_eq!(one("SELECT pg_size_pretty(8192);"), "8192 bytes");
+        // 10 KiB is the first kB threshold (integer division, like PG).
+        assert_eq!(one("SELECT pg_size_pretty(10239);"), "10239 bytes");
+        assert_eq!(one("SELECT pg_size_pretty(10240);"), "10 kB");
+        assert_eq!(one("SELECT pg_size_pretty(1048576);"), "1024 kB");
+        assert_eq!(one("SELECT pg_size_pretty(10485760);"), "10 MB");
+        assert_eq!(one("SELECT pg_size_pretty(NULL);"), "NULL");
     }
 }
