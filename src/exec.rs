@@ -214,7 +214,10 @@ fn require_table_priv(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
         let have = crate::storage::table_privs(&eng.db, ctx.role, t, ctx.snap, ctx.own);
         if have & privs != privs {
             return Err(exec_err(
@@ -240,7 +243,10 @@ fn require_column_privs(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
         let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
         for c in columns {
             if !t.columns.iter().any(|(n, _)| n == c) {
@@ -265,7 +271,10 @@ fn require_column_privs(
 
 /// Require owner-or-superuser on a table (DDL).
 fn require_table_owner(eng: &Engine, ctx: &StmtCtx, table: &str) -> Result<(), ExecError> {
-    if let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
         if t.owner != ctx.role
             && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
         {
@@ -3223,9 +3232,9 @@ fn create_table_from_def(
             // ROLLBACK undoes the link. A temp parent is session-local —
             // mutate it in place (stale links are skipped by routing).
             if eng.db.is_temp_table(ctx.session, parent_name) {
-                if let Some(pp) = eng
-                    .db
-                    .find_table_mut(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+                if let Some(pp) =
+                    eng.db
+                        .find_table_mut(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
                 {
                     if let Some(pi) = pp.partition.as_mut() {
                         pi.children.push(name.to_string());
@@ -3416,7 +3425,11 @@ fn create_constraint_index(
     // `constraint_index_name`).
     let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
     let ix_name = constraint_index_name(table, cname, is_child);
-    if eng.db.find_index(&ix_name, ctx.snap, &ctx.all_xids).is_some() {
+    if eng
+        .db
+        .find_index(&ix_name, ctx.snap, &ctx.all_xids)
+        .is_some()
+    {
         return Err(exec_err(
             "42P07",
             format!("relation \"{}\" already exists", ix_name),
@@ -4617,6 +4630,10 @@ fn materialize_dml_ctes(
 /// the target schema into a single scope, exactly like the runtime's
 /// combined evaluation schemas, so ambiguity (42702) and resolution
 /// agree between Describe and execution.
+/// v1.22: `describe_returning` now expands `RETURNING *` /
+/// `RETURNING qual.*` (PG19) to the target table's columns, in order,
+/// and returns the expanded item list alongside the column descriptors
+/// so execution projects the same list.
 fn describe_returning(
     eng: &Engine,
     snap: &Snapshot,
@@ -4626,11 +4643,46 @@ fn describe_returning(
     qual: &str,
     extra: &[Vec<QCol>],
     returning: &[SelectItem],
-) -> Result<Vec<(String, ColType)>, ExecError> {
+) -> Result<(Vec<(String, ColType)>, Vec<SelectItem>), ExecError> {
     let t = eng
         .db
         .find_table(table, snap, &[own], session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+    // v1.22: expand `*` / `qual.*` to explicit column references.
+    let mut expanded: Vec<SelectItem> = Vec::with_capacity(returning.len());
+    for item in returning {
+        match item {
+            SelectItem::All => {
+                for (n, _) in &t.columns {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(qual.to_string()),
+                            name: n.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            SelectItem::AllOf(q) if q == qual => {
+                for (n, _) in &t.columns {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(qual.to_string()),
+                            name: n.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            SelectItem::AllOf(_) => {
+                return Err(exec_err(
+                    "42601",
+                    "RETURNING qual.* for a non-target table is not supported",
+                ));
+            }
+            SelectItem::Expr { .. } => expanded.push(item.clone()),
+        }
+    }
     let mut combined: Vec<QCol> = Vec::new();
     for s in extra {
         combined.extend(s.iter().cloned());
@@ -4646,22 +4698,14 @@ fn describe_returning(
     let schemas: Vec<Vec<QCol>> = vec![combined];
     let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
     let mut out = Vec::new();
-    for item in returning {
-        match item {
-            SelectItem::Expr { expr, alias } => {
-                let ty = expr_type(eng, snap, own, session, &refs, &[], &[], expr)?;
-                let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
-                out.push((name, ty));
-            }
-            SelectItem::All | SelectItem::AllOf(_) => {
-                return Err(exec_err(
-                    "42601",
-                    "RETURNING * is not supported; list the columns explicitly",
-                ));
-            }
+    for item in &expanded {
+        if let SelectItem::Expr { expr, alias } = item {
+            let ty = expr_type(eng, snap, own, session, &refs, &[], &[], expr)?;
+            let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
+            out.push((name, ty));
         }
     }
-    Ok(out)
+    Ok((out, expanded))
 }
 
 /// v0.10: evaluate a RETURNING list against one affected row.
@@ -4889,7 +4933,9 @@ fn plan_upsert(
 
 /// v0.10: current values of one row version, by id.
 fn row_values_by_id(eng: &Engine, ctx: &StmtCtx, table: &str, id: u64) -> Option<Row> {
-    let t = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session)?;
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)?;
     let pos = t.row_pos(id)?;
     Some(t.rows[pos].values.clone())
 }
@@ -5034,7 +5080,10 @@ fn leaf_upsert_ctx(
 /// rather than the partition's index.
 fn leaf_constraint_name(eng: &Engine, ctx: &StmtCtx, leaf: &str, index_name: &str) -> String {
     if let Some(con) = index_name.strip_prefix(&format!("{leaf}_")) {
-        if let Some(t) = eng.db.find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session) {
+        if let Some(t) = eng
+            .db
+            .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+        {
             let known = t.pkey.as_ref().is_some_and(|p| p.name == con)
                 || t.uniques.iter().any(|u| u.name == con);
             if known {
@@ -6912,7 +6961,7 @@ fn exec_insert(
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let cols = describe_returning(
+        let (cols, returning_expanded) = describe_returning(
             eng,
             ctx.snap,
             ctx.own,
@@ -6943,7 +6992,7 @@ fn exec_insert(
                 ctx.session,
                 ctx.role,
                 &[(&schema, values)],
-                returning,
+                &returning_expanded,
                 &ctes,
             )?));
         }
@@ -7417,10 +7466,14 @@ fn exec_update(
             // The old version is excluded (it is being replaced); the
             // check runs before any mutation, keeping the statement
             // atomic.
-            if let Some(vname) =
-                eng.db
-                    .unique_violation(&dst, &new_dst, Some(*id), ctx.snap, &ctx.all_xids, ctx.session)
-            {
+            if let Some(vname) = eng.db.unique_violation(
+                &dst,
+                &new_dst,
+                Some(*id),
+                ctx.snap,
+                &ctx.all_xids,
+                ctx.session,
+            ) {
                 return Err(exec_err(
                     "23505",
                     format!(
@@ -7704,7 +7757,7 @@ fn exec_update(
             .as_ref()
             .map(|s| vec![s.clone()])
             .unwrap_or_default();
-        let cols = describe_returning(
+        let (cols, returning_expanded) = describe_returning(
             eng,
             ctx.snap,
             ctx.own,
@@ -7755,7 +7808,7 @@ fn exec_update(
                 ctx.session,
                 ctx.role,
                 &scopes,
-                returning,
+                &returning_expanded,
                 &ctes,
             )?));
         }
@@ -8071,7 +8124,7 @@ fn exec_delete(
             .as_ref()
             .map(|s| vec![s.clone()])
             .unwrap_or_default();
-        let cols = describe_returning(
+        let (cols, returning_expanded) = describe_returning(
             eng,
             ctx.snap,
             ctx.own,
@@ -8121,7 +8174,7 @@ fn exec_delete(
                 ctx.session,
                 ctx.role,
                 &[(&cschema, &cvalues)],
-                returning,
+                &returning_expanded,
                 &ctes,
             )?));
         }
@@ -8425,7 +8478,9 @@ fn drop_one_table(
     // then mutate. A DROP of a table dropped by a not-yet-visible
     // transaction behaves like the row case (40001 under RR/SERIALIZABLE).
     let prev_xmax = {
-        let t = eng.db.find_table(name, ctx.snap, &ctx.all_xids, ctx.session);
+        let t = eng
+            .db
+            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session);
         match t {
             None if if_exists => return Ok(()),
             None => {
@@ -8523,9 +8578,9 @@ fn drop_one_table(
     // recursive DROP above already dropped this table's own children.
     if let Some(parent_name) = part_parent {
         if eng.db.is_temp_table(ctx.session, &parent_name) {
-            if let Some(pp) = eng
-                .db
-                .find_table_mut(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            if let Some(pp) =
+                eng.db
+                    .find_table_mut(&parent_name, ctx.snap, &ctx.all_xids, ctx.session)
             {
                 if let Some(pi) = pp.partition.as_mut() {
                     pi.children.retain(|c| c != name);
@@ -8547,7 +8602,10 @@ fn drop_one_table(
                 .find_table(&tn, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|tt| tt.dropped_xmax)
                 .unwrap_or(0);
-            if let Some(tt) = eng.db.find_table_mut(&tn, ctx.snap, &ctx.all_xids, ctx.session) {
+            if let Some(tt) = eng
+                .db
+                .find_table_mut(&tn, ctx.snap, &ctx.all_xids, ctx.session)
+            {
                 tt.dropped_xmax = ctx.own;
                 ctx.writes.push(WriteOp::DropTable {
                     name: tn,
@@ -9482,7 +9540,10 @@ fn plan_order_scan(
     // catalog metadata, so streaming it as if it were ordered would
     // produce wrong row order; those queries fall back to Sort (which is
     // what happened before v0.88 accepted the DDL at all).
-    for ix in eng.db.visible_indexes_for(table_name, snap, &[own], session) {
+    for ix in eng
+        .db
+        .visible_indexes_for(table_name, snap, &[own], session)
+    {
         if !ix.def.planner_usable
             || ix.def.desc.iter().any(|d| *d)
             || ix.def.nulls_first.iter().any(|n| *n)
@@ -10775,9 +10836,12 @@ fn plan_from_item(
                     rows: eng.db.sequences.len() as u64,
                 });
             }
-            let t = eng.db.find_table(name, snap, &[own], session).ok_or_else(|| {
-                exec_err("42P01", format!("relation \"{}\" does not exist", name))
-            })?;
+            let t = eng
+                .db
+                .find_table(name, snap, &[own], session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             let rel_rows = est_rel_rows(&eng.db, name, snap, own, session);
             match plan_access_path(&eng.db, t, name, &qual, where_, snap, own, session) {
@@ -11496,7 +11560,6 @@ fn exec_explain(
 struct AnalyzeCtx<'a> {
     eng: &'a Engine,
     snap: &'a Snapshot,
-    own: u64,
     /// v1.21: every xid owned by the transaction (top + sub-xids).
     all_xids: Vec<u64>,
     session: u64,
@@ -11722,7 +11785,6 @@ fn explain_rows(
         let ax = AnalyzeCtx {
             eng: q.eng,
             snap: q.snap,
-            own: q.own,
             all_xids: q.all_xids.clone(),
             session: q.session,
             top_rows: out.rows.len() as u64,
@@ -13561,6 +13623,13 @@ fn is_degenerate_grouping(stmt: &SelectStmt) -> bool {
 }
 
 fn run_select(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<SelectOut, ExecError> {
+    // v1.22: plan-time CASE constant folding (PG19 `eval_const_expressions`).
+    // Runs before anything else at each query level; subqueries and CTE
+    // bodies get their own call via recursion. Gated on `contains_case`
+    // so queries without CASE pay only a single cheap walk.
+    if contains_case(stmt) {
+        const_fold_check(q, stmt)?;
+    }
     let base = q.ctes.len();
     if !stmt.with.is_empty() {
         materialize_ctes(q, &stmt.with)?;
@@ -21611,6 +21680,34 @@ fn eval_grouped(
         )),
         // Subqueries are their own query level: evaluate normally, with
         // the group's first row available for correlation.
+        // v1.22: `IN (subquery)` / quantified comparisons may hold
+        // aggregates in the left side at THIS level (e.g.
+        // `(1 = ANY(array_agg(f1))) = ANY (SELECT ...)`); PG computes
+        // them with the group and the SubPlan references the value, so
+        // evaluate the left side in grouped context first.
+        Expr::InSub { expr, sub, neg } if contains_agg(expr) => {
+            let lv = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(gscope);
+            eval_in_value(q, &scopes, lv, sub, *neg)
+        }
+        Expr::Quantified {
+            left,
+            op,
+            quant,
+            sub,
+        } if contains_agg(left) => {
+            let lv = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, left,
+            )?;
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(gscope);
+            eval_quantified_value(q, &scopes, lv, op, *quant, sub)
+        }
         Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
@@ -25006,6 +25103,175 @@ fn walk_select(s: &SelectStmt, f: &mut impl FnMut(&Expr)) {
     }
 }
 
+// ============================================================================
+// v1.22: plan-time CASE constant folding (PG19 `eval_const_expressions`,
+// clauses.c). Postgres folds constant subexpressions while the plan is
+// built and raises errors (e.g. 22012 division by zero) then — but it never
+// folds unreachable CASE arms: a WHEN that folds to FALSE drops its arm
+// without touching the result; a WHEN that folds to TRUE folds its result
+// and drops every later arm and the ELSE. This pre-pass runs at the top of
+// `run_select` (every query level funnels through it, including subqueries
+// and CTE bodies). It only EVALUATES; it never rewrites the tree.
+// A subexpression is folded only if syntactically pure — literals,
+// arithmetic/comparison/logical operators, casts, and nested CASEs — with
+// no functions, columns, subqueries, aggregates, or window calls, so there
+// are no side effects and no row dependence. Anything else is left for
+// execution, matching PG's "we do not suppress folding of potentially
+// reachable subexpressions".
+// ============================================================================
+
+/// v1.22: is this expression free of side effects and row references, so
+/// evaluating it at plan time is safe? Conservative: anything not
+/// explicitly listed (notably Func, Column, subqueries, Agg, Window)
+/// returns false.
+fn is_pure_const(e: &Expr) -> bool {
+    let mut pure = true;
+    walk_expr(e, &mut |sub| {
+        if !pure {
+            return;
+        }
+        match sub {
+            Expr::Literal(_)
+            | Expr::Arith { .. }
+            | Expr::Cmp { .. }
+            | Expr::And(..)
+            | Expr::Or(..)
+            | Expr::Not(_)
+            | Expr::Neg(_)
+            | Expr::BitNot(_)
+            | Expr::IsNull { .. }
+            | Expr::IsBool { .. }
+            | Expr::Case { .. }
+            | Expr::Cast { .. }
+            | Expr::Concat(..)
+            | Expr::Between { .. } => {}
+            _ => {
+                pure = false;
+            }
+        }
+    });
+    pure
+}
+
+/// v1.22: add a whole expression subtree to the dead set.
+fn mark_subtree_dead(e: &Expr, dead: &mut HashSet<*const Expr>) {
+    walk_expr(e, &mut |sub| {
+        dead.insert(sub as *const Expr);
+    });
+}
+
+/// v1.22: phase 1 of plan-time folding — mark unreachable CASE arms dead.
+/// A WHEN that folds to FALSE kills its arm; a WHEN that folds to TRUE
+/// kills every later arm and the ELSE. Evaluating a constant WHEN can
+/// itself raise (e.g. `WHEN 1/0`), which aborts the statement at plan
+/// time, like PG19.
+fn mark_dead_arms(
+    q: &mut Q,
+    operand: &Option<Box<Expr>>,
+    whens: &[(Box<Expr>, Box<Expr>)],
+    else_: &Option<Box<Expr>>,
+    dead: &mut HashSet<*const Expr>,
+) -> Result<(), ExecError> {
+    // Simple CASE with a pure-constant operand folds `operand = key`.
+    let op_val: Option<Value> = match operand {
+        Some(o) if is_pure_const(o) => Some(eval_expr(q, &[], o)?),
+        _ => None,
+    };
+    let mut done = false;
+    for (key, result) in whens {
+        if done {
+            mark_subtree_dead(result, dead);
+            continue;
+        }
+        let cond: Option<Value> = if operand.is_some() {
+            match (&op_val, is_pure_const(key)) {
+                (Some(ov), true) => {
+                    let kv = eval_expr(q, &[], key)?;
+                    Some(eval_cmp_vals(CmpOp::Eq, ov, &kv)?)
+                }
+                _ => None,
+            }
+        } else if is_pure_const(key) {
+            Some(eval_expr(q, &[], key)?)
+        } else {
+            None
+        };
+        match cond {
+            Some(Value::Bool(false)) => mark_subtree_dead(result, dead),
+            Some(Value::Bool(true)) => done = true,
+            _ => {}
+        }
+    }
+    if done {
+        if let Some(e) = else_ {
+            mark_subtree_dead(e, dead);
+        }
+    }
+    Ok(())
+}
+
+/// v1.22: does this query level contain a CASE expression? Cheap
+/// pre-check so `const_fold_check` only runs when there's work to do.
+fn contains_case(s: &SelectStmt) -> bool {
+    let mut found = false;
+    walk_select(s, &mut |e| {
+        if !found {
+            if let Expr::Case { .. } = e {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v1.22: plan-time constant folding for one query level. Phase 1 marks
+/// unreachable CASE arms dead; phase 2 evaluates every reachable
+/// pure-constant subexpression, propagating errors (e.g. 22012) as
+/// plan-time statement errors.
+fn const_fold_check(q: &mut Q, stmt: &SelectStmt) -> Result<(), ExecError> {
+    let mut dead: HashSet<*const Expr> = HashSet::new();
+    // Phase 1: mark unreachable CASE arms.
+    let mut err: Result<(), ExecError> = Ok(());
+    walk_select(stmt, &mut |e| {
+        if err.is_err() {
+            return;
+        }
+        // A CASE under an already-dead arm stays dead; walk_expr still
+        // descends, but every node down there is in `dead` too.
+        if dead.contains(&(e as *const Expr)) {
+            return;
+        }
+        if let Expr::Case {
+            operand,
+            whens,
+            else_,
+        } = e
+        {
+            if let Err(x) = mark_dead_arms(q, operand, whens, else_, &mut dead) {
+                err = Err(x);
+            }
+        }
+    });
+    if err.is_err() {
+        return err;
+    }
+    // Phase 2: fold reachable pure constants.
+    walk_select(stmt, &mut |e| {
+        if err.is_err() {
+            return;
+        }
+        if dead.contains(&(e as *const Expr)) {
+            return;
+        }
+        if is_pure_const(e) {
+            if let Err(x) = eval_expr(q, &[], e) {
+                err = Err(x);
+            }
+        }
+    });
+    err
+}
+
 /// True iff every column reference in `e` is qualified with a qualifier
 /// other than `inner_qual`. Fails closed (false) on anything that
 /// could hide an inner-range reference — notably nested subqueries,
@@ -25810,6 +26076,18 @@ fn eval_in(
     neg: bool,
 ) -> Result<Value, ExecError> {
     let v = eval_expr(q, scopes, e)?;
+    eval_in_value(q, scopes, v, sub, neg)
+}
+
+/// v1.22: `IN (subquery)` against a precomputed left value (used by
+/// `eval_grouped` when the left side holds aggregates at that level).
+fn eval_in_value(
+    q: &mut Q,
+    scopes: &[Scope],
+    v: Value,
+    sub: &SelectStmt,
+    neg: bool,
+) -> Result<Value, ExecError> {
     // v0.86: a user-defined `=` operator disables the hashed IN path
     // (builtin hashing can't apply custom equality); the nested loop
     // below probes through the operator instead.
@@ -25957,6 +26235,19 @@ fn eval_quantified(
     sub: &SelectStmt,
 ) -> Result<Value, ExecError> {
     let lv = eval_expr(q, scopes, left)?;
+    eval_quantified_value(q, scopes, lv, op, quant, sub)
+}
+
+/// v1.22: quantified comparison against a precomputed left value (used
+/// by `eval_grouped` when the left side holds aggregates at that level).
+fn eval_quantified_value(
+    q: &mut Q,
+    scopes: &[Scope],
+    lv: Value,
+    op: &QuantOp,
+    quant: QuantKind,
+    sub: &SelectStmt,
+) -> Result<Value, ExecError> {
     let left_vals: Vec<Value> = match &lv {
         Value::Record(fields) => fields.iter().map(|(_, v)| v.clone()).collect(),
         v => vec![v.clone()],
@@ -30079,7 +30370,11 @@ fn func_rowtype_fields(
     q: &mut Q,
     type_name: &str,
 ) -> Result<(Vec<String>, Vec<ColType>), ExecError> {
-    if let Some(t) = q.eng.db.find_table(type_name, q.snap, &q.all_xids, q.session) {
+    if let Some(t) = q
+        .eng
+        .db
+        .find_table(type_name, q.snap, &q.all_xids, q.session)
+    {
         let names = t.columns.iter().map(|(n, _)| n.clone()).collect();
         let types = t.columns.iter().map(|(_, c)| c.clone()).collect();
         return Ok((names, types));
@@ -30435,7 +30730,11 @@ fn pg_column_compression_value(
         None => return Ok(Value::Null),
     };
     let (table_name, row_id) = (entry.table.as_str(), entry.row_id);
-    let t = match q.eng.db.find_table(table_name, q.snap, &q.all_xids, q.session) {
+    let t = match q
+        .eng
+        .db
+        .find_table(table_name, q.snap, &q.all_xids, q.session)
+    {
         Some(t) => t,
         None => return Ok(Value::Null),
     };
@@ -37045,9 +37344,12 @@ fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
-            let t = eng.db.find_table(name, snap, &[own], session).ok_or_else(|| {
-                exec_err("42P01", format!("relation \"{}\" does not exist", name))
-            })?;
+            let t = eng
+                .db
+                .find_table(name, snap, &[own], session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             // v0.23: positional renames apply to plain tables too.
             let schema: Vec<QCol> = t
@@ -39697,16 +39999,9 @@ pub fn describe_columns(
             if returning.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(describe_returning(
-                    eng,
-                    snap,
-                    own,
-                    session,
-                    table,
-                    table,
-                    &[],
-                    returning,
-                )?))
+                Ok(Some(
+                    describe_returning(eng, snap, own, session, table, table, &[], returning)?.0,
+                ))
             }
         }
         // v0.76: UPDATE ... FROM — RETURNING may reference the FROM
@@ -39723,16 +40018,19 @@ pub fn describe_columns(
                 Ok(None)
             } else {
                 let extra = from_schemas(eng, snap, own, session, from, with, &[], &[], &[])?;
-                Ok(Some(describe_returning(
-                    eng,
-                    snap,
-                    own,
-                    session,
-                    table,
-                    alias.as_deref().unwrap_or(table),
-                    &extra,
-                    returning,
-                )?))
+                Ok(Some(
+                    describe_returning(
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        table,
+                        alias.as_deref().unwrap_or(table),
+                        &extra,
+                        returning,
+                    )?
+                    .0,
+                ))
             }
         }
         // v0.65: DELETE's alias (if any) is the visible qualifier.
@@ -39750,16 +40048,19 @@ pub fn describe_columns(
                 Ok(None)
             } else {
                 let extra = from_schemas(eng, snap, own, session, using, with, &[], &[], &[])?;
-                Ok(Some(describe_returning(
-                    eng,
-                    snap,
-                    own,
-                    session,
-                    table,
-                    alias.as_deref().unwrap_or(table),
-                    &extra,
-                    returning,
-                )?))
+                Ok(Some(
+                    describe_returning(
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        table,
+                        alias.as_deref().unwrap_or(table),
+                        &extra,
+                        returning,
+                    )?
+                    .0,
+                ))
             }
         }
         _ => Ok(None),
@@ -52870,5 +53171,130 @@ mod v112_empty_select_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], "2");
         assert_eq!(rows[0][1], "0");
+    }
+
+    /// v1.22: plan-time CASE constant folding — a reachable constant
+    /// `1/0` in a WHEN-true arm raises 22012 at plan time (PG19
+    /// `eval_const_expressions`), even though the row's WHEN is false.
+    #[test]
+    fn v122_case_reachable_const_div0_errors() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE ct (i int);").unwrap();
+        run(&mut eng, "INSERT INTO ct VALUES (50);").unwrap();
+        let e = run(
+            &mut eng,
+            "SELECT CASE WHEN i > 100 THEN 1/0 ELSE 0 END FROM ct;",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22012");
+    }
+
+    /// v1.22: an unreachable CASE arm (WHEN folds to FALSE) is never
+    /// folded — no error, ELSE result returned.
+    #[test]
+    fn v122_case_unreachable_arm_not_folded() {
+        let mut eng = engine();
+        let r = run(&mut eng, "SELECT CASE WHEN 1=0 THEN 1/0 ELSE 1 END;").unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "1");
+    }
+
+    /// v1.22: a WHEN that folds to TRUE drops later arms — their
+    /// constant errors are never folded.
+    #[test]
+    fn v122_case_true_when_drops_later_arms() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "SELECT CASE WHEN 1=1 THEN 7 WHEN 2=2 THEN 1/0 ELSE 1/0 END;",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "7");
+    }
+
+    /// v1.22: grouped aggregate as a quantified comparison's left
+    /// operand — the aggregate folds per group, then the subquery
+    /// comparison runs against the value (PG19 SubPlan semantics).
+    /// `1 = ANY([1,2])` is true; `true = ANY(SELECT false)` is false.
+    #[test]
+    fn v122_quantified_grouped_agg_left() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE qa (f1 int);").unwrap();
+        run(&mut eng, "INSERT INTO qa VALUES (1), (2);").unwrap();
+        let r = run(
+            &mut eng,
+            "SELECT (1 = ANY(array_agg(f1))) = ANY (SELECT false) FROM qa;",
+        )
+        .unwrap();
+        let rows = rows_of(r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "f");
+    }
+
+    /// v1.22: `INSERT ... RETURNING *` expands to the target table's
+    /// columns in order (PG19).
+    #[test]
+    fn v122_returning_star_insert() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rs (k int, v text);").unwrap();
+        let r = run(&mut eng, "INSERT INTO rs VALUES (1, 'a') RETURNING *;").unwrap();
+        match r {
+            ExecResult::Dml { columns, rows, .. } => {
+                assert_eq!(columns, vec![("k".to_string(), ColType::Int), ("v".to_string(), ColType::Text)]);
+                assert_eq!(rows.len(), 1);
+                let vals: Vec<String> =
+                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                assert_eq!(vals, vec!["1".to_string(), "a".to_string()]);
+            }
+            _ => panic!("expected Dml, got {:?}", r),
+        }
+    }
+
+    /// v1.22: `UPDATE ... RETURNING *` and `DELETE ... RETURNING *`.
+    #[test]
+    fn v122_returning_star_update_delete() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rs2 (k int, v text);").unwrap();
+        run(&mut eng, "INSERT INTO rs2 VALUES (1, 'a'), (2, 'b');").unwrap();
+        let r = run(&mut eng, "UPDATE rs2 SET v = 'z' WHERE k = 1 RETURNING *;").unwrap();
+        match r {
+            ExecResult::Dml { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let vals: Vec<String> =
+                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                assert_eq!(vals, vec!["1".to_string(), "z".to_string()]);
+            }
+            _ => panic!("expected Dml"),
+        }
+        let r = run(&mut eng, "DELETE FROM rs2 WHERE k = 2 RETURNING *;").unwrap();
+        match r {
+            ExecResult::Dml { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let vals: Vec<String> =
+                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                assert_eq!(vals, vec!["2".to_string(), "b".to_string()]);
+            }
+            _ => panic!("expected Dml"),
+        }
+    }
+
+    /// v1.22: qualified `RETURNING tbl.*` expands like `*`.
+    #[test]
+    fn v122_returning_qualified_star() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE rs3 (k int, v text);").unwrap();
+        let r = run(&mut eng, "INSERT INTO rs3 VALUES (3, 'c') RETURNING rs3.*;").unwrap();
+        match r {
+            ExecResult::Dml { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let vals: Vec<String> =
+                    rows[0].iter().map(|v| v.to_text().unwrap()).collect();
+                assert_eq!(vals, vec!["3".to_string(), "c".to_string()]);
+            }
+            _ => panic!("expected Dml"),
+        }
     }
 }

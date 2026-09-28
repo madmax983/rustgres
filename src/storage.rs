@@ -5556,7 +5556,12 @@ impl Database {
     }
 
     /// Mutable twin of [`Database::find_index`].
-    pub fn find_index_mut(&mut self, name: &str, snap: &Snapshot, owns: &[u64]) -> Option<&mut Index> {
+    pub fn find_index_mut(
+        &mut self,
+        name: &str,
+        snap: &Snapshot,
+        owns: &[u64],
+    ) -> Option<&mut Index> {
         self.indexes
             .get_mut(name)
             .filter(|ix| index_visible(&ix.def, snap, owns))
