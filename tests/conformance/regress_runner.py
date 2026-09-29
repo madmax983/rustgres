@@ -900,6 +900,13 @@ EXPECTED_PASS_OVERRIDES = [
     # now genuinely supported and must pass.
     (r"(?i)\(\s*(select\s+)?array\s*\[[^\]]*\]\)+\s*\[",
      "v1.23: subscript over parenthesized array[...] supported"),
+    # v1.25: PG19 width_bucket_float8 (float.c) computes in float64 —
+    # the all-float8 overload now takes the verbatim port. The
+    # 1.797e+308/5e-324 LATERAL overflow statement (numeric.sql:946)
+    # must pass; the v1.10 mask below is retired.
+    (r"(?is)\bwidth_bucket\s*\(\s*oper\s*,\s*low\s*,\s*high\s*,\s*cnt\s*\)"
+     r".*\b1\.797e\+308::float8",
+     "v1.25: width_bucket float8 overload supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
@@ -911,8 +918,8 @@ EXPECTED_FAIL_PATTERNS = [
      "v1.10: ambiguous table reference in LATERAL not detected"),
     (r"(?is)\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\(",
      "v1.10: aggregate in LATERAL at own query level not rejected"),
-    (r"(?is)\bwidth_bucket\b.*\blateral\b",
-     "v1.10: float8 precision in LATERAL VALUES"),
+    # v1.25: the width_bucket float8-precision mask is retired — the
+    # all-float8 overload is supported (see EXPECTED_PASS_OVERRIDES).
     (r"(?is)\blateral\b\s*\(\s*values\s*\(\s*\w+\.\*\s*\)",
      "v1.10: row wildcard (n.*) in LATERAL VALUES unsupported"),
     (r"(?is)\blateral\b\s*\(\s*with\s+recursive\b",

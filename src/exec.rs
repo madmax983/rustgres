@@ -27504,6 +27504,90 @@ fn wb_bucket_in_range(
     }
 }
 
+/// v1.25: PG19 `width_bucket_float8` (float.c) ported verbatim to f64.
+/// PG resolves all-float8 (operand, bound1, bound2) calls to this
+/// overload, which computes in float64 — including the divide-by-2
+/// overflow path when the bound difference overflows DBL_MAX, and the
+/// "quotient could round to 1.0, which would be a lie" guard. Error
+/// order and codes mirror PG: 22023 for count/NaN-bound/inf-bound/
+/// equal-bound, 22003 for the count+1 int32 overflow
+/// (pg_add_s32_overflow). `count` arrives as i64 because rustgres also
+/// accepts int2/int8; buckets above i32::MAX are 22003, matching the
+/// exact path's `int_result`.
+fn eval_width_bucket_float8(
+    operand: f64,
+    bound1: f64,
+    bound2: f64,
+    count: i64,
+) -> Result<Value, ExecError> {
+    if count <= 0 {
+        return Err(exec_err("22023", "count must be greater than zero"));
+    }
+    if bound1.is_nan() || bound2.is_nan() {
+        return Err(exec_err("22023", "lower and upper bounds cannot be NaN"));
+    }
+    if bound1.is_infinite() || bound2.is_infinite() {
+        return Err(exec_err("22023", "lower and upper bounds must be finite"));
+    }
+    // pg_add_s32_overflow(count, 1): count+1 must fit int32.
+    let count_plus_one = || -> Result<Value, ExecError> {
+        if count >= i32::MAX as i64 {
+            Err(exec_err("22003", "integer out of range"))
+        } else {
+            Ok(Value::Int(count + 1))
+        }
+    };
+    // PG returns int4: buckets above i32::MAX are 22003.
+    let int_result = |bucket: i64| -> Result<Value, ExecError> {
+        if bucket > i32::MAX as i64 {
+            Err(exec_err("22003", "integer out of range"))
+        } else {
+            Ok(Value::Int(bucket))
+        }
+    };
+    // C `result = count * quotient` truncates the double product toward
+    // zero into int32; the quotient is in [0,1] so no overflow for
+    // PG-sized counts. `as i64` truncates toward zero identically.
+    let scaled = |quotient: f64| -> i64 {
+        let mut result = (count as f64 * quotient) as i64;
+        // The quotient could round to 1.0, which would be a lie.
+        if result >= count {
+            result = count - 1;
+        }
+        result + 1
+    };
+    if bound1 < bound2 {
+        if operand.is_nan() || operand >= bound2 {
+            return count_plus_one();
+        } else if operand < bound1 {
+            return Ok(Value::Int(0));
+        }
+        let quotient = if (bound2 - bound1).is_infinite() {
+            // bound2 - bound1 overflows DBL_MAX; both bounds are finite
+            // so halving all inputs is exact (except negligible
+            // tiny-operand underflow — PG's own comment).
+            (operand / 2.0 - bound1 / 2.0) / (bound2 / 2.0 - bound1 / 2.0)
+        } else {
+            (operand - bound1) / (bound2 - bound1)
+        };
+        int_result(scaled(quotient))
+    } else if bound1 > bound2 {
+        if operand.is_nan() || operand > bound1 {
+            return Ok(Value::Int(0));
+        } else if operand <= bound2 {
+            return count_plus_one();
+        }
+        let quotient = if (bound1 - bound2).is_infinite() {
+            (bound1 / 2.0 - operand / 2.0) / (bound1 / 2.0 - bound2 / 2.0)
+        } else {
+            (bound1 - operand) / (bound1 - bound2)
+        };
+        int_result(scaled(quotient))
+    } else {
+        Err(exec_err("22023", "lower bound cannot equal upper bound"))
+    }
+}
+
 /// v0.64: Convert a finite Numeric to u64 exactly; None when the value
 /// is negative, has a fractional part, or exceeds u64::MAX (pg_lsn input).
 fn numeric_to_u64_exact(n: &crate::storage::Numeric) -> Option<u64> {
@@ -27570,6 +27654,17 @@ fn eval_width_bucket(op: &Value, vals: &[Value], name: &str) -> Result<Value, Ex
     // v0.56: PG19 reports 22023 here (was 2201F).
     if count <= 0 {
         return Err(exec_err("22023", "count must be greater than zero"));
+    }
+
+    // v1.25: PG resolves an all-float8 (operand, bound1, bound2) call to
+    // width_bucket_float8 (float.c), which computes in float64 — not the
+    // exact decimal arithmetic below. At extreme magnitudes the two
+    // disagree (numeric.sql's LATERAL overflow test, row 6: exact yields
+    // 1, PG yields 2), so float8 triples take the verbatim PG19 path.
+    // Every other shape stays on the exact path, so no currently-passing
+    // statement changes behavior (verified against the corpus).
+    if let (Value::Float(o), Value::Float(b1), Value::Float(b2)) = (op, &vals[1], &vals[2]) {
+        return eval_width_bucket_float8(*o, *b1, *b2, count);
     }
 
     let operand = wb_arg(name, op)?;
@@ -45737,6 +45832,72 @@ mod tests {
         // Non-variadic format() is unchanged.
         assert_eq!(one("select format('%s, %s', 'a', 'b')"), "a, b");
         assert_eq!(one("select format('%I', 'mytab')"), "mytab");
+    }
+
+    /// v1.25: PG19 width_bucket_float8 (float.c) computes in float64, not
+    /// exact decimal. Verbatim-port cases from numeric.sql's LATERAL
+    /// overflow test (item 686): row 6 is the diverger (exact decimal
+    /// yields 1, PG yields 2 via the divide-by-2 overflow path).
+    #[test]
+    fn v125_width_bucket_float8_pg19() {
+        let mut eng = engine();
+        // The corpus statement's 12 bucket values (numeric.out).
+        let buckets = run(
+            &mut eng,
+            "SELECT width_bucket(oper, low, high, cnt) FROM (SELECT 1.797e+308::float8 AS big, 5e-324::float8 AS tiny) AS v, LATERAL (VALUES (10.5::float8, -big, big, 1), (10.5::float8, -big, big, 2), (10.5::float8, -big, big, 3), (big / 4, -big / 2, big / 2, 10), (10.5::float8, big, -big, 1), (10.5::float8, big, -big, 2), (10.5::float8, big, -big, 3), (big / 4, big / 2, -big / 2, 10), (0, 0, tiny, 4), (tiny, 0, tiny, 4), (0, 0, 1, 2147483647), (1, 1, 0, 2147483647)) AS sample(oper, low, high, cnt)",
+        )
+        .expect("width_bucket corpus statement");
+        let got: Vec<String> = rows_of(buckets).into_iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec!["1", "2", "2", "8", "1", "2", "2", "3", "1", "5", "1", "1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        // All-float8 error paths keep PG's codes/messages.
+        let e = run(
+            &mut eng,
+            "SELECT width_bucket(5.0::float8, 3.0::float8, 4.0::float8, 0)",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert_eq!(e.message, "count must be greater than zero");
+        let e = run(
+            &mut eng,
+            "SELECT width_bucket(3.5::float8, 3.0::float8, 3.0::float8, 888)",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert_eq!(e.message, "lower bound cannot equal upper bound");
+        // count+1 int32 overflow -> 22003, like PG's pg_add_s32_overflow.
+        let e = run(
+            &mut eng,
+            "SELECT width_bucket(2.0::float8, 0.0::float8, 1.0::float8, 2147483647)",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22003");
+        // Single-value checks go through the closure, defined after the
+        // last direct `run` so the mutable borrow of `eng` doesn't
+        // overlap (E0499).
+        let mut one = |sql: &str| -> String {
+            let r = run(&mut eng, sql).expect(sql);
+            let rows = rows_of(r);
+            assert_eq!(rows.len(), 1, "{sql}");
+            rows[0][0].clone()
+        };
+        // NaN operand on float8 bounds -> count + 1.
+        assert_eq!(
+            one("SELECT width_bucket('NaN'::float8, 3.0::float8, 4.0::float8, 888)"),
+            "889"
+        );
+        // Mixed-type calls stay on the exact-decimal path (no behavior
+        // change): the v0.56 roundoff-hazard cases.
+        assert_eq!(one("SELECT width_bucket(0, -1e100::float8, 1, 10)"), "10");
+        assert_eq!(one("SELECT width_bucket(1, 1e100::float8, 0, 10)"), "10");
+        // The numeric overload is untouched.
+        assert_eq!(one("SELECT width_bucket(5.0, 3.0, 4.0, 10)"), "11");
+        assert_eq!(one("SELECT width_bucket(3.5, 4.0, 3.0, 10)"), "6");
     }
 }
 
