@@ -850,7 +850,6 @@ EXPECTED_PASS_OVERRIDES = [
      r"(?!.*\btattle\b)(?!.*\bunnest\s*\()"
      r"(?!.*\binserttest\w*\b)"
      r"(?!.*\bvarbit\b)"
-     r"(?!.*\barray\s*\[\s*true\s*,\s*false\s*\](?!::))"
      r"(?!.*\(\s*select\s+array\b)"
      r"(?!.*\barray\s*\[[^\]]*\]\s*\)\s*\[)"
      r".*\barray\s*\[",
@@ -1032,9 +1031,9 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)^\s*create\s+type\b", "CREATE TYPE unsupported"),
     (r"(?i)^\s*select\s*;\s*$", "empty SELECT list unsupported"),
     (r"(?i)\bselect\s+(union|intersect|except)\s+select\b", "empty SELECT list unsupported"),
-    # v0.45: format() is supported, but VARIADIC array form needs array
-    # literal/coercion support not yet implemented.
-    (r"(?i)\bformat\s*\([^)]*\bvariadic\b", "format() with VARIADIC array unsupported"),
+    # v1.24: the v0.45 format()+VARIADIC mask is removed — VARIADIC
+    # arrays are supported since v0.90, and PG19 text_format() treats a
+    # NULL VARIADIC array as zero arguments (varlena.c).
     (r"(?i)\blateral\b", "LATERAL joins unsupported"),
     (r"(?i)\bunnest\s*\(", "unnest() unsupported"),
     (r"\)\s*\[", "subscript on subquery/expression result unsupported"),

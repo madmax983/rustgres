@@ -21973,6 +21973,12 @@ fn eval_grouped(
                         q, outer, gscope, schema, rows, idxs, key_vals, group_by, inner,
                     )?;
                     match expand_variadic_value(v)? {
+                        // v1.24: PG19 text_format() treats VARIADIC NULL
+                        // as a zero-length array; every other variadic
+                        // builtin makes the whole call NULL.
+                        None if variadic_null_expands_empty(name) => {
+                            continue;
+                        }
                         None => return Ok(Value::Null),
                         Some(expanded) => {
                             for ev in expanded {
@@ -29417,6 +29423,12 @@ fn is_variadic_marker(e: &Expr) -> Option<&Expr> {
 /// whole call returns NULL (PG: `concat(VARIADIC NULL)` is NULL);
 /// an array expands to its elements. v0.91: anything else is a PG
 /// type error (42821 "VARIADIC argument must be an array").
+/// v1.24: `format` is the one exception — PG19's text_format() treats
+/// a NULL VARIADIC argument as a zero-length array ("If argument is
+/// NULL, we treat it as zero-length array", varlena.c), while
+/// concat/concat_ws define VARIADIC NULL as NULL (concat_internal)
+/// and json_build_*/jsonb_build_* PG_RETURN_NULL() on it. Callers
+/// check `variadic_null_expands_empty(name)` on the None arm.
 fn expand_variadic_value(v: Value) -> Result<Option<Vec<Value>>, ExecError> {
     match v {
         Value::Null => Ok(None),
@@ -29431,6 +29443,15 @@ fn expand_variadic_value(v: Value) -> Result<Option<Vec<Value>>, ExecError> {
             ),
         )),
     }
+}
+
+/// v1.24: PG19 function for which a NULL `VARIADIC` argument expands to
+/// zero arguments instead of making the whole call NULL. Only
+/// `format` behaves this way (varlena.c text_format: "If argument is
+/// NULL, we treat it as zero-length array"); concat/concat_ws define
+/// VARIADIC NULL as NULL and json_build_*/jsonb_build_* return NULL.
+fn variadic_null_expands_empty(func_name: &str) -> bool {
+    func_name.eq_ignore_ascii_case("format")
 }
 
 fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
@@ -30633,6 +30654,10 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
             if let Some(inner) = is_variadic_marker(a) {
                 let v = eval_expr(q, scopes, inner)?;
                 match expand_variadic_value(v)? {
+                    // v1.24: PG19 text_format() treats VARIADIC NULL as a
+                    // zero-length array; every other variadic builtin
+                    // makes the whole call NULL.
+                    None if variadic_null_expands_empty(name) => {}
                     None => return Ok(Value::Null),
                     Some(expanded) => raw_vals.extend(expanded),
                 }
@@ -34438,18 +34463,12 @@ fn pg_format_text(vals: &[Value]) -> Result<Value, ExecError> {
     let mut out = String::new();
     let mut arg: usize = 1; // next argument position (1-based)
     let mut i = 0;
-    // Stringify a value like PG's type output function. Bool renders as
-    // true/false (not the wire t/f).
-    let stringify = |v: &Value| -> Option<String> {
-        match v {
-            Value::Bool(b) => Some(if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }),
-            _ => v.to_text(),
-        }
-    };
+    // Stringify a value like PG19's type output function
+    // (varlena.c text_format_string_conversion calls OutputFunctionCall
+    // for %s/%I/%L). v1.24: the old Bool special-case rendering
+    // true/false was wrong — boolout renders t/f, and Value::to_text()
+    // already does that.
+    let stringify = |v: &Value| -> Option<String> { v.to_text() };
     // Fetch the 1-based argument, or raise "too few arguments".
     let get_arg = |pos: usize| -> Result<&Value, ExecError> {
         if pos < 1 || pos > nargs {
@@ -45677,6 +45696,47 @@ mod tests {
         // inner name has strength 2, so the type-name fallback does
         // not apply).
         assert_eq!(col_name_of("SELECT ARRAY[1,2]::text[]"), "array");
+    }
+
+    /// v1.24: PG19 text_format() VARIADIC handling (varlena.c).
+    /// %s/%I/%L stringify through the type output function (bool ->
+    /// t/f, not true/false), and a NULL VARIADIC array expands to zero
+    /// arguments for format() only — concat/concat_ws still return NULL.
+    #[test]
+    fn v124_format_variadic_pg19() {
+        let mut eng = engine();
+        let mut one = |sql: &str| -> String {
+            let r = run(&mut eng, sql).expect(sql);
+            let rows = rows_of(r);
+            assert_eq!(rows.len(), 1, "{sql}");
+            rows[0][0].clone()
+        };
+        // The two conformance statements (text.sql).
+        assert_eq!(
+            one("select format('%s, %s', variadic array[true, false])"),
+            "t, f"
+        );
+        assert_eq!(one("select format('Hello', variadic NULL::int[])"), "Hello");
+        // Bool %s uses the output function in all positions.
+        assert_eq!(one("select format('%s', true)"), "t");
+        assert_eq!(one("select format('%s-%s', false, true)"), "f-t");
+        // The ::text[] twin is unaffected (text elements already).
+        assert_eq!(
+            one("select format('%s, %s', variadic array[true, false]::text[])"),
+            "true, false"
+        );
+        // VARIADIC NULL stays whole-call NULL for concat/concat_ws.
+        assert_eq!(one("select concat(variadic NULL::int[]) is NULL"), "t");
+        assert_eq!(
+            one("select concat_ws(',', variadic NULL::int[]) is NULL"),
+            "t"
+        );
+        // NULL argument rendering per conversion: %s -> '', %L -> NULL.
+        assert_eq!(one("select format('[%s]', NULL)"), "[]");
+        assert_eq!(one("select format('[%L]', NULL)"), "[NULL]");
+        // Non-variadic format() is unchanged.
+        assert_eq!(one("select format('%s, %s', 'a', 'b')"), "a, b");
+        assert_eq!(one("select format('%I', 'mytab')"), "mytab");
     }
 }
 
