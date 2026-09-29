@@ -2,6 +2,76 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — baseline — 2026-09-29
+
+**Why this workload**: v1.19 (`⚡ v1.19: hashed IN-subquery with JOIN
+support`) added a fast path for uncorrelated `WHERE col IN (SELECT ...)`
+that materializes the subquery's result once per statement instead of
+once per row (`eval_hashed_in`/`HashedIn` in `src/exec.rs`), but no Bolt
+round has profiled it since it shipped. New harness,
+`benches/profile_hashedin.py --outer-rows 50000 --inner-rows 500
+--count 20`: loads a 50,000-row outer table and a 500-row inner table,
+then sends 20 exact iterations of `SELECT count(*) FROM bench_outer
+WHERE k IN (SELECT id FROM bench_inner WHERE tag = 'x')` over the real
+wire protocol against a debug build — an uncorrelated, single-table,
+hash-safe `IN (subquery)` exercising the fast path's per-row code, not a
+synthetic call to one function in isolation.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_hashedin.py --outer-rows 50000 --inner-rows 500 \
+  --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '21,22p'   # PROGRAM TOTALS Ir
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD `dc40d34`):
+**18,506,453,133** total `Ir`. `eval_hashed_in` and its callees —
+the per-row correctness-shape validation this fix targets — account for
+roughly 6% of the total by self-cost alone (`eval_hashed_in` 1.21%,
+`subquery_refs_only_inner` + its closures 2.00%, `SelectStmt::eq` 0.62%,
+`match_hashable_in` 0.42%, `collect_hashable_tables` + `::walk` 0.76%,
+`subplan_inner_is_base_table` 0.28%), but that undercounts its real
+share: every one of those functions clones `String`s or builds `Vec`s on
+every probed row purely to re-derive a fact (is this subquery
+hashable/uncorrelated?) that cannot change within one statement, and
+those allocations drive a large share of this debug build's
+`malloc`/`free`/`memcpy` and UB-check (`is_aligned_to`,
+`precondition_check`) costs elsewhere in the profile — costs that don't
+show up attributed to `eval_hashed_in` in a flat self-cost listing but
+disappear with it, as the after-measurement below shows.
+
+The root cause: `eval_hashed_in` ran `match_hashable_in(sub)` →
+`subplan_inner_is_base_table` (per inner table) →
+`subquery_refs_only_inner(q, sub, &tables)` on *every* row, before ever
+consulting the cache — and `subquery_refs_only_inner` alone clones every
+inner table's column names into a fresh `Vec<String>`
+(`cols.extend(t.columns.iter().map(|(n,_)| n.clone()))`) and walks the
+entire subquery AST (`walk_select`) checking every column reference,
+every single time. The cache lookup itself then re-walked the whole
+subquery AST a second time via `SelectStmt`'s derived `PartialEq`
+(`s == sub`) just to find the entry it was about to use unchanged. None
+of this depends on the probed row's value `v` — it's pure per-row
+overhead on top of the O(1) hash-set probe the caching mechanism was
+built to provide.
+
+**Hypothesis**: `sub: &SelectStmt` is always the same borrowed AST
+node — part of the statement's own immutable WHERE-clause tree, never
+cloned per row — for the entire lifetime of one statement's execution,
+which is the only scope the `hashed_in` cache is ever shared across.
+Keying the cache by `sub`'s address instead of its value, and checking
+that cache *before* re-deriving hashability, lets a cache hit skip the
+entire validation chain (and its allocations) and go straight to the O(1)
+probe — the "once per statement" the mechanism was named for, actually
+enforced for the shape-check too, not just the subquery execution.
+
+See the fix entry above for the change and measurement.
+
 ## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — fix — 2026-09-27
 
 Fixes the target identified in the baseline entry immediately below this
