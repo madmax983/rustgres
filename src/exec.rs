@@ -13543,9 +13543,17 @@ struct Q<'a, 'b> {
     /// snapshot is fixed so one build serves every row.
     hashed_exists: Rc<RefCell<HashMap<(String, String), Rc<HashedExists>>>>,
     /// v0.80: uncorrelated IN-subquery result cache, shared the same
-    /// way: previously seen subqueries (by AST equality) and their
-    /// materialized outputs.
-    hashed_in: Rc<RefCell<Vec<(SelectStmt, Rc<HashedIn>)>>>,
+    /// way: previously seen subqueries and their materialized outputs.
+    /// Keyed by the `SelectStmt`'s address rather than AST equality
+    /// (Bolt, 2026-09-29): `sub: &SelectStmt` is always the same borrowed
+    /// AST node — part of the statement's own WHERE-clause tree, walked
+    /// by reference on every row, never cloned per row — for the entire
+    /// lifetime of one statement's execution (the only scope this cache
+    /// is ever shared across, via `Rc::clone`, never persisted past it).
+    /// A pointer compare is equivalent to the AST-equality compare it
+    /// replaces for that lookup and avoids re-walking the whole subquery
+    /// tree on every probed row.
+    hashed_in: Rc<RefCell<Vec<(*const SelectStmt, Rc<HashedIn>)>>>,
     /// v0.89: statement-local UPDATE overlay — (destination table,
     /// row-version id, new cell values) for rows already processed by
     /// the in-flight UPDATE. Only *volatile* SQL function bodies see
@@ -25756,31 +25764,40 @@ fn eval_hashed_in(
     sub: &SelectStmt,
     neg: bool,
 ) -> Result<Option<Value>, ExecError> {
-    let tables = match match_hashable_in(sub) {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    // v1.19: all inner tables must be base tables (JOINs allowed).
-    for (table, _) in &tables {
-        if !subplan_inner_is_base_table(q, table) {
-            return Ok(None);
-        }
-    }
-    if !subquery_refs_only_inner(q, sub, &tables) {
-        return Ok(None);
-    }
-    // The RefCell borrow is scoped: building runs the subquery, which
-    // recurses into eval_expr and must be free to use the cache.
+    // Bolt (2026-09-29): check the cache — keyed by `sub`'s address, see
+    // the `hashed_in` field doc — before re-deriving hashability. Once a
+    // `sub` has been validated and built for this statement, its shape
+    // and correlation safety cannot change (fixed snapshot, immutable
+    // AST), so a hit skips `match_hashable_in`/`subplan_inner_is_base_table`/
+    // `subquery_refs_only_inner` entirely instead of re-running the whole
+    // validation chain on every probed row.
+    let key = sub as *const SelectStmt;
     let hit = {
         q.hashed_in
             .borrow()
             .iter()
-            .find(|(s, _)| s == sub)
+            .find(|(k, _)| *k == key)
             .map(|(_, c)| c.clone())
     };
     let cached = match hit {
         Some(c) => c,
         None => {
+            let tables = match match_hashable_in(sub) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            // v1.19: all inner tables must be base tables (JOINs allowed).
+            for (table, _) in &tables {
+                if !subplan_inner_is_base_table(q, table) {
+                    return Ok(None);
+                }
+            }
+            if !subquery_refs_only_inner(q, sub, &tables) {
+                return Ok(None);
+            }
+            // The RefCell borrow is scoped: building runs the subquery,
+            // which recurses into eval_expr and must be free to use the
+            // cache.
             let out = {
                 let mut sub_q = Q {
                     eng: &mut *q.eng,
@@ -25806,7 +25823,7 @@ fn eval_hashed_in(
                 return Err(exec_err("42601", "subquery must return only one column"));
             }
             let cached = Rc::new(build_hashed_in(&out.rows));
-            q.hashed_in.borrow_mut().push((sub.clone(), cached.clone()));
+            q.hashed_in.borrow_mut().push((key, cached.clone()));
             cached
         }
     };
