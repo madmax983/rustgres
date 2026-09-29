@@ -37870,6 +37870,19 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
+        // v1.23: PG19's `FigureColnameInternal` for `T_A_Indirection`
+        // (parse_target.c): a subscript/slice chain with no field name
+        // in the indirection takes its column name from the operand, so
+        // `(SELECT ARRAY[1,2,3])[1]` and `(array[1,2])[(SELECT 1)]` are
+        // named `array`, while `arr[1]` keeps the column name `arr`.
+        Expr::Subscript { array, .. } => expr_col_name_strength(array),
+        Expr::Slice { array, .. } => expr_col_name_strength(array),
+        // v1.23: PG19 names an `ARRAY[...]` constructor `array`
+        // (`FigureColnameInternal`, `T_A_ArrayExpr` case).
+        Expr::ArrayCtor { .. } => ("array".to_string(), 2),
+        // v1.23: PG19 names `ARRAY(subselect)` `array`
+        // (`FigureColnameInternal`, `T_SubLink`/`ARRAY_SUBLINK` case).
+        Expr::ArraySubquery(_) => ("array".to_string(), 2),
         // v0.75: PG names an unaliased EXISTS output column "exists".
         Expr::Exists { .. } => ("exists".to_string(), 2),
         _ => ("?column?".to_string(), 0),
@@ -45618,6 +45631,52 @@ mod tests {
                 "1000".to_string(),
             ]]
         );
+    }
+
+    /// v1.23: PG19 `FigureColnameInternal` (parse_target.c) for array
+    /// expressions. A subscript/slice with no field name in the
+    /// indirection is named after its operand (`T_A_Indirection`
+    /// recurses into `ind->arg`), and `ARRAY[...]` / `ARRAY(subquery)`
+    /// act like functions named `array` (`T_A_ArrayExpr`,
+    /// `T_SubLink`/`ARRAY_SUBLINK`). Previously all of these came out
+    /// as `?column?`.
+    fn col_name_of(sql: &str) -> String {
+        let crate::sql::Stmt::Select(sel) = parse_statement(sql).unwrap() else {
+            panic!("not a SELECT: {sql}");
+        };
+        let [crate::sql::SelectItem::Expr { expr, alias: None }] = sel.items.as_slice() else {
+            panic!("unexpected select list: {sql}");
+        };
+        expr_col_name(expr)
+    }
+
+    #[test]
+    fn v123_array_expr_col_names() {
+        // The five conformance statements: subscripts over a scalar
+        // subquery, over a bare ARRAY constructor, and a slice with
+        // subquery bounds.
+        assert_eq!(col_name_of("SELECT (SELECT ARRAY[1,2,3])[1]"), "array");
+        assert_eq!(col_name_of("SELECT ((SELECT ARRAY[1,2,3]))[2]"), "array");
+        assert_eq!(col_name_of("SELECT (((SELECT ARRAY[1,2,3])))[3]"), "array");
+        assert_eq!(
+            col_name_of("SELECT (array[1,2])[(SELECT 1)] FROM generate_series(1, 1) g(i)"),
+            "array"
+        );
+        assert_eq!(
+            col_name_of(
+                "SELECT (array[1,2])[(SELECT 1):(SELECT 2)] FROM generate_series(1, 1) g(i)"
+            ),
+            "array"
+        );
+        // Bare constructors and ARRAY(subquery) are named `array`.
+        assert_eq!(col_name_of("SELECT ARRAY[1,2,3]"), "array");
+        assert_eq!(col_name_of("SELECT ARRAY(SELECT 1)"), "array");
+        // A subscript over a plain column keeps the column's name.
+        assert_eq!(col_name_of("SELECT arr[1] FROM (SELECT 1 AS arr) t"), "arr");
+        // A cast of an array constructor keeps `array` (PG19: the
+        // inner name has strength 2, so the type-name fallback does
+        // not apply).
+        assert_eq!(col_name_of("SELECT ARRAY[1,2]::text[]"), "array");
     }
 }
 

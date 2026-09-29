@@ -894,6 +894,13 @@ EXPECTED_PASS_OVERRIDES = [
      r".*(\bpartition\s+by\b|\battach\s+partition\b"
      r"|\bpartition\s+of\b|\bfor\s+values\s+(in|from|with)\b)",
      "v1.16: declarative partitioning supported"),
+    # v1.23: PG19 FigureColnameInternal names a subscript/slice over a
+    # parenthesized array expression after the operand (`(SELECT
+    # ARRAY[1,2,3])[1]`, `(array[1,2])[(SELECT ...)]` -> `array`). The
+    # v1.11 array override explicitly excludes these shapes; they are
+    # now genuinely supported and must pass.
+    (r"(?i)\(\s*(select\s+)?array\s*\[[^\]]*\]\)+\s*\[",
+     "v1.23: subscript over parenthesized array[...] supported"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
