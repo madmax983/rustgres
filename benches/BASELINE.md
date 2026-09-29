@@ -2,6 +2,101 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — fix — 2026-09-29
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec.rs`: the `hashed_in` cache (v0.80, extended for JOINs in v1.19)
+keyed its `Vec<(SelectStmt, Rc<HashedIn>)>` lookup by full AST equality
+(`s == sub`), and ran the entire hashability/correlation-safety check
+(`match_hashable_in` → `subplan_inner_is_base_table` per table →
+`subquery_refs_only_inner`) *before* that lookup, unconditionally, on
+every row — even on a cache hit, where the answer can't have changed
+since the statement's snapshot and AST are both fixed for its whole
+execution.
+
+```diff
+-    hashed_in: Rc<RefCell<Vec<(SelectStmt, Rc<HashedIn>)>>>,
++    hashed_in: Rc<RefCell<Vec<(*const SelectStmt, Rc<HashedIn>)>>>,
+```
+
+`eval_hashed_in` now keys the lookup on `sub as *const SelectStmt`
+instead of `sub`'s value, and checks that cache *first*: a hit skips
+straight to `probe_hashed_in`, and only a miss (the first row that
+probes a given `IN (subquery)`) runs the validation chain and, if it
+passes, builds the cache entry. The address is a valid cache key because
+`sub: &SelectStmt` is always the same borrowed node from the statement's
+own WHERE-clause AST — walked by reference on every row, never cloned
+per row — for the entire lifetime of one statement's execution, which is
+the only scope `hashed_in` is ever shared across (`Rc::clone`, never
+persisted past the statement). The one behavioral edge case: two
+syntactically-identical `IN (subquery)` occurrences at different AST
+addresses in the same statement (e.g. the same subquery text appearing
+twice in one WHERE clause) no longer share one cache entry the way
+AST-equality did — each now runs its own one-time subquery build instead
+of one shared build. Results are unaffected either way; this is a
+one-time cost paid at most once more per statement in an already-rare
+shape, not a per-row regression.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_hashedin.py --outer-rows 50000
+--inner-rows 500 --count 20`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, two runs to
+confirm determinism):
+
+| run | Ir |
+|---|---|
+| before (baseline entry below) | 18,506,453,133 |
+| after, run 1 | 10,267,664,305 |
+| after, run 2 | 10,271,643,201 |
+
+The two after-runs agree to within 0.039% (10,271,643,201 vs.
+10,267,664,305), consistent with this repo's established
+callgrind-determinism band. Using run 1: **-44.52%** — a factor of 1.8x,
+far beyond the ≥5%-of-profile floor (this workload's Ir *is* the
+100%-hashed-IN profile from the baseline entry, so there's no separate
+"share of a larger workload" to compute).
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 671,681,124 | 356,635,264 | **-46.90%** |
+| Total blocks | 6,903,297 | 903,277 | **-86.91%** |
+
+The block-count delta matches the hypothesis almost exactly: this
+workload's inner table (`bench_inner`) has 2 columns and the subquery's
+`FROM` has 1 table, so each pre-fix row paid ~6 allocations that the
+fix removes entirely on a cache hit (1 for `collect_hashable_tables`'s
+output `Vec`, 2 for its table-name/alias `String` clones, 1 for
+`subquery_refs_only_inner`'s `cols` `Vec`, 2 for its per-row column-name
+`String` clones) — `6,903,297 - 903,277 = 6,000,020`, against
+1,000,000 probed rows (50,000 rows x 20 iterations) x 6 allocations/row
+= 6,000,000 predicted. Both the Ir floor (≥5%) and the DHAT floor
+(≥10% bytes or blocks) clear independently and by a wide margin.
+
+`cargo test --all-features`: 472/472 passed, unchanged (includes
+`tests/protocol_test_v119_hashed_in.py`'s dedicated hashed-IN suite:
+0 failures). `cargo fmt --all -- --check`: clean. `cargo clippy
+--all-targets --all-features -- -D warnings`: 470 pre-existing errors on
+both the pre-change and post-change tree (confirmed via `git stash`) —
+the same toolchain/lint-version mismatch noted in every prior Bolt round
+in this file; zero new errors/warnings from this diff.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashedin-{base,after}-2026-09-29`.
+
+**Reproduce**: apply the diff above to `src/exec.rs` (see the full
+function bodies in the commit for the reordering of the validation
+chain relative to the cache lookup), `cargo build`, then repeat the
+Callgrind/DHAT commands in the baseline entry's "Reproduce" section on
+both the pristine and patched trees.
+
 ## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — baseline — 2026-09-29
 
 **Why this workload**: v1.19 (`⚡ v1.19: hashed IN-subquery with JOIN
