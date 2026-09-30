@@ -39,7 +39,7 @@
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, IndexColSpec,
+    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FrameExclusion, FromItem, IndexColSpec,
     InsertIndirection, InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict,
     OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts,
     SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef,
@@ -13706,6 +13706,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             frame,
             wid,
             filter,
+            exclusion,
         } => Ok(Expr::Window {
             func: func.clone(),
             args: args.iter().map(|a| r(a)).collect::<Result<Vec<_>, _>>()?,
@@ -13731,6 +13732,8 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                 .as_ref()
                 .map(|f| r(f).map(Box::new))
                 .transpose()?,
+            // v1.31: exclusion is a plain enum — nothing to resolve.
+            exclusion: exclusion.clone(),
         }),
     }
 }
@@ -16145,6 +16148,9 @@ struct ExecWindow {
     frame: WindowFrame,
     /// v1.29: FILTER on a windowed aggregate (PG19 `wfunc->aggfilter`).
     filter: Option<Expr>,
+    /// v1.31: PG19 `opt_window_exclusion_clause`; participates in
+    /// window identity like `filter`.
+    exclusion: FrameExclusion,
 }
 
 /// v0.10: validate every window function at this query level: arity,
@@ -16507,6 +16513,14 @@ fn check_window_frame(frame: &WindowFrame, order_len: usize) -> Result<(), ExecE
             }
             Ok(())
         }
+        // v1.31: PG19 parse_clause.c, verbatim — "Per spec, GROUPS mode
+        // requires an ORDER BY clause" (42P20 windowing error).
+        WindowFrame::Groups { .. } => {
+            if order_len == 0 {
+                return Err(exec_err("42P20", "GROUPS mode requires an ORDER BY clause"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -16528,6 +16542,7 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
             order_by,
             frame,
             filter,
+            exclusion,
             wid: _,
         } = e
         {
@@ -16540,6 +16555,8 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
                 frame: frame.clone(),
                 // v1.29: FILTER participates in window identity.
                 filter: filter.as_deref().cloned(),
+                // v1.31: exclusion participates in window identity.
+                exclusion: exclusion.clone(),
             };
             if !out.contains(&w) {
                 out.push(w);
@@ -16634,6 +16651,7 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 frame,
                 wid,
                 filter,
+                exclusion,
             } => {
                 let w = ExecWindow {
                     func: func.clone(),
@@ -16644,6 +16662,8 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                     frame: frame.clone(),
                     // v1.29: FILTER participates in window identity.
                     filter: filter.as_deref().cloned(),
+                    // v1.31: exclusion participates in window identity.
+                    exclusion: exclusion.clone(),
                 };
                 *wid = windows.iter().position(|x| x == &w).unwrap_or(0);
             }
@@ -16784,19 +16804,127 @@ fn rows_bound(b: &FrameBound, pos: usize, n: usize) -> usize {
     }
 }
 
+/// v1.31: resolve a GROUPS frame to an inclusive (start, end) position
+/// range (PG19 nodeWindowAgg.c `update_frameheadpos` /
+/// `update_frametailpos` GROUPS branches). `peer_id` numbers the
+/// partition's peer groups 0, 1, 2, … from the partition start
+/// (contiguous runs — the partition is ordered by the window ORDER
+/// BY); bounds count groups, not rows. Empty frame is `(1, 0)`, like
+/// the other modes.
+///
+/// Bound mapping (PG, verbatim semantics):
+/// - start: UNBOUNDED PRECEDING → 0; CURRENT ROW → first row of the
+///   current group; `k` PRECEDING → first row of group `curg − k`
+///   (clamped at 0); `k` FOLLOWING → first row of group `curg + k`
+///   (past the last group → empty frame).
+/// - end: UNBOUNDED FOLLOWING → `n − 1`; CURRENT ROW → last row of the
+///   current group; `k` PRECEDING → last row of group `curg − k`
+///   (before group 0 → empty frame); `k` FOLLOWING → last row of group
+///   `curg + k` (past the last group → `n − 1`).
+fn groups_frame(
+    peer_id: &[usize],
+    pos: usize,
+    start: &FrameBound,
+    end: &FrameBound,
+) -> (usize, usize) {
+    let n = peer_id.len();
+    debug_assert!(n > 0 && pos < n);
+    let maxg = peer_id.iter().copied().max().unwrap_or(0);
+    let curg = peer_id[pos];
+    // First/last position of each group (groups are contiguous runs).
+    let mut first = vec![usize::MAX; maxg + 1];
+    let mut last = vec![0usize; maxg + 1];
+    for (p, &g) in peer_id.iter().enumerate() {
+        if first[g] == usize::MAX {
+            first[g] = p;
+        }
+        last[g] = p;
+    }
+    let s = match start {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::CurrentRow => first[curg],
+        FrameBound::Preceding(k) => {
+            let target = curg as i128 - *k as i128;
+            first[target.max(0) as usize]
+        }
+        FrameBound::Following(k) => {
+            let target = curg as i128 + *k as i128;
+            if target > maxg as i128 {
+                return (1, 0);
+            }
+            first[target as usize]
+        }
+        FrameBound::UnboundedFollowing => return (1, 0),
+    };
+    let e = match end {
+        FrameBound::UnboundedFollowing => n - 1,
+        FrameBound::CurrentRow => last[curg],
+        FrameBound::Preceding(k) => {
+            let target = curg as i128 - *k as i128;
+            if target < 0 {
+                return (1, 0);
+            }
+            last[target as usize]
+        }
+        FrameBound::Following(k) => {
+            let target = curg as i128 + *k as i128;
+            last[target.min(maxg as i128) as usize]
+        }
+        FrameBound::UnboundedPreceding => return (1, 0),
+    };
+    if s > e {
+        return (1, 0);
+    }
+    (s, e)
+}
+
+/// v1.31: PG19 `row_is_in_frame` exclusion half — true when the frame
+/// row at partition position `p` is excluded from the current row `j`'s
+/// frame by the window's `EXCLUDE` clause:
+/// - `EXCLUDE CURRENT ROW`: `p == j`.
+/// - `EXCLUDE GROUP`: every row of `j`'s peer group (with no ORDER BY
+///   all rows are peers — `peer_id` is all zeros — so everything is
+///   excluded).
+/// - `EXCLUDE TIES`: `j`'s peers except `j` itself (with no ORDER BY,
+///   everything but `j`).
+/// Aggregates skip excluded rows' transitions; first/last/nth_value
+/// navigate to the first/last/nth non-excluded row (PG19
+/// `WindowGetFuncArgInFrame` HEAD/TAIL adjustments). lead/lag are
+/// physical navigation (`WINDOW_SEEK_CURRENT`) — no exclusion, untouched.
+fn frame_excluded(exclusion: &FrameExclusion, peer_id: &[usize], j: usize, p: usize) -> bool {
+    match exclusion {
+        FrameExclusion::NoOthers => false,
+        FrameExclusion::CurrentRow => p == j,
+        FrameExclusion::Group => peer_id[p] == peer_id[j],
+        FrameExclusion::Ties => p != j && peer_id[p] == peer_id[j],
+    }
+}
+
 /// v0.10: resolve a window frame to an inclusive (start, end) position
 /// range within the ordered partition.
+/// v1.31: `peer_id` is the partition's peer-group numbering (PG19
+/// nodeWindowAgg.c `currentgroup`), needed for GROUPS mode and for
+/// frame exclusion.
 fn resolve_frame(
     spec: &ExecWindow,
     input: &WindowInput,
     idxs: &[usize],
     pos: usize,
+    peer_id: &[usize],
 ) -> Result<(usize, usize), ExecError> {
     let n = idxs.len();
     if n == 0 {
         return Ok((0, 0));
     }
     let order_len = spec.order_by.len();
+    // v1.31: GROUPS mode — bounds count peer groups, not rows (PG19
+    // nodeWindowAgg.c `update_frameheadpos` / `update_frametailpos`
+    // GROUPS branches). Frame bounds ignore exclusion (PG comment,
+    // verbatim: "computed without regard for any window exclusion
+    // clause"); exclusion is applied per-row by the callers.
+    if let WindowFrame::Groups { start, end } = &spec.frame {
+        return Ok(groups_frame(peer_id, pos, start, end));
+    }
     // Effective frame (Postgres default rule).
     let (is_range, start, end): (bool, FrameBound, FrameBound) = match &spec.frame {
         WindowFrame::Default => {
@@ -16812,6 +16940,9 @@ fn resolve_frame(
         }
         WindowFrame::Rows { start, end } => (false, start.clone(), end.clone()),
         WindowFrame::Range { start, end } => (true, start.clone(), end.clone()),
+        // v1.31: GROUPS returns early above; this arm is unreachable but
+        // required for exhaustiveness.
+        WindowFrame::Groups { .. } => unreachable!("GROUPS handled before frame dispatch"),
     };
     if !is_range {
         let s = rows_bound(&start, pos, n);
@@ -17330,6 +17461,9 @@ fn frame_start_is_unbounded_preceding(spec: &ExecWindow) -> bool {
     match &spec.frame {
         WindowFrame::Default => true,
         WindowFrame::Rows { start, .. } => matches!(start, FrameBound::UnboundedPreceding),
+        // v1.31: GROUPS + UNBOUNDED PRECEDING also starts every frame at
+        // row 0, so the cumulative fast paths stay valid.
+        WindowFrame::Groups { start, .. } => matches!(start, FrameBound::UnboundedPreceding),
         WindowFrame::Range { start, end } => {
             matches!(start, FrameBound::UnboundedPreceding)
                 && (spec.order_by.is_empty() || !has_offset_bound(end))
@@ -17471,19 +17605,41 @@ fn compute_partition(
         }
         WindowFunc::FirstValue => {
             for j in 0..n {
-                let (s, e) = resolve_frame(spec, input, idxs, j)?;
-                out[j] = if s <= e { arg(s, 0) } else { Value::Null };
+                let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
+                // v1.31: PG19 `WindowGetFuncArgInFrame` HEAD adjustment —
+                // the first *non-excluded* row of the frame.
+                let mut v = Value::Null;
+                if s <= e {
+                    for p in s..=e {
+                        if !frame_excluded(&spec.exclusion, &peer_id, j, p) {
+                            v = arg(p, 0);
+                            break;
+                        }
+                    }
+                }
+                out[j] = v;
             }
         }
         WindowFunc::LastValue => {
             for j in 0..n {
-                let (s, e) = resolve_frame(spec, input, idxs, j)?;
-                out[j] = if s <= e { arg(e, 0) } else { Value::Null };
+                let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
+                // v1.31: PG19 TAIL adjustment — the last non-excluded
+                // row of the frame.
+                let mut v = Value::Null;
+                if s <= e {
+                    for p in (s..=e).rev() {
+                        if !frame_excluded(&spec.exclusion, &peer_id, j, p) {
+                            v = arg(p, 0);
+                            break;
+                        }
+                    }
+                }
+                out[j] = v;
             }
         }
         WindowFunc::NthValue => {
             for j in 0..n {
-                let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                 let nth = match arg(j, 1) {
                     Value::Int(i) => i as i64,
                     Value::BigInt(i) => i,
@@ -17492,11 +17648,23 @@ fn compute_partition(
                     }
                     _ => return Err(exec_err("22003", "nth_value argument must be an integer")),
                 };
-                out[j] = if nth >= 1 && s <= e && (s as i64) + nth - 1 <= e as i64 {
-                    arg((s as i64 + nth - 1) as usize, 0)
-                } else {
-                    Value::Null
-                };
+                // v1.31: PG19 HEAD adjustment — the nth non-excluded row
+                // of the frame.
+                let mut v = Value::Null;
+                if nth >= 1 && s <= e {
+                    let mut seen = 0i64;
+                    for p in s..=e {
+                        if frame_excluded(&spec.exclusion, &peer_id, j, p) {
+                            continue;
+                        }
+                        seen += 1;
+                        if seen == nth {
+                            v = arg(p, 0);
+                            break;
+                        }
+                    }
+                }
+                out[j] = v;
             }
         }
         WindowFunc::Agg(f) => {
@@ -17512,6 +17680,17 @@ fn compute_partition(
                 has_filter
                     && !input.filter_vals.get(idxs[p]).copied().unwrap_or(true)
             };
+            // v1.31: frame exclusion skips rows per-frame (PG19
+            // nodeWindowAgg.c `row_is_in_frame`); composes with FILTER.
+            // The excluded set varies with the current row j (EXCLUDE
+            // CURRENT ROW drops a different row per j; EXCLUDE
+            // GROUP/TIES drop j's own group), so exclusion disables the
+            // cumulative fast paths below like FILTER does — row j+1
+            // cannot reuse row j's accumulator.
+            let has_exclusion = !matches!(spec.exclusion, FrameExclusion::NoOthers);
+            let excl = |j: usize, p: usize| -> bool {
+                has_exclusion && frame_excluded(&spec.exclusion, &peer_id, j, p)
+            };
             // v0.63: `resolve_frame` proves `s` is always 0 whenever the
             // frame's start bound is UNBOUNDED PRECEDING (the implicit
             // default frame an ORDER BY window gets, and the most common
@@ -17519,7 +17698,8 @@ fn compute_partition(
             // increases, so count(*)/count(x)/sum(exact int) can be
             // accumulated once instead of re-scanned from position 0 on
             // every row (was O(n) per row, O(n^2) per partition).
-            let cumulative = frame_start_is_unbounded_preceding(spec) && !has_filter;
+            let cumulative =
+                frame_start_is_unbounded_preceding(spec) && !has_filter && !has_exclusion;
             let sum_int_cat = if cumulative && *f == AggFunc::Sum && spec.args.len() == 1 {
                 partition_sum_int_cat(input, idxs)
             } else {
@@ -17528,10 +17708,11 @@ fn compute_partition(
             if count_star {
                 // Closed form: the frame's size needs no row data.
                 // v1.29: with FILTER, count only the passing rows.
+                // v1.31: with EXCLUDE, count only the non-excluded rows.
                 for j in 0..n {
-                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                     let c = if s <= e {
-                        (s..=e).filter(|&p| !filt(p)).count() as i64
+                        (s..=e).filter(|&p| !filt(p) && !excl(j, p)).count() as i64
                     } else {
                         0
                     };
@@ -17541,10 +17722,10 @@ fn compute_partition(
                 let mut count: i64 = 0;
                 let mut next = 0usize;
                 for j in 0..n {
-                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                     debug_assert_eq!(s, 0);
                     while next <= e {
-                        if !matches!(arg(next, 0), Value::Null) {
+                        if !matches!(arg(next, 0), Value::Null) && !excl(j, next) {
                             count += 1;
                         }
                         next += 1;
@@ -17561,11 +17742,13 @@ fn compute_partition(
                 let mut any = false;
                 let mut next = 0usize;
                 for j in 0..n {
-                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                     debug_assert_eq!(s, 0);
                     while next <= e {
                         let v = arg(next, 0);
-                        if !matches!(v, Value::Null) {
+                        // v1.31: excluded rows never accumulate (PG19
+                        // skips their transition function calls).
+                        if !matches!(v, Value::Null) && !excl(j, next) {
                             any = true;
                             acc = acc
                                 .checked_add(to_i128(&v))
@@ -17588,7 +17771,7 @@ fn compute_partition(
                         .first()
                         .is_some_and(|a| expr_is_statically_array(a, None));
                 for j in 0..n {
-                    let (s, e) = resolve_frame(spec, input, idxs, j)?;
+                    let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                     let mut vals: Vec<Value> = Vec::new();
                     if s <= e {
                         for p in s..=e {
@@ -17596,6 +17779,11 @@ fn compute_partition(
                             // nodeWindowAgg.c "Skip anything FILTERed
                             // out").
                             if filt(p) {
+                                continue;
+                            }
+                            // v1.31: skip excluded rows (PG19
+                            // `row_is_in_frame`).
+                            if excl(j, p) {
                                 continue;
                             }
                             let v = arg(p, 0);
@@ -57311,5 +57499,420 @@ mod v130_ordered_set_tests {
              from (values ('a')) as t(x)",
         );
         assert_eq!(err.code, "42883");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.31: PG19 GROUPS frame mode + frame exclusion — unit tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod v131_groups_exclusion_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    /// v1.31: GROUPS frame mode + frame exclusion (PG19 window
+    /// `opt_frame_clause`: `GROUPS frame_extent
+    /// opt_window_exclusion_clause`). Peer groups by g: {10,20},
+    /// {30,40,50}.
+    fn groups_engine() -> Engine {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE gvals(g int, v int)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO gvals VALUES (1,10),(1,20),(2,30),(2,40),(2,50)",
+        )
+        .unwrap();
+        eng
+    }
+
+    fn groups_q(eng: &mut Engine, sel: &str) -> Vec<Vec<String>> {
+        rows_of(
+            run(
+                eng,
+                &format!("SELECT v, {sel} FROM gvals ORDER BY v"),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn vv(pairs: &[(i32, &str)]) -> Vec<Vec<String>> {
+        pairs
+            .iter()
+            .map(|(v, s)| vec![v.to_string(), s.to_string()])
+            .collect()
+    }
+
+    #[test]
+    fn v131_groups_current_row_is_peer_group() {
+        let mut eng = groups_engine();
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND CURRENT ROW)"
+            ),
+            vv(&[(10, "30"), (20, "30"), (30, "120"), (40, "120"), (50, "120")])
+        );
+        // 0 PRECEDING .. 0 FOLLOWING hits the same single group.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 0 PRECEDING AND 0 FOLLOWING)"
+            ),
+            vv(&[(10, "30"), (20, "30"), (30, "120"), (40, "120"), (50, "120")])
+        );
+    }
+
+    #[test]
+    fn v131_groups_offset_counts_groups_not_rows() {
+        let mut eng = groups_engine();
+        // ±1 group from anywhere reaches both groups: whole partition.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+            ),
+            vv(&[
+                (10, "150"),
+                (20, "150"),
+                (30, "150"),
+                (40, "150"),
+                (50, "150")
+            ])
+        );
+        // 1 PRECEDING .. CURRENT ROW: group 0 sees only itself (clamped),
+        // group 1 reaches back to group 0.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+            ),
+            vv(&[(10, "30"), (20, "30"), (30, "150"), (40, "150"), (50, "150")])
+        );
+    }
+
+    #[test]
+    fn v131_groups_requires_order_by() {
+        let mut eng = groups_engine();
+        // PG19 parse_clause.c, verbatim: 42P20.
+        let err = err_of(
+            &mut eng,
+            "SELECT sum(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM gvals",
+        );
+        assert_eq!(err.code, "42P20");
+        let err = err_of(
+            &mut eng,
+            "SELECT sum(v) OVER (PARTITION BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM gvals",
+        );
+        assert_eq!(err.code, "42P20");
+    }
+
+    #[test]
+    fn v131_groups_empty_frame() {
+        let mut eng = groups_engine();
+        // 2 FOLLOWING from group 0 / 1 runs past the last group: empty.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "count(*) OVER (ORDER BY g GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING)"
+            ),
+            vv(&[(10, "0"), (20, "0"), (30, "0"), (40, "0"), (50, "0")])
+        );
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING)"
+            ),
+            vv(&[
+                (10, "NULL"),
+                (20, "NULL"),
+                (30, "NULL"),
+                (40, "NULL"),
+                (50, "NULL")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_current_row() {
+        let mut eng = groups_engine();
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)"
+            ),
+            vv(&[
+                (10, "140"),
+                (20, "130"),
+                (30, "120"),
+                (40, "110"),
+                (50, "100")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_group() {
+        let mut eng = groups_engine();
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE GROUP)"
+            ),
+            vv(&[(10, "120"), (20, "120"), (30, "30"), (40, "30"), (50, "30")])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_ties() {
+        let mut eng = groups_engine();
+        // Frame is the whole partition (±1 group); each row drops its
+        // peers but keeps itself.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES)"
+            ),
+            vv(&[(10, "130"), (20, "140"), (30, "60"), (40, "70"), (50, "80")])
+        );
+        // Explicit frame (PG, like rustgres, rejects EXCLUDE without a
+        // frame clause): peers of the current row inside the ROWS frame
+        // are dropped, nothing else.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "count(*) OVER (ORDER BY g ROWS BETWEEN UNBOUNDED PRECEDING \
+                 AND CURRENT ROW EXCLUDE TIES)"
+            ),
+            vv(&[(10, "1"), (20, "1"), (30, "3"), (40, "3"), (50, "3")])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_no_others_is_default() {
+        let mut eng = groups_engine();
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE NO OTHERS)"
+            ),
+            vv(&[
+                (10, "150"),
+                (20, "150"),
+                (30, "150"),
+                (40, "150"),
+                (50, "150")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_without_frame_is_syntax_error() {
+        let mut eng = groups_engine();
+        // PG19: exclusion is only valid after a frame extent.
+        let err = err_of(
+            &mut eng,
+            "SELECT sum(v) OVER (ORDER BY v EXCLUDE TIES) FROM gvals",
+        );
+        assert_eq!(err.code, "42601");
+    }
+
+    #[test]
+    fn v131_first_last_nth_value_skip_excluded() {
+        let mut eng = groups_engine();
+        // PG19 WindowGetFuncArgInFrame HEAD adjustment: first
+        // non-excluded row of the frame.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "first_value(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING \
+                 AND 1 FOLLOWING EXCLUDE TIES)"
+            ),
+            vv(&[(10, "10"), (20, "20"), (30, "10"), (40, "10"), (50, "10")])
+        );
+        // TAIL adjustment: last non-excluded row (the final row excludes
+        // itself, so it sees v=40).
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "last_value(v) OVER (ORDER BY g GROUPS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)"
+            ),
+            vv(&[(10, "50"), (20, "50"), (30, "50"), (40, "50"), (50, "40")])
+        );
+        // nth non-excluded row.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "nth_value(v, 2) OVER (ORDER BY g GROUPS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE GROUP)"
+            ),
+            vv(&[(10, "40"), (20, "40"), (30, "20"), (40, "20"), (50, "20")])
+        );
+    }
+
+    #[test]
+    fn v131_lead_lag_ignore_exclusion() {
+        let mut eng = groups_engine();
+        // PG19: lead/lag are physical navigation (WINDOW_SEEK_CURRENT);
+        // exclusion does not move them.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "lead(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING \
+                 AND 1 FOLLOWING EXCLUDE TIES)"
+            ),
+            vv(&[
+                (10, "20"),
+                (20, "30"),
+                (30, "40"),
+                (40, "50"),
+                (50, "NULL")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_composes_with_filter() {
+        let mut eng = groups_engine();
+        // Exclusion drops the current row first; FILTER then drops v <= 15.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) FILTER (WHERE v > 15) OVER (ORDER BY g GROUPS BETWEEN \
+                 UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)"
+            ),
+            vv(&[
+                (10, "140"),
+                (20, "120"),
+                (30, "110"),
+                (40, "100"),
+                (50, "90")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_groups_partitioned() {
+        let mut eng = groups_engine();
+        // Peer groups are numbered per partition. ORDER BY v makes every
+        // row its own group, so ±1 group is ±1 row here.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (PARTITION BY CASE WHEN g = 1 THEN 0 ELSE 1 END \
+                 ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+            ),
+            vv(&[(10, "30"), (20, "30"), (30, "70"), (40, "120"), (50, "90")])
+        );
+    }
+
+    #[test]
+    fn v131_groups_null_order_key_is_own_group() {
+        let mut eng = groups_engine();
+        run(&mut eng, "INSERT INTO gvals VALUES (NULL, 5)").unwrap();
+        // NULLs are peers of each other (PG: nulls are peers); the single
+        // NULL row is its own group.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND CURRENT ROW)"
+            ),
+            vv(&[
+                (5, "5"),
+                (10, "30"),
+                (20, "30"),
+                (30, "120"),
+                (40, "120"),
+                (50, "120")
+            ])
+        );
+    }
+
+    #[test]
+    fn v131_groups_keywords_case_insensitive() {
+        let mut eng = groups_engine();
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) over (order by g groups between 1 preceding and 1 following exclude ties)"
+            ),
+            vv(&[(10, "130"), (20, "140"), (30, "60"), (40, "70"), (50, "80")])
+        );
+    }
+
+    #[test]
+    fn v131_exclude_without_order_by_all_rows_are_peers() {
+        let mut eng = groups_engine();
+        // PG19 row_is_in_frame: with no ORDER BY all rows are peers —
+        // EXCLUDE TIES drops everything but the current row.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "count(*) OVER (ROWS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE TIES)"
+            ),
+            vv(&[(10, "1"), (20, "1"), (30, "1"), (40, "1"), (50, "1")])
+        );
+        // EXCLUDE GROUP drops the whole peer group: empty frame.
+        assert_eq!(
+            groups_q(
+                &mut eng,
+                "sum(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING \
+                 AND UNBOUNDED FOLLOWING EXCLUDE GROUP)"
+            ),
+            vv(&[
+                (10, "NULL"),
+                (20, "NULL"),
+                (30, "NULL"),
+                (40, "NULL"),
+                (50, "NULL")
+            ])
+        );
     }
 }

@@ -1376,6 +1376,10 @@ pub enum Expr {
         /// parse_func.c keeps `wfunc->aggfilter`; only meaningful when
         /// `func` is `WindowFunc::Agg`).
         filter: Option<Box<Expr>>,
+        /// v1.31: PG19 `opt_window_exclusion_clause` (`EXCLUDE ...`
+        /// after the frame extent). Participates in window identity
+        /// like `filter`.
+        exclusion: FrameExclusion,
     },
 }
 
@@ -1398,11 +1402,28 @@ pub enum WindowFunc {
 /// v0.10: window frame. `Default` follows the Postgres rule: with ORDER BY
 /// it is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, otherwise
 /// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+/// v1.31: `Groups` (PG19 gram.y `GROUPS frame_extent`): bounds count
+/// peer groups (rows indistinguishable by the window ORDER BY), not
+/// physical rows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowFrame {
     Default,
     Rows { start: FrameBound, end: FrameBound },
     Range { start: FrameBound, end: FrameBound },
+    Groups { start: FrameBound, end: FrameBound },
+}
+
+/// v1.31: PG19 `opt_window_exclusion_clause` — `EXCLUDE CURRENT ROW` /
+/// `EXCLUDE GROUP` / `EXCLUDE TIES` / `EXCLUDE NO OTHERS` after the frame
+/// extent. Absent and `EXCLUDE NO OTHERS` are both `NoOthers` (PG folds
+/// them to "no exclusion bits").
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum FrameExclusion {
+    #[default]
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 /// v0.10: one end of a window frame.
@@ -5388,6 +5409,8 @@ struct WindowSpec {
     partition_by: Vec<Expr>,
     order_by: Vec<OrderTerm>,
     frame: WindowFrame,
+    /// v1.31: PG19 `opt_window_exclusion_clause`.
+    exclusion: FrameExclusion,
 }
 
 /// v0.88: render a token slice back to SQL-ish source text, for stored
@@ -10860,6 +10883,8 @@ impl Parser {
                     // v1.29: PG19 parse_func.c keeps aggfilter on
                     // windowed aggregates.
                     filter,
+                    // v1.31: PG19 opt_window_exclusion_clause.
+                    exclusion: spec.exclusion,
                 };
             }
             return Ok(expr);
@@ -11015,6 +11040,8 @@ impl Parser {
                     // v1.29: FILTER on a non-aggregate window function is
                     // rejected above (0A000); no filter reaches this node.
                     filter: None,
+                    // v1.31: PG19 opt_window_exclusion_clause.
+                    exclusion: spec.exclusion,
                 });
             }
             return Ok(Expr::Func { name, args });
@@ -11208,28 +11235,38 @@ impl Parser {
                 break;
             }
         }
-        let frame = self.parse_window_frame()?;
+        let (frame, exclusion) = self.parse_window_frame()?;
         self.expect(Token::RParen, "')'")?;
         Ok(WindowSpec {
             partition_by,
             order_by,
             frame,
+            exclusion,
         })
     }
 
     /// v0.10: `[ROWS|RANGE] BETWEEN <bound> AND <bound>`,
     /// `[ROWS|RANGE] <bound>`, or absent (Default).
-    fn parse_window_frame(&mut self) -> Result<WindowFrame, SqlError> {
+    /// v1.31: `GROUPS` mode (PG19 gram.y `GROUPS frame_extent`) and the
+    /// trailing `EXCLUDE ...` clause (PG19 `opt_window_exclusion_clause`,
+    /// only valid after a frame extent). Returns the frame plus the
+    /// exclusion (`NoOthers` when absent).
+    fn parse_window_frame(&mut self) -> Result<(WindowFrame, FrameExclusion), SqlError> {
+        // v0.78-style keyword guard: only treat `groups` as the frame
+        // mode when it starts the frame clause; anywhere else it stays
+        // an ordinary identifier.
         let mode = if self.eat_keyword("rows") {
-            Some(false)
+            Some(0)
         } else if self.eat_keyword("range") {
-            Some(true)
+            Some(1)
+        } else if self.eat_keyword("groups") {
+            Some(2)
         } else {
             None
         };
         let mode = match mode {
             Some(m) => m,
-            None => return Ok(WindowFrame::Default),
+            None => return Ok((WindowFrame::Default, FrameExclusion::NoOthers)),
         };
         let (start, end) = if self.eat_keyword("between") {
             let s = self.parse_frame_bound()?;
@@ -11240,6 +11277,8 @@ impl Parser {
             // `<bound>` alone = `BETWEEN <bound> AND CURRENT ROW`.
             (self.parse_frame_bound()?, FrameBound::CurrentRow)
         };
+        // v1.31: PG19 gram.y `opt_window_exclusion_clause`.
+        let exclusion = self.parse_frame_exclusion()?;
         // Frame sanity: start must not come after end.
         let rank = |b: &FrameBound| match b {
             FrameBound::UnboundedPreceding => 0,
@@ -11254,11 +11293,39 @@ impl Parser {
                     .to_string(),
             ));
         }
-        if mode {
-            Ok(WindowFrame::Range { start, end })
-        } else {
-            Ok(WindowFrame::Rows { start, end })
+        let frame = match mode {
+            1 => WindowFrame::Range { start, end },
+            2 => WindowFrame::Groups { start, end },
+            _ => WindowFrame::Rows { start, end },
+        };
+        Ok((frame, exclusion))
+    }
+
+    /// v1.31: PG19 gram.y `opt_window_exclusion_clause`:
+    /// `EXCLUDE CURRENT ROW | EXCLUDE GROUP | EXCLUDE TIES |
+    /// EXCLUDE NO OTHERS`, or absent (`NoOthers`).
+    fn parse_frame_exclusion(&mut self) -> Result<FrameExclusion, SqlError> {
+        if !self.eat_keyword("exclude") {
+            return Ok(FrameExclusion::NoOthers);
         }
+        if self.eat_keyword("current") {
+            self.expect_keyword("row")?;
+            return Ok(FrameExclusion::CurrentRow);
+        }
+        if self.eat_keyword("group") {
+            return Ok(FrameExclusion::Group);
+        }
+        if self.eat_keyword("ties") {
+            return Ok(FrameExclusion::Ties);
+        }
+        if self.eat_keyword("no") {
+            self.expect_keyword("others")?;
+            return Ok(FrameExclusion::NoOthers);
+        }
+        Err(err(format!(
+            "syntax error: expected CURRENT ROW, GROUP, TIES or NO OTHERS after EXCLUDE, found {:?}",
+            self.peek()
+        )))
     }
 
     /// v0.10: one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`,
