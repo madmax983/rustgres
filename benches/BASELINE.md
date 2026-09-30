@@ -2,6 +2,71 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `split_statements`'s `Vec<char>` collect regrowth — negative result — 2026-09-30
+
+Hypothesis (baseline entry immediately below): fixing `split_statements`'s
+`let chars: Vec<char> = input.chars().collect();` the same way `tokenize`'s
+identical line was fixed on 2026-09-13 (`Vec::with_capacity(input.len())`
++ `extend`, eliminating the `Chars::size_hint()` undershoot's 2-3 regrows)
+would reduce instructions and/or allocations by a floor-clearing amount,
+since `split_statements` measured at 6.95% of total Ir — over the
+≥5%-of-profile floor needed to even attempt this.
+
+**Change made** (identical diff shape to `tokenize`'s fix, reverted after
+measurement — not present in the working tree):
+
+```diff
+-    let chars: Vec<char> = input.chars().collect();
++    let mut chars: Vec<char> = Vec::with_capacity(input.len());
++    chars.extend(input.chars());
+```
+
+**Measurement**: same harness, same machine, same session as the baseline
+entry below (`benches/profile_idxscan.py --rows 50000 --count 50 --width
+1000`, Callgrind `--collect-jumps=yes --cache-sim=yes` and
+`--tool=dhat`).
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind `Ir` (program total) | 6,107,729,013 | 6,101,320,143 | **-0.105%** |
+| Callgrind `Ir` (`split_statements`, inclusive) | 424,322,354 (6.95%) | 420,681,545 (6.89%) | -0.86% (of its own cost) |
+| DHAT total allocations (blocks, program total) | 1,213,133 | 1,212,927 | -0.017% |
+| DHAT total bytes (program total) | 296,043,641 | 292,658,127 | -1.14% |
+| DHAT blocks attributed to `split_statements` | 515 | 309 | -40.0% (of its own blocks) |
+| DHAT bytes attributed to `split_statements` | 9,032,876 | 5,647,348 | -37.5% (of its own bytes) |
+
+The fix works exactly as designed *locally*: `split_statements`'s own
+allocation count and byte volume both drop by roughly a third to two-fifths,
+confirming the regrowth diagnosis was correct. But every one of the
+**impact floor's four gates is measured on the workload total**, not on
+the target function's own numbers, and by that measure this change clears
+none of them: program-wide Ir moved -0.105% (needs ≥5%), program-wide DHAT
+blocks moved -0.017% and bytes -1.14% (both need ≥10%). The reason: unlike
+`tokenize` (called once per already-split statement, and itself 20.7% of
+*all* allocations program-wide when it was fixed), `split_statements` is
+called only once per incoming wire-protocol message — 100 times in this
+100-statement workload — so even a large proportional win inside the
+function is a small absolute slice of a program whose total cost is
+dominated by B-tree index maintenance and per-row MVCC/WHERE evaluation
+(see the baseline entry's "Reading these numbers"). `split_statements`'s
+6.95%-of-Ir share is almost entirely its per-character scan loop (quote,
+comment, and dollar-quote handling) — real, unavoidable work that scales
+with message size — not the one-time collect this fix targeted.
+
+**Verdict**: reverted (`src/sql.rs` restored to its pre-fix state; no
+diff in this repo). `cargo test --all-features`: 472/472 passed on the
+patched tree before reverting (behavior-preserving, as expected — this was
+never a correctness question). Recording this here so nobody re-attempts
+the identical `tokenize`-style fix on `split_statements` expecting a
+repeat of that entry's win: the mechanism is real but the call frequency
+makes the absolute win too small to justify touching this function again
+without a workload that calls it far more heavily relative to the rest of
+the engine (e.g., many small statements per connection rather than a few
+large ones).
+
+After-profiles committed for the record:
+`benches/profiles/{callgrind,dhat}.out.idxscan-after-2026-09-30`.
+
 ## Bolt: `split_statements`'s `Vec<char>` collect regrows on every incoming message — baseline — 2026-09-30
 
 **Workload**: `benches/profile_idxscan.py --rows 50000 --count 50 --width 1000`
