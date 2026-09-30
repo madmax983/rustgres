@@ -49346,6 +49346,92 @@ fn sql_func_final_42p13(ret_type: &str) -> ExecError {
     )
 }
 
+/// v1.34: PG19 `check_sql_fn_retval` / `coerce_fn_result_column`
+/// failure — 42P13 with PG's verbatim detail naming the actual column
+/// type (`format_type_be` of the final statement's output type).
+fn sql_func_coercion_42p13(ret_type: &str, actual_type: &str) -> ExecError {
+    exec_err_detail(
+        "42P13",
+        format!(
+            "return type mismatch in function declared to return {}",
+            ret_type
+        ),
+        format!("Actual return type is {}.", actual_type),
+    )
+}
+
+/// v1.34: a representative non-null value of a column type, used to
+/// probe `eval_cast` for a *type-level* cast path (see
+/// `can_assignment_coerce`). Each dummy mirrors the runtime
+/// representation of its type: `regclass` values are `Text` at runtime
+/// (`eval_regclass_cast`), `xid` values are `Int`, and `char(n)`
+/// values are blank-padded `BpChar`.
+fn dummy_value_of(ty: &ColType) -> Value {
+    match ty {
+        ColType::SmallInt => Value::SmallInt(1),
+        ColType::Int => Value::Int(1),
+        ColType::BigInt => Value::BigInt(1),
+        ColType::Float4 => Value::Float4(1.0),
+        ColType::Float => Value::Float(1.0),
+        ColType::Numeric(_) => Value::Numeric(crate::storage::Numeric::new(1, 0)),
+        ColType::Char(_) => Value::BpChar("x".into()),
+        ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Json => Value::text("x"),
+        ColType::SingleChar => Value::SingleChar(b'x'),
+        ColType::Bool => Value::Bool(true),
+        ColType::Date => Value::Date(1),
+        ColType::Timestamp => Value::Timestamp(1),
+        ColType::Timestamptz => Value::Timestamptz(1),
+        ColType::Bytea => Value::Bytea(vec![0]),
+        ColType::Uuid => Value::Uuid([0; 16]),
+        ColType::PgLsn => Value::PgLsn(1),
+        ColType::Regclass => Value::text("x"),
+        ColType::Xid => Value::Int(1),
+        ColType::Record | ColType::Composite => Value::Record(vec![]),
+        ColType::Array(elem) => Value::Array(crate::storage::ArrayVal {
+            elem: *elem,
+            dims: vec![1],
+            lower: vec![1],
+            elems: vec![dummy_value_of(&elem_scalar_type(*elem))],
+        }),
+    }
+}
+
+/// v1.34: PG19 `coerce_fn_result_column` (executor/functions.c) — does
+/// an *assignment* cast path exist from the source column type to the
+/// target type? Probed through the engine's own runtime cast:
+/// `eval_cast` reports a missing cast path as 42846 ("cannot cast
+/// type X to Y") while value-level failures (22P02 bad input, 22003
+/// out of range, ...) mean the path exists — exactly PG's
+/// type-level-vs-value-level distinction, which accepts e.g.
+/// `RETURNING 'hello'` for `RETURNS integer` at CREATE (the cast then
+/// fails at runtime instead). Typmods never block an assignment cast
+/// (they constrain the value), so they are normalized away; array
+/// casts retype element-wise (PG19), hence the recursion.
+fn can_assignment_coerce(src: &ColType, dst: &ColType) -> bool {
+    fn norm(t: ColType) -> ColType {
+        match t {
+            ColType::Numeric(_) => ColType::Numeric(None),
+            ColType::Char(_) => ColType::Char(None),
+            ColType::Varchar(_) => ColType::Varchar(None),
+            _ => t,
+        }
+    }
+    let (src, dst) = (norm(*src), norm(*dst));
+    if src == dst {
+        return true;
+    }
+    if let (ColType::Array(se), ColType::Array(de)) = (src, dst) {
+        return can_assignment_coerce(&elem_scalar_type(se), &elem_scalar_type(de));
+    }
+    match eval_cast(&dummy_value_of(&src), dst) {
+        Ok(_) => true,
+        // 42846 is eval_cast's type-level "no cast path" signal; any
+        // other code is a value-level failure of this probe value —
+        // the cast path exists.
+        Err(e) => e.code != "42846",
+    }
+}
+
 /// v1.32: parse + validate a SQL-language function body at CREATE time
 /// (PG19 `fmgr_sql_validator`: `pg_parse_query` over the whole body,
 /// then `check_sql_fn_statements` / `check_sql_fn_retval`). Returns the
@@ -49357,6 +49443,11 @@ fn sql_func_final_42p13(ret_type: &str) -> ExecError {
 /// rewritten to `$n` per statement, exactly as the old
 /// single-statement path did.
 fn parse_sql_func_body(
+    eng: &Engine,
+    snap: &Snapshot,
+    xids: &[u64],
+    own: u64,
+    session: u64,
     body: &str,
     args: &[crate::sql::FuncArg],
     ret_type: &str,
@@ -49448,8 +49539,107 @@ fn parse_sql_func_body(
         if unambiguous_count.is_some_and(|n| n != 1) {
             return Err(sql_func_final_42p13(ret_type));
         }
+        // v1.34: PG19 check_sql_fn_retval / coerce_fn_result_column —
+        // for a scalar function whose final statement is DML...RETURNING
+        // with one unambiguous item, the item's static type must admit
+        // an assignment cast to the declared return type (42P13
+        // "Actual return type is %s." otherwise). Anything not
+        // statically decidable (unknown table, unresolvable expression,
+        // named/composite return type) defers to the existing call-time
+        // coercion, exactly like the arity check above.
+        if let Stmt::Insert {
+            table, returning, ..
+        }
+        | Stmt::Update {
+            table, returning, ..
+        }
+        | Stmt::Delete {
+            table, returning, ..
+        } = last
+        {
+            let qual: &str = match last {
+                Stmt::Update { alias, .. } | Stmt::Delete { alias, .. } => {
+                    alias.as_deref().unwrap_or(table)
+                }
+                _ => table,
+            };
+            check_dml_returning_coercible(
+                eng, snap, xids, own, session, table, qual, returning, args, ret_type,
+            )?;
+        }
     }
     Ok(stmts)
+}
+
+/// v1.34: PG19 `check_sql_fn_retval` / `coerce_fn_result_column` for a
+/// scalar SQL function's final DML...RETURNING statement (see
+/// `parse_sql_func_body`). Fails open (Ok) whenever the coercibility
+/// question is not statically decidable — the call-time
+/// `coerce_to_type_name` then applies, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn check_dml_returning_coercible(
+    eng: &Engine,
+    snap: &Snapshot,
+    xids: &[u64],
+    own: u64,
+    session: u64,
+    table: &str,
+    qual: &str,
+    returning: &[crate::sql::SelectItem],
+    args: &[crate::sql::FuncArg],
+    ret_type: &str,
+) -> Result<(), ExecError> {
+    // A single unambiguous RETURNING item (the caller enforced the
+    // arity); `*` shapes defer to the call-time check.
+    let [crate::sql::SelectItem::Expr { expr, .. }] = returning else {
+        return Ok(());
+    };
+    // Declared return type: builtin (or domain-over-builtin, which PG
+    // checks as its scalar base) or defer. Composite/table rowtypes
+    // keep the existing call-time `eval_cast_named` path.
+    let dst = match resolve_func_type_name(eng, snap, own, session, ret_type) {
+        Ok(crate::storage::ColType::Composite) | Err(_) => return Ok(()),
+        Ok(ct) => ct,
+    };
+    // The single output column's static type. `$n` references (named
+    // arguments were rewritten by the caller) take the declared
+    // argument type; anything unresolvable defers to call time.
+    let src = match expr {
+        crate::sql::Expr::Param(n) => {
+            let Some(arg) = args.get(*n as usize - 1) else {
+                return Ok(());
+            };
+            match resolve_func_type_name(eng, snap, own, session, &arg.type_name) {
+                Ok(crate::storage::ColType::Composite) | Err(_) => return Ok(()),
+                Ok(ct) => ct,
+            }
+        }
+        _ => {
+            let Some(t) = eng.db.find_table(table, snap, xids, session) else {
+                return Ok(());
+            };
+            let schema: Vec<QCol> = t
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: qual.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            let schemas = [schema.as_slice()];
+            match expr_type(eng, snap, own, session, &schemas, &[], &[], expr) {
+                Ok(ct) => ct,
+                Err(_) => return Ok(()),
+            }
+        }
+    };
+    if !can_assignment_coerce(&src, &dst) {
+        return Err(sql_func_coercion_42p13(ret_type, &src.sql_name()));
+    }
+    Ok(())
 }
 
 /// v0.86: `CREATE [OR REPLACE] FUNCTION`. Validates the signature
@@ -49575,7 +49765,17 @@ fn exec_create_function(
         // v1.32: multi-statement SQL bodies (PG19 fmgr_sql_validator):
         // parse every statement, validate the final one determines the
         // return type (42P13 on mismatch).
-        parsed = Some(parse_sql_func_body(body, args, ret_type, returns_set)?);
+        parsed = Some(parse_sql_func_body(
+            eng,
+            ctx.snap,
+            &ctx.all_xids,
+            ctx.own,
+            ctx.session,
+            body,
+            args,
+            ret_type,
+            returns_set,
+        )?);
     } else if lang == crate::sql::FuncLang::Internal {
         // v0.86: validate the internal symbol at CREATE (like PG's
         // fmgr lookup); unknown symbols are 0A000.
@@ -59091,6 +59291,319 @@ mod v133_dml_function_bodies {
             rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()).len(),
             3
         );
+    }
+}
+
+/// v1.34: static return-type coercibility at CREATE for DML...RETURNING
+/// bodies (PG19 `check_sql_fn_retval` / `coerce_fn_result_column`,
+/// executor/functions.c). The final DML...RETURNING column's type must
+/// admit an *assignment* cast to the declared return type, else 42P13
+/// with PG's verbatim detail `Actual return type is %s.` Anything not
+/// statically decidable defers to the call-time coercion (unchanged).
+#[cfg(test)]
+mod v134_dml_returning_coercion {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        let r = execute(eng, &mut ctx, &stmt);
+        if r.is_err() {
+            for op in writes.iter().rev() {
+                crate::storage::undo_write_op(eng, &[9], op);
+            }
+        }
+        r
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE t134(a int, b text, t timestamptz);").unwrap();
+    }
+
+    #[test]
+    fn dml_returning_wrong_type_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // PG19 check_sql_fn_retval: timestamptz has no assignment cast
+        // to integer -> 42P13 at CREATE with PG's verbatim detail.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING now()';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.message,
+            "return type mismatch in function declared to return int"
+        );
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+    }
+
+    #[test]
+    fn dml_returning_value_level_cast_still_creates() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // text -> integer HAS an assignment cast path (IO coercion), so
+        // PG accepts this at CREATE; the cast fails at runtime instead.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING ''hello''';",
+        )
+        .expect("text->int cast path exists: CREATE must succeed");
+        let e = err_of(&mut eng, "SELECT f();");
+        assert_eq!(e.code, "22P02");
+    }
+
+    #[test]
+    fn dml_returning_compatible_types_create_and_run() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // int -> text: assignment cast exists; runs fine.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS text LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING 42';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f();").unwrap()),
+            vec![vec!["42"]]
+        );
+        // identity: int -> int.
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS int LANGUAGE sql \
+             AS 'UPDATE t134 SET a = 7 RETURNING a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT g();").unwrap()),
+            vec![vec!["7"]]
+        );
+    }
+
+    #[test]
+    fn dml_returning_whole_row_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // A whole-row RETURNING item has the record type; record has no
+        // assignment cast to integer.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'DELETE FROM t134 RETURNING t134';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(e.detail.as_deref(), Some("Actual return type is record."));
+    }
+
+    #[test]
+    fn dml_returning_array_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING ARRAY[1,2]';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is integer[].")
+        );
+        // (RETURNS int[] itself is a separate parser gap — 42601 in
+        // sql.rs — so the array->array acceptance is covered by the
+        // can_assignment_coerce_predicate unit test below instead.)
+    }
+
+    #[test]
+    fn update_returning_column_type_checked() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // RETURNING a timestamptz column for RETURNS int: no cast path.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'UPDATE t134 SET a = 1 RETURNING t';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+        // Aliased target resolves the qualifier.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION h() RETURNS int LANGUAGE sql \
+             AS 'UPDATE t134 AS x SET a = 1 RETURNING x.t';",
+        );
+        assert_eq!(e.code, "42P13");
+    }
+
+    #[test]
+    fn param_ref_takes_declared_arg_type() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // $1 is declared int: int -> int coerces.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES ($1) RETURNING $1';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f(41);").unwrap()),
+            vec![vec!["41"]]
+        );
+        // $1 declared text, RETURNS int: cast path exists -> CREATE ok.
+        run(
+            &mut eng,
+            "CREATE FUNCTION g(x text) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(b) VALUES ($1) RETURNING $1';",
+        )
+        .expect("text->int cast path exists: CREATE must succeed");
+    }
+
+    #[test]
+    fn engine_cast_superset_stays_create_ok() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // This engine casts boolean -> integer (cast_to_int); the
+        // static check must not reject what the runtime accepts.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING true';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f();").unwrap()),
+            vec![vec!["1"]]
+        );
+    }
+
+    #[test]
+    fn setof_keeps_v133_exemption() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // v1.33 deliberately exempts SETOF from the scalar checks; the
+        // v1.34 coercion check follows the same boundary.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING now()';",
+        )
+        .expect("SETOF keeps the v1.33 exemption");
+    }
+
+    #[test]
+    fn select_final_untouched_by_v134() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // Scope is DML...RETURNING finals only; SELECT finals keep the
+        // v1.33 behavior (call-time coercion).
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT now()';",
+        )
+        .expect("SELECT finals are out of the v1.34 scope");
+    }
+
+    #[test]
+    fn ambiguous_shapes_defer_to_call_time() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // RETURNING * is ambiguous: no static check (call-time arity
+        // check still applies).
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t134(a) VALUES (1) RETURNING *';",
+        )
+        .expect("ambiguous RETURNING * defers to call time");
+        // Unknown table: PG would 42P01 (separate gap); the coercion
+        // check fails open and CREATE still succeeds.
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO nosuch134 VALUES (1) RETURNING 1';",
+        )
+        .expect("unknown table fails open");
+    }
+
+    #[test]
+    fn can_assignment_coerce_predicate() {
+        use crate::storage::ColType;
+        // Identity and trivial paths.
+        assert!(can_assignment_coerce(&ColType::Int, &ColType::Int));
+        assert!(can_assignment_coerce(&ColType::Int, &ColType::Text));
+        assert!(can_assignment_coerce(&ColType::Text, &ColType::Int));
+        assert!(can_assignment_coerce(&ColType::SmallInt, &ColType::BigInt));
+        // Typmods never block.
+        assert!(can_assignment_coerce(
+            &ColType::Numeric(Some((10, 2))),
+            &ColType::Numeric(None)
+        ));
+        // No cast path: timestamptz/record/array -> integer.
+        assert!(!can_assignment_coerce(&ColType::Timestamptz, &ColType::Int));
+        assert!(!can_assignment_coerce(&ColType::Record, &ColType::Int));
+        assert!(!can_assignment_coerce(
+            &ColType::Array(crate::storage::ArrayElem::Int),
+            &ColType::Int
+        ));
+        assert!(!can_assignment_coerce(
+            &ColType::Int,
+            &ColType::Array(crate::storage::ArrayElem::Int)
+        ));
+        // Element-wise array casts.
+        assert!(can_assignment_coerce(
+            &ColType::Array(crate::storage::ArrayElem::Int),
+            &ColType::Array(crate::storage::ArrayElem::Text)
+        ));
+        assert!(!can_assignment_coerce(
+            &ColType::Array(crate::storage::ArrayElem::Timestamptz),
+            &ColType::Array(crate::storage::ArrayElem::Int)
+        ));
     }
 }
 
