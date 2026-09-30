@@ -1492,7 +1492,7 @@ mod tests {
     fn update_reuse_missing_provenance_not_reused() {
         // Value id with no toast_info entry (e.g. metadata already
         // pruned): never reuse a pointer we cannot describe.
-        let t = text_table();
+        let _t = text_table();
         let v = vec![Value::Text(wide_text(1, 6000).into())];
         let reuse = toast_update_reuse(&v, &[7], &v, &std::collections::HashMap::new());
         assert_eq!(reuse, vec![None]);

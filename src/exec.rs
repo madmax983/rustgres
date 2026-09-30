@@ -41,9 +41,10 @@ use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FromItem, IndexColSpec,
     InsertIndirection, InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict,
-    OrderTerm, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind,
-    SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming,
-    UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
+    OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts,
+    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef,
+    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
+    parse_statement,
     parse_trigger_body, trig_event, validate_constraint_expr,
 };
 use crate::storage::index_visible;
@@ -13023,6 +13024,18 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::Agg { arg, arg2, .. } => {
                 arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
             }
+            // v1.30: ordered-set aggregates — scan direct args, the
+            // WITHIN GROUP sort keys, and the FILTER.
+            Expr::WithinGroup {
+                direct_args,
+                within_order_by,
+                filter,
+                ..
+            } => {
+                direct_args.iter().any(expr_uses)
+                    || within_order_by.iter().any(|o| expr_uses(&o.expr))
+                    || filter.as_deref().is_some_and(expr_uses)
+            }
             Expr::ScalarSub(s) => stmt_uses_pg_column_compression(s),
             Expr::ArraySubquery(s) => stmt_uses_pg_column_compression(s),
             Expr::InSub { expr, sub, .. } => {
@@ -13121,6 +13134,18 @@ fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             Expr::Agg { arg, arg2, .. } => {
                 arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
             }
+            // v1.30: ordered-set aggregates — scan direct args, the
+            // WITHIN GROUP sort keys, and the FILTER.
+            Expr::WithinGroup {
+                direct_args,
+                within_order_by,
+                filter,
+                ..
+            } => {
+                direct_args.iter().any(expr_uses)
+                    || within_order_by.iter().any(|o| expr_uses(&o.expr))
+                    || filter.as_deref().is_some_and(expr_uses)
+            }
             Expr::ScalarSub(s) => stmt_uses_tableoid(s),
             Expr::ArraySubquery(s) => stmt_uses_tableoid(s),
             Expr::InSub { expr, sub, .. } => expr_uses(expr) || stmt_uses_tableoid(sub),
@@ -13212,6 +13237,18 @@ fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             Expr::IsDistinctFrom { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Agg { arg, arg2, .. } => {
                 arg.as_deref().is_some_and(expr_uses) || arg2.as_deref().is_some_and(expr_uses)
+            }
+            // v1.30: ordered-set aggregates — scan direct args, the
+            // WITHIN GROUP sort keys, and the FILTER.
+            Expr::WithinGroup {
+                direct_args,
+                within_order_by,
+                filter,
+                ..
+            } => {
+                direct_args.iter().any(expr_uses)
+                    || within_order_by.iter().any(|o| expr_uses(&o.expr))
+                    || filter.as_deref().is_some_and(expr_uses)
             }
             Expr::ScalarSub(s) => stmt_uses_xmin_xmax(s),
             Expr::ArraySubquery(s) => stmt_uses_xmin_xmax(s),
@@ -13625,6 +13662,35 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                 .collect::<Result<Vec<_>, _>>()?,
             // v1.29: resolve columns in FILTER (same row scope as the
             // aggregate arguments).
+            filter: filter
+                .as_ref()
+                .map(|f| r(f).map(Box::new))
+                .transpose()?,
+        }),
+        // v1.30: resolve columns in an ordered-set aggregate — the
+        // direct args, the WITHIN GROUP sort keys, and the FILTER
+        // (all in the same row scope as ordinary aggregate args).
+        Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            filter,
+        } => Ok(Expr::WithinGroup {
+            func: *func,
+            direct_args: direct_args
+                .iter()
+                .map(|a| r(a))
+                .collect::<Result<Vec<_>, _>>()?,
+            within_order_by: within_order_by
+                .iter()
+                .map(|o| {
+                    Ok(OrderTerm {
+                        expr: r(&o.expr)?,
+                        desc: o.desc,
+                        nulls_first: o.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             filter: filter
                 .as_ref()
                 .map(|f| r(f).map(Box::new))
@@ -15440,6 +15506,25 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             }
             Ok(())
         }
+        // v1.30: ordered-set aggregate — direct args, WITHIN GROUP
+        // sort keys, and FILTER are all per-row inputs.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                validate_expr(a)?;
+            }
+            for o in within_order_by {
+                validate_expr(&o.expr)?;
+            }
+            if let Some(f) = filter {
+                validate_expr(f)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -15448,7 +15533,7 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
 /// Subqueries are their own level and are not descended into.
 fn contains_agg(e: &Expr) -> bool {
     match e {
-        Expr::Agg { .. } => true,
+        Expr::Agg { .. } | Expr::WithinGroup { .. } => true,
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => contains_agg(expr),
         Expr::Column { .. }
@@ -15603,6 +15688,24 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                     stack.push(a);
                 }
                 // v1.29: FILTER is a per-row input like the arguments.
+                if let Some(f) = filter {
+                    stack.push(f);
+                }
+            }
+            // v1.30: ordered-set aggregate — walk direct args, the
+            // WITHIN GROUP sort keys, and the FILTER.
+            Expr::WithinGroup {
+                direct_args,
+                within_order_by,
+                filter,
+                ..
+            } => {
+                for a in direct_args {
+                    stack.push(a);
+                }
+                for o in within_order_by {
+                    stack.push(&o.expr);
+                }
                 if let Some(f) = filter {
                     stack.push(f);
                 }
@@ -15877,6 +15980,18 @@ fn contains_window(e: &Expr) -> bool {
         Expr::Agg { arg, arg2, .. } => {
             arg.as_deref().map(contains_window).unwrap_or(false)
                 || arg2.as_deref().map(contains_window).unwrap_or(false)
+        }
+        // v1.30: ordered-set aggregate — windows are forbidden in its
+        // parts, but descend anyway for a faithful answer.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            direct_args.iter().any(contains_window)
+                || within_order_by.iter().any(|o| contains_window(&o.expr))
+                || filter.as_deref().map(contains_window).unwrap_or(false)
         }
         Expr::Extract { from, .. } => contains_window(from),
         Expr::InSub { expr, .. } => contains_window(expr),
@@ -16163,6 +16278,58 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
                 }
                 // No aggregates, windows, or SRFs can remain; validate
                 // the filter's contents like any other per-row input.
+                validate_window_expr(f, true)?;
+            }
+            Ok(())
+        }
+        // v1.30: ordered-set aggregate — direct args, WITHIN GROUP
+        // sort keys, and FILTER are aggregate inputs: windows are
+        // forbidden there (PG19 parse_agg.c), mirroring the Agg arm.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                validate_window_expr(a, true)?;
+            }
+            for o in within_order_by {
+                validate_window_expr(&o.expr, true)?;
+            }
+            if let Some(f) = filter {
+                if contains_grouping(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "grouping operations are not allowed in FILTER",
+                    ));
+                }
+                if contains_agg(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "aggregate functions are not allowed in FILTER",
+                    ));
+                }
+                if contains_window(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "window functions are not allowed in FILTER",
+                    ));
+                }
+                let mut srf = false;
+                expr_walk(f, &mut |x| {
+                    if let Expr::Func { name, .. } = x {
+                        if is_builtin_srf(name) {
+                            srf = true;
+                        }
+                    }
+                });
+                if srf {
+                    return Err(exec_err(
+                        "0A000",
+                        "set-returning functions are not allowed in FILTER",
+                    ));
+                }
                 validate_window_expr(f, true)?;
             }
             Ok(())
@@ -17770,6 +17937,20 @@ fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
                 // v1.29: a volatile FILTER makes the aggregate volatile.
                 || filter.as_ref().is_some_and(|x| expr_is_volatile(db, x))
         }
+        // v1.30: ordered-set aggregate — volatile iff a direct arg,
+        // a WITHIN GROUP sort key, or the FILTER is.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            direct_args.iter().any(|x| expr_is_volatile(db, x))
+                || within_order_by
+                    .iter()
+                    .any(|o| expr_is_volatile(db, &o.expr))
+                || filter.as_ref().is_some_and(|x| expr_is_volatile(db, x))
+        }
         Expr::Func { name, args } => {
             if any_volatile(db, args) {
                 return true;
@@ -18017,6 +18198,24 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
                 collect_column_refs(x, out);
             }
             // v1.29: FILTER reads input columns too.
+            if let Some(x) = filter {
+                collect_column_refs(x, out);
+            }
+        }
+        // v1.30: ordered-set aggregate — refs in direct args, the
+        // WITHIN GROUP sort keys, and the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for x in direct_args {
+                collect_column_refs(x, out);
+            }
+            for o in within_order_by {
+                collect_column_refs(&o.expr, out);
+            }
             if let Some(x) = filter {
                 collect_column_refs(x, out);
             }
@@ -22159,7 +22358,8 @@ fn collect_target_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Ve
     match e {
         // Pruned: aggregates and windows keep their existing
         // evaluation paths; subqueries are their own query level.
-        Expr::Agg { .. } | Expr::Window { .. } => {}
+        // v1.30: ordered-set aggregates prune like plain aggregates.
+        Expr::Agg { .. } | Expr::WithinGroup { .. } | Expr::Window { .. } => {}
         Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
@@ -22463,6 +22663,24 @@ fn eval_grouped(
             *distinct,
             arg2.as_deref(),
             agg_order_by,
+            filter.as_deref(),
+        ),
+        // v1.30: PG19 ordered-set aggregate (WITHIN GROUP).
+        Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            filter,
+        } => eval_within_group_agg(
+            q,
+            outer,
+            gscope,
+            schema,
+            rows,
+            idxs,
+            *func,
+            direct_args,
+            within_order_by,
             filter.as_deref(),
         ),
         Expr::Column { table, name } => {
@@ -23254,6 +23472,516 @@ fn bool_and_vals(vals: &[Value]) -> Result<Value, ExecError> {
         }
     }
     Ok(if any { Value::Bool(true) } else { Value::Null })
+}
+
+// ---------------------------------------------------------------------------
+// v1.30: PG19 ordered-set aggregates (WITHIN GROUP)
+// ---------------------------------------------------------------------------
+
+/// v1.30: is this `ColType` in PG's numeric category (implicitly
+/// coercible to float8, like PG19's `select_common_type` unification
+/// for WITHIN GROUP)?
+fn within_group_numeric(t: &ColType) -> bool {
+    matches!(
+        t,
+        ColType::SmallInt
+            | ColType::Int
+            | ColType::BigInt
+            | ColType::Numeric(_)
+            | ColType::Float4
+            | ColType::Float
+    )
+}
+
+/// v1.30: PG19 parse-time check for hypothetical-set aggregates —
+/// each direct arg must unify with its sort column
+/// (`select_common_type(..., "WITHIN GROUP")` → 42804 "WITHIN GROUP
+/// types %s and %s cannot be matched"). Approximated: identical types
+/// unify; numerics unify with numerics (PG's implicit int→float8
+/// etc.); anything else must match exactly.
+fn within_group_check_arg_types(
+    q: &mut Q,
+    schema: &[QCol],
+    outer: &[Scope],
+    direct_args: &[Expr],
+    within_order_by: &[OrderTerm],
+) -> Result<(), ExecError> {
+    let schemas: &[&[QCol]] = std::slice::from_ref(&schema);
+    let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+    for (a, o) in direct_args.iter().zip(within_order_by.iter()) {
+        // Unwrap named-notation args (eval_expr unwraps them too).
+        let a = match a {
+            Expr::NamedArg { expr, .. } => expr.as_ref(),
+            other => other,
+        };
+        // PG19: an untyped NULL literal coerces to the sort column's
+        // type (like the percentile fractions).
+        if matches!(a, Expr::Literal(Literal::Null)) {
+            continue;
+        }
+        let ta = expr_type(
+            &mut *q.eng,
+            q.snap,
+            q.own,
+            q.session,
+            schemas,
+            &outer_schemas,
+            &[],
+            a,
+        )?;
+        let ts = expr_type(
+            &mut *q.eng,
+            q.snap,
+            q.own,
+            q.session,
+            schemas,
+            &outer_schemas,
+            &[],
+            &o.expr,
+        )?;
+        if ta == ts || (within_group_numeric(&ta) && within_group_numeric(&ts)) {
+            continue;
+        }
+        return Err(exec_err(
+            "42804",
+            format!(
+                "WITHIN GROUP types {} and {} cannot be matched",
+                ta.sql_name(),
+                ts.sql_name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v1.30: validate one percentile fraction (PG19
+/// `orderedsetaggs.c`): NULL → None (a NULL fraction yields NULL);
+/// out-of-[0,1] or NaN → 2201W "percentile value %g is not between 0
+/// and 1"; a non-numeric fraction → 42883 (PG19 has no such
+/// signature).
+fn percentile_fraction_value(agg: &str, f: &Value) -> Result<Option<f64>, ExecError> {
+    match f {
+        Value::Null => Ok(None),
+        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) | Value::Numeric(_)
+        | Value::Float4(_) | Value::Float(_) => {
+            let p = to_f64v(f);
+            if p < 0.0 || p > 1.0 || p.is_nan() {
+                return Err(exec_err(
+                    "2201W",
+                    format!("percentile value {p} is not between 0 and 1"),
+                ));
+            }
+            Ok(Some(p))
+        }
+        other => Err(exec_err(
+            "42883",
+            format!(
+                "function {}({}) does not exist",
+                agg,
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// v1.30: is this Value in PG's numeric category (acceptable as a
+/// `percentile_cont` sort input, matching `within_group_numeric`)?
+fn within_group_numeric_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::SmallInt(_)
+            | Value::Int(_)
+            | Value::BigInt(_)
+            | Value::Numeric(_)
+            | Value::Float4(_)
+            | Value::Float(_)
+    )
+}
+/// v1.30: `percentile_cont` final step (PG19
+/// `percentile_cont_final_common` with `float8_lerp`).
+/// `direct` is the fraction (scalar) or fractions (array);
+/// `vals` the sorted non-null sort values. PG19:
+/// `first_row = floor(p*(N-1))`, `second_row = ceil(p*(N-1))`,
+/// linear interpolation between them; NULL fraction → NULL; no rows
+/// → NULL; NULL/empty fractions array → NULL / empty array (same
+/// shape as the input); NULL elements → NULL elements.
+fn percentile_cont_final(
+    direct: &Value,
+    vals: &[Value],
+) -> Result<Value, ExecError> {
+    // No regular rows → NULL, even for the array form.
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // PG19's float8 variant: a non-numeric sort value has no such
+    // signature (42883). (The static check exempts Text because
+    // untyped NULL literals type as Text; real text fails here.)
+    if vals.iter().any(|v| !within_group_numeric_value(v)) {
+        return Err(exec_err(
+            "42883",
+            "function percentile_cont(float8) does not exist".to_string(),
+        ));
+    }
+    let n = vals.len() as f64;
+    let one = |p: f64| -> Value {
+        let x = p * (n - 1.0);
+        let first = x.floor() as usize;
+        let second = x.ceil() as usize;
+        if first == second {
+            return vals[first].clone();
+        }
+        // PG19 float8_lerp: lo + proportion * (hi - lo).
+        let proportion = x - first as f64;
+        let lo = to_f64v(&vals[first]);
+        let hi = to_f64v(&vals[second]);
+        Value::Float(lo + proportion * (hi - lo))
+    };
+    match direct {
+        Value::Array(a) => {
+            let mut elems = Vec::with_capacity(a.elems.len());
+            for f in &a.elems {
+                match percentile_fraction_value("percentile_cont", f)? {
+                    None => elems.push(Value::Null),
+                    Some(p) => elems.push(one(p)),
+                }
+            }
+            // PG19: "We make the output array the same shape as the
+            // input".
+            Ok(Value::Array(ArrayVal {
+                elem: ArrayElem::Float,
+                dims: a.dims.clone(),
+                lower: a.lower.clone(),
+                elems,
+            }))
+        }
+        f => match percentile_fraction_value("percentile_cont", f)? {
+            None => Ok(Value::Null),
+            Some(p) => Ok(one(p)),
+        },
+    }
+}
+
+/// v1.30: `percentile_disc` final step (PG19
+/// `percentile_disc_final`): `rownum = ceil(p*N)` (1-based); NULL
+/// fraction → NULL; no rows → NULL. Array form mirrors
+/// `percentile_cont`'s shape handling.
+fn percentile_disc_final(
+    direct: &Value,
+    vals: &[Value],
+    elem: ArrayElem,
+) -> Result<Value, ExecError> {
+    // No regular rows → NULL, even for the array form.
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    let n = vals.len() as f64;
+    let one = |p: f64| -> Value {
+        // Smallest K (1-based) with K/N >= p.
+        let rownum = (p * n).ceil() as usize;
+        vals[rownum.max(1) - 1].clone()
+    };
+    match direct {
+        Value::Array(a) => {
+            let mut elems = Vec::with_capacity(a.elems.len());
+            for f in &a.elems {
+                match percentile_fraction_value("percentile_disc", f)? {
+                    None => elems.push(Value::Null),
+                    Some(p) => elems.push(one(p)),
+                }
+            }
+            Ok(Value::Array(ArrayVal {
+                elem,
+                dims: a.dims.clone(),
+                lower: a.lower.clone(),
+                elems,
+            }))
+        }
+        f => match percentile_fraction_value("percentile_disc", f)? {
+            None => Ok(Value::Null),
+            Some(p) => Ok(one(p)),
+        },
+    }
+}
+
+/// v1.30: `mode()` final step (PG19 `mode_final`): most frequent
+/// non-null sort value; ties break to the first in sort order (the
+/// first longest run of the stably-sorted input).
+fn mode_final(vals: &[Value]) -> Result<Value, ExecError> {
+    let mut best: Option<&Value> = None;
+    let mut best_n = 0usize;
+    let mut i = 0;
+    while i < vals.len() {
+        let mut n = 1;
+        // Adjacent in sort order ⟺ equal under the sort's value
+        // comparison (compare_values, desc/NULLS irrelevant for
+        // equality).
+        while i + n < vals.len()
+            && compare_values(&vals[i + n], &vals[i], false, None)? == Ordering::Equal
+        {
+            n += 1;
+        }
+        // Strict `>`: the first longest run wins ties.
+        if n > best_n {
+            best_n = n;
+            best = Some(&vals[i]);
+        }
+        i += n;
+    }
+    Ok(best.cloned().unwrap_or(Value::Null))
+}
+
+/// v1.30: PG19 `ExecQual` equality-operator semantics for
+/// hypothetical `dense_rank` peer detection
+/// (`execTuplesMatchPrepare` over the sort columns): two key tuples
+/// are duplicates iff every column pair is non-null and canonically
+/// equal — NULL never equals, not even NULL.
+fn within_group_keys_dup(a: &[Value], b: &[Value]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        match (x, y) {
+            (Value::Null, _) | (_, Value::Null) => return false,
+            _ => {
+                let mut ka = Vec::new();
+                let mut kb = Vec::new();
+                value_key(x, &mut ka);
+                value_key(y, &mut kb);
+                if ka != kb {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// v1.30: hypothetical-set aggregate final step. `keyed` is the
+/// filter-passing input rows stably sorted by the WITHIN GROUP keys
+/// (NULLs kept — PG19's `ordered_set_transition_multi` never skips
+/// NULLs); `direct` holds the hypothetical row's keys. Follows PG19's
+/// `hypothetical_rank_common` / `hypothetical_dense_rank_final`:
+/// - `rank` = 1 + #(rows strictly less) (hypothetical sorts ahead
+///   of peers, flag -1)
+/// - `dense_rank` = 1 + #(distinct key groups strictly less)
+/// - `percent_rank` = (rank-1)/rowcount (0.0 when there are no rows)
+/// - `cume_dist` = (1 + #(strictly less) + #(peers))/(rowcount+1)
+///   (hypothetical sorts behind peers, flag +1; 1.0 with no rows)
+#[allow(clippy::cast_possible_wrap)]
+fn hypothetical_final(
+    func: OrderedSetAgg,
+    direct: &[Value],
+    keyed: &[(Vec<Value>, usize)],
+    within_order_by: &[OrderTerm],
+) -> Result<Value, ExecError> {
+    let rowcount = keyed.len() as i64;
+    let mut less = 0i64;
+    let mut peers = 0i64;
+    let mut groups_less = 0i64;
+    let mut prev: Option<&Vec<Value>> = None;
+    // The input is sorted, so every strictly-less row precedes every
+    // peer-or-greater row; one pass classifies all three counts.
+    for (keys, _) in keyed {
+        let ord = compare_window_keys(keys, direct, within_order_by)?;
+        match ord {
+            Ordering::Less => {
+                less += 1;
+                let dup = prev.is_some_and(|p| within_group_keys_dup(p, keys));
+                if !dup {
+                    groups_less += 1;
+                }
+            }
+            Ordering::Equal => {
+                peers += 1;
+            }
+            Ordering::Greater => {}
+        }
+        prev = Some(keys);
+    }
+    match func {
+        OrderedSetAgg::Rank => Ok(Value::BigInt(1 + less)),
+        OrderedSetAgg::DenseRank => Ok(Value::BigInt(1 + groups_less)),
+        OrderedSetAgg::PercentRank => {
+            if rowcount == 0 {
+                Ok(Value::Float(0.0))
+            } else {
+                Ok(Value::Float(less as f64 / rowcount as f64))
+            }
+        }
+        OrderedSetAgg::CumeDist => Ok(Value::Float(
+            (1 + less + peers) as f64 / (rowcount + 1) as f64,
+        )),
+        _ => unreachable!("plain ordered-set aggregates are handled by the caller"),
+    }
+}
+
+/// v1.30: evaluate a PG19 ordered-set aggregate (WITHIN GROUP) for one
+/// group. Row gathering, FILTER handling, and the in-aggregate sort
+/// mirror `eval_agg_func`; the final step follows PG19
+/// `src/backend/utils/adt/orderedsetaggs.c`:
+/// - FILTER gates the input rows before the WITHIN GROUP sort (PG19
+///   builds the ordered-set sort from filter-passing rows).
+/// - Direct arguments are evaluated once per group, against the
+///   group's representative (first) input row — PG19's nodeAgg.c
+///   evaluates them against each group's first tuple.
+/// - The WITHIN GROUP sort keys are evaluated per input row and the
+///   rows are stably sorted with `compare_window_keys` (the terms'
+///   ASC/DESC and NULLS FIRST/LAST, exactly like PG19's tuplesort).
+/// - Plain ordered-set aggregates skip NULL sort-key inputs
+///   (`ordered_set_transition`); hypothetical-set aggregates keep
+///   them (`ordered_set_transition_multi` never skips NULLs).
+#[allow(clippy::too_many_arguments)]
+fn eval_within_group_agg(
+    q: &mut Q,
+    outer: &[Scope],
+    gscope: Scope,
+    schema: &[QCol],
+    rows: &[QRow],
+    idxs: &[usize],
+    func: OrderedSetAgg,
+    direct_args: &[Expr],
+    within_order_by: &[OrderTerm],
+    filter: Option<&Expr>,
+) -> Result<Value, ExecError> {
+    // Per-row FILTER predicate in row scope (mirrors eval_agg_func's
+    // filter_ok closure).
+    let filter_ok = |q: &mut Q, i: usize| -> Result<bool, ExecError> {
+        let f = match filter {
+            Some(f) => f,
+            None => return Ok(true),
+        };
+        let frame = Scope {
+            schema,
+            row: &rows[i].cells,
+            prov: None,
+        };
+        let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+        buf.extend_from_slice(outer);
+        buf.push(frame);
+        // PG19 coerce_to_boolean with constructName "FILTER": non-TRUE
+        // (incl. NULL) skips the row; non-boolean is 42804.
+        check_bool(eval_expr(q, &buf, f)?, "FILTER")
+    };
+
+    // PG19 parse-time check for hypothetical-set aggregates (42804
+    // "WITHIN GROUP types %s and %s cannot be matched"): each direct
+    // arg must unify with its sort column. Runs before any direct-arg
+    // evaluation, like PG's parse-time check.
+    if func.is_hypothetical() {
+        within_group_check_arg_types(q, schema, outer, direct_args, within_order_by)?;
+    }
+
+    // Direct args are evaluated once per group, against the group's
+    // representative row (PG19 nodeAgg.c: each group's first tuple).
+    // With no input rows PG19 never evaluates them (the transition
+    // never runs): skip, since the final steps return fixed results
+    // without `direct` then (and resolving a column against the
+    // empty representative row would panic).
+    let mut direct: Vec<Value> = Vec::with_capacity(direct_args.len());
+    if !idxs.is_empty() {
+        let mut rep_scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+        rep_scopes.extend_from_slice(outer);
+        rep_scopes.push(gscope);
+        for a in direct_args {
+            direct.push(eval_expr(q, &rep_scopes, a)?);
+        }
+    }
+
+    // FILTER gates the input rows (PG19 builds the ordered-set sort
+    // from filter-passing rows).
+    let mut visit: Vec<usize> = Vec::with_capacity(idxs.len());
+    for &i in idxs {
+        if filter_ok(q, i)? {
+            visit.push(i);
+        }
+    }
+
+    // Evaluate the WITHIN GROUP sort keys per input row, then stably
+    // sort (PG19 sorts the aggregate's input before accumulation;
+    // ties keep input row order). The sort_err pattern mirrors
+    // eval_agg_func's in-aggregate ORDER BY.
+    let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(visit.len());
+    for &i in &visit {
+        let frame = Scope {
+            schema,
+            row: &rows[i].cells,
+            prov: None,
+        };
+        let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+        buf.extend_from_slice(outer);
+        buf.push(frame);
+        let mut keys = Vec::with_capacity(within_order_by.len());
+        for o in within_order_by {
+            keys.push(eval_expr(q, &buf, &o.expr)?);
+        }
+        keyed.push((keys, i));
+    }
+    let mut sort_err: Option<ExecError> = None;
+    keyed.sort_by(|(ak, _), (bk, _)| {
+        if sort_err.is_some() {
+            return Ordering::Equal;
+        }
+        match compare_window_keys(ak, bk, within_order_by) {
+            Ok(o) => o,
+            Err(e) => {
+                sort_err = Some(e);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = sort_err {
+        return Err(e);
+    }
+
+    if func.is_hypothetical() {
+        return hypothetical_final(func, &direct, &keyed, within_order_by);
+    }
+
+    // Plain ordered-set aggregates: PG19 `ordered_set_transition`
+    // skips NULL inputs. (All three take exactly one sort key; the
+    // parser enforces the arity.)
+    let vals: Vec<Value> = keyed
+        .iter()
+        .map(|(keys, _)| keys[0].clone())
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
+
+    match func {
+        OrderedSetAgg::PercentileCont => {
+            // No rows → NULL without touching the fraction (PG19's
+            // finalfn returns NULL on an empty tuplestore; `direct`
+            // was never evaluated for an empty group).
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let d = direct.first().expect("percentile_cont takes one direct arg");
+            percentile_cont_final(d, &vals)
+        }
+        OrderedSetAgg::PercentileDisc => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let d = direct.first().expect("percentile_disc takes one direct arg");
+            // The array form returns the sort type's array (PG19
+            // builds it from the sort column's type). Derive the
+            // element from the sort expression's static type.
+            let schemas: &[&[QCol]] = std::slice::from_ref(&schema);
+            let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+            let sort_t = expr_type(
+                &mut *q.eng,
+                q.snap,
+                q.own,
+                q.session,
+                schemas,
+                &outer_schemas,
+                &[],
+                &within_order_by[0].expr,
+            )?;
+            percentile_disc_final(d, &vals, ArrayElem::of(&sort_t))
+        }
+        OrderedSetAgg::Mode => mode_final(&vals),
+        _ => unreachable!("hypothetical-set aggregates are handled above"),
+    }
 }
 
 fn eval_agg_func(
@@ -25609,6 +26337,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         // them out of WHERE/ON/GROUP BY, and is_agg_query routes select
         // lists with aggregates to exec_agg).
         Expr::Agg { .. } => Err(exec_err("42803", "aggregates not allowed in this context")),
+        // v1.30: ordered-set aggregates likewise only evaluate in the
+        // grouped path.
+        Expr::WithinGroup { .. } => Err(exec_err(
+            "42803",
+            "aggregates not allowed in this context",
+        )),
         Expr::ScalarSub(sub) => {
             let out = {
                 let mut sub_q = Q {
@@ -25979,6 +26713,24 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             }
             if let Some(a) = arg2 {
                 walk_expr(a, f);
+            }
+        }
+        // v1.30: ordered-set aggregate — walk direct args, the WITHIN
+        // GROUP sort keys, and the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                walk_expr(a, f);
+            }
+            for o in within_order_by {
+                walk_expr(&o.expr, f);
+            }
+            if let Some(x) = filter {
+                walk_expr(x, f);
             }
         }
         Expr::ArrayCtor { elems, .. } => {
@@ -38933,6 +39685,9 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             _ => ("?column?".to_string(), 0),
         },
         Expr::Agg { func, .. } => (func.name().to_string(), 2),
+        // v1.30: PG19 names the column after the ordered-set
+        // aggregate (`FigureColName`: the FuncCall name).
+        Expr::WithinGroup { func, .. } => (func.name().to_string(), 2),
         Expr::Cast { expr, to, written } => {
             // v0.93: a func-style cast (`float8(q1)`) is named after the
             // type name as written (PG19 treats the type-named call like
@@ -39239,6 +39994,24 @@ fn expr_type(
             arg.as_deref(),
             arg2.as_deref(),
         ),
+        // v1.30: PG19 ordered-set aggregate (WITHIN GROUP).
+        Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            ..
+        } => within_group_result_type(
+            eng,
+            snap,
+            own,
+            session,
+            schemas,
+            outer,
+            ctes,
+            *func,
+            direct_args,
+            within_order_by,
+        ),
         Expr::ScalarSub(sub) => {
             // v0.73: the subquery sees this level's ranges (plus any
             // enclosing ones) as correlated outer scopes.
@@ -39469,7 +40242,7 @@ fn arith_operand_type(
                 arith_operand_type(eng, snap, own, session, schemas, outer, ctes, right, *inner)?;
             Ok(Some(combine_arith_types(*inner, ta, tb)?))
         }
-        Expr::Agg { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(
+        Expr::Agg { .. } | Expr::WithinGroup { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(
             eng, snap, own, session, schemas, outer, ctes, e,
         )?)),
         Expr::Cast { to, .. } => Ok(Some(*to)),
@@ -39748,6 +40521,101 @@ fn agg_result_type(
                 )),
             }
         }
+    }
+}
+
+/// v1.30: static result type of a PG19 ordered-set aggregate
+/// (WITHIN GROUP), mirroring `agg_result_type`. PG19 pg_proc
+/// signatures:
+/// - `percentile_cont(float8)` -> float8, `percentile_cont(float8[])`
+///   -> float8[] (the interval variant is out of scope: rustgres has
+///   no Interval value type)
+/// - `percentile_disc(float8)` -> the sort expression's type,
+///   `percentile_disc(float8[])` -> array of it
+/// - `mode()` -> the sort expression's type
+/// - `rank` / `dense_rank` -> bigint, `percent_rank` / `cume_dist` ->
+///   double precision.
+#[allow(clippy::too_many_arguments)]
+fn within_group_result_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    ctes: &[CteDef],
+    func: OrderedSetAgg,
+    direct_args: &[Expr],
+    within_order_by: &[OrderTerm],
+) -> Result<ColType, ExecError> {
+    // Hypothetical-set aggregates have exactly one sort term per
+    // direct arg (enforced at parse time); the sort term's type is
+    // the representative's type for percentile_disc / mode.
+    let sort_ty = |i: usize| {
+        expr_type(
+            eng,
+            snap,
+            own,
+            session,
+            schemas,
+            outer,
+            ctes,
+            &within_order_by[i].expr,
+        )
+    };
+    match func {
+        OrderedSetAgg::PercentileCont => {
+            let a = direct_args.first().expect("percentile_cont takes one direct arg");
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            // PG19 coerces the fraction to float8 implicitly
+            // (numeric/int literals work); the sort column must be
+            // float8-able too (PG19's float8 variant; the interval
+            // variant is out of scope — rustgres has no Interval).
+            // Text is exempt: untyped NULL literals type as Text, and
+            // all-NULL inputs must yield NULL; a real text sort value
+            // fails at execution with 42883 (see percentile_cont_final).
+            let st = sort_ty(0)?;
+            if st != ColType::Text && !within_group_numeric(&st) {
+                return Err(exec_err(
+                    "42883",
+                    "function percentile_cont(float8) does not exist".to_string(),
+                ));
+            }
+            // PG19: an untyped NULL literal coerces to float8 and
+            // yields NULL; any other non-numeric fraction has no such
+            // signature (42883).
+            let null_lit = matches!(a, Expr::Literal(Literal::Null));
+            match t {
+                _ if within_group_numeric(&t) || null_lit => Ok(ColType::Float),
+                ColType::Array(_) => Ok(ColType::Array(crate::storage::ArrayElem::Float)),
+                _ => Err(exec_err(
+                    "42883",
+                    format!("function percentile_cont({}) does not exist", t.sql_name()),
+                )),
+            }
+        }
+        OrderedSetAgg::PercentileDisc => {
+            let a = direct_args.first().expect("percentile_disc takes one direct arg");
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            let elem = sort_ty(0)?;
+            // PG19: an untyped NULL literal coerces to float8 and
+            // yields NULL; any other non-numeric fraction has no such
+            // signature (42883).
+            let null_lit = matches!(a, Expr::Literal(Literal::Null));
+            match t {
+                _ if within_group_numeric(&t) || null_lit => Ok(elem),
+                ColType::Array(_) => {
+                    Ok(ColType::Array(crate::storage::ArrayElem::of(&elem)))
+                }
+                _ => Err(exec_err(
+                    "42883",
+                    format!("function percentile_disc({}) does not exist", t.sql_name()),
+                )),
+            }
+        }
+        OrderedSetAgg::Mode => Ok(sort_ty(0)?),
+        OrderedSetAgg::Rank | OrderedSetAgg::DenseRank => Ok(ColType::BigInt),
+        OrderedSetAgg::PercentRank | OrderedSetAgg::CumeDist => Ok(ColType::Float),
     }
 }
 
@@ -40942,6 +41810,24 @@ fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
             }
             if let Some(a) = arg2 {
                 subst_expr(a, params)?;
+            }
+        }
+        // v1.30: ordered-set aggregate — params may hide in the
+        // direct args, the WITHIN GROUP sort keys, or the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                subst_expr(a, params)?;
+            }
+            for o in within_order_by {
+                subst_expr(&mut o.expr, params)?;
+            }
+            if let Some(f) = filter {
+                subst_expr(f, params)?;
             }
         }
         Expr::ScalarSub(s) => subst_select(s, params)?,
@@ -48639,6 +49525,24 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
                 rewrite_func_arg_expr(&mut o.expr, arg_names);
             }
         }
+        // v1.30: ordered-set aggregate — rewrite named-arg refs in
+        // direct args, the WITHIN GROUP sort keys, and the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                rewrite_func_arg_expr(a, arg_names);
+            }
+            for o in within_order_by {
+                rewrite_func_arg_expr(&mut o.expr, arg_names);
+            }
+            if let Some(f) = filter {
+                rewrite_func_arg_expr(f, arg_names);
+            }
+        }
         _ => {}
     }
 }
@@ -50248,6 +51152,8 @@ fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
             }
         }
         Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } | Expr::Agg { .. } => {}
+        // v1.30: ordered-set aggregates resolve like plain aggregates.
+        Expr::WithinGroup { .. } => {}
         Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
@@ -55632,5 +56538,778 @@ mod v129_filter_tests {
             err.message,
             "argument of FILTER must be type boolean, not type text"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.30: PG19 ordered-set aggregates (WITHIN GROUP) — unit tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod v130_ordered_set_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    fn one(eng: &mut Engine, sql: &str) -> Vec<Vec<String>> {
+        rows_of(run(eng, sql).unwrap())
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    fn cols_of(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Select { columns, .. } => {
+                columns.into_iter().map(|c| c.0).collect()
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    // -- percentile_cont ----------------------------------------------------
+
+    /// Scalar form over ints: PG19 coerces the sort column to float8
+    /// and linearly interpolates (p*(N-1) = 1.5 → 2 + 0.5*(3-2)).
+    #[test]
+    fn cont_scalar_int() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x) \
+                 from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("2.5")]]
+        );
+    }
+
+    /// DESC ordering flips the interpolation ends.
+    #[test]
+    fn cont_desc() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.25) within group (order by x desc) \
+                 from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("3.25")]]
+        );
+    }
+
+    /// Array-fraction form: one result per element, NULL in → NULL
+    /// out, float8[] shape.
+    #[test]
+    fn cont_array_form() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(array[0,0.25,0.5,0.75,1,null]) \
+                 within group (order by x) from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("{1,1.75,2.5,3.25,4,NULL}")]]
+        );
+    }
+
+    /// NULL inputs are skipped by the transition (PG19
+    /// `ordered_set_transition`).
+    #[test]
+    fn cont_skips_null_inputs() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x) \
+                 from (values (null),(1),(3)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// NULL fraction → NULL (not 2201W).
+    #[test]
+    fn cont_null_fraction() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(null) within group (order by x) \
+                 from (values (1)) as t(x)"
+            ),
+            vec![vec![s("NULL")]]
+        );
+    }
+
+    /// No rows → NULL, even for the array form.
+    #[test]
+    fn cont_no_rows() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x) \
+                 from (values (1)) as t(x) where false"
+            ),
+            vec![vec![s("NULL")]]
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(array[0.5]) within group (order by x) \
+                 from (values (1)) as t(x) where false"
+            ),
+            vec![vec![s("NULL")]]
+        );
+    }
+
+    /// Only NULL inputs → NULL (PG19 treats "no non-null rows" as
+    /// empty).
+    #[test]
+    fn cont_only_null_inputs() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x) \
+                 from (values (null),(null)) as t(x)"
+            ),
+            vec![vec![s("NULL")]]
+        );
+    }
+
+    /// FILTER gates the input rows before the WITHIN GROUP sort.
+    #[test]
+    fn cont_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x) \
+                 filter (where x > 1) from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("3")]]
+        );
+    }
+
+    /// Out-of-range and NaN fractions → 2201W, PG-verbatim message.
+    #[test]
+    fn cont_bad_fraction() {
+        let mut eng = engine();
+        for frac in ["2", "-0.5"] {
+            let err = err_of(
+                &mut eng,
+                &format!(
+                    "select percentile_cont({frac}) within group (order by x) \
+                     from (values (1)) as t(x)"
+                ),
+            );
+            assert_eq!(err.code, "2201W");
+            assert_eq!(
+                err.message,
+                format!("percentile value {frac} is not between 0 and 1")
+            );
+        }
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont('nan'::float8) within group (order by x) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "2201W");
+        assert_eq!(err.message, "percentile value NaN is not between 0 and 1");
+    }
+
+    /// A non-numeric fraction has no such signature (42883).
+    #[test]
+    fn cont_text_fraction_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont('a') within group (order by x) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42883");
+    }
+
+    /// Works under GROUP BY, one ordered set per group.
+    #[test]
+    fn cont_group_by() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select g, percentile_cont(0.5) within group (order by x) \
+                 from (values (1,1),(1,2),(2,10),(2,20)) as t(g,x) \
+                 group by g order by g"
+            ),
+            vec![vec![s("1"), s("1.5")], vec![s("2"), s("15")]]
+        );
+    }
+
+    // -- percentile_disc ----------------------------------------------------
+
+    /// Discrete form: rownum = ceil(p*N), 1-based.
+    #[test]
+    fn disc_scalar() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_disc(0.5) within group (order by x) \
+                 from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// Array form over a non-numeric sort column returns that type's
+    /// array.
+    #[test]
+    fn disc_array_text() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_disc(array[0.25,0.5,0.75]) within group (order by x) \
+                 from (values ('a'),('b'),('c'),('d')) as t(x)"
+            ),
+            vec![vec![s("{a,b,c}")]]
+        );
+    }
+
+    /// p=0 takes the first row, p=1 the last.
+    #[test]
+    fn disc_endpoints() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_disc(0) within group (order by x), \
+                        percentile_disc(1) within group (order by x) \
+                 from (values (1),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("1"), s("3")]]
+        );
+    }
+
+    /// NULL fraction → NULL; no rows → NULL.
+    #[test]
+    fn disc_nulls() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_disc(null) within group (order by x) \
+                 from (values (1)) as t(x)"
+            ),
+            vec![vec![s("NULL")]]
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percentile_disc(0.5) within group (order by x) \
+                 from (values (1)) as t(x) where false"
+            ),
+            vec![vec![s("NULL")]]
+        );
+    }
+
+    /// Bad fractions → 2201W, like cont.
+    #[test]
+    fn disc_bad_fraction() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_disc(1.5) within group (order by x) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "2201W");
+        assert_eq!(err.message, "percentile value 1.5 is not between 0 and 1");
+    }
+
+    // -- mode ---------------------------------------------------------------
+
+    /// Most frequent value.
+    #[test]
+    fn mode_basic() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x) \
+                 from (values (1),(2),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// Ties break to the first in sort order.
+    #[test]
+    fn mode_tie_first_in_sort_order() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x) \
+                 from (values (1),(1),(2),(2)) as t(x)"
+            ),
+            vec![vec![s("1")]]
+        );
+        // DESC flips which value sorts first.
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x desc) \
+                 from (values (1),(1),(2),(2)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// NULL inputs are ignored; all-NULL → NULL.
+    #[test]
+    fn mode_nulls() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x) \
+                 from (values (null),(1),(1)) as t(x)"
+            ),
+            vec![vec![s("1")]]
+        );
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x) \
+                 from (values (1)) as t(x) where false"
+            ),
+            vec![vec![s("NULL")]]
+        );
+    }
+
+    /// Text sort column works too.
+    #[test]
+    fn mode_text() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select mode() within group (order by x) \
+                 from (values ('b'),('a'),('b')) as t(x)"
+            ),
+            vec![vec![s("b")]]
+        );
+    }
+
+    // -- hypothetical-set aggregates ----------------------------------------
+
+    /// PG19's own numbers: rank(3) over (1,1,2,2,3,3,4) = 5.
+    #[test]
+    fn hypothetical_rank() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(3) within group (order by x) \
+                 from (values (1),(1),(2),(2),(3),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("5")]]
+        );
+    }
+
+    /// dense_rank(3) over (1,1,2,2,3,3,4) = 3.
+    #[test]
+    fn hypothetical_dense_rank() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select dense_rank(3) within group (order by x) \
+                 from (values (1),(1),(2),(2),(3),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("3")]]
+        );
+    }
+
+    /// percent_rank(3) over 8 rows = (5-1)/8 = 0.5.
+    #[test]
+    fn hypothetical_percent_rank() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select percent_rank(3) within group (order by x) \
+                 from (values (1),(1),(2),(2),(3),(3),(4),(5)) as t(x)"
+            ),
+            vec![vec![s("0.5")]]
+        );
+    }
+
+    /// cume_dist(3) over (1,1,2,2,3,3,4) = (1+4+2)/8 = 0.875.
+    #[test]
+    fn hypothetical_cume_dist() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select cume_dist(3) within group (order by x) \
+                 from (values (1),(1),(2),(2),(3),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("0.875")]]
+        );
+    }
+
+    /// Multi-column hypothetical: the direct args line up with the
+    /// sort columns left to right.
+    #[test]
+    fn hypothetical_multi_column() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(2,'b') within group (order by x, y) \
+                 from (values (1,'a'),(2,'b'),(2,'c')) as t(x,y)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// DESC ordering: rank(3) over (1,2,3,4) desc = 2 (only 4 sorts
+    /// ahead).
+    #[test]
+    fn hypothetical_desc() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(3) within group (order by x desc) \
+                 from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// FILTER gates the hypothetical input rows too.
+    #[test]
+    fn hypothetical_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(3) within group (order by x) filter (where x > 1) \
+                 from (values (1),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// NULL sort-key inputs are kept (PG19
+    /// `ordered_set_transition_multi` never skips NULLs): with
+    /// explicit NULLS FIRST the NULL sorts ahead of the hypothetical
+    /// row and counts toward its rank.
+    #[test]
+    fn hypothetical_keeps_null_keys() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(1) within group (order by x nulls first) \
+                 from (values (null),(2)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// Empty input: rank/dense_rank = 1, percent_rank = 0, cume_dist
+    /// = 1 (PG19 finalfn constants).
+    #[test]
+    fn hypothetical_empty_input() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(1) within group (order by x), \
+                        dense_rank(1) within group (order by x), \
+                        percent_rank(1) within group (order by x), \
+                        cume_dist(1) within group (order by x) \
+                 from (values (1)) as t(x) where false"
+            ),
+            vec![vec![s("1"), s("1"), s("0"), s("1")]]
+        );
+    }
+
+    /// Each NULL-keyed row is its own dense_rank peer group (PG19
+    /// uses the `=` operator; NULL never equals). NULLS FIRST puts
+    /// both NULLs ahead of the hypothetical row; they do not merge.
+    #[test]
+    fn hypothetical_dense_rank_nulls_are_peers_of_none() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select dense_rank(1) within group (order by x nulls first) \
+                 from (values (null),(null),(1)) as t(x)"
+            ),
+            vec![vec![s("3")]]
+        );
+    }
+
+    /// Mismatched direct-arg / sort-column types → 42804.
+    #[test]
+    fn hypothetical_type_mismatch() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select rank('a') within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42804");
+        assert!(err.message.contains("WITHIN GROUP types"), "{}", err.message);
+    }
+
+    /// Numerics unify across int/float (PG19 implicit coercion).
+    #[test]
+    fn hypothetical_numeric_unification() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank(1.5) within group (order by x) \
+                 from (values (1),(2)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// Wrong arity → 42883 with PG's hint style.
+    #[test]
+    fn hypothetical_arity() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select rank(1,2) within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42883");
+        assert!(err.message.contains("HINT"), "{}", err.message);
+    }
+
+    /// Works under GROUP BY with correlated direct args.
+    #[test]
+    fn hypothetical_group_by() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select g, rank(g) within group (order by x) \
+                 from (values (1,10),(1,20),(2,30)) as t(g,x) \
+                 group by g order by g"
+            ),
+            vec![vec![s("1"), s("1")], vec![s("2"), s("1")]]
+        );
+    }
+
+    // -- parse / validation errors ------------------------------------------
+
+    /// WITHIN GROUP is required for ordered-set aggregates (42809).
+    #[test]
+    fn missing_within_group() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont(0.5) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42809");
+        assert!(err.message.contains("WITHIN GROUP is required"), "{}", err.message);
+        let err = err_of(&mut eng, "select mode() from (values (1)) as t(x)");
+        assert_eq!(err.code, "42809");
+    }
+
+    /// `rank()`/`dense_rank()` without WITHIN GROUP still parse as
+    /// window functions (PG19's rule).
+    #[test]
+    fn bare_rank_is_window() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select rank() over (order by x) from (values (2),(1)) as t(x) order by x"
+            ),
+            vec![vec![s("1")], vec![s("2")]]
+        );
+    }
+
+    /// A plain aggregate cannot take WITHIN GROUP (42809).
+    #[test]
+    fn plain_agg_within_group_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x) within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42809");
+        assert!(err.message.contains("not an ordered-set aggregate"), "{}", err.message);
+    }
+
+    /// A non-aggregate cannot take WITHIN GROUP (42809, PG19
+    /// parse_func.c ERRCODE_WRONG_OBJECT_TYPE).
+    #[test]
+    fn nonagg_within_group_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select abs(x) within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42809");
+        assert!(
+            err.message.contains("not an aggregate function"),
+            "{}",
+            err.message
+        );
+        let err = err_of(
+            &mut eng,
+            "select row_number() within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42809");
+        assert!(
+            err.message.contains("window function row_number cannot have WITHIN GROUP"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// DISTINCT on the direct args is rejected (42601).
+    #[test]
+    fn distinct_direct_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont(distinct 0.5) within group (order by x) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42601");
+    }
+
+    /// Two ORDER BYs (aggregate's own + WITHIN GROUP) → 42601.
+    #[test]
+    fn double_order_by_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x order by x) within group (order by x) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42601");
+    }
+
+    /// Ordered-set aggregates cannot be windowed (0A000).
+    #[test]
+    fn over_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont(0.5) within group (order by x) over () \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "0A000");
+    }
+
+    /// An unknown function with WITHIN GROUP → 42809. (PG raises
+    /// 42883 because its catalog lookup fails first; rustgres
+    /// resolves unknown names at execution, so the WITHIN GROUP
+    /// kind check applies uniformly — deliberate approximation.)
+    #[test]
+    fn unknown_func_within_group() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select nosuchfn(1) within group (order by x) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42809");
+    }
+
+    /// Unaliased select items are named after the aggregate (PG19).
+    #[test]
+    fn output_column_names() {
+        let mut eng = engine();
+        assert_eq!(
+            cols_of(
+                &mut eng,
+                "select percentile_cont(0.5) within group (order by x), \
+                        mode() within group (order by x), \
+                        rank(1) within group (order by x) \
+                 from (values (1)) as t(x)"
+            ),
+            vec![s("percentile_cont"), s("mode"), s("rank")]
+        );
+    }
+
+    /// FILTER on a within-group aggregate rejects grouping ops, like
+    /// plain aggregates.
+    #[test]
+    fn filter_rejects_grouping() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont(0.5) within group (order by x) \
+             filter (where x > percentile_cont(0.5) within group (order by x)) \
+             from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "42803");
+    }
+
+    /// percentile_cont with a bad sort type → 42883.
+    #[test]
+    fn cont_text_sort_rejected() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select percentile_cont(0.5) within group (order by x) \
+             from (values ('a')) as t(x)",
+        );
+        assert_eq!(err.code, "42883");
     }
 }

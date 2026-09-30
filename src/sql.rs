@@ -51,6 +51,15 @@ fn err(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v1.30: outcome of `parse_ordered_set_call`. `NotWithinGroup` means
+/// the call is not an ordered-set aggregate after all (only possible
+/// for `rank` / `dense_rank`, which double as window functions) — the
+/// caller rewinds and parses it through the generic path instead.
+enum ParseOsError {
+    NotWithinGroup,
+    Sql(SqlError),
+}
+
 /// A parse-time 42883 (undefined function), like Postgres.
 fn err_undefined(msg: impl Into<String>) -> SqlError {
     SqlError {
@@ -1018,6 +1027,64 @@ impl AggFunc {
     }
 }
 
+/// v1.30: PG19 ordered-set aggregates (`aggkind = 'o'` / `'h'` in
+/// pg_aggregate.dat), called with `WITHIN GROUP (ORDER BY ...)`
+/// (PG19 gram.y `within_group_clause`). `Rank` / `DenseRank` /
+/// `PercentRank` / `CumeDist` are the hypothetical-set aggregates;
+/// the window functions of the same names are the separate
+/// `WindowFunc` variants (disambiguated by the WITHIN GROUP keyword).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderedSetAgg {
+    PercentileCont,
+    PercentileDisc,
+    Mode,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+}
+
+impl OrderedSetAgg {
+    pub fn name(&self) -> &'static str {
+        match self {
+            OrderedSetAgg::PercentileCont => "percentile_cont",
+            OrderedSetAgg::PercentileDisc => "percentile_disc",
+            OrderedSetAgg::Mode => "mode",
+            OrderedSetAgg::Rank => "rank",
+            OrderedSetAgg::DenseRank => "dense_rank",
+            OrderedSetAgg::PercentRank => "percent_rank",
+            OrderedSetAgg::CumeDist => "cume_dist",
+        }
+    }
+
+    /// PG19 `aggkind`: `'h'` for the hypothetical-set aggregates,
+    /// `'o'` for the plain ordered-set ones (pg_aggregate.dat).
+    pub fn is_hypothetical(&self) -> bool {
+        matches!(
+            self,
+            OrderedSetAgg::Rank
+                | OrderedSetAgg::DenseRank
+                | OrderedSetAgg::PercentRank
+                | OrderedSetAgg::CumeDist
+        )
+    }
+}
+
+/// v1.30: is `name` one of PG19's ordered-set aggregate names
+/// (pg_aggregate.dat `aggkind = 'o'` / `'h'`)?
+pub fn is_ordered_set_agg_name(name: &str) -> bool {
+    matches!(
+        name,
+        "percentile_cont"
+            | "percentile_disc"
+            | "mode"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+    )
+}
+
 /// Binary arithmetic operators (v0.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithOp {
@@ -1200,6 +1267,22 @@ pub enum Expr {
         /// only input rows where this evaluates to TRUE feed the
         /// aggregate's transition. Groups are still formed from all
         /// rows; evaluated per input row in row scope.
+        filter: Option<Box<Expr>>,
+    },
+    /// v1.30: PG19 ordered-set aggregate, e.g.
+    /// `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` or
+    /// `rank(5) WITHIN GROUP (ORDER BY x)` (PG19 gram.y
+    /// `within_group_clause`). `direct_args` are the parenthesized
+    /// arguments, evaluated once per group (PG19 nodeAgg.c evaluates
+    /// them against the group's representative input tuple); the
+    /// WITHIN GROUP sort keys are the aggregated args, sorted (with
+    /// the terms' ASC/DESC and NULLS ordering) before the final
+    /// function runs. `filter` is the v1.29 `FILTER (WHERE ...)`
+    /// clause, applied to input rows before the sort.
+    WithinGroup {
+        func: OrderedSetAgg,
+        direct_args: Vec<Expr>,
+        within_order_by: Vec<OrderTerm>,
         filter: Option<Box<Expr>>,
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
@@ -2504,6 +2587,7 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Literal(_)
         | Expr::Param(_)
         | Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
@@ -5147,6 +5231,20 @@ fn max_param_expr(e: &Expr) -> usize {
             .map(max_param_expr)
             .unwrap_or(0)
             .max(arg2.as_deref().map(max_param_expr).unwrap_or(0)),
+        // v1.30: ordered-set aggregate — params may hide in direct
+        // args, the WITHIN GROUP sort keys, or the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => direct_args
+            .iter()
+            .map(max_param_expr)
+            .chain(within_order_by.iter().map(|o| max_param_expr(&o.expr)))
+            .chain(filter.as_deref().map(max_param_expr))
+            .max()
+            .unwrap_or(0),
         Expr::ScalarSub(s) => max_param_select(s),
         Expr::ArraySubquery(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
@@ -5402,6 +5500,13 @@ impl Parser {
     /// Token after the next one (for `qual.*` / `NOT IN` lookahead).
     fn peek2(&self) -> &Token {
         self.tokens.get(self.pos + 1).unwrap_or(&Token::EOF)
+    }
+
+    /// v1.30: is the next input `WITHIN GROUP` (PG19 gram.y
+    /// `within_group_clause`)?
+    fn peek_is_within(&self) -> bool {
+        matches!(self.peek(), Token::Ident(s) if s == "within")
+            && matches!(self.peek2(), Token::Ident(s) if s == "group")
     }
 
     /// Third token (for `qual.*` vs `qual.col` disambiguation).
@@ -10613,6 +10718,20 @@ impl Parser {
             "grouping" => return self.parse_grouping(),
             _ => {}
         }
+        // v1.30: PG19 ordered-set aggregates (`WITHIN GROUP`).
+        // `rank` / `dense_rank` without WITHIN GROUP rewind and parse
+        // as window functions through the generic path below
+        // (unchanged behavior).
+        if is_ordered_set_agg_name(&name) {
+            let save = self.pos;
+            match self.parse_ordered_set_call(&name) {
+                Ok(expr) => return Ok(expr),
+                Err(ParseOsError::NotWithinGroup) => {
+                    self.pos = save;
+                }
+                Err(ParseOsError::Sql(e)) => return Err(e),
+            }
+        }
         let agg = match name.as_str() {
             "count" => Some(AggFunc::Count),
             "sum" => Some(AggFunc::Sum),
@@ -10681,6 +10800,31 @@ impl Parser {
                 Vec::new()
             };
             self.expect(Token::RParen, "')'")?;
+            // v1.30: PG19 parse_func.c 42809 — WITHIN GROUP on a
+            // non-ordered-set aggregate; PG19 gram.y 42601 for the
+            // ORDER BY / DISTINCT combinations.
+            if self.peek_is_within() {
+                if !agg_order_by.is_empty() {
+                    return Err(SqlError {
+                        message: "cannot use multiple ORDER BY clauses with WITHIN GROUP"
+                            .to_string(),
+                        code: "42601",
+                    });
+                }
+                if distinct {
+                    return Err(SqlError {
+                        message: "cannot use DISTINCT with WITHIN GROUP".to_string(),
+                        code: "42601",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "{} is not an ordered-set aggregate, so it cannot have WITHIN GROUP",
+                        name
+                    ),
+                    code: "42809",
+                });
+            }
             // v1.29: `FILTER (WHERE ...)` (PG19 gram.y: the filter
             // clause follows the function application, before OVER).
             let filter = self.parse_filter_clause()?;
@@ -10762,6 +10906,39 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen, "')'")?;
+            // v1.30: PG19 parse_func.c — WITHIN GROUP on something
+            // that is not an ordered-set aggregate (42809). PG19
+            // raises 42883 for unknown names because its catalog
+            // lookup fails first; rustgres resolves unknown names at
+            // execution, so the WITHIN GROUP kind check applies
+            // uniformly (deliberate approximation).
+            if self.peek_is_within() {
+                let is_window_fn = matches!(
+                    name.as_str(),
+                    "row_number"
+                        | "rank"
+                        | "dense_rank"
+                        | "ntile"
+                        | "lag"
+                        | "lead"
+                        | "first_value"
+                        | "last_value"
+                        | "nth_value"
+                );
+                if is_window_fn {
+                    return Err(SqlError {
+                        message: format!("window function {} cannot have WITHIN GROUP", name),
+                        code: "42809",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "WITHIN GROUP specified, but {} is not an aggregate function",
+                        name
+                    ),
+                    code: "42809",
+                });
+            }
             if is_builtin_fn(&name) {
                 check_builtin_arity(&name, args.len())?;
             }
@@ -10862,6 +11039,147 @@ impl Parser {
         let e = self.parse_or()?;
         self.expect(Token::RParen, "')'")?;
         Ok(Some(Box::new(e)))
+    }
+
+    /// v1.30: parse a PG19 ordered-set aggregate call —
+    /// `name(direct_args) WITHIN GROUP (ORDER BY ...) [FILTER ...]`
+    /// (PG19 gram.y `within_group_clause`). The caller has already
+    /// established that `name` is an ordered-set aggregate name and
+    /// that the `(` has not been consumed yet.
+    ///
+    /// Returns `ParseOsError::NotWithinGroup` when no WITHIN GROUP
+    /// follows and the name doubles as a window function
+    /// (`rank` / `dense_rank`); the caller rewinds and parses through
+    /// the generic path. Any other ordered-set name without WITHIN
+    /// GROUP is PG19's 42809 ("WITHIN GROUP is required for
+    /// ordered-set aggregate %s").
+    fn parse_ordered_set_call(&mut self, name: &str) -> Result<Expr, ParseOsError> {
+        let func = match name {
+            "percentile_cont" => OrderedSetAgg::PercentileCont,
+            "percentile_disc" => OrderedSetAgg::PercentileDisc,
+            "mode" => OrderedSetAgg::Mode,
+            "rank" => OrderedSetAgg::Rank,
+            "dense_rank" => OrderedSetAgg::DenseRank,
+            "percent_rank" => OrderedSetAgg::PercentRank,
+            "cume_dist" => OrderedSetAgg::CumeDist,
+            _ => {
+                return Err(ParseOsError::Sql(err(format!(
+                    "unknown ordered-set aggregate {name}"
+                ))));
+            }
+        };
+        // Parenthesized direct args — same arg grammar as generic
+        // calls (named-notation and VARIADIC accepted by the parser;
+        // PG19 rejects DISTINCT / VARIADIC with WITHIN GROUP below).
+        self.expect(Token::LParen, "'('")
+            .map_err(ParseOsError::Sql)?;
+        let distinct = self.eat_keyword("distinct");
+        let mut direct_args: Vec<Expr> = Vec::new();
+        let mut saw_variadic = false;
+        if *self.peek() != Token::RParen {
+            loop {
+                if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::FatArrow)
+                {
+                    let arg_name = self.expect_ident().map_err(ParseOsError::Sql)?;
+                    self.next(); // consume '=>'
+                    let val = self.parse_or().map_err(ParseOsError::Sql)?;
+                    direct_args.push(Expr::NamedArg {
+                        name: arg_name,
+                        expr: Box::new(val),
+                    });
+                } else if self.eat_keyword("variadic") {
+                    saw_variadic = true;
+                    direct_args.push(self.parse_or().map_err(ParseOsError::Sql)?);
+                } else {
+                    direct_args.push(self.parse_or().map_err(ParseOsError::Sql)?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")
+            .map_err(ParseOsError::Sql)?;
+        if !self.peek_is_within() {
+            if matches!(func, OrderedSetAgg::Rank | OrderedSetAgg::DenseRank) {
+                return Err(ParseOsError::NotWithinGroup);
+            }
+            return Err(ParseOsError::Sql(SqlError {
+                message: format!("WITHIN GROUP is required for ordered-set aggregate {name}"),
+                code: "42809",
+            }));
+        }
+        // PG19 gram.y: DISTINCT, VARIADIC, or a second ORDER BY with
+        // WITHIN GROUP are all 42601.
+        if distinct {
+            return Err(ParseOsError::Sql(SqlError {
+                message: "cannot use DISTINCT with WITHIN GROUP".to_string(),
+                code: "42601",
+            }));
+        }
+        if saw_variadic {
+            return Err(ParseOsError::Sql(SqlError {
+                message: "cannot use VARIADIC with WITHIN GROUP".to_string(),
+                code: "42601",
+            }));
+        }
+        // `WITHIN GROUP (ORDER BY ...)` — the ORDER BY keywords are
+        // consumed before the sort terms (the terms themselves are
+        // full order items with ASC/DESC and NULLS FIRST/LAST).
+        self.eat_keyword("within");
+        self.expect_keyword("group").map_err(ParseOsError::Sql)?;
+        self.expect(Token::LParen, "'('")
+            .map_err(ParseOsError::Sql)?;
+        if !self.eat_keyword("order") {
+            return Err(ParseOsError::Sql(err(
+                "syntax error: expected ORDER BY in WITHIN GROUP",
+            )));
+        }
+        self.expect_keyword("by").map_err(ParseOsError::Sql)?;
+        let mut within_order_by = Vec::new();
+        loop {
+            within_order_by.push(self.parse_order_term().map_err(ParseOsError::Sql)?);
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")
+            .map_err(ParseOsError::Sql)?;
+        // FILTER follows WITHIN GROUP (PG19 gram.y clause order),
+        // then the OVER rejection (PG19 parse_func.c 0A000).
+        let filter = self.parse_filter_clause().map_err(ParseOsError::Sql)?;
+        if self.eat_keyword("over") {
+            return Err(ParseOsError::Sql(SqlError {
+                message: format!("OVER is not supported for ordered-set aggregate {name}"),
+                code: "0A000",
+            }));
+        }
+        // Arity: PG19 resolves the ordered-set signatures by direct /
+        // aggregated arg counts (a mismatch is 42883 "undefined
+        // function", like a signature miss). Hypothetical-set
+        // aggregates take exactly one direct arg per sort key.
+        let want_direct = match func {
+            OrderedSetAgg::PercentileCont | OrderedSetAgg::PercentileDisc => 1,
+            OrderedSetAgg::Mode => 0,
+            _ => within_order_by.len(),
+        };
+        if direct_args.len() != want_direct {
+            // PG19's undefined-function hint style (the parser has no
+            // type info, so the signature renders without arg types).
+            return Err(ParseOsError::Sql(err_undefined(format!(
+                "function {name}() does not exist\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts."
+            ))));
+        }
+        Ok(Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            filter,
+        })
     }
 
     fn parse_window_spec(&mut self) -> Result<WindowSpec, SqlError> {
@@ -14149,6 +14467,10 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             what
         ))),
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
+        // v1.30: ordered-set aggregates are aggregates too.
+        Expr::WithinGroup { .. } => {
+            Err(err(format!("cannot use aggregate in {} constraint", what)))
+        }
         Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
@@ -14613,6 +14935,7 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         // Aggregates, subqueries, windows and pre-resolved columns can never
         // appear in a persisted CHECK / DEFAULT (validated at parse time).
         Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
