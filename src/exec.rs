@@ -13606,6 +13606,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             distinct,
             arg2,
             agg_order_by,
+            filter,
         } => Ok(Expr::Agg {
             func: *func,
             arg: arg.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
@@ -13622,6 +13623,12 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            // v1.29: resolve columns in FILTER (same row scope as the
+            // aggregate arguments).
+            filter: filter
+                .as_ref()
+                .map(|f| r(f).map(Box::new))
+                .transpose()?,
         }),
         // v0.10: resolve columns inside window inputs.
         Expr::Window {
@@ -13632,6 +13639,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             order_by,
             frame,
             wid,
+            filter,
         } => Ok(Expr::Window {
             func: func.clone(),
             args: args.iter().map(|a| r(a)).collect::<Result<Vec<_>, _>>()?,
@@ -13652,6 +13660,11 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                 .collect::<Result<Vec<_>, _>>()?,
             frame: frame.clone(),
             wid: *wid,
+            // v1.29: resolve columns in FILTER (windowed aggregates only).
+            filter: filter
+                .as_ref()
+                .map(|f| r(f).map(Box::new))
+                .transpose()?,
         }),
     }
 }
@@ -15414,12 +15427,16 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             Ok(())
         }
         Expr::Extract { from, .. } => validate_expr(from),
-        Expr::Agg { arg, arg2, .. } => {
+        Expr::Agg { arg, arg2, filter, .. } => {
             if let Some(a) = arg {
                 validate_expr(a)?;
             }
             if let Some(a) = arg2 {
                 validate_expr(a)?;
+            }
+            // v1.29: FILTER is a per-row input like the arguments.
+            if let Some(f) = filter {
+                validate_expr(f)?;
             }
             Ok(())
         }
@@ -15576,12 +15593,18 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             Expr::NamedArg { expr, .. } => {
                 stack.push(expr);
             }
-            Expr::Agg { arg, arg2, .. } => {
+            Expr::Agg {
+                arg, arg2, filter, ..
+            } => {
                 if let Some(a) = arg {
                     stack.push(a);
                 }
                 if let Some(a) = arg2 {
                     stack.push(a);
+                }
+                // v1.29: FILTER is a per-row input like the arguments.
+                if let Some(f) = filter {
+                    stack.push(f);
                 }
             }
             Expr::ArrayCtor { elems, .. } => {
@@ -15618,6 +15641,7 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 args,
                 partition_by,
                 order_by,
+                filter,
                 ..
             } => {
                 for a in args {
@@ -15628,6 +15652,10 @@ fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 }
                 for o in order_by {
                     stack.push(&o.expr);
+                }
+                // v1.29: FILTER on a windowed aggregate.
+                if let Some(f) = filter {
+                    stack.push(f);
                 }
             }
             // Leaves, plus subquery levels (never descended into).
@@ -16000,6 +16028,8 @@ struct ExecWindow {
     partition_by: Vec<Expr>,
     order_by: Vec<OrderTerm>,
     frame: WindowFrame,
+    /// v1.29: FILTER on a windowed aggregate (PG19 `wfunc->aggfilter`).
+    filter: Option<Expr>,
 }
 
 /// v0.10: validate every window function at this query level: arity,
@@ -16075,6 +16105,7 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             arg,
             arg2,
             agg_order_by,
+            filter,
             ..
         } => {
             if let Some(a) = arg {
@@ -16087,6 +16118,52 @@ fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
             // per-row inputs like the arguments.
             for o in agg_order_by {
                 validate_window_expr(&o.expr, true)?;
+            }
+            // v1.29: PG19 parse_agg.c / parse_func.c reject aggregates,
+            // window functions, and set-returning functions directly
+            // inside FILTER (the kind name in all three messages is
+            // "FILTER"). Subqueries are their own level: `contains_agg`
+            // / `contains_window` do not descend into them.
+            if let Some(f) = filter {
+                // v1.29: PG19 parse_agg.c likewise rejects GROUPING in
+                // FILTER (kind name "FILTER"); checked before the
+                // aggregate check because `contains_agg` deliberately
+                // treats grouping() as an aggregate (v0.80).
+                if contains_grouping(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "grouping operations are not allowed in FILTER",
+                    ));
+                }
+                if contains_agg(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "aggregate functions are not allowed in FILTER",
+                    ));
+                }
+                if contains_window(f) {
+                    return Err(exec_err(
+                        "42803",
+                        "window functions are not allowed in FILTER",
+                    ));
+                }
+                let mut srf = false;
+                expr_walk(f, &mut |x| {
+                    if let Expr::Func { name, .. } = x {
+                        if is_builtin_srf(name) {
+                            srf = true;
+                        }
+                    }
+                });
+                if srf {
+                    return Err(exec_err(
+                        "0A000",
+                        "set-returning functions are not allowed in FILTER",
+                    ));
+                }
+                // No aggregates, windows, or SRFs can remain; validate
+                // the filter's contents like any other per-row input.
+                validate_window_expr(f, true)?;
             }
             Ok(())
         }
@@ -16283,7 +16360,8 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
             partition_by,
             order_by,
             frame,
-            ..
+            filter,
+            wid: _,
         } = e
         {
             let w = ExecWindow {
@@ -16293,6 +16371,8 @@ fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
                 partition_by: partition_by.clone(),
                 order_by: order_by.clone(),
                 frame: frame.clone(),
+                // v1.29: FILTER participates in window identity.
+                filter: filter.as_deref().cloned(),
             };
             if !out.contains(&w) {
                 out.push(w);
@@ -16386,6 +16466,7 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 order_by,
                 frame,
                 wid,
+                filter,
             } => {
                 let w = ExecWindow {
                     func: func.clone(),
@@ -16394,6 +16475,8 @@ fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                     partition_by: partition_by.clone(),
                     order_by: order_by.clone(),
                     frame: frame.clone(),
+                    // v1.29: FILTER participates in window identity.
+                    filter: filter.as_deref().cloned(),
                 };
                 *wid = windows.iter().position(|x| x == &w).unwrap_or(0);
             }
@@ -16472,6 +16555,10 @@ struct WindowInput {
     part_keys: Vec<Vec<Value>>,
     order_keys: Vec<Vec<Value>>,
     arg_vals: Vec<Vec<Value>>,
+    /// v1.29: per-row FILTER results for windowed aggregates (PG19
+    /// nodeWindowAgg.c "Skip anything FILTERed out"); `true` for every
+    /// row when the spec has no FILTER.
+    filter_vals: Vec<bool>,
 }
 
 /// v0.10: compare two order-key vectors using the window's ORDER BY
@@ -16756,6 +16843,9 @@ fn gather_window_inputs_plain(
             let part_keys = out[reps[i]].part_keys.clone();
             let order_keys = out[reps[i]].order_keys.clone();
             let mut arg_vals = Vec::with_capacity(rows.len());
+            // v1.29: per-row FILTER values for this spec's own window
+            // function (the rep's filter values do not apply).
+            let mut filter_vals = Vec::with_capacity(rows.len());
             for r in rows {
                 let frame = Scope {
                     schema,
@@ -16770,11 +16860,16 @@ fn gather_window_inputs_plain(
                     av.push(eval_expr(q, &scopes, a)?);
                 }
                 arg_vals.push(av);
+                filter_vals.push(match &spec.filter {
+                    Some(f) => check_bool(eval_expr(q, &scopes, f)?, "FILTER")?,
+                    None => true,
+                });
             }
             out.push(WindowInput {
                 part_keys,
                 order_keys,
                 arg_vals,
+                filter_vals,
             });
             continue;
         }
@@ -16783,6 +16878,8 @@ fn gather_window_inputs_plain(
         let mut part_keys = Vec::with_capacity(rows.len());
         let mut order_keys = Vec::with_capacity(rows.len());
         let mut arg_vals = Vec::with_capacity(rows.len());
+        // v1.29: per-row FILTER values (true for all rows when absent).
+        let mut filter_vals = Vec::with_capacity(rows.len());
         for r in rows {
             let frame = Scope {
                 schema,
@@ -16809,11 +16906,16 @@ fn gather_window_inputs_plain(
             part_keys.push(pk);
             order_keys.push(ok);
             arg_vals.push(av);
+            filter_vals.push(match &spec.filter {
+                Some(f) => check_bool(eval_expr(q, &scopes, f)?, "FILTER")?,
+                None => true,
+            });
         }
         out.push(WindowInput {
             part_keys,
             order_keys,
             arg_vals,
+            filter_vals,
         });
     }
     Ok(out)
@@ -16842,6 +16944,9 @@ fn gather_window_inputs_grouped(
             let part_keys = out[reps[i]].part_keys.clone();
             let order_keys = out[reps[i]].order_keys.clone();
             let mut arg_vals = Vec::with_capacity(surviving.len());
+            // v1.29: per-group FILTER values for this spec's own window
+            // function.
+            let mut filter_vals = Vec::with_capacity(surviving.len());
             for &gi in surviving {
                 let (key_vals, idxs) = &groups[gi];
                 let first: &[Value] = match idxs.first() {
@@ -16860,17 +16965,30 @@ fn gather_window_inputs_grouped(
                     )?);
                 }
                 arg_vals.push(av);
+                filter_vals.push(match &spec.filter {
+                    Some(f) => check_bool(
+                        eval_grouped(
+                            q, outer, gscope, schema, rows, idxs, key_vals, group_by, f,
+                        )?,
+                        "FILTER",
+                    )?,
+                    None => true,
+                });
             }
             out.push(WindowInput {
                 part_keys,
                 order_keys,
                 arg_vals,
+                filter_vals,
             });
             continue;
         }
         let mut part_keys = Vec::with_capacity(surviving.len());
         let mut order_keys = Vec::with_capacity(surviving.len());
         let mut arg_vals = Vec::with_capacity(surviving.len());
+        // v1.29: per-group FILTER values (true for all groups when
+        // absent).
+        let mut filter_vals = Vec::with_capacity(surviving.len());
         for &gi in surviving {
             let (key_vals, idxs) = &groups[gi];
             let first: &[Value] = match idxs.first() {
@@ -16903,11 +17021,21 @@ fn gather_window_inputs_grouped(
             part_keys.push(pk);
             order_keys.push(ok);
             arg_vals.push(av);
+            filter_vals.push(match &spec.filter {
+                Some(f) => check_bool(
+                    eval_grouped(
+                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, f,
+                    )?,
+                    "FILTER",
+                )?,
+                None => true,
+            });
         }
         out.push(WindowInput {
             part_keys,
             order_keys,
             arg_vals,
+            filter_vals,
         });
     }
     Ok(out)
@@ -17208,6 +17336,15 @@ fn compute_partition(
             // count(*) counts rows (NULLs included); other aggregates
             // skip NULL inputs, like their grouped counterparts.
             let count_star = *f == AggFunc::Count && spec.args.is_empty();
+            // v1.29: FILTER skips input rows per-frame (PG19
+            // nodeWindowAgg.c "Skip anything FILTERed out"), which
+            // disables the cumulative fast paths below — they cannot
+            // observe the per-row skip.
+            let has_filter = spec.filter.is_some();
+            let filt = |p: usize| -> bool {
+                has_filter
+                    && !input.filter_vals.get(idxs[p]).copied().unwrap_or(true)
+            };
             // v0.63: `resolve_frame` proves `s` is always 0 whenever the
             // frame's start bound is UNBOUNDED PRECEDING (the implicit
             // default frame an ORDER BY window gets, and the most common
@@ -17215,7 +17352,7 @@ fn compute_partition(
             // increases, so count(*)/count(x)/sum(exact int) can be
             // accumulated once instead of re-scanned from position 0 on
             // every row (was O(n) per row, O(n^2) per partition).
-            let cumulative = frame_start_is_unbounded_preceding(spec);
+            let cumulative = frame_start_is_unbounded_preceding(spec) && !has_filter;
             let sum_int_cat = if cumulative && *f == AggFunc::Sum && spec.args.len() == 1 {
                 partition_sum_int_cat(input, idxs)
             } else {
@@ -17223,9 +17360,15 @@ fn compute_partition(
             };
             if count_star {
                 // Closed form: the frame's size needs no row data.
+                // v1.29: with FILTER, count only the passing rows.
                 for j in 0..n {
                     let (s, e) = resolve_frame(spec, input, idxs, j)?;
-                    out[j] = Value::BigInt(if s <= e { (e - s + 1) as i64 } else { 0 });
+                    let c = if s <= e {
+                        (s..=e).filter(|&p| !filt(p)).count() as i64
+                    } else {
+                        0
+                    };
+                    out[j] = Value::BigInt(c);
                 }
             } else if cumulative && *f == AggFunc::Count {
                 let mut count: i64 = 0;
@@ -17282,6 +17425,12 @@ fn compute_partition(
                     let mut vals: Vec<Value> = Vec::new();
                     if s <= e {
                         for p in s..=e {
+                            // v1.29: skip FILTERed-out rows (PG19
+                            // nodeWindowAgg.c "Skip anything FILTERed
+                            // out").
+                            if filt(p) {
+                                continue;
+                            }
                             let v = arg(p, 0);
                             // v0.92: array_agg keeps NULL inputs (PG19:
                             // "Collects all the input values, including
@@ -17612,11 +17761,14 @@ fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
             arg,
             arg2,
             agg_order_by,
+            filter,
             ..
         } => {
             arg.as_ref().is_some_and(|x| expr_is_volatile(db, x))
                 || arg2.as_ref().is_some_and(|x| expr_is_volatile(db, x))
                 || agg_order_by.iter().any(|o| expr_is_volatile(db, &o.expr))
+                // v1.29: a volatile FILTER makes the aggregate volatile.
+                || filter.as_ref().is_some_and(|x| expr_is_volatile(db, x))
         }
         Expr::Func { name, args } => {
             if any_volatile(db, args) {
@@ -17855,11 +18007,17 @@ fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_column_refs(left, out);
             collect_column_refs(right, out);
         }
-        Expr::Agg { arg, arg2, .. } => {
+        Expr::Agg {
+            arg, arg2, filter, ..
+        } => {
             if let Some(x) = arg {
                 collect_column_refs(x, out);
             }
             if let Some(x) = arg2 {
+                collect_column_refs(x, out);
+            }
+            // v1.29: FILTER reads input columns too.
+            if let Some(x) = filter {
                 collect_column_refs(x, out);
             }
         }
@@ -21459,10 +21617,18 @@ fn check_lateral_agg_args(
         });
     }
     for agg in aggs {
-        let Expr::Agg { arg, arg2, .. } = agg else {
+        let Expr::Agg {
+            arg, arg2, filter, ..
+        } = agg
+        else {
             continue;
         };
-        for a in [arg.as_deref(), arg2.as_deref()].into_iter().flatten() {
+        // v1.29: FILTER is evaluated per input row like the aggregate
+        // arguments, so its columns get the same lateral-level check.
+        for a in [arg.as_deref(), arg2.as_deref(), filter.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             let mut cols: Vec<(Option<&str>, &str)> = Vec::new();
             expr_walk(a, &mut |c| {
                 if let Expr::Column { table, name } = c {
@@ -22285,6 +22451,7 @@ fn eval_grouped(
             distinct,
             arg2,
             agg_order_by,
+            filter,
         } => eval_agg_func(
             q,
             outer,
@@ -22296,6 +22463,7 @@ fn eval_grouped(
             *distinct,
             arg2.as_deref(),
             agg_order_by,
+            filter.as_deref(),
         ),
         Expr::Column { table, name } => {
             let qual = table.as_deref().unwrap_or("");
@@ -23100,19 +23268,73 @@ fn eval_agg_func(
     arg2: Option<&Expr>,
     // v0.92: ORDER BY inside the aggregate call (PG19 docs §4.2.7).
     order_by: &[OrderTerm],
+    // v1.29: FILTER (WHERE ...) — only input rows where this is TRUE
+    // feed the transition (PG19 nodeAgg.c folds aggfilter into the
+    // transition expression). Evaluated per input row in row scope;
+    // groups are still formed from all rows.
+    filter: Option<&Expr>,
 ) -> Result<Value, ExecError> {
+    // v1.29: per-row FILTER predicate in row scope (mirrors the scope
+    // construction of the visit loop below).
+    let filter_ok = |q: &mut Q, i: usize| -> Result<bool, ExecError> {
+        let f = match filter {
+            Some(f) => f,
+            None => return Ok(true),
+        };
+        let frame = Scope {
+            schema,
+            row: &rows[i].cells,
+            prov: None,
+        };
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
+        // PG19 coerce_to_boolean with constructName "FILTER": non-TRUE
+        // (incl. NULL) skips the row; non-boolean is 42804.
+        check_bool(eval_expr(q, scopes, f)?, "FILTER")
+    };
     if func == AggFunc::Count && arg.is_none() {
+        // v1.29: COUNT(*) with FILTER counts only the rows passing the
+        // filter (PG19: the filter gates the transition input).
+        if filter.is_some() {
+            let mut n: i64 = 0;
+            for &i in idxs {
+                if filter_ok(q, i)? {
+                    n += 1;
+                }
+            }
+            return Ok(Value::BigInt(n));
+        }
         return Ok(Value::BigInt(idxs.len() as i64));
     }
     let a = arg.expect("non-COUNT aggregates take an argument");
+    // v1.29: FILTER applies at the aggregate's input — before the
+    // in-aggregate ORDER BY sort (PG19 builds the sort from
+    // filter-passing rows) and before DISTINCT dedup.
+    let mut visit: Vec<usize> = idxs.to_vec();
+    if filter.is_some() {
+        let mut kept = Vec::with_capacity(visit.len());
+        for &i in &visit {
+            if filter_ok(q, i)? {
+                kept.push(i);
+            }
+        }
+        visit = kept;
+    }
     // v0.92: ORDER BY inside the aggregate — evaluate the sort keys
     // per input row, then visit rows in sorted order (PG sorts the
     // aggregate's input before accumulation). Stable: ties keep input
     // row order.
-    let mut visit: Vec<usize> = idxs.to_vec();
     if !order_by.is_empty() {
         let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(idxs.len());
-        for &i in idxs {
+        for &i in &visit {
             let frame = Scope {
                 schema,
                 row: &rows[i].cells,
@@ -55081,6 +55303,334 @@ mod v128_projectset_tests {
         assert_eq!(
             rows_of(r),
             vec![vec![s("1"), s("5")], vec![s("2"), s("6")]]
+        );
+    }
+}
+
+/// v1.29: PG19 `FILTER (WHERE ...)` on aggregate calls — the filter
+/// gates each input row before accumulation (PG19 nodeAgg.c folds
+/// `aggfilter` into the transition expression); groups are still formed
+/// from all rows. Also covers the PG19 error shapes: FILTER on a
+/// non-aggregate (42803), on a true window function (0A000), and
+/// aggregates / windows / SRFs directly inside FILTER (42803 / 42803 /
+/// 0A000), plus the 42804 boolean-coercion rule.
+#[cfg(test)]
+mod v129_filter_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    fn one(eng: &mut Engine, sql: &str) -> Vec<Vec<String>> {
+        rows_of(run(eng, sql).unwrap())
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    // -- plain aggregates -------------------------------------------------
+
+    /// The basic shape: only passing rows feed the transition.
+    #[test]
+    fn plain_sum_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select sum(x) filter (where x > 2) from (values (1),(2),(3),(4)) as t(x)"
+            ),
+            vec![vec![s("7")]]
+        );
+    }
+
+    /// `count(*)` with FILTER counts only passing rows (not `idxs.len()`).
+    #[test]
+    fn count_star_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select count(*) filter (where x > 2), count(*) from (values (1),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("1"), s("3")]]
+        );
+    }
+
+    /// FALSE everywhere: sum is NULL, count is 0 (PG19 semantics).
+    #[test]
+    fn filter_all_false() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select sum(x) filter (where false), count(*) filter (where false) from (values (1),(2)) as t(x)"
+            ),
+            vec![vec![s("NULL"), s("0")]]
+        );
+    }
+
+    /// Groups are formed from ALL rows; the filter only gates the
+    /// transition input.
+    #[test]
+    fn grouped_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select a, sum(x) filter (where y > 0) from (values (1,10,1),(1,20,0),(2,30,1)) as t(a,x,y) group by a order by a"
+            ),
+            vec![vec![s("1"), s("10")], vec![s("2"), s("30")]]
+        );
+    }
+
+    /// A group whose rows all fail the filter still appears (with NULL).
+    #[test]
+    fn grouped_filter_empty_group() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select a, sum(x) filter (where y > 0) from (values (1,10,1),(2,30,0)) as t(a,x,y) group by a order by a"
+            ),
+            vec![vec![s("1"), s("10")], vec![s("2"), s("NULL")]]
+        );
+    }
+
+    /// DISTINCT applies after the filter (PG19 sorts the
+    /// filter-passing input).
+    #[test]
+    fn distinct_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select count(distinct x) filter (where x > 1) from (values (1),(2),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("2")]]
+        );
+    }
+
+    /// In-aggregate ORDER BY sorts the filter-passing rows.
+    #[test]
+    fn agg_order_by_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select string_agg(x::text, ',' order by x) filter (where x > 1) from (values (3),(1),(2)) as t(x)"
+            ),
+            vec![vec![s("2,3")]]
+        );
+    }
+
+    /// NULL filter results skip the row (coerce_to_boolean semantics).
+    #[test]
+    fn filter_null_skips() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select count(*) filter (where x > 1) from (values (1),(null),(3)) as t(x)"
+            ),
+            vec![vec![s("1")]]
+        );
+    }
+
+    /// FILTER in HAVING.
+    #[test]
+    fn having_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select a from (values (1),(1),(2)) as t(a) group by a having count(*) filter (where a = 1) > 1"
+            ),
+            vec![vec![s("1")]]
+        );
+    }
+
+    // -- windowed aggregates ----------------------------------------------
+
+    /// FILTER on a windowed aggregate skips rows per frame (PG19
+    /// nodeWindowAgg.c "Skip anything FILTERed out").
+    #[test]
+    fn windowed_sum_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select x, sum(x) filter (where x > 1) over (order by x) from (values (1),(2),(3)) as t(x)"
+            ),
+            vec![
+                vec![s("1"), s("NULL")],
+                vec![s("2"), s("2")],
+                vec![s("3"), s("5")]
+            ]
+        );
+    }
+
+    /// Windowed `count(*)` with FILTER counts passing rows per frame.
+    #[test]
+    fn windowed_count_star_filter() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select count(*) filter (where x > 1) over () from (values (1),(2),(3)) as t(x)"
+            ),
+            vec![vec![s("2")], vec![s("2")], vec![s("2")]]
+        );
+    }
+
+    /// FILTER respects PARTITION BY and explicit frames.
+    #[test]
+    fn windowed_filter_partition_frame() {
+        let mut eng = engine();
+        assert_eq!(
+            one(
+                &mut eng,
+                "select x, sum(y) filter (where y > 0) over (order by x rows between 1 preceding and 1 following) from (values (1,10),(2,-5),(3,20)) as t(x,y)"
+            ),
+            vec![
+                vec![s("1"), s("10")],
+                vec![s("2"), s("30")],
+                vec![s("3"), s("20")]
+            ]
+        );
+    }
+
+    // -- PG19 error shapes -------------------------------------------------
+
+    /// FILTER on a non-aggregate: 42803, PG-verbatim message.
+    #[test]
+    fn filter_on_plain_func() {
+        let mut eng = engine();
+        let err = err_of(&mut eng, "select upper('a') filter (where true)");
+        assert_eq!(err.code, "42803");
+        assert_eq!(
+            err.message,
+            "FILTER specified, but upper is not an aggregate function"
+        );
+    }
+
+    /// FILTER on a true window function with OVER: 0A000.
+    #[test]
+    fn filter_on_window_func() {
+        let mut eng = engine();
+        let err = err_of(&mut eng, "select row_number() filter (where true) over ()");
+        assert_eq!(err.code, "0A000");
+        assert_eq!(
+            err.message,
+            "FILTER is not implemented for non-aggregate window functions"
+        );
+    }
+
+    /// Aggregate directly inside FILTER: 42803.
+    #[test]
+    fn agg_in_filter() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x) filter (where sum(y) > 0) from (values (1,1)) as t(x,y)",
+        );
+        assert_eq!(err.code, "42803");
+        assert_eq!(err.message, "aggregate functions are not allowed in FILTER");
+    }
+
+    /// Window function directly inside FILTER: 42803.
+    #[test]
+    fn window_in_filter() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x) filter (where y > row_number() over ()) from (values (1,1)) as t(x,y)",
+        );
+        assert_eq!(err.code, "42803");
+        assert_eq!(err.message, "window functions are not allowed in FILTER");
+    }
+
+    /// SRF directly inside FILTER: 0A000.
+    #[test]
+    fn srf_in_filter() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x) filter (where generate_series(1,2) > 0) from (values (1)) as t(x)",
+        );
+        assert_eq!(err.code, "0A000");
+        assert_eq!(
+            err.message,
+            "set-returning functions are not allowed in FILTER"
+        );
+    }
+
+    /// GROUPING directly inside FILTER: 42803.
+    #[test]
+    fn grouping_in_filter() {
+        let mut eng = engine();
+        let err = err_of(
+            &mut eng,
+            "select sum(x) filter (where grouping(a) = 0) from (values (1,1)) as t(a,x) group by a",
+        );
+        assert_eq!(err.code, "42803");
+        assert_eq!(
+            err.message,
+            "grouping operations are not allowed in FILTER"
+        );
+    }
+
+    /// Non-boolean FILTER: 42804, PG-verbatim construct name.
+    #[test]
+    fn filter_non_boolean() {
+        let mut eng = engine();
+        let err = err_of(&mut eng, "select sum(x) filter (where 'a') from (values (1)) as t(x)");
+        assert_eq!(err.code, "42804");
+        assert_eq!(
+            err.message,
+            "argument of FILTER must be type boolean, not type text"
         );
     }
 }

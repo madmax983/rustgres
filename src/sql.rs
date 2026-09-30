@@ -1196,6 +1196,11 @@ pub enum Expr {
         /// §4.2.7: allowed in any aggregate; evaluated per input row
         /// before accumulation).
         agg_order_by: Vec<OrderTerm>,
+        /// v1.29: `FILTER (WHERE ...)` (PG19 gram.y `filter_clause`):
+        /// only input rows where this evaluates to TRUE feed the
+        /// aggregate's transition. Groups are still formed from all
+        /// rows; evaluated per input row in row scope.
+        filter: Option<Box<Expr>>,
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
@@ -1284,6 +1289,10 @@ pub enum Expr {
         order_by: Vec<OrderTerm>,
         frame: WindowFrame,
         wid: usize,
+        /// v1.29: `FILTER (WHERE ...)` on a windowed aggregate (PG19
+        /// parse_func.c keeps `wfunc->aggfilter`; only meaningful when
+        /// `func` is `WindowFunc::Agg`).
+        filter: Option<Box<Expr>>,
     },
 }
 
@@ -10672,12 +10681,16 @@ impl Parser {
                 Vec::new()
             };
             self.expect(Token::RParen, "')'")?;
+            // v1.29: `FILTER (WHERE ...)` (PG19 gram.y: the filter
+            // clause follows the function application, before OVER).
+            let filter = self.parse_filter_clause()?;
             let mut expr = Expr::Agg {
                 func: func.clone(),
                 arg: args.first().cloned(),
                 distinct,
                 arg2: args.get(1).cloned(),
                 agg_order_by: agg_order_by.clone(),
+                filter: filter.clone(),
             };
             // v0.10: `<agg>(...) OVER (...)` — windowed aggregate.
             if self.eat_keyword("over") {
@@ -10700,6 +10713,9 @@ impl Parser {
                     order_by: spec.order_by,
                     frame: spec.frame,
                     wid: 0,
+                    // v1.29: PG19 parse_func.c keeps aggfilter on
+                    // windowed aggregates.
+                    filter,
                 };
             }
             return Ok(expr);
@@ -10749,6 +10765,45 @@ impl Parser {
             if is_builtin_fn(&name) {
                 check_builtin_arity(&name, args.len())?;
             }
+            // v1.29: FILTER on a non-aggregate call (PG19 parse_func.c):
+            // 42803 "FILTER specified, but %s is not an aggregate
+            // function" — except on a true window function with OVER
+            // following, which is 0A000 "FILTER is not implemented for
+            // non-aggregate window functions".
+            if self.eat_keyword("filter") {
+                self.expect(Token::LParen, "'('")?;
+                self.expect_keyword("where")?;
+                let _ = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                let followed_by_over =
+                    matches!(self.peek(), Token::Ident(s) if s == "over");
+                let is_window_fn = matches!(
+                    name.as_str(),
+                    "row_number"
+                        | "rank"
+                        | "dense_rank"
+                        | "ntile"
+                        | "lag"
+                        | "lead"
+                        | "first_value"
+                        | "last_value"
+                        | "nth_value"
+                );
+                if is_window_fn && followed_by_over {
+                    return Err(SqlError {
+                        message: "FILTER is not implemented for non-aggregate window functions"
+                            .to_string(),
+                        code: "0A000",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "FILTER specified, but {} is not an aggregate function",
+                        name
+                    ),
+                    code: "42803",
+                });
+            }
             // v0.10: `<func>(...) OVER (...)` — window function.
             if self.eat_keyword("over") {
                 let func = match name.as_str() {
@@ -10780,6 +10835,9 @@ impl Parser {
                     order_by: spec.order_by,
                     frame: spec.frame,
                     wid: 0,
+                    // v1.29: FILTER on a non-aggregate window function is
+                    // rejected above (0A000); no filter reaches this node.
+                    filter: None,
                 });
             }
             return Ok(Expr::Func { name, args });
@@ -10792,6 +10850,20 @@ impl Parser {
 
     /// v0.10: the parenthesized part of `OVER (...)`: optional PARTITION BY,
     /// optional ORDER BY, optional frame clause.
+    /// v1.29: `FILTER (WHERE expr)` (PG19 gram.y `filter_clause`).
+    /// Returns None when no FILTER follows; the caller decides whether
+    /// a present FILTER is legal on the parsed call.
+    fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>, SqlError> {
+        if !self.eat_keyword("filter") {
+            return Ok(None);
+        }
+        self.expect(Token::LParen, "'('")?;
+        self.expect_keyword("where")?;
+        let e = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(Some(Box::new(e)))
+    }
+
     fn parse_window_spec(&mut self) -> Result<WindowSpec, SqlError> {
         self.expect(Token::LParen, "'('")?;
         let mut partition_by = Vec::new();
