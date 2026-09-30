@@ -49567,6 +49567,18 @@ fn parse_sql_func_body(
                 eng, snap, xids, own, session, table, qual, returning, args, ret_type,
             )?;
         }
+        // v1.35: PG19 check_sql_fn_retval / coerce_fn_result_column —
+        // for a scalar function whose final statement is a plain SELECT
+        // with one unambiguous item, the item's static type must admit
+        // an assignment cast to the declared return type (42P13
+        // "Actual return type is %s." otherwise). Anything not
+        // statically decidable (CTEs, subquery FROM items, unresolvable
+        // expression, composite return type, $n of unresolvable type)
+        // defers to the existing call-time coercion, exactly like the
+        // arity check above.
+        if let Stmt::Select(sel) = last {
+            check_select_final_coercible(eng, snap, own, session, sel, args, ret_type)?;
+        }
     }
     Ok(stmts)
 }
@@ -49640,6 +49652,244 @@ fn check_dml_returning_coercible(
         return Err(sql_func_coercion_42p13(ret_type, &src.sql_name()));
     }
     Ok(())
+}
+
+/// v1.35: PG19 `check_sql_fn_retval` / `coerce_fn_result_column` for a
+/// scalar SQL function's final plain-SELECT statement (see
+/// `parse_sql_func_body`). Fails open (Ok) whenever the coercibility
+/// question is not statically decidable — the call-time coercion then
+/// applies, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn check_select_final_coercible(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    sel: &crate::sql::SelectStmt,
+    args: &[crate::sql::FuncArg],
+    ret_type: &str,
+) -> Result<(), ExecError> {
+    // One unambiguous output column (the caller enforced the arity):
+    // plain SELECT, no set operations, no `*` wildcards. Anything
+    // else defers to the call-time check.
+    if sel.set_op.is_some() || sel.items.len() != 1 {
+        return Ok(());
+    }
+    let crate::sql::SelectItem::Expr { expr, .. } = &sel.items[0] else {
+        return Ok(());
+    };
+    // Declared return type: builtin (or domain-over-builtin, which PG
+    // checks as its scalar base) or defer. Composite/table rowtypes
+    // keep the existing call-time `eval_cast_named` path.
+    let dst = match resolve_func_type_name(eng, snap, own, session, ret_type) {
+        Ok(crate::storage::ColType::Composite) | Err(_) => return Ok(()),
+        Ok(ct) => ct,
+    };
+    // WITH queries need CTE schema bindings the static check does not
+    // build; defer those to call time.
+    if !sel.with.is_empty() {
+        return Ok(());
+    }
+    // `$n` references (named arguments were rewritten by the caller)
+    // take the declared argument type as a typed NULL; anything the
+    // substitution cannot type defers to call time.
+    let mut typed = expr.clone();
+    if !substitute_func_params(&mut typed, args, eng, snap, own, session) {
+        return Ok(());
+    }
+    // The FROM range schemas; anything `from_schemas` cannot build
+    // (missing table, untypeable derived table, ...) defers.
+    let schemas = match from_schemas(eng, snap, own, session, &sel.from, &[], &[], &[], &[]) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let refs: Vec<&[QCol]> = schemas.iter().map(Vec::as_slice).collect();
+    let src = match expr_type(eng, snap, own, session, &refs, &[], &[], &typed) {
+        Ok(ct) => ct,
+        Err(_) => return Ok(()),
+    };
+    if !can_assignment_coerce(&src, &dst) {
+        return Err(sql_func_coercion_42p13(ret_type, &src.sql_name()));
+    }
+    Ok(())
+}
+
+/// v1.35: replace `Expr::Param(n)` with a typed-NULL cast carrying the
+/// declared argument type, so `expr_type` can type a SQL function
+/// body's final SELECT (it reports 42P02 for bare params). Returns
+/// false — fail open — when a referenced argument's type is not a
+/// resolvable builtin scalar. The walk is deliberately partial:
+/// variants it does not recurse into keep their `Param`, which makes
+/// `expr_type` fail and the check defer; it can only ever
+/// under-approximate, never mis-type.
+#[allow(clippy::too_many_arguments)]
+fn substitute_func_params(
+    e: &mut Expr,
+    args: &[crate::sql::FuncArg],
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    match e {
+        Expr::Param(n) => {
+            let ct = args
+                .get(*n as usize - 1)
+                .and_then(|a| resolve_func_type_name(eng, snap, own, session, &a.type_name).ok())
+                .filter(|ct| !matches!(ct, crate::storage::ColType::Composite));
+            match ct {
+                Some(ct) => {
+                    *e = Expr::Cast {
+                        expr: Box::new(Expr::Literal(crate::sql::Literal::Null)),
+                        to: ct,
+                        written: None,
+                    };
+                    true
+                }
+                None => false,
+            }
+        }
+        Expr::FieldAccess { expr, .. } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+        }
+        Expr::Arith { left, right, .. } | Expr::Cmp { left, right, .. } => {
+            substitute_func_params(left, args, eng, snap, own, session)
+                && substitute_func_params(right, args, eng, snap, own, session)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+            substitute_func_params(left, args, eng, snap, own, session)
+                && substitute_func_params(right, args, eng, snap, own, session)
+        }
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::BitNot(inner) => {
+            substitute_func_params(inner, args, eng, snap, own, session)
+        }
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            substitute_func_params(left, args, eng, snap, own, session)
+                && substitute_func_params(right, args, eng, snap, own, session)
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+                && substitute_func_params(pattern, args, eng, snap, own, session)
+                && escape
+                    .as_mut()
+                    .is_none_or(|esc| substitute_func_params(esc, args, eng, snap, own, session))
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+                && substitute_func_params(pattern, args, eng, snap, own, session)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            substitute_func_params(expr, args, eng, snap, own, session)
+                && substitute_func_params(low, args, eng, snap, own, session)
+                && substitute_func_params(high, args, eng, snap, own, session)
+        }
+        Expr::Func { args: fargs, .. } => fargs
+            .iter_mut()
+            .all(|a| substitute_func_params(a, args, eng, snap, own, session)),
+        Expr::NamedArg { expr, .. } => substitute_func_params(expr, args, eng, snap, own, session),
+        Expr::Extract { from, .. } => substitute_func_params(from, args, eng, snap, own, session),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand
+                .as_mut()
+                .is_none_or(|op| substitute_func_params(op, args, eng, snap, own, session))
+                && whens.iter_mut().all(|(k, v)| {
+                    substitute_func_params(k, args, eng, snap, own, session)
+                        && substitute_func_params(v, args, eng, snap, own, session)
+                })
+                && else_
+                    .as_mut()
+                    .is_none_or(|el| substitute_func_params(el, args, eng, snap, own, session))
+        }
+        Expr::Row(exprs) => exprs
+            .iter_mut()
+            .all(|x| substitute_func_params(x, args, eng, snap, own, session)),
+        Expr::ArrayCtor { elems, .. } => elems
+            .iter_mut()
+            .all(|x| substitute_func_params(x, args, eng, snap, own, session)),
+        Expr::Subscript { array, indices } => {
+            substitute_func_params(array, args, eng, snap, own, session)
+                && indices
+                    .iter_mut()
+                    .all(|i| substitute_func_params(i, args, eng, snap, own, session))
+        }
+        Expr::Slice { array, bounds } => {
+            substitute_func_params(array, args, eng, snap, own, session)
+                && bounds.iter_mut().all(|(lo, hi)| {
+                    lo.as_mut()
+                        .is_none_or(|l| substitute_func_params(l, args, eng, snap, own, session))
+                        && hi.as_mut().is_none_or(|h| {
+                            substitute_func_params(h, args, eng, snap, own, session)
+                        })
+                })
+        }
+        Expr::UserOp { left, right, .. } => {
+            substitute_func_params(left, args, eng, snap, own, session)
+                && substitute_func_params(right, args, eng, snap, own, session)
+        }
+        // Subquery forms: substitute the outer expression only, never
+        // inside the subquery (its own params belong to it).
+        Expr::InSub { expr, .. } => substitute_func_params(expr, args, eng, snap, own, session),
+        Expr::Quantified { left, .. } => {
+            substitute_func_params(left, args, eng, snap, own, session)
+        }
+        Expr::Agg { arg, arg2, .. } => {
+            arg.as_mut()
+                .is_none_or(|a| substitute_func_params(a, args, eng, snap, own, session))
+                && arg2
+                    .as_mut()
+                    .is_none_or(|a| substitute_func_params(a, args, eng, snap, own, session))
+        }
+        Expr::Window {
+            args: wargs,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            wargs
+                .iter_mut()
+                .chain(partition_by.iter_mut())
+                .all(|a| substitute_func_params(a, args, eng, snap, own, session))
+                && order_by
+                    .iter_mut()
+                    .all(|o| substitute_func_params(&mut o.expr, args, eng, snap, own, session))
+        }
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            direct_args
+                .iter_mut()
+                .all(|a| substitute_func_params(a, args, eng, snap, own, session))
+                && within_order_by
+                    .iter_mut()
+                    .all(|o| substitute_func_params(&mut o.expr, args, eng, snap, own, session))
+                && filter
+                    .as_mut()
+                    .is_none_or(|f| substitute_func_params(f, args, eng, snap, own, session))
+        }
+        // Anything else keeps its `Param`s; `expr_type` then fails and
+        // the check defers to call time (fail open).
+        _ => true,
+    }
 }
 
 /// v0.86: `CREATE [OR REPLACE] FUNCTION`. Validates the signature
@@ -59540,13 +59790,19 @@ mod v134_dml_returning_coercion {
     fn select_final_untouched_by_v134() {
         let mut eng = engine();
         setup(&mut eng);
-        // Scope is DML...RETURNING finals only; SELECT finals keep the
-        // v1.33 behavior (call-time coercion).
-        run(
+        // v1.35 supersedes this pin: SELECT-body finals are now
+        // statically checked too (the v1.34 scope deliberately stopped
+        // at DML...RETURNING). Kept as the negative-case anchor for the
+        // v1.35 check: timestamptz has no assignment cast to integer.
+        let e = err_of(
             &mut eng,
             "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT now()';",
-        )
-        .expect("SELECT finals are out of the v1.34 scope");
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
     }
 
     #[test]
@@ -59604,6 +59860,278 @@ mod v134_dml_returning_coercion {
             &ColType::Array(crate::storage::ArrayElem::Timestamptz),
             &ColType::Array(crate::storage::ArrayElem::Int)
         ));
+    }
+}
+
+/// v1.35: static return-type coercibility at CREATE for SELECT-body
+/// finals (PG19 `check_sql_fn_retval` / `coerce_fn_result_column`,
+/// executor/functions.c) — the remaining quadrant after v1.33
+/// (SELECT-body arity) and v1.34 (DML...RETURNING coercibility). The
+/// final SELECT's single output column must admit an *assignment* cast
+/// to the declared return type, else 42P13 with PG's verbatim detail
+/// `Actual return type is %s.` Anything not statically decidable fails
+/// open to the existing call-time coercion (unchanged).
+#[cfg(test)]
+mod v135_select_final_coercion {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        let r = execute(eng, &mut ctx, &stmt);
+        if r.is_err() {
+            for op in writes.iter().rev() {
+                crate::storage::undo_write_op(eng, &[9], op);
+            }
+        }
+        r
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE t135(a int, b text, t timestamptz);").unwrap();
+    }
+
+    #[test]
+    fn select_final_wrong_type_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // PG19 check_sql_fn_retval: timestamptz has no assignment cast
+        // to integer -> 42P13 at CREATE with PG's verbatim detail.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT now()';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.message,
+            "return type mismatch in function declared to return int"
+        );
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+    }
+
+    #[test]
+    fn select_final_array_mismatch_names_element_type() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT ARRAY[1,2]';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is integer[].")
+        );
+    }
+
+    #[test]
+    fn select_final_value_level_cast_still_creates() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // text -> integer HAS an assignment cast path, so PG accepts
+        // this at CREATE; the cast fails at runtime instead.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT ''hello''';",
+        )
+        .expect("text->int cast path exists: CREATE must succeed");
+        let e = err_of(&mut eng, "SELECT f();");
+        assert_eq!(e.code, "22P02");
+    }
+
+    #[test]
+    fn select_final_compatible_types_create_and_run() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // int -> text: assignment cast exists; runs fine.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS 'SELECT 42';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f();").unwrap()),
+            vec![vec!["42"]]
+        );
+    }
+
+    #[test]
+    fn select_final_checks_only_the_last_statement() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // The first statement's type is irrelevant; the final SELECT
+        // decides (PG19 checks only the last query's tlist).
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS 'SELECT 1; SELECT now();';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS int LANGUAGE sql \
+             AS 'SELECT now(); SELECT 7;';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT g();").unwrap()),
+            vec![vec!["7"]]
+        );
+    }
+
+    #[test]
+    fn select_final_param_typed_by_declared_arg() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // Named refs are rewritten to $n; the declared argument type
+        // drives the check (int -> text coerces, so this creates).
+        run(
+            &mut eng,
+            "CREATE FUNCTION f(a int) RETURNS text LANGUAGE sql AS 'SELECT a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f(42);").unwrap()),
+            vec![vec!["42"]]
+        );
+        // timestamptz -> int has no assignment cast -> 42P13 naming the
+        // argument's type.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION h(a timestamptz) RETURNS int LANGUAGE sql AS 'SELECT a';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+    }
+
+    #[test]
+    fn select_final_from_table_column() {
+        let mut eng = engine();
+        setup(&mut eng);
+        run(&mut eng, "INSERT INTO t135(a, b) VALUES (1, 'x');").unwrap();
+        // Column types resolve through the FROM range: timestamptz
+        // cannot coerce to int.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT t FROM t135';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Actual return type is timestamp with time zone.")
+        );
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS timestamptz LANGUAGE sql \
+             AS 'SELECT t FROM t135 WHERE a = 1';",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn select_final_fail_open_shapes_still_create() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // Composite declared return type: the existing call-time
+        // `eval_cast_named` path applies (v1.34's fail-open rule).
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS t135 LANGUAGE sql AS 'SELECT a FROM t135';",
+        )
+        .unwrap();
+        // `*` shapes defer to the call-time arity/coercion check.
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS int LANGUAGE sql AS 'SELECT * FROM t135';",
+        )
+        .unwrap();
+        // Set-operation finals defer (v1.33 arity conservatism).
+        run(
+            &mut eng,
+            "CREATE FUNCTION h() RETURNS int LANGUAGE sql \
+             AS 'SELECT 1 UNION SELECT now()';",
+        )
+        .unwrap();
+        // WITH queries defer (no CTE schema bindings built).
+        run(
+            &mut eng,
+            "CREATE FUNCTION k() RETURNS int LANGUAGE sql \
+             AS 'WITH x AS (SELECT now() AS t) SELECT t FROM x';",
+        )
+        .unwrap();
+        // Field access on a composite-typed argument cannot be typed
+        // statically (mirrors the corpus f_field_select case).
+        run(
+            &mut eng,
+            "CREATE FUNCTION m(t t135) RETURNS int LANGUAGE sql AS 'SELECT t.a';",
+        )
+        .unwrap();
+        // Out-of-range $n in the output: defer (signature validation
+        // already guarantees resolvable declared types, so only the
+        // index can fail here).
+        run(
+            &mut eng,
+            "CREATE FUNCTION n(a int) RETURNS int LANGUAGE sql AS 'SELECT $5';",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn select_final_setof_keeps_exemption() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // v1.33 pinned: SETOF finals skip the scalar checks entirely.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql AS 'SELECT now()';",
+        )
+        .unwrap();
     }
 }
 
