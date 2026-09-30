@@ -149,6 +149,87 @@ thread_local! {
     /// (unit tests calling the runner directly): notices are dropped.
     static NOTICE_SINK: RefCell<Option<std::rc::Rc<RefCell<Vec<String>>>>> =
         const { RefCell::new(None) };
+
+    /// v1.26: LATERAL namespace markers (PG19 `scanNameSpaceForRefname` /
+    /// `check_agglevels_and_constraints`, PG19's parse-time LATERAL
+    /// rules). Each entry is `(ns_base, depth)`:
+    /// * `ns_base` — index into the current `&[Scope]` chain where the
+    ///   lateral namespace starts: the lateral-visible scopes
+    ///   (textually-preceding FROM items, incl. the immediate left row)
+    ///   plus anything the right side pushes afterwards (its own FROM
+    ///   items, nested subquery scopes). A qualified reference resolving
+    ///   at or past `ns_base` must name a qualifier that occurs exactly
+    ///   once in `scopes[ns_base..]`, else PG19 raises 42P09
+    ///   (`table reference "x" is ambiguous`).
+    /// * `depth` — `q.depth` when the marker was pushed. Scopes are only
+    ///   ever appended while a marker is live, so indices stay valid; a
+    ///   marker whose base lies past a rebuilt shorter chain is ignored.
+    static LATERAL_NS: RefCell<Vec<(usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
+
+    /// v1.26: cross-nest LATERAL inheritance. `eval_cross_nest_join`
+    /// evaluates its right subtree once per left row with the
+    /// textually-preceding FROM scopes appended to `outer`; a lateral
+    /// item nested in that subtree (at the same `q.depth` — reached via
+    /// `build_source`, not via a subquery boundary) extends its marker
+    /// bases over the trailing `usize` scopes. `None` outside a
+    /// cross-nest right subtree. Saved/restored on nesting.
+    static LATERAL_INHERIT: RefCell<Option<(usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// v1.26: pushes a LATERAL namespace marker; pops it on drop, so every
+/// return path (including `?`) restores the stack.
+struct LateralNsGuard;
+impl Drop for LateralNsGuard {
+    fn drop(&mut self) {
+        LATERAL_NS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// v1.26: restores the previous `LATERAL_INHERIT` value on drop.
+struct LateralInheritGuard {
+    prev: Option<(usize, usize)>,
+}
+impl Drop for LateralInheritGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        LATERAL_INHERIT.with(|s| {
+            *s.borrow_mut() = prev;
+        });
+    }
+}
+
+/// v1.26: compute and push the LATERAL namespace marker for a lateral
+/// join whose per-row scopes are `outer[..outer_len] +
+/// prefix[..prefix_len] + [left row]`. A pending cross-nest inheritance
+/// applies only at the same query level (reached via `build_source`,
+/// not across a subquery boundary): the enclosing cross-nest join
+/// appended its preceding scopes as the *first* `n` entries of this
+/// join's `prefix`, and they are lateral-visible here. The inheritance
+/// is left in place for sibling lateral items evaluated later in the
+/// same right subtree.
+fn push_lateral_ns(depth: usize, outer_len: usize, prefix_len: usize) -> LateralNsGuard {
+    let inherit = LATERAL_INHERIT.with(|s| {
+        let cur = *s.borrow();
+        match cur {
+            Some((n, d)) if d == depth && n <= prefix_len => cur,
+            _ => None,
+        }
+    });
+    // The first `n` prefix scopes are lateral-visible (appended by the
+    // enclosing cross-nest join at the same query level); the namespace
+    // starts before them.
+    let ns_base = match inherit {
+        Some((n, _)) => outer_len + prefix_len - n,
+        None => outer_len + prefix_len,
+    };
+    LATERAL_NS.with(|s| {
+        s.borrow_mut().push((ns_base, depth));
+    });
+    LateralNsGuard
 }
 
 /// v1.02: push a notice into the statement-scoped sink (no-op when no
@@ -13174,6 +13255,15 @@ fn resolve_col(
     qual: Option<&str>,
     name: &str,
 ) -> Result<(usize, usize), ExecError> {
+    // v1.26: PG19 `scanNameSpaceForRefname` checks the range name before
+    // the column: inside a LATERAL namespace, a qualifier naming two
+    // visible items is 42P09 `table reference "x" is ambiguous` — even
+    // when the column itself would resolve cleanly, or exists in
+    // neither. References resolving strictly outside the namespace (an
+    // outer query level) keep PG's shadowing rule.
+    if let Some(q) = qual {
+        check_lateral_table_ambiguous(scopes, q)?;
+    }
     for (si, sc) in scopes.iter().enumerate().rev() {
         match qual {
             Some(q) => {
@@ -13193,7 +13283,7 @@ fn resolve_col(
                     }
                 }
                 return found.map(|ci| (si, ci)).ok_or_else(|| {
-                    exec_err("42703", format!("column {}.{} does not exist", q, name))
+                    exec_err("42703", format!("column {q}.{name} does not exist"))
                 });
             }
             None => {
@@ -13227,6 +13317,54 @@ fn resolve_col(
         "42703",
         format!("column \"{}\" does not exist", name),
     ))
+}
+
+/// v1.26: PG19 `scanNameSpaceForRefname` — inside a LATERAL namespace, a
+/// qualified reference must resolve to exactly one namespace item; two
+/// items sharing the qualifier is 42P09 `table reference "x" is
+/// ambiguous`. Only the innermost live marker applies (PG resolves at
+/// the nearest query level holding a match). PG checks the range name
+/// before the column, so the qualifier need not resolve to any column.
+/// A qualifier resolving strictly before the marker's base belongs to an
+/// outer query level and keeps PG's shadowing rule. A marker whose base
+/// lies past the end of a rebuilt shorter scope chain is stale and
+/// ignored.
+fn check_lateral_table_ambiguous(scopes: &[Scope], qual: &str) -> Result<(), ExecError> {
+    let marker = LATERAL_NS.with(|s| s.borrow().last().copied());
+    let Some((ns_base, _)) = marker else {
+        return Ok(());
+    };
+    if ns_base > scopes.len() {
+        return Ok(());
+    }
+    // Innermost scope carrying the qualifier; none means the 42703 path
+    // below handles it (PG: missing FROM-clause entry — a pre-existing
+    // separate divergence, not this check's business).
+    let Some(si) = scopes
+        .iter()
+        .rposition(|sc| sc.schema.iter().any(|c| c.qual == qual))
+    else {
+        return Ok(());
+    };
+    if si < ns_base {
+        return Ok(());
+    }
+    // PG checks the range (table) name, not the column: two namespace
+    // items sharing the qualifier are ambiguous even when only one of
+    // them carries the referenced column.
+    let mut hits = 0;
+    for sc in &scopes[ns_base..] {
+        if sc.schema.iter().any(|c| c.qual == qual) {
+            hits += 1;
+            if hits >= 2 {
+                return Err(exec_err(
+                    "42P09",
+                    format!("table reference \"{qual}\" is ambiguous"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pre-resolve every column reference at this query level of `pred` into a
@@ -19016,6 +19154,12 @@ fn eval_lateral_join(
     alias: Option<&str>,
     col_aliases: &[String],
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    // v1.26: LATERAL namespace marker (PG19 `scanNameSpaceForRefname` /
+    // `check_agglevels_and_constraints`). Pushed once for the whole
+    // join: every left row rebuilds the same scope shape
+    // (`outer + prefix + [left row]`), and the marker pops on every
+    // return path via the guard.
+    let _lateral_ns = push_lateral_ns(q.depth, outer.len(), prefix.len());
     let outer_schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
     // Static schemas, innermost last: preceding FROM items, then the
     // immediate left input.
@@ -19239,6 +19383,16 @@ fn eval_cross_nest_join(
         prov: Vec::new(),
     };
     let mut rows = Vec::new();
+    // v1.26: cross-nest LATERAL inheritance. The right subtree is rebuilt
+    // once per left row with `prefix + [left row]` appended to `outer`;
+    // a lateral item nested in that subtree (at the same `q.depth`)
+    // extends its namespace marker over those trailing scopes. Published
+    // for the whole row loop and restored afterwards; sibling lateral
+    // items each read the same value. Non-lateral references in the
+    // right subtree never consult it.
+    let _lateral_inherit = LateralInheritGuard {
+        prev: LATERAL_INHERIT.with(|s| s.borrow_mut().replace((prefix.len() + 1, q.depth))),
+    };
     for l in lrows {
         let mut prefix2: Vec<Scope> = Vec::with_capacity(prefix.len() + 1);
         prefix2.extend_from_slice(prefix);
@@ -21094,6 +21248,116 @@ fn eval_group_key_expanded(
 /// aggregation per set, with bare select-list columns not in the current
 /// set evaluating to NULL (PG19 semantics). Non-trivial expressions over
 /// unbound columns still raise 42803, like PG.
+/// v1.26: PG19 LATERAL aggregate rule (`parse_agg.c`
+/// `check_agglevels_and_constraints`). A LATERAL subquery is transformed
+/// with the outer pstate's `p_expr_kind = EXPR_KIND_FROM_SUBSELECT`
+/// (`parse_clause.c` `transformRangeSubselect`), and an aggregate call
+/// whose argument references *any* outer-level variable (`min_varlevel
+/// >= 1`) walks up to that pstate — PG19 rejects it with 42803
+/// ("aggregate functions are not allowed in FROM clause of their own
+/// query level"). Runs once at the top of `exec_agg` for the lateral
+/// subquery's own level (the innermost marker whose lateral level is
+/// this query, i.e. `marker.depth + 1 == q.depth`). Only aggregates at
+/// this level are examined — subqueries are their own levels and get
+/// their own check when their `exec_agg` runs (the marker lookup finds
+/// the same marker for nested levels, and `ns_base` stays valid because
+/// scopes are only appended). An argument resolving to any scope before
+/// this level's own FROM scope (`si < ns_base + 1`, where `own` sits at
+/// `ns_base + 1`) triggers the error. Unqualified columns resolve
+/// innermost-first, so genuinely local aggregates are unaffected.
+fn check_lateral_agg_args(
+    q: &Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    schema: &[QCol],
+) -> Result<(), ExecError> {
+    let marker = LATERAL_NS.with(|s| {
+        s.borrow()
+            .iter()
+            .rev()
+            .find(|(_, d)| *d + 1 == q.depth)
+            .copied()
+    });
+    let Some((ns_base, _)) = marker else {
+        return Ok(());
+    };
+    // This query level's scope chain: the lateral-visible scopes, then
+    // this level's own FROM scope. Resolution is schema-only, so a dummy
+    // row suffices (same approach as `is_group_bound`).
+    let own = Scope {
+        schema,
+        row: &[],
+        prov: None,
+    };
+    let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+    scopes.extend_from_slice(outer);
+    scopes.push(own);
+    // Mirror `is_agg_query`'s aggregate set: select items, HAVING,
+    // ORDER BY, DISTINCT ON. `expr_walk` never descends into subquery
+    // levels, so only this level's aggregates are seen.
+    let mut aggs: Vec<&Expr> = Vec::new();
+    for i in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = i {
+            expr_walk(expr, &mut |x| {
+                if matches!(x, Expr::Agg { .. }) {
+                    aggs.push(x);
+                }
+            });
+        }
+    }
+    if let Some(h) = &stmt.having {
+        expr_walk(h, &mut |x| {
+            if matches!(x, Expr::Agg { .. }) {
+                aggs.push(x);
+            }
+        });
+    }
+    for o in &stmt.order_by {
+        expr_walk(&o.expr, &mut |x| {
+            if matches!(x, Expr::Agg { .. }) {
+                aggs.push(x);
+            }
+        });
+    }
+    for e in &stmt.distinct_on {
+        expr_walk(e, &mut |x| {
+            if matches!(x, Expr::Agg { .. }) {
+                aggs.push(x);
+            }
+        });
+    }
+    for agg in aggs {
+        let Expr::Agg { arg, arg2, .. } = agg else {
+            continue;
+        };
+        for a in [arg.as_deref(), arg2.as_deref()].into_iter().flatten() {
+            let mut cols: Vec<(Option<&str>, &str)> = Vec::new();
+            expr_walk(a, &mut |c| {
+                if let Expr::Column { table, name } = c {
+                    cols.push((table.as_deref(), name.as_str()));
+                }
+            });
+            for (table, name) in cols {
+                // Unresolvable here is another error's business (42703
+                // surfaces from evaluation); only a successful
+                // outer-level resolution triggers 42803. `own` (this
+                // level's FROM scope) sits at `ns_base + 1`; anything
+                // before it is an outer query level.
+                let Ok((si, _)) = resolve_col(&scopes, table, name) else {
+                    continue;
+                };
+                if si < ns_base + 1 {
+                    return Err(exec_err(
+                        "42803",
+                        "aggregate functions are not allowed in FROM clause of their own query level",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn exec_agg(
     q: &mut Q,
     outer: &[Scope],
@@ -21104,6 +21368,10 @@ fn exec_agg(
     // v0.10: deduplicated window specs for this query level.
     windows: &[ExecWindow],
 ) -> Result<Vec<OutRow>, ExecError> {
+    // v1.26: PG19 LATERAL aggregate rule — an aggregate in a LATERAL
+    // subquery whose argument references the parent query level is
+    // 42803, raised before any grouping work.
+    check_lateral_agg_args(q, outer, stmt, schema)?;
     let sets = resolve_grouping_sets(stmt)?;
     // v0.80: `GROUPING(...)` analysis — fewer than 32 arguments, each
     // matching a grouping expression of this query level (PG19
@@ -53004,6 +53272,163 @@ mod v110_lateral_tests {
         // Scalar context still rejects multi-column subqueries: 42601.
         let err = run(&mut eng, "SELECT (SELECT 1, 2)").unwrap_err();
         assert_eq!(err.code, "42601");
+    }
+}
+
+/// v1.26: PG19 LATERAL semantic-validation parity — the two singleton
+/// EXPECTED-FAILs this version targets, plus nearby legal controls.
+/// Grounded in PG19 `scanNameSpaceForRefname` (42P09) and
+/// `check_agglevels_and_constraints` (42803); both error codes and
+/// messages verified against a live PostgreSQL 16 and the PG19 sources.
+#[cfg(test)]
+mod v126_lateral_validation_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE int8_tbl (q1 bigint, q2 bigint)").unwrap();
+        run(eng, "INSERT INTO int8_tbl VALUES (1, 2)").unwrap();
+        run(eng, "CREATE TABLE int4_tbl (f1 int)").unwrap();
+        run(eng, "INSERT INTO int4_tbl VALUES (3)").unwrap();
+        run(eng, "CREATE TABLE tenk1 (unique1 int)").unwrap();
+        run(eng, "INSERT INTO tenk1 VALUES (10)").unwrap();
+    }
+
+    /// Corpus singleton 1: a duplicate alias `x` visible inside a nested
+    /// LATERAL query is 42P09 `table reference "x" is ambiguous`.
+    #[test]
+    fn nested_lateral_ambiguous_alias_is_42p09() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let err = run(
+            &mut eng,
+            "select * from int8_tbl x cross join (int4_tbl x cross join lateral (select x.f1) ss)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42P09");
+        assert_eq!(err.message, "table reference \"x\" is ambiguous");
+    }
+
+    /// Corpus singleton 2: an aggregate over a lateral-visible variable
+    /// inside a LATERAL FROM subselect is 42803.
+    #[test]
+    fn lateral_agg_over_parent_level_is_42803() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let err = run(
+            &mut eng,
+            "select 1 from tenk1 a, lateral (select max(a.unique1) from int4_tbl b) ss",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+        assert_eq!(
+            err.message,
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        );
+    }
+
+    /// The 42P09 check is namespace-general, not tied to the corpus
+    /// tables: a duplicate qualifier between the immediate left row and
+    /// the lateral's own FROM item also errors.
+    #[test]
+    fn lateral_own_from_duplicate_alias_is_42p09() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let err = run(
+            &mut eng,
+            "select * from int8_tbl x cross join lateral (select x.q1 from int4_tbl x) ss",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42P09");
+    }
+
+    /// The 42803 check is level-general: an unqualified parent-level
+    /// column inside the aggregate errors too.
+    #[test]
+    fn lateral_agg_unqualified_parent_ref_is_42803() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // unique1 is not in int4_tbl: it resolves to the lateral-visible
+        // tenk1 a -> 42803.
+        let err = run(
+            &mut eng,
+            "select 1 from tenk1 a, lateral (select max(unique1) from int4_tbl b) ss",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+    }
+
+    /// PG19 rejects an aggregate argument referencing ANY outer-level
+    /// scope, not just the immediate left input: `min_varlevel >= 1`
+    /// walks up to the outer pstate (`EXPR_KIND_FROM_SUBSELECT`).
+    #[test]
+    fn lateral_agg_nonimmediate_outer_ref_is_42803() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // z.q1 is two FROM items back (not the immediate left row) —
+        // still an outer-level variable -> 42803.
+        let err = run(
+            &mut eng,
+            "select 1 from int8_tbl z, tenk1 a, lateral (select max(z.q1) from int4_tbl b) ss",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42803");
+    }
+
+    /// Legal controls: unambiguous lateral references and local
+    /// aggregates still succeed.
+    #[test]
+    fn lateral_legal_controls_still_pass() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // Single alias: resolves fine.
+        run(
+            &mut eng,
+            "select * from int8_tbl x cross join lateral (select x.q1) ss",
+        )
+        .unwrap();
+        // Aggregate over the lateral's own level: fine.
+        run(
+            &mut eng,
+            "select * from int8_tbl x cross join lateral (select max(f1) from int4_tbl) ss",
+        )
+        .unwrap();
+        // Correlated lateral without aggregates: fine.
+        run(
+            &mut eng,
+            "select * from tenk1 a, lateral (select a.unique1 from int4_tbl b) ss",
+        )
+        .unwrap();
+        // Top-level aggregate: no marker live, unaffected.
+        run(&mut eng, "select max(q1) from int8_tbl").unwrap();
+        // Scalar subquery (not LATERAL): no marker, unaffected.
+        run(&mut eng, "select (select max(q1) from int8_tbl) from int4_tbl").unwrap();
     }
 }
 

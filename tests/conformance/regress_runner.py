@@ -805,14 +805,13 @@ EXPECTED_PASS_OVERRIDES = [
     # cross-nest visibility, RIGHT/FULL 42P10 rule). Excludes: EXPLAIN
     # (stays masked), UPDATE (lateral in UPDATE...FROM is still an
     # error in PG), parenthesized setops in FROM (unsupported),
-    # aggregates at their own query level (PG rejects), the
-    # ambiguous-table-reference case (PG errors; we don't detect),
     # and statements using unsupported features or hitting scoping
     # edge cases that fail for non-lateral reasons.
+    # v1.26: aggregates at their own query level (PG 42803) and the
+    # ambiguous-table-reference case (PG 42P09) are now genuinely
+    # detected, so their exclusions are removed.
     (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
      r"(?!\s*update\b)(?!.*\bunion\b.*\blateral\b|\blateral\b.*\bunion\b)"
-     r"(?!.*\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\()"
-     r"(?!.*\bint8_tbl\s+x\s+cross\s+join\s*\(\s*int4_tbl\s+x\b)"
      r"(?!.*\binformation_schema\b)"
      r"(?!.*\blateral\b\s*\(\s*select\s+i8\.q1,\s*t2\.f1\b)"
      r"(?!.*\bjoin\s*\(\s*select\s+i42\.f1\b)"
