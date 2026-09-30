@@ -2746,8 +2746,10 @@ pub struct FuncArg {
 /// for the bounded single-`RETURN` subset (v0.97): a body of the form
 /// `BEGIN RETURN <expr>; END` is desugared to `SELECT <expr>` at CREATE
 /// time (see `desugar_plpgsql_body`); anything else in plpgsql is an
-/// honest 0A000. C and other languages are still rejected at parse
-/// time with 42601.
+/// honest 0A000. v1.32: unknown language names are no longer rejected by
+/// the parser — the executor resolves them and raises 42883
+/// (`language "%s" does not exist`, like PG19's proclang.c
+/// `get_language_oid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FuncLang {
     Sql,
@@ -4581,12 +4583,14 @@ pub enum Stmt {
     // declared type names. `body` is the raw function-body string;
     // the executor parses it once at CREATE time. `or_replace`
     // implements CREATE OR REPLACE (42723 without it on duplicates).
+    // v1.32: `lang_name` is the raw LANGUAGE name as written (PG19
+    // parses any name; the executor resolves it, 42883 if unknown).
     CreateFunction {
         name: String,
         args: Vec<FuncArg>,
         ret_type: String,
         returns_set: bool,
-        lang: FuncLang,
+        lang_name: String,
         body: String,
         or_replace: bool,
         volatility: FuncVolatility,
@@ -7659,10 +7663,13 @@ impl Parser {
     /// v0.86: `CREATE [OR REPLACE] FUNCTION name ([argname] type
     /// [, ...]) RETURNS [SETOF] type [LANGUAGE lang] [IMMUTABLE |
     /// STABLE | VOLATILE] [STRICT] AS 'body'` — PG19 CreateFunctionStmt,
-    /// bounded to `LANGUAGE sql` and `LANGUAGE internal`. Any other
-    /// language is rejected here with 42601 (honest unsupported).
-    /// Argument types are stored as written and resolved at execution;
-    /// the body string is parsed once at execution time.
+    /// bounded to `LANGUAGE sql`, `LANGUAGE internal`, and the bounded
+    /// `LANGUAGE plpgsql` subset. Like PG19's gram.y, ANY language name
+    /// parses here; unknown languages are rejected at CREATE time with
+    /// 42883 (`language "%s" does not exist`, proclang.c
+    /// `get_language_oid`), not at parse time. Argument types are stored
+    /// as written and resolved at execution; the body string is parsed
+    /// once at execution time.
     fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
         self.expect_keyword("function")?;
         let name = self.expect_ident()?;
@@ -7688,24 +7695,17 @@ impl Parser {
         self.expect_keyword("returns")?;
         let returns_set = self.eat_keyword("setof");
         let ret_type = self.parse_func_type_name()?;
-        let mut lang: Option<FuncLang> = None;
+        let mut lang_name: Option<String> = None;
         let mut body: Option<String> = None;
         let mut volatility = FuncVolatility::Volatile;
         let mut strict = false;
         loop {
             if self.eat_keyword("language") {
-                let lname = self.expect_ident()?;
-                lang = Some(match lname.as_str() {
-                    "sql" => FuncLang::Sql,
-                    "internal" => FuncLang::Internal,
-                    // v0.97: bounded plpgsql (single-RETURN bodies, see
-                    // desugar_plpgsql_body); richer bodies are an honest
-                    // 0A000 at CREATE time.
-                    "plpgsql" => FuncLang::Plpgsql,
-                    other => {
-                        return Err(err(format!("language \"{}\" is not supported", other)));
-                    }
-                });
+                // v1.32: PG19 parses any language name (gram.y
+                // CreateFunctionStmt); unknown languages fail at CREATE
+                // with 42883 in the executor (proclang.c
+                // get_language_oid), not here.
+                lang_name = Some(self.expect_ident()?);
             } else if self.eat_keyword("immutable") {
                 volatility = FuncVolatility::Immutable;
             } else if self.eat_keyword("stable") {
@@ -7782,14 +7782,17 @@ impl Parser {
                 break;
             }
         }
-        let lang = lang.unwrap_or(FuncLang::Sql);
+        // PG19 defaults the language to "sql" when a body is present
+        // (functioncmds.c CreateFunction); this parser always requires
+        // AS 'body', so the default is unconditional here.
+        let lang_name = lang_name.unwrap_or_else(|| "sql".to_string());
         let body = body.ok_or_else(|| err("syntax error: expected AS 'body'".to_string()))?;
         Ok(Stmt::CreateFunction {
             name,
             args,
             ret_type,
             returns_set,
-            lang,
+            lang_name,
             body,
             or_replace,
             volatility,

@@ -578,7 +578,7 @@ fn execute_inner(
             args,
             ret_type,
             returns_set,
-            lang,
+            lang_name,
             body,
             or_replace,
             volatility,
@@ -590,7 +590,7 @@ fn execute_inner(
             args,
             ret_type,
             *returns_set,
-            *lang,
+            lang_name,
             body,
             *or_replace,
             *volatility,
@@ -31949,21 +31949,9 @@ fn run_func_body(
     // v1.01: multi-statement plpgsql bodies never reach here — they
     // branch above via `fdef.plpgsql`. Reaching this point with
     // `parsed == None` is a corrupt catalog entry.
-    let Stmt::Select(sel) = body else {
-        return Err(exec_err(
-            "0A000",
-            format!("function \"{}\" body is not a SELECT", fdef.name),
-        ));
-    };
+    // v1.32: SQL bodies are statement lists (PG19 fmgr_sql runs each
+    // command in order); CREATE validated every statement is a SELECT.
     let params: Vec<Option<Value>> = coerced.into_iter().map(Some).collect();
-    let mut stmt = Stmt::Select(sel.clone());
-    subst_params(&mut stmt, &params)?;
-    let Stmt::Select(bound) = stmt else {
-        return Err(exec_err(
-            "XX000",
-            "function body lost its SELECT".to_string(),
-        ));
-    };
     // Run the body one query level deeper (fresh CTE scope, like a
     // subquery); the caller's scopes stay visible for outer refs.
     let mut call_q = Q {
@@ -31987,7 +31975,34 @@ fn run_func_body(
         // bodies see the statement snapshot (None).
         pending_updates: pending,
     };
-    run_select(&mut call_q, &bound, scopes)
+    // v1.32: PG19 executes each body statement in order in the
+    // caller's snapshot; only the last statement's result is the
+    // function result (non-final results are discarded).
+    let mut last_out: Option<SelectOut> = None;
+    for s in body.iter() {
+        let Stmt::Select(sel) = s else {
+            return Err(exec_err(
+                "XX000",
+                format!("function \"{}\" body statement is not a SELECT", fdef.name),
+            ));
+        };
+        let mut stmt = Stmt::Select(sel.clone());
+        subst_params(&mut stmt, &params)?;
+        let Stmt::Select(bound) = stmt else {
+            return Err(exec_err(
+                "XX000",
+                "function body lost its SELECT".to_string(),
+            ));
+        };
+        last_out = Some(run_select(&mut call_q, &bound, scopes)?);
+    }
+    // CREATE guarantees a non-empty statement list (42P13 on empty).
+    last_out.ok_or_else(|| {
+        exec_err(
+            "XX000",
+            format!("function \"{}\" has an empty parsed body", fdef.name),
+        )
+    })
 }
 
 /// v1.03: how a plpgsql statement list finished executing. PG's
@@ -48986,6 +49001,123 @@ fn resolve_func_type_name(
     ))
 }
 
+/// v1.32: resolve a `LANGUAGE <name>` clause to a `FuncLang` (PG19
+/// `CreateFunction` resolves the language before anything else, via
+/// proclang.c `get_language_oid`). Unknown languages are 42883
+/// `language "%s" does not exist` — PG-verbatim.
+fn resolve_func_lang(lang_name: &str) -> Result<crate::sql::FuncLang, ExecError> {
+    match lang_name.to_ascii_lowercase().as_str() {
+        "sql" => Ok(crate::sql::FuncLang::Sql),
+        "internal" => Ok(crate::sql::FuncLang::Internal),
+        // v0.97: bounded plpgsql (single-RETURN bodies, see
+        // desugar_plpgsql_body); richer bodies take the
+        // multi-statement path (v1.01).
+        "plpgsql" => Ok(crate::sql::FuncLang::Plpgsql),
+        _ => Err(exec_err(
+            "42883",
+            format!("language \"{}\" does not exist", lang_name),
+        )),
+    }
+}
+
+/// v1.32: the SQLSTATE-42P13 detail phrases below mirror PG19
+/// `check_sql_fn_retval` (executor/functions.c); the bounded engine
+/// rejects non-SELECT body statements with 0A000 since PG's DML/utility
+/// bodies need a write path the function-body executor does not have
+/// (see `run_func_body`).
+fn sql_func_body_kind(stmt: &Stmt) -> &'static str {
+    match stmt {
+        Stmt::Select(_) => "SELECT",
+        Stmt::Insert { .. } => "INSERT",
+        Stmt::Update { .. } => "UPDATE",
+        Stmt::Delete { .. } => "DELETE",
+        _ => "utility statement",
+    }
+}
+
+/// v1.32: parse + validate a SQL-language function body at CREATE time
+/// (PG19 `fmgr_sql_validator`: `pg_parse_query` over the whole body,
+/// then `check_sql_fn_statements` / `check_sql_fn_retval`). Returns the
+/// parsed statements; the executor runs them in order and takes the
+/// last statement's result as the return value (PG19 `fmgr_sql`).
+/// Bounded: only SELECT statements are supported — DML/utility bodies
+/// are an honest 0A000 (the body executor has no Q-level DML write
+/// path). Named argument references are rewritten to `$n` per
+/// statement, exactly as the old single-statement path did.
+fn parse_sql_func_body(
+    body: &str,
+    args: &[crate::sql::FuncArg],
+    ret_type: &str,
+    returns_set: bool,
+) -> Result<Vec<Stmt>, ExecError> {
+    let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
+    let mut stmts = Vec::new();
+    for chunk in crate::sql::split_statements(body) {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut stmt = crate::sql::parse_statement(chunk).map_err(|e| {
+            // PG19 transposes body syntax errors onto the CREATE
+            // FUNCTION statement (sql_function_parse_error_callback).
+            exec_err(
+                e.code,
+                format!("syntax error in function body: {}", e.message),
+            )
+        })?;
+        if !matches!(stmt, Stmt::Select(_)) {
+            return Err(exec_err(
+                "0A000",
+                format!(
+                    "{} is not supported in SQL function bodies (only SELECT)",
+                    sql_func_body_kind(&stmt)
+                ),
+            ));
+        }
+        rewrite_func_arg_refs(&mut stmt, &arg_names);
+        stmts.push(stmt);
+    }
+    // PG19 check_sql_fn_retval: an empty body behaves like "the last
+    // query rewrote to nothing" — return type mismatch. (No VOID
+    // carve-out: RETURNS void is 42704 in this engine today, a
+    // separate type-system gap.)
+    let Some(last) = stmts.last() else {
+        return Err(exec_err(
+            "42P13",
+            format!(
+                "return type mismatch in function declared to return {}",
+                ret_type
+            ),
+        ));
+    };
+    // PG19 check_sql_fn_retval, scalar case: the final statement must
+    // return exactly one column. Enforced here only when the column
+    // count is syntactically unambiguous (plain SELECT, no `*`,
+    // no set operations); ambiguous shapes defer to the existing
+    // call-time check.
+    if !returns_set {
+        if let Stmt::Select(sel) = last {
+            let unambiguous = sel.set_op.is_none()
+                && !sel.items.iter().any(|i| {
+                    matches!(
+                        i,
+                        crate::sql::SelectItem::All | crate::sql::SelectItem::AllOf(_)
+                    )
+                });
+            if unambiguous && sel.items.len() != 1 {
+                return Err(exec_err(
+                    "42P13",
+                    format!(
+                        "return type mismatch in function declared to return {}",
+                        ret_type
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(stmts)
+}
+
 /// v0.86: `CREATE [OR REPLACE] FUNCTION`. Validates the signature
 /// types resolve (42704), parses the SQL body once (42601 on a bad
 /// body), rewrites named argument references to `$n`, and registers
@@ -48999,12 +49131,15 @@ fn exec_create_function(
     args: &[crate::sql::FuncArg],
     ret_type: &str,
     returns_set: bool,
-    lang: crate::sql::FuncLang,
+    lang_name: &str,
     body: &str,
     or_replace: bool,
     volatility: crate::sql::FuncVolatility,
     strict: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.32: PG19 resolves the language first (before return-type
+    // resolution): unknown LANGUAGE is 42883, not a parse error.
+    let lang = resolve_func_lang(lang_name)?;
     // PG19: the return type must exist at CREATE time.
     // v1.00: `RETURNS trigger` is PG19's trigger pseudo-type — valid
     // only for trigger functions (which must be LANGUAGE plpgsql here).
@@ -49098,26 +49233,15 @@ fn exec_create_function(
     } else {
         body
     };
-    let mut parsed: Option<Stmt> = None;
+    let mut parsed: Option<Vec<Stmt>> = None;
     if !is_trigger_fn
         && (lang == crate::sql::FuncLang::Sql || lang == crate::sql::FuncLang::Plpgsql)
         && plpgsql_body.is_none()
     {
-        let mut stmt = crate::sql::parse_statement(body)
-            .map_err(|e| exec_err("42601", format!("syntax error in function body: {:?}", e)))?;
-        // Only SELECT bodies are supported (bounded: no multi-statement
-        // bodies, no utility statements inside functions).
-        if !matches!(stmt, Stmt::Select(_)) {
-            return Err(exec_err(
-                "0A000",
-                "only SELECT function bodies are supported".to_string(),
-            ));
-        }
-        rewrite_func_arg_refs(
-            &mut stmt,
-            &args.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
-        );
-        parsed = Some(stmt);
+        // v1.32: multi-statement SQL bodies (PG19 fmgr_sql_validator):
+        // parse every statement, validate the final one determines the
+        // return type (42P13 on mismatch).
+        parsed = Some(parse_sql_func_body(body, args, ret_type, returns_set)?);
     } else if lang == crate::sql::FuncLang::Internal {
         // v0.86: validate the internal symbol at CREATE (like PG's
         // fmgr lookup); unknown symbols are 0A000.
@@ -49133,9 +49257,13 @@ fn exec_create_function(
     let new_arg_types: Vec<String> = args.iter().map(|a| a.type_name.clone()).collect();
     let prev = find_function_by_signature(eng, name, &new_arg_types);
     if prev.is_some() && !or_replace {
+        // v1.32: PG-verbatim message (pg_proc.c ProcedureCreate).
         return Err(exec_err(
             "42723",
-            format!("function \"{}\" already exists", name),
+            format!(
+                "function \"{}\" already exists with same argument types",
+                name
+            ),
         ));
     }
     // PG19: OR REPLACE with a different return type is 42P13.
@@ -49843,7 +49971,7 @@ pub(crate) fn rebuild_function_bodies(
     arg_names: &[Option<String>],
     body: &str,
     returns_set: bool,
-) -> (Option<Stmt>, Option<crate::sql::PlpgsqlBody>) {
+) -> (Option<Vec<Stmt>>, Option<crate::sql::PlpgsqlBody>) {
     if lang == crate::sql::FuncLang::Plpgsql {
         // v1.03: SETOF bodies skip the single-RETURN desugar exactly as
         // CREATE does (see exec_create_function).
@@ -49860,11 +49988,28 @@ pub(crate) fn rebuild_function_bodies(
         }
         if let Ok(mut stmt) = crate::sql::parse_statement(body) {
             rewrite_func_arg_refs(&mut stmt, arg_names);
-            return (Some(stmt), None);
+            // v1.32: the desugared single SELECT is a one-element body.
+            return (Some(vec![stmt]), None);
         }
         return (None, None);
     }
-    (crate::sql::parse_statement(body).ok(), None)
+    // v1.32: mirror CREATE's multi-statement body parse (see
+    // parse_sql_func_body); validation errors are impossible here
+    // because CREATE already validated this body, so any parse failure
+    // degrades to no parsed body.
+    let mut stmts = Vec::new();
+    for chunk in crate::sql::split_statements(body) {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let Ok(mut stmt) = crate::sql::parse_statement(chunk) else {
+            return (None, None);
+        };
+        rewrite_func_arg_refs(&mut stmt, arg_names);
+        stmts.push(stmt);
+    }
+    (Some(stmts), None)
 }
 
 fn exec_drop_sequence(
@@ -53629,12 +53774,21 @@ mod v097_domain_tests {
             ),
             "0A000"
         );
-        // C is still unsupported at parse time: 42601.
-        let perr = crate::sql::parse_statement(
+        // v1.32: unknown languages now parse (PG19 gram.y accepts any
+        // language name) and fail at CREATE with 42883
+        // (proclang.c get_language_oid), not 42601 at parse time.
+        let stmt = crate::sql::parse_statement(
             "CREATE FUNCTION c97() returns int as 'int f(){}' language c",
         )
-        .unwrap_err();
-        assert_eq!(perr.code, "42601");
+        .expect("unknown language should parse");
+        assert!(matches!(stmt, crate::sql::Stmt::CreateFunction { .. }));
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION c97() returns int as 'int f(){}' language c"
+            ),
+            "42883"
+        );
     }
 
     /// v0.97: desugar_plpgsql_body unit coverage (sql.rs).
@@ -57913,6 +58067,289 @@ mod v131_groups_exclusion_tests {
                 (40, "NULL"),
                 (50, "NULL")
             ])
+        );
+    }
+}
+
+/// v1.32: SQL-language CREATE FUNCTION parity (PG19 fmgr_sql_validator +
+/// fmgr_sql): multi-statement bodies, language resolution at CREATE
+/// (42883), final-statement return-type checks (42P13), duplicate
+/// message wording (42723).
+#[cfg(test)]
+mod v132_sql_function_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    #[test]
+    fn unknown_language_is_42883_at_create() {
+        let mut eng = engine();
+        // v1.32: PG19 resolves the language at CREATE (proclang.c
+        // get_language_oid): unknown languages are 42883, not 42601.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f() RETURNS int LANGUAGE c AS 'SELECT 1';",
+        );
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "language \"c\" does not exist");
+        // Language names resolve case-insensitively (unquoted idents
+        // are folded by the tokenizer).
+        run(
+            &mut eng,
+            "CREATE FUNCTION g() RETURNS int LANGUAGE SQL AS 'SELECT 1';",
+        )
+        .expect("LANGUAGE SQL should resolve");
+        assert_eq!(rows_of(run(&mut eng, "SELECT g();").unwrap()), vec![vec!["1"]]);
+    }
+
+    #[test]
+    fn multi_statement_body_last_statement_wins() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION m() RETURNS int LANGUAGE sql AS 'SELECT 1; SELECT 2; SELECT 3';",
+        )
+        .expect("multi-statement body should create");
+        assert_eq!(rows_of(run(&mut eng, "SELECT m();").unwrap()), vec![vec!["3"]]);
+    }
+
+    #[test]
+    fn multi_statement_body_binds_args_per_statement() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add2(a int, b int) RETURNS int LANGUAGE sql \
+             AS 'SELECT a + b; SELECT a * 10 + b; SELECT $1 + $2';",
+        )
+        .expect("named + positional args should create");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT add2(3, 4);").unwrap()),
+            vec![vec!["7"]]
+        );
+    }
+
+    #[test]
+    fn multi_statement_body_comments_and_empty_chunks() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION cmt() RETURNS int LANGUAGE sql \
+             AS '-- a comment\nSELECT 41;;\n\nSELECT 42;';",
+        )
+        .expect("comments/empty chunks should create");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT cmt();").unwrap()),
+            vec![vec!["42"]]
+        );
+    }
+
+    #[test]
+    fn setof_body_returns_last_statement_rows() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION s() RETURNS SETOF int LANGUAGE sql \
+             AS 'SELECT 1; SELECT generate_series(1, 3);';",
+        )
+        .expect("setof body should create");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT * FROM s();").unwrap()),
+            vec![vec!["1"], vec!["2"], vec!["3"]]
+        );
+    }
+
+    #[test]
+    fn empty_body_is_42p13() {
+        let mut eng = engine();
+        // PG19 check_sql_fn_retval: an empty body is "the last query
+        // rewrote to nothing" -> return type mismatch.
+        let e = err_of(&mut eng, "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS '';");
+        assert_eq!(e.code, "42P13");
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION e2() RETURNS int LANGUAGE sql AS ';;';",
+        );
+        assert_eq!(e.code, "42P13");
+    }
+
+    #[test]
+    fn scalar_two_column_final_is_42p13() {
+        let mut eng = engine();
+        // PG19 check_sql_fn_retval: scalar functions need exactly one
+        // output column from the final statement.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION two() RETURNS int LANGUAGE sql AS 'SELECT 1, 2';",
+        );
+        assert_eq!(e.code, "42P13");
+        // SETOF functions are exempt from the one-column rule.
+        run(
+            &mut eng,
+            "CREATE FUNCTION two_set() RETURNS SETOF int LANGUAGE sql AS 'SELECT 1, 2';",
+        )
+        .expect("SETOF two-column body should create");
+    }
+
+    #[test]
+    fn non_select_body_statement_is_0a000() {
+        let mut eng = engine();
+        // Bounded: PG allows DML bodies, but this engine has no Q-level
+        // DML write path, so non-SELECT body statements are an honest
+        // 0A000 (not a mask).
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION ins() RETURNS int LANGUAGE sql AS 'SELECT 1; INSERT INTO t VALUES (1) RETURNING 1';",
+        );
+        assert_eq!(e.code, "0A000");
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION dd() RETURNS int LANGUAGE sql AS 'DROP TABLE t;';",
+        );
+        assert_eq!(e.code, "0A000");
+    }
+
+    #[test]
+    fn body_syntax_error_transposed_to_create() {
+        let mut eng = engine();
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION bad() RETURNS int LANGUAGE sql AS 'SELECT FROM WHERE';",
+        );
+        assert_eq!(e.code, "42601");
+        assert!(e.message.contains("function body"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn duplicate_message_is_pg_verbatim() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION d() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+        )
+        .unwrap();
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION d() RETURNS int LANGUAGE sql AS 'SELECT 2';",
+        );
+        assert_eq!(e.code, "42723");
+        assert_eq!(
+            e.message,
+            "function \"d\" already exists with same argument types"
+        );
+        // OR REPLACE succeeds and swaps the body.
+        run(
+            &mut eng,
+            "CREATE OR REPLACE FUNCTION d() RETURNS int LANGUAGE sql AS 'SELECT 2;';",
+        )
+        .unwrap();
+        assert_eq!(rows_of(run(&mut eng, "SELECT d();").unwrap()), vec![vec!["2"]]);
+    }
+
+    #[test]
+    fn drop_wrong_signature_is_42883() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION w(int) RETURNS int LANGUAGE sql AS 'SELECT $1';",
+        )
+        .unwrap();
+        let e = err_of(&mut eng, "DROP FUNCTION w(text);");
+        assert_eq!(e.code, "42883");
+        run(&mut eng, "DROP FUNCTION w(int);").unwrap();
+    }
+
+    #[test]
+    fn strict_null_short_circuits_multi_statement() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION sn(int) RETURNS int LANGUAGE sql STRICT AS 'SELECT $1; SELECT $1 + 1';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT sn(NULL);").unwrap()),
+            vec![vec!["NULL"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT sn(41);").unwrap()),
+            vec![vec!["42"]]
+        );
+    }
+
+    #[test]
+    fn volatility_recorded_and_callable() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION imm() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 7;';",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION stb() RETURNS int LANGUAGE sql STABLE AS 'SELECT 8; SELECT 9;';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT imm(), stb();").unwrap()),
+            vec![vec!["7", "9"]]
+        );
+    }
+
+    #[test]
+    fn single_statement_still_works() {
+        let mut eng = engine();
+        // Regression: the old single-SELECT path must be unchanged.
+        run(
+            &mut eng,
+            "CREATE FUNCTION one(a int) RETURNS int LANGUAGE sql AS 'SELECT a * 2';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT one(21);").unwrap()),
+            vec![vec!["42"]]
         );
     }
 }

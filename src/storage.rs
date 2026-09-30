@@ -5033,8 +5033,10 @@ pub struct ShellType {
 /// v0.86: a user-defined function definition. `arg_types` / `ret_type`
 /// are stored as written and resolved at call time (so a type created
 /// after the function still resolves). `body` is the raw body string;
-/// `parsed` is the body parsed once at CREATE time (re-parsed from
-/// `body` after WAL replay / checkpoint restore).
+/// `parsed` is the body parsed once at CREATE time into its statement
+/// list (v1.32: SQL bodies may hold multiple statements; the executor
+/// runs them in order and takes the last statement's result).
+/// Re-parsed from `body` after WAL replay / checkpoint restore.
 #[derive(Clone, Debug)]
 pub struct FuncDef {
     pub name: String,
@@ -5044,7 +5046,7 @@ pub struct FuncDef {
     pub returns_set: bool,
     pub lang: crate::sql::FuncLang,
     pub body: String,
-    pub parsed: Option<crate::sql::Stmt>,
+    pub parsed: Option<Vec<crate::sql::Stmt>>,
     /// v1.01: parsed multi-statement plpgsql body (statement sequences +
     /// EXCEPTION blocks). `Some` only when the v0.97 single-RETURN
     /// desugar did not apply; then `body` holds the original source and
