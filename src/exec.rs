@@ -494,6 +494,12 @@ fn execute_inner(
                     hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                     hashed_in: Rc::new(RefCell::new(Vec::new())),
                     pending_updates: None,
+                    write: Some(qwrite_from_ctx(
+                        &mut *ctx.writes,
+                        ctx.write_xid,
+                        ctx.level,
+                        ctx.default_toast_compression,
+                    )),
                 };
                 run_select(&mut q, sel, &[])?
             };
@@ -2348,6 +2354,7 @@ fn eval_partition_key_expr(
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
+        write: None,
     };
     let scope = Scope {
         schema,
@@ -3652,6 +3659,7 @@ fn eval_default(
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
+                write: None,
             };
             let v = eval_expr(&mut q, &[], e)?;
             coerce_value(v, ctype, cname)
@@ -3868,6 +3876,7 @@ fn check_row_constraints(
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
+                write: None,
             };
             check_domain_value(&mut q, dname, &values[i], is_elem)?;
         }
@@ -3908,6 +3917,7 @@ fn check_row_constraints(
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
+            write: None,
         };
         let frame = Scope {
             schema: &schema,
@@ -4683,7 +4693,7 @@ fn coerce_value(v: Value, col_type: &ColType, col_name: &str) -> Result<Value, E
 /// which runs them for their side effects and validation.
 fn materialize_dml_ctes(
     eng: &mut Engine,
-    ctx: &StmtCtx,
+    ctx: &mut StmtCtx,
     with: &[CteDef],
 ) -> Result<Vec<Rc<CteBinding>>, ExecError> {
     let mut lock_ids = Vec::new();
@@ -4704,6 +4714,12 @@ fn materialize_dml_ctes(
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
+        write: Some(qwrite_from_ctx(
+            &mut *ctx.writes,
+            ctx.write_xid,
+            ctx.level,
+            ctx.default_toast_compression,
+        )),
     };
     materialize_ctes(&mut q, with)?;
     Ok(q.ctes)
@@ -4806,12 +4822,17 @@ fn project_returning(
     scopes: &[(&[QCol], &[Value])],
     returning: &[SelectItem],
     ctes: &[Rc<CteBinding>],
+    // v1.33: statement write context (see `eval_dml_expr`).
+    mut write: Option<QWrite<'_>>,
 ) -> Result<Vec<Value>, ExecError> {
     let mut out = Vec::with_capacity(returning.len());
     for item in returning {
         if let SelectItem::Expr { expr, .. } = item {
+            // v1.33: reborrow the write context per row (it is consumed
+            // by the move into `eval_dml_expr`).
+            let w = write.as_mut().map(QWrite::reborrow);
             out.push(eval_dml_expr(
-                eng, snap, own, session, role, scopes, expr, ctes, None,
+                eng, snap, own, session, role, scopes, expr, ctes, None, w,
             )?);
         }
     }
@@ -5721,6 +5742,12 @@ fn exec_create_table_as(
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
+            write: Some(qwrite_from_ctx(
+                &mut *ctx.writes,
+                ctx.write_xid,
+                ctx.level,
+                ctx.default_toast_compression,
+            )),
         };
         run_select(&mut q, select, &[])?
     };
@@ -6161,7 +6188,7 @@ fn exec_insert(
     }
     // v0.10: WITH materialization (validated; plain INSERT cannot reference
     // the CTEs, but subqueries in RETURNING/ON CONFLICT can).
-    let ctes = materialize_dml_ctes(eng, ctx, with)?;
+    let ctes = materialize_dml_ctes(eng, &mut *ctx, with)?;
     // v0.10: INSERT...SELECT: run the SELECT and convert rows to insert
     // values. The CTEs are already materialized above.
     let select_rows: Option<Vec<Row>> = if let Some(sel) = select {
@@ -6183,6 +6210,12 @@ fn exec_insert(
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
+            write: Some(qwrite_from_ctx(
+                &mut *ctx.writes,
+                ctx.write_xid,
+                ctx.level,
+                ctx.default_toast_compression,
+            )),
         };
         let out = run_select(&mut q, sel, &[])?;
         Some(out.rows)
@@ -6307,6 +6340,12 @@ fn exec_insert(
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                         hashed_in: Rc::new(RefCell::new(Vec::new())),
                         pending_updates: None,
+                        write: Some(qwrite_from_ctx(
+                            &mut *ctx.writes,
+                            ctx.write_xid,
+                            ctx.level,
+                            ctx.default_toast_compression,
+                        )),
                     };
                     targets
                         .iter()
@@ -6428,6 +6467,12 @@ fn exec_insert(
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
+                write: Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             };
             built = Vec::with_capacity(rows.len());
             // v0.72: expand top-level set-returning calls in VALUES
@@ -6847,6 +6892,12 @@ fn exec_insert(
                             w,
                             &ctes,
                             None,
+                            Some(qwrite_from_ctx(
+                                &mut *ctx.writes,
+                                ctx.write_xid,
+                                ctx.level,
+                                ctx.default_toast_compression,
+                            )),
                         )?;
                         if v != Value::Bool(true) {
                             continue;
@@ -6864,6 +6915,12 @@ fn exec_insert(
                             expr,
                             &ctes,
                             None,
+                            Some(qwrite_from_ctx(
+                                &mut *ctx.writes,
+                                ctx.write_xid,
+                                ctx.level,
+                                ctx.default_toast_compression,
+                            )),
                         )?;
                         let (cname, ctype) = &meta_for_upsert.columns[ci];
                         new_values[ci] = coerce_value(v, ctype, cname)?;
@@ -7086,6 +7143,12 @@ fn exec_insert(
                 &[(&schema, values)],
                 &returning_expanded,
                 &ctes,
+                Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             )?));
         }
         (cols, out_rows)
@@ -7268,7 +7331,7 @@ fn exec_update(
     }
     // v0.10: WITH materialization; the CTEs are visible to subqueries in
     // SET/WHERE and in the RETURNING list.
-    let ctes = materialize_dml_ctes(eng, ctx, with)?;
+    let ctes = materialize_dml_ctes(eng, &mut *ctx, with)?;
     // v0.89: statement-local UPDATE overlay — rows already planned by
     // this UPDATE, as (destination leaf table, row-version id, new
     // values in destination order). Volatile SQL function bodies called
@@ -7396,6 +7459,12 @@ fn exec_update(
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
+                write: Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             };
             let (fschema, frows) = build_from(&mut q, &[], from, None, false, None, None)?;
             Some((fschema, frows))
@@ -7439,6 +7508,12 @@ fn exec_update(
                                 pred,
                                 &ctes,
                                 Some(pending.clone()),
+                                Some(qwrite_from_ctx(
+                                    &mut *ctx.writes,
+                                    ctx.write_xid,
+                                    ctx.level,
+                                    ctx.default_toast_compression,
+                                )),
                             )?;
                             v == Value::Bool(true)
                         }
@@ -7470,6 +7545,12 @@ fn exec_update(
                                     pred,
                                     &ctes,
                                     Some(pending.clone()),
+                                    Some(qwrite_from_ctx(
+                                        &mut *ctx.writes,
+                                        ctx.write_xid,
+                                        ctx.level,
+                                        ctx.default_toast_compression,
+                                    )),
                                 )?;
                                 v == Value::Bool(true)
                             }
@@ -7502,6 +7583,12 @@ fn exec_update(
                         expr,
                         &ctes,
                         Some(pending.clone()),
+                        Some(qwrite_from_ctx(
+                            &mut *ctx.writes,
+                            ctx.write_xid,
+                            ctx.level,
+                            ctx.default_toast_compression,
+                        )),
                     )?,
                     Some((fschema, _)) => {
                         let frow = from_row.as_ref().expect("matched row has FROM data");
@@ -7521,6 +7608,12 @@ fn exec_update(
                             expr,
                             &ctes,
                             Some(pending.clone()),
+                            Some(qwrite_from_ctx(
+                                &mut *ctx.writes,
+                                ctx.write_xid,
+                                ctx.level,
+                                ctx.default_toast_compression,
+                            )),
                         )?
                     }
                 };
@@ -7903,6 +7996,12 @@ fn exec_update(
                 &scopes,
                 &returning_expanded,
                 &ctes,
+                Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             )?));
         }
         (cols, out_rows)
@@ -7931,7 +8030,7 @@ fn exec_delete(
     let qual = alias.as_deref().unwrap_or(table);
     // v0.10: WITH materialization (validated; plain DELETE cannot reference
     // the CTEs, but the RETURNING list can via subqueries).
-    let ctes = materialize_dml_ctes(eng, ctx, with)?;
+    let ctes = materialize_dml_ctes(eng, &mut *ctx, with)?;
     // Plan first for statement atomicity (WHERE type errors must not
     // leave half the rows deleted). v0.70: a partitioned target scans
     // every leaf; the plan records (leaf, id, xmax, values in parent
@@ -8036,6 +8135,12 @@ fn exec_delete(
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
+                write: Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             };
             let (uschema, urows) = build_from(&mut q, &[], using, None, false, None, None)?;
             Some((uschema, urows))
@@ -8069,6 +8174,12 @@ fn exec_delete(
                                 pred,
                                 &ctes,
                                 None,
+                                Some(qwrite_from_ctx(
+                                    &mut *ctx.writes,
+                                    ctx.write_xid,
+                                    ctx.level,
+                                    ctx.default_toast_compression,
+                                )),
                             )?;
                             if v == Value::Bool(true) {
                                 matched = true;
@@ -8092,6 +8203,12 @@ fn exec_delete(
                             pred,
                             &ctes,
                             None,
+                            Some(qwrite_from_ctx(
+                                &mut *ctx.writes,
+                                ctx.write_xid,
+                                ctx.level,
+                                ctx.default_toast_compression,
+                            )),
                         )?;
                         (v == Value::Bool(true), None)
                     }
@@ -8270,6 +8387,12 @@ fn exec_delete(
                 &[(&cschema, &cvalues)],
                 &returning_expanded,
                 &ctes,
+                Some(qwrite_from_ctx(
+                    &mut *ctx.writes,
+                    ctx.write_xid,
+                    ctx.level,
+                    ctx.default_toast_compression,
+                )),
             )?));
         }
         (cols, out_rows)
@@ -11931,6 +12054,12 @@ fn exec_explain_analyze(
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
+            write: Some(qwrite_from_ctx(
+                &mut *ctx.writes,
+                ctx.write_xid,
+                ctx.level,
+                ctx.default_toast_compression,
+            )),
         };
         explain_rows(&mut q, &[], sel, true, costs)?
     };
@@ -13804,6 +13933,61 @@ struct Q<'a, 'b> {
     /// a mutation: nothing is written to storage until the whole
     /// UPDATE succeeds, so statement atomicity is preserved.
     pending_updates: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
+    /// v1.33: statement write context for DML inside SQL function
+    /// bodies (see `QWrite`). Forwarded through every nested query
+    /// level of the same statement; `None` only for
+    /// statement-detached evaluations (partition-key probes, column
+    /// defaults, constraint checks). A SQL function with a DML body
+    /// called from such a level fails with an honest 0A000.
+    write: Option<QWrite<'a>>,
+}
+
+/// v1.33: statement write context, threaded through `Q` so SQL
+/// function bodies can execute DML. PG19 `fmgr_sql`
+/// (executor/functions.c) runs *every* body statement — including
+/// INSERT/UPDATE/DELETE — in the caller's transaction, but the body
+/// executor only carries `&mut Q`, so the statement's write log and
+/// write-path parameters ride along on `Q`. The `&mut` reborrow —
+/// never `Rc<RefCell>` — keeps nested function DML (a DML-bodied
+/// function called while evaluating another function body's DML
+/// statement) sound: reborrows nest linearly, so write order is
+/// preserved and no runtime borrow panic is possible.
+struct QWrite<'a> {
+    writes: &'a mut Vec<WriteOp>,
+    write_xid: u64,
+    level: crate::sql::IsolationLevel,
+    default_toast_compression: crate::storage::ToastCompression,
+}
+
+impl<'a> QWrite<'a> {
+    /// Reborrow for a child query level.
+    fn reborrow(&mut self) -> QWrite<'_> {
+        QWrite {
+            writes: &mut *self.writes,
+            write_xid: self.write_xid,
+            level: self.level,
+            default_toast_compression: self.default_toast_compression,
+        }
+    }
+}
+
+/// v1.33: build the statement write context from the statement
+/// context (statement entry points). Takes the individual fields —
+/// NOT `&mut StmtCtx` — so the mutable borrow covers only
+/// `ctx.writes` and the caller's other `ctx` fields (`own`,
+/// `session`, `role`, ...) stay usable while the `Q` is alive.
+fn qwrite_from_ctx<'a>(
+    writes: &'a mut Vec<WriteOp>,
+    write_xid: u64,
+    level: IsolationLevel,
+    default_toast_compression: crate::storage::ToastCompression,
+) -> QWrite<'a> {
+    QWrite {
+        writes,
+        write_xid,
+        level,
+        default_toast_compression,
+    }
 }
 
 /// v0.10: a materialized Common Table Expression: name, output schema and
@@ -20066,6 +20250,7 @@ fn eval_lateral_right(
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -20842,6 +21027,7 @@ fn build_source(
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, outer)?
             };
@@ -26104,6 +26290,7 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
+            write: q.write.as_mut().map(QWrite::reborrow),
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -26551,6 +26738,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -26591,6 +26779,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -26669,6 +26858,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -27701,6 +27891,7 @@ fn eval_hashed_in(
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
+                    write: q.write.as_mut().map(QWrite::reborrow),
                 };
                 run_select(&mut sub_q, sub, scopes)?
             };
@@ -28024,6 +28215,7 @@ fn eval_in_value(
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
+            write: q.write.as_mut().map(QWrite::reborrow),
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -28181,6 +28373,7 @@ fn eval_quantified_value(
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
+            write: q.write.as_mut().map(QWrite::reborrow),
         };
         run_select(&mut sub_q, sub, scopes)?
     };
@@ -29049,6 +29242,8 @@ fn eval_update_expr(
     ctes: &[Rc<CteBinding>],
     // v0.89: statement-local UPDATE overlay (volatile functions only).
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
+    // v1.33: statement write context (see `eval_dml_expr`).
+    write: Option<QWrite<'_>>,
 ) -> Result<Value, ExecError> {
     eval_dml_expr(
         eng,
@@ -29060,6 +29255,7 @@ fn eval_update_expr(
         e,
         ctes,
         pending,
+        write,
     )
 }
 
@@ -29078,6 +29274,10 @@ fn eval_dml_expr(
     ctes: &[Rc<CteBinding>],
     // v0.89: statement-local UPDATE overlay (volatile functions only).
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
+    // v1.33: statement write context, so DML inside SQL function bodies
+    // called from DML expressions (e.g. `INSERT INTO t SELECT f()`
+    // where `f` performs DML) reaches the statement's write log.
+    write: Option<QWrite<'_>>,
 ) -> Result<Value, ExecError> {
     let mut lock_ids = Vec::new();
     let mut q = Q {
@@ -29099,6 +29299,7 @@ fn eval_dml_expr(
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: pending,
+        write,
     };
     let scopes: Vec<Scope> = frames
         .iter()
@@ -31974,27 +32175,43 @@ fn run_func_body(
         // already-processed rows (caller-gated); stable/immutable
         // bodies see the statement snapshot (None).
         pending_updates: pending,
+        write: q.write.as_mut().map(QWrite::reborrow),
     };
     // v1.32: PG19 executes each body statement in order in the
     // caller's snapshot; only the last statement's result is the
     // function result (non-final results are discarded).
+    // v1.33: DML body statements execute through the statement's
+    // write context (`QWrite`): their effects land in the
+    // statement's write log, so statement atomicity (autocommit undo
+    // / transaction-abort undo) and commit-time WAL cover them
+    // exactly like inline DML. New row versions are stamped with
+    // `write_xid` (a member of `all_xids`), so later body statements
+    // see earlier writes under the statement snapshot — this
+    // engine's equivalent of PG19's CommandCounterIncrement between
+    // body statements (executor/functions.c).
     let mut last_out: Option<SelectOut> = None;
     for s in body.iter() {
-        let Stmt::Select(sel) = s else {
-            return Err(exec_err(
-                "XX000",
-                format!("function \"{}\" body statement is not a SELECT", fdef.name),
-            ));
-        };
-        let mut stmt = Stmt::Select(sel.clone());
+        let mut stmt = s.clone();
         subst_params(&mut stmt, &params)?;
-        let Stmt::Select(bound) = stmt else {
-            return Err(exec_err(
-                "XX000",
-                "function body lost its SELECT".to_string(),
-            ));
-        };
-        last_out = Some(run_select(&mut call_q, &bound, scopes)?);
+        match stmt {
+            Stmt::Select(bound) => {
+                last_out = Some(run_select(&mut call_q, &bound, scopes)?);
+            }
+            Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
+                last_out = Some(run_func_dml(&mut call_q, &stmt, &fdef.name)?);
+            }
+            // Unreachable: CREATE validated every body statement is
+            // SELECT/INSERT/UPDATE/DELETE (0A000 otherwise).
+            _ => {
+                return Err(exec_err(
+                    "XX000",
+                    format!(
+                        "function \"{}\" body statement is not SELECT/INSERT/UPDATE/DELETE",
+                        fdef.name
+                    ),
+                ));
+            }
+        }
     }
     // CREATE guarantees a non-empty statement list (42P13 on empty).
     last_out.ok_or_else(|| {
@@ -32003,6 +32220,83 @@ fn run_func_body(
             format!("function \"{}\" has an empty parsed body", fdef.name),
         )
     })
+}
+
+/// v1.33: execute one DML statement of a SQL function body (PG19
+/// `fmgr_sql` runs every body statement, including DML, in the
+/// caller's transaction). Builds a real `StmtCtx` from the call
+/// query level plus the statement write context and runs the
+/// statement through `execute_inner` — deliberately NOT `execute()`:
+/// the NOTICE_SINK thread-local installed by the outer statement
+/// must keep receiving notices (a nested `execute()` would swap it
+/// out), so notices the DML statement pushes directly to
+/// `ctx.notices` (e.g. trigger RAISE NOTICE) are drained into the
+/// sink here via `push_notice`, exactly as the outer statement's
+/// own notices are. Returns the DML's rows as a `SelectOut`
+/// (RETURNING rows, possibly empty); non-final statements' rows are
+/// discarded by the caller. The v0.89 `pending_updates` overlay is
+/// NOT consulted by body DML — an honest bound of this version.
+fn run_func_dml(call_q: &mut Q, stmt: &Stmt, func_name: &str) -> Result<SelectOut, ExecError> {
+    let Some(w) = call_q.write.as_mut().map(QWrite::reborrow) else {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "DML is not supported in function \"{}\" here: the calling query level has no statement write context",
+                func_name
+            ),
+        ));
+    };
+    // PG19: a read-only transaction rejects DML inside function
+    // bodies just like top-level DML (25006). The server's
+    // statement-level `read_only_violation` check cannot see inside
+    // function bodies, so enforce it here; the v0.89 temporary-table
+    // carve-out applies (only permanent relations are protected).
+    if call_q.read_only {
+        let (cmd, target) = match stmt {
+            Stmt::Insert { table, .. } => ("INSERT", table.as_str()),
+            Stmt::Update { table, .. } => ("UPDATE", table.as_str()),
+            Stmt::Delete { table, .. } => ("DELETE", table.as_str()),
+            // Unreachable: run_func_dml only takes DML.
+            _ => ("DML", ""),
+        };
+        if !call_q.eng.db.is_temp_table(call_q.session, target) {
+            return Err(exec_err(
+                "25006",
+                format!("cannot execute {} in a read-only transaction", cmd),
+            ));
+        }
+    }
+    let mut dml_ctx = StmtCtx {
+        snap: call_q.snap,
+        own: call_q.own,
+        write_xid: w.write_xid,
+        all_xids: call_q.all_xids.clone(),
+        level: w.level,
+        writes: &mut *w.writes,
+        session: call_q.session,
+        role: call_q.role,
+        read_only: call_q.read_only,
+        default_toast_compression: w.default_toast_compression,
+        notices: Vec::new(),
+    };
+    let out = execute_inner(&mut *call_q.eng, &mut dml_ctx, stmt)?;
+    // Deliver trigger/RAISE notices through the statement-scoped sink
+    // (PG19 emits them as generated, even if the statement later
+    // fails — the sink is drained by the outer `execute()`).
+    for msg in dml_ctx.notices.drain(..) {
+        push_notice(msg);
+    }
+    match out {
+        ExecResult::Dml { columns, rows, .. } => Ok(SelectOut { columns, rows }),
+        // Unreachable: the DML executors always return `Dml`.
+        _ => Err(exec_err(
+            "XX000",
+            format!(
+                "function \"{}\" body DML did not produce a DML result",
+                func_name
+            ),
+        )),
+    }
 }
 
 /// v1.03: how a plpgsql statement list finished executing. PG's
@@ -32255,6 +32549,7 @@ fn run_plpgsql_body(
         // already-processed rows (caller-gated); stable/immutable
         // bodies see the statement snapshot (None).
         pending_updates: pending,
+        write: q.write.as_mut().map(QWrite::reborrow),
     };
     let nargs = params.len();
     let mut run = PlpgsqlRun {
@@ -41702,7 +41997,7 @@ pub fn eval_execute_arg(
     role: &str,
     e: &Expr,
 ) -> Result<Value, ExecError> {
-    eval_dml_expr(eng, snap, own, session, role, &[], e, &[], None)
+    eval_dml_expr(eng, snap, own, session, role, &[], e, &[], None, None)
 }
 
 /// Replace every `$N` in the statement with its bound value's literal.
@@ -49021,10 +49316,11 @@ fn resolve_func_lang(lang_name: &str) -> Result<crate::sql::FuncLang, ExecError>
 }
 
 /// v1.32: the SQLSTATE-42P13 detail phrases below mirror PG19
-/// `check_sql_fn_retval` (executor/functions.c); the bounded engine
-/// rejects non-SELECT body statements with 0A000 since PG's DML/utility
-/// bodies need a write path the function-body executor does not have
-/// (see `run_func_body`).
+/// `check_sql_fn_retval` (executor/functions.c); v1.32 rejected
+/// non-SELECT body statements with 0A000 since the body executor had
+/// no Q-level DML write path — v1.33 adds it (see `QWrite`), so
+/// INSERT/UPDATE/DELETE bodies are accepted and only utility/DDL
+/// statements stay 0A000.
 fn sql_func_body_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::Select(_) => "SELECT",
@@ -49035,15 +49331,31 @@ fn sql_func_body_kind(stmt: &Stmt) -> &'static str {
     }
 }
 
+/// v1.33: PG19 `check_sql_fn_retval` — the final statement must be
+/// SELECT or INSERT/UPDATE/DELETE/MERGE with RETURNING, else 42P13
+/// with PG's verbatim detail. (MERGE has no engine support; the
+/// message is PG's own.)
+fn sql_func_final_42p13(ret_type: &str) -> ExecError {
+    exec_err_detail(
+        "42P13",
+        format!(
+            "return type mismatch in function declared to return {}",
+            ret_type
+        ),
+        "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+    )
+}
+
 /// v1.32: parse + validate a SQL-language function body at CREATE time
 /// (PG19 `fmgr_sql_validator`: `pg_parse_query` over the whole body,
 /// then `check_sql_fn_statements` / `check_sql_fn_retval`). Returns the
 /// parsed statements; the executor runs them in order and takes the
 /// last statement's result as the return value (PG19 `fmgr_sql`).
-/// Bounded: only SELECT statements are supported — DML/utility bodies
-/// are an honest 0A000 (the body executor has no Q-level DML write
-/// path). Named argument references are rewritten to `$n` per
-/// statement, exactly as the old single-statement path did.
+/// v1.33: INSERT/UPDATE/DELETE statements are accepted (they execute
+/// via the statement's write context, see `QWrite`); utility/DDL
+/// statements stay an honest 0A000. Named argument references are
+/// rewritten to `$n` per statement, exactly as the old
+/// single-statement path did.
 fn parse_sql_func_body(
     body: &str,
     args: &[crate::sql::FuncArg],
@@ -49065,11 +49377,14 @@ fn parse_sql_func_body(
                 format!("syntax error in function body: {}", e.message),
             )
         })?;
-        if !matches!(stmt, Stmt::Select(_)) {
+        if !matches!(
+            stmt,
+            Stmt::Select(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
+        ) {
             return Err(exec_err(
                 "0A000",
                 format!(
-                    "{} is not supported in SQL function bodies (only SELECT)",
+                    "{} is not supported in SQL function bodies (only SELECT, INSERT, UPDATE, DELETE)",
                     sql_func_body_kind(&stmt)
                 ),
             ));
@@ -49082,37 +49397,56 @@ fn parse_sql_func_body(
     // carve-out: RETURNS void is 42704 in this engine today, a
     // separate type-system gap.)
     let Some(last) = stmts.last() else {
-        return Err(exec_err(
-            "42P13",
-            format!(
-                "return type mismatch in function declared to return {}",
-                ret_type
-            ),
-        ));
+        return Err(sql_func_final_42p13(ret_type));
     };
+    // PG19 check_sql_fn_retval: the final statement must be SELECT or
+    // INSERT/UPDATE/DELETE/MERGE with RETURNING. (A final DML without
+    // RETURNING returns no rows, so it cannot satisfy a declared
+    // return type.)
+    let final_returns_rows = match last {
+        Stmt::Select(_) => true,
+        Stmt::Insert { returning, .. }
+        | Stmt::Update { returning, .. }
+        | Stmt::Delete { returning, .. } => !returning.is_empty(),
+        // Unreachable: non-SELECT/DML statements are rejected above.
+        _ => false,
+    };
+    if !final_returns_rows {
+        return Err(sql_func_final_42p13(ret_type));
+    }
     // PG19 check_sql_fn_retval, scalar case: the final statement must
     // return exactly one column. Enforced here only when the column
     // count is syntactically unambiguous (plain SELECT, no `*`,
-    // no set operations); ambiguous shapes defer to the existing
-    // call-time check.
+    // no set operations; DML RETURNING list with no `*`); ambiguous
+    // shapes defer to the existing call-time check.
     if !returns_set {
-        if let Stmt::Select(sel) = last {
-            let unambiguous = sel.set_op.is_none()
-                && !sel.items.iter().any(|i| {
+        let unambiguous_count = match last {
+            Stmt::Select(sel) => {
+                let unambiguous = sel.set_op.is_none()
+                    && !sel.items.iter().any(|i| {
+                        matches!(
+                            i,
+                            crate::sql::SelectItem::All | crate::sql::SelectItem::AllOf(_)
+                        )
+                    });
+                unambiguous.then_some(sel.items.len())
+            }
+            Stmt::Insert { returning, .. }
+            | Stmt::Update { returning, .. }
+            | Stmt::Delete { returning, .. } => {
+                let unambiguous = !returning.iter().any(|i| {
                     matches!(
                         i,
                         crate::sql::SelectItem::All | crate::sql::SelectItem::AllOf(_)
                     )
                 });
-            if unambiguous && sel.items.len() != 1 {
-                return Err(exec_err(
-                    "42P13",
-                    format!(
-                        "return type mismatch in function declared to return {}",
-                        ret_type
-                    ),
-                ));
+                unambiguous.then_some(returning.len())
             }
+            // Unreachable (see above).
+            _ => None,
+        };
+        if unambiguous_count.is_some_and(|n| n != 1) {
+            return Err(sql_func_final_42p13(ret_type));
         }
     }
     Ok(stmts)
@@ -49869,17 +50203,104 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
 /// `Param(n)`. Only qualifiers/names that exactly match an argument
 /// name are rewritten; real table references are untouched.
 pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>]) {
-    // Bodies are SELECTs (validated at CREATE); walk the select list
-    // and WHERE. A full Stmt-wide walk is unnecessary for the bounded
-    // body shapes we accept.
-    if let Stmt::Select(sel) = stmt {
-        for item in &mut sel.items {
-            if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                rewrite_func_arg_expr(expr, arg_names);
+    // Bodies are SELECT/INSERT/UPDATE/DELETE (validated at CREATE);
+    // walk the top-level expression positions. A full Stmt-wide walk
+    // is unnecessary for the bounded body shapes we accept (no
+    // subquery recursion, like the SELECT path).
+    match stmt {
+        Stmt::Select(sel) => rewrite_select_refs(sel, arg_names),
+        Stmt::Insert {
+            rows,
+            select,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            for row in rows {
+                for v in row {
+                    if let crate::sql::InsertValue::Expr(e) = v {
+                        rewrite_func_arg_expr(e, arg_names);
+                    }
+                }
             }
+            if let Some(sel) = select {
+                rewrite_select_refs(sel, arg_names);
+            }
+            if let Some(oc) = on_conflict {
+                if let crate::sql::ConflictAction::DoUpdate { sets, where_ } = &mut oc.action {
+                    for (_, e) in sets.iter_mut() {
+                        rewrite_func_arg_expr(e, arg_names);
+                    }
+                    if let Some(w) = where_ {
+                        rewrite_func_arg_expr(w, arg_names);
+                    }
+                }
+            }
+            rewrite_returning_refs(returning, arg_names);
         }
-        if let Some(w) = &mut sel.where_ {
-            rewrite_func_arg_expr(w, arg_names);
+        Stmt::Update {
+            sets,
+            from,
+            where_,
+            returning,
+            ..
+        } => {
+            for (_, e) in sets.iter_mut() {
+                rewrite_func_arg_expr(e, arg_names);
+            }
+            rewrite_from_fn_refs(from, arg_names);
+            if let Some(w) = where_ {
+                rewrite_func_arg_expr(w, arg_names);
+            }
+            rewrite_returning_refs(returning, arg_names);
+        }
+        Stmt::Delete {
+            using,
+            where_,
+            returning,
+            ..
+        } => {
+            rewrite_from_fn_refs(using, arg_names);
+            if let Some(w) = where_ {
+                rewrite_func_arg_expr(w, arg_names);
+            }
+            rewrite_returning_refs(returning, arg_names);
+        }
+        _ => {}
+    }
+}
+
+/// v1.33: the SELECT half of `rewrite_func_arg_refs` (select list +
+/// WHERE), shared with DML bodies' nested SELECT sources.
+fn rewrite_select_refs(sel: &mut crate::sql::SelectStmt, arg_names: &[Option<String>]) {
+    for item in &mut sel.items {
+        if let crate::sql::SelectItem::Expr { expr, .. } = item {
+            rewrite_func_arg_expr(expr, arg_names);
+        }
+    }
+    if let Some(w) = &mut sel.where_ {
+        rewrite_func_arg_expr(w, arg_names);
+    }
+}
+
+/// v1.33: rewrite named arg references in a DML RETURNING list.
+fn rewrite_returning_refs(returning: &mut [crate::sql::SelectItem], arg_names: &[Option<String>]) {
+    for item in returning {
+        if let crate::sql::SelectItem::Expr { expr, .. } = item {
+            rewrite_func_arg_expr(expr, arg_names);
+        }
+    }
+}
+
+/// v1.33: rewrite named arg references in FROM/USING function call
+/// arguments (e.g. `generate_series(1, n)`), mirroring the plpgsql
+/// body rewriter's FROM walk.
+fn rewrite_from_fn_refs(from: &mut [crate::sql::FromItem], arg_names: &[Option<String>]) {
+    for f in from {
+        if let crate::sql::FromItem::Function { args, .. } = f {
+            for a in args.iter_mut() {
+                rewrite_func_arg_expr(a, arg_names);
+            }
         }
     }
 }
@@ -58236,14 +58657,16 @@ mod v132_sql_function_tests {
     #[test]
     fn non_select_body_statement_is_0a000() {
         let mut eng = engine();
-        // Bounded: PG allows DML bodies, but this engine has no Q-level
-        // DML write path, so non-SELECT body statements are an honest
-        // 0A000 (not a mask).
-        let e = err_of(
+        // v1.33: PG allows DML bodies and this engine now has a
+        // Q-level DML write path (`QWrite`), so INSERT/UPDATE/DELETE
+        // body statements are accepted at CREATE...
+        run(
             &mut eng,
             "CREATE FUNCTION ins() RETURNS int LANGUAGE sql AS 'SELECT 1; INSERT INTO t VALUES (1) RETURNING 1';",
-        );
-        assert_eq!(e.code, "0A000");
+        )
+        .expect("v1.33 accepts DML function bodies");
+        // ...while utility statements stay an honest 0A000 (not a
+        // mask).
         let e = err_of(
             &mut eng,
             "CREATE FUNCTION dd() RETURNS int LANGUAGE sql AS 'DROP TABLE t;';",
@@ -58353,3 +58776,321 @@ mod v132_sql_function_tests {
         );
     }
 }
+
+/// v1.33: DML bodies in SQL-language functions (PG19 `fmgr_sql`
+/// executes every body statement in order; `check_sql_fn_retval`
+/// requires the final statement to be SELECT or
+/// INSERT/UPDATE/DELETE/MERGE RETURNING). Body DML runs through the
+/// statement's write context (`QWrite`): effects are statement-atomic,
+/// visible to later body statements (PG19's CommandCounterIncrement
+/// between statements), blocked in read-only transactions (25006),
+/// and nestable (reborrowed write contexts).
+#[cfg(test)]
+mod v133_dml_function_bodies {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run_with(eng: &mut Engine, sql: &str, read_only: bool) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        let r = execute(eng, &mut ctx, &stmt);
+        // Mirror production `autocommit_execute`: a failed statement
+        // undoes its write log (statement atomicity).
+        if r.is_err() {
+            for op in writes.iter().rev() {
+                crate::storage::undo_write_op(eng, &[9], op);
+            }
+        }
+        r
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        run_with(eng, sql, false)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_of(eng: &mut Engine, sql: &str) -> ExecError {
+        run(eng, sql).unwrap_err()
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE t133(a int);").unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f133_ins(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v) RETURNING a';",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn insert_body_returning_is_the_result() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // The final INSERT...RETURNING's rows are the function result.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_ins(42);").unwrap()),
+            vec![vec!["42"]]
+        );
+        // ...and the write really landed in the table.
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()),
+            vec![vec!["42"]]
+        );
+    }
+
+    #[test]
+    fn later_body_statements_see_earlier_writes() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // PG19 runs CommandCounterIncrement between body statements;
+        // here the shared write_xid/all_xids give the same visibility.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_two(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v); SELECT a FROM t133 WHERE a = v';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_two(7);").unwrap()),
+            vec![vec!["7"]]
+        );
+    }
+
+    #[test]
+    fn update_and_delete_bodies() {
+        let mut eng = engine();
+        setup(&mut eng);
+        run(&mut eng, "SELECT f133_ins(1);").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_upd(oldv int, newv int) RETURNS int LANGUAGE sql \
+             AS 'UPDATE t133 SET a = newv WHERE a = oldv RETURNING a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_upd(1, 10);").unwrap()),
+            vec![vec!["10"]]
+        );
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_del(v int) RETURNS int LANGUAGE sql \
+             AS 'DELETE FROM t133 WHERE a = v RETURNING a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_del(10);").unwrap()),
+            vec![vec!["10"]]
+        );
+        assert!(rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn final_dml_without_returning_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // PG19 check_sql_fn_retval: the final statement must be SELECT
+        // or INSERT/UPDATE/DELETE/MERGE RETURNING.
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f133_bad(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v)';",
+        );
+        assert_eq!(e.code, "42P13");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some(
+                "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."
+            )
+        );
+        // Multi-statement: only the FINAL statement matters.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_ok(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v); SELECT v';",
+        )
+        .expect("non-final DML without RETURNING is fine");
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_ok(3);").unwrap()),
+            vec![vec!["3"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()),
+            vec![vec!["3"]]
+        );
+    }
+
+    #[test]
+    fn final_dml_wrong_column_count_is_42p13() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f133_wide(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v) RETURNING a, a';",
+        );
+        assert_eq!(e.code, "42P13");
+    }
+
+    #[test]
+    fn utility_body_still_0a000() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION f133_util() RETURNS int LANGUAGE sql \
+             AS 'DROP TABLE t133;';",
+        );
+        assert_eq!(e.code, "0A000");
+    }
+
+    #[test]
+    fn named_args_rewritten_in_dml_positions() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // Named argument in VALUES and RETURNING.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_named(val int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (val) RETURNING a + val';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_named(5);").unwrap()),
+            vec![vec!["10"]]
+        );
+        // Named arguments in UPDATE SET and WHERE.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_nupd(oldv int, newv int) RETURNS int LANGUAGE sql \
+             AS 'UPDATE t133 SET a = newv WHERE a = oldv RETURNING a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_nupd(5, 50);").unwrap()),
+            vec![vec!["50"]]
+        );
+    }
+
+    #[test]
+    fn body_dml_is_statement_atomic() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // The second body statement fails: the first statement's
+        // insert must roll back with the statement.
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_boom(v int) RETURNS int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (v); SELECT 1/0';",
+        )
+        .unwrap();
+        let e = err_of(&mut eng, "SELECT f133_boom(9);");
+        assert_eq!(e.code, "22012");
+        assert!(rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn nested_function_dml_reborrows_write_context() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // A DML-bodied function called from another function body:
+        // the write context reborrows (no RefCell, no lost writes).
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_outer(v int) RETURNS int LANGUAGE sql \
+             AS 'SELECT f133_ins(v) + 100';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT f133_outer(11);").unwrap()),
+            vec![vec!["111"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()),
+            vec![vec!["11"]]
+        );
+    }
+
+    #[test]
+    fn read_only_blocks_body_dml() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // PG19: a read-only transaction rejects body DML with 25006;
+        // the server's statement-level check cannot see inside
+        // function bodies, so run_func_dml enforces it.
+        let e = run_with(&mut eng, "SELECT f133_ins(1);", true).unwrap_err();
+        assert_eq!(e.code, "25006");
+        assert_eq!(
+            e.message,
+            "cannot execute INSERT in a read-only transaction"
+        );
+        assert!(rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn dml_bodied_function_called_from_dml() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // INSERT INTO ... SELECT f(): the inner function's INSERT and
+        // the outer INSERT share the statement's write log.
+        run(&mut eng, "INSERT INTO t133(a) SELECT f133_ins(99);").unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT a FROM t133 ORDER BY a;").unwrap()),
+            vec![vec!["99"], vec!["99"]]
+        );
+    }
+
+    #[test]
+    fn setof_dml_body() {
+        let mut eng = engine();
+        setup(&mut eng);
+        run(
+            &mut eng,
+            "CREATE FUNCTION f133_set() RETURNS SETOF int LANGUAGE sql \
+             AS 'INSERT INTO t133(a) VALUES (1), (2), (3) RETURNING a';",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT * FROM f133_set();").unwrap()),
+            vec![vec!["1"], vec!["2"], vec!["3"]]
+        );
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT a FROM t133;").unwrap()).len(),
+            3
+        );
+    }
+}
+
