@@ -493,6 +493,7 @@ fn execute_inner(
                     priv_scopes: Vec::new(),
                     hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                     immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                    plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                     hashed_in: Rc::new(RefCell::new(Vec::new())),
                     pending_updates: None,
                     write: Some(qwrite_from_ctx(
@@ -2354,6 +2355,7 @@ fn eval_partition_key_expr(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
         write: None,
@@ -3660,6 +3662,7 @@ fn eval_default(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: None,
@@ -3878,6 +3881,7 @@ fn check_row_constraints(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: None,
@@ -3920,6 +3924,7 @@ fn check_row_constraints(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: None,
@@ -4718,6 +4723,7 @@ fn materialize_dml_ctes(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
         write: Some(qwrite_from_ctx(
@@ -5747,6 +5753,7 @@ fn exec_create_table_as(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -6216,6 +6223,7 @@ fn exec_insert(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -6347,6 +6355,7 @@ fn exec_insert(
                         priv_scopes: Vec::new(),
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                         hashed_in: Rc::new(RefCell::new(Vec::new())),
                         pending_updates: None,
                         write: Some(qwrite_from_ctx(
@@ -6475,6 +6484,7 @@ fn exec_insert(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -7468,6 +7478,7 @@ fn exec_update(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -8145,6 +8156,7 @@ fn exec_delete(
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -12065,6 +12077,7 @@ fn exec_explain_analyze(
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -13946,6 +13959,23 @@ struct Q<'a, 'b> {
     /// call in the statement. Nothing is cached on error; anything not
     /// provably fold-safe fails open to the per-row path.
     immutable_fn_cache: Rc<RefCell<HashMap<ImmutableFnKey, Value>>>,
+    /// v1.37: planner-time Const substitution for IMMUTABLE SQL-function
+    /// calls (PG19 `eval_const_expressions`/`evaluate_function`): a
+    /// per-statement call-site memo keyed by the `Expr::Func` node's
+    /// address. Once a fold-eligible node evaluates, it behaves as a
+    /// Const for the rest of the statement — later evaluations skip
+    /// argument evaluation, the eligibility walk, and the value-keyed
+    /// cache entirely. Sound because a statement-AST node's scope
+    /// chain, visible CTE set, and statement snapshot are fixed for the
+    /// whole execution, so the first evaluation's eligibility verdict
+    /// holds for every later one. Pointer keys are never dereferenced,
+    /// only compared/hashed (the v1.29 `hashed_in` precedent). Fresh
+    /// per statement entry, cloned across nested query levels;
+    /// `run_func_body` installs a FRESH map (never the shared one) —
+    /// body ASTs are cloned per body execution, so a shared map could
+    /// see a dangling pointer from a dropped clone alias a later
+    /// clone's node.
+    plan_fold_memo: Rc<RefCell<HashMap<*const Expr, Value>>>,
     /// v0.89: statement-local UPDATE overlay — (destination table,
     /// row-version id, new cell values) for rows already processed by
     /// the in-flight UPDATE. Only *volatile* SQL function bodies see
@@ -14204,6 +14234,68 @@ fn walk_from_item_exprs(fi: &FromItem, f: &mut impl FnMut(&Expr)) {
     }
 }
 
+/// v1.37: visit every FROM item of one SELECT statement: this level's
+/// FROM list, CTE bodies, and set-operation branches. Scalar-subquery
+/// expressions are NOT descended into — `select_foldable` recurses into
+/// those explicitly, so each level's FROM items are checked exactly
+/// once per level.
+fn walk_stmt_from_items(s: &SelectStmt, f: &mut impl FnMut(&FromItem)) {
+    fn walk_fi(fi: &FromItem, f: &mut impl FnMut(&FromItem)) {
+        f(fi);
+        match fi {
+            FromItem::Derived { sub, .. } => walk_stmt_from_items(sub, f),
+            FromItem::Join { left, right, .. } => {
+                walk_fi(left, f);
+                walk_fi(right, f);
+            }
+            FromItem::Table { .. } | FromItem::Values { .. } | FromItem::Function { .. } => {}
+        }
+    }
+    for cte in &s.with {
+        match &cte.body {
+            CteBody::Simple(body) => walk_stmt_from_items(body, f),
+            CteBody::Union { left, right, .. } => {
+                walk_stmt_from_items(left, f);
+                walk_stmt_from_items(right, f);
+            }
+        }
+    }
+    for fi in &s.from {
+        walk_fi(fi, f);
+    }
+    if let Some(op) = &s.set_op {
+        walk_stmt_from_items(&op.left, f);
+        for b in &op.chain {
+            walk_stmt_from_items(&b.right, f);
+        }
+    }
+}
+
+/// v1.37: does this SELECT (one body level; subqueries get their own
+/// `select_foldable` call) name a relation that a caller-visible CTE
+/// shadows? FROM resolves CTE-first (CTE, then information_schema,
+/// then view, then table — see `subplan_inner_is_base_table`), so such
+/// a name reads caller state, which can differ per call site within
+/// one statement (a caller CTE shadowing a catalog table name). The
+/// v1.36 value cache is keyed by (name, arg values) and shared across
+/// call sites, so folding here would leak one site's value into
+/// another's — fail open. Body-local CTEs and catalog tables/views
+/// never match the caller's CTE list and keep folding.
+fn select_refs_caller_cte(sel: &SelectStmt, ctes: &[Rc<CteBinding>]) -> bool {
+    let mut found = false;
+    walk_stmt_from_items(sel, &mut |fi| {
+        if found {
+            return;
+        }
+        if let FromItem::Table { name, .. } = fi {
+            if ctes.iter().any(|c| c.name == *name) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
 /// v1.36: can calls to this SQL function be constant-folded within the
 /// current statement (PG19 `evaluate_function`,
 /// optimizer/util/clauses.c:5205)? Every condition must hold; anything
@@ -14228,11 +14320,16 @@ fn walk_from_item_exprs(fi: &FromItem, f: &mut impl FnMut(&Expr)) {
 ///   PG has no equivalent case.)
 /// * Every call-site argument is row-constant (`expr_is_row_const`):
 ///   PG folds only all-Const argument lists.
+/// * v1.37: no body relation name is shadowed by a caller-visible CTE
+///   (`select_refs_caller_cte`): FROM resolves CTE-first, so such a
+///   name reads caller state that can differ per call site — the
+///   per-statement cache would leak one site's value into another's.
 fn immutable_fold_eligible(
     db: &Database,
     scopes: &[Scope],
     args: &[Expr],
     fdef: &crate::storage::FuncDef,
+    ctes: &[Rc<CteBinding>],
 ) -> bool {
     if fdef.lang != crate::sql::FuncLang::Sql
         || fdef.volatility != crate::sql::FuncVolatility::Immutable
@@ -14249,7 +14346,7 @@ fn immutable_fold_eligible(
         return false;
     }
     let mut visiting: Vec<(String, Vec<String>)> = Vec::new();
-    sql_body_foldable(db, scopes, fdef, body, &mut visiting, 0)
+    sql_body_foldable(db, scopes, fdef, body, &mut visiting, 0, ctes)
 }
 
 /// v1.36: body half of `immutable_fold_eligible`, recursed into
@@ -14263,6 +14360,7 @@ fn sql_body_foldable(
     body: &[Stmt],
     visiting: &mut Vec<(String, Vec<String>)>,
     depth: usize,
+    ctes: &[Rc<CteBinding>],
 ) -> bool {
     if depth > 8 {
         return false;
@@ -14273,7 +14371,7 @@ fn sql_body_foldable(
     }
     visiting.push(id);
     let ok = body.iter().all(|s| match s {
-        Stmt::Select(sel) => select_foldable(db, scopes, sel, visiting, depth),
+        Stmt::Select(sel) => select_foldable(db, scopes, sel, visiting, depth, ctes),
         // v1.36: DML bodies never fold (see `immutable_fold_eligible`).
         _ => false,
     });
@@ -14297,7 +14395,13 @@ fn select_foldable(
     sel: &SelectStmt,
     visiting: &mut Vec<(String, Vec<String>)>,
     depth: usize,
+    ctes: &[Rc<CteBinding>],
 ) -> bool {
+    // v1.37: a body relation name shadowed by a caller-visible CTE
+    // reads per-call-site caller state — never fold (fail open).
+    if select_refs_caller_cte(sel, ctes) {
+        return false;
+    }
     let mut ok = true;
     walk_stmt_exprs(sel, &mut |e| {
         if !ok {
@@ -14343,7 +14447,9 @@ fn select_foldable(
                         if cand.lang != crate::sql::FuncLang::Sql
                             || cand.returns_set
                             || cand.plpgsql.is_some()
-                            || !sql_body_foldable(db, scopes, cand, cbody, visiting, depth + 1)
+                            || !sql_body_foldable(
+                                db, scopes, cand, cbody, visiting, depth + 1, ctes,
+                            )
                         {
                             ok = false;
                             return;
@@ -14352,12 +14458,12 @@ fn select_foldable(
                 }
             }
             Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) | Expr::Exists { sub, .. } => {
-                if !select_foldable(db, scopes, sub, visiting, depth) {
+                if !select_foldable(db, scopes, sub, visiting, depth, ctes) {
                     ok = false;
                 }
             }
             Expr::InSub { sub, .. } => {
-                if !select_foldable(db, scopes, sub, visiting, depth) {
+                if !select_foldable(db, scopes, sub, visiting, depth, ctes) {
                     ok = false;
                 }
             }
@@ -14368,7 +14474,7 @@ fn select_foldable(
                     ok = false;
                     return;
                 }
-                if !select_foldable(db, scopes, sub, visiting, depth) {
+                if !select_foldable(db, scopes, sub, visiting, depth, ctes) {
                     ok = false;
                 }
             }
@@ -20700,6 +20806,7 @@ fn eval_lateral_right(
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -21478,6 +21585,7 @@ fn build_source(
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -26742,6 +26850,7 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             immutable_fn_cache: q.immutable_fn_cache.clone(),
+            plan_fold_memo: q.plan_fold_memo.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -27061,7 +27170,8 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             if let Some((_, v)) = q.srf_vals.iter().find(|(call, _)| call == e) {
                 return Ok(v.clone());
             }
-            eval_func(q, scopes, name, args)
+            // v1.37: hand the call-site node to the plan-fold memo.
+            eval_func(q, scopes, name, args, e as *const Expr)
         }
         Expr::Extract { field, from } => {
             let v = eval_expr(q, scopes, from)?;
@@ -27191,6 +27301,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -27233,6 +27344,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -27313,6 +27425,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -28347,6 +28460,7 @@ fn eval_hashed_in(
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     immutable_fn_cache: q.immutable_fn_cache.clone(),
+                    plan_fold_memo: q.plan_fold_memo.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -28672,6 +28786,7 @@ fn eval_in_value(
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             immutable_fn_cache: q.immutable_fn_cache.clone(),
+            plan_fold_memo: q.plan_fold_memo.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -28831,6 +28946,7 @@ fn eval_quantified_value(
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             immutable_fn_cache: q.immutable_fn_cache.clone(),
+            plan_fold_memo: q.plan_fold_memo.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -29759,6 +29875,7 @@ fn eval_dml_expr(
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: pending,
         write,
@@ -32633,6 +32750,11 @@ fn run_func_body(
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
         immutable_fn_cache: q.immutable_fn_cache.clone(),
+        // v1.37: FRESH plan-fold memo, never the shared one: this Q
+        // executes a per-execution clone of the body AST, so a
+        // shared map could alias a dangling pointer from a dropped
+        // clone (see `plan_fold_memo` field doc).
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: q.hashed_in.clone(),
         // v0.89: volatile function bodies see the in-flight UPDATE's
         // already-processed rows (caller-gated); stable/immutable
@@ -33008,6 +33130,9 @@ fn run_plpgsql_body(
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
         immutable_fn_cache: q.immutable_fn_cache.clone(),
+        // v1.37: FRESH plan-fold memo (see field doc): plpgsql bodies execute
+        // with statement-level variable state; never share call-site keys.
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: q.hashed_in.clone(),
         // v0.89: volatile function bodies see the in-flight UPDATE's
         // already-processed rows (caller-gated); stable/immutable
@@ -33325,7 +33450,17 @@ fn resolve_named_args(eng: &Engine, name: &str, args: &[Expr]) -> Result<Vec<Exp
     Ok(result)
 }
 
-fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<Value, ExecError> {
+/// v1.37: `node` is the call-site `Expr::Func` node's address, keying
+/// the plan-fold memo (`Q::plan_fold_memo`). It always identifies the
+/// original call site, even when named-argument reordering below
+/// replaces the `args` slice.
+fn eval_func(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+    node: *const Expr,
+) -> Result<Value, ExecError> {
     // v0.95: resolve `name => expr` named arguments to positional order
     // (PG19 `reorder_function_arguments`). Zero-cost when absent.
     let owned: Vec<Expr>;
@@ -33425,6 +33560,15 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
     // resolution) so both UDF and builtin paths see the expanded args.
     // A NULL variadic array makes the whole call NULL (PG semantics).
     {
+        // v1.37: planner-time Const substitution (PG19
+        // `eval_const_expressions`): probe the call-site memo BEFORE
+        // evaluating arguments. A hit means this `Expr::Func` node
+        // already folded this statement — it is now a Const: return it
+        // without touching the arguments at all. The borrow ends here,
+        // before any `&mut q` use below.
+        if let Some(v) = q.plan_fold_memo.borrow().get(&node).cloned() {
+            return Ok(v);
+        }
         let mut raw_vals = Vec::with_capacity(args.len());
         for a in args {
             if let Some(inner) = is_variadic_marker(a) {
@@ -33453,16 +33597,22 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
             // the per-row path below. Errors are never cached: a
             // failing first call raises here exactly as it would
             // without the cache.
-            if immutable_fold_eligible(&q.eng.db, scopes, args, &fdef) {
+            // v1.37: the eligibility check is caller-CTE-aware (see
+            // `select_refs_caller_cte`); a folded call also populates
+            // the call-site memo, substituting the evaluated Const into
+            // the plan for the rest of the statement.
+            if immutable_fold_eligible(&q.eng.db, scopes, args, &fdef, &q.ctes) {
                 let key = ImmutableFnKey {
                     name: fdef.name.clone(),
                     args: raw_vals.iter().map(fn_key_val).collect(),
                 };
-                if let Some(hit) = q.immutable_fn_cache.borrow().get(&key) {
-                    return Ok(hit.clone());
+                if let Some(hit) = q.immutable_fn_cache.borrow().get(&key).cloned() {
+                    q.plan_fold_memo.borrow_mut().insert(node, hit.clone());
+                    return Ok(hit);
                 }
                 let v = call_user_function(q, scopes, &fdef, &raw_vals)?;
                 q.immutable_fn_cache.borrow_mut().insert(key, v.clone());
+                q.plan_fold_memo.borrow_mut().insert(node, v.clone());
                 return Ok(v);
             }
             return call_user_function(q, scopes, &fdef, &raw_vals);
@@ -61041,5 +61191,330 @@ mod v136_immutable_fold_tests {
         assert_eq!(vals.len(), 3);
         assert_ne!(vals[0], vals[1]);
         assert_ne!(vals[1], vals[2]);
+    }
+}
+
+/// v1.37: planner-time Const substitution for IMMUTABLE SQL-function
+/// calls (PG19 `eval_const_expressions`/`evaluate_function`). Once a
+/// fold-eligible `Expr::Func` node evaluates, the call-site memo
+/// (`Q::plan_fold_memo`) makes it behave as a Const for the rest of
+/// the statement: later evaluations skip argument evaluation, the
+/// eligibility walk, and the value-keyed cache. The memo is keyed by
+/// node address, so it is per call site; eligibility now also rejects
+/// bodies naming a relation a caller-visible CTE shadows (FROM
+/// resolves CTE-first), closing the v1.36 hole where the
+/// value-keyed cache leaked one call site's CTE-visible value into
+/// another site's.
+#[cfg(test)]
+mod v137_plan_fold_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn col0(rows: Vec<Vec<String>>) -> Vec<String> {
+        rows.into_iter().map(|r| r[0].clone()).collect()
+    }
+
+    /// v1.37: the v1.36 hole — a caller CTE shadowing a catalog table
+    /// name made the (name, args)-keyed value cache leak one call
+    /// site's value into another's (`7,7` instead of `7,100`). The
+    /// call inside the CTE's scope is now ineligible (it reads caller
+    /// state), so each site evaluates against what IT sees.
+    #[test]
+    fn cte_shadow_per_site_correctness_inner_first() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t_sh(v int)").unwrap();
+        run(&mut eng, "INSERT INTO t_sh VALUES (100)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION f_sh(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT v FROM t_sh'",
+        )
+        .unwrap();
+        // Inner call site sees the CTE (7); outer sees the table (100).
+        // v1.36 returned 7,7 here.
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT x.f1, f_sh(1) FROM \
+                 (WITH t_sh AS (SELECT 7 AS v) SELECT f_sh(1) AS f1) x",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["7".to_string(), "100".to_string()]]);
+    }
+
+    /// v1.37: same hole, opposite evaluation order — the outer site
+    /// folds first (populating the value cache with 100); the inner
+    /// site must still see its CTE (7), not the cached 100.
+    #[test]
+    fn cte_shadow_per_site_correctness_outer_first() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t_sh2(v int)").unwrap();
+        run(&mut eng, "INSERT INTO t_sh2 VALUES (100)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION f_sh2(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT v FROM t_sh2'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT f_sh2(1), x.f1 FROM \
+                 (WITH t_sh2 AS (SELECT 7 AS v) SELECT f_sh2(1) AS f1) x",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["100".to_string(), "7".to_string()]]);
+    }
+
+    /// v1.37: a body-local CTE (not caller-visible) still folds — the
+    /// shadow check only rejects caller-visible CTE names.
+    #[test]
+    fn body_local_cte_still_folds() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION cte137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'WITH w AS (SELECT 42 AS v) SELECT v FROM w'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT cte137() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(col0(rows), vec!["42".to_string(), "42".to_string(), "42".to_string()]);
+    }
+
+    /// v1.37: a body reading a plain catalog table (no CTE anywhere)
+    /// still folds across rows.
+    #[test]
+    fn catalog_table_body_still_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE base137(v int)").unwrap();
+        run(&mut eng, "INSERT INTO base137 VALUES (5)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION cat137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT v FROM base137'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT cat137() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(col0(rows), vec!["5".to_string(), "5".to_string(), "5".to_string()]);
+    }
+
+    /// v1.37: a caller CTE shadowing a name the body reads through a
+    /// derived table still blocks the fold (the walk descends into
+    /// derived-table subqueries).
+    #[test]
+    fn cte_shadow_through_derived_table() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t_shd(v int)").unwrap();
+        run(&mut eng, "INSERT INTO t_shd VALUES (100)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION f_shd(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT v FROM (SELECT v FROM t_shd) d'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "WITH t_shd AS (SELECT 7 AS v) SELECT f_shd(1), (SELECT v FROM t_shd)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows, vec![vec!["7".to_string(), "7".to_string()]]);
+    }
+
+    /// v1.37: a VOLATILE-marked function never touches the memo — a
+    /// sequence in the body yields a distinct value per row even with
+    /// two call sites in one statement.
+    #[test]
+    fn volatile_never_memoized_two_sites() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s137v").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION sv137() RETURNS int VOLATILE LANGUAGE sql \
+             AS 'SELECT nextval(''s137v'')'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(&mut eng, "SELECT sv137(), sv137() FROM generate_series(1, 3) g").unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        let flat: Vec<String> = rows.into_iter().flatten().collect();
+        let distinct: HashSet<String> = flat.iter().cloned().collect();
+        assert_eq!(distinct.len(), 6, "every call must draw fresh: {flat:?}");
+    }
+
+    /// v1.37: STABLE-marked functions never fold (PG folds STABLE only
+    /// in estimation mode) — the memo stays empty for them.
+    #[test]
+    fn stable_never_memoized() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s137s").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION ss137() RETURNS int STABLE LANGUAGE sql \
+             AS 'SELECT nextval(''s137s'')'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT ss137() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+    }
+
+    /// v1.37: errors are never memoized — the first row raises exactly
+    /// as in v1.36 (memo engages only on success).
+    #[test]
+    fn error_never_memoized() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION e137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 1/0'",
+        )
+        .unwrap();
+        let e = run(&mut eng, "SELECT e137() FROM generate_series(1, 3) g").unwrap_err();
+        assert_eq!(e.code, "22012");
+    }
+
+    /// v1.37: zero-argument fold-eligible calls memoize per call site.
+    #[test]
+    fn zero_arg_call_memoizes() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION z137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 99'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(&mut eng, "SELECT z137(), z137() FROM generate_series(1, 3) g").unwrap(),
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r == &vec!["99".to_string(), "99".to_string()]));
+    }
+
+    /// v1.37: named-argument calls fold — the memo key is the call-site
+    /// node, not the (reordered) argument slice.
+    #[test]
+    fn named_arg_call_folds() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add137(x int, y int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT $1 + $2'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(&mut eng, "SELECT add137(y => 2, x => 40) FROM generate_series(1, 3) g").unwrap(),
+        );
+        assert_eq!(col0(rows), vec!["42".to_string(), "42".to_string(), "42".to_string()]);
+    }
+
+    /// v1.37: a fold-eligible call nested inside a subquery (whose own
+    /// CTE does not shadow anything) folds to the same value.
+    #[test]
+    fn fold_inside_subquery_with_unrelated_cte() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION s137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 11'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT (SELECT s137() FROM (SELECT 1) z) FROM generate_series(1, 2) g",
+            )
+            .unwrap(),
+        );
+        assert_eq!(col0(rows), vec!["11".to_string(), "11".to_string()]);
+    }
+
+    /// v1.37: body-internal call sites get their own (fresh-per-body-
+    /// execution) memo: the inner call folds within the body, the
+    /// outer call folds across statement rows, and every row is
+    /// correct.
+    #[test]
+    fn nested_body_internal_calls_fold() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION inner137(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT $1 * 10'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION outer137() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT sum(inner137(v)) FROM (VALUES (1),(2),(3)) t(v)'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(&mut eng, "SELECT outer137() FROM generate_series(1, 5) g").unwrap(),
+        );
+        assert_eq!(
+            col0(rows),
+            vec![
+                "60".to_string(),
+                "60".to_string(),
+                "60".to_string(),
+                "60".to_string(),
+                "60".to_string()
+            ]
+        );
+    }
+
+    /// v1.37: recursion still refuses the fold but executes normally.
+    #[test]
+    fn recursive_body_runs_unfolded() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION rec137(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT CASE WHEN $1 <= 0 THEN 0 ELSE rec137($1 - 1) + 1 END'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT rec137(3) FROM generate_series(1, 2) g").unwrap());
+        assert_eq!(col0(rows), vec!["3".to_string(), "3".to_string()]);
     }
 }
