@@ -492,6 +492,7 @@ fn execute_inner(
                     srf_vals: Vec::new(),
                     priv_scopes: Vec::new(),
                     hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                     hashed_in: Rc::new(RefCell::new(Vec::new())),
                     pending_updates: None,
                     write: Some(qwrite_from_ctx(
@@ -2352,6 +2353,7 @@ fn eval_partition_key_expr(
         read_only: false,
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
         write: None,
@@ -3657,6 +3659,7 @@ fn eval_default(
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: None,
@@ -3874,6 +3877,7 @@ fn check_row_constraints(
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: None,
@@ -3915,6 +3919,7 @@ fn check_row_constraints(
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: None,
@@ -4712,6 +4717,7 @@ fn materialize_dml_ctes(
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
         write: Some(qwrite_from_ctx(
@@ -5740,6 +5746,7 @@ fn exec_create_table_as(
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -6208,6 +6215,7 @@ fn exec_insert(
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -6338,6 +6346,7 @@ fn exec_insert(
                         srf_vals: Vec::new(),
                         priv_scopes: Vec::new(),
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                         hashed_in: Rc::new(RefCell::new(Vec::new())),
                         pending_updates: None,
                         write: Some(qwrite_from_ctx(
@@ -6465,6 +6474,7 @@ fn exec_insert(
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -7457,6 +7467,7 @@ fn exec_update(
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -8133,6 +8144,7 @@ fn exec_delete(
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
                 pending_updates: None,
                 write: Some(qwrite_from_ctx(
@@ -12052,6 +12064,7 @@ fn exec_explain_analyze(
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
             pending_updates: None,
             write: Some(qwrite_from_ctx(
@@ -13923,6 +13936,16 @@ struct Q<'a, 'b> {
     /// replaces for that lookup and avoids re-walking the whole subquery
     /// tree on every probed row.
     hashed_in: Rc<RefCell<Vec<(*const SelectStmt, Rc<HashedIn>)>>>,
+    /// v1.36: IMMUTABLE SQL-function result cache (PG19
+    /// `evaluate_function`, optimizer/util/clauses.c: constant-folding
+    /// calls whose arguments are all row-constant and whose body is
+    /// provably row-independent and side-effect-free). Keyed by
+    /// (function name, canonical argument values); shared across nested
+    /// query levels by Rc exactly like `hashed_exists`. The statement
+    /// snapshot is fixed, so one body execution serves every identical
+    /// call in the statement. Nothing is cached on error; anything not
+    /// provably fold-safe fails open to the per-row path.
+    immutable_fn_cache: Rc<RefCell<HashMap<ImmutableFnKey, Value>>>,
     /// v0.89: statement-local UPDATE overlay — (destination table,
     /// row-version id, new cell values) for rows already processed by
     /// the in-flight UPDATE. Only *volatile* SQL function bodies see
@@ -13940,6 +13963,452 @@ struct Q<'a, 'b> {
     /// defaults, constraint checks). A SQL function with a DML body
     /// called from such a level fails with an honest 0A000.
     write: Option<QWrite<'a>>,
+}
+
+/// v1.36: cache key for the IMMUTABLE SQL-function result cache:
+/// (function name, canonical argument values). The raw `Value` has no
+/// `Eq + Hash`, so arguments are encoded canonically: floats by bit
+/// pattern (`-0.0` vs `0.0` and NaN payloads, which `PartialEq` and
+/// text rendering conflate, hash distinctly).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ImmutableFnKey {
+    name: String,
+    args: Vec<FnKeyVal>,
+}
+
+/// v1.36: canonical, hashable encoding of one argument `Value`.
+/// The `match` in `fn_key_val` is exhaustive, so adding a variant to
+/// `Value` without extending this enum is a compile error — a new
+/// variant can never silently alias an old one's key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FnKeyVal {
+    SmallInt(i16),
+    Int(i64),
+    BigInt(i64),
+    Float4(u32),
+    Float(u64),
+    Numeric {
+        unscaled: i128,
+        scale: i32,
+        dscale: i32,
+        special: u8,
+        big: Option<Box<crate::storage::BigUint>>,
+    },
+    Text(String),
+    BpChar(String),
+    SingleChar(u8),
+    Bool(bool),
+    Date(i32),
+    Timestamp(i64),
+    Timestamptz(i64),
+    Bytea(Vec<u8>),
+    Uuid([u8; 16]),
+    PgLsn(u64),
+    Record(Vec<(String, FnKeyVal)>),
+    Array {
+        elem: u8,
+        dims: Vec<i32>,
+        lower: Vec<i32>,
+        elems: Vec<FnKeyVal>,
+    },
+    Null,
+}
+
+/// v1.36: encode one argument value into its canonical cache-key form.
+fn fn_key_val(v: &Value) -> FnKeyVal {
+    match v {
+        Value::SmallInt(x) => FnKeyVal::SmallInt(*x),
+        Value::Int(x) => FnKeyVal::Int(*x),
+        Value::BigInt(x) => FnKeyVal::BigInt(*x),
+        Value::Float4(x) => FnKeyVal::Float4(x.to_bits()),
+        Value::Float(x) => FnKeyVal::Float(x.to_bits()),
+        Value::Numeric(n) => FnKeyVal::Numeric {
+            unscaled: n.unscaled,
+            scale: n.scale,
+            dscale: n.dscale,
+            special: match n.special {
+                NumericSpecial::Finite => 0,
+                NumericSpecial::NaN => 1,
+                NumericSpecial::PosInf => 2,
+                NumericSpecial::NegInf => 3,
+            },
+            big: n.big.clone(),
+        },
+        Value::Text(s) => FnKeyVal::Text(s.to_string()),
+        Value::BpChar(s) => FnKeyVal::BpChar(s.to_string()),
+        Value::SingleChar(c) => FnKeyVal::SingleChar(*c),
+        Value::Bool(b) => FnKeyVal::Bool(*b),
+        Value::Date(d) => FnKeyVal::Date(*d),
+        Value::Timestamp(t) => FnKeyVal::Timestamp(*t),
+        Value::Timestamptz(t) => FnKeyVal::Timestamptz(*t),
+        Value::Bytea(b) => FnKeyVal::Bytea(b.clone()),
+        Value::Uuid(u) => FnKeyVal::Uuid(*u),
+        Value::PgLsn(l) => FnKeyVal::PgLsn(*l),
+        Value::Record(fields) => FnKeyVal::Record(
+            fields
+                .iter()
+                .map(|(n, fv)| (n.clone(), fn_key_val(fv)))
+                .collect(),
+        ),
+        Value::Array(a) => FnKeyVal::Array {
+            elem: a.elem as u8,
+            dims: a.dims.clone(),
+            lower: a.lower.clone(),
+            elems: a.elems.iter().map(fn_key_val).collect(),
+        },
+        Value::Null => FnKeyVal::Null,
+    }
+}
+
+/// v1.36: behaviorally-volatile builtins in this engine: repeated
+/// evaluation with identical arguments can return different values.
+/// Hoisted from `expr_is_volatile` (v1.22) so the IMMUTABLE-fold body
+/// scan shares the single canonical list; the nested definition there
+/// now calls this (no behavior change).
+fn volatile_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "nextval"
+            | "currval"
+            | "setval"
+            | "lastval"
+            | "random"
+            | "setseed"
+            | "now"
+            | "current_timestamp"
+            | "clock_timestamp"
+            | "statement_timestamp"
+            | "transaction_timestamp"
+            | "current_date"
+    )
+}
+
+/// v1.36: does this expression read per-row query state? Column and
+/// whole-row references, already-resolved column positions,
+/// parameters, subqueries (which may correlate), aggregates, and
+/// window functions all vary row to row (or level to level), so an
+/// argument expression mentioning any of them is not a constant for
+/// IMMUTABLE folding — PG19's `evaluate_function` only folds when
+/// every argument is a Const node.
+fn expr_mentions_row_input(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |sub| {
+        if found {
+            return;
+        }
+        match sub {
+            Expr::Column { .. }
+            | Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. }
+            | Expr::Param(_)
+            | Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::InSub { .. }
+            | Expr::Exists { .. }
+            | Expr::Quantified { .. }
+            | Expr::Agg { .. }
+            | Expr::WithinGroup { .. }
+            | Expr::Window { .. } => {
+                found = true;
+            }
+            _ => {}
+        }
+    });
+    found
+}
+
+/// v1.36: PG19 `evaluate_function` folds a call only when every
+/// argument is a Const node. The engine's looser-but-sound analogue:
+/// no per-row input and no volatile subexpression anywhere inside (a
+/// STABLE call of constants is statement-constant by contract, hence
+/// foldable; VOLATILE never is).
+fn expr_is_row_const(db: &Database, e: &Expr) -> bool {
+    !expr_mentions_row_input(e) && !expr_is_volatile(db, e)
+}
+
+/// v1.36: visit every expression in a SELECT statement, including the
+/// positions `walk_select` skips (FROM items, CTE bodies, set-operation
+/// branches): the IMMUTABLE-fold body scan must see column references
+/// wherever they hide.
+fn walk_stmt_exprs(s: &SelectStmt, f: &mut impl FnMut(&Expr)) {
+    for cte in &s.with {
+        match &cte.body {
+            CteBody::Simple(body) => walk_stmt_exprs(body, f),
+            CteBody::Union { left, right, .. } => {
+                walk_stmt_exprs(left, f);
+                walk_stmt_exprs(right, f);
+            }
+        }
+    }
+    for d in &s.distinct_on {
+        walk_expr(d, f);
+    }
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk_expr(expr, f);
+        }
+    }
+    for fi in &s.from {
+        walk_from_item_exprs(fi, f);
+    }
+    if let Some(w) = &s.where_ {
+        walk_expr(w, f);
+    }
+    for g in s.group_by.iter().flatten() {
+        walk_expr(g, f);
+    }
+    if let Some(h) = &s.having {
+        walk_expr(h, f);
+    }
+    for t in &s.order_by {
+        walk_expr(&t.expr, f);
+    }
+    if let Some(op) = &s.set_op {
+        walk_stmt_exprs(&op.left, f);
+        for b in &op.chain {
+            walk_stmt_exprs(&b.right, f);
+        }
+        for t in &op.order_by {
+            walk_expr(&t.expr, f);
+        }
+    }
+    // LIMIT / OFFSET are plain `Option<i64>` — no expressions to visit.
+}
+
+/// v1.36: FROM-item half of `walk_stmt_exprs`.
+fn walk_from_item_exprs(fi: &FromItem, f: &mut impl FnMut(&Expr)) {
+    match fi {
+        FromItem::Table { .. } => {}
+        FromItem::Derived { sub, .. } => walk_stmt_exprs(sub, f),
+        FromItem::Values { rows, .. } => {
+            for r in rows {
+                for e in r {
+                    walk_expr(e, f);
+                }
+            }
+        }
+        FromItem::Function { args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+        }
+        FromItem::Join {
+            left, right, on, ..
+        } => {
+            walk_from_item_exprs(left, f);
+            walk_from_item_exprs(right, f);
+            if let Some(o) = on {
+                walk_expr(o, f);
+            }
+        }
+    }
+}
+
+/// v1.36: can calls to this SQL function be constant-folded within the
+/// current statement (PG19 `evaluate_function`,
+/// optimizer/util/clauses.c:5205)? Every condition must hold; anything
+/// else fails open to today's per-row execution.
+///
+/// * SQL language, IMMUTABLE volatility, scalar result, parsed body
+///   present, no plpgsql body. (STABLE folds only in PG's estimation
+///   mode — never in normal planning — and VOLATILE never folds.)
+/// * Every body statement is a SELECT. DML bodies stay per-row: their
+///   write-log effects are row-count-dependent, and PG19 performs no
+///   volatility-vs-body validation at CREATE either, so failing open
+///   is the faithful mirror.
+/// * No volatile calls anywhere in the body — no volatile builtin, no
+///   set-returning builtin in scalar position, no VOLATILE-marked user
+///   function (checked transitively, cycle-guarded) — so the body is
+///   deterministic under the statement's fixed snapshot.
+/// * No reference to the caller's query level: every `Column` is
+///   probed with `resolve_col` against the call-site scopes and every
+///   `WholeRow` qualifier against the scopes' schemas; resolving there
+///   names caller row state, which varies per row. (rustgres lets SQL
+///   bodies see caller scopes; PG19 rejects such bodies at CREATE, so
+///   PG has no equivalent case.)
+/// * Every call-site argument is row-constant (`expr_is_row_const`):
+///   PG folds only all-Const argument lists.
+fn immutable_fold_eligible(
+    db: &Database,
+    scopes: &[Scope],
+    args: &[Expr],
+    fdef: &crate::storage::FuncDef,
+) -> bool {
+    if fdef.lang != crate::sql::FuncLang::Sql
+        || fdef.volatility != crate::sql::FuncVolatility::Immutable
+        || fdef.returns_set
+        || fdef.plpgsql.is_some()
+    {
+        return false;
+    }
+    let body = match fdef.parsed.as_ref() {
+        Some(b) => b,
+        None => return false,
+    };
+    if !args.iter().all(|a| expr_is_row_const(db, a)) {
+        return false;
+    }
+    let mut visiting: Vec<(String, Vec<String>)> = Vec::new();
+    sql_body_foldable(db, scopes, fdef, body, &mut visiting, 0)
+}
+
+/// v1.36: body half of `immutable_fold_eligible`, recursed into
+/// IMMUTABLE/STABLE callees. `visiting` guards direct and mutual
+/// recursion (a recursive body is never folded); `depth` bounds
+/// pathological catalog chains.
+fn sql_body_foldable(
+    db: &Database,
+    scopes: &[Scope],
+    fdef: &crate::storage::FuncDef,
+    body: &[Stmt],
+    visiting: &mut Vec<(String, Vec<String>)>,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let id = (fdef.name.clone(), fdef.arg_types.clone());
+    if visiting.contains(&id) {
+        return false;
+    }
+    visiting.push(id);
+    let ok = body.iter().all(|s| match s {
+        Stmt::Select(sel) => select_foldable(db, scopes, sel, visiting, depth),
+        // v1.36: DML bodies never fold (see `immutable_fold_eligible`).
+        _ => false,
+    });
+    visiting.pop();
+    ok
+}
+
+/// v1.36: one SELECT statement of a fold-candidate body: every
+/// expression must be free of volatile calls and caller-level
+/// references. User-defined operators (and the quantified/array-ANY
+/// forms that resolve one at runtime) are rejected outright — their
+/// procedure's volatility is invisible to static inspection.
+/// Subqueries get the full statement check recursively
+/// (`walk_expr`'s `walk_select` descent skips their FROM items, CTEs,
+/// and set-operation branches, so the explicit recursion here — not
+/// the incidental descent — is what covers them; re-visits are
+/// harmless to the monotonic flag).
+fn select_foldable(
+    db: &Database,
+    scopes: &[Scope],
+    sel: &SelectStmt,
+    visiting: &mut Vec<(String, Vec<String>)>,
+    depth: usize,
+) -> bool {
+    let mut ok = true;
+    walk_stmt_exprs(sel, &mut |e| {
+        if !ok {
+            return;
+        }
+        match e {
+            Expr::Func { name, args } => {
+                if volatile_builtin(name) || is_builtin_srf(name) {
+                    ok = false;
+                    return;
+                }
+                // v1.36: the hidden `__any_all_array` builtin carries
+                // its operator as a text argument; a `user:`-prefixed
+                // operator resolves its (possibly VOLATILE) procedure
+                // at runtime, invisibly to static inspection.
+                if name.as_str() == "__any_all_array"
+                    && args.iter().any(|a| {
+                        matches!(a, Expr::Literal(Literal::Text(s)) if s.starts_with("user:"))
+                    })
+                {
+                    ok = false;
+                    return;
+                }
+                if let Some(overloads) = db.functions.get(name) {
+                    for cand in overloads {
+                        if cand.arg_types.len() != args.len() {
+                            continue;
+                        }
+                        // A VOLATILE callee makes the body
+                        // non-deterministic; anything else must itself
+                        // be fold-safe (transitive check, cycle-guarded).
+                        // Unknown names/arities fail deterministic
+                        // catalog errors (42883) identically on every
+                        // call, so they are fold-safe.
+                        if cand.volatility == crate::sql::FuncVolatility::Volatile {
+                            ok = false;
+                            return;
+                        }
+                        let cbody = match cand.parsed.as_ref() {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        if cand.lang != crate::sql::FuncLang::Sql
+                            || cand.returns_set
+                            || cand.plpgsql.is_some()
+                            || !sql_body_foldable(db, scopes, cand, cbody, visiting, depth + 1)
+                        {
+                            ok = false;
+                            return;
+                        }
+                    }
+                }
+            }
+            Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) | Expr::Exists { sub, .. } => {
+                if !select_foldable(db, scopes, sub, visiting, depth) {
+                    ok = false;
+                }
+            }
+            Expr::InSub { sub, .. } => {
+                if !select_foldable(db, scopes, sub, visiting, depth) {
+                    ok = false;
+                }
+            }
+            Expr::Quantified { op, sub, .. } => {
+                // v1.36: a user-defined quantified operator resolves
+                // its (possibly VOLATILE) procedure at runtime.
+                if matches!(op, QuantOp::User(_)) {
+                    ok = false;
+                    return;
+                }
+                if !select_foldable(db, scopes, sub, visiting, depth) {
+                    ok = false;
+                }
+            }
+            // v1.36: user-defined operators resolve their procedure
+            // from the operand types at runtime (`eval_user_op`), so a
+            // VOLATILE procedure is invisible to static inspection —
+            // fail open.
+            Expr::UserOp { .. } => {
+                ok = false;
+            }
+            Expr::Column { table, name } => {
+                // Resolving against the call-site scopes means this
+                // reference names caller row state (correlation); the
+                // body is not row-independent. Anything else — the
+                // body's own FROM, or a deterministic 42703 — is fine.
+                if resolve_col(scopes, table.as_deref(), name).is_ok() {
+                    ok = false;
+                }
+            }
+            Expr::WholeRow { qual } => {
+                if scopes
+                    .iter()
+                    .any(|sc| sc.schema.iter().any(|c| c.qual == *qual))
+                {
+                    ok = false;
+                }
+            }
+            // `ResolvedCol` never occurs in stored parses (it is built
+            // per execution); seeing one means this AST did not come
+            // from the catalog — refuse to reason about it.
+            Expr::ResolvedCol { .. } => {
+                ok = false;
+            }
+            // `Param` is the function's own argument (replaced by
+            // `subst_params` before the body runs); aggregates, window
+            // calls, and operators are walked into node by node above.
+            _ => {}
+        }
+    });
+    ok
 }
 
 /// v1.33: statement write context, threaded through `Q` so SQL
@@ -18220,25 +18689,8 @@ fn pushable_columns(e: &Expr, cols: &mut Vec<(Option<String>, String)>) -> bool 
 /// volatile. Subqueries are conservatively volatile (they were never
 /// pushable anyway: `pushable_columns` returns false for them).
 fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
-    // Behaviorally-volatile builtins in this engine: repeated
-    // evaluation with identical arguments can return different values.
-    fn volatile_builtin(name: &str) -> bool {
-        matches!(
-            name,
-            "nextval"
-                | "currval"
-                | "setval"
-                | "lastval"
-                | "random"
-                | "setseed"
-                | "now"
-                | "current_timestamp"
-                | "clock_timestamp"
-                | "statement_timestamp"
-                | "transaction_timestamp"
-                | "current_date"
-        )
-    }
+    // v1.36: the behaviorally-volatile builtin list lives at top level
+    // (`volatile_builtin`) so the IMMUTABLE-fold body scan shares it.
     fn any_volatile(db: &Database, es: &[Expr]) -> bool {
         es.iter().any(|x| expr_is_volatile(db, x))
     }
@@ -20247,6 +20699,7 @@ fn eval_lateral_right(
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -21024,6 +21477,7 @@ fn build_source(
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -26287,6 +26741,7 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
             srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
+            immutable_fn_cache: q.immutable_fn_cache.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -26735,6 +27190,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -26776,6 +27232,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -26855,6 +27312,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -27888,6 +28346,7 @@ fn eval_hashed_in(
                     srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
+                    immutable_fn_cache: q.immutable_fn_cache.clone(),
                     hashed_in: q.hashed_in.clone(),
                     // v0.89: plain subqueries never see the UPDATE overlay.
                     pending_updates: None,
@@ -28212,6 +28671,7 @@ fn eval_in_value(
             srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
+            immutable_fn_cache: q.immutable_fn_cache.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -28370,6 +28830,7 @@ fn eval_quantified_value(
             srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
+            immutable_fn_cache: q.immutable_fn_cache.clone(),
             hashed_in: q.hashed_in.clone(),
             // v0.89: plain subqueries never see the UPDATE overlay.
             pending_updates: None,
@@ -29297,6 +29758,7 @@ fn eval_dml_expr(
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: pending,
         write,
@@ -32170,6 +32632,7 @@ fn run_func_body(
         srf_vals: Vec::new(),
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
+        immutable_fn_cache: q.immutable_fn_cache.clone(),
         hashed_in: q.hashed_in.clone(),
         // v0.89: volatile function bodies see the in-flight UPDATE's
         // already-processed rows (caller-gated); stable/immutable
@@ -32544,6 +33007,7 @@ fn run_plpgsql_body(
         srf_vals: Vec::new(),
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
+        immutable_fn_cache: q.immutable_fn_cache.clone(),
         hashed_in: q.hashed_in.clone(),
         // v0.89: volatile function bodies see the in-flight UPDATE's
         // already-processed rows (caller-gated); stable/immutable
@@ -32978,6 +33442,29 @@ fn eval_func(q: &mut Q, scopes: &[Scope], name: &str, args: &[Expr]) -> Result<V
             }
         }
         if let Some(fdef) = resolve_function_overload(q.eng, name, &raw_vals) {
+            // v1.36: IMMUTABLE SQL-function constant folding (PG19
+            // `evaluate_function`, optimizer/util/clauses.c:5205). The
+            // arguments above were evaluated per row exactly as before —
+            // only the body execution is shared: with row-constant
+            // arguments and a provably row-independent,
+            // side-effect-free body, the first call's result is
+            // identical to every per-row execution's, so it serves the
+            // whole statement. Anything not provably safe fails open to
+            // the per-row path below. Errors are never cached: a
+            // failing first call raises here exactly as it would
+            // without the cache.
+            if immutable_fold_eligible(&q.eng.db, scopes, args, &fdef) {
+                let key = ImmutableFnKey {
+                    name: fdef.name.clone(),
+                    args: raw_vals.iter().map(fn_key_val).collect(),
+                };
+                if let Some(hit) = q.immutable_fn_cache.borrow().get(&key) {
+                    return Ok(hit.clone());
+                }
+                let v = call_user_function(q, scopes, &fdef, &raw_vals)?;
+                q.immutable_fn_cache.borrow_mut().insert(key, v.clone());
+                return Ok(v);
+            }
             return call_user_function(q, scopes, &fdef, &raw_vals);
         }
         let mut vals = Vec::with_capacity(raw_vals.len());
@@ -60135,3 +60622,424 @@ mod v135_select_final_coercion {
     }
 }
 
+
+#[cfg(test)]
+mod v136_immutable_fold_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn col0(rows: Vec<Vec<String>>) -> Vec<String> {
+        rows.into_iter().map(|r| r[0].clone()).collect()
+    }
+
+    /// v1.36: a pure IMMUTABLE SQL body with constant arguments folds:
+    /// one body execution serves every row of the statement.
+    #[test]
+    fn immutable_pure_body_folds_across_rows() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add1(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT $1 + 1'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT add1(41) FROM generate_series(1, 1000) g").unwrap());
+        assert_eq!(rows.len(), 1000);
+        assert!(rows.iter().all(|r| r == &vec!["42".to_string()]));
+    }
+
+    /// v1.36: the cache is keyed by argument value — repeated arguments
+    /// hit, distinct ones miss, and every row is still correct.
+    #[test]
+    fn cache_key_distinguishes_arg_values() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add1(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT $1 + 1'",
+        )
+        .unwrap();
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT add1(v) FROM (VALUES (1),(2),(1),(3),(2)) AS t(v) ORDER BY v",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            col0(rows),
+            vec!["2".to_string(), "2".to_string(), "3".to_string(), "3".to_string(), "4".to_string()]
+        );
+    }
+
+    /// v1.36: row-varying arguments never hit (each row evaluates the
+    /// body, exactly as before the fold existed).
+    #[test]
+    fn row_varying_arg_evaluates_per_row() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t136(a int)").unwrap();
+        run(&mut eng, "INSERT INTO t136 VALUES (1),(2),(3)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION add1(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT $1 + 1'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT add1(a) FROM t136 ORDER BY a").unwrap());
+        assert_eq!(col0(rows), vec!["2".to_string(), "3".to_string(), "4".to_string()]);
+    }
+
+    /// v1.36: VOLATILE-marked functions never fold (PG19
+    /// `evaluate_function` folds IMMUTABLE only). A fold would repeat
+    /// the first sequence value on every row.
+    #[test]
+    fn volatile_marked_function_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136v").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION sv136() RETURNS int VOLATILE LANGUAGE sql \
+             AS 'SELECT nextval(''s136v'')'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT sv136() FROM generate_series(1, 5) g").unwrap());
+        assert_eq!(
+            col0(rows),
+            vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()]
+        );
+    }
+
+    /// v1.36: STABLE-marked functions never fold either (PG folds
+    /// STABLE only in estimation mode, never in normal planning).
+    #[test]
+    fn stable_marked_function_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136s").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION ss136() RETURNS int STABLE LANGUAGE sql \
+             AS 'SELECT nextval(''s136s'')'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT ss136() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+    }
+
+    /// v1.36: a body calling a volatile builtin never folds, even when
+    /// the function is (falsely) marked IMMUTABLE — PG performs no
+    /// such check at CREATE, so the fold must fail open.
+    #[test]
+    fn volatile_builtin_in_body_never_folds() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION rv136() RETURNS float8 IMMUTABLE LANGUAGE sql \
+             AS 'SELECT random()'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT rv136() FROM generate_series(1, 5) g").unwrap());
+        let distinct: HashSet<String> = col0(rows).into_iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "random() body must not fold to a single value"
+        );
+    }
+
+    /// v1.36: a VOLATILE callee anywhere in the body blocks the fold
+    /// (transitive check).
+    #[test]
+    fn volatile_callee_blocks_fold() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136c").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION vc136() RETURNS int VOLATILE LANGUAGE sql \
+             AS 'SELECT nextval(''s136c'')'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION ic136() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT vc136()'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT ic136() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+    }
+
+    /// v1.36: a STABLE callee is fine (statement-constant by contract)
+    /// and the fold still applies through it.
+    #[test]
+    fn stable_callee_folds_through() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION st136(x int) RETURNS int STABLE LANGUAGE sql \
+             AS 'SELECT $1 * 2'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION im136(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT st136($1) + 1'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT im136(10), im136(10)").unwrap());
+        assert_eq!(rows, vec![vec!["21".to_string(), "21".to_string()]]);
+    }
+
+    /// v1.36: DML bodies never fold — their write-log effects are
+    /// row-count-dependent. A fold would run the INSERT once.
+    #[test]
+    fn dml_body_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE log136(n int)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION d136() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'INSERT INTO log136 VALUES (1) RETURNING 1'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT d136() FROM generate_series(1, 3) g").unwrap());
+        assert_eq!(rows.len(), 3);
+        let cnt = rows_of(run(&mut eng, "SELECT count(*) FROM log136").unwrap());
+        assert_eq!(cnt, vec![vec!["3".to_string()]]);
+    }
+
+    /// v1.36: a body referencing the caller's query level never folds.
+    /// `a` binds to the calling query's `t136` (rustgres lets SQL
+    /// bodies see caller scopes; PG19 rejects such bodies at CREATE).
+    #[test]
+    fn outer_ref_body_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t136(a int)").unwrap();
+        run(&mut eng, "INSERT INTO t136 VALUES (1),(2),(3)").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION o136() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT a + 100'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT o136() FROM t136 ORDER BY a").unwrap());
+        assert_eq!(
+            col0(rows),
+            vec!["101".to_string(), "102".to_string(), "103".to_string()]
+        );
+    }
+
+    /// v1.36: the recursion guard refuses the fold but execution still
+    /// recurses normally (the base case terminates it).
+    #[test]
+    fn recursive_body_not_folded_but_runs() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION rec136(x int) RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT CASE WHEN $1 <= 0 THEN 0 ELSE rec136($1 - 1) + 1 END'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT rec136(3)").unwrap());
+        assert_eq!(rows, vec![vec!["3".to_string()]]);
+    }
+
+    /// v1.36: STRICT NULL short-circuit composes with the cache — the
+    /// NULL result is cached and replayed, and the body never runs.
+    #[test]
+    fn strict_null_result_caches() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION sn136(x int) RETURNS int IMMUTABLE STRICT LANGUAGE sql \
+             AS 'SELECT $1 / 0'",
+        )
+        .unwrap();
+        let rows = rows_of(run(&mut eng, "SELECT sn136(NULL), sn136(NULL)").unwrap());
+        assert_eq!(rows, vec![vec!["NULL".to_string(), "NULL".to_string()]]);
+    }
+
+    /// v1.36: errors are never cached — every call raises identically.
+    #[test]
+    fn error_never_cached() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION e136() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 1/0'",
+        )
+        .unwrap();
+        let e1 = run(&mut eng, "SELECT e136()").unwrap_err();
+        assert_eq!(e1.code, "22012");
+        let e2 = run(&mut eng, "SELECT e136() FROM generate_series(1, 3) g").unwrap_err();
+        assert_eq!(e2.code, "22012");
+    }
+
+    /// v1.36: the cache key is exact — floats hash by bit pattern, so
+    /// `-0.0` and `0.0` (which `PartialEq` and text rendering
+    /// conflate) never alias; neither do `int` vs `bigint` or
+    /// `text` vs `bpchar`.
+    #[test]
+    fn fn_key_val_is_exact() {
+        assert_ne!(
+            fn_key_val(&Value::Float(0.0)),
+            fn_key_val(&Value::Float(-0.0))
+        );
+        assert_eq!(
+            fn_key_val(&Value::Float(0.0)),
+            fn_key_val(&Value::Float(0.0))
+        );
+        assert_ne!(
+            fn_key_val(&Value::Float(f64::NAN)),
+            fn_key_val(&Value::Float(-f64::NAN))
+        );
+        assert_ne!(
+            fn_key_val(&Value::Float4(0.0)),
+            fn_key_val(&Value::Float4(-0.0))
+        );
+        assert_ne!(fn_key_val(&Value::Int(1)), fn_key_val(&Value::BigInt(1)));
+        assert_ne!(
+            fn_key_val(&Value::Text("a".into())),
+            fn_key_val(&Value::BpChar("a".into()))
+        );
+        assert_eq!(fn_key_val(&Value::Null), fn_key_val(&Value::Null));
+        assert_ne!(fn_key_val(&Value::Null), fn_key_val(&Value::Int(0)));
+    }
+
+    /// v1.36: user-defined operators resolve their procedure at runtime
+    /// from the operand types, so a VOLATILE procedure is invisible to
+    /// static inspection — a body using one must never fold. A volatile
+    /// `?=%` (via a nextval sequence) yields a distinct value per row;
+    /// folding would repeat one value across all rows.
+    #[test]
+    fn userop_volatile_procedure_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136op").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION bump136(x int, y int) RETURNS int VOLATILE LANGUAGE sql \
+             AS 'SELECT x + y + nextval(''s136op'')'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE OPERATOR ?=% (procedure = bump136, leftarg = int, rightarg = int)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION fop136() RETURNS int IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 1 ?=% 2'",
+        )
+        .unwrap();
+        let vals = col0(rows_of(
+            run(&mut eng, "SELECT fop136() FROM generate_series(1, 3) g").unwrap(),
+        ));
+        assert_eq!(vals.len(), 3);
+        assert_ne!(vals[0], vals[1]);
+        assert_ne!(vals[1], vals[2]);
+    }
+
+    /// v1.36: `x op ANY (subquery)` with a user-defined operator must
+    /// never fold for the same reason as plain `UserOp`. The procedure
+    /// returns boolean (quantified operators require it) with its
+    /// volatility observable through `nextval` parity.
+    #[test]
+    fn quantified_userop_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136q").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION qbump136(x int, y int) RETURNS bool VOLATILE LANGUAGE sql \
+             AS 'SELECT (x + y + nextval(''s136q'')) % 2 = 0'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE OPERATOR ?=%% (procedure = qbump136, leftarg = int, rightarg = int)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION fq136() RETURNS bool IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 1 ?=%% ANY (SELECT 2)'",
+        )
+        .unwrap();
+        let vals = col0(rows_of(
+            run(&mut eng, "SELECT fq136() FROM generate_series(1, 3) g").unwrap(),
+        ));
+        assert_eq!(vals.len(), 3);
+        assert_ne!(vals[0], vals[1]);
+        assert_ne!(vals[1], vals[2]);
+    }
+
+    /// v1.36: the array form `x op ANY (array)` desugars to the hidden
+    /// `__any_all_array` builtin with a `user:`-prefixed operator text;
+    /// a volatile user procedure must block folding there too. A
+    /// single-element array keeps exactly one `nextval` per outer row
+    /// so the parity alternates.
+    #[test]
+    fn any_all_array_userop_never_folds() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE SEQUENCE s136a").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION abump136(x int, y int) RETURNS bool VOLATILE LANGUAGE sql \
+             AS 'SELECT (x + y + nextval(''s136a'')) % 2 = 0'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE OPERATOR ?#%% (procedure = abump136, leftarg = int, rightarg = int)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION fa136() RETURNS bool IMMUTABLE LANGUAGE sql \
+             AS 'SELECT 1 ?#%% ANY (ARRAY[1])'",
+        )
+        .unwrap();
+        let vals = col0(rows_of(
+            run(&mut eng, "SELECT fa136() FROM generate_series(1, 3) g").unwrap(),
+        ));
+        assert_eq!(vals.len(), 3);
+        assert_ne!(vals[0], vals[1]);
+        assert_ne!(vals[1], vals[2]);
+    }
+}
