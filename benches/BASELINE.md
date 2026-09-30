@@ -2,6 +2,106 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `split_statements`'s `Vec<char>` collect regrows on every incoming message — baseline — 2026-09-30
+
+**Workload**: `benches/profile_idxscan.py --rows 50000 --count 50 --width 1000`
+— the fixed-count indexed-range-scan driver already committed for
+profiling `src/index.rs` (no prior Bolt round has profiled it). It loads
+50,000 rows via 50 chunked 1,000-row `INSERT` statements, builds a
+secondary btree index with `CREATE INDEX`, then runs 50 `WHERE id BETWEEN
+lo AND hi` range queries over the real wire protocol. Chosen because it
+exercises two realistic message shapes in one run: large multi-row
+`INSERT` statement text (tens of KB per message) and small `SELECT`
+statement text — both of which pass through `sql::split_statements`
+before anything else touches them.
+
+**Profile** (Callgrind, `--collect-jumps=yes --cache-sim=yes`, same
+harness):
+
+`callgrind_annotate --tree=calling --inclusive=yes` attributes **424,322,354
+of the program's 6,107,729,013 total instructions (6.95%) to
+`rustgres::sql::split_statements`** — comfortably over the ≥5%-of-profile
+floor, and the single most expensive individually-named `rustgres::`
+function in the whole run apart from B-tree index maintenance itself
+(`exec_create_index`'s one-time `CREATE INDEX` backfill, 11.83%, and
+`run_select`'s query execution, 11.72%, are both inherent B-tree/MVCC work
+already reviewed and left alone — see the "Reading these numbers"
+discussion below).
+
+Walking `split_statements`'s own callee breakdown: 337,414,314 of its
+424,322,354 Ir (79.5% of its own inclusive cost) sits in
+`<Vec<T,A> as SpecExtend<T,I>>::spec_extend`, reached through
+`Iterator::collect` (206 calls — every `split_statements` call plus every
+statement/tail segment it slices out). The very first line of the
+function is the culprit, and it is the *exact* pattern already found and
+fixed in `tokenize` on 2026-09-13 (see that entry below): `let chars:
+Vec<char> = input.chars().collect();`. `Chars::size_hint()`'s lower bound
+is `byte_len/4` (sized for worst-case 4-byte UTF-8), so for this
+ASCII-heavy SQL text the initial reservation undershoots the real char
+count by ~4x and the `Vec<char>` regrows 2-3 times per call before it
+stops — and unlike `tokenize`, which runs once per already-split
+statement, `split_statements` runs once per **entire incoming message**,
+so a single large multi-row `INSERT`'s tens-of-KB text pays this regrowth
+on the whole blob in one shot.
+
+DHAT (`valgrind --tool=dhat`, same harness): of the program's 1,213,133
+total allocation blocks / 296,043,641 total bytes, only 515 blocks /
+9,032,876 bytes (0.04% of blocks, 3.05% of bytes) walk back through a
+`split_statements` frame — this line's regrowth is a real but numerically
+small share of the *program's* total allocation traffic, because
+`split_statements` is called only once per message (100 times in this
+workload) versus once per statement/token for the parser functions fixed
+in earlier rounds.
+
+**Baseline numbers** (this commit, `split_statements` unchanged):
+
+| counter | value |
+|---|---|
+| Callgrind `Ir` (total, one run) | 6,107,729,013 |
+| Callgrind `Ir` attributed to `split_statements` (inclusive) | 424,322,354 (6.95%) |
+| ...of which in `Vec<char>` collect (`spec_extend`/`Iterator::collect`) | 337,414,314 (5.52% of total) |
+| DHAT total allocations (blocks) | 1,213,133 |
+| DHAT total bytes allocated | 296,043,641 |
+| DHAT blocks attributed to `split_statements` | 515 (0.04% of total) |
+| DHAT bytes attributed to `split_statements` | 9,032,876 (3.05% of total) |
+
+Profiles committed: `benches/profiles/{callgrind,dhat}.out.idxscan-base-2026-09-30`.
+
+**Reproduce**:
+
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_idxscan.py --rows 50000 --count 50 --width 1000
+# SIGTERM the server to flush callgrind.out, then:
+callgrind_annotate --tree=calling --inclusive=yes --show-percs=yes /tmp/cg.out \
+  | grep -A2 'split_statements \[/home'
+```
+
+Same harness under `--tool=dhat --dhat-out-file=/tmp/dh.out`; sum `tb`/`tbk`
+over `pps[]` whose resolved call stack (via `ftbl`) includes a
+`split_statements` frame.
+
+**Reading these numbers**: `exec_create_index` (11.83%) and `run_select`
+(11.72%) both dwarf `split_statements`, but both are inherent-work
+findings, not fixable targets, on inspection: `exec_create_index` backfills
+a `BTreeMap` one key at a time from 50,000 existing rows (`Index::insert`
+→ `BTreeMap::entry` → `search_tree`), which is the B-tree itself doing
+B-tree things — the per-row key is a single already-cheap `Value::Int`
+clone (`IndexKey`'s single-column fast path, fixed 2026-09-17), and no
+redundant work sits above the tree's own node-search/split memcpy cost.
+Likewise `run_select`'s cost is split between `build_source`'s
+`index_scan_ids`/row-visibility walk and `filter_rows`'s per-row WHERE
+evaluation, both of which do exactly one unit of real work per matched
+row. Neither is a `>50-line change touching the public API` away from a
+fix, they are just what a B-tree-backed engine costs; `split_statements`
+is the one function in this profile's top costs that is both over the 5%
+floor and a proven, mechanical, zero-behavior-change fix (same diff shape
+as `tokenize`'s 2026-09-13 fix), so it is the target below.
+
 ## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — fix — 2026-09-29
 
 Fixes the target identified in the baseline entry immediately below this
