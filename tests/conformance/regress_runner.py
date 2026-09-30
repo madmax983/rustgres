@@ -911,8 +911,9 @@ EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
     # override explicitly excludes them so they classify here, not as
     # REAL-FAIL).
-    (r"(?is)\blateral\b\s*\(\s*\(\s*select\b.*\bunion\b",
-     "v1.10: parenthesized setop in LATERAL FROM unsupported"),
+    # v1.27: the parenthesized-setop-in-LATERAL mask is retired — PG19
+    # `select_with_parens` is now parsed in FROM/LATERAL (parse_from_primary
+    # probes `paren_has_top_level_setop`), so the corpus statement passes.
     (r"(?is)\bint8_tbl\s+x\s+cross\s+join\s*\(\s*int4_tbl\s+x\b.*\blateral\b",
      "v1.10: ambiguous table reference in LATERAL not detected"),
     (r"(?is)\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\(",
@@ -997,9 +998,15 @@ EXPECTED_FAIL_PATTERNS = [
     # ROW()-constructor variants below classify under row().
     (r"(?is)^\s*create\s+rule\b", "CREATE RULE unsupported"),
     (r"(?is)^\s*drop\s+rule\b", "DROP RULE unsupported"),
-    (r"(?i)\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),
-    (r"\(\s*\w+(\s*,\s*\w+)+\s*\)\s*(not\s+)?in\s*\(\s*select\b",
-     "row-wise IN (subquery) unsupported"),
+    # v1.27: narrowed — the old `\b(all|any|some)\s*\(\s*select` also
+    # matched `UNION ALL (SELECT ...)` setop shapes (a false positive;
+    # those now parse per PG19 `select_with_parens`). A quantified
+    # comparison always has a comparison operator before ALL/ANY/SOME.
+    (r"(?i)(?:=|<>|!=|<=|>=|<|>|\?=)\s*\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),
+    # v1.27: the row-wise-IN mask is retired — the remaining corpus
+    # statement (`(f1,f1) IN (SELECT f1, generate_series(...) ... GROUP BY
+    # f1)`) passes now that target-list SRFs fan out over grouped rows
+    # (PG19 ProjectSet above Agg).
     # v0.54: zero-column tables (CREATE TABLE t(); INSERT ... DEFAULT
     # VALUES) are not supported; the following LATERAL test is already
     # masked separately.

@@ -488,6 +488,7 @@ fn execute_inner(
                     lock_ids: &mut lock_ids,
                     ctes: Vec::new(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: Vec::new(),
                     hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                     hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -2339,6 +2340,7 @@ fn eval_partition_key_expr(
         lock_ids: &mut lock_ids,
         ctes: Vec::new(),
         wctx: None,
+        srf_vals: Vec::new(),
         role,
         read_only: false,
         priv_scopes: Vec::new(),
@@ -3644,6 +3646,7 @@ fn eval_default(
                 lock_ids: &mut lock_ids,
                 ctes: Vec::new(),
                 wctx: None,
+                srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -3859,6 +3862,7 @@ fn check_row_constraints(
                 lock_ids: &mut lock_ids,
                 ctes: Vec::new(),
                 wctx: None,
+                srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -3898,6 +3902,7 @@ fn check_row_constraints(
             lock_ids: &mut lock_ids,
             ctes: Vec::new(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -4693,6 +4698,7 @@ fn materialize_dml_ctes(
         lock_ids: &mut lock_ids,
         ctes: Vec::new(),
         wctx: None,
+        srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -5709,6 +5715,7 @@ fn exec_create_table_as(
             lock_ids: &mut lock_ids,
             ctes: Vec::new(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -6170,6 +6177,7 @@ fn exec_insert(
             lock_ids: &mut lock_ids,
             ctes: ctes.clone(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -6293,6 +6301,7 @@ fn exec_insert(
                         lock_ids: &mut lock_ids,
                         ctes: ctes.clone(),
                         wctx: None,
+                        srf_vals: Vec::new(),
                         priv_scopes: Vec::new(),
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                         hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -6413,6 +6422,7 @@ fn exec_insert(
                 lock_ids: &mut lock_ids,
                 ctes: ctes.clone(),
                 wctx: None,
+                srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -7380,6 +7390,7 @@ fn exec_update(
                 lock_ids: &mut lock_ids,
                 ctes: ctes.clone(),
                 wctx: None,
+                srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -8019,6 +8030,7 @@ fn exec_delete(
                 lock_ids: &mut lock_ids,
                 ctes: ctes.clone(),
                 wctx: None,
+                srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -11913,6 +11925,7 @@ fn exec_explain_analyze(
             lock_ids: &mut lock_ids,
             ctes: Vec::new(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -13666,6 +13679,13 @@ struct Q<'a, 'b> {
     /// window pre-pass before projection; `Expr::Window` evaluates by
     /// looking up `values[wid][row]`.
     wctx: Option<WindowCtx>,
+    /// v1.27: active SRF fan-out values for PG19 ProjectSet-over-Agg.
+    /// `project_group_expanded` sets this per fanned row to the
+    /// (SRF call, current value) pairs; `eval_grouped`'s `Expr::Func`
+    /// arm returns the bound value instead of raising 42883. Empty
+    /// outside the fan-out. Saved/restored across subquery boundaries
+    /// (a subquery is its own query level).
+    srf_vals: Vec<(Expr, Value)>,
     /// v0.11: acting role, for privilege checks during scans and
     /// sequence-function evaluation.
     role: &'a str,
@@ -19482,6 +19502,7 @@ fn eval_lateral_right(
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -20257,6 +20278,7 @@ fn build_source(
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -21673,96 +21695,382 @@ fn exec_agg_one(
             row: first,
             prov: first_prov,
         };
-        let mut cells = Vec::new();
         // v0.78: grouping-set NULL substitution. `null_items` holds the
         // select-item indices (and `usize::MAX - ci` for star columns)
         // whose bare columns are not in this grouping set: PG projects
         // them as NULL instead of raising 42803.
         let is_null_item = |key: usize| -> bool { null_items.is_some_and(|s| s.contains(&key)) };
-        for (ii, item) in stmt.items.iter().enumerate() {
-            match item {
-                SelectItem::All => {
-                    // v0.23: hidden columns are skipped by `*`.
-                    for (ci, c) in schema.iter().enumerate().filter(|(_, c)| !c.hidden) {
-                        if is_null_item(usize::MAX - ci) {
-                            cells.push(Value::Null);
-                        } else {
-                            cells.push(grouped_col_value(
-                                gscope,
-                                group_keys,
-                                key_vals,
-                                c.qual.as_str(),
-                                &c.name,
-                            )?);
-                        }
-                    }
+        // v1.27: PG19 ProjectSet above the aggregate — an SRF call
+        // anywhere in the target list (top-level or nested, e.g.
+        // `generate_series(1,50)/10`) fans each grouped row out (the
+        // plain path's `expand_srf`, v0.32), unless the SRF is a GROUP
+        // BY key (v0.47 reads those from key_vals) or windows are
+        // present (plain-path rule: windowed queries keep the scalar
+        // reading).
+        let expand_srf = windows.is_empty()
+            && stmt.items.iter().enumerate().any(|(ii, item)| {
+                if is_null_item(ii) {
+                    return false;
                 }
-                SelectItem::AllOf(qual) => {
-                    // v0.23: expand in the qualifier's source-column order.
-                    let idx = qual_star_order(schema, qual);
-                    if idx.is_empty() {
-                        return Err(exec_err(
-                            "42P01",
-                            format!("missing FROM-clause entry for table \"{}\"", qual),
-                        ));
-                    }
-                    for i in idx {
-                        let c = &schema[i];
-                        if is_null_item(usize::MAX - i) {
-                            cells.push(Value::Null);
-                        } else {
-                            cells.push(grouped_col_value(
-                                gscope,
-                                group_keys,
-                                key_vals,
-                                qual.as_str(),
-                                &c.name,
-                            )?);
+                match item {
+                    SelectItem::Expr { expr, .. } => {
+                        if group_keys.iter().any(|g| g == expr) {
+                            return false;
                         }
+                        let mut slots = Vec::new();
+                        collect_grouped_srfs(q.eng, expr, group_keys, &mut slots);
+                        !slots.is_empty()
                     }
+                    _ => false,
                 }
-                SelectItem::Expr { expr, .. } => {
-                    if is_null_item(ii) {
-                        cells.push(Value::Null);
-                    } else {
-                        cells.push(eval_grouped(
-                            q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, expr,
-                        )?);
-                    }
+            });
+        // Rows produced by this group: exactly one normally, or the SRF
+        // fan-out (possibly zero rows when every SRF is empty). Each
+        // fanned row carries its SRF bindings for ORDER BY terms that
+        // name an SRF call textually (PG evaluates ORDER BY after the
+        // ProjectSet).
+        let group_rows: Vec<(Vec<Value>, Vec<(Expr, Value)>)> = if expand_srf {
+            project_group_expanded(
+                q, outer, stmt, schema, gscope, rows_eff, idxs, key_vals, group_keys,
+                &is_null_item,
+            )?
+        } else {
+            let mut cells = Vec::new();
+            for (ii, item) in stmt.items.iter().enumerate() {
+                cells.extend(grouped_project_item(
+                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys,
+                    &is_null_item, ii, item,
+                )?);
+            }
+            vec![(cells, Vec::new())]
+        };
+        for (cells, row_srf) in group_rows {
+            q.srf_vals = row_srf;
+            let sort_keys = if stmt.order_by.is_empty() {
+                None
+            } else {
+                let mut fallback = |e: &Expr| {
+                    eval_grouped(
+                        q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, e,
+                    )
+                };
+                let mut keys = Vec::with_capacity(stmt.order_by.len());
+                for term in &stmt.order_by {
+                    keys.push(order_key(
+                        stmt,
+                        &out_qcols,
+                        &item_pos,
+                        &cells,
+                        &term.expr,
+                        &mut fallback,
+                    )?);
+                }
+                Some(keys)
+            };
+            out_rows.push(OutRow {
+                cells: Row::new(cells),
+                prov: Vec::new(),
+                full: None,
+                sort_keys,
+                // v0.10: ORDER BY terms with windows need the group index.
+                // v1.27: no windows when expanding (see expand_srf above).
+                win_idx: if windows.is_empty() { None } else { Some(gi) },
+            });
+        }
+        // v1.27: the fan-out bindings are per-row; never leak them past
+        // the group's rows.
+        q.srf_vals = Vec::new();
+    }
+    Ok(out_rows)
+}
+
+/// v1.27: project one select-list item for a grouped row, returning its
+/// column values (stars expand to several). Shared by the scalar grouped
+/// projection and by the SRF fan-out below (for the non-SRF items).
+#[allow(clippy::too_many_arguments)]
+fn grouped_project_item(
+    q: &mut Q,
+    outer: &[Scope],
+    gscope: Scope,
+    schema: &[QCol],
+    rows_eff: &[QRow],
+    idxs: &[usize],
+    key_vals: &[Value],
+    group_keys: &[Expr],
+    is_null_item: &dyn Fn(usize) -> bool,
+    ii: usize,
+    item: &SelectItem,
+) -> Result<Vec<Value>, ExecError> {
+    let mut vals = Vec::new();
+    match item {
+        SelectItem::All => {
+            // v0.23: hidden columns are skipped by `*`.
+            for (ci, c) in schema.iter().enumerate().filter(|(_, c)| !c.hidden) {
+                if is_null_item(usize::MAX - ci) {
+                    vals.push(Value::Null);
+                } else {
+                    vals.push(grouped_col_value(
+                        gscope,
+                        group_keys,
+                        key_vals,
+                        c.qual.as_str(),
+                        &c.name,
+                    )?);
                 }
             }
         }
-        let sort_keys = if stmt.order_by.is_empty() {
-            None
-        } else {
-            let mut fallback = |e: &Expr| {
-                eval_grouped(
-                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, e,
-                )
-            };
-            let mut keys = Vec::with_capacity(stmt.order_by.len());
-            for term in &stmt.order_by {
-                keys.push(order_key(
-                    stmt,
-                    &out_qcols,
-                    &item_pos,
-                    &cells,
-                    &term.expr,
-                    &mut fallback,
+        SelectItem::AllOf(qual) => {
+            // v0.23: expand in the qualifier's source-column order.
+            let idx = qual_star_order(schema, qual);
+            if idx.is_empty() {
+                return Err(exec_err(
+                    "42P01",
+                    format!("missing FROM-clause entry for table \"{}\"", qual),
+                ));
+            }
+            for i in idx {
+                let c = &schema[i];
+                if is_null_item(usize::MAX - i) {
+                    vals.push(Value::Null);
+                } else {
+                    vals.push(grouped_col_value(
+                        gscope,
+                        group_keys,
+                        key_vals,
+                        qual.as_str(),
+                        &c.name,
+                    )?);
+                }
+            }
+        }
+        SelectItem::Expr { expr, .. } => {
+            if is_null_item(ii) {
+                vals.push(Value::Null);
+            } else {
+                vals.push(eval_grouped(
+                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, expr,
                 )?);
             }
-            Some(keys)
-        };
-        out_rows.push(OutRow {
-            cells: Row::new(cells),
-            prov: Vec::new(),
-            full: None,
-            sort_keys,
-            // v0.10: ORDER BY terms with windows need the group index.
-            win_idx: if windows.is_empty() { None } else { Some(gi) },
+        }
+    }
+    Ok(vals)
+}
+
+/// v1.27: one SRF occurrence collected from a grouped select item —
+/// PG19's ProjectSet-over-Agg target-list scan finds SRF calls nested
+/// anywhere in the target list (not just top-level), e.g.
+/// `generate_series(1,50)/10`. Each textual occurrence fans out
+/// separately; the fan-out zips them with NULL padding.
+struct GroupedSrf {
+    name: String,
+    args: Vec<Expr>,
+    /// The exact call expression; `eval_grouped` matches it
+    /// structurally against `q.srf_vals`.
+    call: Expr,
+}
+
+/// v1.27: collect the SRF calls to fan out for one grouped select
+/// item. Skips: an SRF call that is itself a GROUP BY key (v0.47 reads
+/// those from key_vals), SRFs under aggregate/window calls (those keep
+/// the existing below-Agg evaluation path), and SRFs inside subqueries
+/// (their own query level handles them, with a fresh Q).
+fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Vec<GroupedSrf>) {
+    match e {
+        // Pruned: aggregates and windows keep their existing
+        // evaluation paths; subqueries are their own query level.
+        Expr::Agg { .. } | Expr::Window { .. } => {}
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::Exists { .. } => {}
+        Expr::Func { name, args } if is_srf(eng, name) => {
+            if !group_keys.iter().any(|g| g == e) {
+                out.push(GroupedSrf {
+                    name: name.clone(),
+                    args: args.clone(),
+                    call: e.clone(),
+                });
+            }
+            // Pruned: no SRF collection inside SRF arguments.
+        }
+        Expr::NamedArg { expr, .. } => collect_grouped_srfs(eng, expr, group_keys, out),
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::WholeRow { .. } => {}
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::IsDistinctFrom { left, right, .. } => {
+            collect_grouped_srfs(eng, left, group_keys, out);
+            collect_grouped_srfs(eng, right, group_keys, out);
+        }
+        Expr::Cast { expr, .. }
+        | Expr::CastNamed { expr, .. }
+        | Expr::FieldAccess { expr, .. }
+        | Expr::Not(expr)
+        | Expr::BitNot(expr)
+        | Expr::Neg(expr)
+        | Expr::IsNull { expr, .. }
+        | Expr::IsBool { expr, .. }
+        | Expr::Extract { from: expr, .. } => collect_grouped_srfs(eng, expr, group_keys, out),
+        Expr::Row(elems) => {
+            for el in elems {
+                collect_grouped_srfs(eng, el, group_keys, out);
+            }
+        }
+        Expr::Like {
+            expr, pattern, escape, ..
+        } => {
+            collect_grouped_srfs(eng, expr, group_keys, out);
+            collect_grouped_srfs(eng, pattern, group_keys, out);
+            if let Some(esc) = escape {
+                collect_grouped_srfs(eng, esc, group_keys, out);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            collect_grouped_srfs(eng, expr, group_keys, out);
+            collect_grouped_srfs(eng, pattern, group_keys, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_grouped_srfs(eng, expr, group_keys, out);
+            collect_grouped_srfs(eng, low, group_keys, out);
+            collect_grouped_srfs(eng, high, group_keys, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_grouped_srfs(eng, a, group_keys, out);
+            }
+        }
+        Expr::Case {
+            operand, whens, else_, ..
+        } => {
+            if let Some(o) = operand {
+                collect_grouped_srfs(eng, o, group_keys, out);
+            }
+            for (k, r) in whens {
+                collect_grouped_srfs(eng, k, group_keys, out);
+                collect_grouped_srfs(eng, r, group_keys, out);
+            }
+            if let Some(el) = else_ {
+                collect_grouped_srfs(eng, el, group_keys, out);
+            }
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            for el in elems {
+                collect_grouped_srfs(eng, el, group_keys, out);
+            }
+        }
+        Expr::Subscript { array, indices, .. } => {
+            collect_grouped_srfs(eng, array, group_keys, out);
+            for i in indices {
+                collect_grouped_srfs(eng, i, group_keys, out);
+            }
+        }
+        Expr::Slice { array, bounds, .. } => {
+            collect_grouped_srfs(eng, array, group_keys, out);
+            for (lo, hi) in bounds {
+                if let Some(b) = lo {
+                    collect_grouped_srfs(eng, b, group_keys, out);
+                }
+                if let Some(b) = hi {
+                    collect_grouped_srfs(eng, b, group_keys, out);
+                }
+            }
+        }
+        Expr::UserOp { left, right, .. } => {
+            collect_grouped_srfs(eng, left, group_keys, out);
+            collect_grouped_srfs(eng, right, group_keys, out);
+        }
+    }
+}
+
+/// v1.27: PG19 ProjectSet above the aggregate (`nodeProjectSet.c`
+/// `ExecProjectSRF`). Each grouped row fans out to one output row per
+/// SRF element; several SRFs zip with NULL padding for the exhausted
+/// ones; an all-empty SRF set drops the grouped row (`hasresult`
+/// false). SRF calls are found nested anywhere in the target list
+/// (PG19's target-list SRF scan): each select item is evaluated per
+/// fanned row with its SRF calls bound to that row's values
+/// (`q.srf_vals`, intercepted in `eval_grouped`'s `Expr::Func` arm).
+/// SRF arguments evaluate once per group in grouped context
+/// (aggregates fold the group, bare columns must be group-bound).
+/// Returns the output rows with each row's SRF bindings (the caller
+/// rebinds them for ORDER BY terms that name an SRF call textually —
+/// PG evaluates ORDER BY after the ProjectSet).
+#[allow(clippy::too_many_arguments)]
+fn project_group_expanded(
+    q: &mut Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    schema: &[QCol],
+    gscope: Scope,
+    rows_eff: &[QRow],
+    idxs: &[usize],
+    key_vals: &[Value],
+    group_keys: &[Expr],
+    is_null_item: &dyn Fn(usize) -> bool,
+) -> Result<Vec<(Vec<Value>, Vec<(Expr, Value)>)>, ExecError> {
+    let saved_srf = std::mem::take(&mut q.srf_vals);
+    // Collect the SRF fan-out slots across the select items. A whole
+    // item that is a GROUP BY key (or a grouping-set NULL item) is not
+    // scanned: it reads from key_vals / NULL like a plain column.
+    let mut slots: Vec<GroupedSrf> = Vec::new();
+    for (ii, item) in stmt.items.iter().enumerate() {
+        if let SelectItem::Expr { expr, .. } = item {
+            if !is_null_item(ii) && !group_keys.iter().any(|g| g == expr) {
+                collect_grouped_srfs(q.eng, expr, group_keys, &mut slots);
+            }
+        }
+    }
+    // SRF arguments evaluate once per group, in grouped context; the
+    // SRF then runs on those values (this is what the old 42883 arm in
+    // `eval_grouped` refused to do).
+    let mut fans: Vec<Vec<Value>> = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        let mut avals = Vec::with_capacity(slot.args.len());
+        for a in &slot.args {
+            avals.push(eval_grouped(
+                q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, a,
+            )?);
+        }
+        fans.push(if is_builtin_srf(&slot.name) {
+            eval_srf_vals(&slot.name, &avals)?
+        } else {
+            let mut chained: Vec<Scope> = outer.to_vec();
+            chained.push(gscope);
+            eval_user_srf_vals(q, &chained, &slot.name, &avals)?
         });
     }
-    Ok(out_rows)
+    // The fan-out width comes from the SRF columns only — a row is
+    // produced only when at least one SRF yields a value. Plain columns
+    // repeat and never create rows on their own.
+    let width = fans.iter().map(Vec::len).max().unwrap_or(0);
+    let mut rows = Vec::with_capacity(width);
+    for k in 0..width {
+        // Bind this row's SRF values (NULL-padded past exhaustion).
+        q.srf_vals = slots
+            .iter()
+            .zip(&fans)
+            .map(|(s, fan)| (s.call.clone(), fan.get(k).cloned().unwrap_or(Value::Null)))
+            .collect();
+        let mut cells = Vec::new();
+        for (ii, item) in stmt.items.iter().enumerate() {
+            cells.extend(grouped_project_item(
+                q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, is_null_item, ii,
+                item,
+            )?);
+        }
+        rows.push((cells, q.srf_vals.clone()));
+    }
+    q.srf_vals = saved_srf;
+    Ok(rows)
 }
 
 /// A bare column in a grouped query: it must be group-bound — either one
@@ -22163,6 +22471,14 @@ fn eval_grouped(
             eval_is_bool(&v, *neg, *val)
         }
         Expr::Func { name, args } => {
+            // v1.27: PG19 ProjectSet-over-Agg — an SRF call collected
+            // for fan-out evaluates to its current row's value.
+            // `project_group_expanded` sets `q.srf_vals` per fanned row;
+            // subqueries run with a fresh Q (empty `srf_vals`), so this
+            // only fires for the item's own expression tree.
+            if let Some((_, v)) = q.srf_vals.iter().find(|(call, _)| call == e) {
+                return Ok(v.clone());
+            }
             // v0.95: resolve `name => expr` named arguments to positional
             // order (PG19). Zero-cost when absent.
             let __owned: Vec<Expr>;
@@ -24521,6 +24837,7 @@ fn eval_row_subquery(q: &mut Q, scopes: &[Scope], sub: &SelectStmt) -> Result<Va
             lock_ids: &mut *q.lock_ids,
             ctes: q.ctes.clone(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             hashed_in: q.hashed_in.clone(),
@@ -24950,6 +25267,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -24989,6 +25307,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -25066,6 +25385,7 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -26079,6 +26399,7 @@ fn eval_hashed_in(
                     lock_ids: &mut *q.lock_ids,
                     ctes: q.ctes.clone(),
                     wctx: None,
+                    srf_vals: Vec::new(),
                     priv_scopes: q.priv_scopes.clone(),
                     hashed_exists: q.hashed_exists.clone(),
                     hashed_in: q.hashed_in.clone(),
@@ -26401,6 +26722,7 @@ fn eval_in_value(
             lock_ids: &mut *q.lock_ids,
             ctes: q.ctes.clone(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             hashed_in: q.hashed_in.clone(),
@@ -26557,6 +26879,7 @@ fn eval_quantified_value(
             lock_ids: &mut *q.lock_ids,
             ctes: q.ctes.clone(),
             wctx: None,
+            srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
             hashed_exists: q.hashed_exists.clone(),
             hashed_in: q.hashed_in.clone(),
@@ -27475,6 +27798,7 @@ fn eval_dml_expr(
         lock_ids: &mut lock_ids,
         ctes: ctes.to_vec(),
         wctx: None,
+        srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
@@ -30358,6 +30682,7 @@ fn run_func_body(
         lock_ids: &mut *q.lock_ids,
         ctes: q.ctes.clone(),
         wctx: None,
+        srf_vals: Vec::new(),
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
         hashed_in: q.hashed_in.clone(),
@@ -30611,6 +30936,7 @@ fn run_plpgsql_body(
         lock_ids: &mut *q.lock_ids,
         ctes: q.ctes.clone(),
         wctx: None,
+        srf_vals: Vec::new(),
         priv_scopes: q.priv_scopes.clone(),
         hashed_exists: q.hashed_exists.clone(),
         hashed_in: q.hashed_in.clone(),
@@ -54020,5 +54346,303 @@ mod v112_empty_select_tests {
             }
             _ => panic!("expected Dml"),
         }
+    }
+}
+
+/// v1.27: PG19 `select_with_parens` in FROM/LATERAL (S1) and PG19
+/// ProjectSet-over-Agg SRF fan-out (S2).
+#[cfg(test)]
+mod v127_projectset_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE int4_tbl (f1 int)").unwrap();
+        run(
+            eng,
+            "INSERT INTO int4_tbl VALUES (0),(123456),(-123456),(2147483647),(-2147483647)",
+        )
+        .unwrap();
+    }
+
+    // -- S1: PG19 select_with_parens in FROM/LATERAL --------------------
+
+    /// Corpus join-suite B: `((select 1) union all (select 2))` shapes
+    /// in FROM used to be 42601; now they parse per PG19
+    /// `select_with_parens`.
+    #[test]
+    fn parenthesized_setop_in_from() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select * from (select null::int as c0 from ((select 1) union all (select 2))) t1 \
+             cross join (select null::int as c1 from ((select 1) union all (select 2))) t2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["NULL".to_string(), "NULL".to_string()],
+                vec!["NULL".to_string(), "NULL".to_string()],
+                vec!["NULL".to_string(), "NULL".to_string()],
+                vec!["NULL".to_string(), "NULL".to_string()],
+            ]
+        );
+    }
+
+    /// Corpus join-suite C: LATERAL over a parenthesized set operation.
+    #[test]
+    fn lateral_parenthesized_setop() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select q1.v, q2.v from (select 1 as v) as q1 cross join lateral \
+             ((select * from ((select 4 as v) union all (select 5 as v)) as q3) \
+             union all (select q1.v)) as q2 order by 1, 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "4".to_string()],
+                vec!["1".to_string(), "5".to_string()],
+            ]
+        );
+    }
+
+    /// Control: single-paren setop in FROM (pre-v1.27 behavior).
+    #[test]
+    fn single_paren_setop_unchanged() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select * from (select 1 union all select 2) t order by 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+    }
+
+    /// Control: redundant parens around a plain subselect (v0.14).
+    #[test]
+    fn redundant_parens_unchanged() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(&mut eng, "select * from ((select 1 as x)) ss order by 1").unwrap();
+        assert_eq!(rows_of(r), vec![vec!["1".to_string()]]);
+    }
+
+    /// Control: parenthesized VALUES in FROM (pre-v1.27 behavior).
+    #[test]
+    fn parenthesized_values_unchanged() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(&mut eng, "select * from ((values (1),(2))) v(x) order by 1").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+    }
+
+    // -- S2: PG19 ProjectSet over Agg ----------------------------------
+
+    /// Bare top-level SRF in a grouped select fans out per group.
+    #[test]
+    fn grouped_bare_srf_fans_out() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select x, generate_series(1,3) from (values (1),(2)) t(x) group by x order by 1, 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+                vec!["1".to_string(), "3".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+                vec!["2".to_string(), "3".to_string()],
+            ]
+        );
+    }
+
+    /// Corpus subselect-suite A: the SRF is nested
+    /// (`generate_series(1,50)/10`); PG19's target-list SRF scan finds
+    /// it and fans out over the aggregate.
+    #[test]
+    fn grouped_nested_srf_in_subselect() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select * from int4_tbl o where (f1, f1) in \
+             (select f1, generate_series(1,50) / 10 g from int4_tbl i group by f1)",
+        )
+        .unwrap();
+        // int4_tbl = {0, 123456, -123456, 2147483647, -2147483647};
+        // only f1 = 0 matches (f1 in {0..5} after the /10 fan-out).
+        assert_eq!(rows_of(r), vec![vec!["0".to_string()]]);
+    }
+
+    /// Nested SRF under arithmetic fans out with the expression
+    /// evaluated per fanned row.
+    #[test]
+    fn grouped_nested_srf_arithmetic() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select x, generate_series(1,6)/2 g from (values (1)) t(x) group by x order by 1, 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "0".to_string()],
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+                vec!["1".to_string(), "3".to_string()],
+            ]
+        );
+    }
+
+    /// Several SRFs zip; the exhausted one pads with NULL.
+    #[test]
+    fn grouped_multi_srf_null_pads() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select generate_series(1,2), generate_series(10,12) from (values (1)) t(x) group by x",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "11".to_string()],
+                vec!["NULL".to_string(), "12".to_string()],
+            ]
+        );
+    }
+
+    /// An all-empty SRF set drops the grouped row (PG `hasresult`).
+    #[test]
+    fn grouped_empty_srf_drops_row() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select generate_series(2,1) from (values (1)) t(x) group by x",
+        )
+        .unwrap();
+        assert!(rows_of(r).is_empty());
+    }
+
+    /// An SRF that is itself a GROUP BY key reads the grouped value
+    /// (v0.47 path), not a fresh fan-out.
+    #[test]
+    fn grouped_srf_key_unchanged() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select generate_series(1,3) g from (values (1)) t(x) group by generate_series(1,3) order by 1",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ]
+        );
+    }
+
+    /// SRF arguments evaluate once per group in grouped context:
+    /// aggregates fold the group.
+    #[test]
+    fn grouped_srf_agg_argument() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let r = run(
+            &mut eng,
+            "select x, generate_series(1, max(x)) from (values (1),(2)) t(x) group by x order by 1, 2",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "1".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+            ]
+        );
+    }
+
+    /// An SRF under an aggregate keeps the 42883 it always had (PG19
+    /// evaluates such SRFs below the Agg, which this engine rejects).
+    #[test]
+    fn srf_under_agg_still_42883() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let err = run(
+            &mut eng,
+            "select sum(generate_series(1,3)) from (values (1)) t(x) group by x",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42883");
     }
 }

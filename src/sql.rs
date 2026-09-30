@@ -12713,18 +12713,45 @@ impl Parser {
             false
         };
         if *self.peek() == Token::LParen {
-            self.next();
-            // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
-            // Only consume an extra '(' when it opens a subquery or VALUES —
-            // never a VALUES row tuple like (1, 2).
-            let mut extra = 0;
-            while *self.peek() == Token::LParen
-                && matches!(self.peek2(), Token::Ident(s) if s == "select" || s == "values")
-            {
+            // v1.27: PG19 `select_with_parens` — a parenthesized query
+            // whose top level is a set operation, e.g.
+            // `FROM ((SELECT ...) UNION ALL (SELECT ...)) t`. The
+            // redundant-paren loop below would mis-consume the inner '('
+            // and choke on the set operator; probe for a top-level setop
+            // first (the same `paren_has_top_level_setop` check
+            // `parse_primary` uses) and parse the whole parenthesized
+            // setop query directly. This branch runs after
+            // `eat_lateral_keyword`, so `LATERAL ((SELECT ...) UNION ...)`
+            // is covered too.
+            let setop_paren = self.paren_has_top_level_setop();
+            // Tracks whether the inner derived table already got its alias
+            // (so the outer alias becomes optional).
+            let mut inner_aliased = false;
+            let mut item = if setop_paren {
+                self.next(); // consume '('
+                let left = self.parse_set_operand()?;
+                let carrier = self.parse_set_chain(left, 1)?;
+                let sub = self.finish_select_query(carrier)?;
+                self.expect(Token::RParen, "')'")?;
+                FromItem::Derived {
+                    sub: Box::new(sub),
+                    alias: String::new(),
+                    col_aliases: Vec::new(),
+                    lateral,
+                }
+            } else {
                 self.next();
-                extra += 1;
-            }
-            let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
+                // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
+                // Only consume an extra '(' when it opens a subquery or VALUES —
+                // never a VALUES row tuple like (1, 2).
+                let mut extra = 0;
+                while *self.peek() == Token::LParen
+                    && matches!(self.peek2(), Token::Ident(s) if s == "select" || s == "values")
+                {
+                    self.next();
+                    extra += 1;
+                }
+                let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
                 self.next();
                 let rows = self.parse_values_rows()?;
                 FromItem::Values {
@@ -12754,10 +12781,8 @@ impl Parser {
             // `((select ...) s LEFT JOIN t ...)`. If we consumed extra '('
             // and the derived table's ')' is not followed by another ')',
             // the extra '(' was the derived table's own paren, not a
-            // redundant one.
-            // Tracks whether the inner derived table already got its alias
-            // (so the outer alias becomes optional).
-            let mut inner_aliased = false;
+            // redundant one. (`inner_aliased` is declared above so the
+            // v1.27 setop branch shares the alias code below.)
             if extra > 0 && matches!(item, FromItem::Derived { .. } | FromItem::Values { .. }) {
                 // Consume the derived table's ')'.
                 self.expect(Token::RParen, "')'")?;
@@ -12795,6 +12820,10 @@ impl Parser {
             for _ in 0..=extra {
                 self.expect(Token::RParen, "')'")?;
             }
+                item
+            }; // end of the non-setop `else` branch; the v1.27 setop branch
+               // rejoins here with `item` already built and `inner_aliased`
+               // false.
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
             // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
             // v0.23: `(a JOIN b ...) [AS] x [(cols)]` — the alias is
