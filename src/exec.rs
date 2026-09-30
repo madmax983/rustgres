@@ -13763,6 +13763,10 @@ struct OutRow {
     /// v0.10: pre-projection input row index, for ORDER BY terms that
     /// contain window functions (set only when the query uses windows).
     win_idx: Option<usize>,
+    /// v1.28: per-row SRF bindings from plain-path ProjectSet fan-out,
+    /// for ORDER BY terms that name an SRF call textually (PG19 evaluates
+    /// ORDER BY after the ProjectSet). Empty for non-fanned rows.
+    srf: Vec<(Expr, Value)>,
 }
 
 /// v0.10: `WITH [RECURSIVE] ...` — materialize every CTE of this query
@@ -14904,6 +14908,9 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
     // scalar (first-row-or-NULL) reading. v0.52: with DISTINCT ON the
     // expansion is deferred until after the first-row-per-group filter
     // (PG's ProjectSet sits above Unique).
+    // v1.28: SRF calls nested anywhere in the target list also fan out
+    // (PG19's ProjectSet; the planner lifts them via
+    // `split_pathtarget_at_srfs`), not just whole top-level SRF items.
     let expand_srf = windows.is_empty()
         && stmt.items.iter().any(|it| {
             matches!(
@@ -14912,8 +14919,11 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                     expr: Expr::Func { name, .. },
                     ..
                 } if is_srf(q.eng, name)
-            )
+            ) || item_has_nested_srf(q.eng, it)
         });
+    // v1.28: whether the general nested-SRF path applies (computed once;
+    // `project_row_expanded` must not re-walk the tree per row).
+    let nested_srf = stmt.items.iter().any(|it| item_has_nested_srf(q.eng, it));
     let mut orows: Vec<OutRow> = if agg {
         exec_agg(q, outer, stmt, &schema, &rows, &out_cols, &windows)?
     } else {
@@ -14926,8 +14936,8 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                 wctx.row = ri;
             }
             if expand_srf && !has_distinct_on {
-                for (cells, prov) in
-                    project_row_expanded(q, outer, stmt, &schema, r, out_cols.len())?
+                for (cells, prov, srf) in
+                    project_row_expanded(q, outer, stmt, &schema, r, out_cols.len(), nested_srf)?
                 {
                     v.push(OutRow {
                         cells,
@@ -14935,6 +14945,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                         full: full.clone(),
                         sort_keys: None,
                         win_idx: None,
+                        srf,
                     });
                 }
                 continue;
@@ -14952,6 +14963,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                 // v0.10: ORDER BY terms with windows need the input
                 // row index.
                 win_idx: if windows.is_empty() { None } else { Some(ri) },
+                srf: Vec::new(),
             });
         }
         v
@@ -14987,8 +14999,8 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                     cells: o.full.expect("DISTINCT ON keeps full pre-projection rows"),
                     prov: o.prov,
                 };
-                for (cells, prov) in
-                    project_row_expanded(q, outer, stmt, &schema, row, out_cols.len())?
+                for (cells, prov, srf) in
+                    project_row_expanded(q, outer, stmt, &schema, row, out_cols.len(), nested_srf)?
                 {
                     expanded.push(OutRow {
                         cells,
@@ -14996,6 +15008,7 @@ fn run_select_inner(q: &mut Q, stmt: &SelectStmt, outer: &[Scope]) -> Result<Sel
                         full: None,
                         sort_keys: None,
                         win_idx: None,
+                        srf,
                     });
                 }
             }
@@ -20983,13 +20996,10 @@ fn project_item_values(
                 }
             }
             // v0.52: DISTINCT ON defers SRF expansion; the initial
-            // projection uses a NULL placeholder.
-            if srf_placeholder {
-                if let Expr::Func { name, .. } = expr {
-                    if is_srf(q.eng, name) {
-                        return Ok(vec![Value::Null]);
-                    }
-                }
+            // projection uses a NULL placeholder. v1.28: nested SRF calls
+            // are placeholders too (their expansion is equally deferred).
+            if srf_placeholder && expr_has_srf(q.eng, expr) {
+                return Ok(vec![Value::Null]);
             }
             Ok(vec![eval_expr(q, scopes, expr)?])
         }
@@ -21000,6 +21010,13 @@ fn project_item_values(
 /// The row fans out to max(SRF widths) output rows; SRFs narrower than the
 /// max pad with NULL; an all-empty SRF set yields zero rows. Plain columns
 /// repeat their value on every fanned-out row.
+/// v1.28: PG19 ProjectSet on the plain path — SRF calls nested anywhere in
+/// the target list (not just top-level items) fan out, mirroring
+/// `project_group_expanded` (`nodeProjectSet.c` `ExecProjectSRF`: the
+/// planner lifts nested SRFs via `split_pathtarget_at_srfs`). Each fanned
+/// row is returned with its SRF bindings so callers can rebind them for
+/// ORDER BY terms that name an SRF call textually (PG evaluates ORDER BY
+/// after the ProjectSet).
 fn project_row_expanded(
     q: &mut Q,
     outer: &[Scope],
@@ -21007,51 +21024,144 @@ fn project_row_expanded(
     schema: &[QCol],
     row: QRow,
     out_ncols: usize,
-) -> Result<Vec<(Row, Vec<RowProv>)>, ExecError> {
+    nested: bool,
+) -> Result<Vec<(Row, Vec<RowProv>, Vec<(Expr, Value)>)>, ExecError> {
     let scopes = projection_scopes(outer, stmt, schema, &row);
-    // (values, pad_with_null): SRF columns pad, plain columns repeat.
-    let mut cols: Vec<(Vec<Value>, bool)> = Vec::with_capacity(out_ncols);
-    for item in &stmt.items {
-        let vals = project_item_values(q, &scopes, schema, &row, item, true, false)?;
-        let srf_col = matches!(
-            item,
-            SelectItem::Expr {
-                expr: Expr::Func { name, .. },
-                ..
-            } if is_srf(q.eng, name)
-        );
-        if srf_col {
-            cols.push((vals, true));
-        } else {
-            for v in vals {
-                cols.push((vec![v], false));
+    if !nested {
+        // Fast path: every SRF is a whole top-level select item.
+        // (values, pad_with_null): SRF columns pad, plain columns repeat.
+        let mut cols: Vec<(Vec<Value>, bool)> = Vec::with_capacity(out_ncols);
+        for item in &stmt.items {
+            let vals = project_item_values(q, &scopes, schema, &row, item, true, false)?;
+            let srf_col = matches!(
+                item,
+                SelectItem::Expr {
+                    expr: Expr::Func { name, .. },
+                    ..
+                } if is_srf(q.eng, name)
+            );
+            if srf_col {
+                cols.push((vals, true));
+            } else {
+                for v in vals {
+                    cols.push((vec![v], false));
+                }
             }
         }
+        // v0.47: the fan-out width comes from the SRF columns only (PG19
+        // nodeProjectSet.c `ExecProjectSRF`: a row is produced only when at
+        // least one SRF yields a value — `hasresult`). Plain columns repeat
+        // and never create rows on their own, so an all-empty SRF set yields
+        // zero rows even next to plain columns.
+        let width = cols
+            .iter()
+            .filter(|(_, pad)| *pad)
+            .map(|(v, _)| v.len())
+            .max()
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(width);
+        for k in 0..width {
+            let mut cells = Vec::with_capacity(cols.len());
+            for (vals, pad) in &cols {
+                if *pad {
+                    cells.push(vals.get(k).cloned().unwrap_or(Value::Null));
+                } else {
+                    cells.push(vals[0].clone());
+                }
+            }
+            out.push((Row::new(cells), row.prov.clone(), Vec::new()));
+        }
+        return Ok(out);
     }
-    // v0.47: the fan-out width comes from the SRF columns only (PG19
-    // nodeProjectSet.c `ExecProjectSRF`: a row is produced only when at
-    // least one SRF yields a value — `hasresult`). Plain columns repeat
-    // and never create rows on their own, so an all-empty SRF set yields
-    // zero rows even next to plain columns.
-    let width = cols
-        .iter()
-        .filter(|(_, pad)| *pad)
-        .map(|(v, _)| v.len())
-        .max()
-        .unwrap_or(0);
+    // General path: at least one SRF is nested inside a larger expression
+    // (this shape raised 42883 before v1.28). Collect every SRF occurrence
+    // across the target list — a whole top-level SRF item is one slot, any
+    // other item is scanned for nested calls — then fan out exactly like
+    // the grouped path: SRF args evaluate per input row, multiple SRFs zip
+    // with NULL padding, an all-empty set drops the row.
+    let saved_srf = std::mem::take(&mut q.srf_vals);
+    let mut slots: Vec<SrfSlot> = Vec::new();
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if let Expr::Func { name, args } = expr {
+                if is_srf(q.eng, name) {
+                    slots.push(SrfSlot {
+                        name: name.clone(),
+                        args: args.clone(),
+                        call: expr.clone(),
+                    });
+                    continue;
+                }
+            }
+            collect_target_srfs(q.eng, expr, &[], &mut slots);
+        }
+    }
+    let mut fans: Vec<Vec<Value>> = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        let mut avals = Vec::with_capacity(slot.args.len());
+        for a in &slot.args {
+            avals.push(eval_expr(q, &scopes, a)?);
+        }
+        fans.push(if is_builtin_srf(&slot.name) {
+            eval_srf_vals(&slot.name, &avals)?
+        } else {
+            eval_user_srf_vals(q, &scopes, &slot.name, &avals)?
+        });
+    }
+    // The fan-out width comes from the SRF calls only — a row is produced
+    // only when at least one SRF yields a value (PG19 `hasresult`). Plain
+    // columns repeat and never create rows on their own.
+    let width = fans.iter().map(Vec::len).max().unwrap_or(0);
     let mut out = Vec::with_capacity(width);
     for k in 0..width {
-        let mut cells = Vec::with_capacity(cols.len());
-        for (vals, pad) in &cols {
-            if *pad {
-                cells.push(vals.get(k).cloned().unwrap_or(Value::Null));
-            } else {
-                cells.push(vals[0].clone());
-            }
+        // Bind this row's SRF values (NULL-padded past exhaustion); each
+        // select item then evaluates with nested SRF calls intercepted to
+        // their fanned values (the v1.28 `eval_expr` Func arm).
+        q.srf_vals = slots
+            .iter()
+            .zip(&fans)
+            .map(|(s, fan)| (s.call.clone(), fan.get(k).cloned().unwrap_or(Value::Null)))
+            .collect();
+        let mut cells = Vec::with_capacity(out_ncols);
+        for item in &stmt.items {
+            cells.extend(project_item_values(
+                q, &scopes, schema, &row, item, false, false,
+            )?);
         }
-        out.push((Row::new(cells), row.prov.clone()));
+        out.push((Row::new(cells), row.prov.clone(), q.srf_vals.clone()));
     }
+    q.srf_vals = saved_srf;
     Ok(out)
+}
+
+/// v1.28: does this expression contain any SRF call at all (a whole
+/// top-level call or one nested inside a larger expression)? Used for the
+/// DISTINCT ON initial-projection placeholder, which NULLs SRF-bearing
+/// items until the deferred expansion runs.
+fn expr_has_srf(eng: &Engine, e: &Expr) -> bool {
+    let mut slots = Vec::new();
+    collect_target_srfs(eng, e, &[], &mut slots);
+    !slots.is_empty()
+}
+
+/// v1.28: does this select item contain an SRF call nested inside a larger
+/// expression (as opposed to a whole top-level SRF item, which takes the
+/// v0.32 fast path)? Drives the general ProjectSet path in
+/// `project_row_expanded` and the `expand_srf` trigger.
+fn item_has_nested_srf(eng: &Engine, item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => {
+            if let Expr::Func { name, .. } = expr {
+                if is_srf(eng, name) {
+                    return false;
+                }
+            }
+            let mut slots = Vec::new();
+            collect_target_srfs(eng, expr, &[], &mut slots);
+            !slots.is_empty()
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -21718,7 +21828,7 @@ fn exec_agg_one(
                             return false;
                         }
                         let mut slots = Vec::new();
-                        collect_grouped_srfs(q.eng, expr, group_keys, &mut slots);
+                        collect_target_srfs(q.eng, expr, group_keys, &mut slots);
                         !slots.is_empty()
                     }
                     _ => false,
@@ -21775,6 +21885,9 @@ fn exec_agg_one(
                 // v0.10: ORDER BY terms with windows need the group index.
                 // v1.27: no windows when expanding (see expand_srf above).
                 win_idx: if windows.is_empty() { None } else { Some(gi) },
+                // v1.28: grouped sort keys are precomputed above with the
+                // row's SRF bindings live — nothing to rebind later.
+                srf: Vec::new(),
             });
         }
         // v1.27: the fan-out bindings are per-row; never leak them past
@@ -21856,25 +21969,27 @@ fn grouped_project_item(
     Ok(vals)
 }
 
-/// v1.27: one SRF occurrence collected from a grouped select item —
-/// PG19's ProjectSet-over-Agg target-list scan finds SRF calls nested
-/// anywhere in the target list (not just top-level), e.g.
-/// `generate_series(1,50)/10`. Each textual occurrence fans out
-/// separately; the fan-out zips them with NULL padding.
-struct GroupedSrf {
+/// v1.27: one SRF occurrence collected from a select item — PG19's
+/// ProjectSet target-list scan finds SRF calls nested anywhere in the
+/// target list (not just top-level), e.g. `generate_series(1,50)/10`.
+/// Each textual occurrence fans out separately; the fan-out zips them
+/// with NULL padding. Shared by the grouped path (ProjectSet over Agg)
+/// and, since v1.28, the plain path (ProjectSet over the scan).
+struct SrfSlot {
     name: String,
     args: Vec<Expr>,
-    /// The exact call expression; `eval_grouped` matches it
+    /// The exact call expression; `eval_grouped`/`eval_expr` match it
     /// structurally against `q.srf_vals`.
     call: Expr,
 }
 
-/// v1.27: collect the SRF calls to fan out for one grouped select
-/// item. Skips: an SRF call that is itself a GROUP BY key (v0.47 reads
-/// those from key_vals), SRFs under aggregate/window calls (those keep
-/// the existing below-Agg evaluation path), and SRFs inside subqueries
-/// (their own query level handles them, with a fresh Q).
-fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Vec<GroupedSrf>) {
+/// v1.27: collect the SRF calls to fan out for one select item. Skips:
+/// an SRF call that is itself a GROUP BY key (v0.47 reads those from
+/// key_vals), SRFs under aggregate/window calls (those keep the existing
+/// below-Agg evaluation path), and SRFs inside subqueries (their own
+/// query level handles them, with a fresh Q). v1.28: shared with the
+/// plain path, which passes empty group keys.
+fn collect_target_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Vec<SrfSlot>) {
     match e {
         // Pruned: aggregates and windows keep their existing
         // evaluation paths; subqueries are their own query level.
@@ -21886,7 +22001,7 @@ fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut V
         | Expr::Exists { .. } => {}
         Expr::Func { name, args } if is_srf(eng, name) => {
             if !group_keys.iter().any(|g| g == e) {
-                out.push(GroupedSrf {
+                out.push(SrfSlot {
                     name: name.clone(),
                     args: args.clone(),
                     call: e.clone(),
@@ -21894,7 +22009,7 @@ fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut V
             }
             // Pruned: no SRF collection inside SRF arguments.
         }
-        Expr::NamedArg { expr, .. } => collect_grouped_srfs(eng, expr, group_keys, out),
+        Expr::NamedArg { expr, .. } => collect_target_srfs(eng, expr, group_keys, out),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::Literal(_)
@@ -21906,8 +22021,8 @@ fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut V
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::IsDistinctFrom { left, right, .. } => {
-            collect_grouped_srfs(eng, left, group_keys, out);
-            collect_grouped_srfs(eng, right, group_keys, out);
+            collect_target_srfs(eng, left, group_keys, out);
+            collect_target_srfs(eng, right, group_keys, out);
         }
         Expr::Cast { expr, .. }
         | Expr::CastNamed { expr, .. }
@@ -21917,76 +22032,76 @@ fn collect_grouped_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut V
         | Expr::Neg(expr)
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
-        | Expr::Extract { from: expr, .. } => collect_grouped_srfs(eng, expr, group_keys, out),
+        | Expr::Extract { from: expr, .. } => collect_target_srfs(eng, expr, group_keys, out),
         Expr::Row(elems) => {
             for el in elems {
-                collect_grouped_srfs(eng, el, group_keys, out);
+                collect_target_srfs(eng, el, group_keys, out);
             }
         }
         Expr::Like {
             expr, pattern, escape, ..
         } => {
-            collect_grouped_srfs(eng, expr, group_keys, out);
-            collect_grouped_srfs(eng, pattern, group_keys, out);
+            collect_target_srfs(eng, expr, group_keys, out);
+            collect_target_srfs(eng, pattern, group_keys, out);
             if let Some(esc) = escape {
-                collect_grouped_srfs(eng, esc, group_keys, out);
+                collect_target_srfs(eng, esc, group_keys, out);
             }
         }
         Expr::Regex { expr, pattern, .. } => {
-            collect_grouped_srfs(eng, expr, group_keys, out);
-            collect_grouped_srfs(eng, pattern, group_keys, out);
+            collect_target_srfs(eng, expr, group_keys, out);
+            collect_target_srfs(eng, pattern, group_keys, out);
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_grouped_srfs(eng, expr, group_keys, out);
-            collect_grouped_srfs(eng, low, group_keys, out);
-            collect_grouped_srfs(eng, high, group_keys, out);
+            collect_target_srfs(eng, expr, group_keys, out);
+            collect_target_srfs(eng, low, group_keys, out);
+            collect_target_srfs(eng, high, group_keys, out);
         }
         Expr::Func { args, .. } => {
             for a in args {
-                collect_grouped_srfs(eng, a, group_keys, out);
+                collect_target_srfs(eng, a, group_keys, out);
             }
         }
         Expr::Case {
             operand, whens, else_, ..
         } => {
             if let Some(o) = operand {
-                collect_grouped_srfs(eng, o, group_keys, out);
+                collect_target_srfs(eng, o, group_keys, out);
             }
             for (k, r) in whens {
-                collect_grouped_srfs(eng, k, group_keys, out);
-                collect_grouped_srfs(eng, r, group_keys, out);
+                collect_target_srfs(eng, k, group_keys, out);
+                collect_target_srfs(eng, r, group_keys, out);
             }
             if let Some(el) = else_ {
-                collect_grouped_srfs(eng, el, group_keys, out);
+                collect_target_srfs(eng, el, group_keys, out);
             }
         }
         Expr::ArrayCtor { elems, .. } => {
             for el in elems {
-                collect_grouped_srfs(eng, el, group_keys, out);
+                collect_target_srfs(eng, el, group_keys, out);
             }
         }
         Expr::Subscript { array, indices, .. } => {
-            collect_grouped_srfs(eng, array, group_keys, out);
+            collect_target_srfs(eng, array, group_keys, out);
             for i in indices {
-                collect_grouped_srfs(eng, i, group_keys, out);
+                collect_target_srfs(eng, i, group_keys, out);
             }
         }
         Expr::Slice { array, bounds, .. } => {
-            collect_grouped_srfs(eng, array, group_keys, out);
+            collect_target_srfs(eng, array, group_keys, out);
             for (lo, hi) in bounds {
                 if let Some(b) = lo {
-                    collect_grouped_srfs(eng, b, group_keys, out);
+                    collect_target_srfs(eng, b, group_keys, out);
                 }
                 if let Some(b) = hi {
-                    collect_grouped_srfs(eng, b, group_keys, out);
+                    collect_target_srfs(eng, b, group_keys, out);
                 }
             }
         }
         Expr::UserOp { left, right, .. } => {
-            collect_grouped_srfs(eng, left, group_keys, out);
-            collect_grouped_srfs(eng, right, group_keys, out);
+            collect_target_srfs(eng, left, group_keys, out);
+            collect_target_srfs(eng, right, group_keys, out);
         }
     }
 }
@@ -22021,11 +22136,11 @@ fn project_group_expanded(
     // Collect the SRF fan-out slots across the select items. A whole
     // item that is a GROUP BY key (or a grouping-set NULL item) is not
     // scanned: it reads from key_vals / NULL like a plain column.
-    let mut slots: Vec<GroupedSrf> = Vec::new();
+    let mut slots: Vec<SrfSlot> = Vec::new();
     for (ii, item) in stmt.items.iter().enumerate() {
         if let SelectItem::Expr { expr, .. } = item {
             if !is_null_item(ii) && !group_keys.iter().any(|g| g == expr) {
-                collect_grouped_srfs(q.eng, expr, group_keys, &mut slots);
+                collect_target_srfs(q.eng, expr, group_keys, &mut slots);
             }
         }
     }
@@ -23243,6 +23358,12 @@ fn apply_order(
         if key_err.is_some() {
             break;
         }
+        // v1.28: PG19 evaluates ORDER BY after the ProjectSet — rebind
+        // this fanned row's SRF values so an ORDER BY term naming an SRF
+        // call textually sees the fanned value (PG19 allows SRFs in ORDER
+        // BY per `check_srf_call_placement`). Non-fanned rows carry no
+        // bindings; save/restore keeps any outer fan-out intact.
+        let saved_srf = std::mem::replace(&mut q.srf_vals, o.srf.clone());
         let row_keys = match &o.sort_keys {
             Some(k) => k.clone(),
             None => {
@@ -23300,6 +23421,7 @@ fn apply_order(
                 row_keys
             }
         };
+        q.srf_vals = saved_srf;
         keys.push(row_keys);
     }
     if let Some(e) = key_err {
@@ -23334,6 +23456,7 @@ fn apply_order(
             full: std::mem::take(&mut orows[i].full),
             sort_keys: std::mem::take(&mut orows[i].sort_keys),
             win_idx: orows[i].win_idx,
+            srf: std::mem::take(&mut orows[i].srf),
         });
     }
     *orows = sorted;
@@ -25148,7 +25271,18 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
             let v = eval_expr(q, scopes, expr)?;
             eval_is_bool(&v, *neg, *val)
         }
-        Expr::Func { name, args } => eval_func(q, scopes, name, args),
+        Expr::Func { name, args } => {
+            // v1.28: PG19 ProjectSet on the plain path — an SRF call
+            // collected for fan-out evaluates to its current row's value.
+            // `q.srf_vals` is only non-empty while a fan-out is projecting
+            // (plain or grouped); subqueries run with a fresh Q (empty
+            // `srf_vals`), so this only fires for the item's own
+            // expression tree. Mirrors `eval_grouped`'s v1.27 arm.
+            if let Some((_, v)) = q.srf_vals.iter().find(|(call, _)| call == e) {
+                return Ok(v.clone());
+            }
+            eval_func(q, scopes, name, args)
+        }
         Expr::Extract { field, from } => {
             let v = eval_expr(q, scopes, from)?;
             eval_extract(field, &v)
@@ -54644,5 +54778,309 @@ mod v127_projectset_tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "42883");
+    }
+}
+
+/// v1.28: PG19 ProjectSet on the plain (non-grouped) path — SRF calls
+/// nested anywhere in the target list fan out (`nodeProjectSet.c`
+/// `ExecProjectSRF`; the planner lifts them via `split_pathtarget_at_srfs`).
+/// Before v1.28 these shapes raised 42883; the top-level-SRF fast path is
+/// unchanged. Also covers the `eval_expr` Func-arm interception (which
+/// additionally fixes an SRF under a user operator on the grouped path)
+/// and the ORDER BY / DISTINCT ON interactions.
+#[cfg(test)]
+mod v128_projectset_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        // Preserve the parser's SQLSTATE (e.g. 42601), like the main
+        // test harness does.
+        let stmt =
+            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    // -- S1: plain-path nested SRF fan-out --------------------------------
+
+    /// The exact shape v1.27 deferred: a builtin SRF nested in arithmetic
+    /// on the plain path fans out (was 42883).
+    #[test]
+    fn nested_srf_arith() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select generate_series(1,3)+1").unwrap();
+        assert_eq!(rows_of(r), vec![vec![s("2")], vec![s("3")], vec![s("4")]]);
+    }
+
+    /// SRF on the left of the operator nests the same way.
+    #[test]
+    fn nested_srf_left_operand() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select 1+generate_series(1,2)").unwrap();
+        assert_eq!(rows_of(r), vec![vec![s("2")], vec![s("3")]]);
+    }
+
+    /// Deeper nesting: the SRF value feeds the whole expression tree.
+    #[test]
+    fn nested_srf_deep() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select generate_series(1,3)*10+5").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("15")], vec![s("25")], vec![s("35")]]
+        );
+    }
+
+    /// Two SRFs zip: the shorter pads with NULL past exhaustion (PG19
+    /// `ExecProjectSRF`).
+    #[test]
+    fn nested_srf_zip_null_pad() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select generate_series(1,3), generate_series(10,11)+0",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![s("1"), s("10")],
+                vec![s("2"), s("11")],
+                vec![s("3"), s("NULL")],
+            ]
+        );
+    }
+
+    /// A top-level SRF item and a nested SRF zip together.
+    #[test]
+    fn nested_srf_mixed_top_and_nested() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select generate_series(1,2), generate_series(1,3)+100",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![s("1"), s("101")],
+                vec![s("2"), s("102")],
+                vec![s("NULL"), s("103")],
+            ]
+        );
+    }
+
+    /// An all-empty SRF set drops the row (`hasresult` false) even next
+    /// to plain columns.
+    #[test]
+    fn nested_srf_empty_drops_row() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select 'a', generate_series(1,0)+1").unwrap();
+        assert_eq!(rows_of(r), Vec::<Vec<String>>::new());
+    }
+
+    /// Plain columns repeat their value on every fanned-out row.
+    #[test]
+    fn nested_srf_plain_col_repeats() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select 'a' as c, generate_series(1,2)+1").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("a"), s("2")], vec![s("a"), s("3")]]
+        );
+    }
+
+    /// The SRF args see the input row: fan-out is per input row.
+    #[test]
+    fn nested_srf_correlated() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select x, x+generate_series(1,2) from (values (10),(20)) t(x)",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![s("10"), s("11")],
+                vec![s("10"), s("12")],
+                vec![s("20"), s("21")],
+                vec![s("20"), s("22")],
+            ]
+        );
+    }
+
+    /// Fan-out works against a real table scan too.
+    #[test]
+    fn nested_srf_from_table() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t128 (f1 int)").unwrap();
+        run(&mut eng, "INSERT INTO t128 VALUES (0),(5)").unwrap();
+        let r = run(&mut eng, "select f1, generate_series(1,2)+f1 from t128").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![s("0"), s("1")],
+                vec![s("0"), s("2")],
+                vec![s("5"), s("6")],
+                vec![s("5"), s("7")],
+            ]
+        );
+    }
+
+    /// PG19 allows SRFs in ORDER BY (parse_func.c `EXPR_KIND_ORDER_BY` is
+    /// "okay"); it evaluates after the ProjectSet, so a textual SRF term
+    /// sees the fanned values.
+    #[test]
+    fn nested_srf_order_by_textual() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select generate_series(1,3)+1 order by generate_series(1,3)+1 desc",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("4")], vec![s("3")], vec![s("2")]]
+        );
+    }
+
+    /// Ordinal ORDER BY over a nested-SRF item sorts the fanned rows.
+    #[test]
+    fn nested_srf_order_by_ordinal() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select generate_series(1,3)+1 order by 1 desc").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("4")], vec![s("3")], vec![s("2")]]
+        );
+    }
+
+    /// DISTINCT ON defers the expansion until after the first-row-per-group
+    /// filter (PG's ProjectSet sits above Unique); nested SRF items are
+    /// NULL placeholders in the initial projection.
+    #[test]
+    fn nested_srf_distinct_on() {
+        let mut eng = engine();
+        let r = run(
+            &mut eng,
+            "select distinct on (x) x, generate_series(1,2)+x \
+             from (values (2),(1)) t(x) order by x",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![
+                vec![s("1"), s("2")],
+                vec![s("1"), s("3")],
+                vec![s("2"), s("3")],
+                vec![s("2"), s("4")],
+            ]
+        );
+    }
+
+    /// A user-defined RETURNS SETOF function nested in an expression fans
+    /// out through `eval_user_srf_vals`.
+    #[test]
+    fn nested_srf_user_function() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION gen128(n int) RETURNS SETOF int AS $$ declare i int; \
+             begin for i in select * from generate_series(1, n) loop return next i * 10; \
+             end loop; end; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        let r = run(&mut eng, "select gen128(2)+1").unwrap();
+        assert_eq!(rows_of(r), vec![vec![s("11")], vec![s("21")]]);
+    }
+
+    /// The v1.28 `eval_expr` Func-arm interception also fixes the latent
+    /// grouped-path gap: `eval_grouped` delegates `UserOp` to `eval_expr`,
+    /// so an SRF under a user operator on the grouped path 42883'd before.
+    #[test]
+    fn srf_under_userop_grouped() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "create function add128(int,int) returns int language sql as 'select $1+$2'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "create operator ?# (procedure = add128, leftarg = int, rightarg = int)",
+        )
+        .unwrap();
+        let r = run(
+            &mut eng,
+            "select x, generate_series(1,2) ?# 10 from (values (1)) t(x) group by x",
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("1"), s("11")], vec![s("1"), s("12")]]
+        );
+    }
+
+    /// SRFs under aggregate calls keep the existing below-Agg path, which
+    /// this engine rejects (unchanged by v1.28).
+    #[test]
+    fn nested_srf_under_agg_still_42883() {
+        let mut eng = engine();
+        let err = run(
+            &mut eng,
+            "select sum(generate_series(1,3))+1 from (values (1)) t(x)",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42883");
+    }
+
+    /// The v0.32 top-level-SRF fast path is untouched by the general path.
+    #[test]
+    fn top_level_srf_fast_path_unchanged() {
+        let mut eng = engine();
+        let r = run(&mut eng, "select generate_series(1,2)").unwrap();
+        assert_eq!(rows_of(r), vec![vec![s("1")], vec![s("2")]]);
+        let r = run(&mut eng, "select generate_series(1,2), generate_series(5,6)").unwrap();
+        assert_eq!(
+            rows_of(r),
+            vec![vec![s("1"), s("5")], vec![s("2"), s("6")]]
+        );
     }
 }

@@ -998,11 +998,14 @@ EXPECTED_FAIL_PATTERNS = [
     # ROW()-constructor variants below classify under row().
     (r"(?is)^\s*create\s+rule\b", "CREATE RULE unsupported"),
     (r"(?is)^\s*drop\s+rule\b", "DROP RULE unsupported"),
+    # v1.28: the `= ALL/ANY/SOME (subquery)` mask is retired — the
+    # quantified-comparison semantics shipped via `eval_quantified` and the
+    # v1.28 corpus scan found zero failing hits under it (the 14 matches
+    # either pass or classify under earlier masks: EXPLAIN, row()).
     # v1.27: narrowed — the old `\b(all|any|some)\s*\(\s*select` also
     # matched `UNION ALL (SELECT ...)` setop shapes (a false positive;
     # those now parse per PG19 `select_with_parens`). A quantified
     # comparison always has a comparison operator before ALL/ANY/SOME.
-    (r"(?i)(?:=|<>|!=|<=|>=|<|>|\?=)\s*\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),
     # v1.27: the row-wise-IN mask is retired — the remaining corpus
     # statement (`(f1,f1) IN (SELECT f1, generate_series(...) ... GROUP BY
     # f1)`) passes now that target-list SRFs fan out over grouped rows
