@@ -1692,14 +1692,21 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
         except (WireError, OSError) as e:
             raise ServerWedged(stmt, "connection died during execution: %r" % e)
 
-        if gset is not None and not actual["err_codes"] and actual["rows"]:
+        if gset is not None and not actual["err_codes"]:
             # psql \gset: first row only; NULL unsets the variable.
-            for cname, cval in zip(actual["colnames"], actual["rows"][0]):
-                vname = gset + cname
-                if cval is None:
-                    psql_vars.pop(vname, None)
-                else:
-                    psql_vars[vname] = cval
+            if actual["rows"]:
+                for cname, cval in zip(actual["colnames"], actual["rows"][0]):
+                    vname = gset + cname
+                    if cval is None:
+                        psql_vars.pop(vname, None)
+                    else:
+                        psql_vars[vname] = cval
+            # v1.42: psql's \gset consumes the query result (it is
+            # stored into variables, not displayed), so drop the result
+            # sets before comparing against the noresult expectation.
+            # Without this, compare_multi reports "unexpected extra
+            # result set" for a correctly-executed \gset.
+            actual["sets"] = []
 
         if casc and (
             actual["err_codes"]

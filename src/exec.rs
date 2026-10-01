@@ -12586,8 +12586,13 @@ fn pg_class_scan(db: &Database, snap: &Snapshot, own: u64, session: u64) -> (Vec
         // Skip the toast tables themselves? No — PG lists them in
         // pg_class too. Include everything.
         // v1.00: relkind — 'p' for partitioned tables, 'r' otherwise.
+        // v1.42: 't' for TOAST tables (PG19 RELKIND_TOASTVALUE,
+        // pg_class.h: "for out-of-line values"). Toast tables are
+        // named `pg_toast.pg_toast_<oid>` (see toast_table_name).
         let relkind = if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
             Value::SingleChar(b'p')
+        } else if name.starts_with("pg_toast.pg_toast_") {
+            Value::SingleChar(b't')
         } else {
             Value::SingleChar(b'r')
         };
@@ -63527,6 +63532,75 @@ mod v140_syscols_returning_tests {
         t.fillfactor = 100;
         let lens = vec![32; 300];
         assert_eq!(pg_heap_page_count(&t, &lens), 2 * 8192);
+    }
+
+    /// v1.42: `pg_class.relkind` is 't' for TOAST tables (PG19
+    /// RELKIND_TOASTVALUE, pg_class.h: "for out-of-line values").
+    #[test]
+    fn v142_pg_class_relkind_toast_is_t() {
+        let mut eng = engine();
+        // text is toastable, so the toast table is created eagerly at
+        // CREATE TABLE (ensure_toast_table_eager).
+        run(&mut eng, "CREATE TABLE t142toast (f1 text);").unwrap();
+        match run(
+            &mut eng,
+            "SELECT relkind FROM pg_class WHERE relname LIKE 'pg_toast.%';",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(cells, vec![Value::SingleChar(b't')]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.42: the ordinary table itself stays 'r' (regression guard for
+    /// the relkind if/else chain).
+    #[test]
+    fn v142_pg_class_relkind_ordinary_is_r() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t142ord (a int);").unwrap();
+        match run(
+            &mut eng,
+            "SELECT relkind FROM pg_class WHERE relname = 't142ord';",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(cells, vec![Value::SingleChar(b'r')]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.42: partitioned tables stay 'p' (regression guard — the 't'
+    /// arm must not swallow the partitioned arm).
+    #[test]
+    fn v142_pg_class_relkind_partitioned_stays_p() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE t142part (a int, b int) PARTITION BY RANGE (a, b);",
+        )
+        .unwrap();
+        match run(
+            &mut eng,
+            "SELECT relkind FROM pg_class WHERE relname = 't142part';",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(cells, vec![Value::SingleChar(b'p')]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
     }
 }
 
