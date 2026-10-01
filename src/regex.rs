@@ -75,7 +75,7 @@ pub struct Captures {
     pub groups: Vec<Option<(usize, usize)>>,
 }
 
-pub fn compile(pattern: &str, case_insensitive: bool) -> Result<Compiled, String> {
+pub fn compile(pattern: &str, case_insensitive: bool) -> Result<std::rc::Rc<Compiled>, String> {
     compile_opts(
         pattern,
         RegexOptions {
@@ -85,8 +85,47 @@ pub fn compile(pattern: &str, case_insensitive: bool) -> Result<Compiled, String
     )
 }
 
+/// v1.40: every `regexp_*`/SIMILAR TO call site recompiles its pattern
+/// from scratch on every row, even though the pattern (and, for a
+/// literal, every compile option) is the same `Expr::Literal` value for
+/// every row of one statement -- and is very often reused verbatim
+/// across statements too (the same `'[0-9]+'` pattern showing up in a
+/// `regexp_replace` and a `regexp_count` call in the same query, as in
+/// `benches/profile_regexp.py`). This thread-local cache, keyed by
+/// (pattern text, flags), makes a repeat `compile_opts` call for a
+/// pattern this connection has already compiled a pointer-clone of the
+/// first compile instead of a full re-parse + re-codegen. Bounded like
+/// PostgreSQL's own regex cache (`backend/utils/adt/regexp.c`'s
+/// `MAX_CACHED_RES`, 32 entries): a connection that compiles an
+/// unbounded number of distinct patterns (e.g. a pattern built from a
+/// column value) would otherwise grow this cache for the life of the
+/// connection thread. Only successful compiles are cached -- an invalid
+/// pattern re-reports the same error on every call, exactly as before.
+const REGEX_CACHE_CAP: usize = 64;
+
+/// (pattern text, case_insensitive, newline_sensitive, expanded).
+type RegexCacheKey = (String, bool, bool, bool);
+
+thread_local! {
+    static REGEX_CACHE: std::cell::RefCell<
+        std::collections::HashMap<RegexCacheKey, std::rc::Rc<Compiled>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// v0.24: compile with explicit flag options.
-pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<Compiled, String> {
+pub fn compile_opts(
+    pattern: &str,
+    opts: RegexOptions,
+) -> Result<std::rc::Rc<Compiled>, String> {
+    let key = (
+        pattern.to_string(),
+        opts.case_insensitive,
+        opts.newline_sensitive,
+        opts.expanded,
+    );
+    if let Some(hit) = REGEX_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
     let mut p = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
@@ -104,12 +143,20 @@ pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<Compiled, Strin
     };
     c.compile_ast(&ast);
     c.emit(Insn::Match);
-    Ok(Compiled {
+    let compiled = std::rc::Rc::new(Compiled {
         insns: c.insns,
         groups: p.groups,
         ci: opts.case_insensitive,
         newline_sensitive: opts.newline_sensitive,
-    })
+    });
+    REGEX_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= REGEX_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(key, compiled.clone());
+    });
+    Ok(compiled)
 }
 
 impl Parser {
