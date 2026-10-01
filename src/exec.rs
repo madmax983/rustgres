@@ -11559,19 +11559,6 @@ fn expr_has_subquery(e: &Expr) -> bool {
     }
 }
 
-/// v1.47: do all column references in `e` carry qualifiers drawn from
-/// `allowed`? Unqualified references fail closed (they could resolve to the
-/// inner range being removed), as do references to any qualifier outside
-/// `allowed` (lateral or outer-query references).
-fn expr_refs_only(e: &Expr, allowed: &HashSet<String>) -> bool {
-    let mut refs = Vec::new();
-    collect_col_refs(e, &mut refs);
-    refs.iter().all(|(t, _)| match t {
-        Some(q) => allowed.contains(q),
-        None => false,
-    })
-}
-
 /// v1.47: all range qualifiers visible in a FROM item (flattened joins via
 /// `pg_item_quals`, aliases for derived/table-function items).
 fn removal_left_quals(item: &FromItem) -> HashSet<String> {
@@ -12111,8 +12098,30 @@ fn find_pullup_in_item(
         FromItem::Join { left, right, .. } => {
             // Check left and right for Derived.
             for child in [left.as_ref(), right.as_ref()] {
-                if let FromItem::Derived { alias, sub, .. } = child {
-                    if is_simple_subquery(sub.as_ref()) {
+                if let FromItem::Derived {
+                    alias,
+                    sub,
+                    lateral,
+                    ..
+                } = child
+                {
+                    // v1.51: scope guards — all required for the fixpoint
+                    // to terminate and for the documented semantics:
+                    // - never pull up LATERAL (the doc claims "not
+                    //   LATERAL"; PG19's lateral-outer-ref restrictions
+                    //   in `is_simple_subquery` aren't modeled here, so a
+                    //   LATERAL pullup could expose an inner FROM-less
+                    //   derived as a direct join child and wedge);
+                    // - never pull up a FROM-less subquery (there is
+                    //   nothing to splice; the splice keeps the Derived
+                    //   and the fixpoint finds it again forever);
+                    // - only single-FROM-item subqueries (the splice
+                    //   replaces the Derived with exactly one item; a
+                    //   multi-item FROM would likewise be kept and loop).
+                    if !lateral
+                        && sub.from.len() == 1
+                        && is_simple_subquery(sub.as_ref())
+                    {
                         return Some((
                             alias.clone(),
                             sub.items.clone(),
@@ -12134,9 +12143,9 @@ fn find_pullup_in_item(
 }
 
 /// v1.50: replace the Derived with `alias` by splicing in `sub_from`.
-/// If the subquery has a single FROM item, it replaces the Derived directly.
-/// If multiple, they are combined with CROSS JOINs (PG's pullup flattens the
-/// jointree; for the scoped simple case of a single join, this is exact).
+/// The subquery always has exactly one FROM item here (enforced by the
+/// v1.51 scope guards in `find_pullup_in_item`), so it replaces the
+/// Derived directly.
 fn splice_pullup_from(
     from: &[FromItem],
     alias: &str,
@@ -12166,8 +12175,8 @@ fn splice_pullup_in_item(
         } => {
             let new_left = splice_pullup_in_item(left, alias, sub_from);
             let new_right = splice_pullup_in_item(right, alias, sub_from);
-            // If a child was replaced by multiple items, wrap them.
-            // (For the scoped case, sub_from has 1 item, so this is direct.)
+            // Rebuild with the spliced children (v1.51: each splice
+            // replaces one Derived with one item, so this is direct).
             FromItem::Join {
                 left: Box::new(new_left),
                 kind: *kind,
@@ -12188,13 +12197,12 @@ fn splice_pullup_in_item(
         } => {
             if dalias == alias {
                 // Replace with the subquery's FROM.
-                // Scoped: sub_from has exactly 1 item (a Join or Table).
-                // If it's a Join, splice it directly.
+                // v1.51: sub_from always has exactly 1 item (enforced by
+                // the scope guards in `find_pullup_in_item`); the else
+                // branch is unreachable defensive fallback.
                 if sub_from.len() == 1 {
                     sub_from[0].clone()
                 } else {
-                    // Multiple: combine with CROSS JOIN (should not happen
-                    // in scoped cases; fail safe by keeping the Derived).
                     FromItem::Derived {
                         alias: dalias.clone(),
                         sub: sub.clone(),
@@ -12224,11 +12232,15 @@ fn splice_pullup_in_item(
 ///
 /// A `Derived` subquery that is "simple" (single plain SELECT: no aggregates,
 /// no GROUP BY/HAVING, no DISTINCT, no LIMIT/OFFSET, no setops, no CTEs, no
-/// locking, not LATERAL) and appears as a direct child of a Join is pulled
-/// up: its FROM tree is spliced into the parent join in place of the
-/// subquery, references to `alias.col` in the parent's SELECT/WHERE/JOIN ONs
-/// are replaced by the subquery's tlist exprs, and the subquery's WHERE is
-/// ANDed into the parent's WHERE.
+/// locking), is not LATERAL, has exactly one FROM item, and appears as a
+/// direct child of a Join is pulled up: its FROM item is spliced into the
+/// parent join in place of the subquery, references to `alias.col` in the
+/// parent's SELECT/WHERE/JOIN ONs are replaced by the subquery's tlist
+/// exprs, and the subquery's WHERE is ANDed into the parent's WHERE.
+/// (PG19 itself pulls up FROM-less subqueries via `replace_empty_jointree`'s
+/// dummy RTE_RESULT, and multi-FROM subqueries by flattening; this rewrite
+/// conservatively skips both — v1.51 scope guards in `find_pullup_in_item`
+/// — leaving them to plan as subqueries exactly as pre-v1.50.)
 ///
 /// Returns `(rewritten_stmt, pulled_exprs)` where `pulled_exprs` are the
 /// non-Column tlist exprs that were substituted (for PG-text paren marking
@@ -12244,7 +12256,14 @@ fn pull_up_simple_subqueries(
     let mut new_stmt = stmt.clone();
     let mut pulled = Vec::new();
     // Fixpoint: pull up one subquery at a time (handles nesting).
-    loop {
+    // v1.51: bound the iterations (defense-in-depth). Each successful
+    // splice removes exactly one Derived from the whole FROM tree —
+    // replacing it with its single FROM item, which was already counted —
+    // so the loop can never need more than `derived_count + 1` passes.
+    // With the scope guards in `find_pullup_in_item` every candidate is
+    // spliceable, so the bound is unreachable in practice.
+    let max_iters = count_derived_from_items(&stmt.from) + 1;
+    for _ in 0..max_iters {
         // Find the first pullup candidate: (alias, subquery items, subquery
         // where, subquery from) at a Join child position.
         let candidate = find_pullup_candidate(&new_stmt.from);
@@ -12272,6 +12291,25 @@ fn pull_up_simple_subqueries(
         }
     }
     Some((new_stmt, pulled))
+}
+
+/// v1.51: count `Derived` FROM items in a FROM tree, recursing through
+/// Joins and into subqueries. Bounds the pullup fixpoint: each splice
+/// removes exactly one Derived, so the loop needs at most this many
+/// iterations (+1).
+fn count_derived_from_items(from: &[FromItem]) -> usize {
+    from.iter()
+        .map(|it| match it {
+            FromItem::Derived { sub, .. } => {
+                1 + count_derived_from_items(&sub.from)
+            }
+            FromItem::Join { left, right, .. } => {
+                count_derived_from_items(std::slice::from_ref(left))
+                    + count_derived_from_items(std::slice::from_ref(right))
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 /// v1.50: qualify unqualified Column refs in tlist exprs using the subquery's
@@ -12654,8 +12692,9 @@ fn join_is_removable(
             _ => false,
         }
     }
-    /// v1.50: like `expr_refs_only`, but also accepts unqualified Columns
-    /// that resolve to the left subtree (and not to the inner table).
+    /// v1.50: all column references in `e` carry qualifiers drawn from
+    /// `allowed`, or are unqualified Columns that resolve to the left
+    /// subtree (and not to the inner table).
     fn expr_refs_only_or_unqualified_left(
         e: &Expr,
         allowed: &HashSet<String>,
@@ -12832,16 +12871,26 @@ fn join_is_removable(
         return false;
     }
     let mut quals = HashSet::new();
-    let mut unqualified = false;
+    // v1.51: resolve unqualified refs against the statement's FROM tree
+    // instead of failing closed. PG resolves Vars by RT index, so an
+    // unqualified column that unambiguously belongs to a range other than
+    // the inner one can never be an inner Var. Only genuinely ambiguous
+    // or unresolvable refs (or refs to the inner range itself) block.
+    let mut blocked = false;
     let mut push = |e: &Expr| {
         let mut refs = Vec::new();
         collect_col_refs(e, &mut refs);
-        for (t, _) in refs {
+        for (t, n) in refs {
             match t {
                 Some(q) => {
                     quals.insert(q.clone());
                 }
-                None => unqualified = true,
+                None => match find_col_table(&stmt.from, &n, eng, snap, own, session) {
+                    Some(q) => {
+                        quals.insert(q);
+                    }
+                    None => blocked = true,
+                },
             }
         }
     };
@@ -12859,7 +12908,7 @@ fn join_is_removable(
     if let Some(h) = &stmt.having {
         push(h);
     }
-    if unqualified || quals.contains(&rqual) {
+    if blocked || quals.contains(&rqual) {
         return false;
     }
 
@@ -13325,9 +13374,16 @@ fn plan_from_item(
                                     std::slice::from_ref(right),
                                     &mut inames,
                                 );
-                                // v1.50: Suppress `Replaces:` for multi-table
-                                // (Join) cases (T2 oracle has no Replaces line;
-                                // T1's single-table Scan does).
+                                // v1.51: `Replaces:` for the dummy inner names the
+                                // RTEs that survived `remove_useless_joins`
+                                // (PG19 explain.c `show_result_replacement_info`).
+                                // T2 #17786: the pulled-up `int8_tbl LEFT JOIN
+                                // innertab` lost its useless inner join, so
+                                // the dummy inner is just `int8_tbl` →
+                                // `Replaces: Scan on int8_tbl`. Multi-RTE
+                                // inners print no `Replaces:` line here (the
+                                // whole-join dummy path above renders those
+                                // as `Join on ...`).
                                 let ireplaces = if inames.len() == 1 {
                                     Some(format!("Scan on {}", inames[0]))
                                 } else {
@@ -66956,10 +67012,19 @@ mod v145_join_removal_tests {
             "EXPLAIN (COSTS OFF) SELECT a.* FROM a JOIN b ON a.b_id = b.id",
         );
         assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
-        // Unqualified column reference: conservative keep.
+        // Unqualified column reference resolving unambiguously to the outer
+        // range: PG resolves `b_id` to `a.b_id` (only `a` has it), so the
+        // inner range is unreferenced above the join and PG removes it
+        // (v1.51: no longer conservatively kept).
         let lines = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE b_id > 0",
+        );
+        assert!(!lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // Ambiguous unqualified reference: conservative keep.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE id > 0",
         );
         assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
         // SELECT list references the inner range.
@@ -68228,5 +68293,218 @@ mod v146_verbose_output_tests {
         } else {
             panic!("expected SELECT");
         }
+    }
+}
+
+#[cfg(test)]
+mod v151_pullup_repair_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+    use std::time::Duration;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap().trim().to_string())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn parse_select(sql: &str) -> SelectStmt {
+        match parse_statement(sql).unwrap() {
+            crate::sql::Stmt::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    /// Run EXPLAIN `sql` on a fresh engine in a worker thread. Returns
+    /// `None` if it does not finish within `secs` — a hang becomes a test
+    /// failure instead of wedging the whole suite.
+    fn explain_guarded(sql: &str, secs: u64) -> Option<Vec<String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sql = sql.to_string();
+        std::thread::spawn(move || {
+            let mut eng = engine();
+            let lines = plan_lines(&mut eng, &sql);
+            let _ = tx.send(lines);
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).ok()
+    }
+
+    /// v1.51: a FROM-less Derived that is a direct Join child is not a
+    /// pullup candidate (there is nothing to splice; v1.50 looped on it
+    /// forever). Minimal repro of the v1.50 hang.
+    #[test]
+    fn v151_empty_from_derived_not_a_candidate() {
+        let s = parse_select(
+            "select * from (select 0 as z) as t1 join (select 1 as y) as t2 on true",
+        );
+        assert!(find_pullup_candidate(&s.from).is_none());
+    }
+
+    /// v1.51: a multi-FROM-item Derived is not a pullup candidate either
+    /// (the splice only handles exactly one FROM item; keeping the
+    /// Derived would make the fixpoint find it again forever). The SQL
+    /// parser folds comma lists into Cross joins, so this shape is built
+    /// by hand to pin the guard.
+    #[test]
+    fn v151_multi_from_derived_not_a_candidate() {
+        let mut s =
+            parse_select("select * from (select 1 as a from t1) as s join t3 on true");
+        let FromItem::Join { left, .. } = &mut s.from[0] else {
+            panic!("expected top-level join");
+        };
+        let FromItem::Derived { sub, .. } = left.as_mut() else {
+            panic!("expected derived left child");
+        };
+        sub.from.push(FromItem::Table {
+            name: "t2".to_string(),
+            alias: None,
+            col_aliases: Vec::new(),
+            only: false,
+        });
+        assert_eq!(sub.from.len(), 2);
+        assert!(find_pullup_candidate(&s.from).is_none());
+    }
+
+    /// v1.51: a LATERAL Derived is never pulled up (the documented claim;
+    /// pulling one up could expose an inner FROM-less derived as a direct
+    /// join child — the v1.50 two-step hang).
+    #[test]
+    fn v151_lateral_derived_not_pulled_up() {
+        let mut eng = engine();
+        for sql in [
+            "CREATE TEMP TABLE lt1 (a int)",
+            "INSERT INTO lt1 VALUES (1)",
+        ] {
+            run(&mut eng, sql).unwrap();
+        }
+        let s = parse_select(
+            "select * from lt1 join lateral (select lt1.a as b) as s on true",
+        );
+        let snap = eng.take_snapshot();
+        assert!(pull_up_simple_subqueries(&s, &eng, &snap, 9, 0).is_none());
+    }
+
+    /// v1.51: the v1.50 minimal hang repro completes (guarded: a regression
+    /// fails this test instead of hanging the suite).
+    #[test]
+    fn v151_minimal_repro_completes() {
+        let lines = explain_guarded(
+            "explain (costs off) select * from (select 0 as z) as t1 join (select 1 as y) as t2 on true",
+            15,
+        )
+        .expect("v1.50 hang regression: EXPLAIN did not finish in 15s");
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")));
+    }
+
+    /// v1.51: more hang shapes from the v1.50 wedge battery (self-contained;
+    /// the full 17-statement corpus battery runs in the conformance tally).
+    #[test]
+    fn v151_wedge_shapes_complete() {
+        for sql in [
+            // wedge #3 shape (lateral has LIMIT: not simple anyway).
+            "explain (costs off) select * from (select 1 as x) ss1 left join (select 2 as y) ss2 on (true)",
+            // nested FROM-less deriveds under a multi-FROM subquery.
+            "explain (costs off) select * from (select 1 as a from (select 3 as c) q1, (select 4 as d) q2) s join (select 5 as e) t on true",
+            // FROM-less derived under a left join (wedge #8 shape, no lateral).
+            "explain (costs off) select * from (select 0 as z) as t1 left join (select true as a) as t2 on true",
+        ] {
+            explain_guarded(sql, 15)
+                .unwrap_or_else(|| panic!("hang regression on: {sql}"));
+        }
+    }
+
+    /// v1.51: T2 #17786 — the pulled-up inner join's useless LEFT JOIN is
+    /// removed (PG19 `remove_useless_joins`: only the constant `42` is
+    /// needed above; `innertab.id` is PK-unique), so the const-false dummy
+    /// inner Result reports `Replaces: Scan on int8_tbl` exactly as the
+    /// `join.out` oracle requires.
+    #[test]
+    fn v151_t2_replaces_scan_on_int8_tbl() {
+        let mut eng = engine();
+        for sql in [
+            "CREATE TEMP TABLE int4_tbl(f1 int4)",
+            "INSERT INTO int4_tbl(f1) VALUES (0), (123456)",
+            "CREATE TEMP TABLE int8_tbl(q1 int8, q2 int8)",
+            "INSERT INTO int8_tbl VALUES (123, 456)",
+            "CREATE TEMP TABLE innertab (id int8 primary key, dat1 int8)",
+            "INSERT INTO innertab VALUES(123, 42)",
+            "CREATE TEMP TABLE tenk1(unique1 int4, unique2 int4)",
+            "INSERT INTO tenk1 VALUES (1, 1)",
+        ] {
+            run(&mut eng, sql).unwrap();
+        }
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT f1, x FROM int4_tbl JOIN ((SELECT 42 AS x FROM int8_tbl LEFT JOIN innertab ON q1 = id) AS ss1 RIGHT JOIN tenk1 ON NULL) ON tenk1.unique1 = ss1.x OR tenk1.unique2 = ss1.x",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop",
+                "->  Seq Scan on int4_tbl",
+                "->  Materialize",
+                "->  Nested Loop Left Join",
+                "Join Filter: NULL::boolean",
+                "Filter: ((tenk1.unique1 = (42)) OR (tenk1.unique2 = (42)))",
+                "->  Seq Scan on tenk1",
+                "->  Result",
+                "Replaces: Scan on int8_tbl",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.51: T1 #17773 still emits its `Replaces: Scan on int8_tbl`
+    /// (no-regression anchor for the `join_is_removable` change).
+    #[test]
+    fn v151_t1_replaces_still_emitted() {
+        let mut eng = engine();
+        for sql in [
+            "CREATE TEMP TABLE int4_tbl(f1 int4)",
+            "INSERT INTO int4_tbl(f1) VALUES (0)",
+            "CREATE TEMP TABLE int8_tbl(q1 int8, q2 int8)",
+            "INSERT INTO int8_tbl VALUES (123, 456)",
+            "CREATE TEMP TABLE innertab (id int8 primary key, dat1 int8)",
+            "INSERT INTO innertab VALUES(123, 42)",
+        ] {
+            run(&mut eng, sql).unwrap();
+        }
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) SELECT q2 FROM (SELECT q2, 'constant'::text AS x FROM int8_tbl LEFT JOIN innertab ON q2 = id) ss RIGHT JOIN int4_tbl ON NULL WHERE x >= x",
+        );
+        assert!(
+            lines.iter().any(|l| l == "Replaces: Scan on int8_tbl"),
+            "T1 lost its Replaces line: {lines:?}"
+        );
     }
 }
