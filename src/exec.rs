@@ -49993,7 +49993,14 @@ fn info_columns_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Ve
                     Value::text("public"),
                     Value::text(tn.as_str()),
                     Value::text(cn.as_str()),
-                    Value::Int((i + 1) as i64),
+                    // v1.44: PG19 information_schema.columns defines
+                    // ordinal_position as CAST(a.attnum AS
+                    // cardinal_number) — the attnum gap survives
+                    // DROP COLUMN (PG never reuses attnums), so this is
+                    // NOT the dense column position. Same
+                    // .get(i)-with-dense-fallback idiom as v1.41's
+                    // pg_attribute.attnum.
+                    Value::Int(t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64),
                     default,
                     Value::text(if t.not_null[i] { "NO" } else { "YES" }),
                     Value::text(format!("{:?}", ty)),
@@ -63807,6 +63814,120 @@ mod v140_syscols_returning_tests {
                     }
                     other => panic!("expected Record, got {other:?}"),
                 }
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.44: `information_schema.columns.ordinal_position` is PG19's
+    /// `CAST(a.attnum AS cardinal_number)` (information_schema.sql:672),
+    /// not the dense 1-based column position. With no DROP COLUMN the
+    /// two coincide.
+    #[test]
+    fn v144_ordinal_position_dense_without_drop() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t144a (a int, b text, c int);").unwrap();
+        match run(
+            &mut eng,
+            "SELECT column_name, ordinal_position FROM information_schema.columns \
+             WHERE table_name = 't144a' ORDER BY ordinal_position",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                let got: Vec<(String, i64)> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let c = r.into_cells();
+                        let Value::Text(n) = &c[0] else {
+                            panic!("name")
+                        };
+                        let Value::Int(p) = c[1] else { panic!("pos") };
+                        (n.to_string(), p)
+                    })
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        ("a".to_string(), 1),
+                        ("b".to_string(), 2),
+                        ("c".to_string(), 3)
+                    ]
+                );
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.44: after `ALTER TABLE ... DROP COLUMN`, the attnum gap
+    /// survives in ordinal_position — PG16 probe: positions 1 and 3
+    /// (the dropped column's attnum is never reused).
+    #[test]
+    fn v144_ordinal_position_gap_after_drop() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t144d (a int, b text, c int);").unwrap();
+        run(&mut eng, "ALTER TABLE t144d DROP COLUMN b;").unwrap();
+        match run(
+            &mut eng,
+            "SELECT column_name, ordinal_position FROM information_schema.columns \
+             WHERE table_name = 't144d' ORDER BY ordinal_position",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                let got: Vec<(String, i64)> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let c = r.into_cells();
+                        let Value::Text(n) = &c[0] else {
+                            panic!("name")
+                        };
+                        let Value::Int(p) = c[1] else { panic!("pos") };
+                        (n.to_string(), p)
+                    })
+                    .collect();
+                assert_eq!(got, vec![("a".to_string(), 1), ("c".to_string(), 3)]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.44: `ALTER TABLE ... ADD COLUMN` after a DROP takes
+    /// max(attnums ever)+1 — never the dropped attnum — and
+    /// ordinal_position follows it (PG19 ATExecAddColumn).
+    #[test]
+    fn v144_ordinal_position_add_after_drop_never_reuses() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t144n (a int, b text, c int);").unwrap();
+        run(&mut eng, "ALTER TABLE t144n DROP COLUMN b;").unwrap();
+        run(&mut eng, "ALTER TABLE t144n ADD COLUMN d int;").unwrap();
+        match run(
+            &mut eng,
+            "SELECT column_name, ordinal_position FROM information_schema.columns \
+             WHERE table_name = 't144n' ORDER BY ordinal_position",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                let got: Vec<(String, i64)> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let c = r.into_cells();
+                        let Value::Text(n) = &c[0] else {
+                            panic!("name")
+                        };
+                        let Value::Int(p) = c[1] else { panic!("pos") };
+                        (n.to_string(), p)
+                    })
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        ("a".to_string(), 1),
+                        ("c".to_string(), 3),
+                        ("d".to_string(), 4)
+                    ]
+                );
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
