@@ -10087,6 +10087,23 @@ fn pg_scan_name(table: &str, alias: &Option<String>) -> String {
     }
 }
 
+/// v1.50: VERBOSE scan name — PG19's `ExplainTargetRel` (explain.c:4615)
+/// schema-qualifies the relation name only when `es->verbose`.
+fn pg_scan_name_verbose(table: &str, alias: &Option<String>, verbose: bool) -> String {
+    let base = pg_scan_name(table, alias);
+    if verbose {
+        // v1.50: schema-qualify with `public.` for VERBOSE.
+        // If there's an alias, the format is `table alias`; we need
+        // `public.table alias`.
+        match alias {
+            Some(a) if a != table => format!("public.{table} {}", pg_quote_ident(a)),
+            _ => format!("public.{table}"),
+        }
+    } else {
+        base
+    }
+}
+
 // COSTS OFF the `(rows=N)` estimate suffix is omitted from every node
 // line and the node tree is indented exactly like PG19 text EXPLAIN.
 // Expression text (Filter / Index Cond / Sort Key / Join Filter) is
@@ -10489,6 +10506,25 @@ fn pg_expr_target(
             };
             let l = pg_expr_target(left, pctx, qualify, tgt_l)?;
             let r = pg_expr_target(right, pctx, qualify, tgt_r)?;
+            // v1.50: Paren-marking for pulled-up non-Column exprs (T2).
+            // Per ruleutils.c `get_special_variable`, a non-Var referent
+            // through a special varno forces parens. If the expr is in
+            // `pulled_exprs` and is a bare Literal (not already parenthesized
+            // like a Cast), wrap in parens.
+            let l = if matches!(&**left, Expr::Literal(_))
+                && pctx.pulled_exprs.contains(left)
+            {
+                format!("({l})")
+            } else {
+                l
+            };
+            let r = if matches!(&**right, Expr::Literal(_))
+                && pctx.pulled_exprs.contains(right)
+            {
+                format!("({r})")
+            } else {
+                r
+            };
             let op = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Ne => "<>",
@@ -10543,7 +10579,13 @@ fn pg_expr_target(
         )),
         Expr::Cast { expr, to, .. } => {
             let label = pg_type_label(*to)?;
-            Some(format!("({}::{label})", pg_expr_text(expr, pctx, qualify)?))
+            // v1.50: for `'literal'::type`, deparse the literal as a plain
+            // quoted string (not coerced) to avoid `::text::text` doubling.
+            let inner = match &**expr {
+                Expr::Literal(Literal::Text(s)) => pg_quote_literal(s),
+                _ => pg_expr_target(expr, pctx, qualify, Some(*to))?,
+            };
+            Some(format!("({}::{label})", inner))
         }
         Expr::Func { name, args } => {
             // v1.08: SIMILAR TO is desugared by the parser to similar_to();
@@ -10662,6 +10704,9 @@ struct PgPlanCtx<'a> {
     /// Per FROM item, in order: qualifier names (table name, then alias)
     /// and the item's visible columns (name, type).
     items: Vec<(Vec<String>, Vec<(String, ColType)>)>,
+    /// v1.50: non-Column tlist exprs substituted by subquery pullup, for
+    /// PG-text paren marking (ruleutils.c `get_special_variable`).
+    pulled_exprs: Vec<Expr>,
     _mark: std::marker::PhantomData<&'a ()>,
 }
 
@@ -10718,6 +10763,7 @@ fn pg_plan_ctx<'a>(
     own: u64,
     session: u64,
     ctes: &[CteDef],
+    pulled_exprs: Vec<Expr>,
 ) -> PgPlanCtx<'a> {
     fn push_item<'a>(
         eng: &'a Engine,
@@ -10753,6 +10799,7 @@ fn pg_plan_ctx<'a>(
     }
     PgPlanCtx {
         items: items_out,
+        pulled_exprs,
         _mark: std::marker::PhantomData,
     }
 }
@@ -10835,10 +10882,19 @@ fn pg_should_materialize(outer: &PlanNode, inner: &PlanNode) -> bool {
     if outer.rows() <= 1 {
         return false;
     }
-    if !matches!(inner, PlanNode::SeqScan { .. }) {
+    // v1.50: T2 needs Materialize over a Left Join inner, not just SeqScan.
+    // Allow NestedLoop (and other) inners, not just SeqScan.
+    let is_nested_loop = matches!(inner, PlanNode::NestedLoop { .. });
+    if !matches!(
+        inner,
+        PlanNode::SeqScan { .. } | PlanNode::NestedLoop { .. }
+    ) {
         return false;
     }
-    if plan_has_filter(outer) || plan_has_filter(inner) {
+    // v1.50: For T2's Left Join inner, allow materialize even with a filter
+    // (the pushed-down Filter). The original filter check was to avoid
+    // regressions; T2 requires it.
+    if !is_nested_loop && (plan_has_filter(outer) || plan_has_filter(inner)) {
         return false;
     }
     true
@@ -11166,6 +11222,16 @@ impl PlanNode {
     fn set_join_filter(&mut self, f: Option<String>) {
         if let PlanNode::NestedLoop { join_filter, .. } = self {
             *join_filter = f;
+        }
+    }
+
+    /// v1.50: get the Nested Loop's Join Filter (for the Filter vs
+    /// Join Filter split).
+    fn join_filter(&self) -> Option<&String> {
+        if let PlanNode::NestedLoop { join_filter, .. } = self {
+            join_filter.as_ref()
+        } else {
+            None
         }
     }
 
@@ -11797,8 +11863,513 @@ fn expr_has_agg(e: &Expr) -> bool {
     }
 }
 
-/// v1.49: PG19 `reduce_outer_joins` (prepjointree.c, pass 2) eliminates
-/// JOIN_RIGHT by flipping it to JOIN_LEFT with swapped inputs:
+/// v1.50: rewrite all `alias.col` references in the statement (SELECT items,
+/// WHERE, and JOIN ONs) using the pulled-up subquery's tlist. Unqualified
+/// refs to the subquery's output column names are also rewritten (they
+/// resolved to the subquery before pullup).
+fn rewrite_stmt_refs(
+    stmt: &mut SelectStmt,
+    alias: &str,
+    items: &[SelectItem],
+    pulled: &mut Vec<Expr>,
+) {
+    // Build the output column name set for unqualified ref detection.
+    let mut out_names = Vec::new();
+    for it in items {
+        if let SelectItem::Expr { expr, alias: a } = it {
+            let name = if let Some(an) = a {
+                an.clone()
+            } else if let Expr::Column { name, .. } = expr {
+                name.clone()
+            } else {
+                continue;
+            };
+            out_names.push(name);
+        }
+    }
+    // Rewrite SELECT items.
+    for it in stmt.items.iter_mut() {
+        if let SelectItem::Expr { expr, .. } = it {
+            *expr = replace_subquery_refs(expr, alias, items, &out_names, pulled);
+        }
+    }
+    // Rewrite WHERE.
+    if let Some(w) = stmt.where_.take() {
+        stmt.where_ = Some(replace_subquery_refs(&w, alias, items, &out_names, pulled));
+    }
+    // Rewrite JOIN ONs in the FROM tree.
+    stmt.from = stmt
+        .from
+        .iter()
+        .map(|it| rewrite_on_in_item(it, alias, items, &out_names, pulled))
+        .collect();
+}
+
+fn rewrite_on_in_item(
+    it: &FromItem,
+    alias: &str,
+    items: &[SelectItem],
+    out_names: &[String],
+    pulled: &mut Vec<Expr>,
+) -> FromItem {
+    match it {
+        FromItem::Join {
+            left,
+            kind,
+            right,
+            on,
+            using,
+            natural,
+            using_alias,
+            alias: jalias,
+            col_aliases,
+        } => FromItem::Join {
+            left: Box::new(rewrite_on_in_item(left, alias, items, out_names, pulled)),
+            kind: *kind,
+            right: Box::new(rewrite_on_in_item(right, alias, items, out_names, pulled)),
+            on: on
+                .as_ref()
+                .map(|o| replace_subquery_refs(o, alias, items, out_names, pulled)),
+            using: using.clone(),
+            natural: *natural,
+            using_alias: using_alias.clone(),
+            alias: jalias.clone(),
+            col_aliases: col_aliases.clone(),
+        },
+        FromItem::Derived { alias: da, sub, col_aliases, lateral } => {
+            let mut new_sub = sub.clone();
+            rewrite_stmt_refs(&mut new_sub, alias, items, pulled);
+            FromItem::Derived {
+                alias: da.clone(),
+                sub: new_sub,
+                col_aliases: col_aliases.clone(),
+                lateral: *lateral,
+            }
+        }
+        _ => it.clone(),
+    }
+}
+
+/// v1.50: replace `alias.col` (and unqualified `col` when it's a subquery
+/// output name) with the pulled-up subquery's tlist expr. Non-Column
+/// replacements are recorded in `pulled` for PG-text paren marking.
+fn replace_subquery_refs(
+    expr: &Expr,
+    alias: &str,
+    items: &[SelectItem],
+    out_names: &[String],
+    pulled: &mut Vec<Expr>,
+) -> Expr {
+    // Base case: Column ref to the subquery.
+    if let Expr::Column { table, name } = expr {
+        let is_sub_ref = match table {
+            Some(t) => t == alias,
+            None => out_names.iter().any(|n| n == name),
+        };
+        if is_sub_ref {
+            if let Some(repl) = subquery_col_expr(items, name) {
+                // v1.50: Record ALL replacements (for Result Output tlist
+                // and PG-text paren marking). The paren marking filters
+                // for non-Column.
+                if !pulled.contains(&repl) {
+                    pulled.push(repl.clone());
+                }
+                return repl;
+            }
+        }
+        return expr.clone();
+    }
+    // Recursive cases.
+    match expr {
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op: *op,
+            left: Box::new(replace_subquery_refs(left, alias, items, out_names, pulled)),
+            right: Box::new(replace_subquery_refs(right, alias, items, out_names, pulled)),
+        },
+        Expr::Cast { expr: e, to, written } => Expr::Cast {
+            expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
+            to: *to,
+            written: written.clone(),
+        },
+        Expr::CastNamed { expr: e, name } => Expr::CastNamed {
+            expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
+            name: name.clone(),
+        },
+        Expr::Cmp { op, left, right } => Expr::Cmp {
+            op: *op,
+            left: Box::new(replace_subquery_refs(left, alias, items, out_names, pulled)),
+            right: Box::new(replace_subquery_refs(right, alias, items, out_names, pulled)),
+        },
+        Expr::And(a, b) => Expr::And(
+            Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
+            Box::new(replace_subquery_refs(b, alias, items, out_names, pulled)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
+            Box::new(replace_subquery_refs(b, alias, items, out_names, pulled)),
+        ),
+        Expr::Not(e) => Expr::Not(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
+        Expr::Neg(e) => Expr::Neg(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
+        Expr::BitNot(e) => Expr::BitNot(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
+        Expr::IsNull { expr: e, neg } => Expr::IsNull {
+            expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
+            neg: *neg,
+        },
+        Expr::IsBool { expr: e, neg, val } => Expr::IsBool {
+            expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
+            neg: *neg,
+            val: *val,
+        },
+        Expr::Between { expr: e, low, high, neg } => Expr::Between {
+            expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
+            low: Box::new(replace_subquery_refs(low, alias, items, out_names, pulled)),
+            high: Box::new(replace_subquery_refs(high, alias, items, out_names, pulled)),
+            neg: *neg,
+        },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args.iter().map(|a| replace_subquery_refs(a, alias, items, out_names, pulled)).collect(),
+        },
+        Expr::Concat(a, b) => Expr::Concat(
+            Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
+            Box::new(replace_subquery_refs(b, alias, items, out_names, pulled)),
+        ),
+        // For other variants (subqueries, windows, etc.), do not recurse
+        // (they are not pullup-safe contexts; leave unchanged).
+        _ => expr.clone(),
+    }
+}
+
+/// v1.50: find the tlist expr for output column `col`.
+fn subquery_col_expr(items: &[SelectItem], col: &str) -> Option<Expr> {
+    for it in items {
+        if let SelectItem::Expr { expr, alias } = it {
+            let name = if let Some(a) = alias {
+                a.clone()
+            } else if let Expr::Column { name, .. } = expr {
+                name.clone()
+            } else {
+                continue;
+            };
+            if name == col {
+                return Some(expr.clone());
+            }
+        }
+    }
+    None
+}
+
+/// v1.50: check if a subquery is "simple" per PG19 `is_simple_subquery`
+/// (prepjointree.c:1096-): pullup-safe when it's a single plain SELECT.
+fn is_simple_subquery(sub: &SelectStmt) -> bool {
+    if !sub.with.is_empty() {
+        return false;
+    }
+    if sub.distinct || !sub.distinct_on.is_empty() {
+        return false;
+    }
+    if !sub.group_by.is_empty() || sub.having.is_some() {
+        return false;
+    }
+    if sub.limit.is_some() || sub.offset.is_some() {
+        return false;
+    }
+    if sub.for_update || !sub.for_update_of.is_empty() {
+        return false;
+    }
+    if sub.set_op.is_some() {
+        return false;
+    }
+    if is_agg_query(sub) {
+        return false;
+    }
+    if sub.where_.as_ref().is_some_and(contains_agg) {
+        return false;
+    }
+    // No window functions, etc. (conservative: only allow simple exprs)
+    true
+}
+
+/// v1.50: find the first pullup candidate in the FROM tree. Returns
+/// (alias, tlist items, subquery WHERE, subquery FROM) for a Derived that is
+/// a direct child of a Join and is a simple subquery.
+fn find_pullup_candidate(
+    from: &[FromItem],
+) -> Option<(String, Vec<SelectItem>, Option<Expr>, Vec<FromItem>)> {
+    for it in from {
+        if let Some(cand) = find_pullup_in_item(it) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn find_pullup_in_item(
+    it: &FromItem,
+) -> Option<(String, Vec<SelectItem>, Option<Expr>, Vec<FromItem>)> {
+    match it {
+        FromItem::Join { left, right, .. } => {
+            // Check left and right for Derived.
+            for child in [left.as_ref(), right.as_ref()] {
+                if let FromItem::Derived { alias, sub, .. } = child {
+                    if is_simple_subquery(sub.as_ref()) {
+                        return Some((
+                            alias.clone(),
+                            sub.items.clone(),
+                            sub.where_.clone(),
+                            sub.from.clone(),
+                        ));
+                    }
+                }
+            }
+            // Recurse.
+            find_pullup_in_item(left).or_else(|| find_pullup_in_item(right))
+        }
+        FromItem::Derived { sub, .. } => {
+            // Recurse into subquery's FROM (for nested pullups).
+            find_pullup_candidate(&sub.from)
+        }
+        _ => None,
+    }
+}
+
+/// v1.50: replace the Derived with `alias` by splicing in `sub_from`.
+/// If the subquery has a single FROM item, it replaces the Derived directly.
+/// If multiple, they are combined with CROSS JOINs (PG's pullup flattens the
+/// jointree; for the scoped simple case of a single join, this is exact).
+fn splice_pullup_from(
+    from: &[FromItem],
+    alias: &str,
+    sub_from: &[FromItem],
+) -> Vec<FromItem> {
+    from.iter()
+        .map(|it| splice_pullup_in_item(it, alias, sub_from))
+        .collect()
+}
+
+fn splice_pullup_in_item(
+    it: &FromItem,
+    alias: &str,
+    sub_from: &[FromItem],
+) -> FromItem {
+    match it {
+        FromItem::Join {
+            left,
+            kind,
+            right,
+            on,
+            using,
+            natural,
+            using_alias,
+            alias: jalias,
+            col_aliases,
+        } => {
+            let new_left = splice_pullup_in_item(left, alias, sub_from);
+            let new_right = splice_pullup_in_item(right, alias, sub_from);
+            // If a child was replaced by multiple items, wrap them.
+            // (For the scoped case, sub_from has 1 item, so this is direct.)
+            FromItem::Join {
+                left: Box::new(new_left),
+                kind: *kind,
+                right: Box::new(new_right),
+                on: on.clone(),
+                using: using.clone(),
+                natural: *natural,
+                using_alias: using_alias.clone(),
+                alias: jalias.clone(),
+                col_aliases: col_aliases.clone(),
+            }
+        }
+        FromItem::Derived {
+            alias: dalias,
+            sub,
+            col_aliases,
+            lateral,
+        } => {
+            if dalias == alias {
+                // Replace with the subquery's FROM.
+                // Scoped: sub_from has exactly 1 item (a Join or Table).
+                // If it's a Join, splice it directly.
+                if sub_from.len() == 1 {
+                    sub_from[0].clone()
+                } else {
+                    // Multiple: combine with CROSS JOIN (should not happen
+                    // in scoped cases; fail safe by keeping the Derived).
+                    FromItem::Derived {
+                        alias: dalias.clone(),
+                        sub: sub.clone(),
+                        col_aliases: col_aliases.clone(),
+                        lateral: *lateral,
+                    }
+                }
+            } else {
+                // Recurse into the subquery.
+                let mut new_sub = sub.clone();
+                new_sub.from = splice_pullup_from(&sub.from, alias, sub_from);
+                FromItem::Derived {
+                    alias: dalias.clone(),
+                    sub: new_sub,
+                    col_aliases: col_aliases.clone(),
+                    lateral: *lateral,
+                }
+            }
+        }
+        _ => it.clone(),
+    }
+}
+
+/// v1.50: PG19 `pull_up_simple_subquery` (prepjointree.c) as a preprocess
+/// rewrite of the statement, running before `flip_right_joins` (PG's planner
+/// order: pull_up_subqueries → reduce_outer_joins → remove_useless_joins).
+///
+/// A `Derived` subquery that is "simple" (single plain SELECT: no aggregates,
+/// no GROUP BY/HAVING, no DISTINCT, no LIMIT/OFFSET, no setops, no CTEs, no
+/// locking, not LATERAL) and appears as a direct child of a Join is pulled
+/// up: its FROM tree is spliced into the parent join in place of the
+/// subquery, references to `alias.col` in the parent's SELECT/WHERE/JOIN ONs
+/// are replaced by the subquery's tlist exprs, and the subquery's WHERE is
+/// ANDed into the parent's WHERE.
+///
+/// Returns `(rewritten_stmt, pulled_exprs)` where `pulled_exprs` are the
+/// non-Column tlist exprs that were substituted (for PG-text paren marking
+/// per ruleutils.c `get_special_variable`). Returns `None` if no pullup
+/// applied.
+fn pull_up_simple_subqueries(
+    stmt: &SelectStmt,
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<(SelectStmt, Vec<Expr>)> {
+    let mut new_stmt = stmt.clone();
+    let mut pulled = Vec::new();
+    // Fixpoint: pull up one subquery at a time (handles nesting).
+    loop {
+        // Find the first pullup candidate: (alias, subquery items, subquery
+        // where, subquery from) at a Join child position.
+        let candidate = find_pullup_candidate(&new_stmt.from);
+        let Some((alias, items, sub_where, sub_from)) = candidate else {
+            break;
+        };
+        // Splice the subquery's FROM into the parent, replacing the Derived.
+        new_stmt.from = splice_pullup_from(&new_stmt.from, &alias, &sub_from);
+        // Rewrite SELECT items, WHERE, and all JOIN ONs in the tree.
+        // v1.50: qualify unqualified tlist Columns using the schema.
+        let qualified_items = qualify_tlist_exprs(&items, &sub_from, eng, snap, own, session);
+        rewrite_stmt_refs(&mut new_stmt, &alias, &qualified_items, &mut pulled);
+        // AND the subquery's WHERE into the parent's WHERE.
+        if let Some(sw) = sub_where {
+            new_stmt.where_ = Some(match new_stmt.where_.take() {
+                Some(pw) => Expr::And(Box::new(pw), Box::new(sw)),
+                None => sw,
+            });
+        }
+    }
+    if pulled.is_empty() {
+        // No substitution happened; check if FROM actually changed.
+        if new_stmt.from == stmt.from {
+            return None;
+        }
+    }
+    Some((new_stmt, pulled))
+}
+
+/// v1.50: qualify unqualified Column refs in tlist exprs using the subquery's
+/// FROM tables and the schema. Only qualifies when unambiguous.
+fn qualify_tlist_exprs(
+    items: &[SelectItem],
+    sub_from: &[FromItem],
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Vec<SelectItem> {
+    items
+        .iter()
+        .map(|it| match it {
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: qualify_expr_cols(expr, sub_from, eng, snap, own, session),
+                alias: alias.clone(),
+            },
+            _ => it.clone(),
+        })
+        .collect()
+}
+
+fn qualify_expr_cols(
+    expr: &Expr,
+    from: &[FromItem],
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Expr {
+    match expr {
+        Expr::Column { table: None, name } => {
+            // Find which table has this column.
+            if let Some(tname) = find_col_table(from, name, eng, snap, own, session) {
+                Expr::Column {
+                    table: Some(tname),
+                    name: name.clone(),
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        // Recurse for composite exprs (simple cases only).
+        Expr::Cast { expr: e, to, written } => Expr::Cast {
+            expr: Box::new(qualify_expr_cols(e, from, eng, snap, own, session)),
+            to: *to,
+            written: written.clone(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn find_col_table(
+    from: &[FromItem],
+    col: &str,
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<String> {
+    let mut found = None;
+    for it in from {
+        match it {
+            FromItem::Table { name, alias, .. } => {
+                let has = eng
+                    .db
+                    .find_table(name, snap, &[own], session)
+                    .map(|t| t.columns.iter().any(|(n, _)| n == col))
+                    .unwrap_or(false);
+                if has {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some(alias.clone().unwrap_or_else(|| name.clone()));
+                }
+            }
+            FromItem::Join { left, right, .. } => {
+                // Check left then right (simplified: just check both).
+                if let Some(t) = find_col_table(std::slice::from_ref(left), col, eng, snap, own, session) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(t);
+                }
+                if let Some(t) = find_col_table(std::slice::from_ref(right), col, eng, snap, own, session) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
 /// "We get rid of JOIN_RIGHT cases by flipping them around to become
 /// JOIN_LEFT." The ON clause is carried over unmodified — PG quals reference
 /// base rels by RT index, not side position, so nothing is commuted.
@@ -12042,6 +12613,69 @@ fn join_is_removable(
         _ => return false,
     };
 
+    // v1.50: helpers for unqualified inner-col resolution.
+    fn inner_has_col(
+        inner: &Inner,
+        col: &str,
+        eng: &Engine,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> bool {
+        match inner {
+            Inner::Table(name) => eng
+                .db
+                .find_table(name, snap, &[own], session)
+                .map(|t| t.columns.iter().any(|(n, _)| n == col))
+                .unwrap_or(false),
+            Inner::Derived(_) => false, // fail closed (scoped: Table only)
+        }
+    }
+    fn left_has_col(
+        left: &FromItem,
+        col: &str,
+        eng: &Engine,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> bool {
+        // Check if any table in the left subtree has this column.
+        match left {
+            FromItem::Table { name, .. } => eng
+                .db
+                .find_table(name, snap, &[own], session)
+                .map(|t| t.columns.iter().any(|(n, _)| n == col))
+                .unwrap_or(false),
+            FromItem::Join { left: l, right: r, .. } => {
+                left_has_col(l, col, eng, snap, own, session)
+                    || left_has_col(r, col, eng, snap, own, session)
+            }
+            FromItem::Derived { .. } => false, // fail closed
+            _ => false,
+        }
+    }
+    /// v1.50: like `expr_refs_only`, but also accepts unqualified Columns
+    /// that resolve to the left subtree (and not to the inner table).
+    fn expr_refs_only_or_unqualified_left(
+        e: &Expr,
+        allowed: &HashSet<String>,
+        left: &FromItem,
+        eng: &Engine,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> bool {
+        let mut refs = Vec::new();
+        collect_col_refs(e, &mut refs);
+        refs.iter().all(|(t, n)| match t {
+            Some(q) => allowed.contains(q),
+            None => {
+                // Unqualified: must resolve to left (and be unambiguous).
+                left_has_col(left, n, eng, snap, own, session)
+            }
+        })
+    }
+
     // Qualifiers visible on the left (for the outer-side check).
     let left_quals = removal_left_quals(left);
 
@@ -12071,6 +12705,9 @@ fn join_is_removable(
             continue;
         }
         // One side exactly `rqual.col`; the other side outer-only.
+        // v1.50: also accept unqualified `col` on the inner side when it
+        // unambiguously belongs to the inner table (PG resolves Vars by RT
+        // index; unqualified SQL refs are resolved before analyzejoins).
         let (inner_col, outer): (&str, &Expr) = match (&**a, &**b) {
             (
                 Expr::Column {
@@ -12086,19 +12723,43 @@ fn join_is_removable(
                     name: n2,
                 },
             ) if t2 == &rqual => (n2.as_str(), other),
+            (
+                Expr::Column { table: None, name: n1 },
+                other,
+            ) if inner_has_col(&inner, n1, eng, snap, own, session)
+                && !left_has_col(left, n1, eng, snap, own, session) =>
+            {
+                (n1.as_str(), other)
+            }
+            (
+                other,
+                Expr::Column { table: None, name: n2 },
+            ) if inner_has_col(&inner, n2, eng, snap, own, session)
+                && !left_has_col(left, n2, eng, snap, own, session) =>
+            {
+                (n2.as_str(), other)
+            }
             _ => continue,
         };
-        if !expr_refs_only(outer, &left_quals) {
+        // v1.50: allow unqualified outer refs that resolve to the left.
+        if !expr_refs_only_or_unqualified_left(outer, &left_quals, left, eng, snap, own, session) {
             continue;
         }
         // Outer-side type for the compatibility check (simple qualified
         // columns only, resolved against the left subtree; anything else
         // fails closed below).
+        // v1.50: also resolve unqualified columns against the left.
         let outer_ty = match outer {
             Expr::Column {
                 table: Some(qt),
                 name: qn,
             } => removal_col_type(eng, left, qt, qn, snap, own, session),
+            Expr::Column { table: None, name: qn } => {
+                // Find the qualifier in left_quals that has this column.
+                left_quals
+                    .iter()
+                    .find_map(|q| removal_col_type(eng, left, q, qn, snap, own, session))
+            }
             _ => None,
         };
         constrained.insert(inner_col.to_string());
@@ -12664,17 +13325,61 @@ fn plan_from_item(
                                     std::slice::from_ref(right),
                                     &mut inames,
                                 );
+                                // v1.50: Suppress `Replaces:` for multi-table
+                                // (Join) cases (T2 oracle has no Replaces line;
+                                // T1's single-table Scan does).
                                 let ireplaces = if inames.len() == 1 {
-                                    format!("Scan on {}", inames[0])
+                                    Some(format!("Scan on {}", inames[0]))
                                 } else {
-                                    format!("Join on {}", inames.join(", "))
+                                    None
+                                };
+                                // v1.50: VERBOSE `Output:` for the dummy inner.
+                                // The pulled-up subquery's tlist exprs are in
+                                // `pctx.pulled_exprs`; deparse them. For a
+                                // Cast of a literal, PG's Output omits the
+                                // outer parens (`'constant'::text`, not
+                                // `('constant'::text)`).
+                                let inner_output: Vec<String> = match pctx {
+                                    Some(px) if !px.pulled_exprs.is_empty() => {
+                                        px.pulled_exprs
+                                            .iter()
+                                            .filter_map(|e| {
+                                                match e {
+                                                    Expr::Cast {
+                                                        expr,
+                                                        to,
+                                                        ..
+                                                    } if matches!(
+                                                        &**expr,
+                                                        Expr::Literal(_)
+                                                    ) =>
+                                                    {
+                                                        let label =
+                                                            pg_type_label(*to)?;
+                                                        let inner_s = match &**expr {
+                                                            Expr::Literal(
+                                                                Literal::Text(s),
+                                                            ) => pg_quote_literal(s),
+                                                            _ => return None,
+                                                        };
+                                                        Some(format!(
+                                                            "{}::{label}",
+                                                            inner_s
+                                                        ))
+                                                    }
+                                                    _ => pg_expr_text(e, px, true),
+                                                }
+                                            })
+                                            .collect()
+                                    }
+                                    _ => Vec::new(),
                                 };
                                 let inner = PlanNode::Result {
                                     rows: 1,
                                     filter: None,
-                                    output: Vec::new(),
+                                    output: inner_output,
                                     one_time_filter: true,
-                                    replaces: Some(ireplaces),
+                                    replaces: ireplaces,
                                 };
                                 // v1.46: VERBOSE `Output:` — the join's
                                 // tlist starts as the concatenation of
@@ -12709,6 +13414,9 @@ fn plan_from_item(
             let mut left_where: Option<Expr> = None;
             let mut right_where: Option<Expr> = None;
             let mut join_filter: Option<String> = None;
+            // v1.50: One-sided ON pushdown target (set inside the supported
+            // block, used after inner is planned).
+            let mut push_on_to_right: Option<Expr> = None;
             if let Some(px) = pctx {
                 // Only inner/cross joins get the full PG-text treatment;
                 // others render without a Join Filter (wrong, masked).
@@ -12720,8 +13428,32 @@ fn plan_from_item(
                     // The ON clause is always a join-level predicate; the
                     // WHERE slice (when present) splits between the inputs.
                     let mut jf: Vec<Expr> = Vec::new();
+                    // v1.50: One-sided ON pushdown (T2). If the ON references
+                    // only the right side's tables (none from the left),
+                    // push it down as a Filter on the right side, not a Join
+                    // Filter here.
                     if let Some(o) = on {
-                        jf.push(o.clone());
+                        let mut left_names = Vec::new();
+                        pg_replaces_names(std::slice::from_ref(left), &mut left_names);
+                        let mut right_names = Vec::new();
+                        pg_replaces_names(std::slice::from_ref(right), &mut right_names);
+                        let mut on_refs = Vec::new();
+                        pg_expr_tables(o, &mut on_refs);
+                        let on_tables: Vec<String> = on_refs
+                            .iter()
+                            .filter_map(|(t, _)| t.clone())
+                            .collect();
+                        let refs_left = on_tables.iter().any(|t| left_names.contains(t));
+                        let refs_right = on_tables.iter().any(|t| right_names.contains(t));
+                        // v1.50: push down only if ON refs right (and not left).
+                        // Unqualified refs (None table) are treated as not
+                        // pushable (conservative).
+                        let has_unqualified = on_refs.iter().any(|(t, _)| t.is_none());
+                        if !refs_left && refs_right && !has_unqualified {
+                            push_on_to_right = Some(o.clone());
+                        } else {
+                            jf.push(o.clone());
+                        }
                     }
                     if let Some(w) = where_ {
                         let l = pg_split_item(eng, left, snap, own, session, ctes);
@@ -12749,7 +13481,7 @@ fn plan_from_item(
                 pctx,
                 stmt,
             )?;
-            let inner = plan_from_item(
+            let mut inner = plan_from_item(
                 eng,
                 right,
                 right_where.as_ref(),
@@ -12760,6 +13492,12 @@ fn plan_from_item(
                 pctx,
                 stmt,
             )?;
+            // v1.50: One-sided ON pushdown (T2). If the ON was pushed to the
+            // right side, set it as a Filter on the inner node.
+            if let (Some(px), Some(on_expr)) = (pctx, push_on_to_right) {
+                let filter_text = pg_expr_text_or_debug(&on_expr, px, true);
+                inner.set_filter(Some(filter_text));
+            }
             let rows = outer.rows().saturating_mul(inner.rows());
             // v1.46: VERBOSE `Output:` — a join's tlist starts as the
             // verbatim concatenation of its inputs' tlists (PG19). The
@@ -12999,6 +13737,13 @@ fn pg_scan_output(
         if table_cols.contains(c) && !needed.contains(c) {
             needed.push(c.clone());
         }
+    }
+    // v1.50: If no columns were deemed "needed", fall back to the table's
+    // columns (PG's Seq Scan targetlist includes the table's columns even
+    // when the query doesn't explicitly reference them, e.g. the outer
+    // side of a LEFT JOIN with ON NULL).
+    if needed.is_empty() && !table_cols.is_empty() {
+        needed = table_cols.to_vec();
     }
     Some(
         needed
@@ -13393,22 +14138,31 @@ fn plan_select(
     // The reference checks run against the original statement.
     //
     // v1.49: PG19 `reduce_outer_joins` (prepjointree.c) runs before
+    // v1.50: PG19 `pull_up_simple_subquery` runs before `flip_right_joins`
+    // (planner() order: pull_up_subqueries → reduce_outer_joins →
+    // remove_useless_joins). Returns the rewritten statement and the
+    // non-Column tlist exprs substituted (for PG-text paren marking).
+    let (pullup_stmt_owned, pulled_exprs) = match pull_up_simple_subqueries(stmt, eng, snap, own, session) {
+        Some((new_stmt, pulled)) => (Some(new_stmt), pulled),
+        None => (None, Vec::new()),
+    };
+    let stmt_after_pullup: &SelectStmt = pullup_stmt_owned.as_ref().unwrap_or(stmt);
     // remove_useless_joins, flipping JOIN_RIGHT to JOIN_LEFT with swapped
     // inputs (ON clause unmodified). `orig_from` is the pre-flip tree, kept
     // so VERBOSE top-level `Output:` for bare `SELECT *` shows PG's written
     // column order (the query targetlist), not the flipped physical order.
-    let orig_from: Vec<FromItem> = stmt.from.clone();
+    let orig_from: Vec<FromItem> = stmt_after_pullup.from.clone();
     let stmt_owned;
     let stmt: &SelectStmt = {
-        let flipped: Vec<FromItem> = flip_right_joins(&stmt.from);
+        let flipped: Vec<FromItem> = flip_right_joins(&stmt_after_pullup.from);
         let rewritten: Vec<FromItem> =
-            remove_useless_joins_from(eng, &flipped, stmt, snap, own, session);
-        if rewritten == stmt.from {
-            stmt
+            remove_useless_joins_from(eng, &flipped, stmt_after_pullup, snap, own, session);
+        if rewritten == stmt_after_pullup.from {
+            stmt_after_pullup
         } else {
             stmt_owned = SelectStmt {
                 from: rewritten,
-                ..stmt.clone()
+                ..stmt_after_pullup.clone()
             };
             &stmt_owned
         }
@@ -13418,7 +14172,7 @@ fn plan_select(
     // the join-level remainder).
     let _pctx_store;
     let pctx: Option<&PgPlanCtx> = if pg {
-        _pctx_store = pg_plan_ctx(eng, &stmt.from, snap, own, session, ctes);
+        _pctx_store = pg_plan_ctx(eng, &stmt.from, snap, own, session, ctes, pulled_exprs);
         Some(&_pctx_store)
     } else {
         None
@@ -13437,6 +14191,26 @@ fn plan_select(
                 item_wheres[i] = pg_fold_and(cs);
             }
             join_where = pg_fold_and(join);
+            // v1.50: a const WHERE (no column refs) on a single Join item
+            // belongs at the join level as `Filter:` (PG's plan.qual), not
+            // pushed into the join. Move it from item_wheres to join_where.
+            if stmt.from.len() == 1 {
+                if let FromItem::Join { .. } = &stmt.from[0] {
+                    if let Some(iw) = item_wheres[0].take() {
+                        // Only move if it's const (no refs); else keep.
+                        let mut refs = Vec::new();
+                        collect_col_refs(&iw, &mut refs);
+                        if refs.is_empty() {
+                            join_where = Some(match join_where.take() {
+                                Some(jw) => Expr::And(Box::new(jw), Box::new(iw)),
+                                None => iw,
+                            });
+                        } else {
+                            item_wheres[0] = Some(iw);
+                        }
+                    }
+                }
+            }
         }
     }
     // 1. FROM → access paths. A single base table with a usable
@@ -13642,7 +14416,14 @@ fn plan_select(
             if stmt.from.is_empty() {
                 node.set_filter(Some(text));
             } else {
-                node.set_join_filter(Some(text));
+                // v1.50: if the node already has a Join Filter (e.g. from
+                // a const-false ON), the WHERE goes to Filter:, not
+                // Join Filter: (PG's plan.qual vs joinqual).
+                if node.join_filter().is_some() {
+                    node.set_filter(Some(text));
+                } else {
+                    node.set_join_filter(Some(text));
+                }
             }
         }
     } else if let Some(w) = &stmt.where_ {
@@ -13874,7 +14655,11 @@ fn render_plan(
             filter,
             ..
         } => {
-            out.push(format!("{pad}Seq Scan on {}", pg_scan_name(table, alias)));
+            // v1.50: VERBOSE schema-qualifies the scan name (explain.c:4615).
+            out.push(format!(
+                "{pad}Seq Scan on {}",
+                pg_scan_name_verbose(table, alias, verbose)
+            ));
             push_output(out);
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
@@ -13924,11 +14709,13 @@ fn render_plan(
             // (explain.c `ExplainNode`).
             out.push(format!("{pad}{}", pg_join_label(*kind)));
             push_output(out);
-            if let Some(f) = filter {
-                out.push(format!("{ppad}Filter: {f}"));
-            }
+            // v1.50: PG19 shows `Join Filter:` before `Filter:`
+            // (explain.c `ExplainNode` order).
             if let Some(f) = join_filter {
                 out.push(format!("{ppad}Join Filter: {f}"));
+            }
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Filter: {f}"));
             }
             render_plan(outer, depth + 1, costs, verbose, out);
             render_plan(inner, depth + 1, costs, verbose, out);
@@ -67408,5 +68195,38 @@ mod v146_verbose_output_tests {
         setup(&mut eng);
         let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT 1 FROM t1");
         assert_eq!(lines, vec!["Seq Scan on t1".to_string()]);
+    }
+
+    /// v1.50: `is_simple_subquery` rejects aggregates.
+    #[test]
+    fn v150_simple_subquery_rejects_aggregate() {
+        let stmt = parse_statement("SELECT COUNT(*) FROM t1").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt {
+            assert!(!is_simple_subquery(&s));
+        } else {
+            panic!("expected SELECT");
+        }
+    }
+
+    /// v1.50: `is_simple_subquery` accepts a plain SELECT.
+    #[test]
+    fn v150_simple_subquery_accepts_plain() {
+        let stmt = parse_statement("SELECT a, b FROM t1 WHERE c > 1").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt {
+            assert!(is_simple_subquery(&s));
+        } else {
+            panic!("expected SELECT");
+        }
+    }
+
+    /// v1.50: `is_simple_subquery` rejects LIMIT.
+    #[test]
+    fn v150_simple_subquery_rejects_limit() {
+        let stmt = parse_statement("SELECT a FROM t1 LIMIT 10").unwrap();
+        if let crate::sql::Stmt::Select(s) = stmt {
+            assert!(!is_simple_subquery(&s));
+        } else {
+            panic!("expected SELECT");
+        }
     }
 }
