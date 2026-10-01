@@ -39,13 +39,13 @@
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, DefaultExpr, Expr, FkAction, FkDef, FrameBound, FrameExclusion, FromItem, IndexColSpec,
-    InsertIndirection, InsertTarget, InsertValue, IsolationLevel, JoinKind, Literal, OnConflict,
-    OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts,
-    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef,
-    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
-    parse_statement,
-    parse_trigger_body, trig_event, validate_constraint_expr,
+    CteDef, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound, FrameExclusion,
+    FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue, IsolationLevel,
+    JoinKind, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel,
+    SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
+    TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc,
+    collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body, trig_event,
+    validate_constraint_expr,
 };
 use crate::storage::index_visible;
 use crate::storage::{
@@ -742,8 +742,17 @@ fn execute_inner(
         } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref()),
         Stmt::DropIndex { names, if_exists } => exec_drop_index(eng, ctx, names, *if_exists),
         Stmt::Explain {
-            stmt, analyze, costs, ..
+            stmt, analyze, costs, opts, ..
         } => {
+            // v1.45: only FORMAT TEXT has a renderer; PG's XML/JSON/YAML
+            // formats are honestly rejected (0A000) rather than silently
+            // rendering text.
+            if opts.format != ExplainFormat::Text {
+                return Err(exec_err(
+                    "0A000",
+                    "EXPLAIN (FORMAT XML/JSON/YAML) is not supported".to_string(),
+                ));
+            }
             if *analyze {
                 exec_explain_analyze(eng, ctx, stmt, *costs)
             } else {
@@ -11135,6 +11144,289 @@ fn plan_cte_body(
     }
 }
 
+/// v1.45: is `col` the sole column of a uniqueness guarantee on `table`?
+/// Uniqueness proof for the simple-case join removal below. Covers PRIMARY
+/// KEY and UNIQUE constraints (which temp tables enforce by column position)
+/// plus standalone unique indexes on regular tables (v0.88: expression /
+/// partial indexes are planner-invisible and never qualify).
+fn is_unique_col(
+    eng: &Engine,
+    table: &str,
+    col: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let db = &eng.db;
+    let Some(t) = db.find_table(table, snap, &[own], session) else {
+        return false;
+    };
+    let single = |u: &UniqueDef| u.cols.len() == 1 && u.cols[0].eq_ignore_ascii_case(col);
+    if t.pkey.as_ref().is_some_and(single) {
+        return true;
+    }
+    if t.uniques.iter().any(single) {
+        return true;
+    }
+    if !db.is_temp_table(session, table) {
+        for ix in db.visible_indexes_for(table, snap, &[own], session) {
+            if ix.def.unique
+                && ix.def.planner_usable
+                && ix.def.col_names.len() == 1
+                && ix.def.col_names[0].eq_ignore_ascii_case(col)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// v1.45: count, over the ORIGINAL from tree, how many ON clauses
+/// reference each table qualifier. A candidate join's inner range is
+/// removable only if its qualifier occurs in exactly one ON clause — its
+/// own. (A set difference would be unsound here: an outer ON referencing
+/// the inner range must block removal, or the rewritten tree dangles.)
+fn collect_on_qual_counts(item: &FromItem, counts: &mut HashMap<String, usize>) {
+    if let FromItem::Join { left, right, on, .. } = item {
+        if let Some(o) = on {
+            let mut refs = Vec::new();
+            collect_col_refs(o, &mut refs);
+            for (t, _) in refs {
+                if let Some(t) = t {
+                    *counts.entry(t).or_insert(0) += 1;
+                }
+            }
+        }
+        collect_on_qual_counts(left, counts);
+        collect_on_qual_counts(right, counts);
+    }
+}
+
+/// v1.45: PG's `remove_useless_joins` (preprocess.c), restricted to the
+/// provably-safe simple case. `L LEFT JOIN R ON L.c1 = R.c2` becomes `L`
+/// alone when R is a plain table, the ON is a single explicitly-qualified
+/// `L.c1 = R.c2` equality, R.c2 is unique in R, and no other expression in
+/// the query level references R's range. The join can then neither filter
+/// nor duplicate L's rows and contributes no columns. Anything doubtful —
+/// unqualified column references, other join types, USING/NATURAL, join
+/// aliases, subquery/function inner sides — keeps the join.
+fn remove_useless_joins(
+    eng: &Engine,
+    item: &FromItem,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> FromItem {
+    // Occurrence counts over the ORIGINAL tree; the recursive rewrite
+    // below is bottom-up and these counts stay a sound (conservative)
+    // reference check throughout.
+    let mut on_counts = HashMap::new();
+    for it in &stmt.from {
+        collect_on_qual_counts(it, &mut on_counts);
+    }
+    remove_useless_joins_inner(eng, item, stmt, &on_counts, snap, own, session)
+}
+
+/// v1.45: recursive worker for [`remove_useless_joins`]; see it for the
+/// safety contract.
+fn remove_useless_joins_inner(
+    eng: &Engine,
+    item: &FromItem,
+    stmt: &SelectStmt,
+    on_counts: &HashMap<String, usize>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> FromItem {
+    let FromItem::Join {
+        left,
+        right,
+        kind,
+        on,
+        using,
+        natural,
+        using_alias,
+        alias,
+        col_aliases,
+    } = item
+    else {
+        return item.clone();
+    };
+    // Recurse first so nested joins are simplified bottom-up.
+    let left = Box::new(remove_useless_joins_inner(
+        eng, left, stmt, on_counts, snap, own, session,
+    ));
+    let right = Box::new(remove_useless_joins_inner(
+        eng, right, stmt, on_counts, snap, own, session,
+    ));
+    let rebuild = || FromItem::Join {
+        left: left.clone(),
+        right: right.clone(),
+        kind: *kind,
+        on: on.clone(),
+        using: using.clone(),
+        natural: *natural,
+        using_alias: using_alias.clone(),
+        alias: alias.clone(),
+        col_aliases: col_aliases.clone(),
+    };
+    // Only plain `LEFT JOIN ... ON` is a candidate.
+    if !matches!(kind, JoinKind::Left)
+        || using_alias.is_some()
+        || alias.is_some()
+        || !using.is_empty()
+        || *natural
+    {
+        return rebuild();
+    }
+    let on_expr = match on {
+        Some(o) => o,
+        None => return rebuild(),
+    };
+    // Inner side must be a plain table: no derived/values/function/CTE
+    // expansion, and no column renames that would desync the uniqueness
+    // check below.
+    let (rname, ralias) = match right.as_ref() {
+        FromItem::Table {
+            name,
+            alias,
+            col_aliases,
+            ..
+        } => {
+            if !col_aliases.is_empty() {
+                return rebuild();
+            }
+            (name, alias)
+        }
+        _ => return rebuild(),
+    };
+    // Outer side must expose an unambiguous qualifier.
+    let lqual: Option<String> = match left.as_ref() {
+        FromItem::Table { name, alias, .. } => {
+            Some(alias.clone().unwrap_or_else(|| name.clone()))
+        }
+        FromItem::Derived { alias, .. } => Some(alias.clone()),
+        _ => None,
+    };
+    let (lqual, rqual) = match lqual {
+        Some(l) => (l, ralias.clone().unwrap_or_else(|| rname.clone())),
+        None => return rebuild(),
+    };
+    // The ON must be exactly `lqual.c1 = rqual.c2` (either order), with
+    // explicit qualification on both sides (an unqualified column could
+    // resolve to either side; staying conservative).
+    let inner_col = match on_expr {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: a,
+            right: b,
+        } => match (&**a, &**b) {
+            (
+                Expr::Column {
+                    table: Some(t1),
+                    name: _,
+                },
+                Expr::Column {
+                    table: Some(t2),
+                    name: n2,
+                },
+            ) if t1 == &lqual && t2 == &rqual => n2,
+            (
+                Expr::Column {
+                    table: Some(t1),
+                    name: n1,
+                },
+                Expr::Column {
+                    table: Some(t2),
+                    name: _,
+                },
+            ) if t1 == &rqual && t2 == &lqual => n1,
+            _ => return rebuild(),
+        },
+        _ => return rebuild(),
+    };
+    // The inner join column must be unique: at most one R row per L row,
+    // so the join can neither duplicate nor (as a LEFT join) filter L.
+    if !is_unique_col(eng, rname.as_str(), inner_col, snap, own, session) {
+        return rebuild();
+    }
+    // Nothing else may reference the inner range: not the SELECT list,
+    // WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT ON, FOR UPDATE OF, nor
+    // any other join's ON clause. (This join's own ON is the single
+    // equality above.) Any unqualified column reference is grounds to
+    // keep the join — it could resolve to the inner range.
+    let mut quals = HashSet::new();
+    let mut unqualified = false;
+    // (Helper closure inlined per call site: `add_expr` would borrow
+    // `quals`/`unqualified` mutably and conflict with the direct inserts.)
+    for it in &stmt.items {
+        match it {
+            // `SELECT *` needs every range's columns: never removable.
+            SelectItem::All => return rebuild(),
+            SelectItem::AllOf(q) => {
+                quals.insert(q.clone());
+            }
+            SelectItem::Expr { expr, .. } => {
+                let mut refs = Vec::new();
+                collect_col_refs(expr, &mut refs);
+                for (t, _) in refs {
+                    match t {
+                        Some(t) => {
+                            quals.insert(t);
+                        }
+                        None => unqualified = true,
+                    }
+                }
+            }
+        }
+    }
+    let add_expr = |e: &Expr, quals: &mut HashSet<String>, unqualified: &mut bool| {
+        let mut refs = Vec::new();
+        collect_col_refs(e, &mut refs);
+        for (t, _) in refs {
+            match t {
+                Some(t) => {
+                    quals.insert(t);
+                }
+                None => *unqualified = true,
+            }
+        }
+    };
+    if let Some(w) = &stmt.where_ {
+        add_expr(w, &mut quals, &mut unqualified);
+    }
+    for gs in &stmt.group_by {
+        for g in gs {
+            add_expr(g, &mut quals, &mut unqualified);
+        }
+    }
+    if let Some(h) = &stmt.having {
+        add_expr(h, &mut quals, &mut unqualified);
+    }
+    for o in &stmt.order_by {
+        add_expr(&o.expr, &mut quals, &mut unqualified);
+    }
+    for d in &stmt.distinct_on {
+        add_expr(d, &mut quals, &mut unqualified);
+    }
+    for f in &stmt.for_update_of {
+        quals.insert(f.clone());
+    }
+    // The inner range must be referenced nowhere else. Non-FROM
+    // expressions were collected above; for ON clauses, the qualifier must
+    // occur in exactly one ON — this join's own (checked structurally
+    // above to be precisely `lqual.c1 = rqual.c2`, so the single
+    // occurrence is the expected one). Any other ON referencing it blocks
+    // removal, otherwise the rewritten tree would dangle.
+    if unqualified || quals.contains(&rqual) || on_counts.get(&rqual).unwrap_or(&0) != &1 {
+        return rebuild();
+    }
+    // Safe: the join contributes nothing. Return the outer side alone.
+    (*left).clone()
+}
+
 fn plan_from_item(
     eng: &Engine,
     item: &FromItem,
@@ -11486,6 +11778,27 @@ fn plan_select(
     let mut eff: Vec<CteDef> = outer_ctes.to_vec();
     eff.extend(stmt.with.iter().cloned());
     let ctes: &[CteDef] = &eff;
+    // v1.45: PG `remove_useless_joins` (simple LEFT JOIN case) as a
+    // preprocess rewrite of the FROM tree, mirroring PG's planner ordering:
+    // before name/type context construction and WHERE distribution below.
+    // The reference checks run against the original statement.
+    let stmt_owned;
+    let stmt: &SelectStmt = {
+        let rewritten: Vec<FromItem> = stmt
+            .from
+            .iter()
+            .map(|it| remove_useless_joins(eng, it, stmt, snap, own, session))
+            .collect();
+        if rewritten.iter().zip(stmt.from.iter()).all(|(a, b)| a == b) {
+            stmt
+        } else {
+            stmt_owned = SelectStmt {
+                from: rewritten,
+                ..stmt.clone()
+            };
+            &stmt_owned
+        }
+    };
     // v1.08: PG-text name/type context for this query level, plus the
     // WHERE clause distributed over the FROM items (per-item slices and
     // the join-level remainder).
@@ -63934,3 +64247,148 @@ mod v140_syscols_returning_tests {
     }
 }
 
+
+#[cfg(test)]
+mod v145_join_removal_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap())
+                .collect(),
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for ddl in [
+            "CREATE TABLE a (id int PRIMARY KEY, b_id int)",
+            "CREATE TABLE b (id int PRIMARY KEY, c_id int)",
+            "CREATE TABLE c (id int PRIMARY KEY)",
+            "CREATE TABLE np (id int, v int)",
+        ] {
+            run(eng, ddl).unwrap();
+        }
+    }
+
+    #[test]
+    fn simple_useless_left_join_removed() {
+        // v1.45: the corpus cases — PG plans these as a bare Seq Scan.
+        let mut eng = engine();
+        setup(&mut eng);
+        for sql in [
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id",
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b AS x ON a.b_id = x.id",
+            // Reversed equality order is fine too.
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON b.id = a.b_id",
+        ] {
+            let lines = plan_lines(&mut eng, sql);
+            assert_eq!(lines, vec!["Seq Scan on a".to_string()], "{sql}");
+        }
+        // Chained join whose outer ON references the inner range: the inner
+        // join must be kept (removing it would dangle b.c_id). Conservative
+        // and sound; PG removes the c-join here, which is future work.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON b.c_id = c.id",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+    }
+
+    #[test]
+    fn join_kept_when_needed() {
+        // v1.45: every doubtful case keeps the join (PG does too).
+        let mut eng = engine();
+        setup(&mut eng);
+        // SELECT * needs b's columns.
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM a LEFT JOIN b ON a.b_id = b.id");
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // WHERE references the inner range.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE b.c_id > 0",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // Join column not unique.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN np ON a.b_id = np.id",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // INNER join is never removed.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a JOIN b ON a.b_id = b.id",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // Unqualified column reference: conservative keep.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE b_id > 0",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        // SELECT list references the inner range.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.*, b.c_id FROM a LEFT JOIN b ON a.b_id = b.id",
+        );
+        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+    }
+
+    #[test]
+    fn removal_preserves_outer_filter() {
+        // v1.45: removing the join must not drop the outer WHERE.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE a.b_id > 0",
+        );
+        assert_eq!(
+            lines,
+            vec!["Seq Scan on a".to_string(), "  Filter: (b_id > 0)".to_string()],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn non_text_format_honestly_rejected() {
+        // v1.45: we render only text; PG19 accepts the syntax, so the
+        // failure must be a feature 0A000, not a 42601.
+        let mut eng = engine();
+        let err = run(&mut eng, "EXPLAIN (FORMAT JSON) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "0A000");
+        let err = run(&mut eng, "EXPLAIN (FORMAT XML) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "0A000");
+        // TEXT still works.
+        let lines = plan_lines(&mut eng, "EXPLAIN (FORMAT TEXT, COSTS OFF) SELECT 1");
+        assert!(!lines.is_empty());
+    }
+}

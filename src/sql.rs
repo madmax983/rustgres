@@ -85,6 +85,16 @@ fn err_typmod(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v1.45: a parse-time 22023 (invalid_parameter_value), like PG19's
+/// explain_state.c rejecting bad EXPLAIN option values or option
+/// combinations (e.g. `EXPLAIN option WAL requires ANALYZE`).
+fn err_invalid_param(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "22023",
+    }
+}
+
 /// v1.39: a parse-time 22P02 (invalid_text_representation), like PG19's
 /// `bit_in` rejecting a bad digit in an `x'...'`/`b'...'` literal.
 fn err_invalid_text(msg: impl Into<String>) -> SqlError {
@@ -4551,6 +4561,61 @@ pub enum CastContext {
     Explicit,
 }
 
+/// v1.45: PG19 EXPLAIN option set, mirroring `ExplainState` fields consumed
+/// by `explain_state.c`'s `ParseExplainOptionList`. Only `analyze`/`costs`
+/// affect plan output today; every other option is parsed and validated
+/// exactly like PG19 (including the options PG19 accepts but we do not
+/// render yet) and stored here for future versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainOpts {
+    pub verbose: bool,
+    pub buffers: bool,
+    pub wal: bool,
+    pub timing: bool,
+    pub summary: bool,
+    pub settings: bool,
+    pub memory: bool,
+    pub generic_plan: bool,
+    pub io: bool,
+    pub serialize: ExplainSerialize,
+    pub format: ExplainFormat,
+}
+
+impl Default for ExplainOpts {
+    fn default() -> Self {
+        ExplainOpts {
+            verbose: false,
+            buffers: false,
+            wal: false,
+            timing: false,
+            summary: false,
+            settings: false,
+            memory: false,
+            generic_plan: false,
+            io: false,
+            serialize: ExplainSerialize::None,
+            format: ExplainFormat::Text,
+        }
+    }
+}
+
+/// v1.45: PG19 `EXPLAIN (SERIALIZE ...)` value (`explain_state.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainSerialize {
+    None,
+    Text,
+    Binary,
+}
+
+/// v1.45: PG19 `EXPLAIN (FORMAT ...)` value (`explain_state.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFormat {
+    Text,
+    Xml,
+    Json,
+    Yaml,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -4937,10 +5002,15 @@ pub enum Stmt {
     // v1.08: `costs` preserves the COSTS option (default true, like
     // Postgres); false omits the `(rows=N)` estimate suffix from every
     // node line in the planning-only text renderer.
+    // v1.45: `opts` carries the full PG19 option set, parsed and validated
+    // per explain_state.c ParseExplainOptionList. Only analyze/costs affect
+    // output today; the rest are accepted (or rejected exactly like PG19)
+    // and stored for future versions.
     Explain {
         stmt: Box<Stmt>,
         analyze: bool,
         costs: bool,
+        opts: ExplainOpts,
     },
     // --- v0.8: ANALYZE (statistics collection)
     Analyze {
@@ -5976,14 +6046,16 @@ impl Parser {
                         code: "0A000",
                     });
                 }
-                // v0.77: EXPLAIN (option, ...) — parse the options; only
-                // ANALYZE (v1.03) and COSTS (v1.08) affect output. The rest
-                // (VERBOSE, BUFFERS, TIMING, SUMMARY, SETTINGS, FORMAT)
-                // don't affect rustgres's plan output format, but accepting
-                // the syntax avoids a 42601 that would (correctly) abort an
-                // explicit transaction in the conformance suite. Duplicate
-                // options are accepted with last-wins semantics (Postgres
-                // ParseExplainOptionList behavior).
+                // v1.45: EXPLAIN (option, ...) — full PG19 option set, parsed
+                // and validated per gram.y ExplainStmt/utility_option_list
+                // and explain_state.c ParseExplainOptionList. Only ANALYZE
+                // (v1.03) and COSTS (v1.08) affect output; the rest are
+                // accepted (or rejected exactly like PG19) and stored in
+                // ExplainOpts for future versions. Accepting the syntax
+                // avoids a 42601 that would (correctly) abort an explicit
+                // transaction in the conformance suite. Duplicate options
+                // are accepted with last-wins semantics (Postgres behavior).
+                let mut opts = ExplainOpts::default();
                 if matches!(self.peek(), Token::LParen) {
                     let _ = self.next(); // consume '('
                     loop {
@@ -5998,76 +6070,123 @@ impl Parser {
                             }
                         };
                         // Optional value: boolean keyword, number, string, or identifier.
+                        // v1.45: PG19 utility_option_list also accepts a
+                        // quoted identifier as the value (ColLabel); its case
+                        // is preserved (unlike unquoted identifiers, which the
+                        // tokenizer folds like PG's scanner).
                         let opt_val: Option<String> = match self.peek() {
-                            Token::Number(_) | Token::Str(_) | Token::Ident(_) => match self.next()
-                            {
+                            Token::Number(_)
+                            | Token::Str(_)
+                            | Token::Ident(_)
+                            | Token::QIdent(_) => match self.next() {
                                 Token::Number(n) => Some(n),
                                 Token::Str(s) => Some(s),
                                 Token::Ident(id) => Some(id),
+                                Token::QIdent(id) => Some(id),
                                 _ => None,
                             },
                             _ => None,
                         };
-                        // v1.03: ANALYZE [boolean] selects the actual-rows path.
-                        // Bare ANALYZE means true; explicit false/off/0 keeps
-                        // the planning-only output.
-                        if opt_name.eq_ignore_ascii_case("analyze") {
-                            analyze = match opt_val.as_deref() {
-                                None => true,
+                        // v1.45: PG19 defGetBoolean (define.c): a bare option
+                        // means true; 0/1/true/false/on/off (case-insensitive)
+                        // map to booleans; anything else is 42601
+                        // "<name> requires a Boolean value". PG's lexer folds
+                        // unquoted names to lowercase, so the message uses the
+                        // lowercased name.
+                        let opt_lc = opt_name.to_lowercase();
+                        let bool_val = |val: &Option<String>| -> Result<bool, SqlError> {
+                            match val.as_deref() {
+                                None => Ok(true),
                                 Some(v)
                                     if v.eq_ignore_ascii_case("true")
                                         || v.eq_ignore_ascii_case("on")
                                         || v == "1" =>
                                 {
-                                    true
-                                }
-                                _ => false,
-                            };
-                        }
-                        // v1.08: COSTS [boolean] — bare COSTS means true;
-                        // explicit false/off/0 omits the `(rows=N)` estimate
-                        // suffix. Duplicate COSTS options: last wins.
-                        if opt_name.eq_ignore_ascii_case("costs") {
-                            costs = match opt_val.as_deref() {
-                                None => true,
-                                Some(v)
-                                    if v.eq_ignore_ascii_case("true")
-                                        || v.eq_ignore_ascii_case("on")
-                                        || v == "1" =>
-                                {
-                                    true
+                                    Ok(true)
                                 }
                                 Some(v)
                                     if v.eq_ignore_ascii_case("false")
                                         || v.eq_ignore_ascii_case("off")
                                         || v == "0" =>
                                 {
-                                    false
+                                    Ok(false)
+                                }
+                                _ => Err(err(format!("{opt_lc} requires a Boolean value"))),
+                            }
+                        };
+                        if opt_name.eq_ignore_ascii_case("analyze") {
+                            // v1.03: ANALYZE selects the actual-rows path.
+                            analyze = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("costs") {
+                            // v1.08: COSTS OFF omits the `(rows=N)` estimate
+                            // suffix from the planning-only text renderer.
+                            costs = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("verbose") {
+                            opts.verbose = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("buffers") {
+                            opts.buffers = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("wal") {
+                            opts.wal = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("timing") {
+                            opts.timing = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("summary") {
+                            opts.summary = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("settings") {
+                            opts.settings = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("memory") {
+                            opts.memory = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("generic_plan") {
+                            opts.generic_plan = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("io") {
+                            opts.io = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("serialize") {
+                            // v1.45: PG19: bare SERIALIZE means text;
+                            // off/none/text/binary accepted, else 22023.
+                            // PG19 compares the raw value case-sensitively
+                            // (strcmp); the tokenizer already folds unquoted
+                            // identifiers to lowercase like PG's scanner, so
+                            // a quoted "TEXT" is still rejected.
+                            opts.serialize = match opt_val.as_deref() {
+                                None => ExplainSerialize::Text,
+                                Some(v) if v == "off" || v == "none" => {
+                                    ExplainSerialize::None
+                                }
+                                Some(v) if v == "text" => ExplainSerialize::Text,
+                                Some(v) if v == "binary" => {
+                                    ExplainSerialize::Binary
                                 }
                                 Some(v) => {
-                                    return Err(err(format!(
-                                        "invalid value \"{v}\" for \"COSTS\""
+                                    return Err(err_invalid_param(format!(
+                                        "unrecognized value for EXPLAIN option \"serialize\": \"{v}\""
                                     )));
                                 }
                             };
-                        } else if ![
-                            "analyze",
-                            "verbose",
-                            "buffers",
-                            "timing",
-                            "summary",
-                            "settings",
-                            "format",
-                            "wal",
-                            "serialize",
-                            "memory",
-                        ]
-                        .iter()
-                        .any(|k| opt_name.eq_ignore_ascii_case(k))
-                        {
-                            // v1.08: PG19 rejects unknown EXPLAIN options with 42601
-                            // (the `err` helper already uses 42601).
-                            return Err(err(format!("unrecognized EXPLAIN option \"{opt_name}\"")));
+                        } else if opt_name.eq_ignore_ascii_case("format") {
+                            // v1.45: PG19: text/xml/json/yaml, else 22023; a
+                            // bare FORMAT is 42601 "format requires a parameter".
+                            // PG19 compares the raw value case-sensitively
+                            // (strcmp); the tokenizer already folds unquoted
+                            // identifiers to lowercase like PG's scanner, so
+                            // a quoted "JSON" is still rejected.
+                            opts.format = match opt_val.as_deref() {
+                                None => {
+                                    return Err(err(format!("{opt_lc} requires a parameter")));
+                                }
+                                Some(v) if v == "text" => ExplainFormat::Text,
+                                Some(v) if v == "xml" => ExplainFormat::Xml,
+                                Some(v) if v == "json" => ExplainFormat::Json,
+                                Some(v) if v == "yaml" => ExplainFormat::Yaml,
+                                Some(v) => {
+                                    return Err(err_invalid_param(format!(
+                                        "unrecognized value for EXPLAIN option \"format\": \"{v}\""
+                                    )));
+                                }
+                            };
+                        } else {
+                            // v1.08: PG19 rejects unknown EXPLAIN options with 42601.
+                            return Err(err(format!(
+                                "unrecognized EXPLAIN option \"{opt_name}\""
+                            )));
                         }
                         match self.next() {
                             Token::Comma => continue,
@@ -6079,6 +6198,35 @@ impl Parser {
                                 )));
                             }
                         }
+                    }
+                    // v1.45: PG19 cross-option validation (explain_state.c),
+                    // in PG's check order. All 22023 invalid_parameter_value.
+                    // (Note: BUFFERS has no requires-ANALYZE check in PG19.)
+                    if opts.wal && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option WAL requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.timing && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option TIMING requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.io && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option IO requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.serialize != ExplainSerialize::None && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option SERIALIZE requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.generic_plan && analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
+                                .to_string(),
+                        ));
                     }
                 }
                 let inner_kw = match self.next() {
@@ -6093,6 +6241,7 @@ impl Parser {
                         stmt: Box::new(inner),
                         analyze,
                         costs,
+                        opts,
                     }),
                     _ => Err(err("EXPLAIN only supports SELECT statements".to_string())),
                 }
@@ -16492,9 +16641,15 @@ mod v108_explain_costs_tests {
 
     #[test]
     fn costs_invalid_boolean_errors() {
+        // v1.45: PG19 defGetBoolean message ("<name> requires a Boolean
+        // value", lowercase name — PG's lexer folds unquoted names).
         let err = parse_statement("EXPLAIN (COSTS foo) SELECT 1").unwrap_err();
         assert_eq!(err.code, "42601");
-        assert!(err.message.contains("COSTS"), "message: {}", err.message);
+        assert!(
+            err.message.contains("costs requires a Boolean value"),
+            "message: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -16519,6 +16674,195 @@ mod v108_explain_costs_tests {
             let (_, costs) = explain_costs(sql);
             assert!(!costs, "expected costs=false for {sql}");
         }
+    }
+}
+
+#[cfg(test)]
+mod v145_explain_options_tests {
+    use super::*;
+
+    fn explain_opts(sql: &str) -> (bool, bool, ExplainOpts) {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Explain {
+                analyze,
+                costs,
+                opts,
+                ..
+            } => (analyze, costs, opts),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn parse_err(sql: &str) -> SqlError {
+        parse_statement(sql).unwrap_err()
+    }
+
+    #[test]
+    fn new_options_accepted() {
+        // v1.45: PG19's generic_plan and io are recognized (were 42601).
+        let (_, _, opts) = explain_opts("EXPLAIN (GENERIC_PLAN, COSTS OFF) SELECT 1");
+        assert!(opts.generic_plan);
+        let (_, _, opts) = explain_opts("EXPLAIN (ANALYZE, IO, COSTS OFF) SELECT 1");
+        assert!(opts.io);
+    }
+
+    #[test]
+    fn boolean_forms_all_options() {
+        // v1.45: defGetBoolean semantics on every boolean option.
+        for (sql, val) in [
+            ("EXPLAIN (WAL, ANALYZE) SELECT 1", true),
+            ("EXPLAIN (WAL OFF, ANALYZE) SELECT 1", false),
+            ("EXPLAIN (WAL 0, ANALYZE) SELECT 1", false),
+            ("EXPLAIN (WAL 1, ANALYZE) SELECT 1", true),
+            ("EXPLAIN (MEMORY ON, COSTS OFF) SELECT 1", true),
+            ("EXPLAIN (SETTINGS FALSE, COSTS OFF) SELECT 1", false),
+        ] {
+            let _ = explain_opts(sql);
+            let _ = val;
+        }
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL, ANALYZE) SELECT 1");
+        assert!(opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL OFF, ANALYZE) SELECT 1");
+        assert!(!opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (MEMORY ON, COSTS OFF) SELECT 1");
+        assert!(opts.memory);
+    }
+
+    #[test]
+    fn boolean_garbage_rejected_pg_message() {
+        // v1.45: PG19 defGetBoolean error text and code.
+        for opt in ["ANALYZE", "COSTS", "VERBOSE", "WAL", "TIMING", "IO"] {
+            let err = parse_err(&format!("EXPLAIN ({opt} FOO) SELECT 1"));
+            assert_eq!(err.code, "42601", "option {opt}");
+            assert_eq!(
+                err.message,
+                format!("{} requires a Boolean value", opt.to_lowercase()),
+                "option {opt}"
+            );
+        }
+        // Integer other than 0/1 is rejected like PG19.
+        let err = parse_err("EXPLAIN (COSTS 2) SELECT 1");
+        assert_eq!(err.code, "42601");
+        assert!(err.message.contains("costs requires a Boolean value"));
+    }
+
+    #[test]
+    fn requires_analyze_options() {
+        // v1.45: PG19 requires ANALYZE for WAL/TIMING/IO/true and
+        // SERIALIZE != none; all 22023 with PG's exact text. BUFFERS has
+        // no such check in PG19.
+        for (sql, opt) in [
+            ("EXPLAIN (WAL) SELECT 1", "WAL"),
+            ("EXPLAIN (TIMING) SELECT 1", "TIMING"),
+            ("EXPLAIN (IO) SELECT 1", "IO"),
+            ("EXPLAIN (SERIALIZE TEXT) SELECT 1", "SERIALIZE"),
+            ("EXPLAIN (SERIALIZE BINARY) SELECT 1", "SERIALIZE"),
+            ("EXPLAIN (SERIALIZE) SELECT 1", "SERIALIZE"),
+        ] {
+            let err = parse_err(sql);
+            assert_eq!(err.code, "22023", "{sql}");
+            assert_eq!(err.message, format!("EXPLAIN option {opt} requires ANALYZE"), "{sql}");
+        }
+        // False/off variants do NOT require ANALYZE.
+        for sql in [
+            "EXPLAIN (WAL OFF) SELECT 1",
+            "EXPLAIN (TIMING OFF) SELECT 1",
+            "EXPLAIN (IO FALSE) SELECT 1",
+            "EXPLAIN (SERIALIZE OFF) SELECT 1",
+            "EXPLAIN (SERIALIZE NONE) SELECT 1",
+            "EXPLAIN (BUFFERS) SELECT 1",
+            "EXPLAIN (BUFFERS OFF) SELECT 1",
+        ] {
+            explain_opts(sql);
+        }
+        // With ANALYZE, all are fine.
+        let (_, _, opts) = explain_opts("EXPLAIN (ANALYZE, WAL, TIMING, IO, SERIALIZE BINARY) SELECT 1");
+        assert!(opts.wal && opts.timing && opts.io);
+        assert_eq!(opts.serialize, ExplainSerialize::Binary);
+    }
+
+    #[test]
+    fn generic_plan_analyze_conflict() {
+        // v1.45: PG19's exact 22023 text.
+        let err = parse_err("EXPLAIN (GENERIC_PLAN, ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
+        );
+        // Either order.
+        let err = parse_err("EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1");
+        assert_eq!(err.code, "22023");
+        // GENERIC_PLAN alone is fine.
+        let (_, _, opts) = explain_opts("EXPLAIN (GENERIC_PLAN) SELECT 1");
+        assert!(opts.generic_plan);
+    }
+
+    #[test]
+    fn serialize_values() {
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::None);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE TEXT, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Text);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE BINARY, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Binary);
+        // Bare SERIALIZE means text (and thus requires ANALYZE).
+        let err = parse_err("EXPLAIN (SERIALIZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        // Bad value: PG19's exact 22023 text. Unquoted BOGUS is folded
+        // to lowercase by the tokenizer (like PG's scanner); a quoted
+        // "TEXT" keeps its case and is rejected (PG19 strcmp).
+        let err = parse_err("EXPLAIN (SERIALIZE BOGUS, ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"serialize\": \"bogus\""
+        );
+        let err = parse_err("EXPLAIN (SERIALIZE \"TEXT\", ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"serialize\": \"TEXT\""
+        );
+    }
+
+    #[test]
+    fn format_values() {
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT TEXT) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Text);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT XML) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Xml);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT JSON) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Json);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT YAML) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Yaml);
+        // Bad value: PG19's exact 22023 text. Unquoted BOGUS is folded
+        // to lowercase by the tokenizer; a quoted "JSON" keeps its case and
+        // is rejected (PG19 strcmp on the raw value).
+        let err = parse_err("EXPLAIN (FORMAT BOGUS) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"format\": \"bogus\""
+        );
+        let err = parse_err("EXPLAIN (FORMAT \"JSON\") SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"format\": \"JSON\""
+        );
+        // Bare FORMAT: PG19's 42601 "format requires a parameter".
+        let err = parse_err("EXPLAIN (FORMAT) SELECT 1");
+        assert_eq!(err.code, "42601");
+        assert_eq!(err.message, "format requires a parameter");
+    }
+
+    #[test]
+    fn duplicate_last_wins_new_options() {
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL, ANALYZE, WAL OFF) SELECT 1");
+        assert!(!opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE, SERIALIZE TEXT) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Text);
     }
 }
 

@@ -906,6 +906,16 @@ EXPECTED_PASS_OVERRIDES = [
     (r"(?is)\bwidth_bucket\s*\(\s*oper\s*,\s*low\s*,\s*high\s*,\s*cnt\s*\)"
      r".*\b1\.797e\+308::float8",
      "v1.25: width_bucket float8 overload supported"),
+    # v1.45: useless-LEFT-JOIN removal (simple case) — the planner now
+    # drops `L LEFT JOIN R ON L.c = R.id` when R.id is unique and R is
+    # unreferenced, so these EXPLAIN (COSTS OFF) statements genuinely pass.
+    # Narrowly scoped to the three corpus statements verified against the
+    # PG19 .out oracles (join.sql "test join removal" block + partitioned
+    # table case); the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+(a|b)\.\*\s+from\s+(a|b)\s+left\s+join\s+"
+     r"(b|c|parted_b)(\s+pb)?\s+on\s+\w+\.\w+\s*=\s*\w+\.id\s*;?\s*$",
+     "v1.45: simple useless LEFT JOIN removed"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
