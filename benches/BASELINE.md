@@ -2,6 +2,99 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compile_opts` recompiles every regexp pattern from scratch on every row — fix — 2026-10-01
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/regex.rs`: `compile_opts` (and `compile`, which forwards to it) now
+checks a thread-local cache, keyed by `(pattern text, case_insensitive,
+newline_sensitive, expanded)`, before parsing or codegen-ing anything. A
+hit returns an `Rc<Compiled>` clone (one refcount bump) instead of
+re-running the parser and compiler; a miss compiles exactly as before and
+inserts the result into the cache. The cache is bounded at 64 entries
+(matching the size PostgreSQL itself uses for its own regex cache,
+`backend/utils/adt/regexp.c`'s `MAX_CACHED_RES`) and clears itself
+outright rather than evicting LRU-style when that cap is hit, so a
+connection that compiles an unbounded number of distinct patterns (e.g.
+a pattern built per-row from a column value) cannot grow the cache
+without limit — it just stops benefiting from it, falling back to
+recompiling every time exactly as before today. Only successful compiles
+are cached; an invalid pattern still reports the same error on every
+call.
+
+`compile`/`compile_opts` return `Result<Rc<Compiled>, String>` instead of
+`Result<Compiled, String>`. Every one of the 14 call sites across
+`src/exec.rs` calls only `&self` methods on the result (`is_match`,
+`find_at`, `group_count`, …), and the 3 helper functions that take
+`re: &crate::regex::Compiled` as a parameter still compile unchanged —
+`&Rc<Compiled>` coerces to `&Compiled` at the call site via `Deref`. No
+other code needed to change.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_regexp.py --rows 2000 --count 20
+--timeout 600`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, two runs each,
+before and after, to confirm determinism):
+
+| run | Ir |
+|---|---|
+| before, run 1 | 9,465,290,559 |
+| before, run 2 | 9,465,341,834 |
+| after, run 1 | 8,470,038,003 |
+| after, run 2 | 8,470,014,807 |
+
+Before-run pair agrees to within 0.00054%; after-run pair agrees to
+within 0.00027% — both comfortably inside this repo's established
+callgrind-determinism band. Using the two-run averages (9,465,316,196.5
+before, 8,470,026,405 after): **-10.52%**, well past the ≥5%-of-profile
+floor.
+
+DHAT (same workload, one run each before/after — see the baseline entry
+below for how the 37.6%-of-bytes/33.2%-of-blocks share was attributed to
+this exact code path before the fix):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 361,987,577 | 226,830,197 | **-37.34%** |
+| Total blocks | 4,097,966 | 2,857,994 | **-30.26%** |
+
+The byte/block reduction (135,157,380 bytes, 1,239,972 blocks) tracks
+the baseline entry's attributed compile-path cost (136,000,000 bytes,
+1,360,000 blocks) closely — the small gap is the cache's own bookkeeping
+allocations (the `HashMap` entries and the handful of one-time compiles
+that still happen on a cache miss, one per distinct `(pattern, opts)`
+pair instead of once per row). Both the Ir floor (≥5%) and the DHAT
+floor (≥10% bytes or blocks) clear independently and by a wide margin.
+
+`cargo test --all-features`: 686/686 passed, unchanged. `cargo fmt --all
+-- --check`: clean. `cargo clippy --all-targets --all-features -- -D
+warnings`: 501 pre-existing errors on both the pre-change and
+post-change tree (confirmed via `git stash`, compared with a
+line-order-independent sorted diff since raw error counts/order are not
+stable across separate `cargo clippy` invocations on this tree) — the
+same toolchain/lint-version mismatch noted in every prior Bolt round in
+this file; zero new errors/warnings from this diff (a type-complexity
+lint on the cache's `HashMap` key was fixed by factoring it into a
+`type RegexCacheKey` alias, per clippy's own suggestion, before this
+count was taken). Regexp-specific protocol suites
+`tests/protocol_test19.py` (27/27), `tests/protocol_test24.py` (89/89),
+`tests/protocol_test31.py` (22/22), `tests/protocol_test32.py` (27/27),
+`tests/protocol_test34.py` (12/12), `tests/protocol_test38.py` (27/27),
+and `tests/protocol_test_v103_plpgsql_loops.py` (20/20, which exercises
+`regexp_replace` inside a plpgsql loop body) all pass unchanged.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.regexcache-{base,after}-2026-10-01`.
+
+**Reproduce**: apply the diff above to `src/regex.rs`, `cargo build`,
+then repeat the Callgrind/DHAT commands in the baseline entry's
+"Reproduce" section on both the pristine and patched trees.
+
 ## Bolt: `compile_opts` recompiles every regexp pattern from scratch on every row — baseline — 2026-10-01
 
 **Why this workload**: v1.26-v1.39 added ten new versions' worth of
