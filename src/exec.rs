@@ -756,7 +756,8 @@ fn execute_inner(
             if *analyze {
                 exec_explain_analyze(eng, ctx, stmt, *costs)
             } else {
-                exec_explain(eng, ctx, stmt, *costs)
+                // v1.46: thread VERBOSE through for `Output:` rendering.
+                exec_explain(eng, ctx, stmt, *costs, opts.verbose)
             }
         }
         Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
@@ -10918,6 +10919,9 @@ enum PlanNode {
     Result {
         rows: u64,
         filter: Option<String>,
+        // v1.46: VERBOSE `Output:` targetlist entries (PG19
+        // `show_plan_tlist`). Empty == PG's NIL == no Output line.
+        output: Vec<String>,
     },
     SeqScan {
         table: String,
@@ -10925,6 +10929,8 @@ enum PlanNode {
         alias: Option<String>,
         filter: Option<String>,
         rows: u64,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     IndexScan {
         table: String,
@@ -10934,6 +10940,8 @@ enum PlanNode {
         cond: String,
         filter: Option<String>,
         rows: u64,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     IndexOrderScan {
         table: String,
@@ -10942,6 +10950,8 @@ enum PlanNode {
         index: String,
         order: String,
         rows: u64,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     NestedLoop {
         filter: Option<String>,
@@ -10950,33 +10960,47 @@ enum PlanNode {
         rows: u64,
         outer: Box<PlanNode>,
         inner: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     Aggregate {
         rows: u64,
         child: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     Unique {
         rows: u64,
         child: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     Sort {
         keys: String,
         rows: u64,
         child: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     Limit {
         n: String,
         rows: u64,
         child: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     SubqueryScan {
         alias: String,
         rows: u64,
         child: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
     /// v0.14: `(VALUES ...)` table source.
     Values {
         rows: u64,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
     },
 }
 
@@ -11015,6 +11039,41 @@ impl PlanNode {
     fn set_join_filter(&mut self, f: Option<String>) {
         if let PlanNode::NestedLoop { join_filter, .. } = self {
             *join_filter = f;
+        }
+    }
+
+    /// v1.46: VERBOSE `Output:` targetlist entries (empty == PG's NIL ==
+    /// no Output line is rendered).
+    fn output(&self) -> &[String] {
+        match self {
+            PlanNode::Result { output, .. }
+            | PlanNode::SeqScan { output, .. }
+            | PlanNode::IndexScan { output, .. }
+            | PlanNode::IndexOrderScan { output, .. }
+            | PlanNode::NestedLoop { output, .. }
+            | PlanNode::Aggregate { output, .. }
+            | PlanNode::Unique { output, .. }
+            | PlanNode::Sort { output, .. }
+            | PlanNode::Limit { output, .. }
+            | PlanNode::SubqueryScan { output, .. }
+            | PlanNode::Values { output, .. } => output,
+        }
+    }
+
+    /// v1.46: replace the VERBOSE `Output:` entries.
+    fn set_output(&mut self, o: Vec<String>) {
+        match self {
+            PlanNode::Result { output, .. }
+            | PlanNode::SeqScan { output, .. }
+            | PlanNode::IndexScan { output, .. }
+            | PlanNode::IndexOrderScan { output, .. }
+            | PlanNode::NestedLoop { output, .. }
+            | PlanNode::Aggregate { output, .. }
+            | PlanNode::Unique { output, .. }
+            | PlanNode::Sort { output, .. }
+            | PlanNode::Limit { output, .. }
+            | PlanNode::SubqueryScan { output, .. }
+            | PlanNode::Values { output, .. } => *output = o,
         }
     }
 }
@@ -11133,7 +11192,11 @@ fn plan_cte_body(
             } else {
                 l.rows().max(r.rows())
             };
-            Ok(PlanNode::Values { rows })
+            Ok(PlanNode::Values {
+                rows,
+                // v1.46: VERBOSE `Output:` (union CTE bodies are nominal).
+                output: Vec::new(),
+            })
         }
         // v1.39: EXPLAIN of a data-modifying CTE is not supported
         // (fail-closed 0A000; PG would show the ModifyTable plan).
@@ -11441,7 +11504,26 @@ fn plan_from_item(
     // legacy Debug filter text. When `Some`, `where_` is the item's own
     // conjunct slice (already distributed by `pg_split_where`).
     pctx: Option<&PgPlanCtx>,
+    // v1.46: the query level being planned — for VERBOSE `Output:`
+    // targetlist computation (select list, GROUP BY/HAVING/ORDER BY,
+    // FROM for the `useprefix` rule).
+    stmt: &SelectStmt,
 ) -> Result<PlanNode, ExecError> {
+    // v1.46: VERBOSE `Output:` entries for a base-table scan of `name`
+    // / `alias`. `index_cols` are the index key columns (index scans
+    // only). Empty (not `None`) when `pctx` is `None` (legacy mode).
+    let scan_output = |name: &str,
+                       alias: Option<&str>,
+                       table_cols: &[String],
+                       where_: Option<&Expr>,
+                       index_cols: &[String]|
+     -> Vec<String> {
+        match pctx {
+            Some(px) => pg_scan_output(stmt, name, alias, table_cols, where_, index_cols, px)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
     match item {
         FromItem::Table { name, alias, .. } => {
             // v0.78: CTEs shadow everything (like Postgres and the
@@ -11455,15 +11537,34 @@ fn plan_from_item(
                 // would recurse forever, so use a nominal estimate (the
                 // executor iterates to a fixpoint instead).
                 let child = if cte.recursive {
-                    PlanNode::Values { rows: 100 }
+                    PlanNode::Values {
+                        rows: 100,
+                        output: Vec::new(),
+                    }
                 } else {
                     plan_cte_body(eng, cte, &ctes[..pos], snap, own, session, pctx.is_some())?
                 };
                 let rows = child.rows();
+                // v1.46: VERBOSE `Output:` — the CTE's output columns
+                // qualified by the scan alias.
+                let output = match pctx {
+                    Some(_) => pg_cte_col_names(eng, cte, &ctes[..pos], snap, own, session)
+                        .map(|names| {
+                            names
+                                .into_iter()
+                                .map(|n| {
+                                    format!("{}.{}", pg_quote_ident(&qual), pg_quote_ident(&n))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 return Ok(PlanNode::SubqueryScan {
                     alias: qual,
                     rows,
                     child: Box::new(child),
+                    output,
                 });
             }
             // v0.9: information_schema virtual tables plan as scans.
@@ -11476,6 +11577,9 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows: 100,
+                    // v1.46: VERBOSE `Output:` (virtual-table columns are
+                    // unknown: refs render, `*` omits the line).
+                    output: scan_output(name, None, &[], where_, &[]),
                 });
             }
             // v0.9: views plan as a plain scan; build_source expands the
@@ -11486,6 +11590,9 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows: 1000,
+                    // v1.46: VERBOSE `Output:` (view columns are not
+                    // expanded: refs render, `*` omits the line).
+                    output: scan_output(name, None, &[], where_, &[]),
                 });
             }
             if name == "pg_stats" && eng.db.find_table(name, snap, &[own], session).is_none() {
@@ -11495,6 +11602,8 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output("pg_stats", None, &[], where_, &[]),
                 });
             }
             // v0.37: pg_class is virtual (TOAST introspection).
@@ -11504,6 +11613,8 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows: eng.db.tables.len() as u64,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output("pg_class", None, &[], where_, &[]),
                 });
             }
             // v0.88: pg_attribute is virtual (bounded catalog subset).
@@ -11523,6 +11634,8 @@ fn plan_from_item(
                                 .unwrap_or(0)
                         })
                         .sum(),
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output("pg_attribute", None, &[], where_, &[]),
                 });
             }
             // v0.11: role catalogs are virtual.
@@ -11537,6 +11650,8 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output(name, None, &[], where_, &[]),
                 });
             }
             // v0.13: pg_replication_slots is virtual too; the estimate is
@@ -11549,6 +11664,8 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows: eng.repl_slots.len() as u64,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output(name, None, &[], where_, &[]),
                 });
             }
             // v0.98: pg_sequences is virtual too; the estimate is the
@@ -11561,6 +11678,8 @@ fn plan_from_item(
                     alias: None,
                     filter: None,
                     rows: eng.db.sequences.len() as u64,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output(name, None, &[], where_, &[]),
                 });
             }
             let t = eng
@@ -11580,11 +11699,16 @@ fn plan_from_item(
                         (Some(px), Some(w)) => Some(pg_expr_text_or_debug(w, px, false)),
                         _ => None,
                     };
+                    // v1.46: VERBOSE `Output:` — the table's columns in
+                    // table order for `*` expansion.
+                    let table_cols: Vec<String> =
+                        t.columns.iter().map(|(n, _)| n.clone()).collect();
                     Ok(PlanNode::SeqScan {
                         table: name.clone(),
                         alias: alias.clone(),
                         filter,
                         rows: rel_rows,
+                        output: scan_output(name, alias.as_deref(), &table_cols, where_, &[]),
                     })
                 }
                 AccessPath::IndexScan {
@@ -11646,11 +11770,25 @@ fn plan_from_item(
                         cond,
                         filter,
                         rows,
+                        // v1.46: VERBOSE `Output:` (index key columns are
+                        // added to the baserel tlist in PG).
+                        output: scan_output(
+                            name,
+                            alias.as_deref(),
+                            &t.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                            where_,
+                            &ix.def.col_names,
+                        ),
                     })
                 }
             }
         }
-        FromItem::Derived { sub, alias, .. } => {
+        FromItem::Derived {
+            sub,
+            alias,
+            col_aliases,
+            ..
+        } => {
             // v1.08: a filter slice on a subquery scan: PG would push it
             // inside, but we render without it (wrong, EXPECTED-FAIL via
             // mask; does not abort the transaction).
@@ -11659,10 +11797,20 @@ fn plan_from_item(
             // executor's shared CTE bindings).
             let child = plan_select(eng, sub, snap, own, session, ctes, pctx.is_some())?;
             let rows = child.rows();
+            // v1.46: VERBOSE `Output:` — the subquery's output columns
+            // qualified by the scan alias (`ss.x, ss.u`).
+            let output = match pctx {
+                Some(_) => {
+                    pg_subquery_scan_output(eng, sub, alias, col_aliases, snap, own, session, ctes)
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
             Ok(PlanNode::SubqueryScan {
                 alias: alias.clone(),
                 rows,
                 child: Box::new(child),
+                output,
             })
         }
         // v0.32: table function — cardinality is unknown at plan time
@@ -11670,14 +11818,42 @@ fn plan_from_item(
         FromItem::Function { .. } => {
             // v1.08: filter on function scan ignored (wrong, EXPECTED-FAIL).
             let _ = (pctx, where_);
-            Ok(PlanNode::Values { rows: 1 })
+            // v1.46: no faithful per-column Output rendering for
+            // function scans (the line is omitted).
+            Ok(PlanNode::Values {
+                rows: 1,
+                output: Vec::new(),
+            })
         }
         // v0.14: VALUES rows are uncorrelated constants.
-        FromItem::Values { rows, .. } => {
+        FromItem::Values {
+            rows,
+            alias,
+            col_aliases,
+            ..
+        } => {
             // v1.08: filter on values scan ignored (wrong, EXPECTED-FAIL).
             let _ = (pctx, where_);
+            // v1.46: VERBOSE `Output:` — the column aliases qualified by
+            // the VALUES alias (PG's `column1, ...` when unaliased).
+            let output = match pctx {
+                Some(_) => {
+                    let n = rows.first().map(|r| r.len()).unwrap_or(0);
+                    let names: Vec<String> = if col_aliases.is_empty() {
+                        (1..=n).map(|i| format!("column{i}")).collect()
+                    } else {
+                        col_aliases.clone()
+                    };
+                    names
+                        .into_iter()
+                        .map(|c| format!("{}.{}", pg_quote_ident(alias), pg_quote_ident(&c)))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             Ok(PlanNode::Values {
                 rows: rows.len() as u64,
+                output,
             })
         }
         // The executor runs joins as nested loops; the filter attaches to
@@ -11737,6 +11913,7 @@ fn plan_from_item(
                 session,
                 ctes,
                 pctx,
+                stmt,
             )?;
             let inner = plan_from_item(
                 eng,
@@ -11747,17 +11924,503 @@ fn plan_from_item(
                 session,
                 ctes,
                 pctx,
+                stmt,
             )?;
             let rows = outer.rows().saturating_mul(inner.rows());
+            // v1.46: VERBOSE `Output:` — a join's tlist starts as the
+            // verbatim concatenation of its inputs' tlists (PG19). The
+            // top-level join's entries are replaced with the query
+            // targetlist at the end of `plan_select`.
+            let mut output = outer.output().to_vec();
+            output.extend(inner.output().iter().cloned());
             Ok(PlanNode::NestedLoop {
                 filter: None,
                 join_filter,
                 rows,
                 outer: Box::new(outer),
                 inner: Box::new(inner),
+                // v1.46: VERBOSE `Output:` filled by the caller (join of
+                // children's entries); the top-level join's entries are
+                // replaced with the query targetlist at the end of
+                // `plan_select`.
+                output,
             })
         }
     }
+}
+
+// ============================================================================
+// v1.46: EXPLAIN VERBOSE `Output:` targetlist rendering.
+//
+// PG19 reference (`src/backend/commands/explain.c`, `ExplainNode`):
+// `if (es->verbose) show_plan_tlist(planstate, ancestors, es)` runs right
+// after the node line, BEFORE every other node property (Join Filter,
+// Filter, Index Cond, Sort Key, ...). `show_plan_tlist`:
+//   - returns silently when `plan->targetlist == NIL` (no line at all),
+//   - is skipped for Append / MergeAppend / RecursiveUnion,
+//   - deparses each tlist entry with `useprefix = es->rtable_size > 1`
+//     (explain.c `get_variable`: the range-table alias when present,
+//     else the relation name).
+// Text rendering (`ExplainPropertyList`, explain_format.c) is
+// `{es->indent * 2 spaces}Output: {comma-joined entries}` — which is
+// exactly the existing `pg_ppad` indent (`6 * depth + 2`).
+//
+// Plan nodes carry `output: Vec<String>` (empty == NIL == no line),
+// computed bottom-up while PG-text planning (`pg == true`, i.e. COSTS
+// OFF). Rules per node (documented approximations where PG's full
+// planner is deeper than ours):
+//   - SeqScan / IndexScan / IndexOrderScan: this table's columns
+//     referenced by the query level's select list (`*` in table order,
+//     explicit refs in select order), then the item's WHERE-slice
+//     columns, then GROUP BY / HAVING / ORDER BY columns, then index
+//     key columns — deduplicated, first-appearance order. PG builds
+//     the baserel tlist from the query targetlist vars first and then
+//     adds qual/sort vars (`add_new_columns_to_pathtarget`).
+//   - NestedLoop (non-top): verbatim concatenation of the children's
+//     entries (PG's join tlist starts as outer ++ inner). The
+//     ruleutils.c paren-forcing for Vars referencing subquery outputs
+//     (`Output: 1, (2), ((2))`) is NOT modeled — those statements stay
+//     EXPECTED-FAIL.
+//   - Result / Aggregate / Unique / Sort / Limit, and a top-level
+//     NestedLoop: the query's select list deparsed with
+//     `pg_expr_text` (PG's top-node tlist IS the query targetlist,
+//     resjunk hidden).
+//   - SubqueryScan: the subquery's output column names qualified by
+//     the scan alias (`ss.x, ss.u`).
+//   - Values: the `FROM (VALUES ...) AS v(a, b)` column aliases (or
+//     PG's `column1, ...` names) qualified by the alias.
+// Strictness: deparse uses `pg_expr_text`, never the `_or_debug`
+// fallback. Whenever an entry has no faithful spelling (unexpandable
+// `*`, whole-row refs, unknown virtual-table columns), the whole
+// node's line is omitted rather than printed wrong.
+// ============================================================================
+
+/// v1.46: PG19 `es->rtable_size > 1` approximation for the Output-deparse
+/// `useprefix` rule: the number of base range-table entries, with
+/// explicit joins flattened to their inputs (like `pg_plan_ctx`).
+/// PG counts CTE rtable entries slightly differently; documented
+/// approximation.
+fn pg_rtable_size(items: &[FromItem]) -> usize {
+    fn count(item: &FromItem) -> usize {
+        match item {
+            FromItem::Join { left, right, .. } => count(left) + count(right),
+            _ => 1,
+        }
+    }
+    items.iter().map(count).sum()
+}
+
+/// v1.46: does the column reference `(qual, name)` belong to the FROM
+/// item with qualifiers `item_quals` (`[table]` or `[table, alias]`)?
+/// Unqualified refs resolve against the level's plan context; an
+/// ambiguous ref (which PG would reject with 42702) is attributed to
+/// the first FROM item owning the column, keeping EXPLAIN
+/// deterministic.
+fn pg_ref_belongs(
+    qual: Option<&str>,
+    name: &str,
+    item_quals: &[String],
+    table_cols: &[String],
+    px: &PgPlanCtx,
+) -> bool {
+    if let Some(q) = qual {
+        return item_quals.iter().any(|x| x == q);
+    }
+    if !table_cols.iter().any(|c| c == name) {
+        return false;
+    }
+    let owners: Vec<&Vec<String>> = px
+        .items
+        .iter()
+        .filter(|(_, cols)| cols.iter().any(|(n, _)| n == name))
+        .map(|(quals, _)| quals)
+        .collect();
+    match owners.len() {
+        1 => owners[0].iter().any(|q| item_quals.contains(q)),
+        // Ambiguous (or absent from the context): first owner wins.
+        _ => owners
+            .first()
+            .map(|quals| quals.iter().any(|q| item_quals.contains(q)))
+            .unwrap_or(false),
+    }
+}
+
+/// v1.46: append this-table column refs of `e` to `needed` (deduped,
+/// first-appearance order). Sets `whole_row` when a whole-row ref
+/// (`SELECT tbl`) names this item — the caller treats that as
+/// unfaithful (no per-column PG spelling modeled here).
+fn pg_collect_needed(
+    e: &Expr,
+    item_quals: &[String],
+    table_cols: &[String],
+    px: &PgPlanCtx,
+    needed: &mut Vec<String>,
+    whole_row: &mut bool,
+) {
+    let mut refs = Vec::new();
+    collect_column_refs(e, &mut refs);
+    for (qual, name) in refs {
+        if name == "*" {
+            if qual
+                .as_deref()
+                .map(|q| item_quals.iter().any(|x| x == q))
+                .unwrap_or(false)
+            {
+                *whole_row = true;
+            }
+            continue;
+        }
+        if pg_ref_belongs(qual.as_deref(), &name, item_quals, table_cols, px)
+            && !needed.iter().any(|n| n == &name)
+        {
+            needed.push(name);
+        }
+    }
+}
+
+/// v1.46: VERBOSE `Output:` entries for a base-table scan node; see the
+/// module doc above for the ordering rule. Returns `None` when no
+/// faithful rendering exists — the line is omitted, never wrong.
+#[allow(clippy::too_many_arguments)]
+fn pg_scan_output(
+    stmt: &SelectStmt,
+    name: &str,
+    alias: Option<&str>,
+    table_cols: &[String],
+    where_: Option<&Expr>,
+    index_cols: &[String],
+    px: &PgPlanCtx,
+) -> Option<Vec<String>> {
+    let mut quals = vec![name.to_string()];
+    if let Some(a) = alias {
+        if a != name {
+            quals.push(a.to_string());
+        }
+    }
+    let qualify = pg_rtable_size(&stmt.from) > 1;
+    let prefix = alias.unwrap_or(name);
+    let mut needed: Vec<String> = Vec::new();
+    let collect = |e: &Expr, needed: &mut Vec<String>| -> Option<()> {
+        let mut whole_row = false;
+        pg_collect_needed(e, &quals, table_cols, px, needed, &mut whole_row);
+        if whole_row {
+            return None;
+        }
+        Some(())
+    };
+    // 1. select list (`*` in table order, explicit refs in select order).
+    for item in &stmt.items {
+        match item {
+            SelectItem::All => {
+                if table_cols.is_empty() {
+                    return None;
+                }
+                for c in table_cols {
+                    if !needed.contains(c) {
+                        needed.push(c.clone());
+                    }
+                }
+            }
+            SelectItem::AllOf(q) => {
+                if quals.iter().any(|x| x == q) {
+                    if table_cols.is_empty() {
+                        return None;
+                    }
+                    for c in table_cols {
+                        if !needed.contains(c) {
+                            needed.push(c.clone());
+                        }
+                    }
+                }
+            }
+            SelectItem::Expr { expr, .. } => {
+                collect(expr, &mut needed)?;
+            }
+        }
+    }
+    // 2. this item's WHERE slice.
+    if let Some(w) = where_ {
+        collect(w, &mut needed)?;
+    }
+    // 3. GROUP BY / HAVING / ORDER BY (sort/group vars are added to the
+    // baserel tlist after the targetlist vars in PG).
+    for set in &stmt.group_by {
+        for g in set {
+            collect(g, &mut needed)?;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        collect(h, &mut needed)?;
+    }
+    for t in &stmt.order_by {
+        collect(&t.expr, &mut needed)?;
+    }
+    // 4. index key columns (PG adds indexqual vars to the baserel tlist).
+    for c in index_cols {
+        if table_cols.contains(c) && !needed.contains(c) {
+            needed.push(c.clone());
+        }
+    }
+    Some(
+        needed
+            .into_iter()
+            .map(|c| {
+                if qualify {
+                    format!("{}.{}", pg_quote_ident(prefix), pg_quote_ident(&c))
+                } else {
+                    pg_quote_ident(&c)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// v1.46: the output column names of a subquery SELECT (PG19
+/// `FigureColName`, via our `expr_col_name`), unqualified. `None` when
+/// they cannot be determined faithfully (`SELECT *` over a non-table
+/// source).
+fn pg_subquery_col_names(
+    eng: &Engine,
+    sub: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for item in &sub.items {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                names.push(alias.clone().unwrap_or_else(|| expr_col_name(expr)));
+            }
+            SelectItem::All => {
+                // Only a single plain-table source can be expanded.
+                let cols: Vec<String> = match sub.from.as_slice() {
+                    [FromItem::Table { name, .. }] => {
+                        if ctes.iter().any(|c| c.name == *name) {
+                            return None;
+                        }
+                        eng.db
+                            .find_table(name, snap, &[own], session)
+                            .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                            .unwrap_or_default()
+                    }
+                    _ => return None,
+                };
+                if cols.is_empty() {
+                    return None;
+                }
+                names.extend(cols);
+            }
+            SelectItem::AllOf(q) => {
+                let mut found: Option<Vec<String>> = None;
+                for it in &sub.from {
+                    if pg_item_quals(it).iter().any(|x| x == q) {
+                        if let FromItem::Table { name, .. } = it {
+                            if ctes.iter().any(|c| c.name == *name) {
+                                return None;
+                            }
+                            found = eng
+                                .db
+                                .find_table(name, snap, &[own], session)
+                                .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect());
+                        }
+                        break;
+                    }
+                }
+                match found {
+                    Some(cols) if !cols.is_empty() => names.extend(cols),
+                    _ => return None,
+                }
+            }
+        }
+    }
+    Some(names)
+}
+
+/// v1.46: output column names of a CTE (`col_aliases` win positionally,
+/// else the body's select names). `visible` holds the CTEs the body may
+/// reference (outer ++ earlier siblings).
+fn pg_cte_col_names(
+    eng: &Engine,
+    cte: &CteDef,
+    visible: &[CteDef],
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<Vec<String>> {
+    if !cte.col_aliases.is_empty() {
+        return Some(cte.col_aliases.clone());
+    }
+    match &cte.body {
+        CteBody::Simple(sel) => pg_subquery_col_names(eng, sel, snap, own, session, visible),
+        CteBody::Union { left, .. } => {
+            pg_subquery_col_names(eng, left, snap, own, session, visible)
+        }
+        // Data-modifying CTEs fail closed before planning reaches here.
+        CteBody::Dml(_) => None,
+    }
+}
+
+/// v1.46: VERBOSE `Output:` for a SubqueryScan: the subquery's output
+/// column names qualified by the scan alias (`ss.x, ss.u`), matching
+/// PG19's rtable-qualified tlist deparse.
+fn pg_subquery_scan_output(
+    eng: &Engine,
+    sub: &SelectStmt,
+    alias: &str,
+    col_aliases: &[String],
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+) -> Option<Vec<String>> {
+    let names: Vec<String> = if col_aliases.is_empty() {
+        pg_subquery_col_names(eng, sub, snap, own, session, ctes)?
+    } else {
+        col_aliases.to_vec()
+    };
+    Some(
+        names
+            .into_iter()
+            .map(|n| format!("{}.{}", pg_quote_ident(alias), pg_quote_ident(&n)))
+            .collect(),
+    )
+}
+
+/// v1.46: `SELECT *` expansion for one FROM item: its output columns,
+/// qualified iff `qualify` (PG19 `useprefix`). `None` when the columns
+/// are not faithfully known (function scans, CTEs with unknowable
+/// bodies).
+fn pg_from_item_star_cols(
+    eng: &Engine,
+    item: &FromItem,
+    qualify: bool,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+) -> Option<Vec<String>> {
+    fn qual_name(qualify: bool, qual: &str, col: &str) -> String {
+        if qualify {
+            format!("{}.{}", pg_quote_ident(qual), pg_quote_ident(col))
+        } else {
+            pg_quote_ident(col)
+        }
+    }
+    match item {
+        FromItem::Table { name, alias, .. } => {
+            let q = alias.as_deref().unwrap_or(name);
+            let cols: Vec<String> = if let Some(pos) = ctes.iter().rposition(|c| c.name == *name) {
+                pg_cte_col_names(eng, &ctes[pos], &ctes[..pos], snap, own, session)?
+            } else {
+                eng.db
+                    .find_table(name, snap, &[own], session)
+                    .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default()
+            };
+            if cols.is_empty() {
+                return None;
+            }
+            Some(
+                cols.into_iter()
+                    .map(|c| qual_name(qualify, q, &c))
+                    .collect(),
+            )
+        }
+        FromItem::Derived {
+            sub,
+            alias,
+            col_aliases,
+            ..
+        } => {
+            let names: Vec<String> = if col_aliases.is_empty() {
+                pg_subquery_col_names(eng, sub, snap, own, session, ctes)?
+            } else {
+                col_aliases.clone()
+            };
+            Some(
+                names
+                    .into_iter()
+                    .map(|n| qual_name(qualify, alias, &n))
+                    .collect(),
+            )
+        }
+        FromItem::Values {
+            alias,
+            col_aliases,
+            rows,
+            ..
+        } => {
+            let n = rows.first().map(|r| r.len()).unwrap_or(0);
+            let names: Vec<String> = if col_aliases.is_empty() {
+                (1..=n).map(|i| format!("column{i}")).collect()
+            } else {
+                col_aliases.clone()
+            };
+            Some(
+                names
+                    .into_iter()
+                    .map(|c| qual_name(qualify, alias, &c))
+                    .collect(),
+            )
+        }
+        FromItem::Join { left, right, .. } => {
+            let mut v = pg_from_item_star_cols(eng, left, qualify, snap, own, session, ctes)?;
+            v.extend(pg_from_item_star_cols(
+                eng, right, qualify, snap, own, session, ctes,
+            )?);
+            Some(v)
+        }
+        // Function scans have no faithful per-column expansion here.
+        FromItem::Function { .. } => None,
+    }
+}
+
+/// v1.46: deparse the query level's select list for a top plan node's
+/// VERBOSE `Output:` (PG19: the top node's tlist IS the query
+/// targetlist, resjunk hidden). Strict: any entry without a faithful
+/// PG spelling — or any unexpandable `*` — omits the whole line.
+fn pg_top_select_output(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+    px: &PgPlanCtx,
+) -> Option<Vec<String>> {
+    let qualify = pg_rtable_size(&stmt.from) > 1;
+    let mut out = Vec::new();
+    for item in &stmt.items {
+        match item {
+            // Whole-row refs have no per-column spelling modeled here.
+            SelectItem::Expr { expr, .. } => out.push(pg_expr_text(expr, px, qualify)?),
+            SelectItem::All => {
+                for it in &stmt.from {
+                    out.extend(pg_from_item_star_cols(
+                        eng, it, qualify, snap, own, session, ctes,
+                    )?);
+                }
+            }
+            SelectItem::AllOf(q) => {
+                let mut done = false;
+                for it in &stmt.from {
+                    if pg_item_quals(it).iter().any(|x| x == q) {
+                        out.extend(pg_from_item_star_cols(
+                            eng, it, qualify, snap, own, session, ctes,
+                        )?);
+                        done = true;
+                        break;
+                    }
+                }
+                if !done {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 fn plan_select(
@@ -11837,10 +12500,24 @@ fn plan_select(
             stmt.where_.as_ref()
         }
     };
+    // v1.46: VERBOSE `Output:` for a node whose tlist IS the query
+    // targetlist (Result / Aggregate / Unique / Sort / Limit, and the
+    // top-level NestedLoop via the end-of-function fixup). Empty in
+    // legacy mode; unfaithful entries omit the whole line.
+    let top_output = || -> Vec<String> {
+        match pctx {
+            Some(px) => {
+                pg_top_select_output(eng, stmt, snap, own, session, ctes, px).unwrap_or_default()
+            }
+            None => Vec::new(),
+        }
+    };
     let mut node = if stmt.from.is_empty() {
         PlanNode::Result {
             rows: 1,
             filter: None,
+            // v1.46: VERBOSE `Output:` — the select list deparsed.
+            output: top_output(),
         }
     } else if stmt.from.len() == 1 {
         if matches!(&stmt.from[0], FromItem::Table { .. }) {
@@ -11860,10 +12537,40 @@ fn plan_select(
                     .join(", ");
                 PlanNode::IndexOrderScan {
                     rows: est_rel_rows(&eng.db, &name, snap, own, session),
-                    table: name,
+                    table: name.clone(),
                     alias: None,
-                    index: hint.index,
+                    index: hint.index.clone(),
                     order,
+                    // v1.46: VERBOSE `Output:` — same rule as a plain
+                    // scan (index key columns appended).
+                    output: match pctx {
+                        Some(px) => {
+                            let table_cols: Vec<String> = eng
+                                .db
+                                .find_table(&name, snap, &[own], session)
+                                .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                                .unwrap_or_default();
+                            let index_cols: Vec<String> = eng
+                                .db
+                                .temp_indexes
+                                .get(&session)
+                                .and_then(|m| m.get(&hint.index))
+                                .or_else(|| eng.db.indexes.get(&hint.index))
+                                .map(|ix| ix.def.col_names.clone())
+                                .unwrap_or_default();
+                            pg_scan_output(
+                                stmt,
+                                &name,
+                                None,
+                                &table_cols,
+                                item_where(0),
+                                &index_cols,
+                                px,
+                            )
+                            .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    },
                 }
             } else {
                 plan_from_item(
@@ -11875,6 +12582,7 @@ fn plan_select(
                     session,
                     ctes,
                     pctx,
+                    stmt,
                 )?
             }
         } else {
@@ -11887,6 +12595,7 @@ fn plan_select(
                 session,
                 ctes,
                 pctx,
+                stmt,
             )?
         }
     } else {
@@ -11901,18 +12610,35 @@ fn plan_select(
             session,
             ctes,
             pctx,
+            stmt,
         )?;
         idx += 1;
         for item in items {
-            let inner = plan_from_item(eng, item, item_where(idx), snap, own, session, ctes, pctx)?;
+            let inner = plan_from_item(
+                eng,
+                item,
+                item_where(idx),
+                snap,
+                own,
+                session,
+                ctes,
+                pctx,
+                stmt,
+            )?;
             idx += 1;
             let rows = node.rows().saturating_mul(inner.rows());
+            // v1.46: VERBOSE `Output:` — concatenation of the inputs'
+            // entries (replaced with the query targetlist for the top
+            // node by the fixup below).
+            let mut output = node.output().to_vec();
+            output.extend(inner.output().iter().cloned());
             node = PlanNode::NestedLoop {
                 filter: None,
                 join_filter: None,
                 rows,
                 outer: Box::new(node),
                 inner: Box::new(inner),
+                output,
             };
         }
         node
@@ -11951,6 +12677,8 @@ fn plan_select(
             node = PlanNode::Aggregate {
                 rows,
                 child: Box::new(node),
+                // v1.46: VERBOSE `Output:` — the query targetlist.
+                output: top_output(),
             };
         }
         let (effective, _) = check_distinct_on_order(stmt, None)?;
@@ -11990,11 +12718,15 @@ fn plan_select(
             keys,
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
         let rows = node.rows();
         node = PlanNode::Unique {
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
     } else if is_agg_query(stmt) {
         let rows = if stmt.group_by.is_empty() {
@@ -12005,12 +12737,16 @@ fn plan_select(
         node = PlanNode::Aggregate {
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
     } else if stmt.distinct {
         let rows = node.rows();
         node = PlanNode::Unique {
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
     }
     // 4. ORDER BY → Sort, unless the index-order scan provides it.
@@ -12050,6 +12786,8 @@ fn plan_select(
             keys,
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
     }
     // 5. OFFSET / LIMIT.
@@ -12068,7 +12806,21 @@ fn plan_select(
             n,
             rows,
             child: Box::new(node),
+            // v1.46: VERBOSE `Output:` — the query targetlist.
+            output: top_output(),
         };
+    }
+    // v1.46: the top plan node's `Output:` is the query targetlist
+    // (PG19: the top tlist, resjunk hidden). Scans, subquery scans and
+    // VALUES keep their construction-time entries; a top-level join
+    // gets the targetlist deparse, falling back to the concatenated
+    // inputs' entries when the targetlist has no faithful spelling.
+    if pg && matches!(node, PlanNode::NestedLoop { .. }) {
+        if let Some(px) = pctx {
+            if let Some(sel) = pg_top_select_output(eng, stmt, snap, own, session, ctes, px) {
+                node.set_output(sel);
+            }
+        }
     }
     Ok(node)
 }
@@ -12078,16 +12830,36 @@ fn plan_select(
 /// PG19's exact text layout (`pg_pad` node prefix, properties at
 /// `6*depth+2` spaces). With `costs=true` the legacy rustgres shape
 /// (two-space indentation, `(rows=N)` suffixes) is kept unchanged.
-fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>) {
+fn render_plan(
+    node: &PlanNode,
+    depth: usize,
+    costs: bool,
+    // v1.46: EXPLAIN VERBOSE — render the `Output:` targetlist lines.
+    verbose: bool,
+    out: &mut Vec<String>,
+) {
     if costs {
         render_plan_costs_on(node, depth, out);
         return;
     }
     let pad = pg_pad(depth);
     let ppad = pg_ppad(depth);
+    // v1.46: VERBOSE `Output:` — PG19 (`ExplainNode`) prints the plan
+    // targetlist immediately after the node line, before every other
+    // property (Join Filter, Filter, Index Cond, Sort Key, ...). Empty
+    // tlists print no line (`show_plan_tlist` NIL check).
+    let push_output = |out: &mut Vec<String>| {
+        if verbose {
+            let o = node.output();
+            if !o.is_empty() {
+                out.push(format!("{ppad}Output: {}", o.join(", ")));
+            }
+        }
+    };
     match node {
         PlanNode::Result { filter, .. } => {
             out.push(format!("{pad}Result"));
+            push_output(out);
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
             }
@@ -12099,6 +12871,7 @@ fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>
             ..
         } => {
             out.push(format!("{pad}Seq Scan on {}", pg_scan_name(table, alias)));
+            push_output(out);
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
             }
@@ -12115,6 +12888,7 @@ fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>
                 "{pad}Index Scan using {index} on {}",
                 pg_scan_name(table, alias)
             ));
+            push_output(out);
             out.push(format!("{ppad}Index Cond: {cond}"));
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
@@ -12131,6 +12905,7 @@ fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>
                 "{pad}Index Scan using {index} on {}",
                 pg_scan_name(table, alias)
             ));
+            push_output(out);
             out.push(format!("{ppad}Order: {order}"));
         }
         PlanNode::NestedLoop {
@@ -12141,38 +12916,45 @@ fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>
             ..
         } => {
             out.push(format!("{pad}Nested Loop"));
+            push_output(out);
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
             }
             if let Some(f) = join_filter {
                 out.push(format!("{ppad}Join Filter: {f}"));
             }
-            render_plan(outer, depth + 1, costs, out);
-            render_plan(inner, depth + 1, costs, out);
+            render_plan(outer, depth + 1, costs, verbose, out);
+            render_plan(inner, depth + 1, costs, verbose, out);
         }
         PlanNode::Aggregate { child, .. } => {
             out.push(format!("{pad}Aggregate"));
-            render_plan(child, depth + 1, costs, out);
+            push_output(out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::Unique { child, .. } => {
             out.push(format!("{pad}Unique"));
-            render_plan(child, depth + 1, costs, out);
+            push_output(out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::Sort { keys, child, .. } => {
             out.push(format!("{pad}Sort"));
+            push_output(out);
             out.push(format!("{ppad}Sort Key: {keys}"));
-            render_plan(child, depth + 1, costs, out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::Limit { child, .. } => {
             out.push(format!("{pad}Limit"));
-            render_plan(child, depth + 1, costs, out);
+            push_output(out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::SubqueryScan { alias, child, .. } => {
             out.push(format!("{pad}Subquery Scan on {alias}"));
-            render_plan(child, depth + 1, costs, out);
+            push_output(out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::Values { .. } => {
             out.push(format!("{pad}Values Scan"));
+            push_output(out);
         }
     }
 }
@@ -12182,7 +12964,7 @@ fn render_plan(node: &PlanNode, depth: usize, costs: bool, out: &mut Vec<String>
 fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(depth);
     match node {
-        PlanNode::Result { rows, filter } => {
+        PlanNode::Result { rows, filter, .. } => {
             out.push(format!("{pad}Result (rows={rows})"));
             if let Some(f) = filter {
                 out.push(format!("{pad}  Filter: {f}"));
@@ -12241,28 +13023,32 @@ fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             render_plan_costs_on(outer, depth + 1, out);
             render_plan_costs_on(inner, depth + 1, out);
         }
-        PlanNode::Aggregate { rows, child } => {
+        PlanNode::Aggregate { rows, child, .. } => {
             out.push(format!("{pad}Aggregate (rows={rows})"));
             render_plan_costs_on(child, depth + 1, out);
         }
-        PlanNode::Unique { rows, child } => {
+        PlanNode::Unique { rows, child, .. } => {
             out.push(format!("{pad}Unique (rows={rows})"));
             render_plan_costs_on(child, depth + 1, out);
         }
-        PlanNode::Sort { keys, rows, child } => {
+        PlanNode::Sort {
+            keys, rows, child, ..
+        } => {
             out.push(format!("{pad}Sort (rows={rows})"));
             out.push(format!("{pad}  Sort Key: {keys}"));
             render_plan_costs_on(child, depth + 1, out);
         }
-        PlanNode::Limit { n, rows, child } => {
+        PlanNode::Limit { n, rows, child, .. } => {
             out.push(format!("{pad}Limit {n} (rows={rows})"));
             render_plan_costs_on(child, depth + 1, out);
         }
-        PlanNode::SubqueryScan { alias, rows, child } => {
+        PlanNode::SubqueryScan {
+            alias, rows, child, ..
+        } => {
             out.push(format!("{pad}Subquery Scan on {alias} (rows={rows})"));
             render_plan_costs_on(child, depth + 1, out);
         }
-        PlanNode::Values { rows } => {
+        PlanNode::Values { rows, .. } => {
             out.push(format!("{pad}Values (rows={rows})"));
         }
     }
@@ -12275,6 +13061,8 @@ fn exec_explain(
     ctx: &mut StmtCtx,
     stmt: &Stmt,
     costs: bool,
+    // v1.46: EXPLAIN VERBOSE — render the `Output:` targetlist lines.
+    verbose: bool,
 ) -> Result<ExecResult, ExecError> {
     let sel = match stmt {
         Stmt::Select(s) => s,
@@ -12289,7 +13077,7 @@ fn exec_explain(
     // v1.08: COSTS OFF selects the PG-text plan rendering.
     let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session, &[], !costs)?;
     let mut lines = Vec::new();
-    render_plan(&plan, 0, costs, &mut lines);
+    render_plan(&plan, 0, costs, verbose, &mut lines);
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
         rows: lines
@@ -12378,7 +13166,7 @@ fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bo
             }
         }
         PlanNode::SubqueryScan { child, .. } => analyze_actual(child, ax, cap, false),
-        PlanNode::Values { rows } => *rows,
+        PlanNode::Values { rows, .. } => *rows,
     }
 }
 
@@ -12524,6 +13312,9 @@ fn explain_rows(
     sel: &SelectStmt,
     analyze: bool,
     costs: bool,
+    // v1.46: EXPLAIN VERBOSE — render the `Output:` targetlist lines
+    // (planning-only path; ANALYZE instrumentation stays out of scope).
+    verbose: bool,
 ) -> Result<Vec<Row>, ExecError> {
     // v1.08: COSTS OFF selects the PG-text plan rendering.
     let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs)?;
@@ -12539,7 +13330,7 @@ fn explain_rows(
         };
         render_analyze(&plan, &ax, 0, None, true, &mut lines);
     } else {
-        render_plan(&plan, 0, costs, &mut lines);
+        render_plan(&plan, 0, costs, verbose, &mut lines);
     }
     Ok(lines
         .into_iter()
@@ -12594,7 +13385,7 @@ fn exec_explain_analyze(
                 ctx.default_toast_compression,
             )),
         };
-        explain_rows(&mut q, &[], sel, true, costs)?
+        explain_rows(&mut q, &[], sel, true, costs, false)?
     };
     Ok(ExecResult::Explain {
         columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
@@ -34000,7 +34791,7 @@ fn run_plpgsql_stmts(
                         stmt,
                         analyze,
                         costs,
-                        ..
+                        opts,
                     } => {
                         let Stmt::Select(inner) = &**stmt else {
                             return Err(exec_err(
@@ -34008,7 +34799,8 @@ fn run_plpgsql_stmts(
                                 "plpgsql FOR over non-SELECT EXPLAIN".to_string(),
                             ));
                         };
-                        explain_rows(q, scopes, inner, *analyze, *costs)?
+                        // v1.46: thread VERBOSE through for `Output:`.
+                        explain_rows(q, scopes, inner, *analyze, *costs, opts.verbose)?
                     }
                     _ => {
                         return Err(exec_err(
@@ -64390,5 +65182,291 @@ mod v145_join_removal_tests {
         // TEXT still works.
         let lines = plan_lines(&mut eng, "EXPLAIN (FORMAT TEXT, COSTS OFF) SELECT 1");
         assert!(!lines.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod v146_verbose_output_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => {
+                rows.into_iter().map(|r| r[0].to_text().unwrap()).collect()
+            }
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for ddl in [
+            "CREATE TABLE t1 (a int, b text)",
+            "CREATE TABLE t2 (a int, c int)",
+        ] {
+            run(eng, ddl).unwrap();
+        }
+    }
+
+    #[test]
+    fn verbose_output_scan_select_then_where_cols() {
+        // v1.46: scan tlist = select-list cols, then WHERE-slice cols
+        // (PG19 `add_new_columns_to_pathtarget` order).
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT a FROM t1 WHERE b = 'x'",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Seq Scan on t1".to_string(),
+                "  Output: a, b".to_string(),
+                "  Filter: (b = 'x'::text)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_output_line_right_after_node_line() {
+        // v1.46: PG19 `ExplainNode` prints Output: immediately after the
+        // node line, before Filter / Join Filter / Index Cond / Sort Key.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT a, b FROM t1 WHERE a > 1",
+        );
+        assert_eq!(lines[0], "Seq Scan on t1");
+        assert_eq!(lines[1], "  Output: a, b");
+        assert_eq!(lines[2], "  Filter: (a > 1)");
+    }
+
+    #[test]
+    fn verbose_output_star_expands_in_table_order() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM t1");
+        assert_eq!(
+            lines,
+            vec!["Seq Scan on t1".to_string(), "  Output: a, b".to_string(),]
+        );
+    }
+
+    #[test]
+    fn verbose_output_join_uses_rtable_qualification() {
+        // v1.46: `useprefix = rtable_size > 1` — multi-table outputs are
+        // alias-qualified; the top join's tlist is the query targetlist.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT t1.a, t2.c FROM t1, t2 WHERE t1.a = t2.a",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "  Output: t1.a, t2.c".to_string(),
+                "  Join Filter: (t1.a = t2.a)".to_string(),
+                "  ->  Seq Scan on t1".to_string(),
+                "        Output: t1.a".to_string(),
+                "  ->  Seq Scan on t2".to_string(),
+                "        Output: t2.c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_output_top_join_is_targetlist_not_concat() {
+        // v1.46: the top join shows the query targetlist even when the
+        // inputs need extra columns (t2.c only for the filter).
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT t1.a FROM t1, t2 WHERE t2.c > 0",
+        );
+        assert_eq!(lines[0], "Nested Loop");
+        assert_eq!(lines[1], "  Output: t1.a");
+        assert!(
+            lines.contains(&"        Output: t2.c".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_output_star_join_expands_all_tables() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM t1, t2",
+        );
+        assert_eq!(lines[1], "  Output: t1.a, t1.b, t2.a, t2.c");
+    }
+
+    #[test]
+    fn verbose_output_subquery_scan_alias_qualified() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM (SELECT a AS x FROM t1) ss",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Subquery Scan on ss".to_string(),
+                "  Output: ss.x".to_string(),
+                "  ->  Seq Scan on t1".to_string(),
+                "        Output: a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_output_values_scan_alias_qualified() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM (VALUES (1, 2)) AS v(p, q)",
+        );
+        assert_eq!(
+            lines,
+            vec!["Values Scan".to_string(), "  Output: v.p, v.q".to_string(),]
+        );
+    }
+
+    #[test]
+    fn verbose_output_sort_limit_show_targetlist() {
+        // v1.46: Sort/Limit tlists are the query targetlist (resjunk
+        // hidden); the scan below still carries the sort column.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT a FROM t1 ORDER BY b LIMIT 2",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Limit".to_string(),
+                "  Output: a".to_string(),
+                "  ->  Sort".to_string(),
+                "        Output: a".to_string(),
+                "        Sort Key: t1.b".to_string(),
+                "        ->  Seq Scan on t1".to_string(),
+                "              Output: a, b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_output_aggregate_plain_group_key() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT a FROM t1 GROUP BY a",
+        );
+        assert_eq!(lines[0], "Aggregate");
+        assert_eq!(lines[1], "  Output: a");
+    }
+
+    #[test]
+    fn verbose_output_omitted_when_no_faithful_spelling() {
+        // v1.46: strict deparse — `count(*)` has no pg_expr_text
+        // spelling, so the Aggregate prints no Output line at all
+        // (never a wrong line).
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) SELECT a, count(*) FROM t1 GROUP BY a",
+        );
+        // The Aggregate itself prints no Output line (strict omission);
+        // the scan below still shows its faithfully-known tlist.
+        assert_eq!(lines[0], "Aggregate");
+        assert_eq!(lines[1], "  ->  Seq Scan on t1");
+        assert_eq!(lines[2], "        Output: a");
+    }
+
+    #[test]
+    fn verbose_output_result_no_from() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT 1");
+        assert_eq!(
+            lines,
+            vec!["Result".to_string(), "  Output: 1".to_string(),]
+        );
+    }
+
+    #[test]
+    fn nonverbose_output_byte_identical() {
+        // v1.46: without VERBOSE the plan text is unchanged (no Output
+        // lines anywhere).
+        let mut eng = engine();
+        setup(&mut eng);
+        for sql in [
+            "EXPLAIN (COSTS OFF) SELECT a, b FROM t1 WHERE a > 1",
+            "EXPLAIN (COSTS OFF) SELECT t1.a, t2.c FROM t1, t2 WHERE t1.a = t2.a",
+            "EXPLAIN (COSTS OFF) SELECT * FROM (SELECT a AS x FROM t1) ss",
+        ] {
+            let lines = plan_lines(&mut eng, sql);
+            assert!(
+                !lines.iter().any(|l| l.contains("Output:")),
+                "{sql}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verbose_output_cte_scan() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF, VERBOSE) WITH x AS (SELECT a AS q FROM t1) SELECT * FROM x",
+        );
+        assert_eq!(lines[0], "Subquery Scan on x");
+        assert_eq!(lines[1], "  Output: x.q");
+    }
+
+    #[test]
+    fn verbose_output_empty_tlist_prints_no_line() {
+        // v1.46: `SELECT 1 FROM t1` needs no columns from the scan —
+        // PG's show_plan_tlist NIL check prints no Output line.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT 1 FROM t1");
+        assert_eq!(lines, vec!["Seq Scan on t1".to_string()]);
     }
 }
