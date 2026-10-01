@@ -13733,6 +13733,10 @@ fn pg_scan_output(
     let qualify = pg_rtable_size(&stmt.from) > 1;
     let prefix = alias.unwrap_or(name);
     let mut needed: Vec<String> = Vec::new();
+    // v1.52: indices into `needed` holding pre-rendered expression text
+    // (not column names) — the final map must use them verbatim instead
+    // of `pg_quote_ident`-ing them (`Output: 1`, not `Output: "1"`).
+    let mut verbatim: Vec<usize> = Vec::new();
     let collect = |e: &Expr, needed: &mut Vec<String>| -> Option<()> {
         let mut whole_row = false;
         pg_collect_needed(e, &quals, table_cols, px, needed, &mut whole_row);
@@ -13767,7 +13771,31 @@ fn pg_scan_output(
                 }
             }
             SelectItem::Expr { expr, .. } => {
+                let before = needed.len();
                 collect(expr, &mut needed)?;
+                // v1.52: PG19 `apply_scanjoin_target_to_paths` (planner.c)
+                // applies the FULL final targetlist — including non-Var
+                // exprs — to the top scan/join paths, so `SELECT 1 FROM t1`
+                // prints `Output: 1` (verified on live PG16; grounded in
+                // PG19 createplan.c `use_physical_tlist` comments). A
+                // select item that contributes no column of this table and
+                // is not itself a column reference (e.g. a constant)
+                // renders as its deparsed text. A column reference to
+                // another table's column contributes nothing here; the
+                // v1.50 all-columns fallback below still covers the
+                // join-child physical-tlist case (e.g. T1's
+                // `Output: int4_tbl.f1`, whose select item is `q2`, a
+                // column of int8_tbl).
+                if needed.len() == before
+                    && !matches!(expr, Expr::Column { .. } | Expr::ResolvedCol { .. })
+                {
+                    if let Some(t) = pg_expr_text(expr, px, qualify) {
+                        // Verbatim: already fully rendered (including any
+                        // qualification); the final map must not quote it.
+                        verbatim.push(needed.len());
+                        needed.push(t);
+                    }
+                }
             }
         }
     }
@@ -13804,8 +13832,12 @@ fn pg_scan_output(
     Some(
         needed
             .into_iter()
-            .map(|c| {
-                if qualify {
+            .enumerate()
+            .map(|(i, c)| {
+                if verbatim.contains(&i) {
+                    // v1.52: pre-rendered expression text — verbatim.
+                    c
+                } else if qualify {
                     format!("{}.{}", pg_quote_ident(prefix), pg_quote_ident(&c))
                 } else {
                     pg_quote_ident(&c)
@@ -68028,6 +68060,10 @@ mod v146_verbose_output_tests {
     fn verbose_output_scan_select_then_where_cols() {
         // v1.46: scan tlist = select-list cols, then WHERE-slice cols
         // (PG19 `add_new_columns_to_pathtarget` order).
+        // v1.52: VERBOSE schema-qualifies the scan name — PG19
+        // `ExplainTargetRel` (explain.c) sets the namespace only when
+        // `es->verbose` and text prints ` on %s.%s`. The v1.46 expectation
+        // encoded the pre-v1.50 unqualified rendering.
         let mut eng = engine();
         setup(&mut eng);
         let lines = plan_lines(
@@ -68037,7 +68073,7 @@ mod v146_verbose_output_tests {
         assert_eq!(
             lines,
             vec![
-                "Seq Scan on t1".to_string(),
+                "Seq Scan on public.t1".to_string(),
                 "  Output: a, b".to_string(),
                 "  Filter: (b = 'x'::text)".to_string(),
             ]
@@ -68048,13 +68084,15 @@ mod v146_verbose_output_tests {
     fn verbose_output_line_right_after_node_line() {
         // v1.46: PG19 `ExplainNode` prints Output: immediately after the
         // node line, before Filter / Join Filter / Index Cond / Sort Key.
+        // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+        // (explain.c).
         let mut eng = engine();
         setup(&mut eng);
         let lines = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF, VERBOSE) SELECT a, b FROM t1 WHERE a > 1",
         );
-        assert_eq!(lines[0], "Seq Scan on t1");
+        assert_eq!(lines[0], "Seq Scan on public.t1");
         assert_eq!(lines[1], "  Output: a, b");
         assert_eq!(lines[2], "  Filter: (a > 1)");
     }
@@ -68066,7 +68104,9 @@ mod v146_verbose_output_tests {
         let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM t1");
         assert_eq!(
             lines,
-            vec!["Seq Scan on t1".to_string(), "  Output: a, b".to_string(),]
+            // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+            // (explain.c).
+            vec!["Seq Scan on public.t1".to_string(), "  Output: a, b".to_string(),]
         );
     }
 
@@ -68074,6 +68114,8 @@ mod v146_verbose_output_tests {
     fn verbose_output_join_uses_rtable_qualification() {
         // v1.46: `useprefix = rtable_size > 1` — multi-table outputs are
         // alias-qualified; the top join's tlist is the query targetlist.
+        // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+        // (explain.c).
         let mut eng = engine();
         setup(&mut eng);
         let lines = plan_lines(
@@ -68086,9 +68128,9 @@ mod v146_verbose_output_tests {
                 "Nested Loop".to_string(),
                 "  Output: t1.a, t2.c".to_string(),
                 "  Join Filter: (t1.a = t2.a)".to_string(),
-                "  ->  Seq Scan on t1".to_string(),
+                "  ->  Seq Scan on public.t1".to_string(),
                 "        Output: t1.a".to_string(),
-                "  ->  Seq Scan on t2".to_string(),
+                "  ->  Seq Scan on public.t2".to_string(),
                 "        Output: t2.c".to_string(),
             ]
         );
@@ -68133,10 +68175,12 @@ mod v146_verbose_output_tests {
         );
         assert_eq!(
             lines,
+            // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+            // (explain.c).
             vec![
                 "Subquery Scan on ss".to_string(),
                 "  Output: ss.x".to_string(),
-                "  ->  Seq Scan on t1".to_string(),
+                "  ->  Seq Scan on public.t1".to_string(),
                 "        Output: a".to_string(),
             ]
         );
@@ -68160,6 +68204,8 @@ mod v146_verbose_output_tests {
     fn verbose_output_sort_limit_show_targetlist() {
         // v1.46: Sort/Limit tlists are the query targetlist (resjunk
         // hidden); the scan below still carries the sort column.
+        // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+        // (explain.c).
         let mut eng = engine();
         setup(&mut eng);
         let lines = plan_lines(
@@ -68174,7 +68220,7 @@ mod v146_verbose_output_tests {
                 "  ->  Sort".to_string(),
                 "        Output: a".to_string(),
                 "        Sort Key: t1.b".to_string(),
-                "        ->  Seq Scan on t1".to_string(),
+                "        ->  Seq Scan on public.t1".to_string(),
                 "              Output: a, b".to_string(),
             ]
         );
@@ -68205,8 +68251,10 @@ mod v146_verbose_output_tests {
         );
         // The Aggregate itself prints no Output line (strict omission);
         // the scan below still shows its faithfully-known tlist.
+        // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+        // (explain.c).
         assert_eq!(lines[0], "Aggregate");
-        assert_eq!(lines[1], "  ->  Seq Scan on t1");
+        assert_eq!(lines[1], "  ->  Seq Scan on public.t1");
         assert_eq!(lines[2], "        Output: a");
     }
 
@@ -68256,10 +68304,21 @@ mod v146_verbose_output_tests {
     fn verbose_output_empty_tlist_prints_no_line() {
         // v1.46: `SELECT 1 FROM t1` needs no columns from the scan —
         // PG's show_plan_tlist NIL check prints no Output line.
+        // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
+        // (explain.c). And the Output line IS printed: PG19
+        // `apply_scanjoin_target_to_paths` applies the FULL final
+        // targetlist (including the Const `1`) to the top scan path —
+        // verified on live PG16: `Output: 1` (PG16 prints the same as
+        // PG19 here per createplan.c). Neither the v1.46 expectation
+        // (no Output line) nor the v1.50 behavior (`Output: a, b` via
+        // the all-columns fallback) was PG-correct.
         let mut eng = engine();
         setup(&mut eng);
         let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT 1 FROM t1");
-        assert_eq!(lines, vec!["Seq Scan on t1".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["Seq Scan on public.t1".to_string(), "  Output: 1".to_string()]
+        );
     }
 
     /// v1.50: `is_simple_subquery` rejects aggregates.
