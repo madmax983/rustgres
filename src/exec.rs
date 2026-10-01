@@ -13132,6 +13132,26 @@ fn qual_star_order(schema: &[QCol], qual: &str) -> Vec<usize> {
     idx
 }
 
+/// v1.43: the qualifier's column values in `qual_star_order` — the flat
+/// expansion of `qual.*` used by `ROW(qual.*, ...)` (PG19 expands the
+/// star into the row's field list; it is not a nested whole-row value).
+/// Shares the innermost-first scope walk with `eval_wholerow`, so the
+/// `JOIN ... USING ... AS alias` quirk (alias exposes only merged keys)
+/// is honored identically. Unknown qualifier is PG19's 42703.
+fn wholerow_flat_values(scopes: &[Scope], qual: &str) -> Result<Vec<Value>, ExecError> {
+    for sc in scopes.iter().rev() {
+        let idx = qual_star_order(sc.schema, qual);
+        if idx.is_empty() {
+            continue;
+        }
+        return Ok(idx.into_iter().map(|i| sc.row[i].clone()).collect());
+    }
+    Err(exec_err(
+        "42703",
+        format!("missing FROM-clause entry for table \"{qual}\""),
+    ))
+}
+
 /// v0.73: evaluate a PG19 whole-row Var (`tbl` / `tbl.*` in expression
 /// position) to a composite `Value::Record`. The field order is the
 /// qualifier's source-column order — exactly matching target-list
@@ -24076,11 +24096,25 @@ fn eval_grouped(
         }
         // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
         // PG's `f1`, `f2`, ... field names.
+        // v1.43: `ROW(qual.*, ...)` — PG19 expands the star into the
+        // row's field list (flat, sequential f-names), not a nested
+        // whole-row value. The grouped scope shape mirrors the
+        // `WholeRow` arm below (outer frames, then the group scope).
         Expr::Row(elems) => {
-            let mut fields = Vec::with_capacity(elems.len());
-            for (i, e) in elems.iter().enumerate() {
-                let v = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, e)?;
-                fields.push((format!("f{}", i + 1), v));
+            let mut fields = Vec::new();
+            for e in elems {
+                if let Expr::WholeRow { qual } = e {
+                    let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+                    scopes.extend_from_slice(outer);
+                    scopes.push(gscope);
+                    for v in wholerow_flat_values(&scopes, qual)? {
+                        fields.push((format!("f{}", fields.len() + 1), v));
+                    }
+                } else {
+                    let v =
+                        eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, e)?;
+                    fields.push((format!("f{}", fields.len() + 1), v));
+                }
             }
             Ok(Value::Record(fields))
         }
@@ -27488,11 +27522,23 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         }
         // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
         // PG's `f1`, `f2`, ... field names.
+        // v1.43: `ROW(qual.*, ...)` — PG19 expands the star into the
+        // row's field list (flat, sequential f-names), not a nested
+        // whole-row value. `wholerow_flat_values` reuses
+        // `qual_star_order`, so the `JOIN ... USING ... AS alias` quirk
+        // (alias exposes only merged keys) matches target-list `qual.*`
+        // and `eval_wholerow` exactly.
         Expr::Row(elems) => {
-            let mut fields = Vec::with_capacity(elems.len());
-            for (i, e) in elems.iter().enumerate() {
-                let v = eval_expr(q, scopes, e)?;
-                fields.push((format!("f{}", i + 1), v));
+            let mut fields = Vec::new();
+            for e in elems {
+                if let Expr::WholeRow { qual } = e {
+                    for v in wholerow_flat_values(scopes, qual)? {
+                        fields.push((format!("f{}", fields.len() + 1), v));
+                    }
+                } else {
+                    let v = eval_expr(q, scopes, e)?;
+                    fields.push((format!("f{}", fields.len() + 1), v));
+                }
             }
             Ok(Value::Record(fields))
         }
@@ -41777,6 +41823,11 @@ fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
+        // v1.43: PG19's `FigureColnameInternal` (parse_target.c,
+        // `T_RowExpr`): "make ROW() act like a function" — the column
+        // name is "row" at strength 2 (so a cast over ROW() keeps
+        // "row", like PG).
+        Expr::Row(..) => ("row".to_string(), 2),
         // v1.23: PG19's `FigureColnameInternal` for `T_A_Indirection`
         // (parse_target.c): a subscript/slice chain with no field name
         // in the indirection takes its column name from the operand, so
@@ -63598,6 +63649,164 @@ mod v140_syscols_returning_tests {
                 assert_eq!(rows.len(), 1);
                 let cells = rows.into_iter().next().unwrap().into_cells();
                 assert_eq!(cells, vec![Value::SingleChar(b'p')]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: `ROW(t.*)` expands the star into the row's field list
+    /// (flat), per PG19 — it is not a nested whole-row value. PG16:
+    /// `SELECT ROW(pj1.*) FROM pj1` → `(1,4,one)`.
+    #[test]
+    fn v143_row_star_expands_flat() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t143r (a int, b text);").unwrap();
+        run(&mut eng, "INSERT INTO t143r VALUES (1, 'x');").unwrap();
+        match run(&mut eng, "SELECT ROW(t143r.*) FROM t143r;").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(cells.len(), 1);
+                match &cells[0] {
+                    Value::Record(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].0, "f1");
+                        assert_eq!(fields[0].1, Value::Int(1));
+                        assert_eq!(fields[1].0, "f2");
+                        assert_eq!(fields[1].1, Value::Text("x".into()));
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: the corpus statement shape (join.sql:138) — an
+    /// unparenthesized `JOIN ... USING ... AS x` alias exposes only the
+    /// merged key columns, so `ROW(x.*)` is a one-field row. PG19
+    /// `expected/join.out` → `(1)`.
+    #[test]
+    fn v143_row_star_join_using_alias() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t143j1 (i int, j int);").unwrap();
+        run(&mut eng, "CREATE TABLE t143j2 (i int, k int);").unwrap();
+        run(&mut eng, "INSERT INTO t143j1 VALUES (1, 4);").unwrap();
+        run(&mut eng, "INSERT INTO t143j2 VALUES (1, -1);").unwrap();
+        match run(
+            &mut eng,
+            "SELECT ROW(x.*) FROM t143j1 JOIN t143j2 USING (i) AS x;",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(cells.len(), 1);
+                match &cells[0] {
+                    Value::Record(fields) => {
+                        assert_eq!(fields.len(), 1);
+                        assert_eq!(fields[0].0, "f1");
+                        assert_eq!(fields[0].1, Value::Int(1));
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: star fields and scalar fields share one sequential
+    /// `f1, f2, ...` namespace. PG16:
+    /// `row_to_json(ROW(pj1.*, 99))` → `{"f1":..,"f2":..,"f3":99}`.
+    #[test]
+    fn v143_row_star_mixed_with_scalar() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t143m (a int, b int);").unwrap();
+        run(&mut eng, "INSERT INTO t143m VALUES (1, 2);").unwrap();
+        match run(&mut eng, "SELECT ROW(t143m.*, 99) FROM t143m;").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                match &cells[0] {
+                    Value::Record(fields) => {
+                        assert_eq!(fields.len(), 3);
+                        assert_eq!(fields[0].0, "f1");
+                        assert_eq!(fields[1].0, "f2");
+                        assert_eq!(fields[2].0, "f3");
+                        assert_eq!(fields[2].1, Value::Int(99));
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: plain `ROW(a, b)` without a star takes the unchanged path
+    /// (regression guard).
+    #[test]
+    fn v143_row_no_star_unchanged() {
+        let mut eng = engine();
+        match run(&mut eng, "SELECT ROW(1, 'a');").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                match &cells[0] {
+                    Value::Record(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0], ("f1".to_string(), Value::Int(1)));
+                        assert_eq!(fields[1], ("f2".to_string(), Value::Text("a".into())));
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: PG19's `FigureColnameInternal` names an unaliased
+    /// `ROW(...)` output column "row" (parse_target.c, `T_RowExpr`:
+    /// "make ROW() act like a function"). join.sql:138 needs this as
+    /// well as the value fix — the runner compares column names.
+    #[test]
+    fn v143_row_colname_is_row() {
+        let mut eng = engine();
+        match run(&mut eng, "SELECT ROW(1, 2);").unwrap() {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].0, "row");
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+        // A cast over ROW() keeps "row" (strength 2), like PG16.
+        match run(&mut eng, "SELECT ROW(1, 2)::text;").unwrap() {
+            ExecResult::Select { columns, .. } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].0, "row");
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.43: a whole-row Var OUTSIDE `ROW(...)` still evaluates to a
+    /// nested composite (regression guard — `eval_wholerow` behavior
+    /// is unchanged; only `ROW(qual.*)` flattens).
+    #[test]
+    fn v143_wholerow_outside_row_still_nests() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t143w (a int, b int);").unwrap();
+        run(&mut eng, "INSERT INTO t143w VALUES (1, 2);").unwrap();
+        match run(&mut eng, "SELECT t143w FROM t143w;").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                let cells = rows.into_iter().next().unwrap().into_cells();
+                match &cells[0] {
+                    Value::Record(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].0, "a");
+                        assert_eq!(fields[1].0, "b");
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
