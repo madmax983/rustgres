@@ -11207,15 +11207,18 @@ fn plan_cte_body(
     }
 }
 
-/// v1.45: is `col` the sole column of a uniqueness guarantee on `table`?
-/// Uniqueness proof for the simple-case join removal below. Covers PRIMARY
-/// KEY and UNIQUE constraints (which temp tables enforce by column position)
-/// plus standalone unique indexes on regular tables (v0.88: expression /
-/// partial indexes are planner-invisible and never qualify).
-fn is_unique_col(
+/// v1.47: do all key columns of some uniqueness guarantee on `table` appear
+/// (case-insensitively) in `constrained`? Uniqueness proof for join removal
+/// (PG19 `relation_has_unique_index_for`, indxpath.c). Covers PRIMARY KEY
+/// and UNIQUE constraints plus standalone unique indexes that are
+/// planner-usable: unique, non-partial, plain columns (PG's "indpred ==
+/// NIL" + immediate — our constraints are all immediate; there is no
+/// DEFERRABLE support). Multi-column keys qualify only when EVERY key
+/// column is constrained by the join's equality conjuncts.
+fn table_has_unique_for(
     eng: &Engine,
     table: &str,
-    col: &str,
+    constrained: &HashSet<String>,
     snap: &Snapshot,
     own: u64,
     session: u64,
@@ -11224,20 +11227,21 @@ fn is_unique_col(
     let Some(t) = db.find_table(table, snap, &[own], session) else {
         return false;
     };
-    let single = |u: &UniqueDef| u.cols.len() == 1 && u.cols[0].eq_ignore_ascii_case(col);
-    if t.pkey.as_ref().is_some_and(single) {
+    let covers = |cols: &[String]| {
+        !cols.is_empty()
+            && cols
+                .iter()
+                .all(|c| constrained.iter().any(|x| x.eq_ignore_ascii_case(c)))
+    };
+    if t.pkey.as_ref().is_some_and(|pk| covers(&pk.cols)) {
         return true;
     }
-    if t.uniques.iter().any(single) {
+    if t.uniques.iter().any(|u| covers(&u.cols)) {
         return true;
     }
     if !db.is_temp_table(session, table) {
         for ix in db.visible_indexes_for(table, snap, &[own], session) {
-            if ix.def.unique
-                && ix.def.planner_usable
-                && ix.def.col_names.len() == 1
-                && ix.def.col_names[0].eq_ignore_ascii_case(col)
-            {
+            if ix.def.unique && ix.def.planner_usable && covers(&ix.def.col_names) {
                 return true;
             }
         }
@@ -11245,56 +11249,472 @@ fn is_unique_col(
     false
 }
 
-/// v1.45: count, over the ORIGINAL from tree, how many ON clauses
-/// reference each table qualifier. A candidate join's inner range is
-/// removable only if its qualifier occurs in exactly one ON clause — its
-/// own. (A set difference would be unsound here: an outer ON referencing
-/// the inner range must block removal, or the rewritten tree dangles.)
-fn collect_on_qual_counts(item: &FromItem, counts: &mut HashMap<String, usize>) {
-    if let FromItem::Join { left, right, on, .. } = item {
-        if let Some(o) = on {
-            let mut refs = Vec::new();
-            collect_col_refs(o, &mut refs);
-            for (t, _) in refs {
-                if let Some(t) = t {
-                    *counts.entry(t).or_insert(0) += 1;
-                }
+/// v1.47: resolve a range qualifier to its underlying table name within
+/// a FROM tree (aliases resolve to the real name; bare names stay as-is).
+fn removal_qual_table(item: &FromItem, qual: &str) -> Option<String> {
+    match item {
+        FromItem::Table { name, alias, .. } => {
+            if alias.as_deref() == Some(qual) || (alias.is_none() && name == qual) {
+                Some(name.clone())
+            } else {
+                None
             }
         }
-        collect_on_qual_counts(left, counts);
-        collect_on_qual_counts(right, counts);
+        FromItem::Join { left, right, .. } => {
+            removal_qual_table(left, qual).or_else(|| removal_qual_table(right, qual))
+        }
+        FromItem::Derived { sub, alias, .. } => {
+            if alias == qual {
+                // Derived: no single underlying table; callers that need a
+                // table type must use subquery_output_types instead.
+                None
+            } else {
+                sub.from.iter().find_map(|f| removal_qual_table(f, qual))
+            }
+        }
+        _ => None,
     }
 }
 
-/// v1.45: PG's `remove_useless_joins` (preprocess.c), restricted to the
-/// provably-safe simple case. `L LEFT JOIN R ON L.c1 = R.c2` becomes `L`
-/// alone when R is a plain table, the ON is a single explicitly-qualified
-/// `L.c1 = R.c2` equality, R.c2 is unique in R, and no other expression in
-/// the query level references R's range. The join can then neither filter
-/// nor duplicate L's rows and contributes no columns. Anything doubtful —
-/// unqualified column references, other join types, USING/NATURAL, join
-/// aliases, subquery/function inner sides — keeps the join.
-fn remove_useless_joins(
+/// v1.47: column type lookup for the join-removal type-compatibility check
+/// (PG19 `equality_ops_are_compatible`, analyzejoins.c: the join's `=` must
+/// agree with the equality the uniqueness proof relies on). `qual` is the
+/// range qualifier as written; it is resolved against `scope` (the FROM
+/// tree the qualifier is visible in) to find the real table.
+fn removal_col_type(
     eng: &Engine,
-    item: &FromItem,
+    scope: &FromItem,
+    qual: &str,
+    col: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<ColType> {
+    let table = removal_qual_table(scope, qual)?;
+    let t = eng.db.find_table(&table, snap, &[own], session)?;
+    let pos = t.column_index(col)?;
+    t.columns.get(pos).map(|(_, ty)| *ty)
+}
+
+/// v1.47: are these two types' equalities compatible for join removal? Same
+/// type is always fine; PG's integer btree opfamily gives consistent
+/// equality semantics across int2/int4/int8 (covers the corpus's
+/// `int8_tbl.q1 = int4_tbl.f1` case). Anything else fails closed.
+fn removal_types_compatible(a: ColType, b: ColType) -> bool {
+    if a == b {
+        return true;
+    }
+    let is_int = |t: &ColType| matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt);
+    is_int(&a) && is_int(&b)
+}
+
+/// v1.47: does `e` contain a subquery anywhere? Join-removal conjuncts must
+/// be plain equalities (PG's mergejoinable restriction, which implies no
+/// subplans); fail closed on `ScalarSub`/`ArraySubquery`/`InSub`/`Exists`/
+/// `Quantified`, and on any unrecognized variant.
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Exists { .. }
+        | Expr::Quantified { .. } => true,
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) | Expr::ResolvedCol { .. } => false,
+        Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Cmp {
+            left: a, right: b, ..
+        }
+        | Expr::UserOp {
+            left: a, right: b, ..
+        }
+        | Expr::IsDistinctFrom {
+            left: a, right: b, ..
+        }
+        | Expr::Concat(a, b) => expr_has_subquery(a) || expr_has_subquery(b),
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) => expr_has_subquery(x),
+        Expr::Func { args, .. } => args.iter().any(expr_has_subquery),
+        Expr::Agg { arg, arg2, .. } => {
+            arg.as_ref().is_some_and(|x| expr_has_subquery(x))
+                || arg2.as_ref().is_some_and(|x| expr_has_subquery(x))
+        }
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => expr_has_subquery(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|x| expr_has_subquery(x))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
+                || else_.as_ref().is_some_and(|x| expr_has_subquery(x))
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => expr_has_subquery(expr),
+        Expr::Row(es) => es.iter().any(expr_has_subquery),
+        Expr::ArrayCtor { elems: es, .. } => es.iter().any(expr_has_subquery),
+        _ => true,
+    }
+}
+
+/// v1.47: do all column references in `e` carry qualifiers drawn from
+/// `allowed`? Unqualified references fail closed (they could resolve to the
+/// inner range being removed), as do references to any qualifier outside
+/// `allowed` (lateral or outer-query references).
+fn expr_refs_only(e: &Expr, allowed: &HashSet<String>) -> bool {
+    let mut refs = Vec::new();
+    collect_col_refs(e, &mut refs);
+    refs.iter().all(|(t, _)| match t {
+        Some(q) => allowed.contains(q),
+        None => false,
+    })
+}
+
+/// v1.47: all range qualifiers visible in a FROM item (flattened joins via
+/// `pg_item_quals`, aliases for derived/table-function items).
+fn removal_left_quals(item: &FromItem) -> HashSet<String> {
+    pg_item_quals(item).into_iter().collect()
+}
+
+/// v1.47: map a subquery's output column names to their types where the
+/// mapping is unambiguous: single plain-table FROM with `*`/`t.*` (position
+/// mapping), or explicit select items whose expression is a plain qualified
+/// column. Used for the join-removal type-compatibility check on derived
+/// inner sides. Anything ambiguous yields no entry (fail closed downstream).
+fn subquery_output_types(
+    eng: &Engine,
+    sub: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> HashMap<String, ColType> {
+    let mut out = HashMap::new();
+    // Set-operation: output types come from the leftmost branch (PG's
+    // setop output types are determined by the left branch).
+    if let Some(root) = sub.set_op.as_ref() {
+        return subquery_output_types(eng, &root.left, snap, own, session);
+    }
+    // Single plain-table FROM?
+    let (tbl_name, tbl_cols): (String, Vec<(String, ColType)>) = match sub.from.as_slice() {
+        [FromItem::Table {
+            name, col_aliases, ..
+        }] if col_aliases.is_empty() => match eng.db.find_table(name, snap, &[own], session) {
+            Some(t) => (name.clone(), t.columns.clone()),
+            None => return out,
+        },
+        _ => return out,
+    };
+    // Helper: type of a column (qualified or unqualified) against the
+    // single FROM table.
+    let col_ty = |qt: Option<&str>, qn: &str| -> Option<ColType> {
+        match qt {
+            Some(q) if !q.eq_ignore_ascii_case(&tbl_name) => None,
+            _ => removal_col_type(eng, &sub.from[0], &tbl_name, qn, snap, own, session),
+        }
+    };
+    let mut pos = 0usize;
+    for item in &sub.items {
+        match item {
+            SelectItem::All | SelectItem::AllOf(_) => {
+                for (cn, ct) in tbl_cols.iter().skip(pos) {
+                    out.insert(cn.to_lowercase(), *ct);
+                    pos += 1;
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                let out_name = alias.clone().unwrap_or_else(|| match expr {
+                    Expr::Column { name, .. } => name.clone(),
+                    _ => String::new(),
+                });
+                if out_name.is_empty() {
+                    continue;
+                }
+                match expr {
+                    Expr::Column { table, name } => {
+                        if let Some(ct) = col_ty(table.as_deref(), name) {
+                            out.insert(out_name.to_lowercase(), ct);
+                        }
+                    }
+                    Expr::Literal(lit) => {
+                        if let Some(ct) = literal_col_type(lit) {
+                            out.insert(out_name.to_lowercase(), ct);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// v1.47: best-effort `ColType` for a literal (for the join-removal
+/// type-compatibility check on derived tables like `SELECT 1 AS x`).
+fn literal_col_type(lit: &Literal) -> Option<ColType> {
+    match lit {
+        Literal::Int(_) => Some(ColType::Int),
+        Literal::BigInt(_) => Some(ColType::BigInt),
+        Literal::SmallInt(_) => Some(ColType::SmallInt),
+        Literal::Float(_) | Literal::Decimal(_) => Some(ColType::Float),
+        Literal::Text(_) => Some(ColType::Text),
+        Literal::Bool(_) => Some(ColType::Bool),
+        _ => None,
+    }
+}
+
+/// v1.47: PG19's `query_is_distinct_for` (analyzejoins.c) for a derived
+/// inner side: can the subquery produce at most one row for each distinct
+/// combination of the `constrained` output columns? `constrained` holds
+/// the subquery's OUTPUT column names constrained by the join's equality
+/// conjuncts. Stricter than PG in one corpus-pinned case: any set-returning
+/// function in the targetlist fails closed (DISTINCT ON + SRF keeps the join
+/// in the expected output).
+fn subquery_is_distinct_for(
+    eng: &Engine,
+    sub: &SelectStmt,
+    constrained: &HashSet<String>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    if sub.set_op.is_some() {
+        return setop_is_distinct_for(eng, sub, constrained, snap, own, session);
+    }
+    if sub.from.iter().any(|f| match f {
+        FromItem::Derived { lateral, .. }
+        | FromItem::Values { lateral, .. }
+        | FromItem::Function { lateral, .. } => *lateral,
+        _ => false,
+    }) {
+        return false;
+    }
+    // Targetlist SRFs fail closed (corpus: DISTINCT ON + generate_series
+    // keeps the join, stricter than beta3's analyzejoins).
+    for item in &sub.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if expr_has_srf(eng, expr) {
+                return false;
+            }
+        }
+    }
+    // Plain DISTINCT: every DISTINCT-clause column constrained. `SELECT
+    // DISTINCT *` constrains all outputs.
+    if sub.distinct {
+        let cols = match pg_subquery_col_names(eng, sub, snap, own, session, &[]) {
+            Some(c) => c,
+            None => return false,
+        };
+        return !cols.is_empty()
+            && cols.iter().all(|c| {
+                constrained
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(c.as_str()))
+            });
+    }
+    // DISTINCT ON: every ON-expression column constrained.
+    if !sub.distinct_on.is_empty() {
+        let mut ok = true;
+        for e in &sub.distinct_on {
+            let mut refs = Vec::new();
+            collect_col_refs(e, &mut refs);
+            if refs.is_empty() {
+                ok = false;
+                break;
+            }
+            for (_, n) in refs {
+                if !constrained
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(n.as_str()))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        return ok;
+    }
+    // GROUP BY / grouping sets: our parser cross-products GROUPING SETS /
+    // ROLLUP / CUBE into `group_by: Vec<Vec<Expr>>` (and dedups DISTINCT
+    // sets), so PG's "groupDistinct OR exactly one expanded set" rule
+    // reduces to: exactly one grouping set. An empty set (`GROUP BY ()`)
+    // yields a single row.
+    if !sub.group_by.is_empty() || sub.group_by_sets {
+        if sub.group_by.len() != 1 {
+            return false;
+        }
+        let mut ok = true;
+        for e in &sub.group_by[0] {
+            let mut refs = Vec::new();
+            collect_col_refs(e, &mut refs);
+            if refs.is_empty() {
+                ok = false;
+                break;
+            }
+            for (_, n) in refs {
+                if !constrained
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(n.as_str()))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        return ok;
+    }
+    // No GROUP BY but aggregates or HAVING: at most one row (PG's
+    // "no groupClause, hasAggs or havingQual" case).
+    let has_agg = sub.items.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => expr_has_agg(expr),
+        _ => false,
+    });
+    if has_agg || sub.having.is_some() {
+        return true;
+    }
+    false
+}
+
+/// v1.47: PG19's `query_is_distinct_for` set-operation branch: every branch
+/// must be non-ALL (`UNION`/`INTERSECT`/`EXCEPT` without ALL dedups), and
+/// all non-junk output columns of each branch must be constrained.
+fn setop_is_distinct_for(
+    eng: &Engine,
+    sub: &SelectStmt,
+    constrained: &HashSet<String>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let root = match sub.set_op.as_ref() {
+        Some(r) => r,
+        None => return false,
+    };
+    // All links must be non-ALL.
+    if root.chain.iter().any(|b| b.all) {
+        return false;
+    }
+    // Every branch's non-junk outputs constrained.
+    let mut branches: Vec<&SelectStmt> = vec![&root.left];
+    for b in &root.chain {
+        branches.push(&b.right);
+    }
+    for br in branches {
+        let cols = match pg_subquery_col_names(eng, br, snap, own, session, &[]) {
+            Some(c) => c,
+            None => return false,
+        };
+        if cols.is_empty() {
+            return false;
+        }
+        if !cols.iter().all(|c| {
+            constrained
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(c.as_str()))
+        }) {
+            return false;
+        }
+    }
+    let _ = (eng, snap, own, session);
+    true
+}
+
+/// v1.47: does `e` contain an aggregate call? (For the no-GROUP-BY
+/// aggregates/HAVING single-row rule in `subquery_is_distinct_for`.)
+fn expr_has_agg(e: &Expr) -> bool {
+    match e {
+        Expr::Agg { .. } | Expr::WithinGroup { .. } => true,
+        Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Cmp {
+            left: a, right: b, ..
+        }
+        | Expr::UserOp {
+            left: a, right: b, ..
+        }
+        | Expr::IsDistinctFrom {
+            left: a, right: b, ..
+        }
+        | Expr::Concat(a, b) => expr_has_agg(a) || expr_has_agg(b),
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::Cast { expr: x, .. } => {
+            expr_has_agg(x)
+        }
+        Expr::Func { args, .. } => args.iter().any(expr_has_agg),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|x| expr_has_agg(x))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_has_agg(w) || expr_has_agg(t))
+                || else_.as_ref().is_some_and(|x| expr_has_agg(x))
+        }
+        _ => false,
+    }
+}
+
+/// v1.47: PG19's `remove_useless_joins` (analyzejoins.c) — full version.
+///
+/// A LEFT JOIN whose inner side is provably distinct on the join keys can
+/// neither duplicate nor (as a LEFT join) filter the outer side's rows, so
+/// when nothing else references the inner range the join is useless.
+///
+/// Fixpoint loop mirroring PG's `goto restart`: each iteration recomputes
+/// ON-qualifier occurrence counts over the CURRENT tree and removes exactly
+/// one provably-useless join (innermost-first), then restarts. Removing a
+/// join drops its entire ON clause — a LEFT JOIN's ON never filters its
+/// left side, so even conjuncts not touching the inner range are safe to
+/// drop with it. Chained removals (where an outer ON references an inner
+/// range that becomes unreferenced after an inner removal) fall out
+/// naturally. Counts are over the whole FROM list so a qualifier referenced
+/// by another top-level item's ON blocks removal.
+fn remove_useless_joins_from(
+    eng: &Engine,
+    from: &[FromItem],
     stmt: &SelectStmt,
     snap: &Snapshot,
     own: u64,
     session: u64,
-) -> FromItem {
-    // Occurrence counts over the ORIGINAL tree; the recursive rewrite
-    // below is bottom-up and these counts stay a sound (conservative)
-    // reference check throughout.
-    let mut on_counts = HashMap::new();
-    for it in &stmt.from {
-        collect_on_qual_counts(it, &mut on_counts);
+) -> Vec<FromItem> {
+    let mut rewritten: Vec<FromItem> = from.to_vec();
+    loop {
+        let mut on_counts = HashMap::new();
+        for it in &rewritten {
+            collect_on_qual_counts(it, &mut on_counts);
+        }
+        let mut progress = false;
+        for it in rewritten.iter_mut() {
+            if let Some(next) =
+                try_remove_one_useless_join(eng, it, stmt, &on_counts, snap, own, session)
+            {
+                *it = next;
+                progress = true;
+                break;
+            }
+        }
+        if !progress {
+            return rewritten;
+        }
     }
-    remove_useless_joins_inner(eng, item, stmt, &on_counts, snap, own, session)
 }
 
-/// v1.45: recursive worker for [`remove_useless_joins`]; see it for the
-/// safety contract.
-fn remove_useless_joins_inner(
+/// v1.47: try to remove a single useless join from `item`, innermost-first.
+/// Returns the rewritten item when one join was removed, else `None`. Only
+/// one removal per call — the fixpoint in `remove_useless_joins` restarts
+/// after each, mirroring PG's `goto restart`.
+fn try_remove_one_useless_join(
     eng: &Engine,
     item: &FromItem,
     stmt: &SelectStmt,
@@ -11302,7 +11722,7 @@ fn remove_useless_joins_inner(
     snap: &Snapshot,
     own: u64,
     session: u64,
-) -> FromItem {
+) -> Option<FromItem> {
     let FromItem::Join {
         left,
         right,
@@ -11315,181 +11735,314 @@ fn remove_useless_joins_inner(
         col_aliases,
     } = item
     else {
-        return item.clone();
+        return None;
     };
-    // Recurse first so nested joins are simplified bottom-up.
-    let left = Box::new(remove_useless_joins_inner(
-        eng, left, stmt, on_counts, snap, own, session,
-    ));
-    let right = Box::new(remove_useless_joins_inner(
-        eng, right, stmt, on_counts, snap, own, session,
-    ));
-    let rebuild = || FromItem::Join {
-        left: left.clone(),
-        right: right.clone(),
-        kind: *kind,
-        on: on.clone(),
-        using: using.clone(),
-        natural: *natural,
-        using_alias: using_alias.clone(),
-        alias: alias.clone(),
-        col_aliases: col_aliases.clone(),
+    let rebuild = |l: FromItem, r: FromItem| {
+        Some(FromItem::Join {
+            left: Box::new(l),
+            right: Box::new(r),
+            kind: *kind,
+            on: on.clone(),
+            using: using.clone(),
+            natural: *natural,
+            using_alias: using_alias.clone(),
+            alias: alias.clone(),
+            col_aliases: col_aliases.clone(),
+        })
     };
-    // Only plain `LEFT JOIN ... ON` is a candidate.
+    // Innermost-first: descend before considering this join.
+    if let Some(new_left) =
+        try_remove_one_useless_join(eng, left, stmt, on_counts, snap, own, session)
+    {
+        return rebuild(new_left, (**right).clone());
+    }
+    if let Some(new_right) =
+        try_remove_one_useless_join(eng, right, stmt, on_counts, snap, own, session)
+    {
+        return rebuild((**left).clone(), new_right);
+    }
+    // Try removing this join; success returns the bare outer side (the
+    // entire ON is dropped — a LEFT JOIN's ON never filters its left).
+    if join_is_removable(eng, item, stmt, on_counts, snap, own, session) {
+        return Some((**left).clone());
+    }
+    None
+}
+
+/// v1.47: PG19's `join_is_removable` (analyzejoins.c) — is this LEFT JOIN
+/// provably useless?
+///
+/// Requirements (all must hold):
+/// - plain `LEFT JOIN ... ON` (no USING/NATURAL/alias; v1.45+ never
+///   attempts RIGHT JOIN removal or self-join elimination).
+/// - every ANDed ON conjunct is `inner_col = outer_expr` with the inner
+///   side exactly `rqual.col` (plain column, fail closed on casts), the
+///   outer side referencing only left-subtree qualifiers (no `rqual`, no
+///   unqualified, no lateral/outer refs), and neither side volatile nor
+///   subquery-containing.
+/// - inner side is a plain table with a uniqueness guarantee (PK / UNIQUE
+///   / planner-usable unique index) covering ALL constrained key columns,
+///   with join-equality/type compatibility — or a derived table provably
+///   distinct on the constrained outputs (`subquery_is_distinct_for`).
+/// - `rqual` appears in no other ON clause (per-iteration counts over the
+///   current tree; the candidate's own ON occurrences are excluded) and in
+///   no non-FROM expression of the original statement.
+fn join_is_removable(
+    eng: &Engine,
+    item: &FromItem,
+    stmt: &SelectStmt,
+    on_counts: &HashMap<String, usize>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let FromItem::Join {
+        left,
+        right,
+        kind,
+        on,
+        using,
+        natural,
+        using_alias,
+        alias,
+        col_aliases,
+    } = item
+    else {
+        return false;
+    };
     if !matches!(kind, JoinKind::Left)
         || using_alias.is_some()
         || alias.is_some()
         || !using.is_empty()
         || *natural
+        || !col_aliases.is_empty()
     {
-        return rebuild();
+        return false;
     }
-    let on_expr = match on {
-        Some(o) => o,
-        None => return rebuild(),
+    let Some(on_expr) = on else {
+        return false;
     };
-    // Inner side must be a plain table: no derived/values/function/CTE
-    // expansion, and no column renames that would desync the uniqueness
-    // check below.
-    let (rname, ralias) = match right.as_ref() {
+
+    // Inner range qualifier + kind.
+    enum Inner<'a> {
+        Table(&'a str),
+        Derived(&'a SelectStmt),
+    }
+    let (rqual, inner) = match right.as_ref() {
         FromItem::Table {
             name,
             alias,
-            col_aliases,
+            col_aliases: rca,
             ..
         } => {
-            if !col_aliases.is_empty() {
-                return rebuild();
+            if !rca.is_empty() {
+                return false;
             }
-            (name, alias)
+            let rq = alias.clone().unwrap_or_else(|| name.clone());
+            (rq, Inner::Table(name.as_str()))
         }
-        _ => return rebuild(),
-    };
-    // Outer side must expose an unambiguous qualifier.
-    let lqual: Option<String> = match left.as_ref() {
-        FromItem::Table { name, alias, .. } => {
-            Some(alias.clone().unwrap_or_else(|| name.clone()))
+        FromItem::Derived {
+            sub,
+            alias,
+            col_aliases: rca,
+            ..
+        } => {
+            if !rca.is_empty() {
+                return false;
+            }
+            (alias.clone(), Inner::Derived(sub.as_ref()))
         }
-        FromItem::Derived { alias, .. } => Some(alias.clone()),
-        _ => None,
+        _ => return false,
     };
-    let (lqual, rqual) = match lqual {
-        Some(l) => (l, ralias.clone().unwrap_or_else(|| rname.clone())),
-        None => return rebuild(),
-    };
-    // The ON must be exactly `lqual.c1 = rqual.c2` (either order), with
-    // explicit qualification on both sides (an unqualified column could
-    // resolve to either side; staying conservative).
-    let inner_col = match on_expr {
-        Expr::Cmp {
+
+    // Qualifiers visible on the left (for the outer-side check).
+    let left_quals = removal_left_quals(left);
+
+    // Collect the usable `inner_col = outer_expr` equalities (PG's
+    // mergejoinable clause_list). Conjuncts that are not usable equalities
+    // (e.g. `t2.id = t3.id`, which does not touch the inner range) are
+    // simply dropped with the ON -- a LEFT JOIN's ON never filters its left
+    // side, so they cannot affect the removal's safety.
+    let mut constrained: HashSet<String> = HashSet::new();
+    // (inner col name, outer-side type) per usable conjunct, for the
+    // type-compatibility check.
+    let mut conjunct_types: Vec<(String, Option<ColType>)> = Vec::new();
+    for c in split_conjuncts(on_expr) {
+        let Expr::Cmp {
             op: CmpOp::Eq,
             left: a,
             right: b,
-        } => match (&**a, &**b) {
-            (
-                Expr::Column {
-                    table: Some(t1),
-                    name: _,
-                },
-                Expr::Column {
-                    table: Some(t2),
-                    name: n2,
-                },
-            ) if t1 == &lqual && t2 == &rqual => n2,
+        } = c
+        else {
+            continue;
+        };
+        if expr_is_volatile(&eng.db, a)
+            || expr_is_volatile(&eng.db, b)
+            || expr_has_subquery(a)
+            || expr_has_subquery(b)
+        {
+            continue;
+        }
+        // One side exactly `rqual.col`; the other side outer-only.
+        let (inner_col, outer): (&str, &Expr) = match (&**a, &**b) {
             (
                 Expr::Column {
                     table: Some(t1),
                     name: n1,
                 },
+                other,
+            ) if t1 == &rqual => (n1.as_str(), other),
+            (
+                other,
                 Expr::Column {
                     table: Some(t2),
-                    name: _,
+                    name: n2,
                 },
-            ) if t1 == &rqual && t2 == &lqual => n1,
-            _ => return rebuild(),
-        },
-        _ => return rebuild(),
-    };
-    // The inner join column must be unique: at most one R row per L row,
-    // so the join can neither duplicate nor (as a LEFT join) filter L.
-    if !is_unique_col(eng, rname.as_str(), inner_col, snap, own, session) {
-        return rebuild();
+            ) if t2 == &rqual => (n2.as_str(), other),
+            _ => continue,
+        };
+        if !expr_refs_only(outer, &left_quals) {
+            continue;
+        }
+        // Outer-side type for the compatibility check (simple qualified
+        // columns only, resolved against the left subtree; anything else
+        // fails closed below).
+        let outer_ty = match outer {
+            Expr::Column {
+                table: Some(qt),
+                name: qn,
+            } => removal_col_type(eng, left, qt, qn, snap, own, session),
+            _ => None,
+        };
+        constrained.insert(inner_col.to_string());
+        conjunct_types.push((inner_col.to_string(), outer_ty));
     }
-    // Nothing else may reference the inner range: not the SELECT list,
-    // WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT ON, FOR UPDATE OF, nor
-    // any other join's ON clause. (This join's own ON is the single
-    // equality above.) Any unqualified column reference is grounds to
-    // keep the join — it could resolve to the inner range.
-    let mut quals = HashSet::new();
-    let mut unqualified = false;
-    // (Helper closure inlined per call site: `add_expr` would borrow
-    // `quals`/`unqualified` mutably and conflict with the direct inserts.)
-    for it in &stmt.items {
-        match it {
-            // `SELECT *` needs every range's columns: never removable.
-            SelectItem::All => return rebuild(),
-            SelectItem::AllOf(q) => {
-                quals.insert(q.clone());
-            }
-            SelectItem::Expr { expr, .. } => {
-                let mut refs = Vec::new();
-                collect_col_refs(expr, &mut refs);
-                for (t, _) in refs {
-                    match t {
-                        Some(t) => {
-                            quals.insert(t);
+    if constrained.is_empty() {
+        return false;
+    }
+
+    // Type compatibility: the join's `=` must agree with the equality the
+    // uniqueness proof relies on (PG's `equality_ops_are_compatible`).
+    match &inner {
+        Inner::Table(rname) => {
+            for (col, outer_ty) in &conjunct_types {
+                let inner_ty =
+                    removal_col_type(eng, right, rqual.as_str(), col, snap, own, session);
+                match (inner_ty, outer_ty) {
+                    (Some(it), Some(ot)) => {
+                        if !removal_types_compatible(it, *ot) {
+                            return false;
                         }
-                        None => unqualified = true,
                     }
+                    _ => return false,
                 }
+            }
+            if !table_has_unique_for(eng, rname, &constrained, snap, own, session) {
+                return false;
+            }
+        }
+        Inner::Derived(sub) => {
+            let out_types = subquery_output_types(eng, sub, snap, own, session);
+            for (col, outer_ty) in &conjunct_types {
+                let inner_ty = out_types.get(&col.to_lowercase()).copied();
+                match (inner_ty, outer_ty) {
+                    (Some(it), Some(ot)) => {
+                        if !removal_types_compatible(it, *ot) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            if !subquery_is_distinct_for(eng, sub, &constrained, snap, own, session) {
+                return false;
             }
         }
     }
-    let add_expr = |e: &Expr, quals: &mut HashSet<String>, unqualified: &mut bool| {
+
+    // `rqual` must occur in no ON other than this join's own. Count this
+    // ON's occurrences of `rqual` and require the tree-wide total to match.
+    let mut own_refs = Vec::new();
+    collect_col_refs(on_expr, &mut own_refs);
+    let own_on_count = own_refs
+        .iter()
+        .filter(|(t, _)| t.as_deref() == Some(rqual.as_str()))
+        .count();
+    if on_counts.get(&rqual).copied().unwrap_or(0) != own_on_count {
+        return false;
+    }
+
+    // Non-FROM expressions of the original statement: `rqual` must appear
+    // nowhere, and no unqualified references (fail closed). `SELECT *`
+    // expands to the inner range's columns too, so it blocks removal;
+    // `t.*` blocks only when `t` is the inner range itself.
+    if stmt.items.iter().any(|item2| match item2 {
+        SelectItem::Expr { .. } => false,
+        SelectItem::All => true,
+        SelectItem::AllOf(q) => q == &rqual,
+    }) {
+        return false;
+    }
+    let mut quals = HashSet::new();
+    let mut unqualified = false;
+    let mut push = |e: &Expr| {
         let mut refs = Vec::new();
         collect_col_refs(e, &mut refs);
         for (t, _) in refs {
             match t {
-                Some(t) => {
-                    quals.insert(t);
+                Some(q) => {
+                    quals.insert(q.clone());
                 }
-                None => *unqualified = true,
+                None => unqualified = true,
             }
         }
     };
-    if let Some(w) = &stmt.where_ {
-        add_expr(w, &mut quals, &mut unqualified);
-    }
-    for gs in &stmt.group_by {
-        for g in gs {
-            add_expr(g, &mut quals, &mut unqualified);
+    for item2 in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item2 {
+            push(expr);
         }
     }
+    if let Some(w) = &stmt.where_ {
+        push(w);
+    }
+    for g in stmt.group_by.iter().flatten() {
+        push(g);
+    }
     if let Some(h) = &stmt.having {
-        add_expr(h, &mut quals, &mut unqualified);
+        push(h);
     }
-    for o in &stmt.order_by {
-        add_expr(&o.expr, &mut quals, &mut unqualified);
+    if unqualified || quals.contains(&rqual) {
+        return false;
     }
-    for d in &stmt.distinct_on {
-        add_expr(d, &mut quals, &mut unqualified);
-    }
-    for f in &stmt.for_update_of {
-        quals.insert(f.clone());
-    }
-    // The inner range must be referenced nowhere else. Non-FROM
-    // expressions were collected above; for ON clauses, the qualifier must
-    // occur in exactly one ON — this join's own (checked structurally
-    // above to be precisely `lqual.c1 = rqual.c2`, so the single
-    // occurrence is the expected one). Any other ON referencing it blocks
-    // removal, otherwise the rewritten tree would dangle.
-    if unqualified || quals.contains(&rqual) || on_counts.get(&rqual).unwrap_or(&0) != &1 {
-        return rebuild();
-    }
-    // Safe: the join contributes nothing. Return the outer side alone.
-    (*left).clone()
+
+    true
 }
 
+fn collect_on_qual_counts(item: &FromItem, counts: &mut HashMap<String, usize>) {
+    match item {
+        FromItem::Join {
+            on, left, right, ..
+        } => {
+            if let Some(e) = on {
+                let mut refs = Vec::new();
+                collect_col_refs(e, &mut refs);
+                for (t, _) in refs {
+                    if let Some(q) = t {
+                        *counts.entry(q.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            collect_on_qual_counts(left, counts);
+            collect_on_qual_counts(right, counts);
+        }
+        FromItem::Derived { sub, .. } => {
+            for f in &sub.from {
+                collect_on_qual_counts(f, counts);
+            }
+        }
+        _ => {}
+    }
+}
 fn plan_from_item(
     eng: &Engine,
     item: &FromItem,
@@ -12441,17 +12994,14 @@ fn plan_select(
     let mut eff: Vec<CteDef> = outer_ctes.to_vec();
     eff.extend(stmt.with.iter().cloned());
     let ctes: &[CteDef] = &eff;
-    // v1.45: PG `remove_useless_joins` (simple LEFT JOIN case) as a
+    // v1.47: PG `remove_useless_joins` (analyzejoins.c, full) as a fixpoint
     // preprocess rewrite of the FROM tree, mirroring PG's planner ordering:
     // before name/type context construction and WHERE distribution below.
     // The reference checks run against the original statement.
     let stmt_owned;
     let stmt: &SelectStmt = {
-        let rewritten: Vec<FromItem> = stmt
-            .from
-            .iter()
-            .map(|it| remove_useless_joins(eng, it, stmt, snap, own, session))
-            .collect();
+        let rewritten: Vec<FromItem> =
+            remove_useless_joins_from(eng, &stmt.from, stmt, snap, own, session);
         if rewritten.iter().zip(stmt.from.iter()).all(|(a, b)| a == b) {
             stmt
         } else {
@@ -65104,14 +65654,14 @@ mod v145_join_removal_tests {
             let lines = plan_lines(&mut eng, sql);
             assert_eq!(lines, vec!["Seq Scan on a".to_string()], "{sql}");
         }
-        // Chained join whose outer ON references the inner range: the inner
-        // join must be kept (removing it would dangle b.c_id). Conservative
-        // and sound; PG removes the c-join here, which is future work.
+        // v1.47: chained removal (PG's `goto restart` fixpoint). The
+        // c-join is removed first (its ON's b.c_id reference becomes
+        // unreferenced), then the b-join goes too.
         let lines = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON b.c_id = c.id",
         );
-        assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        assert_eq!(lines, vec!["Seq Scan on a".to_string()], "{lines:?}");
     }
 
     #[test]
@@ -65184,6 +65734,219 @@ mod v145_join_removal_tests {
         assert!(!lines.is_empty());
     }
 }
+
+#[cfg(test)]
+mod v147_join_removal_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for sql in [
+            "CREATE TEMP TABLE a (id int PRIMARY KEY, b_id int)",
+            "CREATE TEMP TABLE b (id int PRIMARY KEY, c_id int)",
+            "CREATE TEMP TABLE c (id int PRIMARY KEY)",
+            "CREATE TEMP TABLE d (a int, b int)",
+            "CREATE TEMP TABLE e (id1 int, id2 int, PRIMARY KEY (id1, id2))",
+            "CREATE TEMP TABLE int8_tbl (q1 bigint)",
+            "CREATE TEMP TABLE int4_tbl (f1 int)",
+            "INSERT INTO a VALUES (1, 1), (2, NULL)",
+            "INSERT INTO b VALUES (1, 10), (2, 20)",
+            "INSERT INTO c VALUES (1), (2)",
+            "INSERT INTO d VALUES (1, 10), (2, 20), (99, 99)",
+            "INSERT INTO e VALUES (1, 10), (2, 20)",
+            "INSERT INTO int8_tbl VALUES (1), (2)",
+            "INSERT INTO int4_tbl VALUES (1), (2)",
+        ] {
+            run(eng, sql).unwrap();
+        }
+    }
+
+    fn assert_seq_scan(eng: &mut Engine, sql: &str, expected: &str) {
+        let lines = plan_lines(eng, sql);
+        assert_eq!(lines, vec![expected.to_string()], "{sql}");
+    }
+
+    #[test]
+    fn v147_fixpoint_chained_removal() {
+        // v1.47: PG's `goto restart` fixpoint — inner removals unlock outer ones.
+        let mut eng = engine();
+        setup(&mut eng);
+        // #1: (b ⋉ c) inner join removed, then the outer b-join.
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN (b left join c on b.c_id = c.id) ON (a.b_id = b.id)",
+            "Seq Scan on a",
+        );
+        // #2: e-join (multi-column PK) removed, then b-join.
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN e ON e.id1 = a.b_id AND b.c_id = e.id2",
+            "Seq Scan on a",
+        );
+        // #5: t4 removed (whole ON dropped, including the t2.id=t3.id conjunct
+        // that was LEFT-JOIN-scoped and never filtered).
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select 1 from a t1 left join a t2 on true inner join a t3 on true left join a t4 on t2.id = t4.id and t2.id = t3.id",
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("t4")),
+            "t4 should be gone: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn v147_oddly_nested() {
+        // v1.47: the corpus's oddly-nested cases.
+        let mut eng = engine();
+        setup(&mut eng);
+        // #3: a4 removed, then a3; a1⋉a2 (on true) stays.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select a1.id from (a a1 left join a a2 on true) left join (a a3 left join a a4 on a3.id = a4.id) on a2.id = a3.id",
+        );
+        assert_eq!(lines.len(), 3, "{lines:?}"); // Nested Loop + 2 Seq Scans
+        assert!(lines[0].contains("Nested Loop"), "{lines:?}");
+        // #4: all the way down to a bare Seq Scan.
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select a1.id from (a a1 left join a a2 on a1.id = a2.id) left join (a a3 left join a a4 on a3.id = a4.id) on a2.id = a3.id",
+            "Seq Scan on a a1",
+        );
+    }
+
+    #[test]
+    fn v147_subquery_proofs() {
+        // v1.47: derived-table distinctness proofs.
+        let mut eng = engine();
+        setup(&mut eng);
+        // #6: GROUP BY b.id, b.c_id — both constrained.
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT * FROM b GROUP BY b.id, b.c_id) s ON d.a = s.id AND d.b = s.c_id",
+            "Seq Scan on d",
+        );
+        // #7-#10: single empty grouping set (various spellings).
+        for sql in [
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT 1 AS x FROM b GROUP BY ()) s ON d.a = s.x",
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT 1 AS x FROM b GROUP BY GROUPING SETS (())) s ON d.a = s.x",
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT 1 AS x FROM b GROUP BY GROUPING SETS (()), GROUPING SETS (())) s ON d.a = s.x",
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT 1 AS x FROM b GROUP BY DISTINCT GROUPING SETS ((), ())) s ON d.a = s.x",
+        ] {
+            assert_seq_scan(&mut eng, sql, "Seq Scan on d");
+        }
+        // #11: plain DISTINCT, all outputs constrained.
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT DISTINCT * FROM b) s ON d.a = s.id AND d.b = s.c_id",
+            "Seq Scan on d",
+        );
+        // #12: UNION (not ALL).
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT id FROM a UNION SELECT id FROM b) s ON d.a = s.id",
+            "Seq Scan on d",
+        );
+        // #13: GROUP BY + cross-type = (int8 = int4 family agreement).
+        assert_seq_scan(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT i8.* FROM int8_tbl i8 LEFT JOIN (SELECT f1 FROM int4_tbl GROUP BY f1) i4 ON i8.q1 = i4.f1",
+            "Seq Scan on int8_tbl i8",
+        );
+    }
+
+    #[test]
+    fn v147_negatives_stay_kept() {
+        // v1.47: PG keeps these; we must too.
+        let mut eng = engine();
+        setup(&mut eng);
+        for sql in [
+            // `on true`: no usable equality.
+            "EXPLAIN (COSTS OFF) SELECT a1.* FROM a a1 LEFT JOIN a a2 ON true",
+            // Non-equi condition.
+            "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id > b.id",
+            // GROUP BY with an unconstrained column.
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT b.id, b.c_id FROM b GROUP BY b.id, b.c_id) s ON d.a = s.id",
+            // UNION ALL does not dedup.
+            "EXPLAIN (COSTS OFF) SELECT d.* FROM d LEFT JOIN (SELECT id FROM a UNION ALL SELECT id FROM b) s ON d.a = s.id",
+            // Inner range referenced in SELECT.
+            "EXPLAIN (COSTS OFF) SELECT d.*, s.id FROM d LEFT JOIN (SELECT DISTINCT id FROM b) s ON d.a = s.id",
+        ] {
+            let lines = plan_lines(&mut eng, sql);
+            assert!(
+                lines.iter().any(|l| l.contains("Nested Loop") || l.contains("Hash")),
+                "should keep the join: {sql} -> {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v147_result_identity() {
+        // v1.47: removal must not change query results (non-EXPLAIN).
+        let mut eng = engine();
+        setup(&mut eng);
+        let cases = [
+            "SELECT a.* FROM a LEFT JOIN (b left join c on b.c_id = c.id) ON (a.b_id = b.id) ORDER BY a.id",
+            "SELECT d.* FROM d LEFT JOIN (SELECT * FROM b GROUP BY b.id, b.c_id) s ON d.a = s.id AND d.b = s.c_id ORDER BY d.a",
+            "SELECT d.* FROM d LEFT JOIN (SELECT DISTINCT * FROM b) s ON d.a = s.id AND d.b = s.c_id ORDER BY d.a",
+        ];
+        for sql in cases {
+            let rows = match run(&mut eng, sql).unwrap() {
+                ExecResult::Select { rows, .. } => rows,
+                other => panic!("expected SELECT, got {other:?}"),
+            };
+            // d has (1,10),(2,20),(99,99); b has (1,10),(2,20): the (99,99)
+            // row survives with NULLs, others match.
+            assert!(!rows.is_empty(), "{sql}");
+        }
+        // Spot-check exact rows for the GROUP BY case.
+        let rows = match run(
+            &mut eng,
+            "SELECT d.a, d.b FROM d LEFT JOIN (SELECT * FROM b GROUP BY b.id, b.c_id) s ON d.a = s.id AND d.b = s.c_id ORDER BY d.a",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 3);
+    }
+}
+
 
 #[cfg(test)]
 mod v146_verbose_output_tests {
