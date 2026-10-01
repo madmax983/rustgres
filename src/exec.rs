@@ -11020,6 +11020,15 @@ enum PlanNode {
         // v1.46: VERBOSE `Output:` targetlist entries (PG19
         // `show_plan_tlist`). Empty == PG's NIL == no Output line.
         output: Vec<String>,
+        // v1.49: PG19 const-false dummy rel (joinrels.c
+        // `restriction_is_constant_false`, "constant NULL is as good as
+        // constant FALSE", joinrels.c:1580-1582). Renders
+        // `One-Time Filter: false` (explain.c:2253-2255) and, when
+        // `replaces` is `Some`, `Replaces: ...` (explain.c
+        // `show_result_replacement_info`). Set only on the EXPLAIN
+        // (COSTS OFF) plan path; the executor never sees it.
+        one_time_filter: bool,
+        replaces: Option<String>,
     },
     SeqScan {
         table: String,
@@ -11788,6 +11797,61 @@ fn expr_has_agg(e: &Expr) -> bool {
     }
 }
 
+/// v1.49: PG19 `reduce_outer_joins` (prepjointree.c, pass 2) eliminates
+/// JOIN_RIGHT by flipping it to JOIN_LEFT with swapped inputs:
+/// "We get rid of JOIN_RIGHT cases by flipping them around to become
+/// JOIN_LEFT." The ON clause is carried over unmodified — PG quals reference
+/// base rels by RT index, not side position, so nothing is commuted.
+/// Applied to the top-level FROM list before `remove_useless_joins_from`,
+/// mirroring PG's pass order (planner() runs reduce_outer_joins before
+/// grouping_planner/remove_useless_joins). Subqueries are flipped by their
+/// own `plan_select` invocation, so this does not recurse into Derived.
+fn flip_right_joins(from: &[FromItem]) -> Vec<FromItem> {
+    from.iter().map(flip_right_join_item).collect()
+}
+
+fn flip_right_join_item(it: &FromItem) -> FromItem {
+    match it {
+        FromItem::Join {
+            left,
+            kind,
+            right,
+            on,
+            using,
+            natural,
+            using_alias,
+            alias,
+            col_aliases,
+        } => {
+            let (new_left, new_kind, new_right) = if *kind == JoinKind::Right {
+                (
+                    flip_right_join_item(right),
+                    JoinKind::Left,
+                    flip_right_join_item(left),
+                )
+            } else {
+                (
+                    flip_right_join_item(left),
+                    *kind,
+                    flip_right_join_item(right),
+                )
+            };
+            FromItem::Join {
+                left: Box::new(new_left),
+                kind: new_kind,
+                right: Box::new(new_right),
+                on: on.clone(),
+                using: using.clone(),
+                natural: *natural,
+                using_alias: using_alias.clone(),
+                alias: alias.clone(),
+                col_aliases: col_aliases.clone(),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 /// v1.47: PG19's `remove_useless_joins` (analyzejoins.c) — full version.
 ///
 /// A LEFT JOIN whose inner side is provably distinct on the join keys can
@@ -12543,6 +12607,100 @@ fn plan_from_item(
             natural,
             ..
         } => {
+            // v1.49: PG19 const-false JOIN qual (joinrels.c:1090-1121,
+            // `restriction_is_constant_false`). An ON clause folding to
+            // FALSE-or-NULL makes the joinrel dummy (INNER/CROSS: the
+            // whole join plans as a bare `Result`) or the inner rel
+            // dummy (LEFT: the inner side plans as a `Result` with
+            // `One-Time Filter: false`, the join keeps a
+            // `Join Filter: false` / `Join Filter: NULL::boolean`).
+            // JOIN_FULL is never dummy (both sides must be emitted);
+            // JOIN_RIGHT was already flipped to LEFT above.
+            // EXPLAIN-path only (`pctx.is_some()`); execution still
+            // evaluates the ON clause normally.
+            if pctx.is_some() {
+                if let Some(on_expr) = on {
+                    if pg_is_const_false(on_expr) {
+                        let null_qual =
+                            matches!(pg_fold_bool_const(on_expr), Some(None));
+                        match kind {
+                            JoinKind::Inner | JoinKind::Cross => {
+                                let mut names = Vec::new();
+                                pg_replaces_names(
+                                    std::slice::from_ref(left),
+                                    &mut names,
+                                );
+                                pg_replaces_names(
+                                    std::slice::from_ref(right),
+                                    &mut names,
+                                );
+                                let replaces = if names.len() == 1 {
+                                    format!("Scan on {}", names[0])
+                                } else {
+                                    format!("Join on {}", names.join(", "))
+                                };
+                                return Ok(PlanNode::Result {
+                                    rows: 1,
+                                    filter: None,
+                                    output: Vec::new(),
+                                    one_time_filter: true,
+                                    replaces: Some(replaces),
+                                });
+                            }
+                            JoinKind::Left => {
+                                let outer = plan_from_item(
+                                    eng,
+                                    left,
+                                    None,
+                                    snap,
+                                    own,
+                                    session,
+                                    ctes,
+                                    pctx,
+                                    stmt,
+                                )?;
+                                let mut inames = Vec::new();
+                                pg_replaces_names(
+                                    std::slice::from_ref(right),
+                                    &mut inames,
+                                );
+                                let ireplaces = if inames.len() == 1 {
+                                    format!("Scan on {}", inames[0])
+                                } else {
+                                    format!("Join on {}", inames.join(", "))
+                                };
+                                let inner = PlanNode::Result {
+                                    rows: 1,
+                                    filter: None,
+                                    output: Vec::new(),
+                                    one_time_filter: true,
+                                    replaces: Some(ireplaces),
+                                };
+                                // v1.46: VERBOSE `Output:` — the join's
+                                // tlist starts as the concatenation of
+                                // its inputs' (the dummy inner
+                                // contributes none here).
+                                let output = outer.output().to_vec();
+                                let rows = outer.rows();
+                                return Ok(PlanNode::NestedLoop {
+                                    filter: None,
+                                    join_filter: Some(if null_qual {
+                                        "NULL::boolean".to_string()
+                                    } else {
+                                        "false".to_string()
+                                    }),
+                                    rows,
+                                    outer: Box::new(outer),
+                                    inner: Box::new(inner),
+                                    kind: *kind,
+                                    output,
+                                });
+                            }
+                            JoinKind::Right | JoinKind::Full => {}
+                        }
+                    }
+                }
+            }
             // v1.08: in PG-text mode the join's WHERE slice is split
             // between the inputs; the ON clause (inner joins only)
             // becomes the Join Filter. USING/NATURAL and outer joins
@@ -13065,6 +13223,9 @@ fn pg_from_item_star_cols(
 fn pg_top_select_output(
     eng: &Engine,
     stmt: &SelectStmt,
+    // v1.49: pre-flip FROM tree — bare `SELECT *` expands in PG's written
+    // column order (the query targetlist), not the flipped physical order.
+    orig_from: &[FromItem],
     snap: &Snapshot,
     own: u64,
     session: u64,
@@ -13078,7 +13239,7 @@ fn pg_top_select_output(
             // Whole-row refs have no per-column spelling modeled here.
             SelectItem::Expr { expr, .. } => out.push(pg_expr_text(expr, px, qualify)?),
             SelectItem::All => {
-                for it in &stmt.from {
+                for it in orig_from {
                     out.extend(pg_from_item_star_cols(
                         eng, it, qualify, snap, own, session, ctes,
                     )?);
@@ -13104,6 +13265,110 @@ fn pg_top_select_output(
     Some(out)
 }
 
+// ============================================================================
+// v1.49: PG19 const-false dummy rels for EXPLAIN plan shapes.
+//
+// PG19 reference:
+// - `eval_const_expressions` (optimizer/util/clauses.c) folds the WHERE /
+//   JOIN ON clause; a top-level qual that is a FALSE-or-NULL Const makes
+//   the rel dummy.
+// - `restriction_is_constant_false` (optimizer/path/joinrels.c:1547-1588):
+//   "A restriction clause is constant FALSE if it is a Const of the
+//   wrong value ... constant NULL is as good as constant FALSE for our
+//   purposes" (joinrels.c:1580-1582). For JOIN_INNER/JOIN_SEMI the whole
+//   joinrel becomes dummy; for JOIN_LEFT/JOIN_ANTI with a non-pushed-down
+//   false qual the inner rel becomes dummy (joinrels.c:1096-1121);
+//   JOIN_FULL is never dummy.
+// - The dummy rel plans as a bare `Result` with `One-Time Filter: false`
+//   (optimizer/plan/createplan.c `make_result`), and EXPLAIN renders
+//   `Replaces: <Scan|Join> on ...` for it (commands/explain.c
+//   `show_result_replacement_info`, explain.c:5051-5064; skipped only for
+//   a single RTE_RESULT, explain.c:5048-5059).
+//
+// Conservative by design: only the boolean skeleton (literals, NULL,
+// NOT/AND/OR over foldable operands) is folded. Comparisons, function
+// calls, and vars are NEVER folded here, so the v0.55 no-plan-time-folding
+// discipline (e.g. `1/0` in a CASE arm) stays intact. EXPLAIN-path only:
+// the executor evaluates WHERE/ON normally, so execution semantics are
+// untouched.
+
+/// Fold a boolean expression to a constant. `Some(Some(b))` = provably
+/// `b`; `Some(None)` = provably NULL; `None` = not foldable.
+fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
+    match e {
+        Expr::Literal(Literal::Bool(b)) => Some(Some(*b)),
+        Expr::Literal(Literal::Null) => Some(None),
+        Expr::Not(x) => match pg_fold_bool_const(x) {
+            Some(Some(b)) => Some(Some(!b)),
+            Some(None) => Some(None),
+            None => None,
+        },
+        Expr::And(l, r) => match (pg_fold_bool_const(l), pg_fold_bool_const(r)) {
+            (Some(a), Some(b)) => Some(match (a, b) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            }),
+            _ => None,
+        },
+        Expr::Or(l, r) => match (pg_fold_bool_const(l), pg_fold_bool_const(r)) {
+            (Some(a), Some(b)) => Some(match (a, b) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// PG19 `restriction_is_constant_false` for EXPLAIN plan shapes: true
+/// when the qual folds to a FALSE-or-NULL Const.
+fn pg_is_const_false(e: &Expr) -> bool {
+    matches!(pg_fold_bool_const(e), Some(v) if v != Some(true))
+}
+
+/// User-facing RTE names for PG19 `Replaces:` (explain.c
+/// `explain_result_replacement`: the RTE's `eref->aliasname` — the alias
+/// when present, else the relation name; JOIN RTEs contribute their
+/// inputs' names, mirroring the dummy rel's relids).
+fn pg_replaces_names(items: &[FromItem], out: &mut Vec<String>) {
+    for it in items {
+        match it {
+            FromItem::Table { name, alias, .. } => {
+                out.push(alias.clone().unwrap_or_else(|| name.clone()))
+            }
+            FromItem::Derived { alias, .. } => out.push(alias.clone()),
+            FromItem::Values { alias, .. } => out.push(alias.clone()),
+            FromItem::Function { name, alias, .. } => {
+                out.push(alias.clone().unwrap_or_else(|| name.clone()))
+            }
+            FromItem::Join { left, right, .. } => {
+                pg_replaces_names(std::slice::from_ref(left), out);
+                pg_replaces_names(std::slice::from_ref(right), out);
+            }
+        }
+    }
+}
+
+/// PG19 `Replaces:` text for a dummy rel (explain.c:5051-5064):
+/// `Scan on <rel>` for a single RTE, `Join on <a>, <b>, ...` for more.
+/// `None` when there is no FROM (a Result over an empty FROM clause
+/// prints no `Replaces:`, explain.c:5048-5059).
+fn pg_result_replaces(from: &[FromItem]) -> Option<String> {
+    if from.is_empty() {
+        return None;
+    }
+    let mut names = Vec::new();
+    pg_replaces_names(from, &mut names);
+    if names.len() == 1 {
+        Some(format!("Scan on {}", names[0]))
+    } else {
+        Some(format!("Join on {}", names.join(", ")))
+    }
+}
+
 fn plan_select(
     eng: &Engine,
     stmt: &SelectStmt,
@@ -13126,11 +13391,19 @@ fn plan_select(
     // preprocess rewrite of the FROM tree, mirroring PG's planner ordering:
     // before name/type context construction and WHERE distribution below.
     // The reference checks run against the original statement.
+    //
+    // v1.49: PG19 `reduce_outer_joins` (prepjointree.c) runs before
+    // remove_useless_joins, flipping JOIN_RIGHT to JOIN_LEFT with swapped
+    // inputs (ON clause unmodified). `orig_from` is the pre-flip tree, kept
+    // so VERBOSE top-level `Output:` for bare `SELECT *` shows PG's written
+    // column order (the query targetlist), not the flipped physical order.
+    let orig_from: Vec<FromItem> = stmt.from.clone();
     let stmt_owned;
     let stmt: &SelectStmt = {
+        let flipped: Vec<FromItem> = flip_right_joins(&stmt.from);
         let rewritten: Vec<FromItem> =
-            remove_useless_joins_from(eng, &stmt.from, stmt, snap, own, session);
-        if rewritten.iter().zip(stmt.from.iter()).all(|(a, b)| a == b) {
+            remove_useless_joins_from(eng, &flipped, stmt, snap, own, session);
+        if rewritten == stmt.from {
             stmt
         } else {
             stmt_owned = SelectStmt {
@@ -13184,18 +13457,49 @@ fn plan_select(
     // legacy mode; unfaithful entries omit the whole line.
     let top_output = || -> Vec<String> {
         match pctx {
-            Some(px) => {
-                pg_top_select_output(eng, stmt, snap, own, session, ctes, px).unwrap_or_default()
-            }
+            Some(px) => pg_top_select_output(
+                eng,
+                stmt,
+                &orig_from,
+                snap,
+                own,
+                session,
+                ctes,
+                px,
+            )
+            .unwrap_or_default(),
             None => Vec::new(),
         }
     };
+    // v1.49: PG19 const-false top-level qual (joinrels.c
+    // `restriction_is_constant_false`): a WHERE folding to FALSE-or-NULL
+    // makes the whole rel dummy, planned as a bare `Result` with
+    // `One-Time Filter: false` (+ `Replaces:`). EXPLAIN-path only
+    // (`pg`); execution still evaluates the WHERE normally, so a wrong
+    // fold here can only misrender a plan, never misexecute a query.
+    if pg {
+        if let Some(w) = &stmt.where_ {
+            if pg_is_const_false(w) {
+                return Ok(PlanNode::Result {
+                    rows: 1,
+                    filter: None,
+                    // v1.46: VERBOSE `Output:` — the select list deparsed.
+                    output: top_output(),
+                    one_time_filter: true,
+                    replaces: pg_result_replaces(&stmt.from),
+                });
+            }
+        }
+    }
     let mut node = if stmt.from.is_empty() {
         PlanNode::Result {
             rows: 1,
             filter: None,
             // v1.46: VERBOSE `Output:` — the select list deparsed.
             output: top_output(),
+            // v1.49: no FROM, no dummy — plain Result.
+            one_time_filter: false,
+            replaces: None,
         }
     } else if stmt.from.len() == 1 {
         if matches!(&stmt.from[0], FromItem::Table { .. }) {
@@ -13500,7 +13804,9 @@ fn plan_select(
     // inputs' entries when the targetlist has no faithful spelling.
     if pg && matches!(node, PlanNode::NestedLoop { .. }) {
         if let Some(px) = pctx {
-            if let Some(sel) = pg_top_select_output(eng, stmt, snap, own, session, ctes, px) {
+            if let Some(sel) =
+                pg_top_select_output(eng, stmt, &orig_from, snap, own, session, ctes, px)
+            {
                 node.set_output(sel);
             }
         }
@@ -13540,9 +13846,24 @@ fn render_plan(
         }
     };
     match node {
-        PlanNode::Result { filter, .. } => {
+        PlanNode::Result {
+            filter,
+            one_time_filter,
+            replaces,
+            ..
+        } => {
             out.push(format!("{pad}Result"));
             push_output(out);
+            // v1.49: PG19 `Replaces:` (explain.c
+            // `show_result_replacement_info`) then `One-Time Filter:`
+            // (explain.c:2249-2256: replacement info, then the
+            // `resconstantqual` as One-Time Filter, then `Filter:`).
+            if let Some(r) = replaces {
+                out.push(format!("{ppad}Replaces: {r}"));
+            }
+            if *one_time_filter {
+                out.push(format!("{ppad}One-Time Filter: false"));
+            }
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
             }
@@ -66250,6 +66571,9 @@ mod v148_join_label_materialize_tests {
 
     /// v1.48: single-row outers never materialize (no rescan can happen),
     /// and right/full joins get PG's labels.
+    /// v1.49: PG19 `reduce_outer_joins` flips RIGHT to LEFT in the planner,
+    /// so the plan label is now `Nested Loop Left Join` (PG never emits a
+    /// Right-join plan label post-flip).
     #[test]
     fn single_row_outer_not_materialized() {
         let mut eng = engine();
@@ -66269,7 +66593,7 @@ mod v148_join_label_materialize_tests {
             &mut eng,
             "EXPLAIN (COSTS OFF) select a1.id from a a1 right join a a2 on a1.id = a2.id",
         );
-        assert_eq!(lines[0], "Nested Loop Right Join", "{lines:?}");
+        assert_eq!(lines[0], "Nested Loop Left Join", "{lines:?}");
         let lines = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) select a1.id from a a1 full join a a2 on a1.id = a2.id",
@@ -66291,6 +66615,515 @@ mod v148_join_label_materialize_tests {
     }
 }
 
+#[cfg(test)]
+mod v149_right_join_flip_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for sql in [
+            "CREATE TEMP TABLE j1 (id int PRIMARY KEY, v text)",
+            "CREATE TEMP TABLE j2 (id int PRIMARY KEY, w text)",
+            "INSERT INTO j1 VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO j2 VALUES (2, 'x'), (3, 'y')",
+        ] {
+            run(eng, sql).unwrap();
+        }
+    }
+
+    /// v1.49: `flip_right_joins` swaps left/right and sets LEFT, carrying the
+    /// ON clause over unmodified (PG does not commute quals).
+    #[test]
+    fn flip_swaps_sides_and_kind() {
+        let from = parse_statement("SELECT * FROM j1 RIGHT JOIN j2 ON j1.id = j2.id")
+            .unwrap();
+        let from = match from {
+            crate::sql::Stmt::Select(s) => s.from,
+            _ => panic!("expected select"),
+        };
+        let flipped = flip_right_joins(&from);
+        assert_eq!(flipped.len(), 1);
+        match &flipped[0] {
+            FromItem::Join {
+                left,
+                kind,
+                right,
+                on,
+                ..
+            } => {
+                assert_eq!(*kind, JoinKind::Left);
+                // left is now j2, right is now j1
+                assert!(matches!(left.as_ref(), FromItem::Table { name, .. } if name == "j2"));
+                assert!(matches!(right.as_ref(), FromItem::Table { name, .. } if name == "j1"));
+                // ON clause preserved verbatim
+                assert!(on.is_some());
+                let on_text = format!("{on:?}");
+                assert!(on_text.contains("j1") && on_text.contains("j2"), "{on_text}");
+            }
+            other => panic!("expected join, got {other:?}"),
+        }
+    }
+
+    /// v1.49: non-RIGHT joins pass through untouched; nested RIGHT joins flip.
+    #[test]
+    fn flip_recurses_nested_joins() {
+        let from = parse_statement(
+            "SELECT * FROM (j1 RIGHT JOIN j2 ON j1.id = j2.id) LEFT JOIN j1 AS x ON x.id = j2.id",
+        )
+        .unwrap();
+        let from = match from {
+            crate::sql::Stmt::Select(s) => s.from,
+            _ => panic!("expected select"),
+        };
+        let flipped = flip_right_joins(&from);
+        // outer LEFT JOIN untouched, inner RIGHT flipped to LEFT with swap
+        match &flipped[0] {
+            FromItem::Join { kind, left, .. } => {
+                assert_eq!(*kind, JoinKind::Left);
+                match left.as_ref() {
+                    FromItem::Join {
+                        left: il,
+                        kind: ik,
+                        right: ir,
+                        ..
+                    } => {
+                        assert_eq!(*ik, JoinKind::Left);
+                        assert!(
+                            matches!(il.as_ref(), FromItem::Table { name, .. } if name == "j2")
+                        );
+                        assert!(
+                            matches!(ir.as_ref(), FromItem::Table { name, .. } if name == "j1")
+                        );
+                    }
+                    other => panic!("expected inner join, got {other:?}"),
+                }
+            }
+            other => panic!("expected join, got {other:?}"),
+        }
+    }
+
+    /// v1.49: PG19 rendering — a RIGHT JOIN plans as `Nested Loop Left Join`
+    /// with swapped children (corpus join.out 4701 oracle).
+    #[test]
+    fn explain_right_renders_flipped_left() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM j1 RIGHT JOIN j2 ON j1.id = j2.id",
+        );
+        assert_eq!(lines[0], "Nested Loop Left Join", "{lines:?}");
+        // children swapped: j2 (original right) is now the outer
+        assert!(lines[1].contains("j2"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("j1")), "{lines:?}");
+        // and the non-flipped LEFT JOIN renders with the original order
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM j1 LEFT JOIN j2 ON j1.id = j2.id",
+        );
+        assert_eq!(lines[0], "Nested Loop Left Join", "{lines:?}");
+        assert!(lines[1].contains("j1"), "{lines:?}");
+    }
+
+    /// v1.49: VERBOSE top-level `Output:` for bare `SELECT *` shows PG's
+    /// written column order even after the flip (query targetlist, not the
+    /// flipped physical order).
+    #[test]
+    fn verbose_star_output_keeps_written_order() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM j1 RIGHT JOIN j2 ON j1.id = j2.id",
+        );
+        let output_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("Output:"))
+            .expect("expected Output line");
+        // written order: j1 columns first, then j2
+        let j1_pos = output_line.find("j1.id").unwrap();
+        let j2_pos = output_line.find("j2.id").unwrap();
+        assert!(j1_pos < j2_pos, "{output_line}");
+    }
+
+    /// v1.49: the planner flip is semantics-preserving — a RIGHT JOIN returns
+    /// the same rows as the manually-flipped LEFT JOIN (non-EXPLAIN path).
+    /// This is the invariant PG's `reduce_outer_joins` relies on.
+    #[test]
+    fn right_join_results_match_flipped_left() {
+        let mut eng = engine();
+        setup(&mut eng);
+        for (right_sql, left_sql) in [
+            (
+                "SELECT j1.id, j1.v, j2.id, j2.w FROM j1 RIGHT JOIN j2 \
+                 ON j1.id = j2.id ORDER BY j2.id",
+                "SELECT j1.id, j1.v, j2.id, j2.w FROM j2 LEFT JOIN j1 \
+                 ON j1.id = j2.id ORDER BY j2.id",
+            ),
+            (
+                "SELECT count(*) FROM j1 RIGHT JOIN j2 ON j1.id = j2.id",
+                "SELECT count(*) FROM j2 LEFT JOIN j1 ON j1.id = j2.id",
+            ),
+            (
+                "SELECT j2.w FROM j1 RIGHT JOIN j2 ON j1.id = j2.id AND j1.v = 'a'",
+                "SELECT j2.w FROM j2 LEFT JOIN j1 ON j1.id = j2.id AND j1.v = 'a'",
+            ),
+        ] {
+            let r_rows = rows_of(run(&mut eng, right_sql).unwrap());
+            let l_rows = rows_of(run(&mut eng, left_sql).unwrap());
+            assert_eq!(r_rows, l_rows, "mismatch:\n{right_sql}\n{left_sql}");
+        }
+        // spot-check the actual RIGHT JOIN semantics (unmatched right row)
+        let rows = rows_of(
+            run(
+                &mut eng,
+                "SELECT j1.id, j2.id FROM j1 RIGHT JOIN j2 ON j1.id = j2.id ORDER BY j2.id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["2".to_string(), "2".to_string()],
+                vec!["NULL".to_string(), "3".to_string()],
+            ]
+        );
+    }
+}
+
+// v1.49b: PG19 const-false dummy rels (`restriction_is_constant_false`,
+// joinrels.c:1547-1588) on the EXPLAIN (COSTS OFF) plan path.
+#[cfg(test)]
+mod v149b_const_false_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap().trim().to_string())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for sql in [
+            "CREATE TEMP TABLE cf1 (a int)",
+            "CREATE TEMP TABLE cf2 (b int)",
+            "INSERT INTO cf1 VALUES (1), (2)",
+            "INSERT INTO cf2 VALUES (1), (3)",
+        ] {
+            run(eng, sql).unwrap();
+        }
+    }
+
+    fn parse_expr(sql: &str) -> Expr {
+        // Parse via a WHERE clause: `SELECT 1 WHERE <expr>`.
+        match parse_statement(&format!("SELECT 1 WHERE {sql}")).unwrap() {
+            crate::sql::Stmt::Select(s) => s.where_.unwrap(),
+            _ => panic!("expected select"),
+        }
+    }
+
+    /// v1.49b: the boolean-const folder — literals, NULL, NOT/AND/OR.
+    #[test]
+    fn fold_bool_const_skeleton() {
+        assert_eq!(pg_fold_bool_const(&parse_expr("false")), Some(Some(false)));
+        assert_eq!(pg_fold_bool_const(&parse_expr("true")), Some(Some(true)));
+        assert_eq!(pg_fold_bool_const(&parse_expr("NULL")), Some(None));
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("NOT true")),
+            Some(Some(false))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("NOT NULL")),
+            Some(None)
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("false AND true")),
+            Some(Some(false))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("true AND NULL")),
+            Some(None)
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("true OR NULL")),
+            Some(Some(true))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("false OR false")),
+            Some(Some(false))
+        );
+        // Non-foldable: vars, comparisons, function calls.
+        assert_eq!(pg_fold_bool_const(&parse_expr("a = 1")), None);
+        assert_eq!(pg_fold_bool_const(&parse_expr("1 = 0")), None);
+        assert_eq!(pg_fold_bool_const(&parse_expr("false AND a = 1")), None);
+    }
+
+    /// v1.49b: `pg_is_const_false` — FALSE-or-NULL counts as false (PG19
+    /// joinrels.c:1580-1582), TRUE does not.
+    #[test]
+    fn is_const_false_matches_pg() {
+        assert!(pg_is_const_false(&parse_expr("false")));
+        assert!(pg_is_const_false(&parse_expr("NULL")));
+        assert!(pg_is_const_false(&parse_expr("NOT true")));
+        assert!(pg_is_const_false(&parse_expr("false AND NULL")));
+        assert!(!pg_is_const_false(&parse_expr("true")));
+        assert!(!pg_is_const_false(&parse_expr("NOT false")));
+        assert!(!pg_is_const_false(&parse_expr("a = 1")));
+    }
+
+    /// v1.49b: top-level WHERE false → bare `Result` with `One-Time
+    /// Filter: false` + `Replaces: Scan on <table>`.
+    #[test]
+    fn explain_where_false_collapses_to_result() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM cf1 WHERE false",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Result",
+                "Replaces: Scan on cf1",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.49b: no FROM → no `Replaces:` line (PG19 explain.c:5048-5059).
+    #[test]
+    fn explain_where_false_no_from_no_replaces() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT 1 WHERE false");
+        assert_eq!(lines, vec!["Result", "One-Time Filter: false"]);
+    }
+
+    /// v1.49b: VERBOSE `Output:` renders before `Replaces:` (PG19
+    /// explain.c:1947 then 2249-2256).
+    #[test]
+    fn explain_where_false_verbose_output_order() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) SELECT 1 FROM cf1 WHERE false",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Result",
+                "Output: 1",
+                "Replaces: Scan on cf1",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.49b: `LEFT JOIN ... ON false` → inner side becomes a dummy
+    /// `Result`; the join keeps `Join Filter: false`.
+    #[test]
+    fn explain_left_join_on_false_inner_dummy() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM cf1 LEFT JOIN cf2 ON false",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop Left Join",
+                "Join Filter: false",
+                "->  Seq Scan on cf1",
+                "->  Result",
+                "Replaces: Scan on cf2",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.49b: `LEFT JOIN ... ON NULL` → `Join Filter: NULL::boolean`
+    /// (PG19 renders the NULL Const with its type).
+    #[test]
+    fn explain_left_join_on_null_filter_spelling() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM cf1 LEFT JOIN cf2 ON NULL",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop Left Join",
+                "Join Filter: NULL::boolean",
+                "->  Seq Scan on cf1",
+                "->  Result",
+                "Replaces: Scan on cf2",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.49b: `INNER JOIN ... ON false` → the whole join is a bare
+    /// `Result` with `Replaces: Join on ...`.
+    #[test]
+    fn explain_inner_join_on_false_whole_dummy() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM cf1 JOIN cf2 ON false",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Result",
+                "Replaces: Join on cf1, cf2",
+                "One-Time Filter: false",
+            ]
+        );
+    }
+
+    /// v1.49b: FULL JOIN ON false is NOT dummy (PG19 must emit both
+    /// sides; joinrels.c only dummies INNER/LEFT/ANTI).
+    #[test]
+    fn explain_full_join_on_false_not_dummy() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM cf1 FULL JOIN cf2 ON false",
+        );
+        assert_eq!(lines[0], "Nested Loop Full Join");
+        assert!(!lines.iter().any(|l| l.contains("One-Time Filter")));
+    }
+
+    /// v1.49b: the const-false plan shape is EXPLAIN-only — execution
+    /// still evaluates WHERE/ON normally (zero rows for false WHERE,
+    /// preserved left rows for LEFT JOIN ON false).
+    #[test]
+    fn const_false_never_changes_execution() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // WHERE false → zero rows (before and after: the plan shape
+        // change must not alter this).
+        let rows = rows_of(run(&mut eng, "SELECT * FROM cf1 WHERE false").unwrap());
+        assert!(rows.is_empty());
+        // LEFT JOIN ON false → left rows preserved with NULL extension.
+        let rows = rows_of(
+            run(&mut eng, "SELECT a, b FROM cf1 LEFT JOIN cf2 ON false ORDER BY a")
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "NULL".to_string()],
+                vec!["2".to_string(), "NULL".to_string()],
+            ]
+        );
+        // INNER JOIN ON false → zero rows.
+        let rows =
+            rows_of(run(&mut eng, "SELECT * FROM cf1 JOIN cf2 ON false").unwrap());
+        assert!(rows.is_empty());
+        // WHERE true → all rows (not dummy).
+        let rows = rows_of(run(&mut eng, "SELECT a FROM cf1 WHERE true").unwrap());
+        assert_eq!(rows.len(), 2);
+    }
+}
 
 #[cfg(test)]
 mod v146_verbose_output_tests {
