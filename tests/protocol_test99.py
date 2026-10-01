@@ -14,7 +14,7 @@ v1.05 closes the UPDATE lifecycle gaps the v1.04 audit found:
 - INSERT .. ON CONFLICT DO UPDATE and partition-moving UPDATE get the same
   eager cleanup / reuse.
 - The lazy reltoastrelid link (WriteOp::SetToastRelid) is WAL-logged
-  (RGSWAL19) and rolls back.
+  (RGSWAL20) and rolls back.
 
 This test manages its own server on port 5561 (so it can kill/restart
 it) and is RED on the v1.04 base, GREEN on the v1.05 branch.
@@ -28,7 +28,8 @@ Sections:
   F. partition-moving UPDATE moves chunks with the row
   G. UPDATE chunks survive a restart (WAL-logged)
   H. repeated updates: no chunk/metadata accumulation
-  I. WAL magic is RGSWAL19
+  I. WAL magic is RGSWAL20 (v1.41: attnums/next_attnum/fillfactor in
+     CreateTable/AlterTable)
 """
 import os
 import random
@@ -319,7 +320,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("I1 WAL magic is RGSWAL19", magic == b"RGSWAL19")
+    check("I1 WAL magic is RGSWAL20", magic == b"RGSWAL20")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test99: {passed} passed, {failed} failed")

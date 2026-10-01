@@ -3146,6 +3146,10 @@ fn create_table_from_def(
         let mut def = def.clone();
         let mut temp_pinfo: Option<PartitionInfo> = None;
         let mut temp_parent: Option<String> = None;
+        // v1.41: PARTITION OF inherits the parent's attnums (rowtype
+        // copy); stashed like temp_pinfo for after the build.
+        let mut temp_attnums: Option<Vec<i16>> = None;
+        let mut temp_next_attnum: Option<i16> = None;
         if let Some(pdef) = &def.partition {
             if let Some(parent_name) = &pdef.parent {
                 let parent = eng
@@ -3181,6 +3185,10 @@ fn create_table_from_def(
                 // v0.72: same for STORAGE — PG copies attstorage as part
                 // of the rowtype.
                 def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+                // v1.41: attnums travel with the rowtype too (stashed
+                // for after the table is built, like temp_pinfo).
+                temp_attnums = Some(parent.attnums.clone());
+                temp_next_attnum = Some(parent.next_attnum);
                 let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
                 temp_pinfo = Some(pinfo);
                 temp_parent = Some(parent_name.clone());
@@ -3192,6 +3200,13 @@ fn create_table_from_def(
         }
         let mut t = Table::with_def(&def, ctx.own);
         t.partition = temp_pinfo;
+        // v1.41: PARTITION OF child takes the parent's attnums.
+        if let Some(a) = temp_attnums {
+            t.attnums = a;
+        }
+        if let Some(n) = temp_next_attnum {
+            t.next_attnum = n;
+        }
         // v0.96: temp tables get real OIDs too (PG assigns OIDs to temp
         // tables; pg_inherits/pg_class expose them).
         t.oid = eng.db.alloc_oid();
@@ -3308,11 +3323,18 @@ fn create_table_from_def(
             // v0.72: same for STORAGE — PG copies attstorage as part of
             // the rowtype.
             def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+            // v1.41: PARTITION OF copies the parent's rowtype — attnums
+            // travel with it (PG assigns the child the parent's
+            // attribute numbers, gaps included).
+            let inherit_attnums = parent.attnums.clone();
+            let inherit_next_attnum = parent.next_attnum;
             // Build the partition info (validates the bound).
             let (pinfo, _) = build_partition_info(eng, ctx, name, pdef, &def.columns)?;
             // Stash the info for after the table is created.
             // (We can't borrow parent mutably while building.)
             let mut t = Table::with_def(&def, ctx.own);
+            t.attnums = inherit_attnums;
+            t.next_attnum = inherit_next_attnum;
             t.partition = Some(pinfo);
             // v0.11: the creating role owns the table.
             t.owner = ctx.role.to_string();
@@ -12661,7 +12683,9 @@ fn pg_attribute_scan(
                 cells: Row::new(vec![
                     Value::Int(t.oid as i64),
                     Value::text(col_name.as_str()),
-                    Value::Int((i + 1) as i64),
+                    // v1.41: the real PG attnum (never reused after
+                    // DROP), not the 1-based column position.
+                    Value::Int(t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64),
                 ]),
                 prov: Vec::new(),
             });
@@ -13677,9 +13701,9 @@ fn resolve_col(
                         found = Some(ci);
                     }
                 }
-                return found.map(|ci| (si, ci)).ok_or_else(|| {
-                    exec_err("42703", format!("column {q}.{name} does not exist"))
-                });
+                return found
+                    .map(|ci| (si, ci))
+                    .ok_or_else(|| exec_err("42703", format!("column {q}.{name} does not exist")));
             }
             None => {
                 let mut found = None;
@@ -14007,10 +14031,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                 .collect::<Result<Vec<_>, _>>()?,
             // v1.29: resolve columns in FILTER (same row scope as the
             // aggregate arguments).
-            filter: filter
-                .as_ref()
-                .map(|f| r(f).map(Box::new))
-                .transpose()?,
+            filter: filter.as_ref().map(|f| r(f).map(Box::new)).transpose()?,
         }),
         // v1.30: resolve columns in an ordered-set aggregate — the
         // direct args, the WITHIN GROUP sort keys, and the FILTER
@@ -14036,10 +14057,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            filter: filter
-                .as_ref()
-                .map(|f| r(f).map(Box::new))
-                .transpose()?,
+            filter: filter.as_ref().map(|f| r(f).map(Box::new)).transpose()?,
         }),
         // v0.10: resolve columns inside window inputs.
         Expr::Window {
@@ -14073,10 +14091,7 @@ fn resolve_predicate_columns_in(pred: &Expr, scopes: &[Scope]) -> Result<Expr, E
             frame: frame.clone(),
             wid: *wid,
             // v1.29: resolve columns in FILTER (windowed aggregates only).
-            filter: filter
-                .as_ref()
-                .map(|f| r(f).map(Box::new))
-                .transpose()?,
+            filter: filter.as_ref().map(|f| r(f).map(Box::new)).transpose()?,
             // v1.31: exclusion is a plain enum — nothing to resolve.
             exclusion: exclusion.clone(),
         }),
@@ -14223,7 +14238,10 @@ enum FnKeyVal {
     Timestamptz(i64),
     Bytea(Vec<u8>),
     // v1.39: bit length matters (trailing bits are padding).
-    BitString { bitlen: u32, bytes: Vec<u8> },
+    BitString {
+        bitlen: u32,
+        bytes: Vec<u8>,
+    },
     Uuid([u8; 16]),
     PgLsn(u64),
     Tid(u32, u32), // v1.40
@@ -14623,9 +14641,9 @@ fn select_foldable(
                 // operator resolves its (possibly VOLATILE) procedure
                 // at runtime, invisibly to static inspection.
                 if name.as_str() == "__any_all_array"
-                    && args.iter().any(|a| {
-                        matches!(a, Expr::Literal(Literal::Text(s)) if s.starts_with("user:"))
-                    })
+                    && args.iter().any(
+                        |a| matches!(a, Expr::Literal(Literal::Text(s)) if s.starts_with("user:")),
+                    )
                 {
                     ok = false;
                     return;
@@ -14653,7 +14671,13 @@ fn select_foldable(
                             || cand.returns_set
                             || cand.plpgsql.is_some()
                             || !sql_body_foldable(
-                                db, scopes, cand, cbody, visiting, depth + 1, ctes,
+                                db,
+                                scopes,
+                                cand,
+                                cbody,
+                                visiting,
+                                depth + 1,
+                                ctes,
                             )
                         {
                             ok = false;
@@ -16475,7 +16499,9 @@ fn validate_expr(e: &Expr) -> Result<(), ExecError> {
             Ok(())
         }
         Expr::Extract { from, .. } => validate_expr(from),
-        Expr::Agg { arg, arg2, filter, .. } => {
+        Expr::Agg {
+            arg, arg2, filter, ..
+        } => {
             if let Some(a) = arg {
                 validate_expr(a)?;
             }
@@ -18244,9 +18270,7 @@ fn gather_window_inputs_grouped(
                 arg_vals.push(av);
                 filter_vals.push(match &spec.filter {
                     Some(f) => check_bool(
-                        eval_grouped(
-                            q, outer, gscope, schema, rows, idxs, key_vals, group_by, f,
-                        )?,
+                        eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, f)?,
                         "FILTER",
                     )?,
                     None => true,
@@ -18300,9 +18324,7 @@ fn gather_window_inputs_grouped(
             arg_vals.push(av);
             filter_vals.push(match &spec.filter {
                 Some(f) => check_bool(
-                    eval_grouped(
-                        q, outer, gscope, schema, rows, idxs, key_vals, group_by, f,
-                    )?,
+                    eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, f)?,
                     "FILTER",
                 )?,
                 None => true,
@@ -18656,8 +18678,7 @@ fn compute_partition(
             // observe the per-row skip.
             let has_filter = spec.filter.is_some();
             let filt = |p: usize| -> bool {
-                has_filter
-                    && !input.filter_vals.get(idxs[p]).copied().unwrap_or(true)
+                has_filter && !input.filter_vals.get(idxs[p]).copied().unwrap_or(true)
             };
             // v1.31: frame exclusion skips rows per-frame (PG19
             // nodeWindowAgg.c `row_is_in_frame`); composes with FILTER.
@@ -19588,7 +19609,10 @@ enum HashKeyPart {
     Ts(i64),
     Bytea(Vec<u8>),
     // v1.39: bit length matters (trailing bits are padding).
-    BitString { bitlen: u32, bytes: Vec<u8> },
+    BitString {
+        bitlen: u32,
+        bytes: Vec<u8>,
+    },
     Uuid([u8; 16]),
     Char(u8),
     PgLsn(u64),
@@ -23395,15 +23419,32 @@ fn exec_agg_one(
         // ProjectSet).
         let group_rows: Vec<(Vec<Value>, Vec<(Expr, Value)>)> = if expand_srf {
             project_group_expanded(
-                q, outer, stmt, schema, gscope, rows_eff, idxs, key_vals, group_keys,
+                q,
+                outer,
+                stmt,
+                schema,
+                gscope,
+                rows_eff,
+                idxs,
+                key_vals,
+                group_keys,
                 &is_null_item,
             )?
         } else {
             let mut cells = Vec::new();
             for (ii, item) in stmt.items.iter().enumerate() {
                 cells.extend(grouped_project_item(
-                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys,
-                    &is_null_item, ii, item,
+                    q,
+                    outer,
+                    gscope,
+                    schema,
+                    rows_eff,
+                    idxs,
+                    key_vals,
+                    group_keys,
+                    &is_null_item,
+                    ii,
+                    item,
                 )?);
             }
             vec![(cells, Vec::new())]
@@ -23594,7 +23635,10 @@ fn collect_target_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Ve
             }
         }
         Expr::Like {
-            expr, pattern, escape, ..
+            expr,
+            pattern,
+            escape,
+            ..
         } => {
             collect_target_srfs(eng, expr, group_keys, out);
             collect_target_srfs(eng, pattern, group_keys, out);
@@ -23619,7 +23663,10 @@ fn collect_target_srfs(eng: &Engine, e: &Expr, group_keys: &[Expr], out: &mut Ve
             }
         }
         Expr::Case {
-            operand, whens, else_, ..
+            operand,
+            whens,
+            else_,
+            ..
         } => {
             if let Some(o) = operand {
                 collect_target_srfs(eng, o, group_keys, out);
@@ -23733,7 +23780,16 @@ fn project_group_expanded(
         let mut cells = Vec::new();
         for (ii, item) in stmt.items.iter().enumerate() {
             cells.extend(grouped_project_item(
-                q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, is_null_item, ii,
+                q,
+                outer,
+                gscope,
+                schema,
+                rows_eff,
+                idxs,
+                key_vals,
+                group_keys,
+                is_null_item,
+                ii,
                 item,
             )?);
         }
@@ -24751,8 +24807,12 @@ fn within_group_check_arg_types(
 fn percentile_fraction_value(agg: &str, f: &Value) -> Result<Option<f64>, ExecError> {
     match f {
         Value::Null => Ok(None),
-        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) | Value::Numeric(_)
-        | Value::Float4(_) | Value::Float(_) => {
+        Value::SmallInt(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Numeric(_)
+        | Value::Float4(_)
+        | Value::Float(_) => {
             let p = to_f64v(f);
             if p < 0.0 || p > 1.0 || p.is_nan() {
                 return Err(exec_err(
@@ -24764,11 +24824,7 @@ fn percentile_fraction_value(agg: &str, f: &Value) -> Result<Option<f64>, ExecEr
         }
         other => Err(exec_err(
             "42883",
-            format!(
-                "function {}({}) does not exist",
-                agg,
-                other.type_name()
-            ),
+            format!("function {}({}) does not exist", agg, other.type_name()),
         )),
     }
 }
@@ -24794,10 +24850,7 @@ fn within_group_numeric_value(v: &Value) -> bool {
 /// linear interpolation between them; NULL fraction → NULL; no rows
 /// → NULL; NULL/empty fractions array → NULL / empty array (same
 /// shape as the input); NULL elements → NULL elements.
-fn percentile_cont_final(
-    direct: &Value,
-    vals: &[Value],
-) -> Result<Value, ExecError> {
+fn percentile_cont_final(direct: &Value, vals: &[Value]) -> Result<Value, ExecError> {
     // No regular rows → NULL, even for the array form.
     if vals.is_empty() {
         return Ok(Value::Null);
@@ -25143,14 +25196,18 @@ fn eval_within_group_agg(
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
-            let d = direct.first().expect("percentile_cont takes one direct arg");
+            let d = direct
+                .first()
+                .expect("percentile_cont takes one direct arg");
             percentile_cont_final(d, &vals)
         }
         OrderedSetAgg::PercentileDisc => {
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
-            let d = direct.first().expect("percentile_disc takes one direct arg");
+            let d = direct
+                .first()
+                .expect("percentile_disc takes one direct arg");
             // The array form returns the sort type's array (PG19
             // builds it from the sort column's type). Derive the
             // element from the sort expression's static type.
@@ -27295,13 +27352,8 @@ fn sys_prov_entry<'s>(
 /// `ctid` wins (resolved before this is called).
 fn eval_ctid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Value, ExecError> {
     let missing = || exec_err("42703", "column \"ctid\" does not exist".to_string());
-    let entry = sys_prov_entry(scopes, qual, "ctid").map_err(|e| {
-        if e.code == "42703" {
-            missing()
-        } else {
-            e
-        }
-    })?;
+    let entry = sys_prov_entry(scopes, qual, "ctid")
+        .map_err(|e| if e.code == "42703" { missing() } else { e })?;
     // v1.40: the RETURNING path marks FROM/USING ranges (whose row ids
     // are not tracked) with row_id = u64::MAX; their system columns
     // stay 42703, but the qualifier still counts for ambiguity above.
@@ -27326,13 +27378,8 @@ fn eval_ctid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Value, E
 /// is called).
 fn eval_cmin_cmax(scopes: &[Scope], qual: Option<&str>, name: &str) -> Result<Value, ExecError> {
     let missing = || exec_err("42703", format!("column \"{name}\" does not exist"));
-    let entry = sys_prov_entry(scopes, qual, name).map_err(|e| {
-        if e.code == "42703" {
-            missing()
-        } else {
-            e
-        }
-    })?;
+    let entry = sys_prov_entry(scopes, qual, name)
+        .map_err(|e| if e.code == "42703" { missing() } else { e })?;
     if entry.row_id == u64::MAX {
         return Err(missing());
     }
@@ -27656,10 +27703,9 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
         Expr::Agg { .. } => Err(exec_err("42803", "aggregates not allowed in this context")),
         // v1.30: ordered-set aggregates likewise only evaluate in the
         // grouped path.
-        Expr::WithinGroup { .. } => Err(exec_err(
-            "42803",
-            "aggregates not allowed in this context",
-        )),
+        Expr::WithinGroup { .. } => {
+            Err(exec_err("42803", "aggregates not allowed in this context"))
+        }
         Expr::ScalarSub(sub) => {
             let out = {
                 let mut sub_q = Q {
@@ -32405,17 +32451,32 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             // Text: parse `(b,o)`.
             if let Value::Text(t) = v {
                 let s = t.trim().to_string();
-                let inner = s.strip_prefix('(').and_then(|t| t.strip_suffix(')')).ok_or_else(
-                    || exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\"")),
-                )?;
+                let inner = s
+                    .strip_prefix('(')
+                    .and_then(|t| t.strip_suffix(')'))
+                    .ok_or_else(|| {
+                        exec_err(
+                            "22P02",
+                            format!("invalid input syntax for type tid: \"{s}\""),
+                        )
+                    })?;
                 let (bs, os) = inner.split_once(',').ok_or_else(|| {
-                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type tid: \"{s}\""),
+                    )
                 })?;
                 let b: u32 = bs.trim().parse().map_err(|_| {
-                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type tid: \"{s}\""),
+                    )
                 })?;
                 let o: u32 = os.trim().parse().map_err(|_| {
-                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type tid: \"{s}\""),
+                    )
                 })?;
                 return Ok(Value::Tid(b, o));
             }
@@ -33418,7 +33479,6 @@ fn run_func_dml(call_q: &mut Q, stmt: &Stmt, func_name: &str) -> Result<SelectOu
     run_nested_dml(call_q, stmt, &format!("function \"{}\"", func_name))
 }
 
-
 /// v1.03: how a plpgsql statement list finished executing. PG's
 /// `exec_stmt_block` distinguishes "fell off the end" from the
 /// `PLPGSQL_RC_RETURN` code; the bounded executor needs the same
@@ -34371,11 +34431,183 @@ fn pg_column_compression_value(
     }
 }
 
-/// v0.37: `pg_relation_size(regclass)` / `pg_relation_size(regclass,
-/// text)` — an APPROXIMATE size in bytes of the table's stored rows,
-/// summed from the in-memory row data (value bytes plus per-tuple
-/// overhead). This is NOT PostgreSQL's disk-page accounting: it is an
-/// in-memory estimate, and only the `main` fork is tracked.
+/// v1.41: PG19 `typlen`/`typalign` per `ColType`, grounded in
+/// `src/include/catalog/pg_type.dat` of the local PG19 source.
+/// Returns `(typlen, align_bytes)`; `typlen == -1` marks a varlena.
+fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
+    match ty {
+        ColType::Bool => (1, 1),        // 'c'
+        ColType::SingleChar => (1, 1),  // "char": 1/'c'
+        ColType::SmallInt => (2, 2),    // int2: 2/'s'
+        ColType::Int => (4, 4),         // int4: 4/'i'
+        ColType::BigInt => (8, 8),      // int8: 8/'d'
+        ColType::Float4 => (4, 4),      // float4: 4/'i'
+        ColType::Float => (8, 8),       // float8: 8/'d'
+        ColType::Numeric(_) => (-1, 4), // numeric: -1/'i'
+        ColType::Text => (-1, 4),       // text: -1/'i'
+        ColType::Char(_) => (-1, 4),    // bpchar: -1/'i'
+        ColType::Varchar(_) => (-1, 4), // varchar: -1/'i'
+        ColType::Bytea => (-1, 4),      // bytea: -1/'i'
+        ColType::Bit => (-1, 4),        // varbit: -1/'i'
+        ColType::Json => (-1, 4),       // json: -1/'i'
+        ColType::Array(_) => (-1, 4),   // array types: 'i'
+        ColType::Date => (4, 4),        // date: 4/'i'
+        ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
+        ColType::Timestamptz => (8, 8), // timestamptz: 8/'d'
+        ColType::Uuid => (16, 1),       // uuid: 16/'c'
+        ColType::Name => (64, 1),       // name: 64/'c'
+        ColType::Regclass => (4, 4),    // regclass: 4/'i'
+        ColType::Xid => (4, 4),         // xid: 4/'i'
+        ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
+        ColType::Tid => (6, 2),         // tid: 6/'s'
+        // Pseudo/composite types never persist in table columns; map
+        // them to varlena so the layout code stays total.
+        ColType::Record | ColType::Composite => (-1, 8), // record: -1/'d'
+    }
+}
+
+/// v1.41: on-disk size of a PG `numeric` datum: the 8-byte NumericVar
+/// header (ndigits/weight/sign/dscale) plus 2 bytes per base-10000
+/// digit. Approximates PG's `numeric` varlena payload; the varlena
+/// header itself is added by the caller.
+fn pg_numeric_data_len(n: &Numeric) -> usize {
+    let digits: usize = if let Some(big) = &n.big {
+        big.decimal_digits() as usize
+    } else if n.unscaled == 0 {
+        0
+    } else {
+        let mut x = n.unscaled.unsigned_abs();
+        let mut d = 0;
+        while x > 0 {
+            d += 1;
+            x /= 10;
+        }
+        d
+    };
+    8 + 2 * ((digits + 3) / 4)
+}
+
+/// v1.41: PG19 heap tuple length (`t_len`) for one row version, per
+/// `heap_form_tuple` (htup.c): `hoff = MAXALIGN(23 + bitmaplen)`,
+/// per-column `typalign` layout, final `MAXALIGN`. NULLs contribute
+/// only to the null bitmap (present iff any column is nullable).
+/// Toasted cells count as the 18-byte toast pointer datum
+/// (`TOAST_POINTER_SIZE` = `VARHDRSZ_EXTERNAL`(2) +
+/// `sizeof(varatt_external)`(16), varatt.h/detoast.h). Short varlenas
+/// (data <= 126 bytes) take the 1-byte header (`VARHDRSZ_SHORT`),
+/// else the 4-byte header. Compressed-inline values' exact size is
+/// not retained by the engine; the pointer size is a documented
+/// approximation for those cells (bounded ~2KB underestimate).
+fn pg_heap_tuple_len(t: &Table, rv: &RowVersion) -> usize {
+    fn maxalign(x: usize) -> usize {
+        (x + 7) & !7
+    }
+    let ncols = t.columns.len();
+    let has_null = rv.values.iter().any(|v| matches!(v, Value::Null));
+    let bitmaplen = if has_null { (ncols + 7) / 8 } else { 0 };
+    let mut off = maxalign(23 + bitmaplen);
+    for (i, (_, cty)) in t.columns.iter().enumerate() {
+        let v = rv.values.get(i).unwrap_or(&Value::Null);
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let (typlen, align) = pg_typlen_align(cty);
+        // Toasted/out-of-line cell: the inline datum is the pointer.
+        let datum: usize = if rv.toast.get(i).copied().unwrap_or(0) != 0 {
+            18
+        } else if typlen >= 0 {
+            typlen as usize
+        } else {
+            let data: usize = match v {
+                Value::Text(s) | Value::BpChar(s) => s.len(),
+                Value::Bytea(b) => b.len(),
+                // varbit: int32 bit-length + payload bytes.
+                Value::BitString(bs) => 4 + bs.bytes.len(),
+                Value::Numeric(n) => pg_numeric_data_len(n),
+                // v0.79: arrays persist; approximate from the literal.
+                Value::Array(a) => a.to_literal().len(),
+                _ => 0,
+            };
+            data + if data <= 126 { 1 } else { 4 }
+        };
+        off = (off + align - 1) & !(align - 1);
+        off += datum;
+    }
+    maxalign(off)
+}
+
+/// v1.41: number of 8 KiB heap pages PG19 would use for the given
+/// visible row versions, simulating `RelationGetBufferForTuple`
+/// (hio.c) with `fillfactor` from the table:
+///
+/// * `saveFreeSpace = BLCKSZ * (100 - fillfactor) / 100`
+///   (`RelationGetTargetPageFreeSpace`, rel.h);
+/// * `nearlyEmptyFreeSpace = MaxHeapTupleSize -
+///   MaxHeapTuplesPerPage/8 * sizeof(ItemIdData)` = 8160 - 144 = 8016
+///   (htup_details.h: MaxHeapTupleSize = 8160, MaxHeapTuplesPerPage =
+///   291): when `len + saveFreeSpace > nearlyEmptyFreeSpace` the
+///   fillfactor reservation is dropped and `targetFreeSpace =
+///   max(len, nearlyEmptyFreeSpace)` — large tuples still land on a
+///   nearly-empty page instead of forcing a new one;
+/// * placement tries the cached target block first, then the lowest
+///   block with enough free space (the FSM's leftmost search is
+///   approximated by first-fit in block order), else extends;
+/// * the fit check is `targetFreeSpace <= pd_upper - pd_lower -
+///   sizeof(ItemIdData)` (`PageGetHeapFreeSpace`).
+///
+/// Documented approximation: only *visible* row versions are placed —
+/// rustgres has no VACUUM, so dead-tuple space is not modeled (PG
+/// would still count dead tuples' blocks until vacuumed).
+fn pg_heap_page_count(t: &Table, lens: &[usize]) -> u64 {
+    const BLCKSZ: usize = 8192;
+    const PAGE_HEADER: usize = 24; // SizeOfPageHeaderData
+    const ITEM_ID: usize = 4; // sizeof(ItemIdData)
+    const fn maxalign(x: usize) -> usize {
+        (x + 7) & !7
+    }
+    // htup_details.h formulas, evaluated for BLCKSZ = 8192.
+    const MAX_HEAP_TUPLE_SIZE: usize = BLCKSZ - maxalign(PAGE_HEADER + ITEM_ID); // 8160
+    const MAX_HEAP_TUPLES_PER_PAGE: usize = (BLCKSZ - PAGE_HEADER) / (maxalign(23) + ITEM_ID); // 291
+    const NEARLY_EMPTY: usize = MAX_HEAP_TUPLE_SIZE - (MAX_HEAP_TUPLES_PER_PAGE / 8 * ITEM_ID); // 8016
+
+    let save_free = BLCKSZ * (100 - t.fillfactor as usize) / 100;
+    // (pd_lower, pd_upper) per page.
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    let mut target: Option<usize> = None;
+    for &tlen in lens {
+        let len = maxalign(tlen);
+        let target_free = if len + save_free > NEARLY_EMPTY {
+            len.max(NEARLY_EMPTY)
+        } else {
+            len + save_free
+        };
+        let mut placed = false;
+        // Cached target block first, then lowest block with room.
+        let order = target
+            .into_iter()
+            .chain((0..pages.len()).filter(|&i| Some(i) != target));
+        for i in order {
+            let (lo, hi) = pages[i];
+            if target_free <= hi - lo - ITEM_ID {
+                pages[i] = (lo + ITEM_ID, hi - len);
+                target = Some(i);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            pages.push((PAGE_HEADER + ITEM_ID, BLCKSZ - len));
+            target = Some(pages.len() - 1);
+        }
+    }
+    pages.len() as u64 * BLCKSZ as u64
+}
+
+/// v1.41: `pg_relation_size(regclass)` / `pg_relation_size(regclass,
+/// text)` — PG19's heap page accounting: the number of 8 KiB pages
+/// PG's `RelationGetBufferForTuple` would use for the table's visible
+/// row versions (fillfactor-aware, with the "nearly empty page" rule
+/// for large tuples), times 8192. Only the `main` fork is tracked.
 ///
 /// Accepts a relation name, a regclass display value (text), or an OID
 /// integer — like PG's `regclass` input, an all-digit string is read as
@@ -34454,44 +34686,17 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", s)))?
         }
     };
-    // Sum the estimated stored size of all visible row versions.
-    let mut size: i64 = 0;
+    // v1.41: PG19 heap page accounting — per visible row version,
+    // compute the PG heap tuple length and simulate
+    // `RelationGetBufferForTuple` placement; the size is pages × 8192.
+    let mut lens: Vec<usize> = Vec::new();
     for rv in &t.rows {
         if !crate::storage::row_visible(rv, q.snap, &q.all_xids) {
             continue;
         }
-        // Rough estimate: sum of value sizes + per-row overhead.
-        for v in rv.values.iter() {
-            size += match v {
-                Value::Null => 1,
-                Value::Bool(_) => 1,
-                Value::SmallInt(_) => 2,
-                Value::Int(_) => 4,
-                Value::BigInt(_) => 8,
-                Value::Float(_) => 8,
-                Value::Float4(_) => 4,
-                Value::Numeric(_) => 16, // approximate
-                Value::Text(s) => s.len() as i64,
-                Value::BpChar(s) => s.len() as i64,
-                Value::Bytea(b) => b.len() as i64,
-                Value::BitString(b) => b.bytes.len() as i64, // v1.39
-                Value::SingleChar(_) => 1,
-                Value::Date(_) => 4,
-                Value::Timestamp(_) => 8,
-                Value::Timestamptz(_) => 8,
-                Value::Uuid(_) => 16,
-                Value::PgLsn(_) => 8, // v0.64
-                Value::Tid(_, _) => 8, // v1.40
-                // v0.73: records never persist in tables; approximate
-                // from the rendered text length if one ever appears.
-                Value::Record(fields) => crate::storage::record_text(fields).len() as i64,
-                // v0.79: arrays persist; approximate from the literal.
-                Value::Array(a) => a.to_literal().len() as i64,
-            };
-        }
-        size += 24; // per-tuple overhead (approximate)
+        lens.push(pg_heap_tuple_len(t, rv));
     }
-    Ok(Value::BigInt(size))
+    Ok(Value::BigInt(pg_heap_page_count(t, &lens) as i64))
 }
 
 /// v1.13: `pg_size_pretty(bigint) -> text` — PG19's human-readable size
@@ -54284,6 +54489,10 @@ fn alter_add_column(
     }
     let mut next = t.clone();
     next.columns.push((col.to_string(), col_type.clone()));
+    // v1.41: the new column gets the next never-reused attnum (PG19
+    // ATExecAddColumn: max(all attnums, incl. dropped)+1).
+    next.attnums.push(next.next_attnum);
+    next.next_attnum += 1;
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.push(col_type.default_toast_storage());
     // v0.41: validate the COMPRESSION option like CREATE TABLE does.
@@ -54666,6 +54875,9 @@ fn alter_drop_column(
     }
     // Now mutate the table shape.
     next.columns.remove(ci);
+    // v1.41: remove the dropped column's attnum slot too — but do NOT
+    // decrement next_attnum (PG never reuses dropped attnums).
+    next.attnums.remove(ci);
     next.not_null.remove(ci);
     next.defaults.remove(ci);
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
@@ -63172,6 +63384,149 @@ mod v140_syscols_returning_tests {
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
+    }
+
+    /// v1.41: `pg_relation_size` does PG19 heap page accounting — the
+    /// insert.sql:51 case: fillfactor=10, one 32-byte and one
+    /// 1032-byte tuple. PG's "nearly empty page" rule puts the large
+    /// tuple on page 0 anyway: exactly 1 page = 8192 bytes.
+    #[test]
+    fn v141_pg_relation_size_heap_page_accounting() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE large_tuple_test (a int, b text) WITH (fillfactor = 10);",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "ALTER TABLE large_tuple_test ALTER COLUMN b SET STORAGE plain;",
+        )
+        .unwrap();
+        run(&mut eng, "INSERT INTO large_tuple_test (select 1, NULL);").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO large_tuple_test (select 2, repeat('a', 1000));",
+        )
+        .unwrap();
+        match run(
+            &mut eng,
+            "SELECT pg_relation_size('large_tuple_test'::regclass, 'main');",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let row = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(row.into_iter().next().unwrap(), Value::BigInt(8192));
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.41: `pg_relation_size` of an empty table is 0 (no pages).
+    #[test]
+    fn v141_pg_relation_size_empty_is_zero() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t141empty (a int);").unwrap();
+        match run(&mut eng, "SELECT pg_relation_size('t141empty');").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                let row = rows.into_iter().next().unwrap().into_cells();
+                assert_eq!(row.into_iter().next().unwrap(), Value::BigInt(0));
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.41: `pg_attribute.attnum` never reuses dropped numbers — the
+    /// insert.sql:382 sequence (add/drop/add/drop/add) leaves attnum 4
+    /// on the surviving column.
+    #[test]
+    fn v141_attnum_never_reused() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t141a (a int, b int);").unwrap();
+        run(&mut eng, "ALTER TABLE t141a DROP COLUMN a;").unwrap();
+        run(&mut eng, "ALTER TABLE t141a ADD COLUMN a int;").unwrap();
+        run(&mut eng, "ALTER TABLE t141a DROP COLUMN a;").unwrap();
+        run(&mut eng, "ALTER TABLE t141a ADD COLUMN a int NOT NULL;").unwrap();
+        match run(
+            &mut eng,
+            "SELECT attname, attnum FROM pg_attribute WHERE attrelid = 't141a'::regclass ORDER BY attname;",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => {
+                let mut cells: Vec<String> = Vec::new();
+                for r in rows {
+                    for v in r.into_cells() {
+                        cells.push(v.to_text().unwrap_or("NULL".to_string()));
+                    }
+                }
+                // b keeps 2, a was re-added twice -> 4.
+                assert_eq!(cells, vec!["a", "4", "b", "2"]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// v1.41: fresh tables get sequential attnums 1..=n.
+    #[test]
+    fn v141_attnum_fresh_table_sequential() {
+        let t = Table::new(
+            vec![
+                ("x".to_string(), ColType::Int),
+                ("y".to_string(), ColType::Text),
+            ],
+            1,
+        );
+        assert_eq!(t.attnums, vec![1, 2]);
+        assert_eq!(t.next_attnum, 3);
+        assert_eq!(t.fillfactor, 100);
+    }
+
+    /// v1.41: `pg_heap_tuple_len` matches PG19 `heap_form_tuple` for
+    /// the two large_tuple_test rows: (1,NULL) -> 32, (2,'a'x1000) ->
+    /// 1032 (MAXALIGN(23+1 bitmap) = 32 header; int4 at offset 32;
+    /// text short-varlena header 1 + 1000).
+    #[test]
+    fn v141_pg_heap_tuple_len() {
+        let t = Table::new(
+            vec![
+                ("a".to_string(), ColType::Int),
+                ("b".to_string(), ColType::Text),
+            ],
+            1,
+        );
+        let r1 = RowVersion::plain(1, Row::new(vec![Value::Int(1), Value::Null]), 1);
+        let r2 = RowVersion::plain(
+            2,
+            Row::new(vec![Value::Int(2), Value::text("a".repeat(1000))]),
+            1,
+        );
+        assert_eq!(pg_heap_tuple_len(&t, &r1), 32);
+        assert_eq!(pg_heap_tuple_len(&t, &r2), 1032);
+    }
+
+    /// v1.41: `pg_heap_page_count` — fillfactor reserve is dropped for
+    /// tuples larger than the nearly-empty threshold (PG19 hio.c), so
+    /// the 1032-byte tuple joins the 32-byte tuple on page 0.
+    #[test]
+    fn v141_pg_heap_page_count_fillfactor() {
+        let mut t = Table::new(
+            vec![
+                ("a".to_string(), ColType::Int),
+                ("b".to_string(), ColType::Text),
+            ],
+            1,
+        );
+        t.fillfactor = 10;
+        assert_eq!(pg_heap_page_count(&t, &[32, 1032]), 8192);
+        // Empty table: no pages.
+        assert_eq!(pg_heap_page_count(&t, &[]), 0);
+        // Default fillfactor: ~227 small tuples per page.
+        t.fillfactor = 100;
+        let lens = vec![32; 300];
+        assert_eq!(pg_heap_page_count(&t, &lens), 2 * 8192);
     }
 }
 

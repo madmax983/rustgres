@@ -1008,6 +1008,10 @@ mod tests {
                 domain_types: vec![],
                 domain_elem: vec![],
                 inherits: vec![],
+                // v1.41
+                attnums: vec![],
+                next_attnum: 1,
+                fillfactor: 100,
             },
             WalRecord::InsertRows {
                 table: "t".into(),

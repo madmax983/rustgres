@@ -23,6 +23,13 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
+//! Format version 20 (`RGSWAL20` / `RGSCHK16`) is NOT compatible with v1.40
+//! or earlier: v1.41 WAL-logs and checkpoints the real PG attribute
+//! numbers (`attnums`/`next_attnum`) and the `fillfactor` storage
+//! parameter on `CreateTable`/`AlterTable` records and table images.
+//! Like every format bump, old data directories are refused with a
+//! clear error instead of being misread.
+//!
 //! Format version 19 (`RGSWAL19` / `RGSCHK15`) is NOT compatible with v1.04
 //! or earlier: v1.05 WAL-logs the lazy toast-table reltoastrelid link
 //! (`WalRecord::SetToastRelid`, record tag 28). The checkpoint format is
@@ -153,7 +160,7 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK15";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
@@ -209,7 +216,10 @@ const CHKPT_VERSION: u32 = 17;
 /// v0.99: `RGSWAL18` — sequence records carry the data type.
 /// v1.05: `RGSWAL19` — new `SetToastRelid` record (tag 28).
 /// Old `RGSWAL18` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL19";
+/// v1.41: `RGSWAL20` — `CreateTable`/`AlterTable` carry `attnums`,
+/// `next_attnum`, and `fillfactor`. Old `RGSWAL19` files are refused
+/// loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL20";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -344,6 +354,12 @@ pub enum WalRecord {
         /// v0.96: inheritance parent links (`inherits`); empty on old
         /// records.
         inherits: Vec<String>,
+        /// v1.41: real PG attribute numbers per column (`attnums`) and
+        /// the never-reused next-attnum counter (`next_attnum`).
+        attnums: Vec<i16>,
+        next_attnum: i16,
+        /// v1.41: `fillfactor` storage parameter (10–100).
+        fillfactor: u8,
         xmin: u64,
     },
     InsertRows {
@@ -435,6 +451,11 @@ pub enum WalRecord {
         /// v0.96: inheritance parent links (`inherits`); empty on old
         /// records.
         inherits: Vec<String>,
+        /// v1.41: real PG attribute numbers per column (`attnums`),
+        /// the never-reused next-attnum counter, and `fillfactor`.
+        attnums: Vec<i16>,
+        next_attnum: i16,
+        fillfactor: u8,
         next_value_id: u32,
         /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
@@ -1459,6 +1480,9 @@ impl Enc {
                 domain_types,
                 domain_elem,
                 inherits,
+                attnums,
+                next_attnum,
+                fillfactor,
                 xmin,
             } => {
                 self.u8(1);
@@ -1481,6 +1505,13 @@ impl Enc {
                 self.bool_list(domain_elem);
                 // v0.96: inheritance parent links.
                 self.str_list(inherits);
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                self.u32(attnums.len() as u32);
+                for a in attnums {
+                    self.i16(*a);
+                }
+                self.i16(*next_attnum);
+                self.u8(*fillfactor);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -1602,6 +1633,9 @@ impl Enc {
                 domain_types,
                 domain_elem,
                 inherits,
+                attnums,
+                next_attnum,
+                fillfactor,
                 next_value_id,
                 toast_info,
                 xmin,
@@ -1633,6 +1667,13 @@ impl Enc {
                 self.bool_list(domain_elem);
                 // v0.96: inheritance parent links.
                 self.str_list(inherits);
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                self.u32(attnums.len() as u32);
+                for a in attnums {
+                    self.i16(*a);
+                }
+                self.i16(*next_attnum);
+                self.u8(*fillfactor);
                 self.u32(*next_value_id);
                 self.u32(toast_info.len() as u32);
                 for (k, c) in toast_info {
@@ -2395,6 +2436,14 @@ impl<'a> Dec<'a> {
                 let domain_elem = self.bool_list_d()?;
                 // v0.96: inheritance parent links.
                 let inherits = self.str_list_d()?;
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                let n_attnums = self.u32()? as usize;
+                let mut attnums = Vec::with_capacity(n_attnums);
+                for _ in 0..n_attnums {
+                    attnums.push(self.i16()?);
+                }
+                let next_attnum = self.i16()?;
+                let fillfactor = self.u8()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -2410,6 +2459,9 @@ impl<'a> Dec<'a> {
                     domain_types,
                     domain_elem,
                     inherits,
+                    attnums,
+                    next_attnum,
+                    fillfactor,
                     xmin,
                 })
             }
@@ -2537,6 +2589,14 @@ impl<'a> Dec<'a> {
                 let domain_elem = self.bool_list_d()?;
                 // v0.96: inheritance parent links.
                 let inherits = self.str_list_d()?;
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                let n_attnums = self.u32()? as usize;
+                let mut attnums = Vec::with_capacity(n_attnums);
+                for _ in 0..n_attnums {
+                    attnums.push(self.i16()?);
+                }
+                let next_attnum = self.i16()?;
+                let fillfactor = self.u8()?;
                 let next_value_id = self.u32()?;
                 let n_ti = self.u32()? as usize;
                 let mut toast_info = Vec::with_capacity(n_ti);
@@ -2561,6 +2621,9 @@ impl<'a> Dec<'a> {
                     domain_types,
                     domain_elem,
                     inherits,
+                    attnums,
+                    next_attnum,
+                    fillfactor,
                     next_value_id,
                     toast_info,
                     xmin,
@@ -3399,9 +3462,17 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             domain_types,
             domain_elem,
             inherits,
+            attnums,
+            next_attnum,
+            fillfactor,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.41: restore attnums, the next-attnum counter, and
+            // fillfactor.
+            t.attnums = attnums.clone();
+            t.next_attnum = *next_attnum;
+            t.fillfactor = *fillfactor;
             // v0.11
             t.owner = owner.clone();
             t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
@@ -3684,6 +3755,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             domain_types,
             domain_elem,
             inherits,
+            attnums,
+            next_attnum,
+            fillfactor,
             next_value_id,
             toast_info,
             xmin,
@@ -3694,6 +3768,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 prev.dropped_xmax = *xmin;
             }
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.41: restore attnums, the next-attnum counter, and
+            // fillfactor.
+            t.attnums = attnums.clone();
+            t.next_attnum = *next_attnum;
+            t.fillfactor = *fillfactor;
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
@@ -4125,6 +4204,10 @@ pub fn records_for_commit(
                     domain_elem: ours.domain_elem.clone(),
                     // v0.96: inheritance parent links.
                     inherits: ours.inherits.clone(),
+                    // v1.41: attnums, next_attnum, fillfactor.
+                    attnums: ours.attnums.clone(),
+                    next_attnum: ours.next_attnum,
+                    fillfactor: ours.fillfactor,
                     xmin: own,
                 });
             }
@@ -4188,6 +4271,10 @@ pub fn records_for_commit(
                     domain_elem: ours.domain_elem.clone(),
                     // v0.96: inheritance parent links.
                     inherits: ours.inherits.clone(),
+                    // v1.41: attnums, next_attnum, fillfactor.
+                    attnums: ours.attnums.clone(),
+                    next_attnum: ours.next_attnum,
+                    fillfactor: ours.fillfactor,
                     next_value_id: ours.next_value_id,
                     toast_info: ours
                         .toast_info
@@ -4932,6 +5019,14 @@ impl Wal {
                 body.u64(t.created_xmin);
                 body.u64(dropped_xmax);
                 body.columns(&t.columns);
+                // v1.41: real PG attnums, the next-attnum counter, and
+                // fillfactor.
+                body.u32(t.attnums.len() as u32);
+                for a in &t.attnums {
+                    body.i16(*a);
+                }
+                body.i16(t.next_attnum);
+                body.u8(t.fillfactor);
                 // v0.9: constraint/default metadata.
                 body.str(&crate::sql::encode_constraints(t));
                 // v0.11: owner and ACL.
@@ -5491,6 +5586,14 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let columns = d.columns().map_err(|e| bad(&e))?;
+        // v1.41: real PG attnums, the next-attnum counter, fillfactor.
+        let n_attnums = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut attnums = Vec::with_capacity(n_attnums);
+        for _ in 0..n_attnums {
+            attnums.push(d.i16().map_err(|e| bad(&e))?);
+        }
+        let next_attnum = d.i16().map_err(|e| bad(&e))?;
+        let fillfactor = d.u8().map_err(|e| bad(&e))?;
         // v0.9: constraint/default metadata.
         let constraints = d.str().map_err(|e| bad(&e))?;
         // v0.11: owner and ACL.
@@ -5594,6 +5697,10 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
+        // v1.41: restore attnums, next_attnum, fillfactor.
+        __t.attnums = attnums;
+        __t.next_attnum = next_attnum;
+        __t.fillfactor = fillfactor;
         // v0.11
         __t.owner = owner;
         __t.acl = acl;
@@ -6200,6 +6307,10 @@ mod tests {
                 domain_types: vec![None],
                 domain_elem: vec![false],
                 inherits: vec![],
+                // v1.41
+                attnums: vec![1],
+                next_attnum: 2,
+                fillfactor: 100,
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -6317,6 +6428,10 @@ mod tests {
             domain_types: vec![None],
             domain_elem: vec![false],
             inherits: vec!["p1".to_string(), "p2".to_string()],
+            // v1.41
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
             xmin: 3,
         };
         assert_eq!(&roundtrip(&create), &create);
@@ -6337,6 +6452,10 @@ mod tests {
             domain_types: vec![None],
             domain_elem: vec![false],
             inherits: vec!["p1".to_string()],
+            // v1.41
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
             next_value_id: 1,
             toast_info: vec![],
             xmin: 4,
@@ -6469,6 +6588,10 @@ mod tests {
                 domain_types: vec![None],
                 domain_elem: vec![false],
                 inherits: vec![],
+                // v1.41
+                attnums: vec![1],
+                next_attnum: 2,
+                fillfactor: 100,
                 xmin: 4,
             },
         )

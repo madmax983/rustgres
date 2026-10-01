@@ -4927,6 +4927,20 @@ impl RowVersion {
 #[derive(Clone, Debug)]
 pub struct Table {
     pub columns: Vec<(String, ColType)>,
+    /// v1.41: the real PostgreSQL attribute number per live column,
+    /// parallel to `columns`. PG never reuses attnums: `ALTER TABLE ADD
+    /// COLUMN` assigns `max(all attnums ever)+1`, so after DROP+ADD the
+    /// numbers have gaps (unlike the 1-based position). Reported by the
+    /// `pg_attribute` catalog view.
+    pub attnums: Vec<i16>,
+    /// v1.41: next attnum to assign (`max(attnums ever)+1`; 1-based).
+    /// Never decremented — dropped columns' numbers are not reused.
+    pub next_attnum: i16,
+    /// v1.41: `fillfactor` storage parameter (10–100, default 100),
+    /// from `WITH (fillfactor = N)` at CREATE TABLE. Drives the
+    /// `pg_relation_size` heap page simulation (PG19
+    /// `RelationGetTargetPageFreeSpace`).
+    pub fillfactor: u8,
     /// v0.81: named composite type per column, parallel to `columns`
     /// (`Some(name)` iff the column's `ColType` is `Composite`).
     pub composite_types: Vec<Option<String>>,
@@ -5007,6 +5021,12 @@ impl Table {
             .collect();
         Table {
             columns,
+            // v1.41: fresh tables get sequential attnums 1..=n.
+            attnums: (1..=n as i16).collect(),
+            next_attnum: n as i16 + 1,
+            // v1.41: default fillfactor 100 (`with_def` overrides from
+            // reloptions).
+            fillfactor: 100,
             // v0.81: no named composites by default.
             composite_types: vec![None; n],
             // v0.85: no domain-typed columns by default.
@@ -5047,6 +5067,15 @@ impl Table {
     /// Build a table from a parsed v0.9 `TableDef` (constraints included).
     pub fn with_def(def: &TableDef, created_xmin: u64) -> Self {
         let mut t = Table::new(def.columns.clone(), created_xmin);
+        // v1.41: `WITH (fillfactor = N)` (validated 10–100 at exec by
+        // `validate_reloptions`; last wins, like PG).
+        for (name, val) in &def.reloptions {
+            if name == "fillfactor" {
+                if let Ok(n) = val.parse::<u8>() {
+                    t.fillfactor = n;
+                }
+            }
+        }
         t.not_null = def.not_null.clone();
         t.defaults = def.defaults.clone();
         t.checks = def.checks.clone();
