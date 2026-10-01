@@ -200,6 +200,9 @@ def main():
     finally:
         srv.terminate()
         srv.wait()
+        # v1.39: clean up the /tmp binary copy (512MB tmpfs)
+        try: os.unlink(BIN)
+        except OSError: pass
     print("v1.11 protocol: %d failures" % len(fails))
     return 1 if fails else 0
 

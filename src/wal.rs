@@ -1292,6 +1292,11 @@ impl Enc {
                 self.u8(24);
                 return;
             }
+            // v1.39: bit; tag appends after v1.17's.
+            ColType::Bit => {
+                self.u8(25);
+                return;
+            }
             // v0.78: array; tag appends after v0.73's, then the PG array
             // OID (which identifies the element type). Arrays never
             // appear as table columns — no DDL support — but the codec
@@ -1407,6 +1412,14 @@ impl Enc {
                     self.str(name);
                     self.value(val);
                 }
+            }
+            // v1.39: bit-string values (tag 19) — bit length, then the
+            // bytes (the length matters: trailing bits are padding).
+            Value::BitString(b) => {
+                self.u8(19);
+                self.u32(b.bitlen);
+                self.u32(b.bytes.len() as u32);
+                self.bytes(&b.bytes);
             }
         }
     }
@@ -2139,6 +2152,8 @@ impl<'a> Dec<'a> {
             23 => Ok(ColType::Composite),
             // v1.17: xid.
             24 => Ok(ColType::Xid),
+            // v1.39: bit.
+            25 => Ok(ColType::Bit),
             21 => Ok(ColType::Json),
             // v0.78: array, then the PG array OID identifying the
             // element type.
@@ -2166,6 +2181,8 @@ impl<'a> Dec<'a> {
                     2287 => ArrayElem::Record,
                     3221 => ArrayElem::PgLsn,
                     1011 => ArrayElem::Xid,
+                    // v1.39: _bit.
+                    1561 => ArrayElem::Bit,
                     t => return Err(self.err(&format!("unknown array element OID {}", t))),
                 };
                 Ok(ColType::Array(elem))
@@ -2250,6 +2267,16 @@ impl<'a> Dec<'a> {
                 }
                 Ok(Value::Record(fields))
             }
+            // v1.39: bit-string values (tag 19; mirrors the encoder).
+            19 => {
+                let bitlen = self.u32()?;
+                let n = self.u32()? as usize;
+                let bytes = self.take(n)?.to_vec();
+                Ok(Value::BitString(crate::storage::BitString {
+                    bitlen,
+                    bytes,
+                }))
+            }
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
     }
@@ -2279,6 +2306,8 @@ impl<'a> Dec<'a> {
             199 => Ok(ArrayElem::Json),
             2287 => Ok(ArrayElem::Record),
             3221 => Ok(ArrayElem::PgLsn),
+            // v1.39: _bit.
+            1561 => Ok(ArrayElem::Bit),
             t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }

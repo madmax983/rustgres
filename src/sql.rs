@@ -85,6 +85,15 @@ fn err_typmod(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v1.39: a parse-time 22P02 (invalid_text_representation), like PG19's
+/// `bit_in` rejecting a bad digit in an `x'...'`/`b'...'` literal.
+fn err_invalid_text(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "22P02",
+    }
+}
+
 /// v0.28: parse the digits of a PG 16+ non-decimal integer literal (the
 /// `0x`/`0o`/`0b` prefix is already stripped). Underscores between digits
 /// are ignored, like Postgres. Returns None when there are no digits or
@@ -108,6 +117,11 @@ enum Token {
     Str(String),
     UStr(String),   // v0.19: U&'...' raw content (UESCAPE handled by parser)
     UIdent(String), // v0.24: U&"..." raw identifier content (UESCAPE handled by parser)
+    // v1.39: `x'...'`/`b'...'` bit-string literal (PG19 scan.l xhstart):
+    // the char is the normalized lowercase marker ('x' or 'b'), the
+    // String is the raw digit content (validated by the parser with
+    // `bit_in` semantics, not the lexer).
+    BitStr(char, String),
     Param(u32),     // $N parameter placeholder, 1-based
     LParen,
     RParen,
@@ -503,6 +517,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             toks.push(Token::Str(unescape_e_string(&s)?));
             continue;
         }
+        // v1.39: `x'...'`/`b'...'` bit-string literal prefixes (PG19
+        // scan.l xhstart: no space allowed between the prefix and the
+        // quote, and the scanner prepends the marker to the literal).
+        // Validation happens in the parser (`bit_in` semantics); the
+        // lexer only captures the raw digits.
+        if (c == 'x' || c == 'X' || c == 'b' || c == 'B')
+            && i + 1 < chars.len()
+            && chars[i + 1] == '\''
+        {
+            let marker = c.to_ascii_lowercase();
+            i += 1; // consume the prefix, now at the quote
+            let s = parse_single_quoted(&chars, &mut i)?;
+            toks.push(Token::BitStr(marker, s));
+            continue;
+        }
         match c {
             '(' => {
                 toks.push(Token::LParen);
@@ -864,6 +893,9 @@ pub enum Literal {
     Timestamptz(i64), // v0.7: micros since epoch, UTC
     Bytea(Vec<u8>),   // v0.7
     Uuid([u8; 16]),   // v0.7
+    // v1.39: a validated `x'...'`/`b'...'` bit-string literal (PG19
+    // `bit_in`); the marker's case was normalized by the lexer.
+    BitString(crate::storage::BitString),
     Null,
 }
 
@@ -885,6 +917,7 @@ impl Literal {
             Literal::Timestamptz(_) => "timestamp with time zone",
             Literal::Bytea(_) => "bytea",
             Literal::Uuid(_) => "uuid",
+            Literal::BitString(_) => "bit", // v1.39
             Literal::Null => "unknown",
         }
     }
@@ -907,6 +940,7 @@ impl Literal {
             Literal::Timestamptz(_) => ColType::Timestamptz,
             Literal::Bytea(_) => ColType::Bytea,
             Literal::Uuid(_) => ColType::Uuid,
+            Literal::BitString(_) => ColType::Bit, // v1.39
             // Postgres would say "unknown"; text is a fine stand-in.
             Literal::Null => ColType::Text,
         }
@@ -938,6 +972,7 @@ impl Literal {
             Literal::Timestamptz(m) => Value::Timestamptz(m),
             Literal::Bytea(b) => Value::Bytea(b),
             Literal::Uuid(u) => Value::Uuid(u),
+            Literal::BitString(b) => Value::BitString(b), // v1.39
             Literal::Null => Value::Null,
         }
     }
@@ -1641,7 +1676,7 @@ pub struct SetOpRoot {
 /// v0.10: a CTE body. Plain CTEs hold one SELECT; recursive CTEs hold the
 /// `non_recursive UNION [ALL] recursive` pair (UNION elsewhere is not
 /// supported in v0.10).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum CteBody {
     Simple(SelectStmt),
     Union {
@@ -1649,6 +1684,36 @@ pub enum CteBody {
         right: Box<SelectStmt>,
         all: bool,
     },
+    // v1.39: a data-modifying CTE body — `(INSERT/UPDATE/DELETE ...
+    // [RETURNING ...])` (PG19 parse_cte.c). The DML runs when the CTE is
+    // materialized; its RETURNING rows become the CTE's rows. An empty
+    // RETURNING list means zero columns.
+    Dml(Box<Stmt>),
+}
+
+// v1.39: manual PartialEq — `Stmt` does not implement PartialEq (several
+// of its field types don't), so the derived impl cannot cover
+// `CteBody::Dml`. DML bodies are never compared in this engine; two
+// DML bodies compare unequal.
+impl PartialEq for CteBody {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CteBody::Simple(a), CteBody::Simple(b)) => a == b,
+            (
+                CteBody::Union {
+                    left: a,
+                    right: b,
+                    all: c,
+                },
+                CteBody::Union {
+                    left: d,
+                    right: e,
+                    all: f,
+                },
+            ) => a == d && b == e && c == f,
+            _ => false,
+        }
+    }
 }
 
 /// v0.22: UPDATE/DELETE graduated to full predicate expressions (see
@@ -5137,6 +5202,8 @@ fn max_param_ctes(ctes: &[CteDef]) -> usize {
             CteBody::Union { left, right, .. } => {
                 m = m.max(max_param_select(left).max(max_param_select(right)));
             }
+            // v1.39: params inside a data-modifying CTE body.
+            CteBody::Dml(stmt) => m = m.max(stmt.max_param()),
         }
     }
     m
@@ -5455,6 +5522,9 @@ fn tokens_to_sql(toks: &[Token]) -> String {
             Token::QIdent(s) => format!("\"{}\"", s.replace('"', "\"\"")),
             Token::Number(s) => s.clone(),
             Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            // v1.39: render a bit-string literal back in `x'...'` form
+            // (catalog fidelity only).
+            Token::BitStr(marker, s) => format!("{}'{}'", marker, s),
             Token::UStr(s) => format!("U&'{}'", s.replace('\'', "''")),
             Token::UIdent(s) => format!("U&\"{}\"", s.replace('"', "\"\"")),
             Token::Param(n) => format!("${}", n),
@@ -6262,6 +6332,10 @@ impl Parser {
                 }
             }
             "bytea" => Ok(ColType::Bytea),
+            // v1.39: PG's `bit` type (OID 1560). `bit(n)` typmod is not
+            // accepted yet (fail-closed: the value carries its own bit
+            // length, so enforcement would need per-value checks).
+            "bit" => Ok(ColType::Bit),
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
@@ -8794,6 +8868,15 @@ impl Parser {
                     None => Err(err("invalid Unicode escape")),
                 }
             }
+            // v1.39: `x'...'`/`b'...'` bit-string literal. The digits are
+            // validated here with PG19 `bit_in` semantics (22P02 on a bad
+            // digit), because PG raises it during parse analysis.
+            Token::BitStr(marker, raw) => {
+                match crate::storage::BitString::parse(marker, raw.as_str()) {
+                    Ok(bs) => Ok(Literal::BitString(bs)),
+                    Err(msg) => Err(err_invalid_text(msg)),
+                }
+            }
             Token::Ident(s) => match s.as_str() {
                 "true" => Ok(Literal::Bool(true)),
                 "false" => Ok(Literal::Bool(false)),
@@ -9114,6 +9197,17 @@ impl Parser {
             }
             self.expect(Token::LParen, "'('")?;
             let body = self.parse_cte_body(recursive)?;
+            // v1.39: PG19 parse_cte.c — a recursive query must not contain
+            // a data-modifying statement (42P19).
+            if recursive && matches!(body, CteBody::Dml(_)) {
+                return Err(SqlError {
+                    message: format!(
+                        "recursive query \"{}\" must not contain data-modifying statements",
+                        name
+                    ),
+                    code: "42P19",
+                });
+            }
             self.expect(Token::RParen, "')'")?;
             if ctes.iter().any(|c: &CteDef| c.name == name) {
                 return Err(err(format!("duplicate CTE name \"{}\"", name)));
@@ -9200,6 +9294,22 @@ impl Parser {
         }
         // The body must start with SELECT (or VALUES in a non-recursive
         // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
+        // v1.39: or with a data-modifying statement — `WITH x AS
+        // (INSERT/UPDATE/DELETE ... [RETURNING ...])` (PG19 parse_cte.c).
+        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete")
+        {
+            let kw = match self.next() {
+                Token::Ident(kw) => kw,
+                _ => unreachable!("peeked Ident above"),
+            };
+            let stmt = match kw.as_str() {
+                "insert" => self.parse_insert()?,
+                "update" => self.parse_update()?,
+                "delete" => self.parse_delete()?,
+                _ => unreachable!("peeked DML keyword above"),
+            };
+            return Ok(CteBody::Dml(Box::new(stmt)));
+        }
         let is_values = match self.next() {
             Token::Ident(kw) if kw == "select" => false,
             Token::Ident(kw) if kw == "values" && !recursive => true,
@@ -10371,7 +10481,9 @@ impl Parser {
                 self.next();
                 Ok(Expr::Param(n))
             }
-            Token::Number(_) | Token::Str(_) | Token::UStr(_) => {
+            Token::Number(_) | Token::Str(_) | Token::UStr(_) | Token::BitStr(_, _) => {
+                // v1.39: bit-string literals lex to Token::BitStr;
+                // parse_literal validates them (22P02 on a bad digit).
                 // v0.19: adjacent string literals concatenate
                 // ('a' 'b' -> 'ab', per SQL standard).
                 let mut lit = self.parse_literal()?;
@@ -14834,6 +14946,14 @@ fn encode_literal(lit: &Literal, out: &mut String) {
                 out.push_str(&format!("{:02x}", byte));
             }
         }
+        // v1.39: bit length plus hex bytes (the length matters: the
+        // last byte's low bits are padding).
+        Literal::BitString(b) => {
+            out.push_str(&format!("bit {} ", b.bitlen));
+            for byte in &b.bytes {
+                out.push_str(&format!("{:02x}", byte));
+            }
+        }
         Literal::Uuid(u) => {
             out.push_str("uuid ");
             for byte in u {
@@ -15587,6 +15707,15 @@ impl<'a> SexprParser<'a> {
                 let hex = self.atom()?;
                 Literal::Bytea(hex_decode(&hex)?)
             }
+            // v1.39: `(lit bit <bitlen> <hexbytes>)`.
+            "bit" => {
+                let bitlen: u32 = self.atom()?.parse().map_err(|_| "bad bitlen")?;
+                let bytes = hex_decode(&self.atom()?)?;
+                if bytes.len() != ((bitlen as usize + 7) / 8) {
+                    return Err("bad bit bytes".into());
+                }
+                Literal::BitString(crate::storage::BitString { bitlen, bytes })
+            }
             "uuid" => {
                 let hex = self.atom()?;
                 let b = hex_decode(&hex)?;
@@ -15634,6 +15763,7 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "timestamp" | "timestamp without time zone" => ColType::Timestamp,
         "timestamptz" | "timestamp with time zone" => ColType::Timestamptz,
         "bytea" => ColType::Bytea,
+        "bit" => ColType::Bit, // v1.39
         "uuid" => ColType::Uuid,
         o => return Err(format!("bad column type {}", o)),
     })

@@ -149,6 +149,9 @@ fn type_tag(v: &Value) -> u8 {
         Value::Record(_) => 16,
         // v0.79: arrays never index either, but stay total (append-only).
         Value::Array(_) => 17,
+        // v1.39: bit strings never index either, but stay total
+        // (append-only).
+        Value::BitString(_) => 18,
     }
 }
 

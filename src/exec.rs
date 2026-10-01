@@ -49,9 +49,9 @@ use crate::sql::{
 };
 use crate::storage::index_visible;
 use crate::storage::{
-    ArrayElem, ArrayVal, BigDec, ColStats, ColType, Database, Engine, Numeric, NumericSpecial,
-    OperDef, Row, RowVersion, Sequence, ShellType, Snapshot, Table, TableStats, Value, ViewDef,
-    WriteOp, row_visible, toast_consts, toast_storage,
+    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, Numeric,
+    NumericSpecial, OperDef, Row, RowVersion, Sequence, ShellType, Snapshot, Table, TableStats,
+    Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -5893,6 +5893,7 @@ fn array_elem_coltype(e: ArrayElem) -> ColType {
     match e {
         ArrayElem::Bool => ColType::Bool,
         ArrayElem::Bytea => ColType::Bytea,
+        ArrayElem::Bit => ColType::Bit, // v1.39
         ArrayElem::SingleChar => ColType::SingleChar,
         ArrayElem::Name => ColType::Name,
         ArrayElem::SmallInt => ColType::SmallInt,
@@ -9925,6 +9926,7 @@ fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
     Some(match e {
         ArrayElem::Bool => "boolean",
         ArrayElem::Bytea => "bytea",
+        ArrayElem::Bit => "bit", // v1.39
         ArrayElem::SingleChar => "\"char\"",
         ArrayElem::Name => "name",
         ArrayElem::SmallInt => "smallint",
@@ -10945,6 +10947,12 @@ fn plan_cte_body(
             };
             Ok(PlanNode::Values { rows })
         }
+        // v1.39: EXPLAIN of a data-modifying CTE is not supported
+        // (fail-closed 0A000; PG would show the ModifyTable plan).
+        CteBody::Dml(_) => Err(exec_err(
+            "0A000",
+            "EXPLAIN of a data-modifying CTE is not supported",
+        )),
     }
 }
 
@@ -12134,6 +12142,7 @@ fn value_coltype(v: &Value) -> ColType {
         Value::Timestamp(_) => ColType::Timestamp,
         Value::Timestamptz(_) => ColType::Timestamptz,
         Value::Bytea(_) => ColType::Bytea,
+        Value::BitString(_) => ColType::Bit, // v1.39
         Value::Uuid(_) => ColType::Uuid,
         Value::PgLsn(_) => ColType::PgLsn,   // v0.64
         Value::Record(_) => ColType::Record, // v0.73
@@ -13235,6 +13244,10 @@ fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             CteBody::Union { left, right, .. } => {
                 stmt_uses_pg_column_compression(left) || stmt_uses_pg_column_compression(right)
             }
+            // v1.39: a data-modifying CTE body runs through exec_insert
+            // (which handles its own RETURNING provenance); it never
+            // forces provenance on the outer query.
+            CteBody::Dml(_) => false,
         })
 }
 
@@ -13339,6 +13352,8 @@ fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             CteBody::Union { left, right, .. } => {
                 stmt_uses_tableoid(left) || stmt_uses_tableoid(right)
             }
+            // v1.39: see above — a DML CTE body never forces outer provenance.
+            CteBody::Dml(_) => false,
         })
 }
 
@@ -13443,6 +13458,8 @@ fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             CteBody::Union { left, right, .. } => {
                 stmt_uses_xmin_xmax(left) || stmt_uses_xmin_xmax(right)
             }
+            // v1.39: see above — a DML CTE body never forces outer provenance.
+            CteBody::Dml(_) => false,
         })
 }
 
@@ -14039,6 +14056,8 @@ enum FnKeyVal {
     Timestamp(i64),
     Timestamptz(i64),
     Bytea(Vec<u8>),
+    // v1.39: bit length matters (trailing bits are padding).
+    BitString { bitlen: u32, bytes: Vec<u8> },
     Uuid([u8; 16]),
     PgLsn(u64),
     Record(Vec<(String, FnKeyVal)>),
@@ -14079,6 +14098,11 @@ fn fn_key_val(v: &Value) -> FnKeyVal {
         Value::Timestamp(t) => FnKeyVal::Timestamp(*t),
         Value::Timestamptz(t) => FnKeyVal::Timestamptz(*t),
         Value::Bytea(b) => FnKeyVal::Bytea(b.clone()),
+        // v1.39
+        Value::BitString(b) => FnKeyVal::BitString {
+            bitlen: b.bitlen,
+            bytes: b.bytes.clone(),
+        },
         Value::Uuid(u) => FnKeyVal::Uuid(*u),
         Value::PgLsn(l) => FnKeyVal::PgLsn(*l),
         Value::Record(fields) => FnKeyVal::Record(
@@ -14175,6 +14199,10 @@ fn walk_stmt_exprs(s: &SelectStmt, f: &mut impl FnMut(&Expr)) {
                 walk_stmt_exprs(left, f);
                 walk_stmt_exprs(right, f);
             }
+            // v1.39: a data-modifying CTE body is a separate statement
+            // (run via execute_inner when materialized); the fold scan
+            // does not descend into it (fail-open, per the fn docs).
+            CteBody::Dml(_) => {}
         }
     }
     for d in &s.distinct_on {
@@ -14265,6 +14293,8 @@ fn walk_stmt_from_items(s: &SelectStmt, f: &mut impl FnMut(&FromItem)) {
                 walk_stmt_from_items(left, f);
                 walk_stmt_from_items(right, f);
             }
+            // v1.39: see above — the DML body is a separate statement.
+            CteBody::Dml(_) => {}
         }
     }
     for fi in &s.from {
@@ -15362,6 +15392,15 @@ fn eval_cte(q: &mut Q, cte: &CteDef) -> Result<CteBinding, ExecError> {
             cte_binding(cte, out.columns, out.rows)
         }
         CteBody::Union { left, right, all } => eval_recursive_cte(q, cte, left, right, *all),
+        // v1.39: data-modifying CTE body — run the DML through the
+        // shared nested-DML helper (v1.33 `run_func_dml` pattern); its
+        // RETURNING rows become the CTE's rows. A sibling-CTE reference
+        // inside the DML body fails closed (42P01) via the existing
+        // name resolution, which only sees the outer query's bindings.
+        CteBody::Dml(stmt) => {
+            let out = run_nested_dml(q, stmt, &format!("CTE \"{}\"", cte.name))?;
+            cte_binding(cte, out.columns, out.rows)
+        }
     }
 }
 
@@ -15553,6 +15592,9 @@ fn validate_ctes(ctes: &[CteDef]) -> Result<(), ExecError> {
             // v0.10: Postgres allows a non-recursive body in WITH
             // RECURSIVE; skip the recursion checks.
             CteBody::Simple(_) => continue,
+            // v1.39: recursive + DML is rejected at parse time (42P19),
+            // so a DML body here is always non-recursive; skip.
+            CteBody::Dml(_) => continue,
         };
         if stmt_refs_table(left, &cte.name) {
             return Err(exec_err(
@@ -15588,6 +15630,9 @@ fn cte_body_refs_table(body: &CteBody, name: &str) -> bool {
         CteBody::Union { left, right, .. } => {
             stmt_refs_table(left, name) || stmt_refs_table(right, name)
         }
+        // v1.39: only used by the recursive-CTE shape checks, which a
+        // DML body can never reach (parse-time 42P19).
+        CteBody::Dml(_) => false,
     }
 }
 
@@ -19321,6 +19366,8 @@ enum HashFam {
     /// (UTC-only), so both hash the i64.
     Ts,
     Bytea,
+    // v1.39
+    Bit,
     Uuid,
     /// "char": the single byte.
     Char,
@@ -19339,6 +19386,7 @@ fn hash_family(ty: &ColType) -> Option<HashFam> {
         ColType::Date => HashFam::Date,
         ColType::Timestamp | ColType::Timestamptz => HashFam::Ts,
         ColType::Bytea => HashFam::Bytea,
+        ColType::Bit => HashFam::Bit, // v1.39
         ColType::Uuid => HashFam::Uuid,
         ColType::SingleChar => HashFam::Char,
         ColType::PgLsn => HashFam::PgLsn,
@@ -19369,6 +19417,8 @@ enum HashKeyPart {
     Date(i32),
     Ts(i64),
     Bytea(Vec<u8>),
+    // v1.39: bit length matters (trailing bits are padding).
+    BitString { bitlen: u32, bytes: Vec<u8> },
     Uuid([u8; 16]),
     Char(u8),
     PgLsn(u64),
@@ -19439,6 +19489,14 @@ fn hash_key_part(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
         },
         HashFam::Bytea => match v {
             Value::Bytea(b) => Some(HashKeyPart::Bytea(b.clone())),
+            _ => None,
+        },
+        // v1.39
+        HashFam::Bit => match v {
+            Value::BitString(b) => Some(HashKeyPart::BitString {
+                bitlen: b.bitlen,
+                bytes: b.bytes.clone(),
+            }),
             _ => None,
         },
         HashFam::Uuid => match v {
@@ -22558,6 +22616,13 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.push(12);
             out.extend_from_slice(&(b.len() as u64).to_be_bytes());
             out.extend_from_slice(b);
+        }
+        // v1.39: bit strings group by (bitlen, bytes) — the bit
+        // length matters because trailing bits are padding.
+        Value::BitString(b) => {
+            out.push(18);
+            out.extend_from_slice(&b.bitlen.to_be_bytes());
+            out.extend_from_slice(&b.bytes);
         }
         Value::Uuid(u) => {
             out.push(13);
@@ -26811,6 +26876,7 @@ fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
     match elem {
         E::Bool => ColType::Bool,
         E::Bytea => ColType::Bytea,
+        E::Bit => ColType::Bit, // v1.39
         E::SingleChar => ColType::SingleChar,
         E::Name => ColType::Name,
         E::SmallInt => ColType::SmallInt,
@@ -27503,6 +27569,8 @@ enum SubplanFamily {
     Timestamp,
     Timestamptz,
     Bytea,
+    // v1.39
+    Bit,
     Uuid,
 }
 
@@ -27518,6 +27586,8 @@ enum SubplanKey {
     Timestamp(i64),
     Timestamptz(i64),
     Bytea(Vec<u8>),
+    // v1.39: bit length matters (trailing bits are padding).
+    BitString { bitlen: u32, bytes: Vec<u8> },
     Uuid([u8; 16]),
 }
 
@@ -27546,6 +27616,11 @@ fn subplan_key(v: &Value) -> Option<SubplanKey> {
         Value::Timestamp(x) => Some(SubplanKey::Timestamp(*x)),
         Value::Timestamptz(x) => Some(SubplanKey::Timestamptz(*x)),
         Value::Bytea(x) => Some(SubplanKey::Bytea(x.clone())),
+        // v1.39
+        Value::BitString(x) => Some(SubplanKey::BitString {
+            bitlen: x.bitlen,
+            bytes: x.bytes.clone(),
+        }),
         Value::Uuid(x) => Some(SubplanKey::Uuid(*x)),
         _ => None,
     }
@@ -27560,6 +27635,7 @@ fn subplan_key_family(k: &SubplanKey) -> SubplanFamily {
         SubplanKey::Timestamp(_) => SubplanFamily::Timestamp,
         SubplanKey::Timestamptz(_) => SubplanFamily::Timestamptz,
         SubplanKey::Bytea(_) => SubplanFamily::Bytea,
+        SubplanKey::BitString { .. } => SubplanFamily::Bit, // v1.39
         SubplanKey::Uuid(_) => SubplanFamily::Uuid,
     }
 }
@@ -27576,6 +27652,7 @@ fn subplan_col_family(ty: &ColType) -> Option<SubplanFamily> {
         ColType::Timestamp => Some(SubplanFamily::Timestamp),
         ColType::Timestamptz => Some(SubplanFamily::Timestamptz),
         ColType::Bytea => Some(SubplanFamily::Bytea),
+        ColType::Bit => Some(SubplanFamily::Bit), // v1.39
         ColType::Uuid => Some(SubplanFamily::Uuid),
         _ => None,
     }
@@ -30905,6 +30982,37 @@ fn cast_bytea_to_int(b: &[u8], width: usize, type_name: &str) -> Result<i128, Ex
     })
 }
 
+/// v1.39: PG19 `bittoint4` (varbit.c): the bytes assemble big-endian,
+/// the padding bits at the end shift out (VARBITPAD), and the result
+/// reinterprets as int32. bitlen > 32 is 22003 "integer out of range".
+fn bit_to_int4(bs: &BitString) -> Result<i32, ExecError> {
+    if bs.bitlen > 32 {
+        return Err(exec_err("22003", "integer out of range"));
+    }
+    let mut v: u32 = 0;
+    for &byte in &bs.bytes {
+        v = (v << 8) | u32::from(byte);
+    }
+    let pad = (bs.bytes.len() * 8).saturating_sub(bs.bitlen as usize) as u32;
+    v >>= pad;
+    Ok(v as i32)
+}
+
+/// v1.39: PG19 `bittoint8` (varbit.c): same shape as `bit_to_int4` for
+/// 64 bits; bitlen > 64 is 22003 "bigint out of range".
+fn bit_to_int8(bs: &BitString) -> Result<i64, ExecError> {
+    if bs.bitlen > 64 {
+        return Err(exec_err("22003", "bigint out of range"));
+    }
+    let mut v: u64 = 0;
+    for &byte in &bs.bytes {
+        v = (v << 8) | u64::from(byte);
+    }
+    let pad = (bs.bytes.len() * 8).saturating_sub(bs.bitlen as usize) as u32;
+    v >>= pad;
+    Ok(v as i64)
+}
+
 fn float_to_int(f: f64) -> Result<i128, ExecError> {
     if !f.is_finite() {
         return Err(exec_err("22003", "integer out of range"));
@@ -32100,6 +32208,9 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 Value::Bytea(b) => cast_bytea_to_int(b, 4, "integer")?,
                 // v0.36: "char" -> int4 is chartoi4: the byte as SIGNED int8.
                 Value::SingleChar(b) => i128::from(*b as i8),
+                // v1.39: bit -> int4 is PG19 `bittoint4` (varbit.c),
+                // an explicit-context cast (pg_cast.dat 'e').
+                Value::BitString(bs) => return bit_to_int4(bs).map(|w| Value::Int(w as i64)),
                 _ => cast_to_int(v)?,
             };
             i32::try_from(i)
@@ -32109,6 +32220,9 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::BigInt => {
             let i = match v {
                 Value::Bytea(b) => cast_bytea_to_int(b, 8, "bigint")?,
+                // v1.39: bit -> int8 is PG19 `bittoint8` (varbit.c),
+                // an explicit-context cast (pg_cast.dat 'e').
+                Value::BitString(bs) => return bit_to_int8(bs).map(Value::BigInt),
                 _ => cast_to_int(v)?,
             };
             i64::try_from(i)
@@ -32187,6 +32301,15 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             Value::Int(i) => Ok(Value::Bytea((*i as i32).to_be_bytes().to_vec())),
             Value::BigInt(i) => Ok(Value::Bytea(i.to_be_bytes().to_vec())),
             other => Err(cast_err(other, "bytea")),
+        },
+        // v1.39: `bit` target — identity for bit values (PG's bit(bit)
+        // typmod cast is a no-op here since the value carries its own
+        // bit length). No other source casts to bit (PG19 pg_cast.dat
+        // has only int4/int8 -> bit as explicit casts, which need the
+        // int-to-bits conversion — not yet implemented).
+        ColType::Bit => match v {
+            Value::BitString(bs) => Ok(Value::BitString(bs.clone())),
+            other => Err(cast_err(other, "bit")),
         },
         ColType::Uuid => match v {
             Value::Text(s) => crate::storage::parse_uuid(s).map(Value::Uuid).map_err(|_| {
@@ -32879,42 +33002,38 @@ fn run_func_body(
         )
     })
 }
-
-/// v1.33: execute one DML statement of a SQL function body (PG19
-/// `fmgr_sql` runs every body statement, including DML, in the
-/// caller's transaction). Builds a real `StmtCtx` from the call
-/// query level plus the statement write context and runs the
-/// statement through `execute_inner` — deliberately NOT `execute()`:
-/// the NOTICE_SINK thread-local installed by the outer statement
-/// must keep receiving notices (a nested `execute()` would swap it
-/// out), so notices the DML statement pushes directly to
-/// `ctx.notices` (e.g. trigger RAISE NOTICE) are drained into the
-/// sink here via `push_notice`, exactly as the outer statement's
-/// own notices are. Returns the DML's rows as a `SelectOut`
-/// (RETURNING rows, possibly empty); non-final statements' rows are
-/// discarded by the caller. The v0.89 `pending_updates` overlay is
-/// NOT consulted by body DML — an honest bound of this version.
-fn run_func_dml(call_q: &mut Q, stmt: &Stmt, func_name: &str) -> Result<SelectOut, ExecError> {
+/// v1.39: run a DML statement nested inside another query level — a
+/// data-modifying CTE body or a function-body DML. Shared by
+/// `run_func_dml` (v1.33) and CTE materialization: it builds a `StmtCtx`
+/// from the calling query level's write context (the statement's
+/// `write_xid`, so the DML's rows are stamped exactly like top-level
+/// DML's) and deliberately runs `execute_inner` rather than `execute()`
+/// so trigger/RAISE notices flow through the statement-scoped
+/// `NOTICE_SINK` instead of being emitted eagerly. `what` names the
+/// construct for error messages (e.g. `function "f"`, `CTE "x"`).
+/// The v0.89 `pending_updates` overlay is NOT consulted by nested DML —
+/// an honest bound of this version.
+fn run_nested_dml(call_q: &mut Q, stmt: &Stmt, what: &str) -> Result<SelectOut, ExecError> {
     let Some(w) = call_q.write.as_mut().map(QWrite::reborrow) else {
         return Err(exec_err(
             "0A000",
             format!(
-                "DML is not supported in function \"{}\" here: the calling query level has no statement write context",
-                func_name
+                "DML is not supported in {} here: the calling query level has no statement write context",
+                what
             ),
         ));
     };
-    // PG19: a read-only transaction rejects DML inside function
-    // bodies just like top-level DML (25006). The server's
+    // PG19: a read-only transaction rejects DML inside nested query
+    // levels just like top-level DML (25006). The server's
     // statement-level `read_only_violation` check cannot see inside
-    // function bodies, so enforce it here; the v0.89 temporary-table
+    // nested DML, so enforce it here; the v0.89 temporary-table
     // carve-out applies (only permanent relations are protected).
     if call_q.read_only {
         let (cmd, target) = match stmt {
             Stmt::Insert { table, .. } => ("INSERT", table.as_str()),
             Stmt::Update { table, .. } => ("UPDATE", table.as_str()),
             Stmt::Delete { table, .. } => ("DELETE", table.as_str()),
-            // Unreachable: run_func_dml only takes DML.
+            // Unreachable: run_nested_dml only takes DML.
             _ => ("DML", ""),
         };
         if !call_q.eng.db.is_temp_table(call_q.session, target) {
@@ -32949,13 +33068,18 @@ fn run_func_dml(call_q: &mut Q, stmt: &Stmt, func_name: &str) -> Result<SelectOu
         // Unreachable: the DML executors always return `Dml`.
         _ => Err(exec_err(
             "XX000",
-            format!(
-                "function \"{}\" body DML did not produce a DML result",
-                func_name
-            ),
+            format!("{} body DML did not produce a DML result", what),
         )),
     }
 }
+
+/// v1.33: run a data-modifying statement (INSERT/UPDATE/DELETE) from
+/// inside a SQL or plpgsql function body. Thin wrapper over
+/// `run_nested_dml` (v1.39).
+fn run_func_dml(call_q: &mut Q, stmt: &Stmt, func_name: &str) -> Result<SelectOut, ExecError> {
+    run_nested_dml(call_q, stmt, &format!("function \"{}\"", func_name))
+}
+
 
 /// v1.03: how a plpgsql statement list finished executing. PG's
 /// `exec_stmt_block` distinguishes "fell off the end" from the
@@ -34012,6 +34136,7 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 Value::Text(s) => s.len() as i64,
                 Value::BpChar(s) => s.len() as i64,
                 Value::Bytea(b) => b.len() as i64,
+                Value::BitString(b) => b.bytes.len() as i64, // v1.39
                 Value::SingleChar(_) => 1,
                 Value::Date(_) => 4,
                 Value::Timestamp(_) => 8,
@@ -40204,6 +40329,7 @@ fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Timestamp(_) => Cow::Borrowed("timestamp"),
         Value::Timestamptz(_) => Cow::Borrowed("timestamptz"),
         Value::Bytea(_) => Cow::Borrowed("bytea"),
+        Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
         Value::Uuid(_) => Cow::Borrowed("uuid"),
         Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
         Value::Record(_) => Cow::Borrowed("record"), // v0.73
@@ -40783,19 +40909,99 @@ fn from_schema_item(
 /// v0.10: output schema of one CTE for the Describe path. `earlier` holds
 /// the CTEs visible to the body (outer scopes + earlier siblings — never
 /// the CTE itself). A recursive CTE describes as its non-recursive term.
-fn describe_cte(
+/// v1.39: describe the RETURNING columns of a data-modifying CTE body,
+/// mirroring `describe_columns`' DML arms. An empty RETURNING list means
+/// zero columns.
+fn describe_cte_dml(
     eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    stmt: &Stmt,
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    match stmt {
+        Stmt::Insert {
+            table, returning, ..
+        } => {
+            if returning.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(describe_returning(eng, snap, own, session, table, table, &[], returning)?.0)
+            }
+        }
+        Stmt::Update {
+            table,
+            alias,
+            from,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let extra = from_schemas(eng, snap, own, session, from, with, &[], &[], &[])?;
+                Ok(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref().unwrap_or(table),
+                    &extra,
+                    returning,
+                )?
+                .0)
+            }
+        }
+        Stmt::Delete {
+            table,
+            alias,
+            using,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let extra = from_schemas(eng, snap, own, session, using, with, &[], &[], &[])?;
+                Ok(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref().unwrap_or(table),
+                    &extra,
+                    returning,
+                )?
+                .0)
+            }
+        }
+        _ => Err(exec_err(
+            "0A000",
+            "data-modifying CTE body must be INSERT, UPDATE, or DELETE",
+        )),
+    }
+}
+
+fn describe_cte(    eng: &Engine,
     snap: &Snapshot,
     own: u64,
     session: u64,
     cte: &CteDef,
     earlier: &[CteDef],
 ) -> Result<Vec<QCol>, ExecError> {
-    let body = match &cte.body {
-        CteBody::Simple(s) => s,
-        CteBody::Union { left, .. } => left,
+    // v1.39: a data-modifying CTE body describes its RETURNING list
+    // (an empty RETURNING list means zero columns).
+    let cols: Vec<(String, ColType)> = match &cte.body {
+        CteBody::Simple(s) => describe_select_outer(eng, snap, own, session, s, earlier, &[], &[])?,
+        CteBody::Union { left, .. } => {
+            describe_select_outer(eng, snap, own, session, left, earlier, &[], &[])?
+        }
+        CteBody::Dml(stmt) => describe_cte_dml(eng, snap, own, session, stmt)?,
     };
-    let cols = describe_select_outer(eng, snap, own, session, body, earlier, &[], &[])?;
     // v0.23: more column aliases than CTE output columns is 42601.
     check_col_alias_arity(&cte.name, cols.len(), &cte.col_aliases)?;
     Ok(cols
@@ -42482,11 +42688,18 @@ fn infer_ctes(
     out: &mut [Option<ColType>],
 ) {
     for cte in ctes {
-        let body: &SelectStmt = match &cte.body {
-            CteBody::Simple(s) => s,
-            CteBody::Union { left, .. } => left,
-        };
-        let _ = infer_select(body, eng, snap, own, session, &[], out);
+        match &cte.body {
+            CteBody::Simple(s) => {
+                let _ = infer_select(s, eng, snap, own, session, &[], out);
+            }
+            CteBody::Union { left, .. } => {
+                let _ = infer_select(left, eng, snap, own, session, &[], out);
+            }
+            // v1.39: no DML param inference yet — params inside a
+            // data-modifying CTE body stay unpinned (best-effort, per
+            // the fn docs).
+            CteBody::Dml(_) => {}
+        }
     }
 }
 
@@ -42662,6 +42875,16 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::text(s))
+        }
+        // v1.39: bit-string parameters go through PG19 `bit_in`
+        // semantics (22P02 on a bad digit).
+        ColType::Bit => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            match crate::storage::BitString::parse_input(s) {
+                Ok(b) => Ok(Value::BitString(b)),
+                Err(msg) => Err(bad(msg)),
+            }
         }
         // v0.35: parameter input goes through the type's input function,
         // i.e. assignment semantics (blank-tolerant, 22001 on excess).
@@ -42915,6 +43138,8 @@ fn subst_ctes(ctes: &mut [CteDef], params: &[Option<Value>]) -> Result<(), ExecE
                 subst_select(left, params)?;
                 subst_select(right, params)?;
             }
+            // v1.39: substitute inside the data-modifying statement.
+            CteBody::Dml(stmt) => subst_params(stmt, params)?,
         }
     }
     Ok(())
@@ -43054,6 +43279,8 @@ fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
         Some(Value::Timestamptz(m)) => Literal::Timestamptz(*m),
         Some(Value::Bytea(b)) => Literal::Bytea(b.clone()),
+        // v1.39: bit strings substitute losslessly as bit literals.
+        Some(Value::BitString(b)) => Literal::BitString(b.clone()),
         Some(Value::Uuid(u)) => Literal::Uuid(*u),
         // v0.64: pg_lsn parameter substitutes as its text format.
         Some(Value::PgLsn(lsn)) => {
@@ -43247,6 +43474,11 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::Timestamp => Value::Timestamp(0),
         ColType::Timestamptz => Value::Timestamptz(0),
         ColType::Bytea => Value::Bytea(Vec::new()),
+        // v1.39: the empty bit string.
+        ColType::Bit => Value::BitString(crate::storage::BitString {
+            bitlen: 0,
+            bytes: Vec::new(),
+        }),
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::Regclass => Value::Text("".into()),
         ColType::Name => Value::text(""),  // v0.57
@@ -50402,6 +50634,11 @@ fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Timestamp => Value::Timestamp(1),
         ColType::Timestamptz => Value::Timestamptz(1),
         ColType::Bytea => Value::Bytea(vec![0]),
+        // v1.39: one set bit.
+        ColType::Bit => Value::BitString(crate::storage::BitString {
+            bitlen: 1,
+            bytes: vec![0x80],
+        }),
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::PgLsn => Value::PgLsn(1),
         ColType::Regclass => Value::text("x"),
@@ -62163,5 +62400,228 @@ mod v138_cast_tests {
             },
         );
         run(&mut eng, "CREATE CAST (integer AS r138) WITHOUT FUNCTION").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod v139_bit_cte_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn col0(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn err_code(eng: &mut Engine, sql: &str) -> &'static str {
+        run(eng, sql).unwrap_err().code
+    }
+
+    fn err_msg(eng: &mut Engine, sql: &str) -> String {
+        run(eng, sql).unwrap_err().message
+    }
+
+    // --- bit-string literals (PG19 bit_in) ---
+
+    #[test]
+    fn bit_literal_hex_digits() {
+        let mut eng = engine();
+        // x'1A' = 00011010 (4 bits per hex digit).
+        assert_eq!(col0(&mut eng, "select x'1A'::text;"), vec!["00011010"]);
+        assert_eq!(col0(&mut eng, "select X'ff'::text;"), vec!["11111111"]);
+    }
+
+    #[test]
+    fn bit_literal_binary_digits() {
+        let mut eng = engine();
+        assert_eq!(col0(&mut eng, "select b'101'::text;"), vec!["101"]);
+        assert_eq!(col0(&mut eng, "select B'0010'::text;"), vec!["0010"]);
+    }
+
+    #[test]
+    fn bit_literal_typeof() {
+        let mut eng = engine();
+        assert_eq!(col0(&mut eng, "select pg_typeof(x'1A');"), vec!["bit"]);
+    }
+
+    #[test]
+    fn bit_literal_bad_hex_digit() {
+        let mut eng = engine();
+        assert_eq!(err_code(&mut eng, "select x'2G';"), "22P02");
+        assert!(err_msg(&mut eng, "select x'2G';").contains("\"G\" is not a valid hexadecimal digit"));
+    }
+
+    #[test]
+    fn bit_literal_bad_binary_digit() {
+        let mut eng = engine();
+        assert_eq!(err_code(&mut eng, "select b'102';"), "22P02");
+        assert!(err_msg(&mut eng, "select b'102';").contains("\"2\" is not a valid binary digit"));
+    }
+
+    // --- bit -> int4 / int8 (PG19 bittoint4/bittoint8) ---
+
+    #[test]
+    fn bit_to_int4() {
+        let mut eng = engine();
+        assert_eq!(col0(&mut eng, "select x'1A'::integer;"), vec!["26"]);
+        assert_eq!(col0(&mut eng, "select b'101'::integer;"), vec!["5"]);
+        // Two's complement: 32 one-bits = -1.
+        assert_eq!(col0(&mut eng, "select x'FFFFFFFF'::integer;"), vec!["-1"]);
+        // Short strings are zero-extended on the left.
+        assert_eq!(col0(&mut eng, "select x'2'::integer;"), vec!["2"]);
+    }
+
+    #[test]
+    fn bit_to_int4_range() {
+        let mut eng = engine();
+        assert_eq!(err_code(&mut eng, "select x'1FFFFFFFF'::integer;"), "22003");
+    }
+
+    #[test]
+    fn bit_to_int8() {
+        let mut eng = engine();
+        assert_eq!(col0(&mut eng, "select b'101'::bigint;"), vec!["5"]);
+        assert_eq!(
+            col0(&mut eng, "select x'FFFFFFFFFFFFFFFF'::bigint;"),
+            vec!["-1"]
+        );
+    }
+
+    #[test]
+    fn bit_to_int8_range() {
+        let mut eng = engine();
+        assert_eq!(
+            err_code(&mut eng, "select x'1FFFFFFFFFFFFFFFF'::bigint;"),
+            "22003"
+        );
+    }
+
+    // --- data-modifying CTEs (PG19 parse_cte.c) ---
+
+    fn mk(eng: &mut Engine) {
+        run(eng, "create table t139(a int, b text);").unwrap();
+    }
+
+    #[test]
+    fn cte_insert_returning() {
+        let mut eng = engine();
+        mk(&mut eng);
+        let rows = match run(
+            &mut eng,
+            "with ins as (insert into t139 values (1, 'x'), (2, 'y') returning *) select * from ins order by a;",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => rows,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 2);
+        // The rows are visible in the table too (same statement snapshot).
+        assert_eq!(col0(&mut eng, "select count(*) from t139;"), vec!["2"]);
+    }
+
+    #[test]
+    fn cte_delete_returning() {
+        let mut eng = engine();
+        mk(&mut eng);
+        run(&mut eng, "insert into t139 values (1, 'x'), (2, 'y');").unwrap();
+        assert_eq!(
+            col0(
+                &mut eng,
+                "with d as (delete from t139 where a = 1 returning a) select * from d;"
+            ),
+            vec!["1"]
+        );
+        assert_eq!(col0(&mut eng, "select count(*) from t139;"), vec!["1"]);
+    }
+
+    #[test]
+    fn cte_update_returning() {
+        let mut eng = engine();
+        mk(&mut eng);
+        run(&mut eng, "insert into t139 values (1, 'x');").unwrap();
+        assert_eq!(
+            col0(
+                &mut eng,
+                "with u as (update t139 set b = 'z' where a = 1 returning b) select * from u;"
+            ),
+            vec!["z"]
+        );
+    }
+
+    #[test]
+    fn cte_dml_chained() {
+        let mut eng = engine();
+        mk(&mut eng);
+        // A second CTE can read the first CTE's RETURNING rows.
+        assert_eq!(
+            col0(
+                &mut eng,
+                "with a as (insert into t139 values (7, 'w') returning *), b as (select a from a) select * from b;"
+            ),
+            vec!["7"]
+        );
+    }
+
+    #[test]
+    fn cte_dml_recursive_rejected() {
+        let mut eng = engine();
+        mk(&mut eng);
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "with recursive r as (insert into t139 values (3, 'q') returning *) select * from r;"
+            ),
+            "42P19"
+        );
+    }
+
+    #[test]
+    fn cte_dml_empty_returning() {
+        let mut eng = engine();
+        mk(&mut eng);
+        // No RETURNING list: zero columns, but the insert still happens.
+        match run(
+            &mut eng,
+            "with ins as (insert into t139 values (5, 'v')) select * from ins;",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { columns, rows, .. } => {
+                assert_eq!(columns.len(), 0);
+                assert_eq!(rows.len(), 0);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+        assert_eq!(col0(&mut eng, "select count(*) from t139;"), vec!["1"]);
     }
 }

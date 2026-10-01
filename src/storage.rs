@@ -56,7 +56,12 @@ pub enum ColType {
     Timestamp,   // OID 1114 (v0.7)
     Timestamptz, // OID 1184 (v0.7)
     Bytea,       // OID 17 (v0.7)
-    Uuid,        // OID 2950 (v0.7)
+    // v1.39: PG's `bit` fixed-length bit-string type (OID 1560) — the
+    // result type of `x'...'`/`b'...'` literals (PG19 `bit_in`). The
+    // value's bit length is carried on the value itself (PG stores the
+    // typmod on the VarBit datum); `ColType` stays `Copy`.
+    Bit,  // OID 1560
+    Uuid, // OID 2950 (v0.7)
     // v0.37: PG's regclass type (OID 2205) — an OID that displays as
     // the relation name. Used for pg_class.reltoastrelid::regclass.
     Regclass, // OID 2205
@@ -129,6 +134,8 @@ pub enum ArrayElem {
     Record,
     PgLsn,
     Xid,
+    // v1.39: `bit` arrays (`_bit`, OID 1561).
+    Bit,
 }
 
 impl ArrayElem {
@@ -139,6 +146,7 @@ impl ArrayElem {
             ColType::Array(e) => *e,
             ColType::Bool => ArrayElem::Bool,
             ColType::Bytea => ArrayElem::Bytea,
+            ColType::Bit => ArrayElem::Bit,
             ColType::SingleChar => ArrayElem::SingleChar,
             ColType::Name => ArrayElem::Name,
             ColType::SmallInt => ArrayElem::SmallInt,
@@ -189,6 +197,8 @@ impl ArrayElem {
             ArrayElem::Record => 2287,
             ArrayElem::PgLsn => 3221,
             ArrayElem::Xid => 1011,
+            // v1.39: PG's `_bit` array OID (pg_type.dat).
+            ArrayElem::Bit => 1561,
         }
     }
 
@@ -217,6 +227,7 @@ impl ArrayElem {
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
+            ArrayElem::Bit => "bit",
         }
     }
 
@@ -245,7 +256,94 @@ impl ArrayElem {
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
+            ArrayElem::Bit => "bit",
         }
+    }
+}
+
+/// v1.39: a fixed-length bit string — the value of PG19's `bit` type
+/// (OID 1560), produced by `x'...'`/`b'...'` literals via `bit_in`
+/// semantics. Mirrors PG's `VarBit` layout: `bitlen` significant bits
+/// stored big-endian in `bytes` (MSB first), with the unused low bits
+/// of the last byte zeroed (`bytes.len() == (bitlen + 7) / 8`, except
+/// `bitlen == 0` which stores no bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitString {
+    pub bitlen: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl BitString {
+    /// PG19 `bit_in` (varbit.c): `marker` is the normalized literal
+    /// prefix (`'b'` or `'x'`, case-insensitive at the scanner). Binary
+    /// digits must each be `0`/`1` (22P02 "not a valid binary digit");
+    /// hex digits must each be valid hex (22P02 "not a valid hexadecimal
+    /// digit"). A hex literal's bit length is 4x its digit count. The
+    /// error is always SQLSTATE 22P02; only the message is returned.
+    pub fn parse(marker: char, digits: &str) -> Result<BitString, String> {
+        let mut bits: Vec<u8> = Vec::new();
+        match marker {
+            'b' | 'B' => {
+                for ch in digits.chars() {
+                    match ch {
+                        '0' => bits.push(0),
+                        '1' => bits.push(1),
+                        // PG reports the offending character, e.g.
+                        // `"2" is not a valid binary digit`.
+                        _ => return Err(format!("\"{ch}\" is not a valid binary digit")),
+                    }
+                }
+            }
+            'x' | 'X' => {
+                for ch in digits.chars() {
+                    match ch.to_digit(16) {
+                        Some(d) => {
+                            bits.push((d >> 3) as u8 & 1);
+                            bits.push((d >> 2) as u8 & 1);
+                            bits.push((d >> 1) as u8 & 1);
+                            bits.push(d as u8 & 1);
+                        }
+                        // PG: `"g" is not a valid hexadecimal digit`.
+                        None => return Err(format!("\"{ch}\" is not a valid hexadecimal digit")),
+                    }
+                }
+            }
+            _ => return Err(format!("invalid bit-string prefix '{marker}'")),
+        }
+        let bitlen = bits.len() as u32;
+        let mut bytes = vec![0u8; (bits.len() + 7) / 8];
+        for (i, b) in bits.iter().enumerate() {
+            if *b == 1 {
+                bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        Ok(BitString { bitlen, bytes })
+    }
+
+    /// v1.39: PG19 `bit_in` on a raw input string (parameter values,
+    /// casts from text). A leading `b`/`B`/`x`/`X` selects the digit
+    /// base; otherwise the whole string is binary digits (varbit.c:
+    /// "This allows things like cast('1001' as bit) to work
+    /// transparently").
+    pub fn parse_input(s: &str) -> Result<BitString, String> {
+        let (marker, digits) = match s.chars().next() {
+            Some('b') | Some('B') | Some('x') | Some('X') => (s.chars().next().unwrap(), &s[1..]),
+            _ => ('b', s),
+        };
+        BitString::parse(marker, digits)
+    }
+
+    /// PG19 `bit_out`: the bit characters, MSB first.
+    pub fn to_bit_chars(&self) -> String {
+        let mut s = String::with_capacity(self.bitlen as usize);
+        for i in 0..self.bitlen as usize {
+            s.push(if self.bytes[i / 8] & (1 << (7 - (i % 8))) != 0 {
+                '1'
+            } else {
+                '0'
+            });
+        }
+        s
     }
 }
 
@@ -270,6 +368,7 @@ impl ColType {
             ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
             ColType::Bytea => 17,         // BYTEA
+            ColType::Bit => 1560,         // BIT (v1.39)
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
             ColType::Name => 19,          // NAME (v0.57)
@@ -307,6 +406,7 @@ impl ColType {
             ColType::Timestamp => "timestamp without time zone",
             ColType::Timestamptz => "timestamp with time zone",
             ColType::Bytea => "bytea",
+            ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Xid => "xid",      // v1.17
@@ -348,6 +448,7 @@ impl ColType {
             ColType::Timestamp => "timestamp",
             ColType::Timestamptz => "timestamptz",
             ColType::Bytea => "bytea",
+            ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Xid => "xid",      // v1.17
@@ -4066,6 +4167,11 @@ pub enum Value {
     Timestamptz(i64), // v0.7: micros since epoch, UTC
     Bytea(Vec<u8>),   // v0.7
     Uuid([u8; 16]),   // v0.7
+    // v1.39: PG's `bit` fixed-length bit string (OID 1560) — the value
+    // of `x'...'`/`b'...'` literals. The bit length rides on the value
+    // (PG's VarBit datum carries its typmod); display is the bit
+    // characters (`bit_out`).
+    BitString(BitString),
     // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
     // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
     PgLsn(u64),
@@ -4234,6 +4340,8 @@ impl Value {
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
             Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
             Value::Bytea(b) => Some(bytea_text(b)),
+            // v1.39: PG19 `bit_out` — the bit characters.
+            Value::BitString(b) => Some(b.to_bit_chars()),
             Value::Uuid(u) => Some(uuid_text(u)),
             // v0.64: pg_lsn displays as HIGH/LOW uppercase hex, LOW
             // zero-padded to 8 digits (e.g. `0/016AE7F8`).
@@ -4329,6 +4437,7 @@ impl Value {
             Value::Timestamp(_) => Cow::Borrowed("timestamp without time zone"),
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
             Value::Bytea(_) => Cow::Borrowed("bytea"),
+            Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
             Value::Uuid(_) => Cow::Borrowed("uuid"),
             Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
             Value::Record(_) => Cow::Borrowed("record"), // v0.73
@@ -4357,6 +4466,7 @@ impl Value {
             Value::Timestamp(_) => ColType::Timestamp,
             Value::Timestamptz(_) => ColType::Timestamptz,
             Value::Bytea(_) => ColType::Bytea,
+            Value::BitString(_) => ColType::Bit, // v1.39
             Value::Uuid(_) => ColType::Uuid,
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
             // v0.73: a whole-row value has composite (record) type.

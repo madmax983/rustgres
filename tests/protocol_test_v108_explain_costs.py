@@ -220,6 +220,9 @@ def main():
     finally:
         proc.terminate()
         proc.wait()
+        # v1.39: clean up the /tmp binary copy (512MB tmpfs)
+        try: os.unlink(BIN)
+        except OSError: pass
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

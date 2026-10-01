@@ -158,6 +158,9 @@ def main():
         return 0
     finally:
         srv.terminate()
+        # v1.39: clean up the /tmp binary copy (512MB tmpfs)
+        try: os.unlink(BIN)
+        except OSError: pass
 
 if __name__ == "__main__":
     sys.exit(main())
