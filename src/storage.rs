@@ -81,6 +81,10 @@ pub enum ColType {
     // xidout, and `=`/`xidin` equality is plain integer equality like
     // PG's xideq.
     Xid, // OID 28
+    // v1.40: PG's `tid` tuple-identifier type (OID 27) — the type of the
+    // `ctid` system column. Values are carried as `Value::Tid(block,
+    // offset)`; display is PG's tidout `(b,o)`.
+    Tid, // OID 27
     // v0.73: PG's `record` pseudo-type (OID 2249) — the type of a
     // whole-row value (`tbl` / `tbl.*` in expression position). The
     // engine does not track per-table rowtype OIDs (a documented gap);
@@ -136,6 +140,8 @@ pub enum ArrayElem {
     Xid,
     // v1.39: `bit` arrays (`_bit`, OID 1561).
     Bit,
+    // v1.40: `tid` arrays (`_tid`, OID 1010).
+    Tid,
 }
 
 impl ArrayElem {
@@ -169,6 +175,7 @@ impl ArrayElem {
             ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
             ColType::Xid => ArrayElem::Xid,
+            ColType::Tid => ArrayElem::Tid, // v1.40
         }
     }
 
@@ -197,6 +204,7 @@ impl ArrayElem {
             ArrayElem::Record => 2287,
             ArrayElem::PgLsn => 3221,
             ArrayElem::Xid => 1011,
+            ArrayElem::Tid => 1010, // v1.40: PG's `_tid` (pg_type.dat)
             // v1.39: PG's `_bit` array OID (pg_type.dat).
             ArrayElem::Bit => 1561,
         }
@@ -228,6 +236,7 @@ impl ArrayElem {
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
             ArrayElem::Bit => "bit",
+            ArrayElem::Tid => "tid", // v1.40
         }
     }
 
@@ -257,6 +266,7 @@ impl ArrayElem {
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
             ArrayElem::Bit => "bit",
+            ArrayElem::Tid => "tid", // v1.40
         }
     }
 }
@@ -360,6 +370,7 @@ impl ColType {
             ColType::SingleChar => 18,    // "char" (v0.36)
             ColType::PgLsn => 3220,       // PG_LSN (v0.64)
             ColType::Xid => 28,           // XID (v1.17)
+            ColType::Tid => 27,           // TID (v1.40)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -410,6 +421,7 @@ impl ColType {
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Xid => "xid",      // v1.17
+            ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
@@ -452,6 +464,7 @@ impl ColType {
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
             ColType::Xid => "xid",      // v1.17
+            ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
@@ -4187,6 +4200,12 @@ pub enum Value {
     // elements. `lower` holds PG's per-dimension lower bounds (default
     // 1; slices preserve the source bounds, e.g. `[2:3]`).
     Array(ArrayVal),
+    // v1.40: PG's `tid` tuple-identifier type (OID 27) — the type of the
+    // `ctid` system column. Carried as (block, offset); rustgres has no
+    // heap pages, so the block is always 0 and the offset is the row
+    // version's position in its table (SELECT) or the post-DML version's
+    // position (RETURNING). Displays as PG's tidout `(b,o)`.
+    Tid(u32, u32),
     Null,
 }
 
@@ -4351,6 +4370,8 @@ impl Value {
             Value::Record(fields) => Some(record_text(fields)),
             // v0.79: PG19 array_out: `{...}` with PG's quoting rules.
             Value::Array(a) => Some(a.to_literal()),
+            // v1.40: PG19 tidout: `(block,offset)`.
+            Value::Tid(b, o) => Some(format!("({b},{o})")),
             Value::Null => None,
         }
     }
@@ -4438,6 +4459,7 @@ impl Value {
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
             Value::Bytea(_) => Cow::Borrowed("bytea"),
             Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
+            Value::Tid(_, _) => Cow::Borrowed("tid"), // v1.40
             Value::Uuid(_) => Cow::Borrowed("uuid"),
             Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
             Value::Record(_) => Cow::Borrowed("record"), // v0.73
@@ -4467,6 +4489,7 @@ impl Value {
             Value::Timestamptz(_) => ColType::Timestamptz,
             Value::Bytea(_) => ColType::Bytea,
             Value::BitString(_) => ColType::Bit, // v1.39
+            Value::Tid(_, _) => ColType::Tid, // v1.40
             Value::Uuid(_) => ColType::Uuid,
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
             // v0.73: a whole-row value has composite (record) type.

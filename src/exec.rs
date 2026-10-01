@@ -4839,6 +4839,10 @@ fn project_returning(
     session: u64,
     role: &str,
     scopes: &[(&[QCol], &[Value])],
+    // v1.40: per-row provenance for RETURNING system columns (see
+    // `eval_dml_expr`). One entry per range in the scope; the
+    // FROM/USING range (if any) carries row_id = u64::MAX.
+    prov: &[RowProv],
     returning: &[SelectItem],
     ctes: &[Rc<CteBinding>],
     // v1.33: statement write context (see `eval_dml_expr`).
@@ -4851,7 +4855,17 @@ fn project_returning(
             // by the move into `eval_dml_expr`).
             let w = write.as_mut().map(QWrite::reborrow);
             out.push(eval_dml_expr(
-                eng, snap, own, session, role, scopes, expr, ctes, None, w,
+                eng,
+                snap,
+                own,
+                session,
+                role,
+                scopes,
+                Some(prov),
+                expr,
+                ctes,
+                None,
+                w,
             )?);
         }
     }
@@ -5894,6 +5908,7 @@ fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Bool => ColType::Bool,
         ArrayElem::Bytea => ColType::Bytea,
         ArrayElem::Bit => ColType::Bit, // v1.39
+        ArrayElem::Tid => ColType::Tid, // v1.40
         ArrayElem::SingleChar => ColType::SingleChar,
         ArrayElem::Name => ColType::Name,
         ArrayElem::SmallInt => ColType::SmallInt,
@@ -6741,6 +6756,13 @@ fn exec_insert(
     let mut inserts: Vec<(u64, Row)> = Vec::new();
     let mut updates: Vec<(String, u64, u64, Row)> = Vec::new();
     let mut ret_rows: Vec<Row> = Vec::new();
+    // v1.40: per-row provenance for RETURNING system columns, parallel
+    // to ret_rows. `table` is the leaf holding the post-DML version
+    // (partition routing); `qual` is the target's range qualifier.
+    let mut ret_prov: Vec<RowProv> = Vec::new();
+    // v1.40: upsert DO UPDATE rows whose new version id is allocated
+    // after planning: (ret_prov index, updates index).
+    let mut ret_prov_fixups: Vec<(usize, usize)> = Vec::new();
     if let Some(plan) = &upsert {
         let mut key_map: HashMap<(String, Vec<u8>), u64> = HashMap::new();
         // Latest planned values per row id (planned inserts and the new
@@ -6858,6 +6880,13 @@ fn exec_insert(
                 // partition router remaps them per leaf.
                 inserts.push((id, values.clone()));
                 ret_rows.push(values.clone());
+                // v1.40: ctable is the leaf for a partitioned target,
+                // else the table itself.
+                ret_prov.push(RowProv {
+                    qual: table.to_string(),
+                    table: ctable.clone(),
+                    row_id: id,
+                });
                 continue;
             };
             match &plan.action {
@@ -6917,6 +6946,7 @@ fn exec_insert(
                             ctx.session,
                             ctx.role,
                             &frames,
+                            None,
                             w,
                             &ctes,
                             None,
@@ -6940,6 +6970,7 @@ fn exec_insert(
                             ctx.session,
                             ctx.role,
                             &frames,
+                            None,
                             expr,
                             &ctes,
                             None,
@@ -7059,6 +7090,14 @@ fn exec_insert(
                     latest.insert(tid, store_row.clone());
                     updates.push((ctable.clone(), tid, prev_xmax, store_row));
                     ret_rows.push(new_values);
+                    // v1.40: the new version id is allocated with the
+                    // other update_ids below; record the fixup.
+                    ret_prov_fixups.push((ret_prov.len(), updates.len() - 1));
+                    ret_prov.push(RowProv {
+                        qual: table.to_string(),
+                        table: ctable.clone(),
+                        row_id: u64::MAX,
+                    });
                 }
             }
         }
@@ -7069,6 +7108,13 @@ fn exec_insert(
             let values = values.clone();
             inserts.push((id, values.clone()));
             ret_rows.push(values);
+            // v1.40: the leaf is resolved by route_partition_inserts
+            // below; `table` is overwritten with it.
+            ret_prov.push(RowProv {
+                qual: table.to_string(),
+                table: table.to_string(),
+                row_id: id,
+            });
         }
     }
     let n = inserts.len() + updates.len();
@@ -7081,6 +7127,18 @@ fn exec_insert(
     // v0.69: route to partition leaves if the target is partitioned.
     // (Statement-atomic: routing happens before any mutation.)
     let routed = route_partition_inserts(eng, ctx, table, &inserts)?;
+    // v1.40: resolve the partition leaf holding each inserted row for
+    // RETURNING system columns (`tableoid` reports the leaf, like PG).
+    // Upsert DO UPDATE rows are not routed and keep their planned leaf.
+    let leaf_of: std::collections::HashMap<u64, &str> = routed
+        .iter()
+        .flat_map(|(leaf, rows)| rows.iter().map(|(id, _)| (*id, leaf.as_str())))
+        .collect();
+    for rp in &mut ret_prov {
+        if let Some(leaf) = leaf_of.get(&rp.row_id) {
+            rp.table = leaf.to_string();
+        }
+    }
     // Apply inserts (versions, TOAST, index maintenance).
     for (leaf, leaf_inserts) in &routed {
         apply_row_inserts(eng, ctx, leaf, leaf_inserts)?;
@@ -7134,6 +7192,14 @@ fn exec_insert(
         eng.db
             .index_insert_row(utab, *new_id, new_values, ctx.session);
     }
+    // v1.40: fill in the new version ids for upsert DO UPDATE rows'
+    // RETURNING provenance (allocated with the other update_ids).
+    for (ret_idx, upd_idx) in &ret_prov_fixups {
+        let (utab, new_id, _, _, _) = &indexed[*upd_idx];
+        let rp = &mut ret_prov[*ret_idx];
+        rp.table = utab.clone();
+        rp.row_id = *new_id;
+    }
     // v0.10: RETURNING.
     let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
         (Vec::new(), Vec::new())
@@ -7161,7 +7227,8 @@ fn exec_insert(
             })
             .collect();
         let mut out_rows = Vec::with_capacity(ret_rows.len());
-        for values in &ret_rows {
+        // v1.40: per-row provenance drives RETURNING system columns.
+        for (values, rp) in ret_rows.iter().zip(ret_prov.iter()) {
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
@@ -7169,6 +7236,7 @@ fn exec_insert(
                 ctx.session,
                 ctx.role,
                 &[(&schema, values)],
+                std::slice::from_ref(rp),
                 &returning_expanded,
                 &ctes,
                 Some(qwrite_from_ctx(
@@ -7375,11 +7443,13 @@ fn exec_update(
     // order); rows whose partition key changed are planned as moves
     // (src leaf, old id, prev xmax, dst leaf, new values in dst order).
     // `ret_new` carries every new row in parent order for RETURNING.
-    let (plan, moves, ret_new, ret_from, from_schema): (
+    let (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema): (
         Vec<(String, u64, u64, Row)>,
         Vec<(String, u64, u64, String, Row)>,
         Vec<Row>,
         Vec<Option<Row>>,
+        // v1.40: (old row id, destination leaf) per ret_new row.
+        Vec<(u64, String)>,
         Option<Vec<QCol>>,
     ) = {
         let t = eng
@@ -7462,6 +7532,10 @@ fn exec_update(
         let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
         let mut moves: Vec<(String, u64, u64, String, Row)> = Vec::new();
         let mut ret_new: Vec<Row> = Vec::new();
+        // v1.40: (old row id, destination leaf) per ret_new row, for
+        // RETURNING system columns. The new version id is allocated
+        // in the apply loop below.
+        let mut ret_prov_ids: Vec<(u64, String)> = Vec::new();
         // v0.76: UPDATE ... FROM — build the FROM items once (like SELECT's
         // FROM and DELETE's USING). Each target row is tested against the
         // cross product; SET/WHERE/RETURNING see the combined scopes with
@@ -7714,6 +7788,9 @@ fn exec_update(
                 .or_default()
                 .push((*id, Row::new(new_dst.clone())));
             ret_new.push(Row::new(new_values.clone()));
+            // v1.40: `dst` is the leaf holding the new version (the
+            // source `leaf` when the row does not move).
+            ret_prov_ids.push((*id, dst.clone()));
             // v0.76: remember the FROM row for RETURNING (None without FROM).
             ret_from.push(from_row.clone());
             let old_src = Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()));
@@ -7835,12 +7912,14 @@ fn exec_update(
         // Apply the cascade after the unique checks pass.
         apply_fk_cascade(eng, ctx, cascade)?;
         let from_schema = from_data.map(|(s, _)| s);
-        (plan, moves, ret_new, ret_from, from_schema)
+        (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
     let n = plan.len() + moves.len();
+    // v1.40: old -> new version id, for RETURNING system columns.
+    let mut new_id_of: Vec<(u64, u64)> = Vec::with_capacity(n);
     {
         let mut by_leaf: std::collections::HashMap<String, Vec<(u64, u64, Row)>> =
             std::collections::HashMap::new();
@@ -7872,6 +7951,9 @@ fn exec_update(
                     .find_table_mut(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                     .expect("table still visible; engine lock held throughout");
                 for ((old_id, prev_xmax, new_values), new_id) in rows.iter().cloned().zip(new_ids) {
+                    // v1.40: remember the new version id for RETURNING
+                    // system columns.
+                    new_id_of.push((old_id, new_id));
                     let pos = t
                         .row_pos(old_id)
                         .expect("row version still present; engine lock held throughout");
@@ -7913,6 +7995,9 @@ fn exec_update(
             std::collections::HashMap::new();
         for (src, old_id, prev_xmax, dst, new_values) in moves {
             let new_id = eng.alloc_row_id();
+            // v1.40: remember the new version id for RETURNING system
+            // columns.
+            new_id_of.push((old_id, new_id));
             by_src.entry(src).or_default().push((old_id, prev_xmax));
             by_dst.entry(dst).or_default().push((new_id, new_values));
         }
@@ -8000,8 +8085,30 @@ fn exec_update(
                 })
                 .collect()
         };
+        // v1.40: per-row provenance for RETURNING system columns —
+        // the new version's (destination leaf, new row id). PG evaluates
+        // UPDATE ... RETURNING against the new row version.
+        let new_id_of: std::collections::HashMap<u64, u64> = new_id_of.into_iter().collect();
+        let ret_prov: Vec<RowProv> = ret_prov_ids
+            .iter()
+            .map(|(old_id, dst)| RowProv {
+                qual: rqual.to_string(),
+                table: dst.clone(),
+                // Defensive: every planned row is applied, so the id is
+                // always present; u64::MAX keeps system columns a clean
+                // 42703 if that ever drifts.
+                row_id: new_id_of.get(old_id).copied().unwrap_or(u64::MAX),
+            })
+            .collect();
+        // v1.40: the FROM range's qualifier, for the ambiguity check on
+        // unqualified system-column references (its row ids are not
+        // tracked, so its system columns stay 42703).
+        let from_qual: Option<String> = from_schema
+            .as_ref()
+            .and_then(|fs| fs.first().map(|c| c.qual.clone()));
         let mut out_rows = Vec::with_capacity(ret_new.len());
-        for (new_values, frow_opt) in ret_new.iter().zip(ret_from.iter()) {
+        for ((new_values, frow_opt), rp) in ret_new.iter().zip(ret_from.iter()).zip(ret_prov.iter())
+        {
             // v0.76: UPDATE ... FROM — RETURNING sees the FROM columns too.
             // Combine into a single schema (FROM first, then target) so
             // unqualified refs resolve.
@@ -8017,6 +8124,20 @@ fn exec_update(
                 _ => (schema.clone(), new_values.to_vec()),
             };
             let scopes: Vec<(&[QCol], &[Value])> = vec![(&cschema, &cvalues)];
+            // v1.40: provenance for the scope's ranges — the FROM range
+            // (if any) first, then the target. The FROM entry is a
+            // sentinel: only its qualifier participates.
+            let prov: Vec<RowProv> = match (&from_qual, frow_opt) {
+                (Some(fq), Some(_)) => vec![
+                    RowProv {
+                        qual: fq.clone(),
+                        table: String::new(),
+                        row_id: u64::MAX,
+                    },
+                    rp.clone(),
+                ],
+                _ => vec![rp.clone()],
+            };
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
@@ -8024,6 +8145,7 @@ fn exec_update(
                 ctx.session,
                 ctx.role,
                 &scopes,
+                prov.as_slice(),
                 &returning_expanded,
                 &ctes,
                 Some(qwrite_from_ctx(
@@ -8203,6 +8325,7 @@ fn exec_delete(
                                 ctx.session,
                                 ctx.role,
                                 &[(uschema, &urow.cells), (&schema, values)],
+                                None,
                                 pred,
                                 &ctes,
                                 None,
@@ -8394,8 +8517,26 @@ fn exec_delete(
                 })
                 .collect()
         };
+        // v1.40: per-row provenance for RETURNING system columns —
+        // the deleted version's (leaf, old row id). PG evaluates
+        // DELETE ... RETURNING against the old row version (its xmax is
+        // the deleting xid). ret_vals is parallel to plan.
+        let ret_prov: Vec<RowProv> = plan
+            .iter()
+            .map(|(leaf, id, _, _, _, _)| RowProv {
+                qual: qual.to_string(),
+                table: leaf.clone(),
+                row_id: *id,
+            })
+            .collect();
+        // v1.40: the USING range's qualifier, for the ambiguity check
+        // on unqualified system-column references (its row ids are not
+        // tracked, so its system columns stay 42703).
+        let using_qual: Option<String> = using_schema
+            .as_ref()
+            .and_then(|us| us.first().map(|c| c.qual.clone()));
         let mut out_rows = Vec::with_capacity(ret_vals.len());
-        for (values, urow_opt) in ret_vals.iter().zip(ret_using.iter()) {
+        for ((values, urow_opt), rp) in ret_vals.iter().zip(ret_using.iter()).zip(ret_prov.iter()) {
             // v0.76: DELETE ... USING — RETURNING sees the USING columns
             // too. Combine into a single schema (USING first, then
             // target), mirroring UPDATE ... FROM.
@@ -8410,6 +8551,20 @@ fn exec_delete(
                     }
                     _ => (schema.clone(), values.to_vec()),
                 };
+            // v1.40: provenance for the scope's ranges — the USING range
+            // (if any) first, then the target. The USING entry is a
+            // sentinel: only its qualifier participates.
+            let prov: Vec<RowProv> = match (&using_qual, urow_opt) {
+                (Some(uq), Some(_)) => vec![
+                    RowProv {
+                        qual: uq.clone(),
+                        table: String::new(),
+                        row_id: u64::MAX,
+                    },
+                    rp.clone(),
+                ],
+                _ => vec![rp.clone()],
+            };
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
@@ -8417,6 +8572,7 @@ fn exec_delete(
                 ctx.session,
                 ctx.role,
                 &[(&cschema, &cvalues)],
+                prov.as_slice(),
                 &returning_expanded,
                 &ctes,
                 Some(qwrite_from_ctx(
@@ -9927,6 +10083,7 @@ fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
         ArrayElem::Bool => "boolean",
         ArrayElem::Bytea => "bytea",
         ArrayElem::Bit => "bit", // v1.39
+        ArrayElem::Tid => "tid", // v1.40
         ArrayElem::SingleChar => "\"char\"",
         ArrayElem::Name => "name",
         ArrayElem::SmallInt => "smallint",
@@ -12128,6 +12285,7 @@ fn type_rank(t: &ColType) -> u8 {
 }
 fn value_coltype(v: &Value) -> ColType {
     match v {
+        Value::Tid(_, _) => ColType::Tid, // v1.40
         Value::SmallInt(_) => ColType::SmallInt,
         Value::Int(_) => ColType::Int,
         Value::BigInt(_) => ColType::BigInt,
@@ -13362,10 +13520,18 @@ fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
 /// FROM scan, following the `stmt_uses_tableoid` pattern — the values
 /// vary per row (the row's MVCC version header), so provenance must be
 /// populated when they are referenced.
+/// v1.40: also covers `ctid`/`cmin`/`cmax`, which read the same
+/// per-row provenance.
 fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
     fn expr_uses(e: &Expr) -> bool {
         match e {
-            Expr::Column { name, .. } => name == "xmin" || name == "xmax",
+            Expr::Column { name, .. } => {
+                name == "xmin"
+                    || name == "xmax"
+                    || name == "ctid"
+                    || name == "cmin"
+                    || name == "cmax"
+            }
             Expr::Func { args, .. } => args.iter().any(expr_uses),
             Expr::NamedArg { expr, .. } => expr_uses(expr),
             Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
@@ -14060,6 +14226,7 @@ enum FnKeyVal {
     BitString { bitlen: u32, bytes: Vec<u8> },
     Uuid([u8; 16]),
     PgLsn(u64),
+    Tid(u32, u32), // v1.40
     Record(Vec<(String, FnKeyVal)>),
     Array {
         elem: u8,
@@ -14105,6 +14272,7 @@ fn fn_key_val(v: &Value) -> FnKeyVal {
         },
         Value::Uuid(u) => FnKeyVal::Uuid(*u),
         Value::PgLsn(l) => FnKeyVal::PgLsn(*l),
+        Value::Tid(b, o) => FnKeyVal::Tid(*b, *o), // v1.40
         Value::Record(fields) => FnKeyVal::Record(
             fields
                 .iter()
@@ -19372,6 +19540,7 @@ enum HashFam {
     /// "char": the single byte.
     Char,
     PgLsn,
+    Tid, // v1.40
 }
 
 fn hash_family(ty: &ColType) -> Option<HashFam> {
@@ -19390,6 +19559,7 @@ fn hash_family(ty: &ColType) -> Option<HashFam> {
         ColType::Uuid => HashFam::Uuid,
         ColType::SingleChar => HashFam::Char,
         ColType::PgLsn => HashFam::PgLsn,
+        ColType::Tid => HashFam::Tid, // v1.40
         _ => return None,
     })
 }
@@ -19422,6 +19592,7 @@ enum HashKeyPart {
     Uuid([u8; 16]),
     Char(u8),
     PgLsn(u64),
+    Tid(u32, u32), // v1.40
 }
 
 /// v0.94: PG19 float hash canonicalization
@@ -19509,6 +19680,10 @@ fn hash_key_part(v: &Value, fam: HashFam) -> Option<HashKeyPart> {
         },
         HashFam::PgLsn => match v {
             Value::PgLsn(l) => Some(HashKeyPart::PgLsn(*l)),
+            _ => None,
+        },
+        HashFam::Tid => match v {
+            Value::Tid(b, o) => Some(HashKeyPart::Tid(*b, *o)),
             _ => None,
         },
     }
@@ -22632,6 +22807,12 @@ fn value_key(v: &Value, out: &mut Vec<u8>) {
         Value::PgLsn(lsn) => {
             out.push(15);
             out.extend_from_slice(&lsn.to_be_bytes());
+        }
+        // v1.40: tid groups by (block, offset).
+        Value::Tid(b, o) => {
+            out.push(19);
+            out.extend_from_slice(&b.to_be_bytes());
+            out.extend_from_slice(&o.to_be_bytes());
         }
         // v0.36: the one-byte "char" value groups by its byte.
         Value::SingleChar(b) => {
@@ -26877,6 +27058,7 @@ fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Bool => ColType::Bool,
         E::Bytea => ColType::Bytea,
         E::Bit => ColType::Bit, // v1.39
+        E::Tid => ColType::Tid, // v1.40
         E::SingleChar => ColType::SingleChar,
         E::Name => ColType::Name,
         E::SmallInt => ColType::SmallInt,
@@ -27057,6 +27239,106 @@ fn eval_xmin_xmax(
     Ok(Value::Int(xid as i64))
 }
 
+/// v1.40: shared scope + provenance-entry selection for the system
+/// columns added in v1.40 (`ctid`, `cmin`, `cmax`). Identical semantics
+/// to `eval_xmin_xmax`'s selection: the qualifier picks its range's
+/// entry; an unqualified reference with more than one range is
+/// ambiguous in PG (42702). A user column wins (resolved before this
+/// is called).
+fn sys_prov_entry<'s>(
+    scopes: &'s [Scope<'s>],
+    qual: Option<&str>,
+    name: &str,
+) -> Result<&'s RowProv, ExecError> {
+    let missing = || exec_err("42703", format!("column \"{name}\" does not exist"));
+    let sc = match qual {
+        Some(qual_name) => scopes
+            .iter()
+            .rev()
+            .find(|sc| sc.schema.iter().any(|c| c.qual == qual_name))
+            .ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table \"{qual_name}\""),
+                )
+            })?,
+        None => scopes.last().ok_or_else(missing)?,
+    };
+    let prov = sc.prov.ok_or_else(missing)?;
+    match qual {
+        Some(qual_name) => prov
+            .iter()
+            .find(|e| e.qual == qual_name)
+            .ok_or_else(missing),
+        None => {
+            let mut quals: Vec<&str> = Vec::new();
+            for e in prov {
+                if !quals.contains(&e.qual.as_str()) {
+                    quals.push(e.qual.as_str());
+                }
+            }
+            if quals.len() > 1 {
+                return Err(exec_err(
+                    "42702",
+                    format!("column reference \"{name}\" is ambiguous"),
+                ));
+            }
+            prov.first().ok_or_else(missing)
+        }
+    }
+}
+
+/// v1.40: `ctid` system column — the row's tuple identifier, read from
+/// row provenance like `xmin`/`xmax`. rustgres has no heap pages, so
+/// the block is always 0 and the offset is the row version's position
+/// in its table (PG19 `tidout` renders `(b,o)`). A user column named
+/// `ctid` wins (resolved before this is called).
+fn eval_ctid(q: &mut Q, scopes: &[Scope], qual: Option<&str>) -> Result<Value, ExecError> {
+    let missing = || exec_err("42703", "column \"ctid\" does not exist".to_string());
+    let entry = sys_prov_entry(scopes, qual, "ctid").map_err(|e| {
+        if e.code == "42703" {
+            missing()
+        } else {
+            e
+        }
+    })?;
+    // v1.40: the RETURNING path marks FROM/USING ranges (whose row ids
+    // are not tracked) with row_id = u64::MAX; their system columns
+    // stay 42703, but the qualifier still counts for ambiguity above.
+    if entry.row_id == u64::MAX {
+        return Err(missing());
+    }
+    let t = q
+        .eng
+        .db
+        .find_table(&entry.table, q.snap, &q.all_xids, q.session)
+        .ok_or_else(missing)?;
+    let pos = t.row_pos(entry.row_id).ok_or_else(missing)?;
+    Ok(Value::Tid(0, pos as u32))
+}
+
+/// v1.40: `cmin`/`cmax` system columns — PG19's per-row command ids
+/// (`HeapTupleHeaderData.t_cmin/t_cmax`). rustgres does not track
+/// per-row command ids, so both report 0 (documented honest gap).
+/// Typed as `xid`: PG's `cid` displays as unsigned decimal exactly
+/// like `xid` (the wire OID 28 vs PG's 29 is a documented fidelity
+/// gap). A user column named `cmin`/`cmax` wins (resolved before this
+/// is called).
+fn eval_cmin_cmax(scopes: &[Scope], qual: Option<&str>, name: &str) -> Result<Value, ExecError> {
+    let missing = || exec_err("42703", format!("column \"{name}\" does not exist"));
+    let entry = sys_prov_entry(scopes, qual, name).map_err(|e| {
+        if e.code == "42703" {
+            missing()
+        } else {
+            e
+        }
+    })?;
+    if entry.row_id == u64::MAX {
+        return Err(missing());
+    }
+    Ok(Value::Int(0))
+}
+
 fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> {
     match e {
         // v0.95: a NamedArg that reaches evaluation unwraps to its value
@@ -27083,6 +27365,28 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     // (no provenance) falls back to the original error.
                     if e.code == "42703" && (name == "xmin" || name == "xmax") {
                         match eval_xmin_xmax(q, scopes, table.as_deref(), name) {
+                            Ok(v) => return Ok(v),
+                            Err(e2) if e2.code == "42703" => {}
+                            Err(e2) => return Err(e2),
+                        }
+                    }
+                    // v1.40: `ctid` system column — the row's tuple id.
+                    // Same fallback position as `xmin`/`xmax`: a user
+                    // column wins (resolved above). A 42702 (ambiguous)
+                    // or other error propagates; only a 42703 (no
+                    // provenance) falls back to the original error.
+                    if e.code == "42703" && name == "ctid" {
+                        match eval_ctid(q, scopes, table.as_deref()) {
+                            Ok(v) => return Ok(v),
+                            Err(e2) if e2.code == "42703" => {}
+                            Err(e2) => return Err(e2),
+                        }
+                    }
+                    // v1.40: `cmin`/`cmax` system columns — PG19's
+                    // per-row command ids (always 0 here; see
+                    // eval_cmin_cmax). Same fallback position.
+                    if e.code == "42703" && (name == "cmin" || name == "cmax") {
+                        match eval_cmin_cmax(scopes, table.as_deref(), name) {
                             Ok(v) => return Ok(v),
                             Err(e2) if e2.code == "42703" => {}
                             Err(e2) => return Err(e2),
@@ -29913,6 +30217,7 @@ fn eval_update_expr(
         session,
         role,
         &[(schema, values)],
+        None,
         e,
         ctes,
         pending,
@@ -29931,6 +30236,10 @@ fn eval_dml_expr(
     session: u64,
     role: &str,
     frames: &[(&[QCol], &[Value])],
+    // v1.40: per-row provenance for RETURNING system columns
+    // (`tableoid`/`xmin`/`xmax`/`ctid`/`cmin`/`cmax`). None for SET/WHERE
+    // expressions (system columns are not visible there).
+    prov: Option<&[RowProv]>,
     e: &Expr,
     ctes: &[Rc<CteBinding>],
     // v0.89: statement-local UPDATE overlay (volatile functions only).
@@ -29966,10 +30275,14 @@ fn eval_dml_expr(
     };
     let scopes: Vec<Scope> = frames
         .iter()
-        .map(|(schema, row)| Scope {
+        .enumerate()
+        .map(|(i, (schema, row))| Scope {
             schema,
             row,
-            prov: None,
+            // v1.40: the provenance attaches to the last frame — the
+            // target range (RETURNING combines FROM/USING + target
+            // with the target last). Other frames keep prov: None.
+            prov: if i + 1 == frames.len() { prov } else { None },
         })
         .collect();
     let v = eval_expr(&mut q, &scopes, e)?;
@@ -32083,6 +32396,31 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.40: cast to tid (from text `(b,o)`, like PG's tidin).
+        ColType::Tid => {
+            // Identity: already a tid.
+            if let Value::Tid(b, o) = v {
+                return Ok(Value::Tid(*b, *o));
+            }
+            // Text: parse `(b,o)`.
+            if let Value::Text(t) = v {
+                let s = t.trim().to_string();
+                let inner = s.strip_prefix('(').and_then(|t| t.strip_suffix(')')).ok_or_else(
+                    || exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\"")),
+                )?;
+                let (bs, os) = inner.split_once(',').ok_or_else(|| {
+                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                })?;
+                let b: u32 = bs.trim().parse().map_err(|_| {
+                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                })?;
+                let o: u32 = os.trim().parse().map_err(|_| {
+                    exec_err("22P02", format!("invalid input syntax for type tid: \"{s}\""))
+                })?;
+                return Ok(Value::Tid(b, o));
+            }
+            return Err(exec_err("42846", "cannot cast to tid"));
+        }
         // v0.64: cast to pg_lsn (from text like '0/016AE7F8' or numeric).
         // Note: `pg_lsn(23783416)` parses as a cast (function-call syntax
         // for the type), so numeric inputs must be handled here.
@@ -34143,6 +34481,7 @@ fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> 
                 Value::Timestamptz(_) => 8,
                 Value::Uuid(_) => 16,
                 Value::PgLsn(_) => 8, // v0.64
+                Value::Tid(_, _) => 8, // v1.40
                 // v0.73: records never persist in tables; approximate
                 // from the rendered text length if one ever appears.
                 Value::Record(fields) => crate::storage::record_text(fields).len() as i64,
@@ -40315,6 +40654,7 @@ use std::borrow::Cow;
 
 fn value_type_name(v: &Value) -> Cow<'static, str> {
     match v {
+        Value::Tid(_, _) => Cow::Borrowed("tid"), // v1.40
         Value::SmallInt(_) => Cow::Borrowed("smallint"),
         Value::Int(_) => Cow::Borrowed("integer"),
         Value::BigInt(_) => Cow::Borrowed("bigint"),
@@ -41302,6 +41642,15 @@ fn expr_type(
                     // v1.17: `xmin`/`xmax` system columns — typed as xid
                     // (OID 28), like PG.
                     if name == "xmin" || name == "xmax" {
+                        return Ok(ColType::Xid);
+                    }
+                    // v1.40: `ctid` system column — typed as tid (OID
+                    // 27), like PG. `cmin`/`cmax` are typed as xid
+                    // (see eval_cmin_cmax for why).
+                    if name == "ctid" {
+                        return Ok(ColType::Tid);
+                    }
+                    if name == "cmin" || name == "cmax" {
                         return Ok(ColType::Xid);
                     }
                     match resolve_col(&oscopes, table.as_deref(), name) {
@@ -42933,6 +43282,22 @@ fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<Value, ExecE
                 .map(Value::BigInt)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v1.40: parameter input for tid goes through tidin `(b,o)`
+        // (PG19 `tidin`).
+        ColType::Tid => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            let s = s.trim();
+            let inner = s
+                .strip_prefix('(')
+                .and_then(|t| t.strip_suffix(')'))
+                .ok_or_else(|| bad(format!("\"{s}\"")))?;
+            let (bs, os) = inner
+                .split_once(',')
+                .ok_or_else(|| bad(format!("\"{s}\"")))?;
+            let b: u32 = bs.trim().parse().map_err(|_| bad(format!("\"{s}\"")))?;
+            let o: u32 = os.trim().parse().map_err(|_| bad(format!("\"{s}\"")))?;
+            Ok(Value::Tid(b, o))
+        }
         // v1.17: parameter input for xid goes through xidin (unsigned
         // decimal, like PG).
         ColType::Xid => {
@@ -43045,7 +43410,7 @@ pub fn eval_execute_arg(
     role: &str,
     e: &Expr,
 ) -> Result<Value, ExecError> {
-    eval_dml_expr(eng, snap, own, session, role, &[], e, &[], None, None)
+    eval_dml_expr(eng, snap, own, session, role, &[], None, e, &[], None, None)
 }
 
 /// Replace every `$N` in the statement with its bound value's literal.
@@ -43286,6 +43651,8 @@ fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::PgLsn(lsn)) => {
             Literal::Text(format!("{:X}/{:08X}", lsn >> 32, lsn & 0xFFFF_FFFF).into())
         }
+        // v1.40: tid parameter substitutes as its `(b,o)` text format.
+        Some(Value::Tid(b, o)) => Literal::Text(format!("({b},{o})").into()),
         // v0.73: records never arrive as parameters (parse_param_value
         // rejects the record type); substituting NULL is unreachable.
         Some(Value::Record(_)) => Literal::Null,
@@ -43485,6 +43852,7 @@ fn dummy_value(t: &ColType) -> Value {
         ColType::PgLsn => Value::PgLsn(0), // v0.64
         // v1.17: xids are carried as Value::Int.
         ColType::Xid => Value::Int(0),
+        ColType::Tid => Value::Tid(0, 0), // v1.40
         // v0.73: records never appear as parameter types in practice;
         // the empty record is the honest dummy.
         ColType::Record => Value::Record(Vec::new()),
@@ -50643,6 +51011,7 @@ fn dummy_value_of(ty: &ColType) -> Value {
         ColType::PgLsn => Value::PgLsn(1),
         ColType::Regclass => Value::text("x"),
         ColType::Xid => Value::Int(1),
+        ColType::Tid => Value::Tid(0, 0), // v1.40
         ColType::Record | ColType::Composite => Value::Record(vec![]),
         ColType::Array(elem) => Value::Array(crate::storage::ArrayVal {
             elem: *elem,
@@ -62625,3 +62994,184 @@ mod v139_bit_cte_tests {
         assert_eq!(col0(&mut eng, "select count(*) from t139;"), vec!["1"]);
     }
 }
+
+// v1.40: system columns in RETURNING (`tableoid`, `xmin`/`xmax` via
+// per-row provenance) + the missing SELECT siblings (`ctid`, `cmin`,
+// `cmax`). `tableoid` reports the partition leaf holding the row
+// (PG19); `ctid` is synthesized from the row's storage position
+// `(block, offset)`; `cmin`/`cmax` are always 0 (no per-command
+// tracking, like PG's display of a frozen cid).
+#[cfg(test)]
+mod v140_syscols_returning_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn dml_rows(eng: &mut Engine, sql: &str) -> Vec<Vec<String>> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Dml { rows, .. } => rows
+                .into_iter()
+                .map(|r| {
+                    r.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected DML, got {other:?}"),
+        }
+    }
+
+    fn err_code(eng: &mut Engine, sql: &str) -> &'static str {
+        run(eng, sql).unwrap_err().code
+    }
+
+    #[test]
+    fn insert_returning_syscols() {
+        let mut eng = engine();
+        run(&mut eng, "create table t140(a int);").unwrap();
+        let rows = dml_rows(
+            &mut eng,
+            "insert into t140 values (1),(2) returning a, tableoid, xmin, xmax, ctid, cmin, cmax;",
+        );
+        assert_eq!(rows.len(), 2);
+        // a, tableoid>0, xmin=9 (write xid), xmax=0, ctid=(0,0)/(0,1),
+        // cmin=0, cmax=0.
+        assert_eq!(rows[0][0], "1");
+        assert!(rows[0][1].parse::<u32>().unwrap() > 0);
+        assert_eq!(rows[0][2], "9");
+        assert_eq!(rows[0][3], "0");
+        assert_eq!(rows[0][4], "(0,0)");
+        assert_eq!(rows[0][5], "0");
+        assert_eq!(rows[0][6], "0");
+        assert_eq!(rows[1][4], "(0,1)");
+    }
+
+    #[test]
+    fn update_returning_syscols_new_version() {
+        let mut eng = engine();
+        run(&mut eng, "create table t140(a int);").unwrap();
+        run(&mut eng, "insert into t140 values (1),(2);").unwrap();
+        let rows = dml_rows(
+            &mut eng,
+            "update t140 set a = 10 where a = 1 returning a, tableoid, xmin, xmax, ctid;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "10");
+        assert!(rows[0][1].parse::<u32>().unwrap() > 0);
+        // PG evaluates UPDATE RETURNING against the NEW version.
+        assert_eq!(rows[0][2], "9");
+        assert_eq!(rows[0][3], "0");
+        // New version appended after the two inserts: position (0,2).
+        assert_eq!(rows[0][4], "(0,2)");
+    }
+
+    #[test]
+    fn delete_returning_syscols_old_version() {
+        let mut eng = engine();
+        run(&mut eng, "create table t140(a int);").unwrap();
+        run(&mut eng, "insert into t140 values (1),(2);").unwrap();
+        let rows = dml_rows(
+            &mut eng,
+            "delete from t140 where a = 2 returning a, tableoid, xmin, xmax, ctid;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "2");
+        // PG evaluates DELETE RETURNING against the OLD version: its
+        // xmax is the deleting xid.
+        assert_eq!(rows[0][2], "9");
+        assert_eq!(rows[0][3], "9");
+        assert_eq!(rows[0][4], "(0,1)");
+    }
+
+    #[test]
+    fn partitioned_insert_returning_tableoid_leaf() {
+        let mut eng = engine();
+        run(&mut eng, "create table p140(a int) partition by range (a);").unwrap();
+        run(
+            &mut eng,
+            "create table p140_1 partition of p140 for values from (1) to (10);",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "create table p140_2 partition of p140 for values from (10) to (20);",
+        )
+        .unwrap();
+        // insert.sql:442 equivalent — tableoid::regclass names the leaf
+        // holding each row, not the partitioned parent.
+        let rows = dml_rows(
+            &mut eng,
+            "insert into p140 values (5),(15) returning a, tableoid::regclass;",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["5".to_string(), "p140_1".to_string()]);
+        assert_eq!(rows[1], vec!["15".to_string(), "p140_2".to_string()]);
+    }
+
+    #[test]
+    fn update_from_unqualified_ctid_ambiguous() {
+        let mut eng = engine();
+        run(&mut eng, "create table t140(a int);").unwrap();
+        run(&mut eng, "create table u140(a int);").unwrap();
+        run(&mut eng, "insert into t140 values (1);").unwrap();
+        run(&mut eng, "insert into u140 values (1);").unwrap();
+        // Two ranges in scope: unqualified ctid is 42702, like PG.
+        // (Pins join.sql:3448's PASS — this must stay an error.)
+        assert_eq!(
+            err_code(&mut eng, "update t140 set a = 1 from u140 returning ctid;"),
+            "42702"
+        );
+        // Qualified resolves to the target's new version (fresh table:
+        // the 42702 statement above applied its UPDATE before RETURNING
+        // failed, so t140 already has a second version).
+        run(&mut eng, "create table t141(a int);").unwrap();
+        run(&mut eng, "insert into t141 values (1);").unwrap();
+        let rows = dml_rows(
+            &mut eng,
+            "update t141 set a = 2 from u140 returning t141.ctid;",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "(0,1)");
+    }
+
+    #[test]
+    fn select_ctid_cmin_cmax_siblings() {
+        let mut eng = engine();
+        run(&mut eng, "create table t140(a int);").unwrap();
+        run(&mut eng, "insert into t140 values (1);").unwrap();
+        match run(&mut eng, "select ctid, cmin, cmax from t140;").unwrap() {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                let cells: Vec<String> = rows.into_iter().next().unwrap().into_iter()
+                    .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                    .collect();
+                assert_eq!(cells, vec!["(0,0)", "0", "0"]);
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+}
+

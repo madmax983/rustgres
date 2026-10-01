@@ -1297,6 +1297,11 @@ impl Enc {
                 self.u8(25);
                 return;
             }
+            // v1.40: tid; tag appends after v1.39's.
+            ColType::Tid => {
+                self.u8(26);
+                return;
+            }
             // v0.78: array; tag appends after v0.73's, then the PG array
             // OID (which identifies the element type). Arrays never
             // appear as table columns — no DDL support — but the codec
@@ -1420,6 +1425,12 @@ impl Enc {
                 self.u32(b.bitlen);
                 self.u32(b.bytes.len() as u32);
                 self.bytes(&b.bytes);
+            }
+            // v1.40: tid values; tag appends after v1.39's.
+            Value::Tid(b, o) => {
+                self.u8(20);
+                self.u32(*b);
+                self.u32(*o);
             }
         }
     }
@@ -2154,6 +2165,8 @@ impl<'a> Dec<'a> {
             24 => Ok(ColType::Xid),
             // v1.39: bit.
             25 => Ok(ColType::Bit),
+            // v1.40: tid.
+            26 => Ok(ColType::Tid),
             21 => Ok(ColType::Json),
             // v0.78: array, then the PG array OID identifying the
             // element type.
@@ -2232,6 +2245,8 @@ impl<'a> Dec<'a> {
             15 => Ok(Value::SingleChar(self.u8()?)),
             // v0.64: pg_lsn.
             16 => Ok(Value::PgLsn(self.u64()?)),
+            // v1.40: tid.
+            20 => Ok(Value::Tid(self.u32()?, self.u32()?)),
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -2308,6 +2323,8 @@ impl<'a> Dec<'a> {
             3221 => Ok(ArrayElem::PgLsn),
             // v1.39: _bit.
             1561 => Ok(ArrayElem::Bit),
+            // v1.40: _tid.
+            1010 => Ok(ArrayElem::Tid),
             t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }

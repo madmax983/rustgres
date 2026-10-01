@@ -152,6 +152,8 @@ fn type_tag(v: &Value) -> u8 {
         // v1.39: bit strings never index either, but stay total
         // (append-only).
         Value::BitString(_) => 18,
+        // v1.40: tids never index either, but stay total (append-only).
+        Value::Tid(_, _) => 19,
     }
 }
 
