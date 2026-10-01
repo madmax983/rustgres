@@ -4469,6 +4469,23 @@ pub enum RaiseLevel {
     Exception,
 }
 
+/// v1.38: `CREATE CAST` coercion method (PG19 `CoercionMethod`).
+/// Only `Binary` (`WITHOUT FUNCTION`) is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastMethod {
+    Binary,
+    Function,
+    InOut,
+}
+
+/// v1.38: `CREATE CAST` coercion context (PG19 `CoercionContext`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -4544,6 +4561,15 @@ pub enum Stmt {
     DropType {
         names: Vec<String>,
         if_exists: bool,
+    },
+    // --- v1.38: CREATE CAST (bounded): only the WITHOUT FUNCTION
+    // (binary) method is executed; WITH FUNCTION / WITH INOUT parse
+    // and are honestly rejected at execution time (0A000).
+    CreateCast {
+        src: String,
+        dst: String,
+        method: CastMethod,
+        context: CastContext,
     },
     // --- v0.85: CREATE DOMAIN (bounded): a named type over a base
     // type with optional CHECK constraints, NOT NULL, and DEFAULT.
@@ -4938,6 +4964,7 @@ impl Stmt {
                 | Stmt::DropSequence { .. }
                 | Stmt::CreateType { .. }
                 | Stmt::DropType { .. }
+                | Stmt::CreateCast { .. }
                 | Stmt::CreateDomain { .. }
                 | Stmt::AlterDomain { .. }
                 | Stmt::DropDomain { .. }
@@ -6524,6 +6551,11 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "domain") {
             return self.parse_create_domain();
         }
+        // v1.38: CREATE CAST (sourcetype AS targettype) WITHOUT FUNCTION
+        // | WITH FUNCTION funcname | WITH INOUT [AS IMPLICIT | AS ASSIGNMENT].
+        if matches!(self.peek(), Token::Ident(s) if s == "cast") {
+            return self.parse_create_cast();
+        }
         // v0.75: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
         // cols FROM table. Accepted as a no-op (statistics are not used
         // by the planner); the syntax is validated.
@@ -7658,6 +7690,90 @@ impl Parser {
             like_base,
             composite: None,
         })
+    }
+
+    /// v1.38: `CREATE CAST (sourcetype AS targettype) WITHOUT FUNCTION
+    /// | WITH FUNCTION funcname [(args)] | WITH INOUT [AS IMPLICIT |
+    /// AS ASSIGNMENT]` — PG19 gram.y `CreateCastStmt`, bounded: the
+    /// type names are parsed as (optionally schema-qualified)
+    /// identifiers; only WITHOUT FUNCTION is executed, the other
+    /// methods parse and are rejected at execution time (0A000).
+    fn parse_create_cast(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("cast")?;
+        self.expect(Token::LParen, "'('")?;
+        let src = self.parse_cast_type_name()?;
+        self.expect_keyword("as")?;
+        let dst = self.parse_cast_type_name()?;
+        self.expect(Token::RParen, "')'")?;
+        let method = if self.eat_keyword("without") {
+            self.expect_keyword("function")?;
+            CastMethod::Binary
+        } else if self.eat_keyword("with") {
+            if self.eat_keyword("function") {
+                // Function name, optionally with an argument list —
+                // consumed and ignored (the method is unimplemented).
+                let _ = self.expect_ident()?;
+                if *self.peek() == Token::LParen {
+                    self.next();
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match self.next() {
+                            Token::LParen => depth += 1,
+                            Token::RParen => depth -= 1,
+                            Token::EOF => {
+                                return Err(err(
+                                    "syntax error: unterminated function argument list".to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                CastMethod::Function
+            } else if self.eat_keyword("inout") {
+                CastMethod::InOut
+            } else {
+                return Err(err(
+                    "syntax error: expected FUNCTION or INOUT after WITH".to_string()
+                ));
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected WITHOUT FUNCTION, WITH FUNCTION, or WITH INOUT".to_string(),
+            ));
+        };
+        let context = if self.eat_keyword("as") {
+            if self.eat_keyword("implicit") {
+                CastContext::Implicit
+            } else if self.eat_keyword("assignment") {
+                CastContext::Assignment
+            } else {
+                return Err(err(
+                    "syntax error: expected IMPLICIT or ASSIGNMENT".to_string()
+                ));
+            }
+        } else {
+            CastContext::Explicit
+        };
+        Ok(Stmt::CreateCast {
+            src,
+            dst,
+            method,
+            context,
+        })
+    }
+
+    /// v1.38: a type name in `CREATE CAST` — an optionally
+    /// schema-qualified identifier (the qualifier is accepted and
+    /// ignored, like `parse_type_name`). The tokenizer already folds
+    /// unquoted names to lowercase.
+    fn parse_cast_type_name(&mut self) -> Result<String, SqlError> {
+        let name = self.expect_ident()?;
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+            self.next(); // '.'
+            return self.expect_ident();
+        }
+        Ok(name)
     }
 
     /// v0.86: `CREATE [OR REPLACE] FUNCTION name ([argname] type

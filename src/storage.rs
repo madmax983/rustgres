@@ -5057,6 +5057,15 @@ pub struct FuncDef {
     pub strict: bool,
 }
 
+/// v1.38: a user-defined cast definition, keyed by (source, target)
+/// canonical type name in `Database::casts`. Only the binary method
+/// (`WITHOUT FUNCTION`) is supported; the context records whether the
+/// cast may be applied implicitly, on assignment, or explicitly only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CastDef {
+    pub context: crate::sql::CastContext,
+}
+
 /// v0.86: a user-defined operator definition: `name` (e.g. `=`, `?=`)
 /// mapping to `procedure` for `(leftarg, rightarg)`.
 #[derive(Clone, Debug)]
@@ -5120,6 +5129,14 @@ pub struct Database {
     /// single) definitions for its arities. Transactional, WAL-logged
     /// and checkpointed like functions.
     pub operators: HashMap<String, Vec<OperDef>, FxBuildHasher>,
+    /// v1.38: user-defined casts by (source, target) canonical type
+    /// name. Only the binary (`WITHOUT FUNCTION`) method is supported.
+    /// Transactional via the statement undo log (`WriteOp::CreateCast`).
+    /// KNOWN GAP: not WAL-logged and not checkpointed (same precedent
+    /// as `stats` / `temp_indexes`) — a restart drops user-defined
+    /// casts. Full durability needs a new `WalRecord` variant plus a
+    /// checkpoint-format bump (RGSWAL14), disproportionate for now.
+    pub casts: HashMap<(String, String), CastDef, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
     pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
@@ -5278,6 +5295,8 @@ impl Database {
             // v0.86: user-defined functions and operators.
             functions: HashMap::default(),
             operators: HashMap::default(),
+            // v1.38: user-defined casts (in-memory; see the field docs).
+            casts: HashMap::default(),
             // v0.37: table OIDs for pg_class.
             next_oid: toast_consts::FIRST_USER_OID,
         };
@@ -6771,6 +6790,15 @@ pub enum WriteOp {
         name: String,
         prev: Vec<OperDef>,
     },
+    // --- v1.38: CREATE CAST. Casts live in `Database::casts` (not the
+    // versioned catalog and not WAL-logged — see the field docs); the
+    // op carries the previous entry so statement-undo / ROLLBACK
+    // restores it exactly.
+    CreateCast {
+        src: String,
+        dst: String,
+        prev: Option<CastDef>,
+    },
     // --- v0.8: index DDL. DropIndex carries the whole index so undo can
     // restore the definition and its entries exactly.
     CreateIndex {
@@ -7089,6 +7117,19 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                 eng.db.operators.remove(name);
             } else {
                 eng.db.operators.insert(name.clone(), prev.clone());
+            }
+        }
+        // --- v1.38: cast DDL undo. Restore the previous entry, or
+        // remove the key when there was none.
+        WriteOp::CreateCast { src, dst, prev } => {
+            let key = (src.clone(), dst.clone());
+            match prev {
+                Some(def) => {
+                    eng.db.casts.insert(key, *def);
+                }
+                None => {
+                    eng.db.casts.remove(&key);
+                }
             }
         }
         WriteOp::CreateIndex { name } => {

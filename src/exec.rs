@@ -553,6 +553,13 @@ fn execute_inner(
             composite,
         } => exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref()),
         Stmt::DropType { names, if_exists } => exec_drop_type(eng, ctx, names, *if_exists),
+        // --- v1.38: CREATE CAST (binary method only) ---
+        Stmt::CreateCast {
+            src,
+            dst,
+            method,
+            context,
+        } => exec_create_cast(eng, ctx, src, dst, *method, *context),
         // --- v0.85: CREATE/DROP DOMAIN ---
         Stmt::CreateDomain {
             name,
@@ -31794,6 +31801,67 @@ fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
 /// must have at least as many fields as the target; extra source fields
 /// are dropped (PG matches by position for ROW() casts); each field is
 /// coerced to the target field type. A non-record source is 42846.
+/// v1.38: apply a user-defined binary cast (`CREATE CAST ...
+/// WITHOUT FUNCTION`) to a value. Returns `Ok(None)` when no cast is
+/// registered for (value's physical type, target). The source key is
+/// the value's physical type name (`integer`, `real`, `bigint`,
+/// `double precision`); the target key folds builtins but keeps
+/// LIKE-defined names. Validation guaranteed physical compatibility,
+/// so this only reinterprets bits between the representable pairs
+/// (int4<->float4, int8<->float8) or returns the value unchanged when
+/// the physical types already match.
+fn apply_binary_cast(q: &Q, v: &Value, name: &str) -> Result<Option<Value>, ExecError> {
+    let src_key = v.col_type().sql_name().to_string();
+    let dst_key = match cast_type_key(q.eng, name) {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    if q.eng.db.casts.get(&(src_key, dst_key)).is_none() {
+        return Ok(None);
+    }
+    // Target's physical column type (LIKE types resolve to base).
+    let dst_ct = {
+        let mut cur = name;
+        let ct = loop {
+            if let Ok(ct) = crate::sql::coltype_by_name(cur) {
+                break Some(ct);
+            }
+            match q
+                .eng
+                .db
+                .types
+                .get(cur)
+                .and_then(|st| st.like_base.as_deref())
+            {
+                Some(base) => cur = base,
+                None => break None,
+            }
+        };
+        match ct {
+            Some(ct) => ct,
+            None => return Ok(None),
+        }
+    };
+    match (v, dst_ct) {
+        (Value::Int(i), crate::storage::ColType::Float4) => {
+            Ok(Some(Value::Float4(f32::from_bits(*i as u32))))
+        }
+        (Value::Float4(f), crate::storage::ColType::Int) => {
+            Ok(Some(Value::Int(f.to_bits() as i32 as i64)))
+        }
+        (Value::BigInt(i), crate::storage::ColType::Float) => {
+            Ok(Some(Value::Float(f64::from_bits(*i as u64))))
+        }
+        (Value::Float(f), crate::storage::ColType::BigInt) => {
+            Ok(Some(Value::BigInt(f.to_bits() as i64)))
+        }
+        _ if v.col_type() == dst_ct => Ok(Some(v.clone())),
+        // No value-level rule (unreachable for validated casts) —
+        // fall through to the normal cast path.
+        _ => Ok(None),
+    }
+}
+
 fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
     // v0.85: cast to a domain — coerce to the base type, then enforce
     // the domain's constraints (PG19 coerce_to_domain). NULL still goes
@@ -31820,6 +31888,11 @@ fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError>
     }
     if v == &Value::Null {
         return Ok(Value::Null);
+    }
+    // v1.38: user-defined binary casts take precedence over the
+    // composite path (a LIKE-defined target is not a composite).
+    if let Some(casted) = apply_binary_cast(q, v, name)? {
+        return Ok(casted);
     }
     eval_cast_composite_inner(q, v, name)
 }
@@ -33333,6 +33406,112 @@ fn eval_internal_function(symbol: &str, args: &[Value]) -> Result<Value, ExecErr
                     let ord = cmp_ordering(a, b, CmpOp::Eq)?;
                     Ok(Value::Bool(ord == Some(Ordering::Equal)))
                 }
+            }
+        }
+        // v1.38: int4in(cstring) -> int4 (PG19 int.c `int4in` via
+        // `pg_strtoint32_safe`). `parse_int_text` implements the same
+        // input grammar (base prefixes, underscores, 22P02/22003); the
+        // i128 result is narrowed to int32 with PG's 22003 range error.
+        // STRICT: NULL in -> NULL out.
+        "int4in" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    format!("function int4in expects 1 argument, got {}", args.len()),
+                ));
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let v = parse_int_text(s)?;
+                    let narrowed = i32::try_from(v).map_err(|_| {
+                        exec_err(
+                            "22003",
+                            format!("value \"{}\" is out of range for type integer", s),
+                        )
+                    })?;
+                    // rustgres keeps INT4 in `Value::Int(i64)`.
+                    Ok(Value::Int(narrowed as i64))
+                }
+                other => Err(exec_err(
+                    "42804",
+                    format!(
+                        "int4in: argument must be cstring, got {:?}",
+                        other.col_type()
+                    ),
+                )),
+            }
+        }
+        // v1.38: int4out(int4) -> cstring (PG19 int.c `int4out` via
+        // `pg_ltoa`: plain decimal). STRICT.
+        "int4out" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    format!("function int4out expects 1 argument, got {}", args.len()),
+                ));
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Int(v) => Ok(Value::Text(((*v as i32).to_string()).into())),
+                other => Err(exec_err(
+                    "42804",
+                    format!(
+                        "int4out: argument must be integer, got {:?}",
+                        other.col_type()
+                    ),
+                )),
+            }
+        }
+        // v1.38: int8in(cstring) -> int8 (PG19 int.c `int8in` via
+        // `pg_strtoint64_safe`). STRICT.
+        "int8in" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    format!("function int8in expects 1 argument, got {}", args.len()),
+                ));
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    let v = parse_int_text(s)?;
+                    let narrowed = i64::try_from(v).map_err(|_| {
+                        exec_err(
+                            "22003",
+                            format!("value \"{}\" is out of range for type bigint", s),
+                        )
+                    })?;
+                    Ok(Value::BigInt(narrowed))
+                }
+                other => Err(exec_err(
+                    "42804",
+                    format!(
+                        "int8in: argument must be cstring, got {:?}",
+                        other.col_type()
+                    ),
+                )),
+            }
+        }
+        // v1.38: int8out(int8) -> cstring (PG19 int.c `int8out` via
+        // `pg_ltoa`: plain decimal). STRICT.
+        "int8out" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    format!("function int8out expects 1 argument, got {}", args.len()),
+                ));
+            }
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::BigInt(v) => Ok(Value::Text(v.to_string().into())),
+                other => Err(exec_err(
+                    "42804",
+                    format!(
+                        "int8out: argument must be bigint, got {:?}",
+                        other.col_type()
+                    ),
+                )),
             }
         }
         _ => Err(exec_err(
@@ -39820,12 +39999,13 @@ fn func_result_type(
                 .get(name)
                 .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
             {
-                // Builtin type name -> ColType; table name -> Composite.
-                if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+                // v1.38: resolve via the shared helper so named types,
+                // shells, and the cstring pseudo-type type-check (the
+                // old ad-hoc builtin/table checks 42883'd them).
+                if let Ok(ct) =
+                    resolve_func_type_name(eng, snap, own, session, &fdef.ret_type)
+                {
                     return Ok(ct);
-                }
-                if eng.db.tables.contains_key(&fdef.ret_type) {
-                    return Ok(ColType::Composite);
                 }
             }
             Err(exec_err(
@@ -40978,10 +41158,18 @@ fn expr_type(
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
                 Some(st) => match st.domain.as_ref() {
                     Some(dom) => Ok(dom.base.clone()),
-                    None => Err(exec_err(
-                        "42704",
-                        format!("type \"{}\" does not exist", name),
-                    )),
+                    // v1.38: LIKE types carry their base's physical
+                    // type (a `::xfloat4` value is physically a
+                    // float4); unknown shells still 42704.
+                    None => match st.like_base.as_deref() {
+                        Some(base) => crate::sql::coltype_by_name(base).map_err(|_| {
+                            exec_err("42704", format!("type \"{}\" does not exist", name))
+                        }),
+                        None => Err(exec_err(
+                            "42704",
+                            format!("type \"{}\" does not exist", name),
+                        )),
+                    },
                 },
                 _ => {
                     // v0.86: table rowtypes (PG19: every table has a
@@ -49561,6 +49749,183 @@ fn exec_drop_type(
     })
 }
 
+/// v1.38: physical representation of a type for binary-cast
+/// compatibility (PG19 `get_typlenbyvalalign`): (typlen, typbyval,
+/// typalign). LIKE-defined named types resolve to their base;
+/// builtins cover the fixed-size pass-by-value numerics. Anything
+/// else (varlena types, shells, composites, domains, unknown names)
+/// is None — PG19-faithful for the bounded type set; a binary cast
+/// involving them is 42P17.
+fn type_phys_repr(eng: &Engine, name: &str) -> Option<(i16, bool, char)> {
+    // LIKE types share their base's representation (that's the point
+    // of the float4/float8 test types: `like = float4`).
+    let mut cur = name;
+    loop {
+        if let Ok(ct) = crate::sql::coltype_by_name(cur) {
+            return match ct {
+                crate::storage::ColType::SmallInt => Some((2, true, 's')),
+                crate::storage::ColType::Int => Some((4, true, 'i')),
+                crate::storage::ColType::BigInt => Some((8, true, 'd')),
+                crate::storage::ColType::Float4 => Some((4, true, 'i')),
+                crate::storage::ColType::Float => Some((8, true, 'd')),
+                _ => None,
+            };
+        }
+        match eng.db.types.get(cur) {
+            Some(st) => match &st.like_base {
+                Some(base) => cur = base,
+                // Shell (or composite/domain/unknown-base LIKE): no
+                // physical representation.
+                None => return None,
+            },
+            None => return None,
+        }
+    }
+}
+
+/// v1.38: canonical cast-catalog name for a type: builtins fold to
+/// `ColType::sql_name()` (`float4` -> `real`, `int4` -> `integer`);
+/// LIKE-defined named types keep their catalog name. Shells,
+/// composites, domains, and unknown names are None.
+fn cast_type_key(eng: &Engine, name: &str) -> Option<String> {
+    if let Ok(ct) = crate::sql::coltype_by_name(name) {
+        return Some(ct.sql_name().to_string());
+    }
+    match eng.db.types.get(name) {
+        Some(st) if st.like_base.is_some() => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// v1.38: `CREATE CAST (src AS dst) WITHOUT FUNCTION [AS
+/// IMPLICIT|AS ASSIGNMENT]` — PG19 `CreateCast`, bounded to the
+/// binary method. Validation mirrors PG19: both types must exist
+/// (42704); binary casts need superuser (42501 — the conformance
+/// runner connects as the bootstrap superuser `postgres`); no
+/// pseudo/shell types (42809); no composites, arrays, ranges, enums,
+/// or domains (42P17); source and target must be physically compatible
+/// — same typlen/byval/align (42P17); source and target must differ
+/// (42P17); duplicates are 42710. `WITH FUNCTION` / `WITH INOUT`
+/// parse but are honestly unimplemented (0A000).
+#[allow(clippy::too_many_arguments)]
+fn exec_create_cast(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    src: &str,
+    dst: &str,
+    method: crate::sql::CastMethod,
+    context: crate::sql::CastContext,
+) -> Result<ExecResult, ExecError> {
+    use crate::sql::CastMethod;
+    if method != CastMethod::Binary {
+        return Err(exec_err(
+            "0A000",
+            "CREATE CAST WITH FUNCTION / WITH INOUT is not implemented; only WITHOUT FUNCTION (binary) casts are supported".to_string(),
+        ));
+    }
+    // PG19: both types must exist (typenameTypeId -> 42704).
+    for name in [src, dst] {
+        let known = crate::sql::coltype_by_name(name).is_ok() || eng.db.types.contains_key(name);
+        if !known {
+            return Err(exec_err(
+                "42704",
+                format!("type \"{}\" does not exist", name),
+            ));
+        }
+    }
+    // PG19: must be superuser to create a cast WITHOUT FUNCTION.
+    if !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
+        return Err(exec_err(
+            "42501",
+            "must be superuser to create a cast WITHOUT FUNCTION".to_string(),
+        ));
+    }
+    // PG19: no pseudo-types. rustgres shells are the pseudo-type
+    // analogue here (a placeholder with no representation).
+    for (which, name) in [("source", src), ("target", dst)] {
+        if let Some(st) = eng.db.types.get(name) {
+            if st.like_base.is_none() && st.composite.is_none() && st.domain.is_none() {
+                return Err(exec_err(
+                    "42809",
+                    format!("{} data type \"{}\" is a pseudo-type", which, name),
+                ));
+            }
+            if st.composite.is_some() {
+                return Err(exec_err(
+                    "42P17",
+                    "composite data types are not binary-compatible".to_string(),
+                ));
+            }
+            if st.domain.is_some() {
+                return Err(exec_err(
+                    "42P17",
+                    "domain data types must not be marked binary-compatible".to_string(),
+                ));
+            }
+        }
+    }
+    // Canonical keys; composites/domains/shells/unknowns were handled
+    // above or are unkeyable (LIKE types excepted).
+    let src_key = cast_type_key(eng, src).ok_or_else(|| {
+        exec_err(
+            "42P17",
+            format!(
+                "source data type \"{}\" cannot participate in a binary cast",
+                src
+            ),
+        )
+    })?;
+    let dst_key = cast_type_key(eng, dst).ok_or_else(|| {
+        exec_err(
+            "42P17",
+            format!(
+                "target data type \"{}\" cannot participate in a binary cast",
+                dst
+            ),
+        )
+    })?;
+    // PG19: source and target must be physically compatible.
+    let src_phys = type_phys_repr(eng, src);
+    let dst_phys = type_phys_repr(eng, dst);
+    if src_phys.is_none() || dst_phys.is_none() || src_phys != dst_phys {
+        return Err(exec_err(
+            "42P17",
+            "source and target data types are not physically compatible".to_string(),
+        ));
+    }
+    // PG19: source and target must differ (length-coercion functions
+    // are the only exception; binary casts have none).
+    if src_key == dst_key {
+        return Err(exec_err(
+            "42P17",
+            "source data type and target data type are the same".to_string(),
+        ));
+    }
+    let key = (src_key, dst_key);
+    if eng.db.casts.contains_key(&key) {
+        return Err(exec_err(
+            "42710",
+            format!(
+                "cast from type \"{}\" to type \"{}\" already exists",
+                src, dst
+            ),
+        ));
+    }
+    let prev = eng
+        .db
+        .casts
+        .insert(key.clone(), crate::storage::CastDef { context });
+    debug_assert!(prev.is_none());
+    ctx.writes.push(WriteOp::CreateCast {
+        src: key.0,
+        dst: key.1,
+        prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE CAST".to_string(),
+    })
+}
+
 /// v0.85: CREATE DOMAIN — a named type over a base type with CHECK
 /// constraints (PG19 `coerce_to_domain`). The base resolves against
 /// the type catalog: builtins pass through, a named composite base
@@ -49905,6 +50270,14 @@ fn resolve_func_type_name(
     if let Ok(ct) = crate::sql::coltype_by_name(name) {
         return Ok(ct);
     }
+    // v1.38: `cstring` is PG19's C-string pseudo-type (the argument
+    // type of internal input functions like `int4in`). rustgres has no
+    // Cstring value — internal functions receive the text directly —
+    // so it resolves to the defer-triggering `Composite` placeholder,
+    // like shell types below.
+    if name.eq_ignore_ascii_case("cstring") {
+        return Ok(ColType::Composite);
+    }
     if let Some(st) = eng.db.types.get(name) {
         if st.composite.is_some() {
             return Ok(ColType::Composite);
@@ -49917,6 +50290,16 @@ fn resolve_func_type_name(
             if let Ok(ct) = crate::sql::coltype_by_name(base) {
                 return Ok(ct);
             }
+        }
+        // v1.38: a bare shell type (like_base/composite/domain all
+        // None) is still a valid function signature type in PG19 — the
+        // shell exists precisely so later objects can reference the
+        // not-yet-defined type. `ColType::Composite` is the placeholder
+        // the static SQL-function checks already defer on
+        // (`Ok(Composite) | Err(_) => return Ok(())`), and call-time
+        // coercion is name-based, so no passing path changes.
+        if st.like_base.is_none() && st.composite.is_none() && st.domain.is_none() {
+            return Ok(ColType::Composite);
         }
         return Err(exec_err(
             "42704",
@@ -50665,8 +51048,10 @@ fn exec_create_function(
         )?);
     } else if lang == crate::sql::FuncLang::Internal {
         // v0.86: validate the internal symbol at CREATE (like PG's
-        // fmgr lookup); unknown symbols are 0A000.
-        if !matches!(body, "int4eq") {
+        // fmgr lookup); unknown symbols are 0A000. v1.38: the int4/int8
+        // I/O symbols (PG19 int.c) join int4eq — the float4/float8
+        // conformance types are defined in terms of them.
+        if !matches!(body, "int4eq" | "int4in" | "int4out" | "int8in" | "int8out") {
             return Err(exec_err(
                 "0A000",
                 format!("unsupported internal function \"{}\"", body),
@@ -61516,5 +61901,267 @@ mod v137_plan_fold_tests {
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT rec137(3) FROM generate_series(1, 2) g").unwrap());
         assert_eq!(col0(rows), vec!["3".to_string(), "3".to_string()]);
+    }
+}
+
+/// v1.38: shell types + `cstring` in internal-function signatures, the
+/// `int4in/int4out/int8in/int8out` internal I/O symbols, and
+/// `CREATE CAST ... WITHOUT FUNCTION` binary casts (PG19 `CreateCast`).
+#[cfg(test)]
+mod v138_cast_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn rows_of(r: ExecResult) -> Vec<Vec<String>> {
+        match r {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn col0(rows: Vec<Vec<String>>) -> Vec<String> {
+        rows.into_iter().map(|r| r[0].clone()).collect()
+    }
+
+    fn err_code(eng: &mut Engine, sql: &str) -> &'static str {
+        run(eng, sql).unwrap_err().code
+    }
+
+    /// v1.38 (Root 1): a shell type is legal in a function signature
+    /// (PG19 allows it — that is the shell's purpose), and `cstring`
+    /// (PG19's C-string pseudo-type) is accepted too.
+    #[test]
+    fn shell_and_cstring_accepted_in_signature() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TYPE s138a").unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION s138a_in(cstring) RETURNS s138a IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int4in'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION s138a_out(s138a) RETURNS cstring IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int4out'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE TYPE s138a (INPUT = s138a_in, OUTPUT = s138a_out, LIKE = integer)",
+        )
+        .unwrap();
+    }
+
+    /// v1.38: `int4in`/`int8in` parse like PG19's `pg_strtoint32_safe` /
+    /// `pg_strtoint64` — whitespace, sign, 0x/0o/0b prefixes, PG-style
+    /// 22003/22P02 errors, and STRICT NULL handling.
+    #[test]
+    fn int_in_semantics() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION i4in138(cstring) RETURNS integer IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int4in'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION i8in138(cstring) RETURNS bigint IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int8in'",
+        )
+        .unwrap();
+        let r = rows_of(run(&mut eng, "SELECT i4in138('  +42  ')").unwrap());
+        assert_eq!(col0(r), vec!["42".to_string()]);
+        let r = rows_of(run(&mut eng, "SELECT i4in138('0x10')").unwrap());
+        assert_eq!(col0(r), vec!["16".to_string()]);
+        let r = rows_of(run(&mut eng, "SELECT i4in138('-2147483648')").unwrap());
+        assert_eq!(col0(r), vec!["-2147483648".to_string()]);
+        let r = rows_of(
+            run(&mut eng, "SELECT i8in138('9223372036854775807')").unwrap(),
+        );
+        assert_eq!(col0(r), vec!["9223372036854775807".to_string()]);
+        // NULL in (STRICT) -> NULL out, no error.
+        let r = rows_of(run(&mut eng, "SELECT i4in138(NULL)").unwrap());
+        assert_eq!(col0(r), vec!["NULL".to_string()]);
+        // PG19 error codes.
+        assert_eq!(err_code(&mut eng, "SELECT i4in138('2147483648')"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT i8in138('-9223372036854775809')"), "22003");
+        assert_eq!(err_code(&mut eng, "SELECT i4in138('abc')"), "22P02");
+        assert_eq!(err_code(&mut eng, "SELECT i4in138('12.5')"), "22P02");
+    }
+
+    /// v1.38: `int4out`/`int8out` render decimal text (PG19 `pg_ltoa`).
+    #[test]
+    fn int_out_semantics() {
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE FUNCTION i4out138(integer) RETURNS cstring IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int4out'",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "CREATE FUNCTION i8out138(bigint) RETURNS cstring IMMUTABLE STRICT \
+             LANGUAGE internal AS 'int8out'",
+        )
+        .unwrap();
+        let r = rows_of(run(&mut eng, "SELECT i4out138(-2147483647)").unwrap());
+        assert_eq!(col0(r), vec!["-2147483647".to_string()]);
+        let r = rows_of(run(&mut eng, "SELECT i8out138(0::bigint)").unwrap());
+        assert_eq!(col0(r), vec!["0".to_string()]);
+        // Wrong argument type -> 42804 (PG19 would 42883 at lookup; the
+        // function resolved by arity here, so the mismatch surfaces).
+        assert_eq!(err_code(&mut eng, "SELECT i4out138('42')"), "42804");
+        // Wrong arity -> 42883 from overload resolution (the function's
+        // 1-arg overload doesn't match 2 args).
+        assert_eq!(err_code(&mut eng, "SELECT i4out138(1, 2)"), "42883");
+    }
+
+    /// v1.38: an unknown internal symbol is rejected at CREATE with
+    /// 0A000 (fail fast, like the v1.37 `int4eq`-only allowlist did).
+    #[test]
+    fn unknown_internal_symbol_is_0a000() {
+        let mut eng = engine();
+        assert_eq!(
+            err_code(
+                &mut eng,
+                "CREATE FUNCTION nosym138(integer) RETURNS integer IMMUTABLE STRICT \
+                 LANGUAGE internal AS 'no_such_symbol'"
+            ),
+            "0A000"
+        );
+    }
+
+    /// v1.38 (Root 3): `CREATE CAST ... WITHOUT FUNCTION` — the PG19
+    /// `CreateCast` validation matrix.
+    #[test]
+    fn create_cast_validation_matrix() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TYPE c138").unwrap();
+        // Unknown source type -> 42704.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (nosuch138 AS integer) WITHOUT FUNCTION"),
+            "42704"
+        );
+        // Unknown target type -> 42704.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS nosuch138) WITHOUT FUNCTION"),
+            "42704"
+        );
+        // Same type -> 42P17.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS integer) WITHOUT FUNCTION"),
+            "42P17"
+        );
+        // Physically incompatible (different typlen) -> 42P17.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS bigint) WITHOUT FUNCTION"),
+            "42P17"
+        );
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS text) WITHOUT FUNCTION"),
+            "42P17"
+        );
+        // Shell (pseudo) type -> 42809.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (c138 AS integer) WITHOUT FUNCTION"),
+            "42809"
+        );
+        // The float4.sql target statements succeed.
+        run(&mut eng, "CREATE TYPE c138 (LIKE = float4)").unwrap();
+        run(&mut eng, "CREATE CAST (c138 AS float4) WITHOUT FUNCTION").unwrap();
+        run(&mut eng, "CREATE CAST (float4 AS c138) WITHOUT FUNCTION").unwrap();
+        run(&mut eng, "CREATE CAST (c138 AS integer) WITHOUT FUNCTION").unwrap();
+        run(&mut eng, "CREATE CAST (integer AS c138) WITHOUT FUNCTION").unwrap();
+        // Duplicate -> 42710.
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS c138) WITHOUT FUNCTION"),
+            "42710"
+        );
+        // WITH FUNCTION is out of scope -> 0A000, like PG19's
+        // "not yet implemented".
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS bigint) WITH FUNCTION int4larger"),
+            "0A000"
+        );
+    }
+
+    /// v1.38: binary casts reinterpret bits (PG19 CoerceViaIO-free
+    /// binary coercion): int32 1 -> f32 1.401298464324817e-45.
+    #[test]
+    fn binary_cast_reinterprets_bits() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TYPE b138 (LIKE = float4)").unwrap();
+        run(&mut eng, "CREATE CAST (integer AS b138) WITHOUT FUNCTION").unwrap();
+        run(&mut eng, "CREATE CAST (b138 AS float4) WITHOUT FUNCTION").unwrap();
+        let r = rows_of(run(&mut eng, "SELECT 1::b138::float4").unwrap());
+        assert_eq!(col0(r), vec!["1.401298464324817e-45".to_string()]);
+        // int8 <-> float8 identity of width.
+        run(&mut eng, "CREATE TYPE b8138 (LIKE = float8)").unwrap();
+        run(&mut eng, "CREATE CAST (bigint AS b8138) WITHOUT FUNCTION").unwrap();
+        run(&mut eng, "CREATE CAST (b8138 AS float8) WITHOUT FUNCTION").unwrap();
+        let r = rows_of(run(&mut eng, "SELECT 4613937818241073152::b8138::float8").unwrap());
+        assert_eq!(col0(r), vec!["3".to_string()]);
+        // Without a registered cast, a LIKE target is not a composite.
+        assert_eq!(err_code(&mut eng, "SELECT 1::b8138"), "42846");
+    }
+
+    /// v1.38: rolling back a CREATE CAST removes it (`WriteOp::CreateCast`
+    /// undo). The unit `run()` helper auto-commits, so the undo log entry
+    /// is driven directly through the public `undo_write_op`.
+    #[test]
+    fn create_cast_rolls_back() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TYPE r138 (LIKE = float4)").unwrap();
+        run(&mut eng, "CREATE CAST (integer AS r138) WITHOUT FUNCTION").unwrap();
+        // The cast is visible: a duplicate is rejected...
+        assert_eq!(
+            err_code(&mut eng, "CREATE CAST (integer AS r138) WITHOUT FUNCTION"),
+            "42710"
+        );
+        // ...and after undoing the WriteOp it can be created again.
+        crate::storage::undo_write_op(
+            &mut eng,
+            &[9],
+            &crate::storage::WriteOp::CreateCast {
+                src: "integer".to_string(),
+                dst: "r138".to_string(),
+                prev: None,
+            },
+        );
+        run(&mut eng, "CREATE CAST (integer AS r138) WITHOUT FUNCTION").unwrap();
     }
 }

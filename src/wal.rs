@@ -4481,6 +4481,12 @@ pub fn records_for_commit(
                 });
                 i += 1;
             }
+            // v1.38: cast DDL is deliberately NOT WAL-logged (documented
+            // known gap on `Database::casts`): user-defined casts are
+            // in-memory and do not survive restart.
+            WriteOp::CreateCast { .. } => {
+                i += 1;
+            }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
                     i += 1;
