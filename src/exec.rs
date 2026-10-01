@@ -10758,9 +10758,107 @@ fn pg_plan_ctx<'a>(
 }
 
 /// v1.08: fold conjuncts into one AND tree (`None` for an empty list).
+/// v1.48: constant-TRUE conjuncts are dropped before folding. PG19 drops
+/// constant-TRUE clauses "in any case" (restrictinfo.c
+/// `extract_actual_clauses`), so `ON true` / `WHERE true` never render a
+/// `Join Filter:` / `Filter:` line.
 fn pg_fold_and(cs: Vec<Expr>) -> Option<Expr> {
     cs.into_iter()
+        .filter(|e| !matches!(e, Expr::Literal(Literal::Bool(true))))
         .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+}
+
+/// v1.48: PG19's text label for a nested-loop join kind (explain.c
+/// `ExplainNode`: the jointype switch appends to the `"Nested Loop"`
+/// pname; inner renders bare, and cross joins plan as inner so PG has no
+/// cross label). rustgres's `JoinKind` has no semi/anti variants.
+fn pg_join_label(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Left => "Nested Loop Left Join",
+        JoinKind::Right => "Nested Loop Right Join",
+        JoinKind::Full => "Nested Loop Full Join",
+        JoinKind::Inner | JoinKind::Cross => "Nested Loop",
+    }
+}
+
+/// v1.48: does any node in this plan subtree carry a scan `Filter:` or a
+/// join `Join Filter:`?
+fn plan_has_filter(node: &PlanNode) -> bool {
+    match node {
+        PlanNode::Result { filter, .. }
+        | PlanNode::SeqScan { filter, .. }
+        | PlanNode::IndexScan { filter, .. } => filter.is_some(),
+        PlanNode::NestedLoop {
+            filter,
+            join_filter,
+            outer,
+            inner,
+            ..
+        } => {
+            filter.is_some()
+                || join_filter.is_some()
+                || plan_has_filter(outer)
+                || plan_has_filter(inner)
+        }
+        PlanNode::Materialize { child, .. }
+        | PlanNode::Aggregate { child, .. }
+        | PlanNode::Unique { child, .. }
+        | PlanNode::Sort { child, .. }
+        | PlanNode::Limit { child, .. }
+        | PlanNode::SubqueryScan { child, .. } => plan_has_filter(child),
+        PlanNode::IndexOrderScan { .. } | PlanNode::Values { .. } => false,
+    }
+}
+
+/// v1.48: should the inner side of this nested loop be wrapped in a PG19
+/// `Materialize` node?
+///
+/// PG19 (joinpath.c `try_nestloop_path`) always considers a materialized
+/// inner path (`create_material_path`) alongside the plain one and keeps
+/// the cheaper (`add_path`). For a non-self-materializing inner the
+/// costing (costsize.c `initial_cost_nestloop` + `cost_rescan` +
+/// `cost_material`) reduces to roughly "outer rows > 1": with a single
+/// outer row no rescan ever happens, so the materialize build overhead
+/// makes the materialized path lose (or tie, with the plain path added
+/// first).
+///
+/// rustgres has no cost model, so the rule is structural and
+/// conservative: materialize only when the outer estimate exceeds one
+/// row, the inner is a plain seq scan (the PG `!ExecMaterializesOutput`
+/// case the corpus exercises; parameterized/index inner shapes need the
+/// real cost model), and neither side carries a filter — rustgres's scan
+/// estimates ignore filter selectivity while PG's filtered estimates
+/// decide the rescan count, so a filtered side makes the structural
+/// estimate unreliable (this is what keeps the passing filtered
+/// self-joins on `sl`/`sj` rendering PG's plain shape).
+fn pg_should_materialize(outer: &PlanNode, inner: &PlanNode) -> bool {
+    if outer.rows() <= 1 {
+        return false;
+    }
+    if !matches!(inner, PlanNode::SeqScan { .. }) {
+        return false;
+    }
+    if plan_has_filter(outer) || plan_has_filter(inner) {
+        return false;
+    }
+    true
+}
+
+/// v1.48: wrap the nested-loop inner side in `Materialize` when
+/// [`pg_should_materialize`] says PG's planner would pick the
+/// materialized inner path.
+fn pg_maybe_materialize(outer: &PlanNode, inner: PlanNode) -> PlanNode {
+    if pg_should_materialize(outer, &inner) {
+        let rows = inner.rows();
+        let output = inner.output().to_vec();
+        PlanNode::Materialize {
+            rows,
+            child: Box::new(inner),
+            output,
+        }
+    } else {
+        inner
+    }
 }
 
 /// v1.08: AND-flatten preserving source order (unlike `split_conjuncts`,
@@ -10960,6 +11058,23 @@ enum PlanNode {
         rows: u64,
         outer: Box<PlanNode>,
         inner: Box<PlanNode>,
+        /// v1.48: the join kind. PG19 interpolates it into the node label
+        /// (explain.c `ExplainNode`): `Nested Loop Left Join`,
+        /// `Nested Loop Right Join`, `Nested Loop Full Join`; inner (and
+        /// cross, which PG has no separate label for) renders bare
+        /// `Nested Loop`.
+        kind: JoinKind,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
+    },
+    /// v1.48: PG19 `Materialize` node (explain.c `T_Material` →
+    /// `"Materialize"`). Rendered above a nested loop's inner side when
+    /// the planner chooses PG's materialized inner path (joinpath.c
+    /// `create_material_path`). A Material node does not project, so
+    /// `output` mirrors the child's targetlist.
+    Materialize {
+        rows: u64,
+        child: Box<PlanNode>,
         // v1.46: VERBOSE `Output:` entries.
         output: Vec<String>,
     },
@@ -11016,7 +11131,10 @@ impl PlanNode {
             | PlanNode::Unique { rows, .. }
             | PlanNode::Sort { rows, .. }
             | PlanNode::Limit { rows, .. }
-            | PlanNode::SubqueryScan { rows, .. } => *rows,
+            | PlanNode::SubqueryScan { rows, .. }
+            // v1.48: a Materialize node passes its child's row count
+            // through (PG19 sizes the material path like the subpath).
+            | PlanNode::Materialize { rows, .. } => *rows,
             PlanNode::Values { rows, .. } => *rows,
         }
     }
@@ -11056,6 +11174,9 @@ impl PlanNode {
             | PlanNode::Sort { output, .. }
             | PlanNode::Limit { output, .. }
             | PlanNode::SubqueryScan { output, .. }
+            // v1.48: Materialize does not project; its targetlist is the
+            // child's.
+            | PlanNode::Materialize { output, .. }
             | PlanNode::Values { output, .. } => output,
         }
     }
@@ -11073,6 +11194,8 @@ impl PlanNode {
             | PlanNode::Sort { output, .. }
             | PlanNode::Limit { output, .. }
             | PlanNode::SubqueryScan { output, .. }
+            // v1.48: see `output()` above.
+            | PlanNode::Materialize { output, .. }
             | PlanNode::Values { output, .. } => *output = o,
         }
     }
@@ -12486,12 +12609,17 @@ fn plan_from_item(
             // targetlist at the end of `plan_select`.
             let mut output = outer.output().to_vec();
             output.extend(inner.output().iter().cloned());
+            // v1.48: PG19 renders the join kind in the node label
+            // (`Nested Loop Left Join`, ...) and may materialize the
+            // inner side (see `pg_should_materialize`).
+            let inner = pg_maybe_materialize(&outer, inner);
             Ok(PlanNode::NestedLoop {
                 filter: None,
                 join_filter,
                 rows,
                 outer: Box::new(outer),
                 inner: Box::new(inner),
+                kind: *kind,
                 // v1.46: VERBOSE `Output:` filled by the caller (join of
                 // children's entries); the top-level join's entries are
                 // replaced with the query targetlist at the end of
@@ -13182,12 +13310,17 @@ fn plan_select(
             // node by the fixup below).
             let mut output = node.output().to_vec();
             output.extend(inner.output().iter().cloned());
+            // v1.48: comma joins are cross joins (PG plans them as inner
+            // nested loops); PG may materialize the inner side (see
+            // `pg_should_materialize`).
+            let inner = pg_maybe_materialize(&node, inner);
             node = PlanNode::NestedLoop {
                 filter: None,
                 join_filter: None,
                 rows,
                 outer: Box::new(node),
                 inner: Box::new(inner),
+                kind: JoinKind::Cross,
                 output,
             };
         }
@@ -13463,9 +13596,12 @@ fn render_plan(
             join_filter,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{pad}Nested Loop"));
+            // v1.48: PG19 interpolates the join kind into the node label
+            // (explain.c `ExplainNode`).
+            out.push(format!("{pad}{}", pg_join_label(*kind)));
             push_output(out);
             if let Some(f) = filter {
                 out.push(format!("{ppad}Filter: {f}"));
@@ -13475,6 +13611,12 @@ fn render_plan(
             }
             render_plan(outer, depth + 1, costs, verbose, out);
             render_plan(inner, depth + 1, costs, verbose, out);
+        }
+        // v1.48: PG19 `Materialize` (explain.c `T_Material`).
+        PlanNode::Materialize { child, .. } => {
+            out.push(format!("{pad}Materialize"));
+            push_output(out);
+            render_plan(child, depth + 1, costs, verbose, out);
         }
         PlanNode::Aggregate { child, .. } => {
             out.push(format!("{pad}Aggregate"));
@@ -13564,14 +13706,21 @@ fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             rows,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{pad}Nested Loop (rows={rows})"));
+            // v1.48: same join-kind label rule as the PG-text renderer.
+            out.push(format!("{pad}{} (rows={rows})", pg_join_label(*kind)));
             if let Some(f) = filter {
                 out.push(format!("{pad}  Filter: {f}"));
             }
             render_plan_costs_on(outer, depth + 1, out);
             render_plan_costs_on(inner, depth + 1, out);
+        }
+        // v1.48: PG19 `Materialize` (explain.c `T_Material`).
+        PlanNode::Materialize { rows, child, .. } => {
+            out.push(format!("{pad}Materialize (rows={rows})"));
+            render_plan_costs_on(child, depth + 1, out);
         }
         PlanNode::Aggregate { rows, child, .. } => {
             out.push(format!("{pad}Aggregate (rows={rows})"));
@@ -13702,6 +13851,8 @@ fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bo
         PlanNode::IndexScan { rows, .. }
         | PlanNode::IndexOrderScan { rows, .. }
         | PlanNode::NestedLoop { rows, .. }
+        // v1.48: a Materialize node passes its child's rows through.
+        | PlanNode::Materialize { rows, .. }
         | PlanNode::Aggregate { rows, .. } => *rows,
         PlanNode::Unique { child, .. } => analyze_actual(child, ax, cap, false),
         PlanNode::Sort { child, .. } => bounded(analyze_actual(child, ax, None, false)),
@@ -13795,14 +13946,21 @@ fn render_analyze(
             filter,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{}Nested Loop {}", pad, tag));
+            // v1.48: same join-kind label rule as the PG-text renderer.
+            out.push(format!("{}{} {}", pad, pg_join_label(*kind), tag));
             if let Some(f) = filter {
                 out.push(format!("{}Filter: {}", ppad, f));
             }
             render_analyze(outer, ax, depth + 1, None, false, out);
             render_analyze(inner, ax, depth + 1, None, false, out);
+        }
+        // v1.48: PG19 `Materialize` (explain.c `T_Material`).
+        PlanNode::Materialize { child, .. } => {
+            out.push(format!("{}Materialize {}", pad, tag));
+            render_analyze(child, ax, depth + 1, None, false, out);
         }
         PlanNode::Aggregate { child, .. } => {
             out.push(format!("{}Aggregate {}", pad, tag));
@@ -65835,12 +65993,22 @@ mod v147_join_removal_tests {
         let mut eng = engine();
         setup(&mut eng);
         // #3: a4 removed, then a3; a1⋉a2 (on true) stays.
+        // v1.48: PG renders the left-join label and materializes the
+        // inner side (joinpath.c `create_material_path` alternative).
         let lines = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) select a1.id from (a a1 left join a a2 on true) left join (a a3 left join a a4 on a3.id = a4.id) on a2.id = a3.id",
         );
-        assert_eq!(lines.len(), 3, "{lines:?}"); // Nested Loop + 2 Seq Scans
-        assert!(lines[0].contains("Nested Loop"), "{lines:?}");
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop Left Join".to_string(),
+                "  ->  Seq Scan on a a1".to_string(),
+                "  ->  Materialize".to_string(),
+                "        ->  Seq Scan on a a2".to_string(),
+            ],
+            "{lines:?}"
+        );
         // #4: all the way down to a bare Seq Scan.
         assert_seq_scan(
             &mut eng,
@@ -65944,6 +66112,182 @@ mod v147_join_removal_tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(rows.len(), 3);
+    }
+}
+
+
+#[cfg(test)]
+mod v148_join_label_materialize_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        for sql in [
+            "CREATE TEMP TABLE a (id int PRIMARY KEY, b_id int)",
+            "INSERT INTO a VALUES (0, 0), (1, NULL)",
+        ] {
+            run(eng, sql).unwrap();
+        }
+    }
+
+    /// v1.48: PG19 interpolates the join kind into the Nested Loop label
+    /// (explain.c `ExplainNode`); `ON true` renders no Join Filter
+    /// (restrictinfo.c "Constant-TRUE clauses are dropped in any case").
+    #[test]
+    fn target3_left_join_label_and_materialize() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select a1.id from (a a1 left join a a2 on true) left join (a a3 left join a a4 on a3.id = a4.id) on a2.id = a3.id",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop Left Join".to_string(),
+                "  ->  Seq Scan on a a1".to_string(),
+                "  ->  Materialize".to_string(),
+                "        ->  Seq Scan on a a2".to_string(),
+            ],
+            "{lines:?}"
+        );
+    }
+
+    /// v1.48: inner joins keep the bare `Nested Loop` label; both inner
+    /// sides materialize; the `ON true` Join Filter is dropped.
+    #[test]
+    fn target5_inner_label_double_materialize() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select 1 from a t1 left join a t2 on true inner join a t3 on true left join a t4 on t2.id = t4.id and t2.id = t3.id",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "  ->  Nested Loop Left Join".to_string(),
+                "        ->  Seq Scan on a t1".to_string(),
+                "        ->  Materialize".to_string(),
+                "              ->  Seq Scan on a t2".to_string(),
+                "  ->  Materialize".to_string(),
+                "        ->  Seq Scan on a t3".to_string(),
+            ],
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Join Filter")),
+            "{lines:?}"
+        );
+    }
+
+    /// v1.48: a filtered outer scan keeps PG's plain (unmaterialized)
+    /// shape — rustgres scan estimates ignore filter selectivity, so a
+    /// filter makes the rescan-count estimate unreliable.
+    #[test]
+    fn filtered_self_join_not_materialized() {
+        let mut eng = engine();
+        for sql in [
+            "create temp table sl(a int, b int, c int)",
+            "create temp table sj (a int, b int, c int)",
+            "insert into sj values (1, null), (null, 2), (2, 1)",
+        ] {
+            run(&mut eng, sql).unwrap();
+        }
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select * from sl t1, sl t2 where t1.a = t2.a and t1.b = 1 and t2.b = 2",
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Materialize")),
+            "{lines:?}"
+        );
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1, sj j2 WHERE j1.b = j2.b AND j1.a*j1.a = 1 AND j2.a*j2.a = 2",
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Materialize")),
+            "{lines:?}"
+        );
+        assert_eq!(lines[0], "Nested Loop");
+    }
+
+    /// v1.48: single-row outers never materialize (no rescan can happen),
+    /// and right/full joins get PG's labels.
+    #[test]
+    fn single_row_outer_not_materialized() {
+        let mut eng = engine();
+        setup(&mut eng);
+        run(&mut eng, "CREATE TEMP TABLE one (id int PRIMARY KEY)").unwrap();
+        run(&mut eng, "INSERT INTO one VALUES (1)").unwrap();
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select * from one o, a i",
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Materialize")),
+            "{lines:?}"
+        );
+        assert_eq!(lines[0], "Nested Loop");
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select a1.id from a a1 right join a a2 on a1.id = a2.id",
+        );
+        assert_eq!(lines[0], "Nested Loop Right Join", "{lines:?}");
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select a1.id from a a1 full join a a2 on a1.id = a2.id",
+        );
+        assert_eq!(lines[0], "Nested Loop Full Join", "{lines:?}");
+    }
+
+    /// v1.48: constant-TRUE is dropped from scan filters too, matching
+    /// PG19 (`WHERE true` renders no `Filter:` line).
+    #[test]
+    fn constant_true_scan_filter_dropped() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) select * from a where true",
+        );
+        assert_eq!(lines, vec!["Seq Scan on a".to_string()], "{lines:?}");
     }
 }
 
