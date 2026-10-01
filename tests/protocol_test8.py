@@ -545,7 +545,9 @@ def t_explain():
         check("explain sort+limit", "Sort" in plan and "Limit 1" in plan, plan)
 
         plan = plan_of(c, "SELECT * FROM (SELECT id FROM a) s WHERE id = 2")
-        check("explain subquery scan", "Subquery Scan on s" in plan, plan)
+        # v1.54: top-level simple subquery pulls up (PG
+        # `pull_up_simple_subquery`) — flat Index Scan, not Subquery Scan.
+        check("explain subquery scan", "Index Scan using idx_a_id on a" in plan, plan)
 
         _, _, codes = c.q("EXPLAIN ANALYZE SELECT 1")
         check("explain analyze -> 0A000", codes == ["0A000"], f"{codes}")

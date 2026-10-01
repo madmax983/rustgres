@@ -1612,6 +1612,24 @@ pub struct SelectStmt {
     /// above are empty/ignored and the query is `set_op`'s branches.
     /// `None` for plain SELECTs (zero behavior change).
     pub set_op: Option<Box<SetOpRoot>>,
+    /// v1.54: PG19's dead rtable entries from `pull_up_simple_subquery`
+    /// (prepjointree.c): a pulled-up subquery's RTE stays in the rtable
+    /// (with `subquery = NULL`), so `es->rtable_size` — the EXPLAIN
+    /// `useprefix` rule — counts it. The parser always sets 0; the
+    /// EXPLAIN-path pullup sets the number of spliced Deriveds.
+    /// Consulted only by PG-text rendering (`pg_rtable_size` call
+    /// sites); never by execution.
+    pub dead_rtes: usize,
+}
+
+/// v1.54: `AS [NOT] MATERIALIZED` CTE hint (PG12+, PG19 gram.y
+/// `materialized` opt). Recorded by the parser; the planner's CTE-inlining
+/// gate (`SS_process_ctes`) honors it. `Default` = no hint given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CteMaterialize {
+    Default,
+    Materialized,
+    NotMaterialized,
 }
 
 /// v0.10: one Common Table Expression.
@@ -1621,6 +1639,8 @@ pub struct CteDef {
     pub col_aliases: Vec<String>,
     pub body: CteBody,
     pub recursive: bool,
+    /// v1.54: the `AS [NOT] MATERIALIZED` hint (`Default` when absent).
+    pub materialized: CteMaterialize,
 }
 
 /// v0.44: an empty `SelectStmt` shell, used as the carrier of a
@@ -1642,6 +1662,7 @@ fn empty_select() -> SelectStmt {
         for_update: false,
         for_update_of: Vec::new(),
         set_op: None,
+        dead_rtes: 0,
     }
 }
 
@@ -9336,14 +9357,18 @@ impl Parser {
                 Vec::new()
             };
             self.expect_keyword("as")?;
-            // v0.75: `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTE hints
-            // (PG12+). The hint is accepted and ignored — CTEs are always
-            // evaluated per reference here.
-            if self.eat_keyword("not") {
+            // v1.54: `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTE hints
+            // (PG12+). Recorded in `CteDef.materialized` for the
+            // planner's CTE-inlining gate (PG19 `SS_process_ctes`); no
+            // longer ignored.
+            let materialized = if self.eat_keyword("not") {
                 self.expect_keyword("materialized")?;
+                CteMaterialize::NotMaterialized
+            } else if self.eat_keyword("materialized") {
+                CteMaterialize::Materialized
             } else {
-                let _ = self.eat_keyword("materialized");
-            }
+                CteMaterialize::Default
+            };
             self.expect(Token::LParen, "'('")?;
             let body = self.parse_cte_body(recursive)?;
             // v1.39: PG19 parse_cte.c — a recursive query must not contain
@@ -9366,6 +9391,7 @@ impl Parser {
                 col_aliases,
                 body,
                 recursive,
+                materialized,
             });
             if *self.peek() == Token::Comma {
                 self.next();
@@ -12778,6 +12804,7 @@ impl Parser {
             for_update: false,
             for_update_of: Vec::new(),
             set_op: None,
+            dead_rtes: 0,
         })
     }
 

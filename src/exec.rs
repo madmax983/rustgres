@@ -39,11 +39,11 @@
 use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound, FrameExclusion,
-    FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue, IsolationLevel,
-    JoinKind, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel,
-    SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
-    TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc,
+    CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound,
+    FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
+    IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind, QuantOp,
+    RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
+    Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc,
     collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body, trig_event,
     validate_constraint_expr,
 };
@@ -10707,6 +10707,9 @@ struct PgPlanCtx<'a> {
     /// v1.50: non-Column tlist exprs substituted by subquery pullup, for
     /// PG-text paren marking (ruleutils.c `get_special_variable`).
     pulled_exprs: Vec<Expr>,
+    /// v1.54: EXPLAIN VERBOSE flag — PG's `show_upper_qual` uses
+    /// `useprefix = rtable_size > 1 || es->verbose` for Filter lines.
+    verbose: bool,
     _mark: std::marker::PhantomData<&'a ()>,
 }
 
@@ -10764,6 +10767,8 @@ fn pg_plan_ctx<'a>(
     session: u64,
     ctes: &[CteDef],
     pulled_exprs: Vec<Expr>,
+    // v1.54: EXPLAIN VERBOSE flag for the Filter `useprefix` rule.
+    verbose: bool,
 ) -> PgPlanCtx<'a> {
     fn push_item<'a>(
         eng: &'a Engine,
@@ -10800,6 +10805,7 @@ fn pg_plan_ctx<'a>(
     PgPlanCtx {
         items: items_out,
         pulled_exprs,
+        verbose,
         _mark: std::marker::PhantomData,
     }
 }
@@ -11379,12 +11385,14 @@ fn plan_cte_body(
     session: u64,
     // v1.08: PG-text mode for EXPLAIN (COSTS OFF).
     pg: bool,
+    // v1.54: EXPLAIN VERBOSE flag (Filter `useprefix` rule).
+    verbose: bool,
 ) -> Result<PlanNode, ExecError> {
     match &cte.body {
-        CteBody::Simple(sel) => plan_select(eng, sel, snap, own, session, visible, pg),
+        CteBody::Simple(sel) => plan_select(eng, sel, snap, own, session, visible, pg, verbose),
         CteBody::Union { left, right, all } => {
-            let l = plan_select(eng, left, snap, own, session, visible, pg)?;
-            let r = plan_select(eng, right, snap, own, session, visible, pg)?;
+            let l = plan_select(eng, left, snap, own, session, visible, pg, verbose)?;
+            let r = plan_select(eng, right, snap, own, session, visible, pg, verbose)?;
             let rows = if *all {
                 l.rows().saturating_add(r.rows())
             } else {
@@ -12061,6 +12069,11 @@ fn is_simple_subquery(sub: &SelectStmt) -> bool {
     if sub.limit.is_some() || sub.offset.is_some() {
         return false;
     }
+    // v1.54 (drive-by #2): PG19's `is_simple_subquery` (prepjointree.c)
+    // forbids `sortClause` — a subquery with ORDER BY is never "simple".
+    if !sub.order_by.is_empty() {
+        return false;
+    }
     if sub.for_update || !sub.for_update_of.is_empty() {
         return false;
     }
@@ -12084,6 +12097,27 @@ fn find_pullup_candidate(
     from: &[FromItem],
 ) -> Option<(String, Vec<SelectItem>, Option<Expr>, Vec<FromItem>)> {
     for it in from {
+        // v1.54: PG pulls up top-level subqueries too, not just Join
+        // children (needed for inlined CTEs: `select * from (select ..)
+        // x`). From-less subqueries are allowed here (PG's
+        // `replace_empty_jointree`); they splice to an empty FROM.
+        // LATERAL is still never pulled up (v1.51).
+        if let FromItem::Derived {
+            alias,
+            sub,
+            lateral,
+            ..
+        } = it
+        {
+            if !lateral && sub.from.len() <= 1 && is_simple_subquery(sub.as_ref()) {
+                return Some((
+                    alias.clone(),
+                    sub.items.clone(),
+                    sub.where_.clone(),
+                    sub.from.clone(),
+                ));
+            }
+        }
         if let Some(cand) = find_pullup_in_item(it) {
             return Some(cand);
         }
@@ -12152,7 +12186,7 @@ fn splice_pullup_from(
     sub_from: &[FromItem],
 ) -> Vec<FromItem> {
     from.iter()
-        .map(|it| splice_pullup_in_item(it, alias, sub_from))
+        .flat_map(|it| splice_pullup_in_item(it, alias, sub_from))
         .collect()
 }
 
@@ -12160,7 +12194,7 @@ fn splice_pullup_in_item(
     it: &FromItem,
     alias: &str,
     sub_from: &[FromItem],
-) -> FromItem {
+) -> Vec<FromItem> {
     match it {
         FromItem::Join {
             left,
@@ -12175,19 +12209,29 @@ fn splice_pullup_in_item(
         } => {
             let new_left = splice_pullup_in_item(left, alias, sub_from);
             let new_right = splice_pullup_in_item(right, alias, sub_from);
-            // Rebuild with the spliced children (v1.51: each splice
-            // replaces one Derived with one item, so this is direct).
-            FromItem::Join {
-                left: Box::new(new_left),
+            // v1.54: from-less pullup only targets top-level Deriveds
+            // (never Join children), so each side yields exactly one item.
+            vec![FromItem::Join {
+                left: Box::new(
+                    new_left
+                        .into_iter()
+                        .next()
+                        .expect("v1.54: join-child splice yields one item"),
+                ),
                 kind: *kind,
-                right: Box::new(new_right),
+                right: Box::new(
+                    new_right
+                        .into_iter()
+                        .next()
+                        .expect("v1.54: join-child splice yields one item"),
+                ),
                 on: on.clone(),
                 using: using.clone(),
                 natural: *natural,
                 using_alias: using_alias.clone(),
                 alias: jalias.clone(),
                 col_aliases: col_aliases.clone(),
-            }
+            }]
         }
         FromItem::Derived {
             alias: dalias,
@@ -12196,33 +12240,23 @@ fn splice_pullup_in_item(
             lateral,
         } => {
             if dalias == alias {
-                // Replace with the subquery's FROM.
-                // v1.51: sub_from always has exactly 1 item (enforced by
-                // the scope guards in `find_pullup_in_item`); the else
-                // branch is unreachable defensive fallback.
-                if sub_from.len() == 1 {
-                    sub_from[0].clone()
-                } else {
-                    FromItem::Derived {
-                        alias: dalias.clone(),
-                        sub: sub.clone(),
-                        col_aliases: col_aliases.clone(),
-                        lateral: *lateral,
-                    }
-                }
+                // Replace with the subquery's FROM. v1.54: a from-less
+                // subquery (PG's `replace_empty_jointree`) splices to
+                // nothing — the Derived is removed.
+                sub_from.to_vec()
             } else {
                 // Recurse into the subquery.
                 let mut new_sub = sub.clone();
                 new_sub.from = splice_pullup_from(&sub.from, alias, sub_from);
-                FromItem::Derived {
+                vec![FromItem::Derived {
                     alias: dalias.clone(),
                     sub: new_sub,
                     col_aliases: col_aliases.clone(),
                     lateral: *lateral,
-                }
+                }]
             }
         }
-        _ => it.clone(),
+        _ => vec![it.clone()],
     }
 }
 
@@ -12237,10 +12271,11 @@ fn splice_pullup_in_item(
 /// parent join in place of the subquery, references to `alias.col` in the
 /// parent's SELECT/WHERE/JOIN ONs are replaced by the subquery's tlist
 /// exprs, and the subquery's WHERE is ANDed into the parent's WHERE.
-/// (PG19 itself pulls up FROM-less subqueries via `replace_empty_jointree`'s
-/// dummy RTE_RESULT, and multi-FROM subqueries by flattening; this rewrite
-/// conservatively skips both — v1.51 scope guards in `find_pullup_in_item`
-/// — leaving them to plan as subqueries exactly as pre-v1.50.)
+/// v1.54: also pulls up top-level Deriveds (not just Join children —
+/// PG pulls up any simple subquery), including FROM-less subqueries
+/// (PG's `replace_empty_jointree`; the Derived is removed, leaving an
+/// empty FROM). Each spliced Derived increments `dead_rtes` (PG's dead
+/// rtable entries for the EXPLAIN `useprefix` rule).
 ///
 /// Returns `(rewritten_stmt, pulled_exprs)` where `pulled_exprs` are the
 /// non-Column tlist exprs that were substituted (for PG-text paren marking
@@ -12255,26 +12290,49 @@ fn pull_up_simple_subqueries(
 ) -> Option<(SelectStmt, Vec<Expr>)> {
     let mut new_stmt = stmt.clone();
     let mut pulled = Vec::new();
+    // v1.54: PG's dead rtable entries — one per spliced Derived.
+    let mut dead_rtes = 0usize;
     // Fixpoint: pull up one subquery at a time (handles nesting).
     // v1.51: bound the iterations (defense-in-depth). Each successful
     // splice removes exactly one Derived from the whole FROM tree —
-    // replacing it with its single FROM item, which was already counted —
-    // so the loop can never need more than `derived_count + 1` passes.
-    // With the scope guards in `find_pullup_in_item` every candidate is
-    // spliceable, so the bound is unreachable in practice.
+    // replacing it with its single FROM item (or nothing, if from-less),
+    // which was already counted — so the loop can never need more than
+    // `derived_count + 1` passes. With the scope guards in
+    // `find_pullup_in_item` every candidate is spliceable, so the bound
+    // is unreachable in practice.
     let max_iters = count_derived_from_items(&stmt.from) + 1;
     for _ in 0..max_iters {
         // Find the first pullup candidate: (alias, subquery items, subquery
-        // where, subquery from) at a Join child position.
+        // where, subquery from), at a Join child or top-level position.
         let candidate = find_pullup_candidate(&new_stmt.from);
         let Some((alias, items, sub_where, sub_from)) = candidate else {
             break;
         };
+        // v1.54: was the candidate the ONLY top-level FROM item? (For
+        // the from-less `SELECT *` expansion below.)
+        let was_single_top = new_stmt.from.len() == 1
+            && matches!(new_stmt.from[0], FromItem::Derived { .. });
         // Splice the subquery's FROM into the parent, replacing the Derived.
         new_stmt.from = splice_pullup_from(&new_stmt.from, &alias, &sub_from);
+        dead_rtes += 1;
         // Rewrite SELECT items, WHERE, and all JOIN ONs in the tree.
         // v1.50: qualify unqualified tlist Columns using the schema.
         let qualified_items = qualify_tlist_exprs(&items, &sub_from, eng, snap, own, session);
+        // v1.54: top-level pullup of the ONLY from item — `SELECT *`
+        // expands over the subquery's tlist (PG's parse-time `*`
+        // expansion), not the spliced table's columns. (For from-less
+        // subqueries the FROM is empty; otherwise `*` would widen to
+        // the whole table.)
+        if was_single_top {
+            new_stmt.items = new_stmt
+                .items
+                .iter()
+                .flat_map(|it| match it {
+                    SelectItem::All => qualified_items.clone(),
+                    other => vec![other.clone()],
+                })
+                .collect();
+        }
         rewrite_stmt_refs(&mut new_stmt, &alias, &qualified_items, &mut pulled);
         // AND the subquery's WHERE into the parent's WHERE.
         if let Some(sw) = sub_where {
@@ -12290,6 +12348,7 @@ fn pull_up_simple_subqueries(
             return None;
         }
     }
+    new_stmt.dead_rtes = stmt.dead_rtes + dead_rtes;
     Some((new_stmt, pulled))
 }
 
@@ -12992,7 +13051,16 @@ fn plan_from_item(
                         output: Vec::new(),
                     }
                 } else {
-                    plan_cte_body(eng, cte, &ctes[..pos], snap, own, session, pctx.is_some())?
+                    plan_cte_body(
+                        eng,
+                        cte,
+                        &ctes[..pos],
+                        snap,
+                        own,
+                        session,
+                        pctx.is_some(),
+                        pctx.map(|p| p.verbose).unwrap_or(false),
+                    )?
                 };
                 let rows = child.rows();
                 // v1.46: VERBOSE `Output:` — the CTE's output columns
@@ -13145,8 +13213,17 @@ fn plan_from_item(
                     // v1.08: PG-text Filter (the whole item slice; index
                     // selection found nothing usable). Falls back to Debug
                     // format (EXPECTED-FAIL via mask, no txn abort).
+                    // v1.54: PG's Filter prefixing uses
+                    // `useprefix = verbose || has_dead_rtes` (dead RTEs
+                    // from pulled-up subqueries force qualification; a
+                    // plain multi-table query does NOT qualify scan
+                    // Filters in non-verbose mode).
                     let filter = match (pctx, where_) {
-                        (Some(px), Some(w)) => Some(pg_expr_text_or_debug(w, px, false)),
+                        (Some(px), Some(w)) => Some(pg_expr_text_or_debug(
+                            w,
+                            px,
+                            px.verbose || stmt.dead_rtes > 0,
+                        )),
                         _ => None,
                     };
                     // v1.46: VERBOSE `Output:` — the table's columns in
@@ -13207,7 +13284,13 @@ fn plan_from_item(
                                 .collect();
                             residual.reverse();
                             match pg_fold_and(residual) {
-                                Some(e) => Some(pg_expr_text_or_debug(&e, px, false)),
+                                // v1.54: PG's Filter prefixing uses
+                                // `useprefix = verbose || has_dead_rtes`.
+                                Some(e) => Some(pg_expr_text_or_debug(
+                                    &e,
+                                    px,
+                                    px.verbose || stmt.dead_rtes > 0,
+                                )),
                                 None => None,
                             }
                         }
@@ -13245,7 +13328,16 @@ fn plan_from_item(
             let _ = (pctx, where_);
             // v0.78: derived tables see the enclosing CTEs (like the
             // executor's shared CTE bindings).
-            let child = plan_select(eng, sub, snap, own, session, ctes, pctx.is_some())?;
+            let child = plan_select(
+                eng,
+                sub,
+                snap,
+                own,
+                session,
+                ctes,
+                pctx.is_some(),
+                pctx.map(|p| p.verbose).unwrap_or(false),
+            )?;
             let rows = child.rows();
             // v1.46: VERBOSE `Output:` — the subquery's output columns
             // qualified by the scan alias (`ss.x, ss.u`).
@@ -13730,7 +13822,7 @@ fn pg_scan_output(
             quals.push(a.to_string());
         }
     }
-    let qualify = pg_rtable_size(&stmt.from) > 1;
+    let qualify = pg_rtable_size(&stmt.from) + stmt.dead_rtes > 1;
     let prefix = alias.unwrap_or(name);
     let mut needed: Vec<String> = Vec::new();
     // v1.52: indices into `needed` holding pre-rendered expression text
@@ -14065,7 +14157,9 @@ fn pg_top_select_output(
     ctes: &[CteDef],
     px: &PgPlanCtx,
 ) -> Option<Vec<String>> {
-    let qualify = pg_rtable_size(&stmt.from) > 1;
+    // v1.54: PG counts dead rtable entries (pulled-up subqueries) in
+    // `es->rtable_size` for the `useprefix` rule.
+    let qualify = pg_rtable_size(&stmt.from) + stmt.dead_rtes > 1;
     let mut out = Vec::new();
     for item in &stmt.items {
         match item {
@@ -14214,7 +14308,17 @@ fn plan_select(
     // and sort keys are deparsed PG19-style; anything without a faithful
     // spelling is an honest error (stays masked).
     pg: bool,
+    // v1.54: EXPLAIN VERBOSE flag — PG's Filter `useprefix` rule is
+    // `rtable_size > 1 || verbose` (explain.c `show_upper_qual`).
+    verbose: bool,
 ) -> Result<PlanNode, ExecError> {
+    // v1.54: PG19 `SS_process_ctes` (subselect.c) — inline simple
+    // non-recursive CTEs as an AST rewrite BEFORE
+    // `pull_up_simple_subqueries` (PG's planner order: SS_process_ctes
+    // then pull_up_subqueries). Inlined CTEs leave `with`, so the
+    // existing pullup sees plain Deriveds and flattens them.
+    let inlined_owned = inline_cte_refs(stmt);
+    let stmt: &SelectStmt = &inlined_owned;
     // v0.78: effective CTE list = outer ++ this level's WITH. Later
     // entries shadow earlier ones on name lookup (rposition).
     let mut eff: Vec<CteDef> = outer_ctes.to_vec();
@@ -14260,7 +14364,16 @@ fn plan_select(
     // the join-level remainder).
     let _pctx_store;
     let pctx: Option<&PgPlanCtx> = if pg {
-        _pctx_store = pg_plan_ctx(eng, &stmt.from, snap, own, session, ctes, pulled_exprs);
+        _pctx_store = pg_plan_ctx(
+            eng,
+            &stmt.from,
+            snap,
+            own,
+            session,
+            ctes,
+            pulled_exprs,
+            verbose,
+        );
         Some(&_pctx_store)
     } else {
         None
@@ -14970,7 +15083,16 @@ fn exec_explain(
     };
     // Planning only inspects definitions and statistics — nothing runs.
     // v1.08: COSTS OFF selects the PG-text plan rendering.
-    let plan = plan_select(&*eng, sel, ctx.snap, ctx.own, ctx.session, &[], !costs)?;
+    let plan = plan_select(
+        &*eng,
+        sel,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        &[],
+        !costs,
+        verbose,
+    )?;
     let mut lines = Vec::new();
     render_plan(&plan, 0, costs, verbose, &mut lines);
     Ok(ExecResult::Explain {
@@ -15221,7 +15343,7 @@ fn explain_rows(
     verbose: bool,
 ) -> Result<Vec<Row>, ExecError> {
     // v1.08: COSTS OFF selects the PG-text plan rendering.
-    let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs)?;
+    let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs, verbose)?;
     let mut lines = Vec::new();
     if analyze {
         let out = run_select(q, sel, scopes)?;
@@ -17361,6 +17483,315 @@ fn volatile_builtin(name: &str) -> bool {
             | "transaction_timestamp"
             | "current_date"
     )
+}
+
+/// v1.54: PG19-volatility for CTE inlining (`SS_process_ctes` /
+/// `contain_volatile_functions`, subselect.c). PG's catalog marks
+/// `now()`, `current_timestamp`, `statement_timestamp`,
+/// `transaction_timestamp`, and `current_date` STABLE — they do NOT
+/// block inlining (corpus target `stable-inline`). Only true
+/// volatiles (`random`, `nextval`, ..., `clock_timestamp`) do. This is
+/// deliberately narrower than rustgres's `volatile_builtin` (which
+/// also blocks IMMUTABLE const-folding); do not unify them.
+fn pg_volatile_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "nextval" | "currval" | "setval" | "lastval" | "random" | "setseed" | "clock_timestamp"
+    )
+}
+
+/// v1.54: does this statement contain a PG-volatile function call
+/// anywhere (items, quals, FROM, CTE bodies, subqueries)? Gate for
+/// CTE inlining — PG's `contain_volatile_functions` check.
+fn stmt_has_pg_volatile(s: &SelectStmt) -> bool {
+    let mut found = false;
+    walk_stmt_exprs(s, &mut |e| {
+        if found {
+            return;
+        }
+        if let Expr::Func { name, .. } = e {
+            if pg_volatile_builtin(name) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v1.54: does this statement contain a data-modifying CTE anywhere?
+/// Gate for CTE inlining — PG's `contain_dml` check.
+fn stmt_has_dml(s: &SelectStmt) -> bool {
+    fn fi_has_dml(fi: &FromItem) -> bool {
+        match fi {
+            FromItem::Derived { sub, .. } => stmt_has_dml(sub),
+            FromItem::Join { left, right, .. } => fi_has_dml(left) || fi_has_dml(right),
+            FromItem::Table { .. } | FromItem::Values { .. } | FromItem::Function { .. } => false,
+        }
+    }
+    s.with.iter().any(|c| match &c.body {
+        CteBody::Simple(b) => stmt_has_dml(b),
+        CteBody::Union { left, right, .. } => stmt_has_dml(left) || stmt_has_dml(right),
+        CteBody::Dml(_) => true,
+    }) || s.from.iter().any(fi_has_dml)
+        || s.set_op.as_ref().is_some_and(|op| {
+            stmt_has_dml(&op.left) || op.chain.iter().any(|b| stmt_has_dml(&b.right))
+        })
+}
+
+/// v1.54: can this CTE be inlined by `inline_cte_refs`? Mirrors PG19's
+/// `inline_cte` gates (subselect.c:1139): not recursive, not
+/// `AS MATERIALIZED`, simple SELECT body, no DML, no PG-volatile
+/// functions. The single-reference requirement is checked separately
+/// (`count_cte_refs`); multi-ref CTEs never inline here — stricter
+/// than PG's `AS NOT MATERIALIZED` exception, untestable in the
+/// corpus (test 7's oracle is unmatchable anyway).
+fn cte_inlineable(cte: &CteDef) -> bool {
+    // `WITH RECURSIVE` marks every CTE recursive (parser) — PG's
+    // `SS_process_ctes` skips those.
+    if cte.recursive {
+        return false;
+    }
+    if cte.materialized == CteMaterialize::Materialized {
+        return false;
+    }
+    let body = match &cte.body {
+        CteBody::Simple(b) => b,
+        _ => return false,
+    };
+    if stmt_has_dml(body) {
+        return false;
+    }
+    if stmt_has_pg_volatile(body) {
+        return false;
+    }
+    true
+}
+
+/// v1.54: scope-aware CTE reference visitor for inlining. Calls
+/// `visit` for every `FromItem::Table{name}` with whether it binds to
+/// the target CTE. `target_idx` is `Some(i)` when the target is
+/// `stmt.with[i]` at the current level, `None` when it comes from an
+/// outer level. Shadowing follows PG's `ctelevelsup` rule: an inner
+/// `WITH name` rebinds the name (and a target is only visible in
+/// sibling CTE bodies defined AFTER it).
+fn visit_cte_refs(
+    stmt: &SelectStmt,
+    target_name: &str,
+    target_idx: Option<usize>,
+    sees_target: bool,
+    visit: &mut impl FnMut(bool),
+) {
+    // Outer-level target shadowed by this level's WITH.
+    let sees = if target_idx.is_none() && stmt.with.iter().any(|c| c.name == target_name) {
+        false
+    } else {
+        sees_target
+    };
+    for fi in &stmt.from {
+        visit_cte_refs_from(fi, target_name, target_idx, sees, visit);
+    }
+    for (j, cte) in stmt.with.iter().enumerate() {
+        let s = match target_idx {
+            Some(i) => sees && j > i,
+            None => sees,
+        };
+        match &cte.body {
+            CteBody::Simple(body) => visit_cte_refs(body, target_name, None, s, visit),
+            CteBody::Union { left, right, .. } => {
+                visit_cte_refs(left, target_name, None, s, visit);
+                visit_cte_refs(right, target_name, None, s, visit);
+            }
+            CteBody::Dml(_) => {}
+        }
+    }
+    if let Some(op) = &stmt.set_op {
+        visit_cte_refs(&op.left, target_name, target_idx, sees, visit);
+        for b in &op.chain {
+            visit_cte_refs(&b.right, target_name, target_idx, sees, visit);
+        }
+    }
+}
+
+fn visit_cte_refs_from(
+    fi: &FromItem,
+    target_name: &str,
+    target_idx: Option<usize>,
+    sees_target: bool,
+    visit: &mut impl FnMut(bool),
+) {
+    match fi {
+        FromItem::Table { name, .. } => visit(sees_target && name == target_name),
+        FromItem::Derived { sub, .. } => visit_cte_refs(sub, target_name, None, sees_target, visit),
+        FromItem::Join { left, right, .. } => {
+            visit_cte_refs_from(left, target_name, target_idx, sees_target, visit);
+            visit_cte_refs_from(right, target_name, target_idx, sees_target, visit);
+        }
+        FromItem::Values { .. } | FromItem::Function { .. } => {}
+    }
+}
+
+/// v1.54: count `FromItem::Table{target_name}` refs in `stmt`'s subtree
+/// that bind to `stmt.with[target_idx]`.
+fn count_cte_refs(stmt: &SelectStmt, target_name: &str, target_idx: usize) -> usize {
+    let mut n = 0;
+    visit_cte_refs(stmt, target_name, Some(target_idx), true, &mut |binds| {
+        if binds {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// v1.54: replace the `FromItem::Table` refs binding to the target CTE
+/// with a clone of `replacement`. Mirrors `visit_cte_refs`'s scope
+/// logic. Returns the number replaced.
+fn replace_cte_refs(
+    stmt: &mut SelectStmt,
+    target_name: &str,
+    target_idx: Option<usize>,
+    sees_target: bool,
+    replacement: &FromItem,
+) -> usize {
+    let sees = if target_idx.is_none() && stmt.with.iter().any(|c| c.name == target_name) {
+        false
+    } else {
+        sees_target
+    };
+    let mut n = 0;
+    for fi in &mut stmt.from {
+        n += replace_cte_refs_from(fi, target_name, target_idx, sees, replacement);
+    }
+    for (j, cte) in stmt.with.iter_mut().enumerate() {
+        let s = match target_idx {
+            Some(i) => sees && j > i,
+            None => sees,
+        };
+        match &mut cte.body {
+            CteBody::Simple(body) => n += replace_cte_refs(body, target_name, None, s, replacement),
+            CteBody::Union { left, right, .. } => {
+                n += replace_cte_refs(left, target_name, None, s, replacement);
+                n += replace_cte_refs(right, target_name, None, s, replacement);
+            }
+            CteBody::Dml(_) => {}
+        }
+    }
+    if let Some(op) = &mut stmt.set_op {
+        n += replace_cte_refs(&mut op.left, target_name, target_idx, sees, replacement);
+        for b in &mut op.chain {
+            n += replace_cte_refs(&mut b.right, target_name, target_idx, sees, replacement);
+        }
+    }
+    n
+}
+
+fn replace_cte_refs_from(
+    fi: &mut FromItem,
+    target_name: &str,
+    target_idx: Option<usize>,
+    sees_target: bool,
+    replacement: &FromItem,
+) -> usize {
+    match fi {
+        FromItem::Table { name, .. } => {
+            if sees_target && name == target_name {
+                *fi = replacement.clone();
+                1
+            } else {
+                0
+            }
+        }
+        FromItem::Derived { sub, .. } => {
+            replace_cte_refs(sub, target_name, None, sees_target, replacement)
+        }
+        FromItem::Join { left, right, .. } => {
+            replace_cte_refs_from(left, target_name, target_idx, sees_target, replacement)
+                + replace_cte_refs_from(right, target_name, target_idx, sees_target, replacement)
+        }
+        FromItem::Values { .. } | FromItem::Function { .. } => 0,
+    }
+}
+
+/// v1.54: PG19 `SS_process_ctes` (subselect.c) as an AST rewrite —
+/// inline simple non-recursive CTEs BEFORE `pull_up_simple_subqueries`
+/// (PG's planner order). A CTE inlines iff `cte_inlineable` holds and
+/// exactly one `FromItem::Table` binds to it; the ref becomes
+/// `FromItem::Derived{ body }` and the CTE leaves `with`, so the
+/// existing pullup flattens it. Runs top-down (this level first, then
+/// recurses into subqueries and CTE bodies), to a fixpoint at each
+/// level (each inlining shrinks `with`, so it terminates).
+fn inline_cte_refs(stmt: &SelectStmt) -> SelectStmt {
+    let mut out = stmt.clone();
+    loop {
+        let mut progressed = false;
+        let mut i = 0;
+        while i < out.with.len() {
+            let cte = out.with[i].clone();
+            if !cte_inlineable(&cte) {
+                i += 1;
+                continue;
+            }
+            if count_cte_refs(&out, &cte.name, i) != 1 {
+                i += 1;
+                continue;
+            }
+            let body = match &cte.body {
+                CteBody::Simple(b) => b.clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let replacement = FromItem::Derived {
+                sub: Box::new(body),
+                alias: cte.name.clone(),
+                col_aliases: cte.col_aliases.clone(),
+                lateral: false,
+            };
+            let replaced = replace_cte_refs(&mut out, &cte.name, Some(i), true, &replacement);
+            if replaced != 1 {
+                // Count/replace disagree — never inline (safety).
+                i += 1;
+                continue;
+            }
+            out.with.remove(i);
+            progressed = true;
+            break;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    for fi in &mut out.from {
+        inline_cte_refs_from(fi);
+    }
+    for cte in &mut out.with {
+        match &mut cte.body {
+            CteBody::Simple(body) => *body = inline_cte_refs(body),
+            CteBody::Union { left, right, .. } => {
+                **left = inline_cte_refs(left);
+                **right = inline_cte_refs(right);
+            }
+            CteBody::Dml(_) => {}
+        }
+    }
+    if let Some(op) = &mut out.set_op {
+        *op.left = inline_cte_refs(&op.left);
+        for b in &mut op.chain {
+            *b.right = inline_cte_refs(&b.right);
+        }
+    }
+    out
+}
+
+fn inline_cte_refs_from(fi: &mut FromItem) {
+    match fi {
+        FromItem::Derived { sub, .. } => **sub = inline_cte_refs(sub),
+        FromItem::Join { left, right, .. } => {
+            inline_cte_refs_from(left);
+            inline_cte_refs_from(right);
+        }
+        FromItem::Table { .. } | FromItem::Values { .. } | FromItem::Function { .. } => {}
+    }
 }
 
 /// v1.36: does this expression read per-row query state? Column and
@@ -51579,6 +52010,8 @@ mod tests {
             "plan was:\n{plan}"
         );
         // Chained CTEs: inner CTE visible to later ones.
+        // v1.54: single-ref simple CTEs inline (PG `inline_cte`) — both
+        // x and y flatten to a bare Result (verified against PG16).
         let r2 = run(
             &mut eng,
             "EXPLAIN WITH x AS (SELECT 1 AS a), y AS (SELECT a + 1 AS b FROM x) SELECT * FROM y",
@@ -51589,9 +52022,11 @@ mod tests {
             .map(|r| r[0].clone())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(plan2.contains("Subquery Scan on y"), "plan was:\n{plan2}");
-        assert!(plan2.contains("Subquery Scan on x"), "plan was:\n{plan2}");
+        assert!(plan2.contains("Result"), "plan was:\n{plan2}");
+        assert!(!plan2.contains("Subquery Scan"), "plan was:\n{plan2}");
         // CTE shadowing a real table plans the CTE, like the executor.
+        // v1.54: single-ref simple CTE inlines (PG `inline_cte`) — flat
+        // Result (verified against PG16).
         let r3 = run(
             &mut eng,
             "EXPLAIN WITH cte_t AS (SELECT 2 AS a) SELECT * FROM cte_t",
@@ -51603,7 +52038,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            plan3.contains("Subquery Scan on cte_t"),
+            plan3.contains("Result"),
             "plan was:\n{plan3}"
         );
         // Recursive CTE: nominal estimate, no infinite recursion.
@@ -68075,7 +68510,8 @@ mod v146_verbose_output_tests {
             vec![
                 "Seq Scan on public.t1".to_string(),
                 "  Output: a, b".to_string(),
-                "  Filter: (b = 'x'::text)".to_string(),
+                // v1.54: VERBOSE qualifies scan Filters (PG `useprefix`).
+                "  Filter: (t1.b = 'x'::text)".to_string(),
             ]
         );
     }
@@ -68094,7 +68530,9 @@ mod v146_verbose_output_tests {
         );
         assert_eq!(lines[0], "Seq Scan on public.t1");
         assert_eq!(lines[1], "  Output: a, b");
-        assert_eq!(lines[2], "  Filter: (a > 1)");
+        // v1.54: VERBOSE qualifies scan Filters (PG `useprefix`,
+        // verified against PG16: `Filter: (t1.a > 0)`).
+        assert_eq!(lines[2], "  Filter: (t1.a > 1)");
     }
 
     #[test]
@@ -68175,13 +68613,12 @@ mod v146_verbose_output_tests {
         );
         assert_eq!(
             lines,
-            // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
-            // (explain.c).
+            // v1.54: top-level simple subquery pulls up (PG
+            // `pull_up_simple_subquery`) — flat Seq Scan, not a
+            // Subquery Scan. Verified against PG16.
             vec![
-                "Subquery Scan on ss".to_string(),
-                "  Output: ss.x".to_string(),
-                "  ->  Seq Scan on public.t1".to_string(),
-                "        Output: a".to_string(),
+                "Seq Scan on public.t1".to_string(),
+                "  Output: t1.a".to_string(),
             ]
         );
     }
@@ -68296,8 +68733,10 @@ mod v146_verbose_output_tests {
             &mut eng,
             "EXPLAIN (COSTS OFF, VERBOSE) WITH x AS (SELECT a AS q FROM t1) SELECT * FROM x",
         );
-        assert_eq!(lines[0], "Subquery Scan on x");
-        assert_eq!(lines[1], "  Output: x.q");
+        // v1.54: single-ref simple CTE inlines (PG `inline_cte`), then the
+        // top-level subquery pulls up — PG renders a flat Seq Scan.
+        assert_eq!(lines[0], "Seq Scan on public.t1");
+        assert_eq!(lines[1], "  Output: t1.a");
     }
 
     #[test]
@@ -68565,5 +69004,151 @@ mod v151_pullup_repair_tests {
             lines.iter().any(|l| l == "Replaces: Scan on int8_tbl"),
             "T1 lost its Replaces line: {lines:?}"
         );
+    }
+}
+
+/// v1.54: CTE inlining for simple non-recursive CTEs (PG19 `inline_cte`
+/// + `pull_up_simple_subquery`). Single-ref CTEs with a simple SELECT
+/// body, no DML, and no volatile functions inline; the resulting
+/// top-level subquery pulls up to a flat scan.
+#[cfg(test)]
+mod v154_cte_inline_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).unwrap() {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|r| r[0].to_text().unwrap().to_string())
+                .collect(),
+            other => panic!("expected EXPLAIN, got {other:?}"),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 integer)").unwrap();
+        run(eng, "INSERT INTO subselect_tbl VALUES (1, 2, 3)").unwrap();
+        run(eng, "CREATE TABLE int4_tbl (f1 integer)").unwrap();
+    }
+
+    #[test]
+    fn cte_inline_basic() {
+        // v1.54: basic single-ref CTE inlines to a flat Seq Scan with
+        // qualified Output/Filter (dead RTE forces useprefix).
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1 FROM subselect_tbl) SELECT * FROM x WHERE f1 = 1",
+        );
+        assert_eq!(lines[0], "Seq Scan on public.subselect_tbl");
+        assert_eq!(lines[1], "  Output: subselect_tbl.f1");
+        assert_eq!(lines[2], "  Filter: (subselect_tbl.f1 = 1)");
+    }
+
+    #[test]
+    fn cte_inline_stable_fn() {
+        // v1.54: STABLE functions (now()) do not block inlining — PG
+        // treats now()/current_timestamp as STABLE, not VOLATILE.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1, now() FROM subselect_tbl) SELECT * FROM x WHERE f1 = 1",
+        );
+        assert_eq!(lines[0], "Seq Scan on public.subselect_tbl");
+        assert_eq!(lines[1], "  Output: subselect_tbl.f1, now()");
+    }
+
+    #[test]
+    fn cte_no_inline_volatile() {
+        // v1.54: VOLATILE functions (random()) block inlining — the CTE
+        // stays a Subquery Scan.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1, random() FROM subselect_tbl) SELECT * FROM x WHERE f1 = 1",
+        );
+        assert_eq!(lines[0], "Subquery Scan on x");
+    }
+
+    #[test]
+    fn cte_no_inline_materialized() {
+        // v1.54: AS MATERIALIZED blocks inlining per PG semantics.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS MATERIALIZED (SELECT f1 FROM subselect_tbl) SELECT * FROM x WHERE f1 = 1",
+        );
+        assert_eq!(lines[0], "Subquery Scan on x");
+    }
+
+    #[test]
+    fn cte_inline_nested() {
+        // v1.54: nested CTEs inline recursively — inner refs resolve to
+        // the inlined outer body.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT * FROM int4_tbl) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT * FROM y) ss",
+        );
+        assert_eq!(lines[0], "Seq Scan on public.int4_tbl");
+        assert_eq!(lines[1], "  Output: int4_tbl.f1");
+    }
+
+    #[test]
+    fn cte_inline_shadowed() {
+        // v1.54: inner WITH rebinds the name (PG `ctelevelsup`
+        // shadowing) — the inner x (SELECT 2) wins.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT 1) SELECT * FROM (WITH x AS (SELECT 2) SELECT * FROM x) ss",
+        );
+        assert_eq!(lines[0], "Result");
+        assert_eq!(lines[1], "  Output: 2");
+    }
+
+    #[test]
+    fn cte_multi_ref_no_inline() {
+        // v1.54: multi-referenced CTEs never inline (stricter than PG,
+        // which allows it for non-volatile; untestable here so we stay
+        // conservative).
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1 FROM subselect_tbl) SELECT * FROM x, x AS x2",
+        );
+        assert!(lines.iter().any(|l| l.contains("Subquery Scan on x")), "{lines:?}");
     }
 }
