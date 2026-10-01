@@ -2,6 +2,87 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compile_opts` recompiles every regexp pattern from scratch on every row — baseline — 2026-10-01
+
+**Why this workload**: v1.26-v1.39 added ten new versions' worth of
+planner/executor generality (LATERAL, SRF fan-out, ordered-set
+aggregates, SQL function bodies, IMMUTABLE constant folding, bit-string
+literals, data-modifying CTEs, …) since the last profiling-focused Bolt
+round (v1.25, 2026-09-29), none of it re-profiled since. `benches/
+profile_regexp.py --rows 2000 --count 20 --timeout 600` (existing
+driver, unchanged) sends 20 exact iterations of `SELECT
+regexp_replace(s, '[0-9]+', '#', 'g'), regexp_like(s, '[0-9]{3,}'),
+regexp_count(s, '[0-9]+') FROM bench_re` — three regexp functions
+(replace/match/count), two distinct literal patterns, over 2,000 text
+rows — over the real wire protocol against a debug build. This re-uses
+the same workload a prior round (`Compiled::find_at` scratch-buffer
+reuse, 2026-09-19) profiled, chosen again because regexp functions are
+common in real text-cleaning/validation queries and the per-row
+evaluation path underneath them (`eval_func` → `eval_func_vals` →
+`eval_str_func`) is exactly the kind of path the v1.26-v1.39 features
+layered more logic onto.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_regexp.py --rows 2000 --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,24p'   # PROGRAM TOTALS Ir
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.39, commit
+`2d2e4ea`): **9,465,290,559** total `Ir`. The flat self-cost list is
+dominated by the regex *matching* VM itself (`Compiled::run` 4.49%,
+`Compiled::find_at` 2.50%, `CharClass::matches` 1.43% + its closure
+0.80%, `backtrack` 0.80%) and by generic `Vec<char>`/UTF-8 machinery
+used both during matching and during compilation (`str::eq` variants,
+`memcpy`, `malloc`/`free`, `Vec<char>::extend_desugared`,
+`chunks_exact`, `split_at_unchecked`) — none of which, by flat self-cost
+alone, points at any single row-independent target: `compile_opts` and
+its `Parser::*`/`Compiler::*` callees sum to only ~2.0% of total `Ir` by
+self-cost, under the 5%-of-profile floor on an instruction-count basis
+by itself.
+
+The DHAT allocation profile tells a different story. Every one of the 14
+`crate::regex::compile_opts`/`compile` call sites in `src/exec.rs`
+compiles its pattern argument from scratch on *every row* — even though
+`'[0-9]+'` and `'[0-9]{3,}'` are `Expr::Literal` string constants that
+never change across all 2,000 rows × 20 iterations × (up to 2 calls
+sharing `'[0-9]+'`) = up to 80,000 full parse+codegen cycles of two
+distinct patterns. Attributing DHAT's per-allocation-site call stacks to
+frames that can only appear on the compile path (`regex::Parser::*`,
+`regex::Compiler::*`, `regex::compile_opts` itself — as opposed to
+`regex::Compiled::{run,find_at,is_match}`, which is pattern-independent
+*matching*, not compilation) shows the compile path responsible for
+**37.57%** of this workload's total bytes allocated (136,000,000 /
+361,987,577) and **33.19%** of total allocation blocks (1,360,000 /
+4,097,966) — comfortably clearing the ≥10%-of-allocations floor on its
+own, independent of the Ir number.
+
+**Hypothesis**: `compile_opts`'s result depends only on its two
+arguments (`pattern`, `opts`) — nothing about the row being evaluated,
+the statement, or the connection's state. A cache keyed on those two
+arguments removes the re-parse + re-codegen for every row after the
+first that uses a given `(pattern, opts)` pair, collapsing up to 80,000
+full compiles in this workload down to 2 (one per distinct pattern) —
+the same "pure function of its own arguments, so memoize it" shape as
+this repo's existing `Q::immutable_fn_cache` (v1.36) and `hashed_in`
+cache (v0.80, fixed 2026-09-29), except global to the connection rather
+than scoped to one statement, since a compiled pattern is reusable
+across statements too and `eval_str_func`/`eval_func_vals` are
+deliberately pure functions with no access to per-statement state like
+`Q`.
+
+`cargo test --all-features`: 686/686 passed (pre-change tree,
+unmodified).
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.regexcache-{base,after}-2026-10-01`.
+
 ## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — fix — 2026-09-29
 
 Fixes the target identified in the baseline entry immediately below this
