@@ -10469,9 +10469,280 @@ fn pg_expr_text_or_debug(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> String {
     pg_expr_text(e, pctx, qualify).unwrap_or_else(|| format!("{:?}", e))
 }
 
+// ---------------------------------------------------------------------------
+// v1.57: const-folding of IN-list items + coercion-aware IN-LHS deparse.
+// ---------------------------------------------------------------------------
+
+/// v1.57: sentinel `written` marker for synthesized implicit-coercion
+/// casts (see `pg_rewrite_coercions`). A NUL byte cannot appear in real
+/// SQL text, so this never collides with a user-written cast.
+const PG_SYNTH_COERCE_WRITTEN: &str = "\u{0}pg-coerce";
+
+/// v1.57: declared argument types and result type of the immutable float8
+/// builtins understood by the IN-list machinery. Grounded in pg_proc.dat
+/// (proargtypes/prorettype; provolatile defaults to immutable for these).
+fn pg_math_builtin_sig(name: &str) -> Option<(&'static [ColType], ColType)> {
+    const F8: &[ColType] = &[ColType::Float];
+    const F8F8: &[ColType] = &[ColType::Float, ColType::Float];
+    match name {
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" | "exp" | "ln" | "sqrt" | "cbrt" => Some((F8, ColType::Float)),
+        "atan2" => Some((F8F8, ColType::Float)),
+        _ => None,
+    }
+}
+
+/// v1.57: PG19 has native cross-type operators for all int2/int4/int8
+/// pairs and for (float4,float8) — for `=`, `+`, `-`, `*`, `/`
+/// (pg_operator.dat: int48eq, float48eq, int24pl, ...). No coercion is
+/// inserted for these pairs, so no cast deparses.
+fn pg_native_binop_pair(a: ColType, b: ColType) -> bool {
+    use ColType::*;
+    if a == b {
+        return true;
+    }
+    let int = |t: &ColType| matches!(t, SmallInt | Int | BigInt);
+    if int(&a) && int(&b) {
+        return true;
+    }
+    matches!((&a, &b), (Float4, Float) | (Float, Float4))
+}
+
+/// v1.57: exact f64 value of a constant literal, mirroring PG19's parser
+/// coercion of the literal to float8 before an immutable builtin is
+/// const-folded: correctly-rounded decimal parse; int64->float8 is exact
+/// below 2^53 and round-to-nearest above (like PG's C cast).
+fn pg_literal_to_f64(lit: &Literal) -> Option<f64> {
+    match lit {
+        Literal::Int(i) | Literal::BigInt(i) => Some(*i as f64),
+        Literal::SmallInt(i) => Some(f64::from(*i)),
+        Literal::Float(f) => Some(*f),
+        Literal::Real(r) => Some(f64::from(*r)),
+        Literal::Decimal(s) => s.parse::<f64>().ok(),
+        Literal::Text(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// v1.57: intrinsic type of a constant literal. Unknown-type text and
+/// untyped NULL fail closed (their type comes from context).
+fn pg_literal_col_type(lit: &Literal) -> Option<ColType> {
+    match lit {
+        Literal::SmallInt(_) => Some(ColType::SmallInt),
+        Literal::Int(_) => Some(ColType::Int),
+        Literal::BigInt(_) => Some(ColType::BigInt),
+        Literal::Float(_) => Some(ColType::Float),
+        Literal::Real(_) => Some(ColType::Float4),
+        Literal::Decimal(_) => Some(ColType::Numeric(None)),
+        Literal::Bool(_) => Some(ColType::Bool),
+        _ => None,
+    }
+}
+
+/// v1.57: fold `CAST(lit AS to)` over an already-folded literal. Only
+/// PG-agreeing exact casts: NULL (folds to a null of the target type; the
+/// array element prints bare NULL either way), unknown->text (no-op),
+/// exact int->float8 widening, and decimal->float8 (correctly rounded,
+/// like PG's numeric_float8). Anything else fails closed.
+fn pg_cast_const_literal(lit: &Literal, to: ColType) -> Option<Literal> {
+    if matches!(lit, Literal::Null) {
+        return Some(Literal::Null);
+    }
+    match (lit, to) {
+        (Literal::Text(_), ColType::Text) => Some(lit.clone()),
+        (Literal::Int(i) | Literal::BigInt(i), ColType::Float) if i.unsigned_abs() < (1 << 53) => {
+            Some(Literal::Float(*i as f64))
+        }
+        (Literal::SmallInt(i), ColType::Float) => Some(Literal::Float(f64::from(*i))),
+        (Literal::Real(r), ColType::Float) => Some(Literal::Float(f64::from(*r))),
+        (Literal::Decimal(s), ColType::Float) => s.parse::<f64>().ok().map(Literal::Float),
+        _ => {
+            if pg_literal_col_type(lit) == Some(to) {
+                Some(lit.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// v1.57: fold a constant IN-list item to a `Literal`, mirroring PG19
+/// `eval_const_expressions`/`evaluate_function` (clauses.c) for immutable
+/// builtins on constant arguments:
+/// - strict + constant-NULL input -> NULL (PG folds this even for
+///   non-immutable functions; ours are strict),
+/// - all-constant inputs + immutable -> evaluate,
+/// - anything else -> None (fail closed; the OR form is kept).
+///
+/// Only `sin`/`cos`/`tan` are evaluated: they are total on finite float8
+/// inputs (PG's dsin/dcos/dtan raise only on infinite input or overflow,
+/// neither reachable from a finite literal), so the fold cannot disagree
+/// with PG. Domain-checked builtins (asin/acos/exp/ln/...) stay unfolded.
+fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
+    match e {
+        Expr::Literal(lit) => Some(lit.clone()),
+        Expr::Func { name, args } => {
+            let f: fn(f64) -> f64 = match name.to_ascii_lowercase().as_str() {
+                "sin" => f64::sin,
+                "cos" => f64::cos,
+                "tan" => f64::tan,
+                _ => return None,
+            };
+            if args.len() != 1 {
+                return None;
+            }
+            let arg = pg_fold_const_item(&args[0])?;
+            if matches!(arg, Literal::Null) {
+                return Some(Literal::Null);
+            }
+            let x = pg_literal_to_f64(&arg)?;
+            // PG raises on infinite input; NaN has no faithful array
+            // spelling here — fail closed on both (no corpus coverage).
+            if !x.is_finite() {
+                return None;
+            }
+            let y = f(x);
+            if !y.is_finite() {
+                return None;
+            }
+            Some(Literal::Float(y))
+        }
+        Expr::Cast { expr, to, .. } => {
+            let lit = pg_fold_const_item(expr)?;
+            pg_cast_const_literal(&lit, *to)
+        }
+        _ => None,
+    }
+}
+
+/// v1.57: infer the intrinsic type of an IN-list LHS expression without an
+/// Engine (deparse path only). Arithmetic uses the executor's numeric
+/// lattice (smallint < integer < bigint < numeric < real < double
+/// precision), which agrees with PG's operator resolution for `+ - * /`
+/// (native cross-type int/float operators resolve to the wider type).
+/// None = unknowable -> the caller fails closed.
+fn pg_infer_type(e: &Expr, pctx: &PgPlanCtx) -> Option<ColType> {
+    match e {
+        Expr::Column { table, name } => pctx.col_type(table.as_deref(), name),
+        Expr::Literal(lit) => pg_literal_col_type(lit),
+        Expr::Cast { to, .. } => Some(*to),
+        Expr::Func { name, args } => {
+            let (arg_tys, ret) = pg_math_builtin_sig(&name.to_ascii_lowercase())?;
+            if args.len() == arg_tys.len() {
+                Some(ret)
+            } else {
+                None
+            }
+        }
+        Expr::Arith { op, left, right } => {
+            if !matches!(
+                op,
+                ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div
+            ) {
+                return None;
+            }
+            let l = pg_infer_type(left, pctx)?;
+            let r = pg_infer_type(right, pctx)?;
+            Some(rank_type(numeric_rank(&l)?.max(numeric_rank(&r)?)))
+        }
+        _ => None,
+    }
+}
+
+/// v1.57: insert explicit `Cast` nodes where PG19's parser would have put
+/// implicit coercions, so the existing `pg_expr_text` Cast arm renders
+/// PG's `(arg)::type` deparse (ruleutils.c `get_coercion_expr`, shown
+/// because ScalarArrayOpExpr deparse uses showimplicit=true). Handles the
+/// shapes an IN-list LHS can take: immutable float8 builtins (argument
+/// coercion) and `+ - * /` (operand coercion to the common type, except
+/// where PG has a native cross-type operator). None = fail closed.
+fn pg_rewrite_coercions(e: &Expr, pctx: &PgPlanCtx) -> Option<Expr> {
+    match e {
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => Some(e.clone()),
+        // Explicit casts already deparse faithfully; leave them alone.
+        Expr::Cast { .. } => Some(e.clone()),
+        Expr::Func { name, args } => {
+            let (arg_tys, _) = pg_math_builtin_sig(&name.to_ascii_lowercase())?;
+            if args.len() != arg_tys.len() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(args.len());
+            for (a, want) in args.iter().zip(arg_tys.iter()) {
+                let rw = pg_rewrite_coercions(a, pctx)?;
+                let got = pg_infer_type(a, pctx)?;
+                out.push(if got == *want || pg_native_binop_pair(got, *want) {
+                    rw
+                } else {
+                    // Implicit upcast (pg_cast.dat): PG inserts a FuncExpr
+                    // coercion, shown with showimplicit=true. A
+                    // downcast/uncastable type means PG would reject the
+                    // expression — fail closed.
+                    let gr = numeric_rank(&got)?;
+                    let wr = numeric_rank(want)?;
+                    if gr >= wr {
+                        return None;
+                    }
+                    Expr::Cast {
+                        expr: Box::new(rw),
+                        to: *want,
+                        written: Some(PG_SYNTH_COERCE_WRITTEN.to_string()),
+                    }
+                });
+            }
+            Some(Expr::Func {
+                name: name.clone(),
+                args: out,
+            })
+        }
+        Expr::Arith { op, left, right } => {
+            if !matches!(
+                op,
+                ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div
+            ) {
+                return None;
+            }
+            let rw_l = pg_rewrite_coercions(left, pctx)?;
+            let rw_r = pg_rewrite_coercions(right, pctx)?;
+            let tl = pg_infer_type(left, pctx)?;
+            let tr = pg_infer_type(right, pctx)?;
+            if pg_native_binop_pair(tl, tr) {
+                // PG uses the native cross-type operator; no coercion.
+                return Some(Expr::Arith {
+                    op: *op,
+                    left: Box::new(rw_l),
+                    right: Box::new(rw_r),
+                });
+            }
+            let common = rank_type(numeric_rank(&tl)?.max(numeric_rank(&tr)?));
+            let cr = numeric_rank(&common)?;
+            let wrap = |rw: Expr, got: ColType| -> Option<Expr> {
+                let gr = numeric_rank(&got)?;
+                if gr == cr {
+                    Some(rw)
+                } else if gr < cr {
+                    Some(Expr::Cast {
+                        expr: Box::new(rw),
+                        to: common,
+                        written: Some(PG_SYNTH_COERCE_WRITTEN.to_string()),
+                    })
+                } else {
+                    // Unreachable (common is the max rank); fail closed.
+                    None
+                }
+            };
+            Some(Expr::Arith {
+                op: *op,
+                left: Box::new(wrap(rw_l, tl)?),
+                right: Box::new(wrap(rw_r, tr)?),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// v1.56: recognize our parser's `x IN (v1, v2, ...)` desugar (a left-deep
 /// `Or` tree of `=` comparisons against one structurally-equal LHS with
-/// literal RHS items) and render PG19's `x = ANY ('{...}'::elemtype[])`
+/// constant RHS items) and render PG19's `x = ANY ('{...}'::elemtype[])`
 /// form. Returns `None` for anything that isn't faithfully an IN-list
 /// (fail closed → the OR form is kept).
 ///
@@ -10480,12 +10751,19 @@ fn pg_expr_text_or_debug(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> String {
 ///   when there are >1 non-Var RHS items; single-item IN stays `x = a`,
 ///   and Var-containing items are ORed on separately (so every folded
 ///   item must be Var-free — literals always are).
+/// - v1.57: constant items are folded per `eval_const_expressions`
+///   (clauses.c) / `evaluate_function`: immutable builtins on constant
+///   args (`sin(0.5)` -> `0.479425538604203`) before the array is built.
 /// - The array element type prefers the LHS type when the RHS items are
 ///   unknown-type literals (`select_common_type` with lexpr first).
 /// - EXPLAIN deparse: `(lhs = ANY (array))` (ruleutils.c
-///   `T_ScalarArrayOpExpr`, not-pretty mode); the constant array prints
-///   via `array_out` + `simple_quote_literal` + `::elemtype[]`
-///   (`get_const_expr`).
+///   `T_ScalarArrayOpExpr`, not-pretty mode, showimplicit=true); the
+///   constant array prints via `array_out` + `simple_quote_literal` +
+///   `::elemtype[]` (`get_const_expr`). Parser-inserted coercions on the
+///   left arg deparse as casts (`get_coercion_expr`), except where PG has
+///   a native cross-type operator (all int2/int4/int8 pairs and
+///   float4/float8 for `=`/`+`/`-`/`*`/`/` — pg_operator.dat), in which
+///   case no coercion exists and none deparses.
 ///
 /// Known limitation: a hand-written `x = v1 OR x = v2` (not via IN) has
 /// the same shape and folds too; PG would deparse the OR form. No
@@ -10513,7 +10791,7 @@ fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
         return None;
     }
     let mut lhs: Option<&Expr> = None;
-    let mut items: Vec<&Literal> = Vec::with_capacity(rev.len());
+    let mut items: Vec<Literal> = Vec::with_capacity(rev.len());
     for d in &rev {
         let Expr::Cmp {
             op: CmpOp::Eq,
@@ -10528,18 +10806,21 @@ fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
             Some(l) if l == left.as_ref() => {}
             _ => return None,
         }
-        // Only Var-free (literal) items join the array — mirrors PG's
-        // rnonvars partition (Vars are ORed on separately).
-        let Expr::Literal(lit) = right.as_ref() else {
-            return None;
-        };
-        items.push(lit);
+        // v1.57: items join the array when constant — literals directly,
+        // or immutable builtins on constants (PG19 eval_const_expressions
+        // folds these before planning). Mirrors PG's rnonvars partition:
+        // Var-containing (non-constant) items are ORed on separately, so
+        // one kills the whole fold (fail closed).
+        items.push(pg_fold_const_item(right.as_ref())?);
     }
     let lhs = lhs?;
     // Element type: PG prefers the LHS type for unknown literals.
     let mut elem_ty: ColType = match lhs {
         Expr::Cast { to, .. } => *to,
         Expr::Column { table, name } => pctx.col_type(table.as_deref(), name)?,
+        // v1.57: a computed LHS (e.g. `sin(two)+four`) — PG's lexpr has a
+        // real type; infer it. Uninferable -> fail closed.
+        Expr::Arith { .. } | Expr::Func { .. } => pg_infer_type(lhs, pctx)?,
         _ => return None,
     };
     // PG19 select_common_type: an item type the LHS type coerces to
@@ -10583,7 +10864,25 @@ fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
             let inner = pg_expr_text(expr, pctx, qualify)?;
             format!("({inner})::{label}")
         }
-        _ => pg_expr_text(lhs, pctx, qualify)?,
+        _ => {
+            // v1.57: PG deparses the ScalarArrayOpExpr's left arg with
+            // showimplicit=true (ruleutils.c T_ScalarArrayOpExpr), so
+            // parser-inserted coercions appear as casts: re-insert them
+            // as explicit Casts, then render. A native cross-type `=`
+            // operator (all int2/int4/int8 pairs, float4/float8 —
+            // pg_operator.dat) needs no coercion, so no cast deparses
+            // (e.g. `(unique1 = ANY ('{1200,1}'::bigint[]))`).
+            let rewritten = pg_rewrite_coercions(lhs, pctx)?;
+            let lhs_ty = pg_infer_type(lhs, pctx)?;
+            let inner = pg_expr_text(&rewritten, pctx, qualify)?;
+            if lhs_ty == elem_ty || pg_native_binop_pair(lhs_ty, elem_ty) {
+                inner
+            } else {
+                // Unreachable for Column/Arith/Func LHS (the element type
+                // derives from the LHS type); fail closed if ever hit.
+                return None;
+            }
+        }
     };
     Some(format!(
         "({lhs_text} = ANY ({}::{label}))",
@@ -10880,8 +11179,15 @@ fn pg_expr_target(
             pg_expr_text(a, pctx, qualify)?,
             pg_expr_text(b, pctx, qualify)?
         )),
-        Expr::Cast { expr, to, .. } => {
+        Expr::Cast { expr, to, written } => {
             let label = pg_type_label(*to)?;
+            // v1.57: synthesized implicit-coercion casts (see
+            // pg_rewrite_coercions) render PG19's get_coercion_expr form
+            // `(arg)::type` — parens around the argument, not the cast.
+            if written.as_deref() == Some(PG_SYNTH_COERCE_WRITTEN) {
+                let inner = pg_expr_text(expr, pctx, qualify)?;
+                return Some(format!("({inner})::{label}"));
+            }
             // v1.50: for `'literal'::type`, deparse the literal as a plain
             // quoted string (not coerced) to avoid `::text::text` doubling.
             let inner = match &**expr {
@@ -69773,5 +70079,294 @@ mod v156_in_any_tests {
             }
             other => panic!("expected Or, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // v1.57: const-folding of IN-list items + coercion-aware LHS deparse.
+    // ------------------------------------------------------------------
+
+    fn dec(s: &str) -> Expr {
+        Expr::Literal(Literal::Decimal(s.to_string()))
+    }
+
+    fn func(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Func {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    /// v1.57: sin(0.5) folds to PG's float8 value, bit-exact
+    /// (f64::sin is correctly rounded here; verified 2026-10-01).
+    #[test]
+    fn v157_fold_sin_const() {
+        assert_eq!(
+            pg_fold_const_item(&func("sin", vec![dec("0.5")])),
+            Some(Literal::Float(0.479425538604203))
+        );
+    }
+
+    /// v1.57: cos/tan fold; builtin name matching is case-insensitive.
+    #[test]
+    fn v157_fold_cos_tan_const() {
+        assert_eq!(
+            pg_fold_const_item(&func("cos", vec![dec("0.5")])),
+            Some(Literal::Float(0.8775825618903728))
+        );
+        assert_eq!(
+            pg_fold_const_item(&func("COS", vec![dec("0.5")])),
+            Some(Literal::Float(0.8775825618903728))
+        );
+        assert_eq!(
+            pg_fold_const_item(&func("tan", vec![dec("0.5")])),
+            Some(Literal::Float(0.5463024898437905))
+        );
+    }
+
+    /// v1.57: strictness — sin(NULL) folds to NULL (PG evaluate_function).
+    #[test]
+    fn v157_fold_sin_null_strict() {
+        assert_eq!(
+            pg_fold_const_item(&func("sin", vec![Expr::Literal(Literal::Null)])),
+            Some(Literal::Null)
+        );
+    }
+
+    /// v1.57: non-constant arguments don't fold.
+    #[test]
+    fn v157_fold_sin_column_no_fold() {
+        assert_eq!(pg_fold_const_item(&func("sin", vec![col("two")])), None);
+    }
+
+    /// v1.57: unknown builtins, wrong arity, domain-unsafe builtins, and
+    /// non-finite inputs don't fold (fail closed).
+    #[test]
+    fn v157_fold_no_fold_cases() {
+        assert_eq!(pg_fold_const_item(&func("foobar", vec![dec("0.5")])), None);
+        assert_eq!(pg_fold_const_item(&func("now", vec![])), None);
+        // asin is immutable but domain-checked (|x|>1 raises in PG);
+        // conservatively unfolded.
+        assert_eq!(pg_fold_const_item(&func("asin", vec![dec("0.5")])), None);
+        assert_eq!(
+            pg_fold_const_item(&func("sin", vec![dec("0.5"), dec("0.5")])),
+            None
+        );
+        // Infinite input: PG's dsin raises.
+        assert_eq!(
+            pg_fold_const_item(&func(
+                "sin",
+                vec![Expr::Literal(Literal::Float(f64::INFINITY))]
+            )),
+            None
+        );
+        // NaN input: no faithful array spelling; fail closed.
+        assert_eq!(
+            pg_fold_const_item(&func(
+                "sin",
+                vec![Expr::Literal(Literal::Float(f64::NAN))]
+            )),
+            None
+        );
+    }
+
+    /// v1.57: CAST folding — exact casts only.
+    #[test]
+    fn v157_fold_cast_cases() {
+        let cast = |e: Expr, to: ColType| Expr::Cast {
+            expr: Box::new(e),
+            to,
+            written: None,
+        };
+        assert_eq!(
+            pg_fold_const_item(&cast(int(2), ColType::Int)),
+            Some(Literal::Int(2))
+        );
+        assert_eq!(
+            pg_fold_const_item(&cast(int(2), ColType::Float)),
+            Some(Literal::Float(2.0))
+        );
+        // |i| >= 2^53: int8->float8 rounds in PG too — fail closed.
+        assert_eq!(
+            pg_fold_const_item(&cast(
+                Expr::Literal(Literal::Int(1i64 << 53)),
+                ColType::Float
+            )),
+            None
+        );
+        // decimal -> float8 (correctly rounded, like numeric_float8).
+        assert_eq!(
+            pg_fold_const_item(&cast(dec("0.5"), ColType::Float)),
+            Some(Literal::Float(0.5))
+        );
+        // int -> text: no faithful fold.
+        assert_eq!(pg_fold_const_item(&cast(int(2), ColType::Text)), None);
+        // NULL -> anything: NULL.
+        assert_eq!(
+            pg_fold_const_item(&cast(Expr::Literal(Literal::Null), ColType::Float)),
+            Some(Literal::Null)
+        );
+    }
+
+    /// v1.57: LHS type inference.
+    #[test]
+    fn v157_infer_type_cases() {
+        let ctx = pctx(vec![
+            ("two", ColType::Int),
+            ("four", ColType::Int),
+            ("f", ColType::Float),
+        ]);
+        assert_eq!(pg_infer_type(&col("two"), &ctx), Some(ColType::Int));
+        assert_eq!(
+            pg_infer_type(&func("sin", vec![col("two")]), &ctx),
+            Some(ColType::Float)
+        );
+        // float8 + int -> float8 (numeric lattice max rank).
+        let e = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(func("sin", vec![col("two")])),
+            right: Box::new(col("four")),
+        };
+        assert_eq!(pg_infer_type(&e, &ctx), Some(ColType::Float));
+        // int + int -> int (native cross-type operator, wider wins).
+        let e = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(col("two")),
+            right: Box::new(col("four")),
+        };
+        assert_eq!(pg_infer_type(&e, &ctx), Some(ColType::Int));
+        // Unknown builtin -> None.
+        assert_eq!(pg_infer_type(&func("foobar", vec![col("two")]), &ctx), None);
+        // % is not handled -> None.
+        let e = Expr::Arith {
+            op: ArithOp::Mod,
+            left: Box::new(col("two")),
+            right: Box::new(col("four")),
+        };
+        assert_eq!(pg_infer_type(&e, &ctx), None);
+    }
+
+    /// v1.57: coercion rewrite inserts PG's implicit casts for the
+    /// `sin(two)+four` LHS; the existing Cast arm renders `(x)::type`.
+    #[test]
+    fn v157_rewrite_coercions_sin_plus() {
+        let ctx = pctx(vec![("two", ColType::Int), ("four", ColType::Int)]);
+        let e = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(func("sin", vec![col("two")])),
+            right: Box::new(col("four")),
+        };
+        let rw = pg_rewrite_coercions(&e, &ctx).unwrap();
+        assert_eq!(
+            pg_expr_text(&rw, &ctx, false).unwrap(),
+            "(sin((two)::double precision) + (four)::double precision)"
+        );
+    }
+
+    /// v1.57: native cross-type int operators get no casts.
+    #[test]
+    fn v157_rewrite_coercions_int_pair_no_cast() {
+        let ctx = pctx(vec![("a", ColType::SmallInt), ("b", ColType::Int)]);
+        let e = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(col("a")),
+            right: Box::new(col("b")),
+        };
+        let rw = pg_rewrite_coercions(&e, &ctx).unwrap();
+        assert_eq!(pg_expr_text(&rw, &ctx, false).unwrap(), "(a + b)");
+    }
+
+    /// v1.57: end-to-end — subselect L3393 shape folds to PG's exact text.
+    #[test]
+    fn v157_fold_in_any_sin_items() {
+        let ctx = pctx(vec![("two", ColType::Int), ("four", ColType::Int)]);
+        let lhs = || Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(func("sin", vec![col("two")])),
+            right: Box::new(col("four")),
+        };
+        let e = or(eq(lhs(), func("sin", vec![dec("0.5")])), eq(lhs(), int(2)));
+        assert_eq!(
+            pg_fold_in_any(&e, &ctx, false).unwrap(),
+            "((sin((two)::double precision) + (four)::double precision) = ANY ('{0.479425538604203,2}'::double precision[]))"
+        );
+    }
+
+    /// v1.57: subselect L3402 shape — NULL item renders bare.
+    #[test]
+    fn v157_fold_in_any_sin_null_item() {
+        let ctx = pctx(vec![("two", ColType::Int), ("four", ColType::Int)]);
+        let lhs = || Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(func("sin", vec![col("two")])),
+            right: Box::new(col("four")),
+        };
+        let e = or(
+            or(
+                eq(lhs(), func("sin", vec![dec("0.5")])),
+                eq(lhs(), Expr::Literal(Literal::Null)),
+            ),
+            eq(lhs(), int(2)),
+        );
+        assert_eq!(
+            pg_fold_in_any(&e, &ctx, false).unwrap(),
+            "((sin((two)::double precision) + (four)::double precision) = ANY ('{0.479425538604203,NULL,2}'::double precision[]))"
+        );
+    }
+
+    /// v1.57: int widening still shows no LHS cast — PG uses its native
+    /// cross-type `=` (int48eq etc.; verified against subselect.out:3355
+    /// `(unique1 = ANY ('{1200,1}'::bigint[]))`).
+    #[test]
+    fn v157_fold_in_any_int_widening_no_lhs_cast() {
+        let ctx = pctx(vec![("unique1", ColType::Int)]);
+        let e = or(
+            eq(col("unique1"), int(1)),
+            eq(
+                col("unique1"),
+                Expr::Literal(Literal::BigInt(3_000_000_000))
+            ),
+        );
+        assert_eq!(
+            pg_fold_in_any(&e, &ctx, false).unwrap(),
+            "(unique1 = ANY ('{1,3000000000}'::bigint[]))"
+        );
+    }
+
+    /// v1.57: a volatile item kills the fold (fail closed, OR form kept).
+    #[test]
+    fn v157_no_fold_volatile_item() {
+        let ctx = pctx(vec![("a", ColType::Float)]);
+        let e = or(
+            eq(col("a"), func("sin", vec![dec("0.5")])),
+            eq(col("a"), func("random", vec![])),
+        );
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.57: a non-constant (Var) item kills the fold.
+    #[test]
+    fn v157_no_fold_var_item() {
+        let ctx = pctx(vec![("a", ColType::Float), ("b", ColType::Float)]);
+        let e = or(
+            eq(col("a"), func("sin", vec![dec("0.5")])),
+            eq(col("a"), col("b")),
+        );
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.57: a computed LHS whose type can't be inferred kills the fold.
+    #[test]
+    fn v157_no_fold_uninferable_lhs() {
+        let ctx = pctx(vec![("a", ColType::Float)]);
+        let lhs = || Expr::Arith {
+            op: ArithOp::Mod,
+            left: Box::new(col("a")),
+            right: Box::new(int(2)),
+        };
+        let e = or(
+            eq(lhs(), func("sin", vec![dec("0.5")])),
+            eq(lhs(), int(2)),
+        );
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
     }
 }
