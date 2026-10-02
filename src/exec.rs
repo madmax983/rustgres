@@ -10469,6 +10469,294 @@ fn pg_expr_text_or_debug(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> String {
     pg_expr_text(e, pctx, qualify).unwrap_or_else(|| format!("{:?}", e))
 }
 
+/// v1.56: recognize our parser's `x IN (v1, v2, ...)` desugar (a left-deep
+/// `Or` tree of `=` comparisons against one structurally-equal LHS with
+/// literal RHS items) and render PG19's `x = ANY ('{...}'::elemtype[])`
+/// form. Returns `None` for anything that isn't faithfully an IN-list
+/// (fail closed → the OR form is kept).
+///
+/// PG19 groundings:
+/// - `transformAExprIn` (parse_expr.c) builds the ScalarArrayOpExpr only
+///   when there are >1 non-Var RHS items; single-item IN stays `x = a`,
+///   and Var-containing items are ORed on separately (so every folded
+///   item must be Var-free — literals always are).
+/// - The array element type prefers the LHS type when the RHS items are
+///   unknown-type literals (`select_common_type` with lexpr first).
+/// - EXPLAIN deparse: `(lhs = ANY (array))` (ruleutils.c
+///   `T_ScalarArrayOpExpr`, not-pretty mode); the constant array prints
+///   via `array_out` + `simple_quote_literal` + `::elemtype[]`
+///   (`get_const_expr`).
+///
+/// Known limitation: a hand-written `x = v1 OR x = v2` (not via IN) has
+/// the same shape and folds too; PG would deparse the OR form. No
+/// conformance statement has that shape (verified 2026-10-01).
+fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
+    // Flatten the left-deep Or spine the parser builds, back into source
+    // order. Anything right-nested fails the Cmp check below.
+    let mut rev: Vec<&Expr> = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::Or(a, b) => {
+                rev.push(b);
+                cur = a;
+            }
+            _ => {
+                rev.push(cur);
+                break;
+            }
+        }
+    }
+    rev.reverse();
+    // PG only builds the array form for >1 items.
+    if rev.len() < 2 {
+        return None;
+    }
+    let mut lhs: Option<&Expr> = None;
+    let mut items: Vec<&Literal> = Vec::with_capacity(rev.len());
+    for d in &rev {
+        let Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } = d
+        else {
+            return None;
+        };
+        match lhs {
+            None => lhs = Some(left),
+            Some(l) if l == left.as_ref() => {}
+            _ => return None,
+        }
+        // Only Var-free (literal) items join the array — mirrors PG's
+        // rnonvars partition (Vars are ORed on separately).
+        let Expr::Literal(lit) = right.as_ref() else {
+            return None;
+        };
+        items.push(lit);
+    }
+    let lhs = lhs?;
+    // Element type: PG prefers the LHS type for unknown literals.
+    let mut elem_ty: ColType = match lhs {
+        Expr::Cast { to, .. } => *to,
+        Expr::Column { table, name } => pctx.col_type(table.as_deref(), name)?,
+        _ => return None,
+    };
+    // PG19 select_common_type: an item type the LHS type coerces to
+    // implicitly (but not vice versa) wins. In the integer hierarchy
+    // (int2 -> int4 -> int8 are implicit upcasts) that widens the
+    // element type to the widest int kind present, e.g. `intcol IN
+    // (1, 3000000000)` deparses as `bigint[]`.
+    if let Some(mut rank) = pg_int_kind_rank(elem_ty) {
+        for lit in &items {
+            let lr = match lit {
+                Literal::SmallInt(_) => 0,
+                Literal::Int(_) => 1,
+                Literal::BigInt(_) => 2,
+                _ => continue,
+            };
+            if lr > rank {
+                rank = lr;
+            }
+        }
+        elem_ty = match rank {
+            0 => ColType::SmallInt,
+            1 => ColType::Int,
+            _ => ColType::BigInt,
+        };
+    }
+    let label = pg_any_array_label(elem_ty)?;
+    let mut arr = String::from("{");
+    for (i, lit) in items.iter().enumerate() {
+        if i > 0 {
+            arr.push(',');
+        }
+        arr.push_str(&pg_array_elem_text(lit, elem_ty)?);
+    }
+    arr.push('}');
+    let lhs_text = match lhs {
+        // PG deparses an explicit coercion as `(arg)::type` (ruleutils.c
+        // get_coercion_expr: parens around the argument, then `::type`),
+        // e.g. `((stringu1)::text = ANY (...))`.
+        Expr::Cast { expr, to, .. } => {
+            let label = pg_type_label(*to)?;
+            let inner = pg_expr_text(expr, pctx, qualify)?;
+            format!("({inner})::{label}")
+        }
+        _ => pg_expr_text(lhs, pctx, qualify)?,
+    };
+    Some(format!(
+        "({lhs_text} = ANY ({}::{label}))",
+        pg_quote_literal(&arr)
+    ))
+}
+
+/// v1.56: rank within PG's implicit-upcast integer hierarchy
+/// int2 -> int4 -> int8, for the IN-list element-type widening.
+fn pg_int_kind_rank(t: ColType) -> Option<u8> {
+    match t {
+        ColType::SmallInt => Some(0),
+        ColType::Int => Some(1),
+        ColType::BigInt => Some(2),
+        _ => None,
+    }
+}
+
+/// v1.56: true for plain `digits[.digits]` spellings, which PG19
+/// numeric_out reproduces exactly (other spellings get normalized).
+fn pg_is_plain_decimal(s: &str) -> bool {
+    let t = s.trim();
+    let mut parts = t.split('.');
+    let int_ok = parts
+        .next()
+        .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let frac_ok = match parts.next() {
+        None => true,
+        Some(p) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
+    };
+    int_ok && frac_ok && parts.next().is_none()
+}
+
+/// v1.56: render one IN-list item like PG19 `array_out` prints an array
+/// element of type `elem`: the type's output function, then `array_out`'s
+/// quoting rules (empty string and case-insensitive "null" are quoted;
+/// `"`, `\`, `{`, `}`, the delimiter `,` and whitespace force quotes
+/// with `\`-escapes; NULL prints bare). `None` = the literal cannot be
+/// an element of an `elem`-typed array (fail closed).
+fn pg_array_elem_text(lit: &Literal, elem: ColType) -> Option<String> {
+    match lit {
+        Literal::Null => Some("NULL".to_string()),
+        Literal::Text(s) => {
+            let s = s.as_ref();
+            match elem {
+                // Character types: the unknown literal is coerced with
+                // typmod -1 (coerce_to_common_type), so no blank-padding
+                // or truncation applies; the raw text is the element.
+                // (Name/SingleChar are deliberately excluded: namein
+                // silently truncates to 63 bytes and charin takes one
+                // byte — no corpus coverage, fail closed.)
+                ColType::Text | ColType::Char(_) | ColType::Varchar(_) => {
+                    Some(pg_array_quote_elem(s))
+                }
+                // PG19 coerces unknown literals to the common type; the
+                // element then prints via the type's output function.
+                ColType::Int | ColType::BigInt | ColType::SmallInt => {
+                    let v: i64 = s.trim().parse().ok()?;
+                    Some(v.to_string())
+                }
+                // Text -> float8/float4 is deliberately unhandled: PG's
+                // float8out switches to scientific notation at extreme
+                // magnitudes and our pg_float_text approximation doesn't
+                // reproduce those thresholds — fail closed (no corpus
+                // coverage, so these stay EF either way).
+                // numeric_out preserves plain `digits[.digits]` spellings;
+                // anything else fails closed (numeric_out normalizes it).
+                ColType::Numeric(_) if pg_is_plain_decimal(s) => Some(s.trim().to_string()),
+                ColType::Bool => match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" => Some("t".to_string()),
+                    "false" | "f" | "0" => Some("f".to_string()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Literal::Int(i) | Literal::BigInt(i) => match elem {
+            ColType::Int | ColType::BigInt | ColType::SmallInt => Some(i.to_string()),
+            // int coerced to numeric: numeric_out(i) is plain digits.
+            ColType::Numeric(_) => Some(i.to_string()),
+            // int coerced to float8/float4: float8out(i). PG switches to
+            // scientific notation at 1e15 (d2s.c: "we switch to scientific
+            // notation when the display exponent reaches 15"); below that
+            // both PG and Rust print plain digits.
+            ColType::Float | ColType::Float4 if i.unsigned_abs() < 1_000_000_000_000_000 => {
+                Some(i.to_string())
+            }
+            _ => None,
+        },
+        Literal::SmallInt(i) => match elem {
+            ColType::SmallInt | ColType::Int | ColType::BigInt => Some(i.to_string()),
+            _ => None,
+        },
+        // float8out shortest round-trip (same approximation as the
+        // scalar const path).
+        Literal::Float(f) => match elem {
+            ColType::Float => Some(pg_float_text(*f)),
+            _ => None,
+        },
+        Literal::Real(f) => match elem {
+            ColType::Float4 => Some(pg_float_text(f64::from(*f))),
+            _ => None,
+        },
+        // Numeric items: numeric_out reproduces plain `digits[.digits]`
+        // spellings exactly; anything else (exponents, `.5`, `5.`) fails
+        // closed since numeric_out normalizes them.
+        Literal::Decimal(s) => match elem {
+            ColType::Numeric(_) if pg_is_plain_decimal(s.as_ref()) => Some(s.to_string()),
+            _ => None,
+        },
+        Literal::Bool(b) => match elem {
+            ColType::Bool => Some(if *b { "t" } else { "f" }.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// v1.56: PG19 `array_out` element quoting: double-quote when the element
+/// is empty, case-insensitively "null", or contains `"`, `\`, `{`, `}`,
+/// `,` or whitespace (PG's `scanner_isspace`); `"` and `\` are
+/// backslash-escaped inside the quotes.
+fn pg_array_quote_elem(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\\' | '{' | '}' | ',' | ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B'
+            )
+        });
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// v1.56: the `::elemtype[]` label for an IN-list array constant.
+/// Typmods are dropped — PG's `format_type_with_typemod` on the array
+/// type shows the bare element name (`character[]`, `numeric[]`).
+fn pg_any_array_label(elem: ColType) -> Option<String> {
+    let e = match elem {
+        ColType::Int => "integer",
+        ColType::BigInt => "bigint",
+        ColType::SmallInt => "smallint",
+        ColType::Float => "double precision",
+        ColType::Float4 => "real",
+        ColType::Numeric(_) => "numeric",
+        ColType::Text => "text",
+        ColType::Name => "name",
+        ColType::Char(_) => "character",
+        ColType::Varchar(_) => "character varying",
+        ColType::SingleChar => "\"char\"",
+        ColType::Bool => "boolean",
+        ColType::Date => "date",
+        ColType::Timestamp => "timestamp without time zone",
+        ColType::Timestamptz => "timestamp with time zone",
+        ColType::Bytea => "bytea",
+        ColType::Uuid => "uuid",
+        _ => return None,
+    };
+    Some(format!("{e}[]"))
+}
+
 /// `pg_expr_text` with a coercion target for a top-level untyped string
 /// literal (used for comparison operands).
 fn pg_expr_target(
@@ -10492,16 +10780,23 @@ fn pg_expr_target(
             // Untyped string literal takes the other side's column type
             // (PG19 parser coercion of unknown-type literals). The target
             // goes to the LITERAL side, not the column side.
+            // v1.56: also when the other side is a Cast-wrapped column
+            // (e.g. `stringu1::text = 'RFAAAA'`), whose target is the
+            // cast's type. Previously no target was found (the old arms
+            // only matched a bare Column), so `pg_literal_text` got
+            // `None` and the whole comparison fell to a Debug-fallback EF.
             let tgt_l = match (&**left, &**right) {
                 (Expr::Literal(Literal::Text(_)), Expr::Column { table, name }) => {
                     pctx.col_type(table.as_deref(), name)
                 }
+                (Expr::Literal(Literal::Text(_)), Expr::Cast { to, .. }) => Some(*to),
                 _ => None,
             };
             let tgt_r = match (&**left, &**right) {
                 (Expr::Column { table, name }, Expr::Literal(Literal::Text(_))) => {
                     pctx.col_type(table.as_deref(), name)
                 }
+                (Expr::Cast { to, .. }, Expr::Literal(Literal::Text(_))) => Some(*to),
                 _ => None,
             };
             let l = pg_expr_target(left, pctx, qualify, tgt_l)?;
@@ -10541,11 +10836,19 @@ fn pg_expr_target(
             pg_expr_text(a, pctx, qualify)?,
             pg_expr_text(b, pctx, qualify)?
         )),
-        Expr::Or(a, b) => Some(format!(
-            "({} OR {})",
-            pg_expr_text(a, pctx, qualify)?,
-            pg_expr_text(b, pctx, qualify)?
-        )),
+        Expr::Or(a, b) => {
+            // v1.56: the parser desugars `x IN (v1, v2, ...)` to a left-deep
+            // Or of `=` comparisons; PG19 deparses that shape as
+            // `x = ANY ('{...}'::elemtype[])`.
+            if let Some(any) = pg_fold_in_any(e, pctx, qualify) {
+                return Some(any);
+            }
+            Some(format!(
+                "({} OR {})",
+                pg_expr_text(a, pctx, qualify)?,
+                pg_expr_text(b, pctx, qualify)?
+            ))
+        }
         Expr::Not(x) => Some(format!("(NOT {})", pg_expr_text(x, pctx, qualify)?)),
         Expr::IsNull { expr, neg } => Some(format!(
             "({} IS {}NULL)",
@@ -12419,6 +12722,31 @@ fn qualify_expr_cols(
             to: *to,
             written: written.clone(),
         },
+        // v1.56: recurse into Func args, Cmp sides, And/Or so columns
+        // inside them get qualified too (previously only Cast was
+        // recursed into, leaving e.g. `f(x)` or `x = 1` in a subquery
+        // target list with unqualified columns that PG prints qualified,
+        // forcing a Debug-fallback EF).
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| qualify_expr_cols(a, from, eng, snap, own, session))
+                .collect(),
+        },
+        Expr::Cmp { op, left, right } => Expr::Cmp {
+            op: *op,
+            left: Box::new(qualify_expr_cols(left, from, eng, snap, own, session)),
+            right: Box::new(qualify_expr_cols(right, from, eng, snap, own, session)),
+        },
+        Expr::And(a, b) => Expr::And(
+            Box::new(qualify_expr_cols(a, from, eng, snap, own, session)),
+            Box::new(qualify_expr_cols(b, from, eng, snap, own, session)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(qualify_expr_cols(a, from, eng, snap, own, session)),
+            Box::new(qualify_expr_cols(b, from, eng, snap, own, session)),
+        ),
         _ => expr.clone(),
     }
 }
@@ -69150,5 +69478,300 @@ mod v154_cte_inline_tests {
             "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1 FROM subselect_tbl) SELECT * FROM x, x AS x2",
         );
         assert!(lines.iter().any(|l| l.contains("Subquery Scan on x")), "{lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod v156_in_any_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// One-table plan ctx with unqualified column names.
+    fn pctx(cols: Vec<(&str, ColType)>) -> PgPlanCtx<'static> {
+        PgPlanCtx {
+            items: vec![(
+                vec!["t".to_string()],
+                cols.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
+            )],
+            pulled_exprs: vec![],
+            verbose: false,
+            _mark: std::marker::PhantomData,
+        }
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column {
+            table: None,
+            name: name.to_string(),
+        }
+    }
+
+    fn txt(s: &str) -> Expr {
+        Expr::Literal(Literal::Text(Arc::from(s)))
+    }
+
+    fn int(i: i64) -> Expr {
+        Expr::Literal(Literal::Int(i))
+    }
+
+    fn eq(l: Expr, r: Expr) -> Expr {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn or(l: Expr, r: Expr) -> Expr {
+        Expr::Or(Box::new(l), Box::new(r))
+    }
+
+    fn cast_text(e: Expr) -> Expr {
+        Expr::Cast {
+            expr: Box::new(e),
+            to: ColType::Text,
+            written: None,
+        }
+    }
+
+    /// v1.56: the proven flip — the parser's `stringu1::text IN
+    /// (VALUES('RFAAAA'),('VJAAAA'))` desugar renders PG19's `= ANY` form.
+    #[test]
+    fn v156_fold_cast_text_in_list() {
+        let ctx = pctx(vec![("stringu1", ColType::Text)]);
+        let lhs = || cast_text(col("stringu1"));
+        // Left-deep Or in source order, like the parser builds.
+        let e = or(eq(lhs(), txt("RFAAAA")), eq(lhs(), txt("VJAAAA")));
+        assert_eq!(
+            pg_expr_text(&e, &ctx, false).unwrap(),
+            "((stringu1)::text = ANY ('{RFAAAA,VJAAAA}'::text[]))"
+        );
+    }
+
+    /// v1.56: plain integer column IN-list.
+    #[test]
+    fn v156_fold_int_list() {
+        let ctx = pctx(vec![("unique1", ColType::Int)]);
+        let e = or(
+            or(eq(col("unique1"), int(1)), eq(col("unique1"), int(2))),
+            eq(col("unique1"), int(3)),
+        );
+        assert_eq!(
+            pg_expr_text(&e, &ctx, false).unwrap(),
+            "(unique1 = ANY ('{1,2,3}'::integer[]))"
+        );
+    }
+
+    /// v1.56: PG19 select_common_type widens int4+int8 to int8.
+    #[test]
+    fn v156_fold_bigint_widen() {
+        let ctx = pctx(vec![("unique1", ColType::Int)]);
+        let e = or(
+            eq(col("unique1"), int(1)),
+            eq(
+                col("unique1"),
+                Expr::Literal(Literal::BigInt(3_000_000_000)),
+            ),
+        );
+        assert_eq!(
+            pg_expr_text(&e, &ctx, false).unwrap(),
+            "(unique1 = ANY ('{1,3000000000}'::bigint[]))"
+        );
+    }
+
+    /// v1.56: no fold for a single comparison (PG needs >1 items).
+    #[test]
+    fn v156_no_fold_single_cmp() {
+        let ctx = pctx(vec![("unique1", ColType::Int)]);
+        let e = eq(col("unique1"), int(1));
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+        assert_eq!(pg_expr_text(&e, &ctx, false).unwrap(), "(unique1 = 1)");
+    }
+
+    /// v1.56: no fold when the LHS differs across disjuncts.
+    #[test]
+    fn v156_no_fold_mixed_lhs() {
+        let ctx = pctx(vec![("a", ColType::Int), ("b", ColType::Int)]);
+        let e = or(eq(col("a"), int(1)), eq(col("b"), int(2)));
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.56: no fold when an item isn't a literal (PG ORs Vars on).
+    #[test]
+    fn v156_no_fold_non_literal_rhs() {
+        let ctx = pctx(vec![("a", ColType::Int), ("b", ColType::Int)]);
+        let e = or(eq(col("a"), int(1)), eq(col("a"), col("b")));
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.56: no fold for non-`=` operators.
+    #[test]
+    fn v156_no_fold_non_eq_op() {
+        let ctx = pctx(vec![("a", ColType::Int)]);
+        let lt = |l: Expr, r: Expr| Expr::Cmp {
+            op: CmpOp::Lt,
+            left: Box::new(l),
+            right: Box::new(r),
+        };
+        let e = or(lt(col("a"), int(1)), lt(col("a"), int(2)));
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.56: no fold for a `name` column — namein truncates to 63 bytes,
+    /// which we don't replicate (fail closed, stays EF).
+    #[test]
+    fn v156_no_fold_name_col() {
+        let ctx = pctx(vec![("stringu1", ColType::Name)]);
+        let e = or(eq(col("stringu1"), txt("a")), eq(col("stringu1"), txt("b")));
+        assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+
+    /// v1.56: PG19 array_out element quoting rules.
+    #[test]
+    fn v156_quote_elem_cases() {
+        let cases = [
+            ("RFAAAA", "RFAAAA"),   // plain: bare
+            ("", "\"\""),           // empty: quoted
+            ("null", "\"null\""),   // case-insensitive NULL: quoted
+            ("NULL", "\"NULL\""),   // case-insensitive NULL: quoted
+            ("nulLx", "nulLx"),     // merely containing "null": bare
+            ("b,c", "\"b,c\""),     // delimiter: quoted
+            ("a{b", "\"a{b\""),     // braces: quoted
+            ("a}b", "\"a}b\""),     // braces: quoted
+            ("a\"b", "\"a\\\"b\""), // quote: quoted + escaped
+            ("a\\b", "\"a\\\\b\""), // backslash: quoted + escaped
+            ("a b", "\"a b\""),     // space: quoted
+            ("a\tb", "\"a\tb\""),   // tab: quoted
+        ];
+        for (input, want) in cases {
+            assert_eq!(pg_array_quote_elem(input), want, "input {input:?}");
+        }
+    }
+
+    /// v1.56: array element rendering per type.
+    #[test]
+    fn v156_elem_text_cases() {
+        use ColType::*;
+        let t = |s: &str| Literal::Text(Arc::from(s));
+        // NULL prints bare (array_out).
+        assert_eq!(pg_array_elem_text(&Literal::Null, Text).unwrap(), "NULL");
+        // Unknown literal coerced to int4: int4out.
+        assert_eq!(pg_array_elem_text(&t("42"), Int).unwrap(), "42");
+        // Unknown literal coerced to bool: boolout is t/f.
+        assert_eq!(pg_array_elem_text(&t("true"), Bool).unwrap(), "t");
+        assert_eq!(pg_array_elem_text(&t("FALSE"), Bool).unwrap(), "f");
+        assert_eq!(pg_array_elem_text(&t("maybe"), Bool).is_none(), true);
+        // Int item into numeric: plain digits.
+        assert_eq!(
+            pg_array_elem_text(&Literal::Int(7), Numeric(None)).unwrap(),
+            "7"
+        );
+        // Int item into float8 below 1e15: plain digits.
+        assert_eq!(pg_array_elem_text(&Literal::Int(7), Float).unwrap(), "7");
+        // Int item into float8 at/above 1e15: PG uses scientific — fail closed.
+        assert_eq!(
+            pg_array_elem_text(&Literal::Int(1_000_000_000_000_000), Float).is_none(),
+            true
+        );
+        // Decimal into numeric: plain spelling preserved.
+        assert_eq!(
+            pg_array_elem_text(&Literal::Decimal("1.50".to_string()), Numeric(None)).unwrap(),
+            "1.50"
+        );
+        // Decimal with exponent: numeric_out normalizes — fail closed.
+        assert_eq!(
+            pg_array_elem_text(&Literal::Decimal("1.5e3".to_string()), Numeric(None)).is_none(),
+            true
+        );
+        // Text into float8: fail closed (float8out thresholds unreplicated).
+        assert_eq!(pg_array_elem_text(&t("1.5"), Float).is_none(), true);
+        // Int into text: no implicit coercion — fail closed (PG keeps the OR).
+        assert_eq!(pg_array_elem_text(&Literal::Int(1), Text).is_none(), true);
+    }
+
+    /// v1.56 (ride-along fix #2): an untyped text literal compared to a
+    /// Cast-wrapped column takes the cast's type — previously the whole
+    /// comparison fell to a Debug-fallback EF.
+    #[test]
+    fn v156_cmp_cast_text_literal_coerces() {
+        let ctx = pctx(vec![("stringu1", ColType::Text)]);
+        let e = eq(cast_text(col("stringu1")), txt("RFAAAA"));
+        assert_eq!(
+            pg_expr_text(&e, &ctx, false).unwrap(),
+            "((stringu1::text) = 'RFAAAA'::text)"
+        );
+    }
+
+    /// v1.56 (ride-along fix #1): qualify_expr_cols recurses into Func
+    /// args, Cmp sides, And and Or — not just Cast.
+    #[test]
+    fn v156_qualify_recurses_composites() {
+        let mut eng = Engine::new();
+        let stmt = parse_statement("CREATE TABLE q1 (a integer)").unwrap();
+        let snap0 = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut sctx = StmtCtx {
+            snap: &snap0,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(&mut eng, &mut sctx, &stmt).unwrap();
+        let snap = eng.take_snapshot();
+        let from = vec![FromItem::Table {
+            name: "q1".to_string(),
+            alias: None,
+            col_aliases: vec![],
+            only: false,
+        }];
+        let qual_col = || Expr::Column {
+            table: Some("q1".to_string()),
+            name: "a".to_string(),
+        };
+        // Func args.
+        let e = Expr::Func {
+            name: "f".to_string(),
+            args: vec![col("a")],
+        };
+        assert_eq!(
+            qualify_expr_cols(&e, &from, &eng, &snap, 9, 0),
+            Expr::Func {
+                name: "f".to_string(),
+                args: vec![qual_col()],
+            }
+        );
+        // Cmp sides.
+        let e = eq(col("a"), int(1));
+        assert_eq!(
+            qualify_expr_cols(&e, &from, &eng, &snap, 9, 0),
+            eq(qual_col(), int(1))
+        );
+        // And / Or.
+        let e = Expr::And(
+            Box::new(eq(col("a"), int(1))),
+            Box::new(eq(col("a"), int(2))),
+        );
+        match qualify_expr_cols(&e, &from, &eng, &snap, 9, 0) {
+            Expr::And(a, b) => {
+                assert_eq!(*a, eq(qual_col(), int(1)));
+                assert_eq!(*b, eq(qual_col(), int(2)));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+        let e = or(eq(col("a"), int(1)), eq(col("a"), int(2)));
+        match qualify_expr_cols(&e, &from, &eng, &snap, 9, 0) {
+            Expr::Or(a, b) => {
+                assert_eq!(*a, eq(qual_col(), int(1)));
+                assert_eq!(*b, eq(qual_col(), int(2)));
+            }
+            other => panic!("expected Or, got {other:?}"),
+        }
     }
 }
