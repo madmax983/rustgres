@@ -10571,6 +10571,66 @@ fn pg_cast_const_literal(lit: &Literal, to: ColType) -> Option<Literal> {
     }
 }
 
+/// v1.59: compare two non-null constant literals with a comparison
+/// operator, mirroring PG19's const-folding (`ece_evaluate_expr` in
+/// clauses.c). Integers compare as i64 (exact); floats as f64 (fail
+/// closed on NaN, where PG's float8eq has NaN-is-equal semantics);
+/// mixed int/float as f64 when the int is exactly representable
+/// (|i| < 2^53, else fail closed); text and bool compare naturally.
+/// Anything else (dates, numerics, bytea, ...) fails closed.
+/// None = incomparable.
+fn pg_literal_cmp(l: &Literal, op: CmpOp, r: &Literal) -> Option<bool> {
+    use std::cmp::Ordering;
+    fn as_i64(l: &Literal) -> Option<i64> {
+        match l {
+            Literal::SmallInt(i) => Some(*i as i64),
+            Literal::Int(i) | Literal::BigInt(i) => Some(*i),
+            _ => None,
+        }
+    }
+    fn as_f64(l: &Literal) -> Option<f64> {
+        match l {
+            Literal::Float(f) => Some(*f),
+            Literal::Real(x) => Some(f64::from(*x)),
+            _ => None,
+        }
+    }
+    let ord: Ordering = if let (Some(a), Some(b)) = (as_i64(l), as_i64(r)) {
+        a.cmp(&b)
+    } else if let (Some(a), Some(b)) = (as_f64(l), as_f64(r)) {
+        if a.is_nan() || b.is_nan() {
+            return None;
+        }
+        a.partial_cmp(&b)?
+    } else if let (Some(a), Some(b)) = (as_i64(l), as_f64(r)) {
+        // PG coerces the int to float8; exact when |a| < 2^53.
+        if a.unsigned_abs() >= (1 << 53) {
+            return None;
+        }
+        (a as f64).partial_cmp(&b)?
+    } else if let (Some(a), Some(b)) = (as_f64(l), as_i64(r)) {
+        if b.unsigned_abs() >= (1 << 53) {
+            return None;
+        }
+        a.partial_cmp(&(b as f64))?
+    } else if let (Literal::Text(a), Literal::Text(b)) = (l, r) {
+        a.cmp(b)
+    } else if let (Literal::Bool(a), Literal::Bool(b)) = (l, r) {
+        a.cmp(b)
+    } else {
+        return None;
+    };
+    Some(match op {
+        CmpOp::Eq => ord == Ordering::Equal,
+        CmpOp::Ne => ord != Ordering::Equal,
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+        CmpOp::ImageEq => return None,
+    })
+}
+
 /// v1.57: fold a constant IN-list item to a `Literal`, mirroring PG19
 /// `eval_const_expressions`/`evaluate_function` (clauses.c) for immutable
 /// builtins on constant arguments:
@@ -10587,6 +10647,25 @@ fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
     match e {
         Expr::Literal(lit) => Some(lit.clone()),
         Expr::Func { name, args } => {
+            // v1.59: NULLIF(a, b) = CASE WHEN a = b THEN NULL ELSE a END
+            // (PG19 eval_const_expressions folds it; NULLIF is immutable).
+            if name.eq_ignore_ascii_case("nullif") {
+                if args.len() != 2 {
+                    return None;
+                }
+                let a = pg_fold_const_item(&args[0])?;
+                let b = pg_fold_const_item(&args[1])?;
+                // `a = NULL` / `NULL = b` is never true, so NULLIF
+                // returns a (NULLIF is not strict on either argument).
+                if matches!(a, Literal::Null) || matches!(b, Literal::Null) {
+                    return Some(a);
+                }
+                return Some(if pg_literal_cmp(&a, CmpOp::Eq, &b)? {
+                    Literal::Null
+                } else {
+                    a
+                });
+            }
             let f: fn(f64) -> f64 = match name.to_ascii_lowercase().as_str() {
                 "sin" => f64::sin,
                 "cos" => f64::cos,
@@ -14898,6 +14977,23 @@ fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
             }),
             _ => None,
         },
+        // v1.59: fold comparisons of constants (PG19 eval_const_expressions
+        // folds an OpExpr whose args are all Consts). Comparison operators
+        // are strict: a NULL operand yields NULL, not false.
+        Expr::Cmp { op, left, right } => {
+            let l = pg_fold_const_item(left)?;
+            let r = pg_fold_const_item(right)?;
+            if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
+                return Some(None);
+            }
+            Some(Some(pg_literal_cmp(&l, *op, &r)?))
+        }
+        // v1.59: fold IS [NOT] NULL on a constant.
+        Expr::IsNull { expr, neg } => {
+            let v = pg_fold_const_item(expr)?;
+            let is_null = matches!(v, Literal::Null);
+            Some(Some(if *neg { !is_null } else { is_null }))
+        }
         _ => None,
     }
 }
@@ -68914,9 +69010,14 @@ mod v149b_const_false_tests {
             pg_fold_bool_const(&parse_expr("false OR false")),
             Some(Some(false))
         );
-        // Non-foldable: vars, comparisons, function calls.
+        // Non-foldable: vars, function calls.
         assert_eq!(pg_fold_bool_const(&parse_expr("a = 1")), None);
-        assert_eq!(pg_fold_bool_const(&parse_expr("1 = 0")), None);
+        // v1.59: constant comparisons now fold (PG19 eval_const_expressions
+        // folds an OpExpr whose args are all Consts) — `1 = 0` is false.
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("1 = 0")),
+            Some(Some(false))
+        );
         assert_eq!(pg_fold_bool_const(&parse_expr("false AND a = 1")), None);
     }
 
@@ -70386,5 +70487,209 @@ mod v156_in_any_tests {
             eq(lhs(), int(2)),
         );
         assert!(pg_fold_in_any(&e, &ctx, false).is_none());
+    }
+}
+
+/// v1.59: const-false qual folding for EXPLAIN (`pg_fold_bool_const` +
+/// `pg_literal_cmp` + NULLIF in `pg_fold_const_item`). Flips the three
+/// case.out statements to `Result` / `One-Time Filter: false`.
+#[cfg(test)]
+mod v159_const_false_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn int(i: i64) -> Expr {
+        Expr::Literal(Literal::Int(i))
+    }
+
+    fn flt(f: f64) -> Expr {
+        Expr::Literal(Literal::Float(f))
+    }
+
+    fn txt(s: &str) -> Expr {
+        Expr::Literal(Literal::Text(Arc::from(s)))
+    }
+
+    fn null() -> Expr {
+        Expr::Literal(Literal::Null)
+    }
+
+    fn cmp(op: CmpOp, l: Expr, r: Expr) -> Expr {
+        Expr::Cmp {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn nullif(a: Expr, b: Expr) -> Expr {
+        Expr::Func {
+            name: "nullif".to_string(),
+            args: vec![a, b],
+        }
+    }
+
+    fn is_null(e: Expr, neg: bool) -> Expr {
+        Expr::IsNull {
+            expr: Box::new(e),
+            neg,
+        }
+    }
+
+    /// v1.59: integer comparisons fold exactly (i64).
+    #[test]
+    fn v159_literal_cmp_int() {
+        let a = Literal::Int(1);
+        let b = Literal::Int(2);
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Eq, &b), Some(false));
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Ne, &b), Some(true));
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Lt, &b), Some(true));
+        assert_eq!(pg_literal_cmp(&b, CmpOp::Gt, &a), Some(true));
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Le, &a), Some(true));
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Ge, &a), Some(true));
+        // SmallInt/BigInt participate in the integer domain.
+        assert_eq!(
+            pg_literal_cmp(&Literal::SmallInt(1), CmpOp::Eq, &Literal::BigInt(1)),
+            Some(true)
+        );
+    }
+
+    /// v1.59: float comparisons; NaN fails closed (PG's float8eq treats
+    /// NaN as equal — no faithful fold here).
+    #[test]
+    fn v159_literal_cmp_float() {
+        let a = Literal::Float(1.5);
+        let b = Literal::Float(2.5);
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Lt, &b), Some(true));
+        assert_eq!(pg_literal_cmp(&a, CmpOp::Eq, &a), Some(true));
+        // Mixed int/float: PG coerces int to float8; exact for |i| < 2^53.
+        assert_eq!(
+            pg_literal_cmp(&Literal::Int(2), CmpOp::Eq, &Literal::Float(2.0)),
+            Some(true)
+        );
+        assert_eq!(
+            pg_literal_cmp(&Literal::Float(0.1), CmpOp::Gt, &Literal::Int(0)),
+            Some(true)
+        );
+        assert_eq!(
+            pg_literal_cmp(&Literal::Float(f64::NAN), CmpOp::Eq, &a),
+            None
+        );
+        // Huge ints are not exactly representable as f64: fail closed.
+        assert_eq!(
+            pg_literal_cmp(&Literal::Int(1 << 60), CmpOp::Eq, &Literal::Float(1e18)),
+            None
+        );
+    }
+
+    /// v1.59: text/bool compare naturally; mismatched domains fail closed.
+    #[test]
+    fn v159_literal_cmp_text_bool_other() {
+        assert_eq!(
+            pg_literal_cmp(
+                &Literal::Text(Arc::from("a")),
+                CmpOp::Lt,
+                &Literal::Text(Arc::from("b"))
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            pg_literal_cmp(&Literal::Bool(true), CmpOp::Eq, &Literal::Bool(false)),
+            Some(false)
+        );
+        assert_eq!(
+            pg_literal_cmp(&Literal::Int(1), CmpOp::Eq, &Literal::Text(Arc::from("1"))),
+            None
+        );
+        assert_eq!(
+            pg_literal_cmp(&Literal::Int(1), CmpOp::ImageEq, &Literal::Int(1)),
+            None
+        );
+    }
+
+    /// v1.59: NULLIF folds per PG's CASE semantics.
+    #[test]
+    fn v159_fold_nullif() {
+        // Equal args → NULL.
+        assert_eq!(
+            pg_fold_const_item(&nullif(int(1), int(1))),
+            Some(Literal::Null)
+        );
+        // Unequal args → first arg.
+        assert_eq!(
+            pg_fold_const_item(&nullif(int(1), int(2))),
+            Some(Literal::Int(1))
+        );
+        // A NULL argument never makes the equality true → first arg
+        // (NULLIF is not strict).
+        assert_eq!(
+            pg_fold_const_item(&nullif(int(1), null())),
+            Some(Literal::Int(1))
+        );
+        assert_eq!(
+            pg_fold_const_item(&nullif(null(), int(1))),
+            Some(Literal::Null)
+        );
+        // Name matching is case-insensitive; wrong arity fails closed.
+        assert_eq!(
+            pg_fold_const_item(&Expr::Func {
+                name: "NULLIF".to_string(),
+                args: vec![int(1), int(1)],
+            }),
+            Some(Literal::Null)
+        );
+        assert_eq!(
+            pg_fold_const_item(&Expr::Func {
+                name: "nullif".to_string(),
+                args: vec![int(1)],
+            }),
+            None
+        );
+    }
+
+    /// v1.59: the three case.out target quals fold to false.
+    #[test]
+    fn v159_fold_bool_const_targets() {
+        // NULLIF(1, 2) = 2 → 1 = 2 → false.
+        let e1 = cmp(CmpOp::Eq, nullif(int(1), int(2)), int(2));
+        assert_eq!(pg_fold_bool_const(&e1), Some(Some(false)));
+        assert!(pg_is_const_false(&e1));
+        // NULLIF(1, 1) IS NOT NULL → NULL IS NOT NULL → false.
+        let e2 = is_null(nullif(int(1), int(1)), true);
+        assert_eq!(pg_fold_bool_const(&e2), Some(Some(false)));
+        assert!(pg_is_const_false(&e2));
+        // NULLIF(1, null) = 2 → 1 = 2 → false.
+        let e3 = cmp(CmpOp::Eq, nullif(int(1), null()), int(2));
+        assert_eq!(pg_fold_bool_const(&e3), Some(Some(false)));
+        assert!(pg_is_const_false(&e3));
+    }
+
+    /// v1.59: strictness and fail-closed behavior.
+    #[test]
+    fn v159_fold_bool_const_strict() {
+        // NULL = 2 → NULL; PG treats a NULL qual as dummy ("constant NULL
+        // is as good as constant FALSE", joinrels.c) so pg_is_const_false
+        // is true — but the fold itself reports NULL, not false.
+        let e = cmp(CmpOp::Eq, null(), int(2));
+        assert_eq!(pg_fold_bool_const(&e), Some(None));
+        assert!(pg_is_const_false(&e));
+        // A true constant is not const-false.
+        let t = cmp(CmpOp::Eq, int(2), int(2));
+        assert_eq!(pg_fold_bool_const(&t), Some(Some(true)));
+        assert!(!pg_is_const_false(&t));
+        // Non-constant operands fail closed.
+        let col = Expr::Column {
+            table: None,
+            name: "two".to_string(),
+        };
+        let nc = cmp(CmpOp::Eq, col, int(2));
+        assert_eq!(pg_fold_bool_const(&nc), None);
+        assert!(!pg_is_const_false(&nc));
+        // IS NULL on a non-null constant.
+        assert_eq!(
+            pg_fold_bool_const(&is_null(int(1), false)),
+            Some(Some(false))
+        );
+        assert_eq!(pg_fold_bool_const(&is_null(null(), false)), Some(Some(true)));
     }
 }
