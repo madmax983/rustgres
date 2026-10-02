@@ -916,6 +916,18 @@ EXPECTED_PASS_OVERRIDES = [
      r"select\s+(a|b)\.\*\s+from\s+(a|b)\s+left\s+join\s+"
      r"(b|c|parted_b)(\s+pb)?\s+on\s+\w+\.\w+\s*=\s*\w+\.id\s*;?\s*$",
      "v1.45: simple useless LEFT JOIN removed"),
+    # v1.60: immutable-function const-fold pullup — the planner now folds
+    # `f_immutable_int4(1)` (IMMUTABLE, constant args) at plan time
+    # (PG19 `simplify_function`) and pulls the constant up out of the
+    # function scan (PG19 `pull_up_constant_function`), so the const-false
+    # qual plans as `Result` + `Replaces:` + `One-Time Filter: false`.
+    # Narrowly scoped to the single join.out corpus statement verified
+    # against the PG19 oracle; the EXPLAIN-with-options mask stays for
+    # the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+unique1\s+from\s+tenk1\s*,\s*f_immutable_int4\s*\(\s*1\s*\)"
+     r"\s+x\s+where\s+x\s*=\s*42\s*;?\s*$",
+     "v1.60: immutable function-scan const pullup"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS

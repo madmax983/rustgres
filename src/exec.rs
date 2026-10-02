@@ -10631,6 +10631,322 @@ fn pg_literal_cmp(l: &Literal, op: CmpOp, r: &Literal) -> Option<bool> {
     })
 }
 
+/// v1.60: per-fold context for the EXPLAIN-path constant folder, mirroring
+/// PG19 `eval_const_expressions`' `context` argument (clauses.c): the
+/// catalog for immutable-function lookup, the active-function stack (PG's
+/// `context->active_fns`) so a self-recursive function can never send the
+/// folder into an infinite loop, and two scoped bindings:
+/// - `params`/`param_names`: while folding a function body, `Param(n)` and
+///   named-argument columns resolve to the folded argument literals
+///   (innermost query level wins, like PG);
+/// - `fnscan_subs`: in a pulled-up WHERE clause, unqualified columns naming
+///   a constant-folded function-scan output resolve to its constant (PG19
+///   `pull_up_constant_function`, prepjointree.c:2235).
+struct PgConstFold<'a> {
+    db: Option<&'a Database>,
+    visiting: Vec<(String, Vec<Option<String>>)>,
+    params: Vec<Literal>,
+    param_names: Vec<Option<String>>,
+    fnscan_subs: Vec<(String, Literal)>,
+}
+
+impl<'a> PgConstFold<'a> {
+    /// A pure folder with no catalog and no bindings: behaves exactly like
+    /// the v1.57-v1.59 folder (immutable builtins only; user-defined calls
+    /// and bare columns never fold).
+    fn pure() -> Self {
+        PgConstFold {
+            db: None,
+            visiting: Vec::new(),
+            params: Vec::new(),
+            param_names: Vec::new(),
+            fnscan_subs: Vec::new(),
+        }
+    }
+    /// A catalog-backed folder for the EXPLAIN plan path.
+    fn with_db(db: &'a Database) -> Self {
+        PgConstFold {
+            db: Some(db),
+            visiting: Vec::new(),
+            params: Vec::new(),
+            param_names: Vec::new(),
+            fnscan_subs: Vec::new(),
+        }
+    }
+    /// Resolve an unqualified column reference: function-body parameters
+    /// first (innermost scope), then pulled-up function-scan outputs.
+    fn resolve_col(&self, name: &str) -> Option<&Literal> {
+        if let Some(i) = self
+            .param_names
+            .iter()
+            .position(|a| a.as_deref() == Some(name))
+        {
+            return self.params.get(i);
+        }
+        self.fnscan_subs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, l)| l)
+    }
+}
+
+/// v1.60: fold a call to an immutable function with all-constant arguments,
+/// mirroring PG19 `simplify_function` (clauses.c:5205-5297) feeding
+/// `pull_up_constant_function` (prepjointree.c:2235):
+/// - only IMMUTABLE functions fold (STABLE/VOLATILE never),
+/// - all arguments must already fold to constants,
+/// - strict + constant-NULL input -> NULL without calling the body
+///   (a non-strict function is evaluated with the NULL bound),
+/// - the body must be a single plain `SELECT <expr>` with no FROM/WHERE/
+///   GROUP BY/etc. (the v0.97 desugar shape for `RETURN <expr>`);
+///   anything else fails closed,
+/// - a recursion guard (PG's `active_fns`) rejects self-recursive calls.
+///
+/// Any lookup miss, arity ambiguity, or evaluation failure -> None (fail
+/// closed). EXPLAIN-path only; execution never calls this.
+fn pg_fold_immutable_call(fc: &mut PgConstFold, name: &str, args: &[Expr]) -> Option<Literal> {
+    // Resolve exactly one catalog candidate (name + arity); the borrow of
+    // `fc.db` ends here so `fc` can be mutated below. PG resolves
+    // overloads; we have no overload set to choose from, so ambiguity
+    // fails closed.
+    let (arg_names, body, found_strict) = {
+        let db = fc.db?;
+        let found = db.functions.get(name).and_then(|v| {
+            let mut it = v.iter().filter(|f| f.arg_names.len() == args.len());
+            match (it.next(), it.next()) {
+                (Some(f), None) => Some(f),
+                _ => None,
+            }
+        })?;
+        if found.volatility != crate::sql::FuncVolatility::Immutable
+            || found.returns_set
+            || found.plpgsql.is_some()
+        {
+            return None;
+        }
+        (found.arg_names.clone(), found.parsed.clone()?, found.strict)
+    };
+    // Recursion guard (PG's `active_fns` in `eval_const_expressions`,
+    // which wraps the body expansion): pushed only around the body fold
+    // below. Argument folding needs no guard — each nested call operates
+    // on a strictly smaller sub-expression, so it always terminates;
+    // keeping the guard off here lets legitimate nested calls like
+    // `f(f(2))` fold.
+    let key = (name.to_string(), arg_names.clone());
+    // Fold the arguments first (PG folds args before the call).
+    let mut folded: Vec<Literal> = Vec::with_capacity(args.len());
+    for a in args {
+        folded.push(pg_fold_const_item(a, fc)?);
+    }
+    // Strict + constant-NULL input -> NULL without calling the body (PG19
+    // `simplify_function` folds this even for non-immutable functions).
+    // A non-strict function is evaluated with the NULL bound instead.
+    if found_strict && folded.iter().any(|l| matches!(l, Literal::Null)) {
+        return Some(Literal::Null);
+    }
+    // Body must be a single plain `SELECT <expr>`.
+    let target = match body.as_slice() {
+        [Stmt::Select(s)]
+            if s.with.is_empty()
+                && !s.distinct
+                && s.distinct_on.is_empty()
+                && s.from.is_empty()
+                && s.where_.is_none()
+                && s.group_by.is_empty()
+                && s.having.is_none()
+                && s.order_by.is_empty()
+                && s.limit.is_none()
+                && s.offset.is_none()
+                && s.set_op.is_none() =>
+        {
+            match s.items.as_slice() {
+                [SelectItem::Expr { expr, .. }] => expr.clone(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if fc.visiting.contains(&key) {
+        return None;
+    }
+    fc.visiting.push(key);
+    // Bind the folded arguments as the body's parameters (innermost scope
+    // wins, like PG's query levels); the outer pulled-up map is hidden
+    // while the body folds, since the body is a separate query level.
+    let saved_params = std::mem::replace(&mut fc.params, folded);
+    let saved_names = std::mem::replace(&mut fc.param_names, arg_names);
+    let saved_subs = std::mem::take(&mut fc.fnscan_subs);
+    let out = pg_fold_const_item(&target, fc);
+    fc.params = saved_params;
+    fc.param_names = saved_names;
+    fc.fnscan_subs = saved_subs;
+    fc.visiting.pop();
+    out
+}
+
+/// v1.60: mirror PG19 `pull_up_constant_function` (prepjointree.c:2235)
+/// for the EXPLAIN const-false check: collect the constant each
+/// constant-folded FROM-function item's output column stands for, and the
+/// FROM items surviving the pullup (folded function scans become no-op
+/// RTE_RESULTs, dropped by PG19 `remove_useless_results`, which also
+/// elides single-child joins and keeps at least one child). Returns
+/// `(substitutions, surviving_items)`; the survivors feed the `Replaces:`
+/// line when the qual goes const-false.
+///
+/// Fail-closed: any FROM item that is not a plain table, a function, or a
+/// join of those disables substitution entirely (survivors = the original
+/// FROM); a function whose call does not fold is left alone; an output
+/// name colliding with a real table column or another substituted output
+/// is dropped from the map (PG would qualify those references; we fail
+/// closed instead).
+fn pg_fnscan_subs(
+    from: &[FromItem],
+    fc: &mut PgConstFold,
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<(String, Literal)>, Vec<FromItem>) {
+    /// One item's pullup result: the surviving item (`None` = the item was
+    /// a folded function scan, i.e. a dropped no-op RTE_RESULT), the
+    /// substitutions its subtree contributed, the table columns its
+    /// subtree occupies, and whether the subtree was fully analyzable.
+    struct PruneOut {
+        item: Option<FromItem>,
+        subs: Vec<(String, Literal)>,
+        taken: Vec<String>,
+        ok: bool,
+    }
+    fn prune(
+        it: &FromItem,
+        fc: &mut PgConstFold,
+        eng: &Engine,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> PruneOut {
+        let blank = |item: Option<FromItem>| PruneOut {
+            item,
+            subs: Vec::new(),
+            taken: Vec::new(),
+            ok: true,
+        };
+        match it {
+            FromItem::Table { name, .. } => {
+                let mut o = blank(Some(it.clone()));
+                if let Some(t) = eng.db.find_table(name, snap, &[own], session) {
+                    o.taken.extend(t.columns.iter().map(|c| c.0.clone()));
+                }
+                o
+            }
+            FromItem::Function {
+                name,
+                args,
+                alias,
+                col_aliases,
+                ..
+            } => match pg_fold_immutable_call(fc, name, args) {
+                Some(lit) => {
+                    let out = col_aliases
+                        .first()
+                        .cloned()
+                        .or_else(|| alias.clone())
+                        .unwrap_or_else(|| name.clone());
+                    let mut o = blank(None);
+                    o.subs.push((out, lit));
+                    o
+                }
+                None => blank(Some(it.clone())),
+            },
+            FromItem::Join {
+                left,
+                kind,
+                right,
+                on,
+                using,
+                natural,
+                using_alias,
+                alias,
+                col_aliases,
+            } => {
+                let l = prune(left, fc, eng, snap, own, session);
+                let r = prune(right, fc, eng, snap, own, session);
+                let o = PruneOut {
+                    // PG19 `remove_useless_results`: a join that lost a
+                    // no-op side collapses to the surviving side; if both
+                    // sides were no-ops, at least one child is kept.
+                    item: match (l.item, r.item) {
+                        (Some(li), Some(ri)) => Some(FromItem::Join {
+                            left: Box::new(li),
+                            kind: *kind,
+                            right: Box::new(ri),
+                            on: on.clone(),
+                            using: using.clone(),
+                            natural: *natural,
+                            using_alias: using_alias.clone(),
+                            alias: alias.clone(),
+                            col_aliases: col_aliases.clone(),
+                        }),
+                        (Some(li), None) => Some(li),
+                        (None, Some(ri)) => Some(ri),
+                        (None, None) => Some(it.clone()),
+                    },
+                    subs: l.subs.into_iter().chain(r.subs).collect(),
+                    taken: l.taken.into_iter().chain(r.taken).collect(),
+                    ok: l.ok && r.ok,
+                };
+                o
+            }
+            // Derived / Values / anything else: the output column set is
+            // not provable here — disable substitution (fail closed) but
+            // keep the item for `Replaces:`.
+            _ => PruneOut {
+                item: Some(it.clone()),
+                subs: Vec::new(),
+                taken: Vec::new(),
+                ok: false,
+            },
+        }
+    }
+    let mut subs: Vec<(String, Literal)> = Vec::new();
+    let mut taken: Vec<String> = Vec::new();
+    let mut ok = true;
+    let mut surviving: Vec<FromItem> = Vec::new();
+    for it in from {
+        let o = prune(it, fc, eng, snap, own, session);
+        subs.extend(o.subs);
+        taken.extend(o.taken);
+        ok = ok && o.ok;
+        if let Some(item) = o.item {
+            surviving.push(item);
+        }
+    }
+    if !ok || subs.is_empty() {
+        return (Vec::new(), from.to_vec());
+    }
+    // Drop substitutions whose output name collides with a real table
+    // column or another substituted function output.
+    let mut seen: Vec<String> = Vec::new();
+    subs.retain(|(name, _)| {
+        if taken.iter().any(|t| t == name) || seen.iter().any(|s| s == name) {
+            return false;
+        }
+        seen.push(name.clone());
+        true
+    });
+    if subs.is_empty() {
+        return (Vec::new(), from.to_vec());
+    }
+    // PG19 `remove_useless_results` keeps at least one child: never drop
+    // every FROM item.
+    if surviving.is_empty() {
+        if let Some(last) = from.last() {
+            surviving.push(last.clone());
+        }
+    }
+    (subs, surviving)
+}
+
 /// v1.57: fold a constant IN-list item to a `Literal`, mirroring PG19
 /// `eval_const_expressions`/`evaluate_function` (clauses.c) for immutable
 /// builtins on constant arguments:
@@ -10643,9 +10959,18 @@ fn pg_literal_cmp(l: &Literal, op: CmpOp, r: &Literal) -> Option<bool> {
 /// inputs (PG's dsin/dcos/dtan raise only on infinite input or overflow,
 /// neither reachable from a finite literal), so the fold cannot disagree
 /// with PG. Domain-checked builtins (asin/acos/exp/ln/...) stay unfolded.
-fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
+fn pg_fold_const_item(e: &Expr, fc: &mut PgConstFold) -> Option<Literal> {
     match e {
         Expr::Literal(lit) => Some(lit.clone()),
+        // v1.60: parameter / pulled-up function-scan references. While
+        // folding a function body, `Param(n)` and named-argument columns
+        // resolve to the folded argument literals; in a pulled-up WHERE
+        // clause, unqualified columns naming a folded function-scan output
+        // resolve to its constant (PG19 `pull_up_constant_function`,
+        // prepjointree.c:2235). Both maps are empty on the pure
+        // (deparse-path) folder, so behavior there is unchanged.
+        Expr::Param(n) => fc.params.get((*n as usize).checked_sub(1)?).cloned(),
+        Expr::Column { table: None, name } => fc.resolve_col(name).cloned(),
         Expr::Func { name, args } => {
             // v1.59: NULLIF(a, b) = CASE WHEN a = b THEN NULL ELSE a END
             // (PG19 eval_const_expressions folds it; NULLIF is immutable).
@@ -10653,8 +10978,8 @@ fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
                 if args.len() != 2 {
                     return None;
                 }
-                let a = pg_fold_const_item(&args[0])?;
-                let b = pg_fold_const_item(&args[1])?;
+                let a = pg_fold_const_item(&args[0], fc)?;
+                let b = pg_fold_const_item(&args[1], fc)?;
                 // `a = NULL` / `NULL = b` is never true, so NULLIF
                 // returns a (NULLIF is not strict on either argument).
                 if matches!(a, Literal::Null) || matches!(b, Literal::Null) {
@@ -10670,12 +10995,15 @@ fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
                 "sin" => f64::sin,
                 "cos" => f64::cos,
                 "tan" => f64::tan,
-                _ => return None,
+                // v1.60: anything else may be an immutable user function
+                // with constant args (PG19 `simplify_function`,
+                // clauses.c:5205-5297); STABLE/VOLATILE never fold.
+                _ => return pg_fold_immutable_call(fc, name, args),
             };
             if args.len() != 1 {
                 return None;
             }
-            let arg = pg_fold_const_item(&args[0])?;
+            let arg = pg_fold_const_item(&args[0], fc)?;
             if matches!(arg, Literal::Null) {
                 return Some(Literal::Null);
             }
@@ -10692,7 +11020,7 @@ fn pg_fold_const_item(e: &Expr) -> Option<Literal> {
             Some(Literal::Float(y))
         }
         Expr::Cast { expr, to, .. } => {
-            let lit = pg_fold_const_item(expr)?;
+            let lit = pg_fold_const_item(expr, fc)?;
             pg_cast_const_literal(&lit, *to)
         }
         _ => None,
@@ -10894,8 +11222,13 @@ fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
         // or immutable builtins on constants (PG19 eval_const_expressions
         // folds these before planning). Mirrors PG's rnonvars partition:
         // Var-containing (non-constant) items are ORed on separately, so
-        // one kills the whole fold (fail closed).
-        items.push(pg_fold_const_item(right.as_ref())?);
+        // one kills the whole fold (fail closed). v1.60: the deparse path
+        // stays pure (no catalog, no bindings) — user calls never fold
+        // here, exactly as before.
+        items.push(pg_fold_const_item(
+            right.as_ref(),
+            &mut PgConstFold::pure(),
+        )?);
     }
     let lhs = lhs?;
     // Element type: PG prefers the LHS type for unknown literals.
@@ -14153,20 +14486,17 @@ fn plan_from_item(
             // evaluates the ON clause normally.
             if pctx.is_some() {
                 if let Some(on_expr) = on {
-                    if pg_is_const_false(on_expr) {
-                        let null_qual =
-                            matches!(pg_fold_bool_const(on_expr), Some(None));
+                    // v1.60: catalog-backed fold (immutable calls with
+                    // constant args fold, PG19 `simplify_function`); no
+                    // pulled-up function-scan bindings at the ON site.
+                    let mut fc = PgConstFold::with_db(&eng.db);
+                    if pg_is_const_false(on_expr, &mut fc) {
+                        let null_qual = matches!(pg_fold_bool_const(on_expr, &mut fc), Some(None));
                         match kind {
                             JoinKind::Inner | JoinKind::Cross => {
                                 let mut names = Vec::new();
-                                pg_replaces_names(
-                                    std::slice::from_ref(left),
-                                    &mut names,
-                                );
-                                pg_replaces_names(
-                                    std::slice::from_ref(right),
-                                    &mut names,
-                                );
+                                pg_replaces_names(std::slice::from_ref(left), &mut names);
+                                pg_replaces_names(std::slice::from_ref(right), &mut names);
                                 let replaces = if names.len() == 1 {
                                     format!("Scan on {}", names[0])
                                 } else {
@@ -14944,24 +15274,30 @@ fn pg_top_select_output(
 //   a single RTE_RESULT, explain.c:5048-5059).
 //
 // Conservative by design: only the boolean skeleton (literals, NULL,
-// NOT/AND/OR over foldable operands) is folded. Comparisons, function
-// calls, and vars are NEVER folded here, so the v0.55 no-plan-time-folding
+// NOT/AND/OR over foldable operands) is folded. v1.59 added comparisons
+// of constants; v1.60 adds calls to IMMUTABLE functions with all-constant
+// arguments (PG19 `simplify_function`, clauses.c:5205-5297) plus the
+// pulled-up constants of constant-folded function-scan RTEs (PG19
+// `pull_up_constant_function`, prepjointree.c:2235). STABLE/VOLATILE calls
+// and unresolvable vars are NEVER folded, so the v0.55 no-plan-time-folding
 // discipline (e.g. `1/0` in a CASE arm) stays intact. EXPLAIN-path only:
 // the executor evaluates WHERE/ON normally, so execution semantics are
 // untouched.
 
 /// Fold a boolean expression to a constant. `Some(Some(b))` = provably
 /// `b`; `Some(None)` = provably NULL; `None` = not foldable.
-fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
+/// v1.60: takes the fold context so pulled-up function-scan constants
+/// (and, inside a body fold, parameters) resolve during the fold.
+fn pg_fold_bool_const(e: &Expr, fc: &mut PgConstFold) -> Option<Option<bool>> {
     match e {
         Expr::Literal(Literal::Bool(b)) => Some(Some(*b)),
         Expr::Literal(Literal::Null) => Some(None),
-        Expr::Not(x) => match pg_fold_bool_const(x) {
+        Expr::Not(x) => match pg_fold_bool_const(x, fc) {
             Some(Some(b)) => Some(Some(!b)),
             Some(None) => Some(None),
             None => None,
         },
-        Expr::And(l, r) => match (pg_fold_bool_const(l), pg_fold_bool_const(r)) {
+        Expr::And(l, r) => match (pg_fold_bool_const(l, fc), pg_fold_bool_const(r, fc)) {
             (Some(a), Some(b)) => Some(match (a, b) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -14969,7 +15305,7 @@ fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
             }),
             _ => None,
         },
-        Expr::Or(l, r) => match (pg_fold_bool_const(l), pg_fold_bool_const(r)) {
+        Expr::Or(l, r) => match (pg_fold_bool_const(l, fc), pg_fold_bool_const(r, fc)) {
             (Some(a), Some(b)) => Some(match (a, b) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -14981,8 +15317,8 @@ fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
         // folds an OpExpr whose args are all Consts). Comparison operators
         // are strict: a NULL operand yields NULL, not false.
         Expr::Cmp { op, left, right } => {
-            let l = pg_fold_const_item(left)?;
-            let r = pg_fold_const_item(right)?;
+            let l = pg_fold_const_item(left, fc)?;
+            let r = pg_fold_const_item(right, fc)?;
             if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
                 return Some(None);
             }
@@ -14990,7 +15326,7 @@ fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
         }
         // v1.59: fold IS [NOT] NULL on a constant.
         Expr::IsNull { expr, neg } => {
-            let v = pg_fold_const_item(expr)?;
+            let v = pg_fold_const_item(expr, fc)?;
             let is_null = matches!(v, Literal::Null);
             Some(Some(if *neg { !is_null } else { is_null }))
         }
@@ -15000,8 +15336,9 @@ fn pg_fold_bool_const(e: &Expr) -> Option<Option<bool>> {
 
 /// PG19 `restriction_is_constant_false` for EXPLAIN plan shapes: true
 /// when the qual folds to a FALSE-or-NULL Const.
-fn pg_is_const_false(e: &Expr) -> bool {
-    matches!(pg_fold_bool_const(e), Some(v) if v != Some(true))
+/// v1.60: takes the fold context (pulled-up function-scan constants).
+fn pg_is_const_false(e: &Expr, fc: &mut PgConstFold) -> bool {
+    matches!(pg_fold_bool_const(e, fc), Some(v) if v != Some(true))
 }
 
 /// User-facing RTE names for PG19 `Replaces:` (explain.c
@@ -15180,17 +15517,8 @@ fn plan_select(
     // legacy mode; unfaithful entries omit the whole line.
     let top_output = || -> Vec<String> {
         match pctx {
-            Some(px) => pg_top_select_output(
-                eng,
-                stmt,
-                &orig_from,
-                snap,
-                own,
-                session,
-                ctes,
-                px,
-            )
-            .unwrap_or_default(),
+            Some(px) => pg_top_select_output(eng, stmt, &orig_from, snap, own, session, ctes, px)
+                .unwrap_or_default(),
             None => Vec::new(),
         }
     };
@@ -15202,14 +15530,27 @@ fn plan_select(
     // fold here can only misrender a plan, never misexecute a query.
     if pg {
         if let Some(w) = &stmt.where_ {
-            if pg_is_const_false(w) {
+            // v1.60: PG19 `pull_up_constant_function` (prepjointree.c:2235):
+            // a FROM-function item whose call folds to a constant is
+            // pulled up — its output column behaves as the constant in the
+            // qual — and the no-op RTE_RESULTs are dropped from the
+            // `Replaces:` line (PG19 `remove_useless_results`, which keeps
+            // at least one child). EXPLAIN-path only (`pg`); execution
+            // still evaluates the WHERE normally, so a wrong fold here can
+            // only misrender a plan, never misexecute a query.
+            let mut fc = PgConstFold::with_db(&eng.db);
+            let (subs, surviving) = pg_fnscan_subs(&stmt.from, &mut fc, eng, snap, own, session);
+            fc.fnscan_subs = subs;
+            if pg_is_const_false(w, &mut fc) {
                 return Ok(PlanNode::Result {
                     rows: 1,
                     filter: None,
                     // v1.46: VERBOSE `Output:` — the select list deparsed.
                     output: top_output(),
                     one_time_filter: true,
-                    replaces: pg_result_replaces(&stmt.from),
+                    // v1.60: `Replaces:` over the RTEs surviving the
+                    // function pullup (PG19 `remove_useless_results`).
+                    replaces: pg_result_replaces(&surviving),
                 });
             }
         }
@@ -68647,10 +68988,7 @@ mod v148_join_label_materialize_tests {
         setup(&mut eng);
         run(&mut eng, "CREATE TEMP TABLE one (id int PRIMARY KEY)").unwrap();
         run(&mut eng, "INSERT INTO one VALUES (1)").unwrap();
-        let lines = plan_lines(
-            &mut eng,
-            "EXPLAIN (COSTS OFF) select * from one o, a i",
-        );
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) select * from one o, a i");
         assert!(
             !lines.iter().any(|l| l.contains("Materialize")),
             "{lines:?}"
@@ -68674,10 +69012,7 @@ mod v148_join_label_materialize_tests {
     fn constant_true_scan_filter_dropped() {
         let mut eng = engine();
         setup(&mut eng);
-        let lines = plan_lines(
-            &mut eng,
-            "EXPLAIN (COSTS OFF) select * from a where true",
-        );
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) select * from a where true");
         assert_eq!(lines, vec!["Seq Scan on a".to_string()], "{lines:?}");
     }
 }
@@ -68713,10 +69048,9 @@ mod v149_right_join_flip_tests {
 
     fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
         match run(eng, sql).unwrap() {
-            ExecResult::Explain { rows, .. } => rows
-                .into_iter()
-                .map(|r| r[0].to_text().unwrap())
-                .collect(),
+            ExecResult::Explain { rows, .. } => {
+                rows.into_iter().map(|r| r[0].to_text().unwrap()).collect()
+            }
             other => panic!("expected EXPLAIN, got {other:?}"),
         }
     }
@@ -68750,8 +69084,7 @@ mod v149_right_join_flip_tests {
     /// ON clause over unmodified (PG does not commute quals).
     #[test]
     fn flip_swaps_sides_and_kind() {
-        let from = parse_statement("SELECT * FROM j1 RIGHT JOIN j2 ON j1.id = j2.id")
-            .unwrap();
+        let from = parse_statement("SELECT * FROM j1 RIGHT JOIN j2 ON j1.id = j2.id").unwrap();
         let from = match from {
             crate::sql::Stmt::Select(s) => s.from,
             _ => panic!("expected select"),
@@ -68773,7 +69106,10 @@ mod v149_right_join_flip_tests {
                 // ON clause preserved verbatim
                 assert!(on.is_some());
                 let on_text = format!("{on:?}");
-                assert!(on_text.contains("j1") && on_text.contains("j2"), "{on_text}");
+                assert!(
+                    on_text.contains("j1") && on_text.contains("j2"),
+                    "{on_text}"
+                );
             }
             other => panic!("expected join, got {other:?}"),
         }
@@ -68983,55 +69319,91 @@ mod v149b_const_false_tests {
     /// v1.49b: the boolean-const folder — literals, NULL, NOT/AND/OR.
     #[test]
     fn fold_bool_const_skeleton() {
-        assert_eq!(pg_fold_bool_const(&parse_expr("false")), Some(Some(false)));
-        assert_eq!(pg_fold_bool_const(&parse_expr("true")), Some(Some(true)));
-        assert_eq!(pg_fold_bool_const(&parse_expr("NULL")), Some(None));
         assert_eq!(
-            pg_fold_bool_const(&parse_expr("NOT true")),
+            pg_fold_bool_const(&parse_expr("false"), &mut PgConstFold::pure()),
             Some(Some(false))
         );
         assert_eq!(
-            pg_fold_bool_const(&parse_expr("NOT NULL")),
-            Some(None)
-        );
-        assert_eq!(
-            pg_fold_bool_const(&parse_expr("false AND true")),
-            Some(Some(false))
-        );
-        assert_eq!(
-            pg_fold_bool_const(&parse_expr("true AND NULL")),
-            Some(None)
-        );
-        assert_eq!(
-            pg_fold_bool_const(&parse_expr("true OR NULL")),
+            pg_fold_bool_const(&parse_expr("true"), &mut PgConstFold::pure()),
             Some(Some(true))
         );
         assert_eq!(
-            pg_fold_bool_const(&parse_expr("false OR false")),
+            pg_fold_bool_const(&parse_expr("NULL"), &mut PgConstFold::pure()),
+            Some(None)
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("NOT true"), &mut PgConstFold::pure()),
+            Some(Some(false))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("NOT NULL"), &mut PgConstFold::pure()),
+            Some(None)
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("false AND true"), &mut PgConstFold::pure()),
+            Some(Some(false))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("true AND NULL"), &mut PgConstFold::pure()),
+            Some(None)
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("true OR NULL"), &mut PgConstFold::pure()),
+            Some(Some(true))
+        );
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("false OR false"), &mut PgConstFold::pure()),
             Some(Some(false))
         );
         // Non-foldable: vars, function calls.
-        assert_eq!(pg_fold_bool_const(&parse_expr("a = 1")), None);
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("a = 1"), &mut PgConstFold::pure()),
+            None
+        );
         // v1.59: constant comparisons now fold (PG19 eval_const_expressions
         // folds an OpExpr whose args are all Consts) — `1 = 0` is false.
         assert_eq!(
-            pg_fold_bool_const(&parse_expr("1 = 0")),
+            pg_fold_bool_const(&parse_expr("1 = 0"), &mut PgConstFold::pure()),
             Some(Some(false))
         );
-        assert_eq!(pg_fold_bool_const(&parse_expr("false AND a = 1")), None);
+        assert_eq!(
+            pg_fold_bool_const(&parse_expr("false AND a = 1"), &mut PgConstFold::pure()),
+            None
+        );
     }
 
     /// v1.49b: `pg_is_const_false` — FALSE-or-NULL counts as false (PG19
     /// joinrels.c:1580-1582), TRUE does not.
     #[test]
     fn is_const_false_matches_pg() {
-        assert!(pg_is_const_false(&parse_expr("false")));
-        assert!(pg_is_const_false(&parse_expr("NULL")));
-        assert!(pg_is_const_false(&parse_expr("NOT true")));
-        assert!(pg_is_const_false(&parse_expr("false AND NULL")));
-        assert!(!pg_is_const_false(&parse_expr("true")));
-        assert!(!pg_is_const_false(&parse_expr("NOT false")));
-        assert!(!pg_is_const_false(&parse_expr("a = 1")));
+        assert!(pg_is_const_false(
+            &parse_expr("false"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(pg_is_const_false(
+            &parse_expr("NULL"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(pg_is_const_false(
+            &parse_expr("NOT true"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(pg_is_const_false(
+            &parse_expr("false AND NULL"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(!pg_is_const_false(
+            &parse_expr("true"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(!pg_is_const_false(
+            &parse_expr("NOT false"),
+            &mut PgConstFold::pure()
+        ));
+        assert!(!pg_is_const_false(
+            &parse_expr("a = 1"),
+            &mut PgConstFold::pure()
+        ));
     }
 
     /// v1.49b: top-level WHERE false → bare `Result` with `One-Time
@@ -69046,11 +69418,7 @@ mod v149b_const_false_tests {
         );
         assert_eq!(
             lines,
-            vec![
-                "Result",
-                "Replaces: Scan on cf1",
-                "One-Time Filter: false",
-            ]
+            vec!["Result", "Replaces: Scan on cf1", "One-Time Filter: false",]
         );
     }
 
@@ -69177,8 +69545,11 @@ mod v149b_const_false_tests {
         assert!(rows.is_empty());
         // LEFT JOIN ON false → left rows preserved with NULL extension.
         let rows = rows_of(
-            run(&mut eng, "SELECT a, b FROM cf1 LEFT JOIN cf2 ON false ORDER BY a")
-                .unwrap(),
+            run(
+                &mut eng,
+                "SELECT a, b FROM cf1 LEFT JOIN cf2 ON false ORDER BY a",
+            )
+            .unwrap(),
         );
         assert_eq!(
             rows,
@@ -69188,8 +69559,7 @@ mod v149b_const_false_tests {
             ]
         );
         // INNER JOIN ON false → zero rows.
-        let rows =
-            rows_of(run(&mut eng, "SELECT * FROM cf1 JOIN cf2 ON false").unwrap());
+        let rows = rows_of(run(&mut eng, "SELECT * FROM cf1 JOIN cf2 ON false").unwrap());
         assert!(rows.is_empty());
         // WHERE true → all rows (not dummy).
         let rows = rows_of(run(&mut eng, "SELECT a FROM cf1 WHERE true").unwrap());
@@ -69297,7 +69667,10 @@ mod v146_verbose_output_tests {
             lines,
             // v1.52: `public.` per `ExplainTargetRel` verbose-only namespace
             // (explain.c).
-            vec!["Seq Scan on public.t1".to_string(), "  Output: a, b".to_string(),]
+            vec![
+                "Seq Scan on public.t1".to_string(),
+                "  Output: a, b".to_string(),
+            ]
         );
     }
 
@@ -69509,7 +69882,10 @@ mod v146_verbose_output_tests {
         let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF, VERBOSE) SELECT 1 FROM t1");
         assert_eq!(
             lines,
-            vec!["Seq Scan on public.t1".to_string(), "  Output: 1".to_string()]
+            vec![
+                "Seq Scan on public.t1".to_string(),
+                "  Output: 1".to_string()
+            ]
         );
     }
 
@@ -69613,9 +69989,8 @@ mod v151_pullup_repair_tests {
     /// forever). Minimal repro of the v1.50 hang.
     #[test]
     fn v151_empty_from_derived_not_a_candidate() {
-        let s = parse_select(
-            "select * from (select 0 as z) as t1 join (select 1 as y) as t2 on true",
-        );
+        let s =
+            parse_select("select * from (select 0 as z) as t1 join (select 1 as y) as t2 on true");
         assert!(find_pullup_candidate(&s.from).is_none());
     }
 
@@ -69626,8 +70001,7 @@ mod v151_pullup_repair_tests {
     /// by hand to pin the guard.
     #[test]
     fn v151_multi_from_derived_not_a_candidate() {
-        let mut s =
-            parse_select("select * from (select 1 as a from t1) as s join t3 on true");
+        let mut s = parse_select("select * from (select 1 as a from t1) as s join t3 on true");
         let FromItem::Join { left, .. } = &mut s.from[0] else {
             panic!("expected top-level join");
         };
@@ -69656,9 +70030,7 @@ mod v151_pullup_repair_tests {
         ] {
             run(&mut eng, sql).unwrap();
         }
-        let s = parse_select(
-            "select * from lt1 join lateral (select lt1.a as b) as s on true",
-        );
+        let s = parse_select("select * from lt1 join lateral (select lt1.a as b) as s on true");
         let snap = eng.take_snapshot();
         assert!(pull_up_simple_subqueries(&s, &eng, &snap, 9, 0).is_none());
     }
@@ -69688,8 +70060,7 @@ mod v151_pullup_repair_tests {
             // FROM-less derived under a left join (wedge #8 shape, no lateral).
             "explain (costs off) select * from (select 0 as z) as t1 left join (select true as a) as t2 on true",
         ] {
-            explain_guarded(sql, 15)
-                .unwrap_or_else(|| panic!("hang regression on: {sql}"));
+            explain_guarded(sql, 15).unwrap_or_else(|| panic!("hang regression on: {sql}"));
         }
     }
 
@@ -69804,7 +70175,11 @@ mod v154_cte_inline_tests {
     }
 
     fn setup(eng: &mut Engine) {
-        run(eng, "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 integer)").unwrap();
+        run(
+            eng,
+            "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 integer)",
+        )
+        .unwrap();
         run(eng, "INSERT INTO subselect_tbl VALUES (1, 2, 3)").unwrap();
         run(eng, "CREATE TABLE int4_tbl (f1 integer)").unwrap();
     }
@@ -69902,7 +70277,10 @@ mod v154_cte_inline_tests {
             &mut eng,
             "EXPLAIN (VERBOSE, COSTS OFF) WITH x AS (SELECT f1 FROM subselect_tbl) SELECT * FROM x, x AS x2",
         );
-        assert!(lines.iter().any(|l| l.contains("Subquery Scan on x")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("Subquery Scan on x")),
+            "{lines:?}"
+        );
     }
 }
 
@@ -70220,7 +70598,7 @@ mod v156_in_any_tests {
     #[test]
     fn v157_fold_sin_const() {
         assert_eq!(
-            pg_fold_const_item(&func("sin", vec![dec("0.5")])),
+            pg_fold_const_item(&func("sin", vec![dec("0.5")]), &mut PgConstFold::pure()),
             Some(Literal::Float(0.479425538604203))
         );
     }
@@ -70229,15 +70607,15 @@ mod v156_in_any_tests {
     #[test]
     fn v157_fold_cos_tan_const() {
         assert_eq!(
-            pg_fold_const_item(&func("cos", vec![dec("0.5")])),
+            pg_fold_const_item(&func("cos", vec![dec("0.5")]), &mut PgConstFold::pure()),
             Some(Literal::Float(0.8775825618903728))
         );
         assert_eq!(
-            pg_fold_const_item(&func("COS", vec![dec("0.5")])),
+            pg_fold_const_item(&func("COS", vec![dec("0.5")]), &mut PgConstFold::pure()),
             Some(Literal::Float(0.8775825618903728))
         );
         assert_eq!(
-            pg_fold_const_item(&func("tan", vec![dec("0.5")])),
+            pg_fold_const_item(&func("tan", vec![dec("0.5")]), &mut PgConstFold::pure()),
             Some(Literal::Float(0.5463024898437905))
         );
     }
@@ -70246,7 +70624,10 @@ mod v156_in_any_tests {
     #[test]
     fn v157_fold_sin_null_strict() {
         assert_eq!(
-            pg_fold_const_item(&func("sin", vec![Expr::Literal(Literal::Null)])),
+            pg_fold_const_item(
+                &func("sin", vec![Expr::Literal(Literal::Null)]),
+                &mut PgConstFold::pure()
+            ),
             Some(Literal::Null)
         );
     }
@@ -70254,36 +70635,51 @@ mod v156_in_any_tests {
     /// v1.57: non-constant arguments don't fold.
     #[test]
     fn v157_fold_sin_column_no_fold() {
-        assert_eq!(pg_fold_const_item(&func("sin", vec![col("two")])), None);
+        assert_eq!(
+            pg_fold_const_item(&func("sin", vec![col("two")]), &mut PgConstFold::pure()),
+            None
+        );
     }
 
     /// v1.57: unknown builtins, wrong arity, domain-unsafe builtins, and
     /// non-finite inputs don't fold (fail closed).
     #[test]
     fn v157_fold_no_fold_cases() {
-        assert_eq!(pg_fold_const_item(&func("foobar", vec![dec("0.5")])), None);
-        assert_eq!(pg_fold_const_item(&func("now", vec![])), None);
+        assert_eq!(
+            pg_fold_const_item(&func("foobar", vec![dec("0.5")]), &mut PgConstFold::pure()),
+            None
+        );
+        assert_eq!(
+            pg_fold_const_item(&func("now", vec![]), &mut PgConstFold::pure()),
+            None
+        );
         // asin is immutable but domain-checked (|x|>1 raises in PG);
         // conservatively unfolded.
-        assert_eq!(pg_fold_const_item(&func("asin", vec![dec("0.5")])), None);
         assert_eq!(
-            pg_fold_const_item(&func("sin", vec![dec("0.5"), dec("0.5")])),
+            pg_fold_const_item(&func("asin", vec![dec("0.5")]), &mut PgConstFold::pure()),
+            None
+        );
+        assert_eq!(
+            pg_fold_const_item(
+                &func("sin", vec![dec("0.5"), dec("0.5")]),
+                &mut PgConstFold::pure()
+            ),
             None
         );
         // Infinite input: PG's dsin raises.
         assert_eq!(
-            pg_fold_const_item(&func(
-                "sin",
-                vec![Expr::Literal(Literal::Float(f64::INFINITY))]
-            )),
+            pg_fold_const_item(
+                &func("sin", vec![Expr::Literal(Literal::Float(f64::INFINITY))]),
+                &mut PgConstFold::pure()
+            ),
             None
         );
         // NaN input: no faithful array spelling; fail closed.
         assert_eq!(
-            pg_fold_const_item(&func(
-                "sin",
-                vec![Expr::Literal(Literal::Float(f64::NAN))]
-            )),
+            pg_fold_const_item(
+                &func("sin", vec![Expr::Literal(Literal::Float(f64::NAN))]),
+                &mut PgConstFold::pure()
+            ),
             None
         );
     }
@@ -70297,31 +70693,37 @@ mod v156_in_any_tests {
             written: None,
         };
         assert_eq!(
-            pg_fold_const_item(&cast(int(2), ColType::Int)),
+            pg_fold_const_item(&cast(int(2), ColType::Int), &mut PgConstFold::pure()),
             Some(Literal::Int(2))
         );
         assert_eq!(
-            pg_fold_const_item(&cast(int(2), ColType::Float)),
+            pg_fold_const_item(&cast(int(2), ColType::Float), &mut PgConstFold::pure()),
             Some(Literal::Float(2.0))
         );
         // |i| >= 2^53: int8->float8 rounds in PG too — fail closed.
         assert_eq!(
-            pg_fold_const_item(&cast(
-                Expr::Literal(Literal::Int(1i64 << 53)),
-                ColType::Float
-            )),
+            pg_fold_const_item(
+                &cast(Expr::Literal(Literal::Int(1i64 << 53)), ColType::Float),
+                &mut PgConstFold::pure()
+            ),
             None
         );
         // decimal -> float8 (correctly rounded, like numeric_float8).
         assert_eq!(
-            pg_fold_const_item(&cast(dec("0.5"), ColType::Float)),
+            pg_fold_const_item(&cast(dec("0.5"), ColType::Float), &mut PgConstFold::pure()),
             Some(Literal::Float(0.5))
         );
         // int -> text: no faithful fold.
-        assert_eq!(pg_fold_const_item(&cast(int(2), ColType::Text)), None);
+        assert_eq!(
+            pg_fold_const_item(&cast(int(2), ColType::Text), &mut PgConstFold::pure()),
+            None
+        );
         // NULL -> anything: NULL.
         assert_eq!(
-            pg_fold_const_item(&cast(Expr::Literal(Literal::Null), ColType::Float)),
+            pg_fold_const_item(
+                &cast(Expr::Literal(Literal::Null), ColType::Float),
+                &mut PgConstFold::pure()
+            ),
             Some(Literal::Null)
         );
     }
@@ -70442,7 +70844,7 @@ mod v156_in_any_tests {
             eq(col("unique1"), int(1)),
             eq(
                 col("unique1"),
-                Expr::Literal(Literal::BigInt(3_000_000_000))
+                Expr::Literal(Literal::BigInt(3_000_000_000)),
             ),
         );
         assert_eq!(
@@ -70482,10 +70884,7 @@ mod v156_in_any_tests {
             left: Box::new(col("a")),
             right: Box::new(int(2)),
         };
-        let e = or(
-            eq(lhs(), func("sin", vec![dec("0.5")])),
-            eq(lhs(), int(2)),
-        );
+        let e = or(eq(lhs(), func("sin", vec![dec("0.5")])), eq(lhs(), int(2)));
         assert!(pg_fold_in_any(&e, &ctx, false).is_none());
     }
 }
@@ -70612,37 +71011,43 @@ mod v159_const_false_tests {
     fn v159_fold_nullif() {
         // Equal args → NULL.
         assert_eq!(
-            pg_fold_const_item(&nullif(int(1), int(1))),
+            pg_fold_const_item(&nullif(int(1), int(1)), &mut PgConstFold::pure()),
             Some(Literal::Null)
         );
         // Unequal args → first arg.
         assert_eq!(
-            pg_fold_const_item(&nullif(int(1), int(2))),
+            pg_fold_const_item(&nullif(int(1), int(2)), &mut PgConstFold::pure()),
             Some(Literal::Int(1))
         );
         // A NULL argument never makes the equality true → first arg
         // (NULLIF is not strict).
         assert_eq!(
-            pg_fold_const_item(&nullif(int(1), null())),
+            pg_fold_const_item(&nullif(int(1), null()), &mut PgConstFold::pure()),
             Some(Literal::Int(1))
         );
         assert_eq!(
-            pg_fold_const_item(&nullif(null(), int(1))),
+            pg_fold_const_item(&nullif(null(), int(1)), &mut PgConstFold::pure()),
             Some(Literal::Null)
         );
         // Name matching is case-insensitive; wrong arity fails closed.
         assert_eq!(
-            pg_fold_const_item(&Expr::Func {
-                name: "NULLIF".to_string(),
-                args: vec![int(1), int(1)],
-            }),
+            pg_fold_const_item(
+                &Expr::Func {
+                    name: "NULLIF".to_string(),
+                    args: vec![int(1), int(1)],
+                },
+                &mut PgConstFold::pure()
+            ),
             Some(Literal::Null)
         );
         assert_eq!(
-            pg_fold_const_item(&Expr::Func {
-                name: "nullif".to_string(),
-                args: vec![int(1)],
-            }),
+            pg_fold_const_item(
+                &Expr::Func {
+                    name: "nullif".to_string(),
+                    args: vec![int(1)],
+                },
+                &mut PgConstFold::pure()
+            ),
             None
         );
     }
@@ -70652,16 +71057,25 @@ mod v159_const_false_tests {
     fn v159_fold_bool_const_targets() {
         // NULLIF(1, 2) = 2 → 1 = 2 → false.
         let e1 = cmp(CmpOp::Eq, nullif(int(1), int(2)), int(2));
-        assert_eq!(pg_fold_bool_const(&e1), Some(Some(false)));
-        assert!(pg_is_const_false(&e1));
+        assert_eq!(
+            pg_fold_bool_const(&e1, &mut PgConstFold::pure()),
+            Some(Some(false))
+        );
+        assert!(pg_is_const_false(&e1, &mut PgConstFold::pure()));
         // NULLIF(1, 1) IS NOT NULL → NULL IS NOT NULL → false.
         let e2 = is_null(nullif(int(1), int(1)), true);
-        assert_eq!(pg_fold_bool_const(&e2), Some(Some(false)));
-        assert!(pg_is_const_false(&e2));
+        assert_eq!(
+            pg_fold_bool_const(&e2, &mut PgConstFold::pure()),
+            Some(Some(false))
+        );
+        assert!(pg_is_const_false(&e2, &mut PgConstFold::pure()));
         // NULLIF(1, null) = 2 → 1 = 2 → false.
         let e3 = cmp(CmpOp::Eq, nullif(int(1), null()), int(2));
-        assert_eq!(pg_fold_bool_const(&e3), Some(Some(false)));
-        assert!(pg_is_const_false(&e3));
+        assert_eq!(
+            pg_fold_bool_const(&e3, &mut PgConstFold::pure()),
+            Some(Some(false))
+        );
+        assert!(pg_is_const_false(&e3, &mut PgConstFold::pure()));
     }
 
     /// v1.59: strictness and fail-closed behavior.
@@ -70671,25 +71085,253 @@ mod v159_const_false_tests {
         // is as good as constant FALSE", joinrels.c) so pg_is_const_false
         // is true — but the fold itself reports NULL, not false.
         let e = cmp(CmpOp::Eq, null(), int(2));
-        assert_eq!(pg_fold_bool_const(&e), Some(None));
-        assert!(pg_is_const_false(&e));
+        assert_eq!(pg_fold_bool_const(&e, &mut PgConstFold::pure()), Some(None));
+        assert!(pg_is_const_false(&e, &mut PgConstFold::pure()));
         // A true constant is not const-false.
         let t = cmp(CmpOp::Eq, int(2), int(2));
-        assert_eq!(pg_fold_bool_const(&t), Some(Some(true)));
-        assert!(!pg_is_const_false(&t));
+        assert_eq!(
+            pg_fold_bool_const(&t, &mut PgConstFold::pure()),
+            Some(Some(true))
+        );
+        assert!(!pg_is_const_false(&t, &mut PgConstFold::pure()));
         // Non-constant operands fail closed.
         let col = Expr::Column {
             table: None,
             name: "two".to_string(),
         };
         let nc = cmp(CmpOp::Eq, col, int(2));
-        assert_eq!(pg_fold_bool_const(&nc), None);
-        assert!(!pg_is_const_false(&nc));
+        assert_eq!(pg_fold_bool_const(&nc, &mut PgConstFold::pure()), None);
+        assert!(!pg_is_const_false(&nc, &mut PgConstFold::pure()));
         // IS NULL on a non-null constant.
         assert_eq!(
-            pg_fold_bool_const(&is_null(int(1), false)),
+            pg_fold_bool_const(&is_null(int(1), false), &mut PgConstFold::pure()),
             Some(Some(false))
         );
-        assert_eq!(pg_fold_bool_const(&is_null(null(), false)), Some(Some(true)));
+        assert_eq!(
+            pg_fold_bool_const(&is_null(null(), false), &mut PgConstFold::pure()),
+            Some(Some(true))
+        );
+    }
+}
+
+/// v1.60: EXPLAIN-path folding of IMMUTABLE function calls with constant
+/// arguments (PG19 `simplify_function`, clauses.c:5205-5297) and the
+/// pulled-up function-scan constants (PG19 `pull_up_constant_function`,
+/// prepjointree.c:2235).
+#[cfg(test)]
+mod v160_immutable_fold_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn int(i: i64) -> Expr {
+        Expr::Literal(Literal::Int(i))
+    }
+
+    fn null() -> Expr {
+        Expr::Literal(Literal::Null)
+    }
+
+    fn ufunc(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Func {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .map(|l| l.trim().to_string())
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE t1(a int)").unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f_immutable_int4(i int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ begin return i; end $$",
+        )
+        .unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f_stable_int4(i int) RETURNS int LANGUAGE plpgsql STABLE AS $$ begin return i; end $$",
+        )
+        .unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f_volatile_int4(i int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$ begin return i; end $$",
+        )
+        .unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f_strict_imm(i int) RETURNS int LANGUAGE plpgsql IMMUTABLE STRICT AS $$ begin return i; end $$",
+        )
+        .unwrap();
+        run(
+            eng,
+            "CREATE FUNCTION f_recur(i int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ begin return f_recur(i); end $$",
+        )
+        .unwrap();
+    }
+
+    /// The immutable plpgsql function folds with constant args.
+    #[test]
+    fn v160_fold_immutable_call() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let mut fc = PgConstFold::with_db(&eng.db);
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_immutable_int4", &[int(1)]),
+            Some(Literal::Int(1))
+        );
+        // Nested immutable calls fold inside-out.
+        assert_eq!(
+            pg_fold_immutable_call(
+                &mut fc,
+                "f_immutable_int4",
+                &[ufunc("f_immutable_int4", vec![int(2)])]
+            ),
+            Some(Literal::Int(2))
+        );
+        // Non-constant argument fails closed.
+        let col = Expr::Column {
+            table: None,
+            name: "a".to_string(),
+        };
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_immutable_int4", &[col]),
+            None
+        );
+        // Unknown function fails closed.
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "no_such_fn", &[int(1)]),
+            None
+        );
+    }
+
+    /// STABLE and VOLATILE functions never fold (PG only folds IMMUTABLE).
+    #[test]
+    fn v160_fold_volatile_stable_never() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let mut fc = PgConstFold::with_db(&eng.db);
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_stable_int4", &[int(1)]),
+            None
+        );
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_volatile_int4", &[int(1)]),
+            None
+        );
+    }
+
+    /// STRICT + NULL input folds to NULL without calling the body; a
+    /// non-strict immutable function evaluates the body with NULL bound.
+    #[test]
+    fn v160_fold_null_args() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let mut fc = PgConstFold::with_db(&eng.db);
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_strict_imm", &[null()]),
+            Some(Literal::Null)
+        );
+        // Non-strict `return i` with NULL input evaluates to NULL.
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_immutable_int4", &[null()]),
+            Some(Literal::Null)
+        );
+    }
+
+    /// A self-recursive call hits the recursion guard (PG's `active_fns`).
+    #[test]
+    fn v160_fold_recursion_guard() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let mut fc = PgConstFold::with_db(&eng.db);
+        assert_eq!(pg_fold_immutable_call(&mut fc, "f_recur", &[int(1)]), None);
+        // The guard is scoped: an unrelated fold still works after.
+        assert_eq!(
+            pg_fold_immutable_call(&mut fc, "f_immutable_int4", &[int(1)]),
+            Some(Literal::Int(1))
+        );
+    }
+
+    /// The corpus target: the pulled-up constant makes the qual const-false
+    /// → `Result` + `Replaces: Scan on t1` + `One-Time Filter: false`.
+    #[test]
+    fn v160_explain_one_time_filter_fnscan() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a FROM t1, f_immutable_int4(1) x WHERE x = 42",
+        );
+        assert_eq!(
+            lines,
+            vec!["Result", "Replaces: Scan on t1", "One-Time Filter: false"]
+        );
+    }
+
+    /// A const-true qual does not collapse; a stable function never folds.
+    #[test]
+    fn v160_explain_no_collapse_cases() {
+        let mut eng = engine();
+        setup(&mut eng);
+        // x = 1 is const-true after pullup: no dummy rel.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a FROM t1, f_immutable_int4(1) x WHERE x = 1",
+        );
+        assert!(!lines.iter().any(|l| l.contains("One-Time Filter")));
+        // STABLE is never pulled up: the qual stays non-constant.
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a FROM t1, f_stable_int4(1) x WHERE x = 42",
+        );
+        assert!(!lines.iter().any(|l| l.contains("One-Time Filter")));
+    }
+
+    /// The pulled-up function is dropped from `Replaces:` even when the
+    /// const-false qual does not involve it (PG pulls up before checking).
+    #[test]
+    fn v160_explain_replaces_drops_folded_fnscan() {
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT a FROM t1, f_immutable_int4(1) x WHERE 1 = 0",
+        );
+        assert_eq!(
+            lines,
+            vec!["Result", "Replaces: Scan on t1", "One-Time Filter: false"]
+        );
     }
 }
