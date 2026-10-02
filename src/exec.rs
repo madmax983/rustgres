@@ -12510,6 +12510,171 @@ fn est_index_rows(
     (rel * sel).round().max(1.0) as u64
 }
 
+// --- v1.63: cost-based nestloop side selection -------------------------------
+// PG19 `make_join_rel` (joinrels.c) calls `add_paths_to_joinrel` twice for
+// JOIN_INNER — `(rel1, rel2)` and `(rel2, rel1)` — and `add_path` keeps the
+// cheaper via `cost_nestloop` (costsize.c): the inner scan is re-run once
+// per outer row, so the more selective (smaller estimated output) side
+// usually wins the outer slot. The helpers below port just enough of that
+// cost model to make the same choice; the swap only reorders EXPLAIN plan
+// children (the executor never sees `PlanNode`), so results are identical
+// by construction.
+
+/// v1.63: selectivity of one WHERE-slice conjunct for nestloop side
+/// selection. Equality and range shapes go through `conjunct_bounds`
+/// (column-vs-literal, literal coerced to the column type) with the
+/// ANALYZE-backed `est_eq_sel` / `est_range_sel` estimators; `<>` is PG19's
+/// `neqsel` (1 − eqsel); `IS [NOT] NULL` uses the stats null fraction.
+/// Anything else returns 1.0 — fail closed, no selectivity opinion.
+fn est_conjunct_sel(
+    db: &Database,
+    table: &str,
+    qual: &str,
+    columns: &[(String, ColType)],
+    c: &Expr,
+) -> f64 {
+    let ts = db.stats.get(table);
+    // `IS [NOT] NULL`: the stats null fraction; without stats, no opinion
+    // (PG19's `nulltestsel` likewise needs the column stats).
+    if let Expr::IsNull { expr, neg } = c {
+        if let Expr::Column { name, .. } = &**expr {
+            if let Some(cs) = ts.and_then(|t| t.cols.get(name)) {
+                let s = if *neg {
+                    1.0 - cs.null_frac
+                } else {
+                    cs.null_frac
+                };
+                return s.clamp(0.0, 1.0);
+            }
+        }
+        return 1.0;
+    }
+    // `<>`: never indexable, so probe the equality path directly.
+    if let Expr::Cmp {
+        op: CmpOp::Ne,
+        left,
+        right,
+    } = c
+    {
+        let probe = Expr::Cmp {
+            op: CmpOp::Eq,
+            left: left.clone(),
+            right: right.clone(),
+        };
+        if let Some(bs) = conjunct_bounds(&probe, qual, table, columns) {
+            if let [(pos, IndexBoundKind::Eq, v)] = bs.as_slice() {
+                return (1.0 - est_eq_sel(ts, &columns[*pos].0, v)).clamp(0.0001, 1.0);
+            }
+        }
+        return 1.0;
+    }
+    // Equality and range shapes via the index-bound extractor.
+    if let Some(bs) = conjunct_bounds(c, qual, table, columns) {
+        let mut sel = 1.0f64;
+        // Group a BETWEEN's adjacent lo+hi pair (same column) into one
+        // histogram lookup; a lone bound leaves the other side open.
+        let mut ranges: HashMap<usize, (Option<&Value>, Option<&Value>)> = HashMap::new();
+        for (pos, kind, v) in bs.iter() {
+            match kind {
+                IndexBoundKind::Eq => sel *= est_eq_sel(ts, &columns[*pos].0, v),
+                IndexBoundKind::Gt(_) => ranges.entry(*pos).or_insert((None, None)).0 = Some(v),
+                IndexBoundKind::Lt(_) => ranges.entry(*pos).or_insert((None, None)).1 = Some(v),
+            }
+        }
+        for (pos, (lo, hi)) in ranges.iter() {
+            sel *= est_range_sel(ts, &columns[*pos].0, *lo, *hi);
+        }
+        return sel.clamp(0.0, 1.0);
+    }
+    1.0
+}
+
+/// v1.63: estimated output rows of a planned scan side after its WHERE
+/// slice (`rel_rows` is the plan's stored, unfiltered estimate). Only
+/// base-table scans are estimable here; the caller gates on the node
+/// shape. A positive estimate never rounds to zero (PG19
+/// `clamp_row_est`); an empty table stays empty.
+fn est_filtered_rows(
+    db: &Database,
+    table: &str,
+    qual: &str,
+    t: &Table,
+    rel_rows: f64,
+    where_: Option<&Expr>,
+) -> f64 {
+    let mut sel = 1.0f64;
+    if let Some(w) = where_ {
+        for c in split_conjuncts(w) {
+            sel *= est_conjunct_sel(db, table, qual, &t.columns, c);
+            if sel <= 0.0 {
+                break;
+            }
+        }
+    }
+    (rel_rows * sel).max(if rel_rows > 0.0 { 1.0 } else { 0.0 })
+}
+
+/// v1.63: cost-based nestloop outer/inner choice — true when the current
+/// inner (`b`) belongs outer.
+///
+/// Ports `initial_cost_nestloop`'s normal (non-SEMI/ANTI, non-inner-unique)
+/// case with `cost_rescan`'s default (a rescan costs the full scan for
+/// non-materialized paths). The terms symmetric in the two orders cancel
+/// — both startup costs, both scans' own run costs, and
+/// `final_cost_nestloop`'s `cpu_per_tuple * outer_rows * inner_rows` CPU
+/// term — leaving the rescan-multiplied term: swapping `a` (current
+/// outer) and `b` (current inner) wins iff
+/// `(rows_b − 1) * scan_cost_a < (rows_a − 1) * scan_cost_b`,
+/// with `scan_cost` as `cost_seqscan`'s skeleton
+/// (`seq_page_cost * pages + cpu_tuple_cost * rows`, PG19 defaults;
+/// pages via the v1.62 `est_heap_pages` port of `relpages`). Per-row
+/// filter CPU costs are second-order for the ordering decision and are
+/// omitted (documented simplification).
+///
+/// Only plain base-table SeqScan sides are estimable; anything else
+/// (index scans, subqueries, VALUES, joins, ...) returns false — fail
+/// closed to FROM order. Ties keep FROM order (strict `<`), and a
+/// degenerate zero scan cost keeps FROM order too.
+fn pg_nestloop_swap(
+    db: &Database,
+    a: &PlanNode,
+    a_where: Option<&Expr>,
+    b: &PlanNode,
+    b_where: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let (a_table, a_qual) = match a {
+        PlanNode::SeqScan { table, alias, .. } => (table, alias.as_deref().unwrap_or(table)),
+        _ => return false,
+    };
+    let (b_table, b_qual) = match b {
+        PlanNode::SeqScan { table, alias, .. } => (table, alias.as_deref().unwrap_or(table)),
+        _ => return false,
+    };
+    let ta = match db.find_table(a_table, snap, &[own], session) {
+        Some(t) => t,
+        None => return false,
+    };
+    let tb = match db.find_table(b_table, snap, &[own], session) {
+        Some(t) => t,
+        None => return false,
+    };
+    // v1.62: heap pages for the I/O term; filtered rows for the CPU term
+    // (PG19's `cost_seqscan` charges `cpu_tuple_cost` per *output* row).
+    let rows_a = est_filtered_rows(db, a_table, a_qual, ta, a.rows() as f64, a_where);
+    let rows_b = est_filtered_rows(db, b_table, b_qual, tb, b.rows() as f64, b_where);
+    const SEQ_PAGE_COST: f64 = 1.0;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    let cost_a = est_heap_pages(ta) as f64 * SEQ_PAGE_COST + rows_a * CPU_TUPLE_COST;
+    let cost_b = est_heap_pages(tb) as f64 * SEQ_PAGE_COST + rows_b * CPU_TUPLE_COST;
+    if cost_a <= 0.0 || cost_b <= 0.0 {
+        return false;
+    }
+    (rows_b - 1.0) * cost_a < (rows_a - 1.0) * cost_b
+}
+
 /// v0.78: plan a CTE body for EXPLAIN. `visible` holds the CTEs the body
 /// may reference (outer levels ++ earlier siblings, in definition
 /// order). UNION bodies (recursive CTEs) are estimated, not planned.
@@ -14801,10 +14966,35 @@ fn plan_from_item(
             )?;
             // v1.50: One-sided ON pushdown (T2). If the ON was pushed to the
             // right side, set it as a Filter on the inner node.
+            // v1.63: read the pushdown flag before the `if let` moves it.
+            let on_pushed_right = push_on_to_right.is_some();
             if let (Some(px), Some(on_expr)) = (pctx, push_on_to_right) {
                 let filter_text = pg_expr_text_or_debug(&on_expr, px, true);
                 inner.set_filter(Some(filter_text));
             }
+            // v1.63: cost-based nestloop side selection (selective side
+            // outer). PG19 tries both orders for JOIN_INNER only
+            // (joinrels.c); outer joins keep their written order. Skipped
+            // when the ON was pushed to the right side — that filter's
+            // selectivity is not in `right_where`, so fail closed. The
+            // swap only reorders plan children; the executor never sees
+            // PlanNode, so results are identical by construction.
+            let (outer, inner) = if matches!(kind, JoinKind::Inner | JoinKind::Cross)
+                && !on_pushed_right
+                && pg_nestloop_swap(
+                    &eng.db,
+                    &outer,
+                    left_where.as_ref(),
+                    &inner,
+                    right_where.as_ref(),
+                    snap,
+                    own,
+                    session,
+                ) {
+                (inner, outer)
+            } else {
+                (outer, inner)
+            };
             let rows = outer.rows().saturating_mul(inner.rows());
             // v1.46: VERBOSE `Output:` — a join's tlist starts as the
             // verbatim concatenation of its inputs' tlists (PG19). The
@@ -15769,22 +15959,47 @@ fn plan_select(
                 pctx,
                 stmt,
             )?;
+            let inner_where = item_where(idx);
             idx += 1;
-            let rows = node.rows().saturating_mul(inner.rows());
+            // v1.63: cost-based nestloop side selection (selective side
+            // outer). The current outer's WHERE slice is only known while
+            // it is still the first single scan; once the outer is a join
+            // the SeqScan-only gate fails closed anyway. The swap only
+            // reorders plan children — the executor never sees PlanNode,
+            // so results are identical by construction.
+            let outer_where = match &node {
+                PlanNode::SeqScan { .. } => item_where(0),
+                _ => None,
+            };
+            let (outer, inner) = if pg_nestloop_swap(
+                &eng.db,
+                &node,
+                outer_where,
+                &inner,
+                inner_where,
+                snap,
+                own,
+                session,
+            ) {
+                (inner, node)
+            } else {
+                (node, inner)
+            };
+            let rows = outer.rows().saturating_mul(inner.rows());
             // v1.46: VERBOSE `Output:` — concatenation of the inputs'
             // entries (replaced with the query targetlist for the top
             // node by the fixup below).
-            let mut output = node.output().to_vec();
+            let mut output = outer.output().to_vec();
             output.extend(inner.output().iter().cloned());
             // v1.48: comma joins are cross joins (PG plans them as inner
             // nested loops); PG may materialize the inner side (see
             // `pg_should_materialize`).
-            let inner = pg_maybe_materialize(&node, inner);
+            let inner = pg_maybe_materialize(&outer, inner);
             node = PlanNode::NestedLoop {
                 filter: None,
                 join_filter: None,
                 rows,
-                outer: Box::new(node),
+                outer: Box::new(outer),
                 inner: Box::new(inner),
                 kind: JoinKind::Cross,
                 output,
@@ -71642,6 +71857,343 @@ mod v161_distinct_limit_tests {
         assert_eq!(out.len(), 1);
     }
 }
+
+// ============================================================================
+// v1.63: cost-based nestloop side selection (PG19 `cost_nestloop` parity).
+// ============================================================================
+#[cfg(test)]
+mod v163_nestloop_side_selection_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    /// Raw (indented) EXPLAIN lines, so child order is observable.
+    fn plan_raw(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup_sj(eng: &mut Engine) {
+        run(eng, "CREATE TABLE sj (a int unique, b int, c int unique)").unwrap();
+        run(
+            eng,
+            "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1), (3, 1, 3)",
+        )
+        .unwrap();
+    }
+
+    /// Index of the first line containing `pat` (trimmed compare).
+    fn find_line(lines: &[String], pat: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l.trim() == pat)
+            .unwrap_or_else(|| panic!("missing line {pat:?} in {lines:?}"))
+    }
+
+    #[test]
+    fn v163_t3_selective_side_outer() {
+        // PG19 puts the filtered (smaller) side outer: `2 = j2.a`
+        // selects ~1 of 4 rows, so j2 wins the outer slot (cost_nestloop:
+        // the inner scan is re-run per outer row).
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1, sj j2 WHERE j1.b = j2.b AND 2 = j2.a",
+        );
+        let outer = find_line(&lines, "->  Seq Scan on sj j2");
+        let inner = find_line(&lines, "->  Seq Scan on sj j1");
+        assert!(outer < inner, "j2 must be outer, got: {lines:?}");
+        assert!(lines.iter().any(|l| l.trim() == "Filter: (2 = a)"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "Join Filter: (j1.b = j2.b)")
+        );
+    }
+
+    #[test]
+    fn v163_t4_selective_side_outer() {
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT n2.a FROM sj n1, sj n2 WHERE n1.a <> n2.a AND n2.a = 1",
+        );
+        let outer = find_line(&lines, "->  Seq Scan on sj n2");
+        let inner = find_line(&lines, "->  Seq Scan on sj n1");
+        assert!(outer < inner, "n2 must be outer, got: {lines:?}");
+        assert!(lines.iter().any(|l| l.trim() == "Filter: (a = 1)"));
+    }
+
+    #[test]
+    fn v163_explicit_inner_join_swaps() {
+        // Site 2: explicit JOIN ... ON syntax gets the same treatment.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1 INNER JOIN sj j2 ON j1.b = j2.b WHERE 2 = j2.a",
+        );
+        let outer = find_line(&lines, "->  Seq Scan on sj j2");
+        let inner = find_line(&lines, "->  Seq Scan on sj j1");
+        assert!(outer < inner, "j2 must be outer, got: {lines:?}");
+    }
+
+    #[test]
+    fn v163_symmetric_keeps_from_order() {
+        // Tie: both sides unfiltered, same cost — strict `<` keeps FROM
+        // order (this is also PG's tie behavior: the first-added path wins).
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1, sj j2 WHERE j1.b = j2.b",
+        );
+        let j1 = find_line(&lines, "->  Seq Scan on sj j1");
+        let j2 = find_line(&lines, "->  Seq Scan on sj j2");
+        assert!(j1 < j2, "FROM order must be kept on a tie, got: {lines:?}");
+    }
+
+    #[test]
+    fn v163_already_selective_outer_no_swap() {
+        // The selective side is already outer: swapping would lose.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1, sj j2 WHERE j1.b = j2.b AND j1.a = 2",
+        );
+        let j1 = find_line(&lines, "->  Seq Scan on sj j1");
+        let j2 = find_line(&lines, "->  Seq Scan on sj j2");
+        assert!(j1 < j2, "selective j1 must stay outer, got: {lines:?}");
+        assert!(lines.iter().any(|l| l.trim() == "Filter: (a = 2)"));
+    }
+
+    #[test]
+    fn v163_left_join_keeps_written_order() {
+        // PG19 only tries both orders for JOIN_INNER (joinrels.c); outer
+        // joins keep their written order even when the inner side is
+        // more selective.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1 LEFT JOIN sj j2 ON j1.b = j2.b WHERE 2 = j2.a",
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Nested Loop Left Join")),
+            "must stay a left join, got: {lines:?}"
+        );
+        let j1 = find_line(&lines, "->  Seq Scan on sj j1");
+        let j2 = find_line(&lines, "->  Seq Scan on sj j2");
+        assert!(j1 < j2, "left join must keep written order, got: {lines:?}");
+    }
+
+    #[test]
+    fn v163_subquery_side_no_swap() {
+        // Fail closed: a non-scan side is unestimable, so FROM order is
+        // kept even when the subquery side is tiny.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj j1, (SELECT 1 AS x) q WHERE j1.a = 1",
+        );
+        let j1 = find_line(&lines, "->  Seq Scan on sj j1");
+        let q = lines
+            .iter()
+            .position(|l| l.contains("Subquery Scan"))
+            .expect("subquery scan");
+        assert!(j1 < q, "sj must stay outer, got: {lines:?}");
+    }
+
+    #[test]
+    fn v163_results_identical_after_swap() {
+        // Soundness: the swap only reorders EXPLAIN plan children (the
+        // executor never sees PlanNode), so results are unchanged. Run
+        // the t3/t4 queries for real and check the rows.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let rows_of = |eng: &mut Engine, sql: &str| -> Vec<Vec<String>> {
+            match run(eng, sql).expect("runs") {
+                ExecResult::Select { rows, .. } => rows
+                    .into_iter()
+                    .map(|r| {
+                        r.into_iter()
+                            .map(|c| c.to_text().unwrap_or("NULL".to_string()))
+                            .collect()
+                    })
+                    .collect(),
+                other => panic!("expected Select, got {:?}", other),
+            }
+        };
+        // t3: j1.b = j2.b AND 2 = j2.a. sj rows: (1,null,2),
+        // (null,2,null), (2,1,1), (3,1,3). j2.a = 2 -> j2 = (2,1,1);
+        // j1.b = 1 -> j1 = (2,1,1) and (3,1,3).
+        let mut t3 = rows_of(
+            &mut eng,
+            "SELECT j1.a, j2.a FROM sj j1, sj j2 WHERE j1.b = j2.b AND 2 = j2.a ORDER BY 1, 2",
+        );
+        t3.sort();
+        assert_eq!(
+            t3,
+            vec![
+                vec!["2".to_string(), "2".to_string()],
+                vec!["3".to_string(), "2".to_string()]
+            ]
+        );
+        // t4: n1.a <> n2.a AND n2.a = 1 -> n2 = (1,null,2); n1.a <>
+        // 1 -> n1 = (2,1,1), (3,1,3) (the null-a row fails the <>).
+        let mut t4 = rows_of(
+            &mut eng,
+            "SELECT n2.a FROM sj n1, sj n2 WHERE n1.a <> n2.a AND n2.a = 1 ORDER BY 1",
+        );
+        t4.sort();
+        assert_eq!(t4.len(), 2);
+        assert!(t4.iter().all(|r| r == &vec!["1".to_string()]));
+    }
+
+    #[test]
+    fn v163_conjunct_selectivity_shapes() {
+        // Unit-cover the selectivity shapes: Eq/Ne/range get opinions,
+        // unestimable shapes fail closed to 1.0.
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        let snap = eng.take_snapshot();
+        let db = &eng.db;
+        // No ANALYZE has run: est_eq_sel's no-stats default (0.1).
+        let col_a = Expr::Column {
+            table: Some("j2".to_string()),
+            name: "a".to_string(),
+        };
+        let lit2 = Expr::Literal(Literal::Int(2));
+        let eq = Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(lit2.clone()),
+            right: Box::new(col_a.clone()),
+        };
+        let s = est_conjunct_sel(
+            db,
+            "sj",
+            "j2",
+            &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
+            &eq,
+        );
+        assert!((s - 0.1).abs() < 1e-9, "eq selectivity, got {s}");
+        let ne = Expr::Cmp {
+            op: CmpOp::Ne,
+            left: Box::new(lit2.clone()),
+            right: Box::new(col_a.clone()),
+        };
+        let s = est_conjunct_sel(
+            db,
+            "sj",
+            "j2",
+            &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
+            &ne,
+        );
+        assert!((s - 0.9).abs() < 1e-9, "ne selectivity, got {s}");
+        let lt = Expr::Cmp {
+            op: CmpOp::Lt,
+            left: Box::new(col_a.clone()),
+            right: Box::new(lit2.clone()),
+        };
+        let s = est_conjunct_sel(
+            db,
+            "sj",
+            "j2",
+            &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
+            &lt,
+        );
+        assert!((s - 0.1).abs() < 1e-9, "range selectivity, got {s}");
+        // Column-vs-column: unestimable -> 1.0.
+        let col_b = Expr::Column {
+            table: Some("j2".to_string()),
+            name: "b".to_string(),
+        };
+        let cmp = Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(col_a.clone()),
+            right: Box::new(col_b),
+        };
+        let s = est_conjunct_sel(
+            db,
+            "sj",
+            "j2",
+            &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
+            &cmp,
+        );
+        assert!((s - 1.0).abs() < 1e-9, "unestimable must be 1.0, got {s}");
+        // IS NULL without stats: no opinion -> 1.0.
+        let isn = Expr::IsNull {
+            expr: Box::new(col_a),
+            neg: false,
+        };
+        let s = est_conjunct_sel(
+            db,
+            "sj",
+            "j2",
+            &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
+            &isn,
+        );
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "IS NULL without stats must be 1.0, got {s}"
+        );
+    }
+
+    #[test]
+    fn v163_t5_inner_pair_selective_outer() {
+        // t5's inner pair gets the pairwise PG-correct order (n2 outer);
+        // the full t5 still needs 3-way join reordering (documented gap).
+        let mut eng = engine();
+        setup_sj(&mut eng);
+        run(&mut eng, "CREATE TABLE sl (a int, b int, c int)").unwrap();
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM (SELECT n2.a FROM sj n1, sj n2 WHERE n1.a <> n2.a) q0, sl WHERE q0.a = 1",
+        );
+        // Inner nested loop: n2 (filtered) outer, n1 inner.
+        let n2 = lines
+            .iter()
+            .position(|l| l.contains("Seq Scan on sj n2"))
+            .expect("n2 scan");
+        let n1 = lines
+            .iter()
+            .position(|l| l.contains("Seq Scan on sj n1"))
+            .expect("n1 scan");
+        assert!(n2 < n1, "n2 must be the inner loop's outer, got: {lines:?}");
+    }
+}
+
 
 // ============================================================================
 // v1.62: tiny-table SeqScan choice (PG19 cost-model parity).

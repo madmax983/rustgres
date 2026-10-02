@@ -946,11 +946,12 @@ EXPECTED_PASS_OVERRIDES = [
     # vs one seq_page_cost for the seq scan), so `plan_access_path`
     # now forces SeqScan when the table's heap fits in one page.
     # Narrowly scoped to the four join.sql corpus statements verified
-    # against the PG19 .out oracle (the EXPLAIN comparison is
-    # order-insensitive, so the two nestloop side-swap siblings match
-    # as multisets). The fifth sibling (q0/sl) additionally needs
-    # cost-based join reordering, out of scope; the
-    # EXPLAIN-with-options mask stays for the rest.
+    # against the PG19 .out oracle. v1.63: the two nestloop side-swap
+    # siblings (t3/t4) now match the oracle byte-exactly — cost-based
+    # side selection (`pg_nestloop_swap`, cost_nestloop parity) puts the
+    # selective side outer — not just as multisets. The fifth sibling
+    # (q0/sl) additionally needs cost-based join reordering, out of
+    # scope; the EXPLAIN-with-options mask stays for the rest.
     (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
      r"(?:select\s+\*\s+from\s+sj\s+j1\s*,\s*sj\s+j2\s+where\s+"
      r"j1\.b\s*=\s*j2\.b\s+and\s+(?:j1\.a\s*=\s*2(\s+and\s+j2\.a\s*=\s*3)?|2\s*=\s*j2\.a)"
