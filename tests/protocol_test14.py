@@ -369,6 +369,11 @@ def t_nameless_index(c):
     c.q("CREATE TABLE t_idx (a int, b int)")
     _, _, codes, _ = c.q("CREATE INDEX ON t_idx (a, b)")
     check("k-nameless-create", not codes, f"{codes}")
+    # v1.62: PG19's cost model never index-scans a single-page relation,
+    # so seed past one heap page — this check is about the auto-name
+    # rendering in EXPLAIN, not the scan choice.
+    for i in range(400):
+        c.q(f"INSERT INTO t_idx VALUES ({i}, {i})")
     # PG auto-name convention: <table>_<cols>_idx — visible in EXPLAIN.
     _, rows, codes, _ = c.q("EXPLAIN SELECT * FROM t_idx WHERE a = 1 AND b = 2")
     plan = " ".join(r[0] for r in rows)

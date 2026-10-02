@@ -136,6 +136,14 @@ def main():
             if err:
                 print(f"setup failed: {sql}: {err}")
                 return 1
+        # v1.62: PG19's cost model never index-scans a single-page
+        # relation, so seed t1 past one heap page — the index-rendering
+        # checks below need the planner to keep the IndexScan.
+        for i in range(3, 403):
+            rows, _, err = q(s, f"INSERT INTO t1 VALUES ({i},'x')")
+            if err:
+                print(f"seed failed: {err}")
+                return 1
 
         # 1. Result column is exactly "QUERY PLAN"
         rows, cols, err = q(s, "EXPLAIN (COSTS OFF) SELECT 1")

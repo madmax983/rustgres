@@ -9640,6 +9640,29 @@ fn conjunct_bounds(
     }
 }
 
+/// v1.62: estimated heap page count for the scan-type choice — PG19's
+/// own heap-page accounting (`pg_heap_page_count`, the v1.41 port of
+/// hio.c placement) over every row version in the table. PG's planner
+/// costs `baserel->pages` (the physical page count, dead tuples
+/// included — rustgres has no VACUUM), so this deliberately ignores
+/// snapshot visibility, mirroring `relpages`.
+fn est_heap_pages(t: &Table) -> u64 {
+    // A page holds at most 291 minimum-size tuples
+    // (`MAX_HEAP_TUPLES_PER_PAGE` inside `pg_heap_page_count`); past
+    // that the table provably exceeds one page without measuring
+    // every tuple.
+    const MAX_TUPLES_PER_PAGE: usize = 291;
+    let mut lens: Vec<usize> = Vec::new();
+    for rv in &t.rows {
+        if lens.len() >= MAX_TUPLES_PER_PAGE {
+            return 2;
+        }
+        lens.push(pg_heap_tuple_len(t, rv));
+    }
+    // `pg_heap_page_count` returns bytes; one heap page is 8192.
+    pg_heap_page_count(t, &lens) / 8192
+}
+
 /// Planned access path for one base-table scan.
 #[derive(Clone, Debug)]
 enum AccessPath {
@@ -9795,7 +9818,22 @@ fn plan_access_path(
             });
         }
     }
-    best.unwrap_or(AccessPath::SeqScan)
+    // v1.62: PG19 cost-model parity for tiny tables. PG19's `cost_index`
+    // (costsize.c) can never beat `cost_seqscan` on a single-page
+    // relation: the index path's I/O floor is one `random_page_cost`
+    // (4x `seq_page_cost`) plus the index descent, while the seq scan
+    // reads the one page at `seq_page_cost` — and `index_pages_fetched`
+    // returns >= 1 for any positive fetch count on a 1-page table, so
+    // the inequality holds for every selectivity and correlation.
+    // PG therefore always Seq-Scans 1-page relations even when a usable
+    // index exists (e.g. join.out's `sj`, 4 rows on 1 page). The scan
+    // choice never changes results — both scans return the same rows
+    // and the full predicate is always re-applied — only the plan.
+    match best {
+        Some(AccessPath::IndexScan { .. }) if est_heap_pages(t) <= 1 => AccessPath::SeqScan,
+        Some(path) => path,
+        None => AccessPath::SeqScan,
+    }
 }
 
 /// Row-version ids from `ix` matching an equality `prefix` plus an
@@ -49032,6 +49070,17 @@ mod tests {
     fn index_scan_shares_table_row_storage() {
         let mut eng = engine();
         run(&mut eng, "CREATE INDEX users_id_ix ON users(id)").unwrap();
+        // v1.62: PG19's cost model never index-scans a single-page
+        // relation, so seed past one heap page to keep the index scan
+        // (the row-sharing assertion is about the executor, not the
+        // planner's scan choice).
+        for i in 4..=500 {
+            run(
+                &mut eng,
+                &format!("INSERT INTO users VALUES ({i}, 'n{i}')"),
+            )
+            .unwrap();
+        }
         let plan = rows_of(run(&mut eng, "EXPLAIN SELECT * FROM users WHERE id = 2").unwrap());
         let plan = plan.concat().join(" ");
         assert!(
@@ -62042,12 +62091,23 @@ mod v108_costs_off_tests {
         }
     }
 
+    /// v1.62: seed the table past one heap page so the planner
+    /// legitimately keeps the index scan — PG19's cost model never
+    /// index-scans a single-page relation, so these rendering tests
+    /// need a multi-page table to exercise the IndexScan path.
+    fn seed_multi_page(eng: &mut Engine, table: &str, vals: impl Fn(u32) -> String) {
+        for i in 1..=400 {
+            run(eng, &format!("INSERT INTO {table} VALUES {}", vals(i))).unwrap();
+        }
+    }
+
     #[test]
     fn index_cond_single_parens() {
         // v1.08: single index condition renders one paren pair: `(a = 42)`.
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int, b text)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        seed_multi_page(&mut eng, "t1", |i| format!("({i}, 'x')"));
         let plan = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42",
@@ -62062,6 +62122,7 @@ mod v108_costs_off_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        seed_multi_page(&mut eng, "t1", |i| format!("({i})"));
         let plan = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a > 10 AND a < 100",
@@ -62075,6 +62136,7 @@ mod v108_costs_off_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int, b text)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        seed_multi_page(&mut eng, "t1", |i| format!("({i}, 'hello')"));
         let plan = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE a = 42 AND b = 'hello'",
@@ -62089,6 +62151,7 @@ mod v108_costs_off_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1 (a int)").unwrap();
         run(&mut eng, "CREATE INDEX i1 ON t1 (a)").unwrap();
+        seed_multi_page(&mut eng, "t1", |i| format!("({i})"));
         let plan = plan_lines(
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 t WHERE t.a = 1",
@@ -71573,6 +71636,138 @@ mod v161_distinct_limit_tests {
         )
         .expect("runs")
         {
+            ExecResult::Select { rows, .. } => rows,
+            other => panic!("expected Select, got {:?}", other),
+        };
+        assert_eq!(out.len(), 1);
+    }
+}
+
+// ============================================================================
+// v1.62: tiny-table SeqScan choice (PG19 cost-model parity).
+// ============================================================================
+#[cfg(test)]
+mod v162_tiny_table_seqscan_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .map(|l| l.trim().to_string())
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn heap_pages(eng: &mut Engine, table: &str) -> u64 {
+        let snap = eng.take_snapshot();
+        let t = eng
+            .db
+            .find_table(table, &snap, &[9], 0)
+            .expect("table exists");
+        est_heap_pages(t)
+    }
+
+    #[test]
+    fn v162_tiny_indexed_table_plans_seqscan() {
+        // PG19's cost model never picks an index scan on a single-page
+        // relation (costsize.c: index I/O floor is random_page_cost +
+        // descent vs seq_page_cost for the seq scan).
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE sj (a int unique, b int, c int unique)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1), (3, 1, 3)",
+        )
+        .unwrap();
+        assert_eq!(heap_pages(&mut eng, "sj"), 1);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM sj WHERE a = 2");
+        assert!(
+            lines.iter().any(|l| l.contains("Seq Scan on sj")),
+            "tiny table must Seq Scan, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Index Scan")),
+            "no Index Scan on a 1-page table, got: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("Filter: (a = 2)")));
+    }
+
+    #[test]
+    fn v162_empty_indexed_table_plans_seqscan() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE e (a int unique)").unwrap();
+        assert_eq!(heap_pages(&mut eng, "e"), 0);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM e WHERE a = 1");
+        assert!(lines.iter().any(|l| l.contains("Seq Scan on e")));
+        assert!(!lines.iter().any(|l| l.contains("Index Scan")));
+    }
+
+    #[test]
+    fn v162_multi_page_table_keeps_indexscan() {
+        // The rule is conservative: past one page the index scan stays.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE big (a int unique, b text)").unwrap();
+        for i in 0..400 {
+            run(&mut eng, &format!("INSERT INTO big VALUES ({i}, 'x')")).unwrap();
+        }
+        assert!(heap_pages(&mut eng, "big") > 1);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM big WHERE a = 42",
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Index Scan")),
+            "multi-page table must keep its Index Scan, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn v162_scan_choice_does_not_change_results() {
+        // Scan-type choice changes the plan, never the rows: the full
+        // predicate is always re-applied by the executor.
+        let mut eng = engine();
+        run(
+            &mut eng,
+            "CREATE TABLE sj (a int unique, b int, c int unique)",
+        )
+        .unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1), (3, 1, 3)",
+        )
+        .unwrap();
+        let out = match run(&mut eng, "SELECT a, b, c FROM sj WHERE a = 2").expect("runs") {
             ExecResult::Select { rows, .. } => rows,
             other => panic!("expected Select, got {:?}", other),
         };

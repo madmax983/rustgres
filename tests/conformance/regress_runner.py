@@ -940,6 +940,24 @@ EXPECTED_PASS_OVERRIDES = [
      r"select\s+distinct\s+four\s*(,\s*1\s*,\s*2\s*,\s*3\s*)?"
      r"from\s+tenk1\s+where\s+four\s*=\s*0\s*;?\s*$",
      "v1.61: redundant DISTINCT keys plan as LIMIT 1"),
+    # v1.62: tiny-table SeqScan choice — PG19's cost model (costsize.c)
+    # never picks an index scan on a single-page relation (the index
+    # path's I/O floor is one random_page_cost plus the index descent
+    # vs one seq_page_cost for the seq scan), so `plan_access_path`
+    # now forces SeqScan when the table's heap fits in one page.
+    # Narrowly scoped to the four join.sql corpus statements verified
+    # against the PG19 .out oracle (the EXPLAIN comparison is
+    # order-insensitive, so the two nestloop side-swap siblings match
+    # as multisets). The fifth sibling (q0/sl) additionally needs
+    # cost-based join reordering, out of scope; the
+    # EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"(?:select\s+\*\s+from\s+sj\s+j1\s*,\s*sj\s+j2\s+where\s+"
+     r"j1\.b\s*=\s*j2\.b\s+and\s+(?:j1\.a\s*=\s*2(\s+and\s+j2\.a\s*=\s*3)?|2\s*=\s*j2\.a)"
+     r"|select\s+n2\.a\s+from\s+sj\s+n1\s*,\s*sj\s+n2\s+where\s+"
+     r"n1\.a\s*<>\s*n2\.a\s+and\s+n2\.a\s*=\s*1)"
+     r"\s*;?\s*$",
+     "v1.62: single-page table forces SeqScan over IndexScan"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
