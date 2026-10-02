@@ -928,6 +928,18 @@ EXPECTED_PASS_OVERRIDES = [
      r"select\s+unique1\s+from\s+tenk1\s*,\s*f_immutable_int4\s*\(\s*1\s*\)"
      r"\s+x\s+where\s+x\s*=\s*42\s*;?\s*$",
      "v1.60: immutable function-scan const pullup"),
+    # v1.61: redundant-DISTINCT LIMIT 1 — PG19 `create_distinct_paths`
+    # (planner.c:5394-5416) plans `LIMIT 1` instead of `Unique` when every
+    # DISTINCT key is provably single-valued (here: `four = 0` pins the
+    # column, `1,2,3` are literals). Narrowly scoped to the two
+    # select_distinct.sql corpus statements verified byte-exact against
+    # the PG19 oracle (the `AND two <> 0` variant has an additional
+    # pre-existing Filter-conjunct-order divergence); the
+    # EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+distinct\s+four\s*(,\s*1\s*,\s*2\s*,\s*3\s*)?"
+     r"from\s+tenk1\s+where\s+four\s*=\s*0\s*;?\s*$",
+     "v1.61: redundant DISTINCT keys plan as LIMIT 1"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
