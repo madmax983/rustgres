@@ -11901,13 +11901,25 @@ fn pg_fold_and(cs: Vec<Expr>) -> Option<Expr> {
 /// v1.48: PG19's text label for a nested-loop join kind (explain.c
 /// `ExplainNode`: the jointype switch appends to the `"Nested Loop"`
 /// pname; inner renders bare, and cross joins plan as inner so PG has no
-/// cross label). rustgres's `JoinKind` has no semi/anti variants.
+/// cross label). v1.68: `JoinKind::Anti` renders `Nested Loop Anti Join`
+/// (PG19 `JOIN_ANTI`); the variant exists for the EXPLAIN planner only.
 fn pg_join_label(kind: JoinKind) -> &'static str {
     match kind {
         JoinKind::Left => "Nested Loop Left Join",
         JoinKind::Right => "Nested Loop Right Join",
         JoinKind::Full => "Nested Loop Full Join",
+        JoinKind::Anti => "Nested Loop Anti Join",
         JoinKind::Inner | JoinKind::Cross => "Nested Loop",
+    }
+}
+
+/// v1.68: PG19's text label for a hash-join kind (explain.c `ExplainNode`:
+/// `" %s Join"` interpolated for non-inner jointypes, bare `"Hash Join"`
+/// for `JOIN_INNER`).
+fn pg_hash_join_label(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Anti => "Hash Anti Join",
+        _ => "Hash Join",
     }
 }
 
@@ -12299,6 +12311,10 @@ enum PlanNode {
         rows: u64,
         outer: Box<PlanNode>,
         inner: Box<PlanNode>,
+        /// v1.68: the join kind. PG19 interpolates it into the node label
+        /// (explain.c `ExplainNode`): `Hash Anti Join` for `JOIN_ANTI`;
+        /// inner renders bare `Hash Join`.
+        kind: JoinKind,
         // v1.46: VERBOSE `Output:` entries.
         output: Vec<String>,
     },
@@ -15580,6 +15596,9 @@ fn plan_from_item(
                                 });
                             }
                             JoinKind::Right | JoinKind::Full => {}
+                            // v1.68: `JoinKind::Anti` is EXPLAIN-planner
+                            // only (never parsed from a FROM join).
+                            JoinKind::Anti => {}
                         }
                     }
                 }
@@ -15895,6 +15914,7 @@ fn plan_from_item(
                     rows,
                     outer: Box::new(h_outer),
                     inner: Box::new(h_inner),
+                    kind: JoinKind::Inner,
                     output: h_output,
                 })
             } else {
@@ -16578,6 +16598,423 @@ fn pg_result_replaces(from: &[FromItem]) -> Option<String> {
     }
 }
 
+// ============================================================================
+// v1.68: NOT IN / NOT EXISTS → Hash Anti Join (PG19 subselect.c
+// `convert_ANY_sublink_to_join` / `convert_EXISTS_sublink_to_join`,
+// called from `pull_up_sublinks` in prepjointree.c).
+// ============================================================================
+
+/// v1.68: catalog NOT NULL check for a plain column (the catalog half of
+/// PG19 `sublink_testexpr_is_not_nullable` /
+/// `query_outputs_are_not_nullable`: "if we can prove that neither the
+/// outer query's expressions nor the sub-select's output columns can be
+/// NULL, and further that the operator itself cannot return NULL for
+/// non-null inputs, then the logic is identical and it's safe to convert
+/// NOT IN to an anti-join", subselect.c:1355-1362). Fail-closed: unknown
+/// table or column reads as nullable.
+fn pg_anti_col_not_null(
+    eng: &Engine,
+    table: &str,
+    col: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    eng.db
+        .find_table(table, snap, &[own], session)
+        .and_then(|t| {
+            t.columns
+                .iter()
+                .position(|(n, _)| n == col)
+                .and_then(|i| t.not_null.get(i).copied())
+        })
+        .unwrap_or(false)
+}
+
+/// v1.68: PG19 `set_rtable_names` (ruleutils.c:4288-4380) alias
+/// uniquification for EXPLAIN. Names are taken in rtable order (outer
+/// tables first, then the pulled-up subquery's tables); a user alias wins
+/// over the relation name; the first use keeps the bare name and each
+/// later collision appends `_1`, `_2`, ... (the hash counter starts at 0
+/// and is pre-incremented, so the first collision is `_1`).
+fn pg_anti_unique_names(names: &[String]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut counters: HashMap<String, u64> = HashMap::new();
+    names
+        .iter()
+        .map(|n| {
+            if seen.insert(n.clone()) {
+                counters.insert(n.clone(), 0);
+                n.clone()
+            } else {
+                let c = counters.entry(n.clone()).or_insert(0);
+                // Mirror PG's do/while: keep incrementing until the
+                // suffixed name is itself unused.
+                loop {
+                    *c += 1;
+                    let cand = format!("{n}_{c}");
+                    if seen.insert(cand.clone()) {
+                        return cand;
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+/// v1.68: set `alias` on every unaliased scan node in the subtree (the
+/// pulled-up subquery's table after `set_rtable_names` uniquification).
+/// Only `SeqScan`/`IndexScan` carry aliases; anything else is left alone
+/// (a non-scan inner shape fails the v1.68 shape gate before this runs).
+fn pg_anti_set_scan_alias(node: &mut PlanNode, alias: &str) {
+    match node {
+        PlanNode::SeqScan { alias: a, .. } | PlanNode::IndexScan { alias: a, .. } => {
+            if a.is_none() {
+                *a = Some(alias.to_string());
+            }
+        }
+        PlanNode::NestedLoop { outer, inner, .. } | PlanNode::HashJoin { outer, inner, .. } => {
+            pg_anti_set_scan_alias(outer, alias);
+            pg_anti_set_scan_alias(inner, alias);
+        }
+        PlanNode::Materialize { child, .. }
+        | PlanNode::Aggregate { child, .. }
+        | PlanNode::Unique { child, .. }
+        | PlanNode::Sort { child, .. }
+        | PlanNode::Limit { child, .. }
+        | PlanNode::SubqueryScan { child, .. } => pg_anti_set_scan_alias(child, alias),
+        _ => {}
+    }
+}
+
+/// v1.68: does this qualifier name the given table (by relation name or
+/// user alias)? `None` (unqualified) never matches here — callers resolve
+/// unqualified columns against the single-table shape separately.
+fn pg_anti_qual_is(qual: &Option<String>, table: &str, alias: &Option<String>) -> bool {
+    match qual {
+        Some(q) => q == table || Some(q) == alias.as_ref(),
+        None => false,
+    }
+}
+
+/// v1.68: shared shape gate for the pulled-up anti-join subquery: single
+/// plain table, no setops/grouping/distinct/ordering/CTEs. Mirrors PG19
+/// `simplify_EXISTS_query`'s rejections (subselect.c:1804-1814), minus the
+/// constant-LIMIT carve-out which each path handles itself. Returns the
+/// inner table name and user alias.
+fn pg_anti_gate_sub(sub: &SelectStmt) -> Option<(String, Option<String>)> {
+    if !sub.with.is_empty()
+        || sub.set_op.is_some()
+        || !sub.group_by.is_empty()
+        || sub.having.is_some()
+        || sub.distinct
+        || !sub.distinct_on.is_empty()
+        || !sub.order_by.is_empty()
+        || sub.offset.is_some()
+    {
+        return None;
+    }
+    match sub.from.as_slice() {
+        [FromItem::Table { name, alias, .. }] => Some((name.clone(), alias.clone())),
+        _ => None,
+    }
+}
+
+/// v1.68: the `NOT EXISTS` half of `pg_try_anti_join` (PG19
+/// `convert_EXISTS_sublink_to_join`, subselect.c:1590). Returns the
+/// `(outer_col, inner_col, inner_table, inner_alias, inner_subquery)` tuple
+/// on success, `Ok(None)` when the sublink is not convertible (fail closed).
+fn anti_from_exists(
+    outer_table: &str,
+    outer_alias: &Option<String>,
+    sub: &SelectStmt,
+) -> Result<Option<(String, String, String, Option<String>, SelectStmt)>, ExecError> {
+    // PG requires no nullability proof for EXISTS (it is never NULL), but
+    // the subquery must simplify: no setops, aggs, grouping sets, HAVING,
+    // OFFSET (subselect.c:1804-1814), and a constant positive LIMIT is
+    // dropped, not planned.
+    if let Some(n) = sub.limit {
+        if n <= 0 {
+            return Ok(None);
+        }
+    }
+    let (inner_table, inner_alias) = match pg_anti_gate_sub(sub) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let w = match &sub.where_ {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let (left, right) = match w {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return Ok(None),
+    };
+    // One side must name the inner table, the other the outer table (the
+    // correlation). Both sides must be qualified — unqualified sides are
+    // ambiguous without namespace resolution, so fail closed.
+    let side_of = |e: &Expr| -> Option<bool> {
+        match e {
+            Expr::Column { table: qt, .. } => {
+                if pg_anti_qual_is(qt, &inner_table, &inner_alias) {
+                    Some(true)
+                } else if pg_anti_qual_is(qt, outer_table, outer_alias) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    let (inner_e, outer_e) = match (side_of(left), side_of(right)) {
+        (Some(true), Some(false)) => (left, right),
+        (Some(false), Some(true)) => (right, left),
+        _ => return Ok(None),
+    };
+    let col_name = |e: &Expr| match e {
+        Expr::Column { name, .. } => name.clone(),
+        _ => String::new(),
+    };
+    let mut inner_sub = sub.clone();
+    inner_sub.limit = None;
+    Ok(Some((
+        col_name(outer_e),
+        col_name(inner_e),
+        inner_table,
+        inner_alias,
+        inner_sub,
+    )))
+}
+
+/// v1.68: try to plan `SELECT ... FROM <single table> WHERE <single
+/// NOT IN / NOT EXISTS sublink>` as a PG19 `Hash Anti Join`.
+///
+/// This mirrors `convert_ANY_sublink_to_join` (for `NOT (x = ANY
+/// (subquery))`, i.e. `NOT IN`) and `convert_EXISTS_sublink_to_join` (for
+/// `NOT EXISTS`), which build a `JOIN_ANTI` JoinExpr when the sublink is
+/// convertible, and fail closed otherwise.
+///
+/// EXPLAIN-path only (called with `pg == true`): like every other
+/// `PlanNode`, the executor never sees the node — it keeps its own
+/// per-row `InSub`/`Exists` subplan evaluation — so results are identical
+/// by construction (the v1.64 display-only precedent). A `None` return
+/// falls through to the normal planner; any shape outside the narrow
+/// v1.68 gate (multi-table subqueries, grouping, expression keys, ...)
+/// returns `None` rather than guessing.
+fn pg_try_anti_join(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    // --- gate 1: the whole WHERE is one negated sublink ---
+    let w = match &stmt.where_ {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    // --- gate 2: single plain outer table (the anti join's preserved side)
+    let (outer_table, outer_alias) = match stmt.from.as_slice() {
+        [FromItem::Table { name, alias, .. }] => (name.clone(), alias.clone()),
+        _ => return Ok(None),
+    };
+    // --- gate 3: no outer query features beyond a plain SELECT ---
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+    {
+        return Ok(None);
+    }
+
+    // The equijoin key pair, outer column first, plus the subquery to plan
+    // as the inner (build) side.
+    let (outer_col, inner_col, inner_table, inner_alias, inner_sub): (
+        String,
+        String,
+        String,
+        Option<String>,
+        SelectStmt,
+    ) = match w {
+        // --- NOT EXISTS: parses as `Not(Exists{neg: false})` ---
+        Expr::Not(inner) => match inner.as_ref() {
+            Expr::Exists { sub, neg: false } => {
+                match anti_from_exists(&outer_table, &outer_alias, sub)? {
+                    Some(t) => t,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        },
+        // --- NOT EXISTS (defensive: a direct negated form) ---
+        Expr::Exists { sub, neg: true } => {
+            match anti_from_exists(&outer_table, &outer_alias, sub)? {
+                Some(t) => t,
+                None => return Ok(None),
+            }
+        }
+        // --- NOT IN: `NOT (outer_col = ANY (SELECT inner_col ...))` ---
+        Expr::InSub {
+            expr,
+            sub,
+            neg: true,
+        } => {
+            // The outer key must be a plain column: PG's
+            // `sublink_testexpr_is_not_nullable` additionally requires the
+            // operator to be a safe index member (`op_is_safe_index_member`
+            // as a proxy for "cannot return NULL for non-null inputs");
+            // rustgres's hashable equality is `CmpOp::Eq`, which the
+            // `InSub` desugar guarantees.
+            let outer_col = match expr.as_ref() {
+                Expr::Column { table: qt, name } => {
+                    let names_outer = match qt {
+                        None => true,
+                        Some(_) => pg_anti_qual_is(qt, &outer_table, &outer_alias),
+                    };
+                    if !names_outer {
+                        return Ok(None);
+                    }
+                    // The .out corpus notes for the outer side: "we don't
+                    // check outer query quals for now" — catalog NOT NULL
+                    // only.
+                    if !pg_anti_col_not_null(eng, &outer_table, name, snap, own, session) {
+                        return Ok(None);
+                    }
+                    name.clone()
+                }
+                _ => return Ok(None),
+            };
+            let (inner_table, inner_alias) = match pg_anti_gate_sub(sub.as_ref()) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            // Single unaliased output column (the pulled-up join key).
+            let inner_col = match sub.items.as_slice() {
+                [SelectItem::Expr { expr, alias: None }] => match expr {
+                    Expr::Column { table: qt, name } => {
+                        let names_inner = match qt {
+                            None => true,
+                            Some(_) => pg_anti_qual_is(qt, &inner_table, &inner_alias),
+                        };
+                        if !names_inner {
+                            return Ok(None);
+                        }
+                        name.clone()
+                    }
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            // PG's `query_outputs_are_not_nullable`: catalog NOT NULL, or
+            // forced by an `IS NOT NULL` qual on the (non-outerjoined)
+            // subquery table — `find_subquery_safe_quals` +
+            // `find_nonnullable_vars` (clauses.c:2075).
+            let forced = match &sub.where_ {
+                Some(Expr::IsNull { expr, neg: true }) => match expr.as_ref() {
+                    Expr::Column { table: qt, name } => {
+                        name == &inner_col
+                            && match qt {
+                                None => true,
+                                Some(_) => pg_anti_qual_is(qt, &inner_table, &inner_alias),
+                            }
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !forced && !pg_anti_col_not_null(eng, &inner_table, &inner_col, snap, own, session) {
+                return Ok(None);
+            }
+            // Anything beyond the null-forcing qual is outside the v1.68
+            // shape (it would render as an extra inner Filter PG might
+            // place differently); fail closed.
+            if sub.where_.is_some() && !forced {
+                return Ok(None);
+            }
+            if sub.limit.is_some() {
+                return Ok(None);
+            }
+            (
+                outer_col,
+                inner_col,
+                inner_table,
+                inner_alias,
+                (**sub).clone(),
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    // --- build the two sides with the existing planner ---
+    // Outer: the FROM with the converted sublink removed (PG replaces the
+    // SubLink with constant TRUE and elides it, subselect.c:1326-1328).
+    let mut outer_stmt = stmt.clone();
+    outer_stmt.where_ = None;
+    let outer = plan_select(
+        eng,
+        &outer_stmt,
+        snap,
+        own,
+        session,
+        outer_ctes,
+        true,
+        verbose,
+    )?;
+    // Inner: the pulled-up subquery, planned as the hash build side.
+    let inner_plan = plan_select(
+        eng, &inner_sub, snap, own, session, outer_ctes, true, verbose,
+    )?;
+
+    // --- PG19 `set_rtable_names` uniquification (ruleutils.c) ---
+    let outer_name = outer_alias.clone().unwrap_or_else(|| outer_table.clone());
+    let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
+    let uniq = pg_anti_unique_names(&[outer_name.clone(), inner_name.clone()]);
+    let (outer_ref, inner_ref) = (uniq[0].clone(), uniq[1].clone());
+
+    // The inner scan takes the uniquified name when it collides (PG prints
+    // `Seq Scan on not_null_tab not_null_tab_1`); the scan-qual rule
+    // (`show_scan_qual`: no prefix for plain scans) keeps any inner
+    // Filter unqualified, so the already-deparsed text stays valid.
+    let mut inner = inner_plan;
+    if inner_ref != inner_name {
+        pg_anti_set_scan_alias(&mut inner, &inner_ref);
+    }
+
+    // `Hash Cond:` with the outer var on the left (PG19
+    // `create_hashjoin_plan` / `get_switched_clauses`); upper-qual
+    // `useprefix` (rtable_size > 1) always qualifies here.
+    let hash_cond = format!(
+        "({}.{} = {}.{})",
+        pg_quote_ident(&outer_ref),
+        pg_quote_ident(&outer_col),
+        pg_quote_ident(&inner_ref),
+        pg_quote_ident(&inner_col),
+    );
+    let rows = outer.rows();
+    let output = outer.output().to_vec();
+    Ok(Some(PlanNode::HashJoin {
+        filter: None,
+        hash_cond,
+        rows,
+        outer: Box::new(outer),
+        inner: Box::new(inner),
+        kind: JoinKind::Anti,
+        output,
+    }))
+}
+
 fn plan_select(
     eng: &Engine,
     stmt: &SelectStmt,
@@ -16606,6 +17043,16 @@ fn plan_select(
     let mut eff: Vec<CteDef> = outer_ctes.to_vec();
     eff.extend(stmt.with.iter().cloned());
     let ctes: &[CteDef] = &eff;
+    // v1.68: PG19 NOT IN / NOT EXISTS → Hash Anti Join
+    // (`convert_ANY_sublink_to_join` / `convert_EXISTS_sublink_to_join`,
+    // subselect.c). EXPLAIN-path only (`pg`); the executor never sees the
+    // node, so a wrong shape here can only misrender a plan, never
+    // misexecute a query. Fail-closed: `None` falls through below.
+    if pg {
+        if let Some(node) = pg_try_anti_join(eng, stmt, snap, own, session, ctes, verbose)? {
+            return Ok(node);
+        }
+    }
     // v1.47: PG `remove_useless_joins` (analyzejoins.c, full) as a fixpoint
     // preprocess rewrite of the FROM tree, mirroring PG's planner ordering:
     // before name/type context construction and WHERE distribution below.
@@ -17261,9 +17708,12 @@ fn render_plan(
             hash_cond,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{pad}Hash Join"));
+            // v1.68: the join kind interpolates into the node label
+            // (PG19 explain.c `ExplainNode`): `Hash Anti Join`.
+            out.push(format!("{pad}{}", pg_hash_join_label(*kind)));
             push_output(out);
             out.push(format!("{ppad}Hash Cond: {hash_cond}"));
             if let Some(f) = filter {
@@ -17391,9 +17841,11 @@ fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             rows,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{pad}Hash Join (rows={rows})"));
+            // v1.68: kind interpolates into the label (PG19 explain.c).
+            out.push(format!("{pad}{} (rows={rows})", pg_hash_join_label(*kind)));
             out.push(format!("{pad}  Hash Cond: {hash_cond}"));
             if let Some(f) = filter {
                 out.push(format!("{pad}  Join Filter: {f}"));
@@ -17660,9 +18112,11 @@ fn render_analyze(
             hash_cond,
             outer,
             inner,
+            kind,
             ..
         } => {
-            out.push(format!("{}Hash Join {}", pad, tag));
+            // v1.68: kind interpolates into the label (PG19 explain.c).
+            out.push(format!("{}{} {}", pad, pg_hash_join_label(*kind), tag));
             out.push(format!("{}Hash Cond: {}", ppad, hash_cond));
             if let Some(f) = filter {
                 out.push(format!("{}Join Filter: {}", ppad, f));
@@ -73950,5 +74404,309 @@ mod v162_tiny_table_seqscan_tests {
             other => panic!("expected Select, got {:?}", other),
         };
         assert_eq!(out.len(), 1);
+    }
+}
+
+// ============================================================================
+// v1.68: NOT IN / NOT EXISTS → Hash Anti Join (PG19 subselect.c
+// `convert_ANY_sublink_to_join` / `convert_EXISTS_sublink_to_join`).
+// ============================================================================
+#[cfg(test)]
+mod v168_hash_anti_join_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn select_texts(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Select { rows, .. } => rows
+                .into_iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| v.to_text().unwrap_or("NULL".to_string()))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect(),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    fn setup_notnull(eng: &mut Engine) {
+        run(eng, "CREATE TABLE not_null_tab (id int NOT NULL)").unwrap();
+        run(eng, "INSERT INTO not_null_tab VALUES (1),(2),(3)").unwrap();
+        run(eng, "CREATE TABLE null_tab (id int)").unwrap();
+        run(eng, "INSERT INTO null_tab VALUES (1),(NULL),(3)").unwrap();
+    }
+
+    /// v1.68: T11 — `NOT IN` with both sides provably NOT NULL plans as a
+    /// PG19 `Hash Anti Join`; the pulled-up inner table collides with the
+    /// outer name, so `set_rtable_names` (ruleutils.c) renames it
+    /// `not_null_tab_1`. Byte-exact vs the subselect.out oracle.
+    #[test]
+    fn v168_not_in_both_notnull_is_hash_anti_join() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM not_null_tab \
+             WHERE id NOT IN (SELECT id FROM not_null_tab)",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Hash Anti Join".to_string(),
+                "  Hash Cond: (not_null_tab.id = not_null_tab_1.id)".to_string(),
+                "  ->  Seq Scan on not_null_tab".to_string(),
+                "  ->  Hash".to_string(),
+                "        ->  Seq Scan on not_null_tab not_null_tab_1".to_string(),
+            ]
+        );
+    }
+
+    /// v1.68: T12 — the inner side forced non-nullable by an
+    /// `IS NOT NULL` qual (`query_outputs_are_not_nullable` via
+    /// `find_subquery_safe_quals`, clauses.c:2075) still converts; the
+    /// qual renders as an unqualified inner `Filter:` (PG19
+    /// `show_scan_qual`: no prefix for plain scans).
+    #[test]
+    fn v168_not_in_inner_forced_notnull_keeps_filter() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM not_null_tab \
+             WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL)",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Hash Anti Join".to_string(),
+                "  Hash Cond: (not_null_tab.id = null_tab.id)".to_string(),
+                "  ->  Seq Scan on not_null_tab".to_string(),
+                "  ->  Hash".to_string(),
+                "        ->  Seq Scan on null_tab".to_string(),
+                "              Filter: (id IS NOT NULL)".to_string(),
+            ]
+        );
+    }
+
+    /// v1.68: T10 — correlated `NOT EXISTS` needs no nullability proof
+    /// (EXISTS is never NULL); the `LIMIT 1` is dropped by PG19
+    /// `simplify_EXISTS_query`, and the WHERE equijoin becomes the hash
+    /// clause with the outer var on the left.
+    #[test]
+    fn v168_not_exists_correlated_is_hash_anti_join() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE int4_tbl (f1 int)").unwrap();
+        let lines = plan_lines(
+            &mut eng,
+            "explain (costs off) select * from int4_tbl o where not exists \
+             (select 1 from int4_tbl i where i.f1=o.f1 limit 1)",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Hash Anti Join".to_string(),
+                "  Hash Cond: (o.f1 = i.f1)".to_string(),
+                "  ->  Seq Scan on int4_tbl o".to_string(),
+                "  ->  Hash".to_string(),
+                "        ->  Seq Scan on int4_tbl i".to_string(),
+            ]
+        );
+    }
+
+    /// v1.68: fail-closed — a nullable outer side must NOT convert (PG19:
+    /// "No ANTI JOIN: outer side is nullable"). The plan stays a plain
+    /// Seq Scan with the sublink as a filter.
+    #[test]
+    fn v168_nullable_outer_stays_seqscan() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM null_tab \
+             WHERE id NOT IN (SELECT id FROM not_null_tab)",
+        );
+        assert_eq!(lines[0], "Seq Scan on null_tab");
+        assert!(
+            !lines.iter().any(|l| l.contains("Anti Join")),
+            "no anti join expected, got: {lines:?}"
+        );
+    }
+
+    /// v1.68: fail-closed — a nullable inner side with no `IS NOT NULL`
+    /// qual must NOT convert (PG19: "No ANTI JOIN: inner side is
+    /// nullable").
+    #[test]
+    fn v168_nullable_inner_stays_seqscan() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM not_null_tab \
+             WHERE id NOT IN (SELECT id FROM null_tab)",
+        );
+        assert_eq!(lines[0], "Seq Scan on not_null_tab");
+        assert!(
+            !lines.iter().any(|l| l.contains("Anti Join")),
+            "no anti join expected, got: {lines:?}"
+        );
+    }
+
+    /// v1.68: the COSTS ON (legacy) rendering path is untouched by the
+    /// anti-join planner (the hook only fires for `pg == true`).
+    #[test]
+    fn v168_costs_on_unaffected() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN SELECT * FROM not_null_tab \
+             WHERE id NOT IN (SELECT id FROM not_null_tab)",
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Anti Join")),
+            "COSTS ON must not use the anti-join path, got: {lines:?}"
+        );
+    }
+
+    /// v1.68: PG19 `set_rtable_names` uniquification — first use keeps the
+    /// bare name, collisions get `_1`, `_2`, ... (ruleutils.c:4335-4370).
+    #[test]
+    fn v168_unique_names_collide_with_suffix() {
+        assert_eq!(
+            pg_anti_unique_names(&["a".to_string(), "a".to_string(), "b".to_string()]),
+            vec!["a".to_string(), "a_1".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            pg_anti_unique_names(&["a".to_string(), "a".to_string(), "a".to_string()]),
+            vec!["a".to_string(), "a_1".to_string(), "a_2".to_string()]
+        );
+        // A suffixed name that is itself taken pushes the collision on.
+        assert_eq!(
+            pg_anti_unique_names(&["a_1".to_string(), "a".to_string(), "a".to_string()]),
+            vec!["a_1".to_string(), "a".to_string(), "a_2".to_string()]
+        );
+    }
+
+    /// v1.68: result identity — the classic `NOT IN` NULL trap. A NULL in
+    /// the inner set makes the whole predicate unknown, so NO rows come
+    /// back (the executor's own subplan evaluation; the EXPLAIN node is
+    /// display-only and never changes this).
+    #[test]
+    fn v168_not_in_null_trap_result_identity() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        // null_tab = (1), (NULL), (3): the NULL poisons the NOT IN.
+        assert_eq!(
+            select_texts(
+                &mut eng,
+                "SELECT * FROM not_null_tab WHERE id NOT IN (SELECT id FROM null_tab)"
+            ),
+            Vec::<String>::new(),
+        );
+        // With the NULL filtered out, the anti join's rows appear.
+        assert_eq!(
+            select_texts(
+                &mut eng,
+                "SELECT * FROM not_null_tab \
+                 WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL)"
+            ),
+            vec!["2".to_string()],
+        );
+        // Both sides provably non-null: plain anti semantics.
+        assert_eq!(
+            select_texts(
+                &mut eng,
+                "SELECT * FROM not_null_tab WHERE id NOT IN (SELECT id FROM not_null_tab)"
+            ),
+            Vec::<String>::new(),
+        );
+    }
+
+    /// v1.68: result identity — `NOT EXISTS` with NULL keys on both sides.
+    /// EXISTS/NOT EXISTS is never NULL itself, so NULL keys simply never
+    /// match (no poisoning, unlike `NOT IN`).
+    #[test]
+    fn v168_not_exists_null_keys_result_identity() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        // not_null_tab(1,2,3) NOT EXISTS null_tab(1,NULL,3) on id=id:
+        // 1 and 3 match, NULL never matches → only 2 survives.
+        assert_eq!(
+            select_texts(
+                &mut eng,
+                "SELECT * FROM not_null_tab o WHERE NOT EXISTS \
+                 (SELECT 1 FROM null_tab i WHERE i.id = o.id)"
+            ),
+            vec!["2".to_string()],
+        );
+        // NULL outer keys never match either: null_tab's NULL row survives
+        // (no NOT NULL constraint here, so the plan stays a filter — the
+        // rows are what matter).
+        let mut got = select_texts(
+            &mut eng,
+            "SELECT id FROM null_tab o WHERE NOT EXISTS \
+             (SELECT 1 FROM not_null_tab i WHERE i.id = o.id)",
+        );
+        got.sort();
+        assert_eq!(got, vec!["NULL".to_string()]);
+    }
+
+    /// v1.68: the EXPLAIN shape and the executed rows agree — the plan
+    /// claims an anti join and the executor returns exactly the anti
+    /// join's rows.
+    #[test]
+    fn v168_plan_shape_matches_executed_rows() {
+        let mut eng = engine();
+        setup_notnull(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM not_null_tab \
+             WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL)",
+        );
+        assert_eq!(lines[0], "Hash Anti Join");
+        assert_eq!(
+            select_texts(
+                &mut eng,
+                "SELECT * FROM not_null_tab \
+                 WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL)"
+            ),
+            vec!["2".to_string()],
+        );
     }
 }

@@ -1574,6 +1574,13 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// v1.68: PG19 `JOIN_ANTI` (primnodes.h) — the anti-join produced by
+    /// `convert_ANY_sublink_to_join` / `convert_EXISTS_sublink_to_join`
+    /// (subselect.c) for `NOT IN` / `NOT EXISTS`. EXPLAIN renders it
+    /// interpolated into the node label (`Hash Anti Join`, explain.c
+    /// `ExplainNode`). Never produced by the SQL parser (there is no
+    /// `ANTI JOIN` syntax); only by the EXPLAIN planner.
+    Anti,
 }
 
 /// A full SELECT statement (v0.6).
