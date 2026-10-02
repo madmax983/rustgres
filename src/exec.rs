@@ -10519,6 +10519,11 @@ fn pg_literal_to_f64(lit: &Literal) -> Option<f64> {
         Literal::Float(f) => Some(*f),
         Literal::Real(r) => Some(f64::from(*r)),
         Literal::Decimal(s) => s.parse::<f64>().ok(),
+        // v1.58: substituted EXECUTE arguments round-trip through
+        // Value::Numeric, so parameter-derived literals arrive as
+        // Numeric rather than Decimal; Numeric::to_f64 is PG19's
+        // numeric_float8 (correctly rounded).
+        Literal::Numeric(n) => Some(n.to_f64()),
         Literal::Text(s) => s.trim().parse::<f64>().ok(),
         _ => None,
     }
@@ -11102,19 +11107,23 @@ fn pg_expr_target(
             let r = pg_expr_target(right, pctx, qualify, tgt_r)?;
             // v1.50: Paren-marking for pulled-up non-Column exprs (T2).
             // Per ruleutils.c `get_special_variable`, a non-Var referent
-            // through a special varno forces parens. If the expr is in
-            // `pulled_exprs` and is a bare Literal (not already parenthesized
-            // like a Cast), wrap in parens.
-            let l = if matches!(&**left, Expr::Literal(_))
-                && pctx.pulled_exprs.contains(left)
-            {
+            // through a special varno forces parens.
+            // v1.58: a Cast of a literal also needs the parens now that
+            // the Cast arm renders `'lit'::type` without outer parens
+            // (PG folds the cast at plan time; the pull-up parens come
+            // from get_special_variable, not the cast). A Cast of a
+            // non-literal still renders parenthesized, so it must not
+            // be double-wrapped.
+            let needs_pullup_paren = |e: &Expr| {
+                matches!(e, Expr::Literal(_))
+                    || matches!(e, Expr::Cast { expr, .. } if matches!(&**expr, Expr::Literal(_)))
+            };
+            let l = if needs_pullup_paren(left) && pctx.pulled_exprs.contains(left) {
                 format!("({l})")
             } else {
                 l
             };
-            let r = if matches!(&**right, Expr::Literal(_))
-                && pctx.pulled_exprs.contains(right)
-            {
+            let r = if needs_pullup_paren(right) && pctx.pulled_exprs.contains(right) {
                 format!("({r})")
             } else {
                 r
@@ -11194,7 +11203,16 @@ fn pg_expr_target(
                 Expr::Literal(Literal::Text(s)) => pg_quote_literal(s),
                 _ => pg_expr_target(expr, pctx, qualify, Some(*to))?,
             };
-            Some(format!("({}::{label})", inner))
+            // v1.58: PG19 folds `CAST(const AS type)` at plan time
+            // (eval_const_expressions), so a cast of a literal deparses
+            // as a Const — `'lit'::type` with no outer parens
+            // (ruleutils.c get_const_expr). The old `('lit'::type)`
+            // form never matches PG.
+            if matches!(&**expr, Expr::Literal(_)) {
+                Some(format!("{inner}::{label}"))
+            } else {
+                Some(format!("({inner}::{label})"))
+            }
         }
         Expr::Func { name, args } => {
             // v1.08: SIMILAR TO is desugared by the parser to similar_to();

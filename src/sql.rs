@@ -6257,14 +6257,21 @@ impl Parser {
                     }
                 };
                 let inner = self.parse_top_kw(inner_kw)?;
+                // v1.58: EXPLAIN EXECUTE — PG19 (explain.c ExplainExecuteQuery)
+                // plans the named prepared statement with the EXECUTE
+                // arguments bound (custom plan). The inner Execute is
+                // resolved to its bound statement in run_statement before
+                // the planner sees it.
                 match inner {
-                    Stmt::Select(_) => Ok(Stmt::Explain {
+                    Stmt::Select(_) | Stmt::Execute { .. } => Ok(Stmt::Explain {
                         stmt: Box::new(inner),
                         analyze,
                         costs,
                         opts,
                     }),
-                    _ => Err(err("EXPLAIN only supports SELECT statements".to_string())),
+                    _ => Err(err(
+                        "EXPLAIN only supports SELECT and EXECUTE statements".to_string()
+                    )),
                 }
             }
             "analyze" => {
@@ -12414,8 +12421,10 @@ impl Parser {
         Ok(Stmt::Execute { name, args })
     }
 
-    // `DEALLOCATE name` / `DEALLOCATE ALL`.
+    // `DEALLOCATE [PREPARE] name` / `DEALLOCATE [PREPARE] ALL` (PG19).
+    // v1.58: the PREPARE keyword is optional noise per gram.y.
     fn parse_deallocate(&mut self) -> Result<Stmt, SqlError> {
+        let _ = self.eat_keyword("prepare");
         let name = if self.eat_keyword("all") {
             None
         } else {

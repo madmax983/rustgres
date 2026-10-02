@@ -3222,15 +3222,19 @@ fn resolve_sql_execute(
             code: "26000",
             message: format!("prepared statement \"{}\" does not exist", name),
         })?;
+    // v1.58: PG19 (prepare.c EvaluateParams) reports the arity
+    // mismatch as 42601 with the expected/got counts in the detail.
     if !prepared.types.is_empty() && args.len() != prepared.types.len() {
         return Err(ExecError {
-            detail: None,
-            code: "42P02",
-            message: format!(
-                "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                name,
+            detail: Some(format!(
+                "Expected {} parameters but got {}.",
                 prepared.types.len(),
                 args.len()
+            )),
+            code: "42601",
+            message: format!(
+                "wrong number of parameters for prepared statement \"{}\"",
+                name
             ),
         });
     }
@@ -3260,10 +3264,33 @@ fn run_statement(
     // v0.74: SQL-level EXECUTE resolves to the stored prepared
     // statement with its arguments bound, so the checks below see the
     // real statement. (PREPARE/DEALLOCATE are handled in the match.)
+    // v1.58: EXPLAIN EXECUTE — resolve the inner Execute the same way
+    // (PG19 ExplainExecuteQuery evaluates the EXECUTE arguments and
+    // plans the prepared statement with them bound: custom-plan
+    // semantics), so the planner sees a plain SELECT.
     let owned;
     let stmt = match stmt {
         Stmt::Execute { name, args } => {
             owned = resolve_sql_execute(engine, session, name, args)?;
+            &owned
+        }
+        Stmt::Explain {
+            stmt: inner,
+            analyze,
+            costs,
+            opts,
+        } if matches!(inner.as_ref(), Stmt::Execute { .. }) => {
+            let (name, args) = match inner.as_ref() {
+                Stmt::Execute { name, args } => (name.clone(), args.clone()),
+                _ => unreachable!("guarded by matches! above"),
+            };
+            let resolved = resolve_sql_execute(engine, session, &name, &args)?;
+            owned = Stmt::Explain {
+                stmt: Box::new(resolved),
+                analyze: *analyze,
+                costs: *costs,
+                opts: opts.clone(),
+            };
             &owned
         }
         other => other,
@@ -3353,15 +3380,29 @@ fn run_statement(
             })
         }
         Stmt::Deallocate { name } => {
+            // v1.58: PG19 (prepare.c DeallocateQuery/DropPreparedStatement)
+            // raises 26000 for an unknown name; the command tag is
+            // DEALLOCATE ALL when no name is given (utility.c).
             match name {
                 Some(n) => {
-                    session.sql_prepared.remove(n);
+                    if session.sql_prepared.remove(n).is_none() {
+                        return Err(ExecError {
+                            detail: None,
+                            code: "26000",
+                            message: format!("prepared statement \"{}\" does not exist", n),
+                        });
+                    }
+                    Ok(ExecResult::Command {
+                        tag: "DEALLOCATE".to_string(),
+                    })
                 }
-                None => session.sql_prepared.clear(),
+                None => {
+                    session.sql_prepared.clear();
+                    Ok(ExecResult::Command {
+                        tag: "DEALLOCATE ALL".to_string(),
+                    })
+                }
             }
-            Ok(ExecResult::Command {
-                tag: "DEALLOCATE".to_string(),
-            })
         }
         Stmt::Execute { .. } => Err(ExecError {
             detail: None,
@@ -5969,5 +6010,272 @@ mod tests {
         assert_eq!(session.role, "postgres");
         assert_eq!(show_text(&session, "role"), "postgres");
         assert_eq!(show_text(&session, "session_user"), "postgres");
+    }
+
+    // ------------------------------------------------------------------
+    // v1.58: SQL-level PREPARE / EXECUTE / DEALLOCATE + EXPLAIN EXECUTE.
+    // PG19 grounding: prepare.c (PrepareQuery/ExecuteQuery/
+    // DeallocateQuery/ExplainExecuteQuery) and tcop/utility.c tags.
+    // ------------------------------------------------------------------
+
+    fn v158_setup(tag: &str) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal(&format!("rg158-prepare-{tag}"));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        for sql in [
+            "CREATE TABLE t (a int, b numeric, c text, d bool)",
+            "INSERT INTO t VALUES (1, 1.5, 'one', true), (2, 2.5, 'two', false), (3, NULL, 'three', true)",
+        ] {
+            let stmt = crate::sql::parse_statement(sql).expect("parses");
+            run_statement(&engine, &wal, &mut session, &stmt).expect("setup");
+        }
+        commit_implicit_txn(&engine, &wal, &mut session).expect("commits");
+        (engine, wal, session)
+    }
+
+    fn v158_run(
+        engine: &Arc<Mutex<Engine>>,
+        wal: &Arc<Mutex<Wal>>,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecResult, ExecError> {
+        let stmt = crate::sql::parse_statement(sql).expect("parses");
+        run_statement(engine, wal, session, &stmt)
+    }
+
+    /// Render every result row as a `|`-joined string of values.
+    fn v158_rows(res: ExecResult) -> Vec<String> {
+        match res {
+            ExecResult::Select { rows, .. } => rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect(),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    /// EXPLAIN plan lines as plain strings.
+    fn v158_plan(res: ExecResult) -> Vec<String> {
+        match res {
+            ExecResult::Explain { rows, .. } => rows
+                .iter()
+                .map(|r| r[0].to_text().unwrap_or_default())
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    /// v1.58: PREPARE + EXECUTE returns exactly the rows of the
+    /// equivalent direct query (result identity).
+    #[test]
+    fn v158_prepare_execute_result_identity() {
+        let (engine, wal, mut session) = v158_setup("identity");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int) AS SELECT a, c FROM t WHERE a > $1 ORDER BY a",
+        )
+        .expect("prepare");
+        let via_execute =
+            v158_rows(v158_run(&engine, &wal, &mut session, "EXECUTE q(1)").expect("execute"));
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a, c FROM t WHERE a > 1 ORDER BY a",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert_eq!(via_execute, vec!["2|two", "3|three"]);
+    }
+
+    /// v1.58: result identity across parameter types (int, numeric,
+    /// text, bool), including a NULL argument.
+    #[test]
+    fn v158_prepare_execute_param_types() {
+        let (engine, wal, mut session) = v158_setup("ptypes");
+        // int + numeric + text + bool in one statement.
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q4 (int, numeric, text, bool) AS SELECT a FROM t WHERE a = $1 AND b = $2 AND c = $3 AND d = $4",
+        )
+        .expect("prepare");
+        let via_execute = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXECUTE q4(2, 2.5, 'two', false)",
+            )
+            .expect("execute"),
+        );
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a FROM t WHERE a = 2 AND b = 2.5 AND c = 'two' AND d = false",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert_eq!(via_execute, vec!["2"]);
+        // NULL argument: `a = NULL` is never true, like the direct query.
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE qn (int) AS SELECT a FROM t WHERE a = $1",
+        )
+        .expect("prepare");
+        let via_execute =
+            v158_rows(v158_run(&engine, &wal, &mut session, "EXECUTE qn(NULL)").expect("execute"));
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a FROM t WHERE a = NULL",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert!(via_execute.is_empty());
+    }
+
+    /// v1.58: EXPLAIN EXECUTE plans the prepared statement with the
+    /// arguments bound (PG19 custom-plan semantics) — the plan is
+    /// identical to EXPLAIN of the substituted direct query.
+    #[test]
+    fn v158_explain_execute_matches_direct() {
+        let (engine, wal, mut session) = v158_setup("explain");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int) AS SELECT a FROM t WHERE a > $1",
+        )
+        .expect("prepare");
+        let via_execute = v158_plan(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXPLAIN (COSTS OFF) EXECUTE q(1)",
+            )
+            .expect("explain execute"),
+        );
+        let direct = v158_plan(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXPLAIN (COSTS OFF) SELECT a FROM t WHERE a > 1",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert!(via_execute.iter().any(|l| l.contains("Seq Scan on t")));
+    }
+
+    /// v1.58: EXECUTE of an unknown name is 26000 (PG19
+    /// ERRCODE_UNDEFINED_PSTATEMENT).
+    #[test]
+    fn v158_execute_unknown_name() {
+        let (engine, wal, mut session) = v158_setup("unknown");
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+        assert_eq!(e.message, "prepared statement \"nope\" does not exist");
+        // Same for EXPLAIN EXECUTE.
+        let e = v158_run(&engine, &wal, &mut session, "EXPLAIN EXECUTE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+    }
+
+    /// v1.58: duplicate PREPARE is 42P05 (PG19
+    /// ERRCODE_DUPLICATE_PSTATEMENT).
+    #[test]
+    fn v158_prepare_duplicate() {
+        let (engine, wal, mut session) = v158_setup("dup");
+        v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 1").expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 2").unwrap_err();
+        assert_eq!(e.code, "42P05");
+        assert_eq!(e.message, "prepared statement \"q\" already exists");
+    }
+
+    /// v1.58: wrong argument count is 42601 with PG's detail line
+    /// (PG19 prepare.c EvaluateParams).
+    #[test]
+    fn v158_execute_wrong_arity() {
+        let (engine, wal, mut session) = v158_setup("arity");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int, int) AS SELECT $1 + $2",
+        )
+        .expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE q(1)").unwrap_err();
+        assert_eq!(e.code, "42601");
+        assert_eq!(
+            e.message,
+            "wrong number of parameters for prepared statement \"q\""
+        );
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Expected 2 parameters but got 1.")
+        );
+    }
+
+    /// v1.58: DEALLOCATE of an unknown name is 26000 (PG19
+    /// DropPreparedStatement); DEALLOCATE ALL clears everything and
+    /// reports the PG tag.
+    #[test]
+    fn v158_deallocate_semantics() {
+        let (engine, wal, mut session) = v158_setup("dealloc");
+        let e = v158_run(&engine, &wal, &mut session, "DEALLOCATE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+        assert_eq!(e.message, "prepared statement \"nope\" does not exist");
+        v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 1").expect("prepare");
+        // The optional PREPARE keyword parses (PG19 gram.y).
+        match v158_run(&engine, &wal, &mut session, "DEALLOCATE PREPARE q").expect("deallocate") {
+            ExecResult::Command { tag } => assert_eq!(tag, "DEALLOCATE"),
+            other => panic!("expected Command, got {:?}", other),
+        }
+        // Gone now.
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE q").unwrap_err();
+        assert_eq!(e.code, "26000");
+        // DEALLOCATE ALL clears the rest with PG's tag.
+        v158_run(&engine, &wal, &mut session, "PREPARE q1 AS SELECT 1").expect("prepare");
+        v158_run(&engine, &wal, &mut session, "PREPARE q2 AS SELECT 2").expect("prepare");
+        match v158_run(&engine, &wal, &mut session, "DEALLOCATE ALL").expect("deallocate all") {
+            ExecResult::Command { tag } => assert_eq!(tag, "DEALLOCATE ALL"),
+            other => panic!("expected Command, got {:?}", other),
+        }
+        assert!(session.sql_prepared.is_empty());
+    }
+
+    /// v1.58: prepared statements are session-scoped — a second
+    /// session cannot see (or execute) the first session's statements.
+    #[test]
+    fn v158_prepared_statements_are_session_scoped() {
+        let (engine, wal, mut session_a) = v158_setup("scoped");
+        let mut session_b = session_no_txn();
+        v158_run(&engine, &wal, &mut session_a, "PREPARE q AS SELECT 1").expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session_b, "EXECUTE q").unwrap_err();
+        assert_eq!(e.code, "26000");
+        // And deallocating in B does not touch A's statement.
+        v158_run(&engine, &wal, &mut session_b, "DEALLOCATE ALL").expect("deallocate all");
+        v158_rows(v158_run(&engine, &wal, &mut session_a, "EXECUTE q").expect("execute"));
     }
 }
