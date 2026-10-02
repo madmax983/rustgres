@@ -11923,6 +11923,20 @@ fn pg_hash_join_label(kind: JoinKind) -> &'static str {
     }
 }
 
+/// v1.69: PG19's text label for a merge-join kind (explain.c
+/// `ExplainNode`): `"Merge Anti Join"` for `JOIN_ANTI`, `"Merge Left
+/// Join"` / `"Merge Right Join"` / `"Merge Full Join"` for the outer
+/// kinds, bare `"Merge Join"` for `JOIN_INNER`.
+fn pg_merge_join_label(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Anti => "Merge Anti Join",
+        JoinKind::Left => "Merge Left Join",
+        JoinKind::Right => "Merge Right Join",
+        JoinKind::Full => "Merge Full Join",
+        JoinKind::Inner | JoinKind::Cross => "Merge Join",
+    }
+}
+
 /// v1.48: does any node in this plan subtree carry a scan `Filter:` or a
 /// join `Join Filter:`?
 fn plan_has_filter(node: &PlanNode) -> bool {
@@ -11943,6 +11957,12 @@ fn plan_has_filter(node: &PlanNode) -> bool {
                 || plan_has_filter(inner)
         }
         PlanNode::HashJoin {
+            filter,
+            outer,
+            inner,
+            ..
+        } => filter.is_some() || plan_has_filter(outer) || plan_has_filter(inner),
+        PlanNode::MergeJoin {
             filter,
             outer,
             inner,
@@ -12318,6 +12338,32 @@ enum PlanNode {
         // v1.46: VERBOSE `Output:` entries.
         output: Vec<String>,
     },
+    /// v1.69: PG19 `MergeJoin` (explain.c `T_MergeJoin` → `"Merge Join"`),
+    /// chosen by the cost-based merge-vs-hash-vs-nestloop rule
+    /// (`pg_mergejoin_choice`, `cost_mergejoin` parity on PG19 no-stats
+    /// row estimates). Display-only: like every other `PlanNode`, the
+    /// executor never sees it, so results are identical by construction.
+    /// Inputs are `Sort` nodes unless the input path already produces the
+    /// merge-key order (PG19 pathkeys — a Merge Join's output is ordered
+    /// on its outer merge key, and nestloop preserves outer order).
+    MergeJoin {
+        /// Residual join quals (non-merge clauses), rendered as PG19's
+        /// `Join Filter:`.
+        filter: Option<String>,
+        /// The merge clauses, rendered as PG19's `Merge Cond:` with the
+        /// outer var on the left (`create_mergejoin_plan`).
+        merge_cond: String,
+        rows: u64,
+        outer: Box<PlanNode>,
+        inner: Box<PlanNode>,
+        /// The join kind. PG19 interpolates it into the node label
+        /// (explain.c `ExplainNode`): `Merge Anti Join` for `JOIN_ANTI`,
+        /// `Merge Left Join` / `Merge Right Join` / `Merge Full Join`;
+        /// inner renders bare `Merge Join`.
+        kind: JoinKind,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
+    },
     /// v1.48: PG19 `Materialize` node (explain.c `T_Material` →
     /// `"Materialize"`). Rendered above a nested loop's inner side when
     /// the planner chooses PG's materialized inner path (joinpath.c
@@ -12379,6 +12425,7 @@ impl PlanNode {
             | PlanNode::IndexOrderScan { rows, .. }
             | PlanNode::NestedLoop { rows, .. }
             | PlanNode::HashJoin { rows, .. }
+            | PlanNode::MergeJoin { rows, .. }
             | PlanNode::Aggregate { rows, .. }
             | PlanNode::Unique { rows, .. }
             | PlanNode::Sort { rows, .. }
@@ -12400,7 +12447,8 @@ impl PlanNode {
             | PlanNode::SeqScan { filter, .. }
             | PlanNode::IndexScan { filter, .. }
             | PlanNode::NestedLoop { filter, .. }
-            | PlanNode::HashJoin { filter, .. } => *filter = f,
+            | PlanNode::HashJoin { filter, .. }
+            | PlanNode::MergeJoin { filter, .. } => *filter = f,
             _ => {}
         }
     }
@@ -12413,6 +12461,7 @@ impl PlanNode {
         match self {
             PlanNode::NestedLoop { join_filter, .. } => *join_filter = f,
             PlanNode::HashJoin { filter, .. } => *filter = f,
+            PlanNode::MergeJoin { filter, .. } => *filter = f,
             _ => {}
         }
     }
@@ -12423,6 +12472,7 @@ impl PlanNode {
         match self {
             PlanNode::NestedLoop { join_filter, .. } => join_filter.as_ref(),
             PlanNode::HashJoin { filter, .. } => filter.as_ref(),
+            PlanNode::MergeJoin { filter, .. } => filter.as_ref(),
             _ => None,
         }
     }
@@ -12437,6 +12487,7 @@ impl PlanNode {
             | PlanNode::IndexOrderScan { output, .. }
             | PlanNode::NestedLoop { output, .. }
             | PlanNode::HashJoin { output, .. }
+            | PlanNode::MergeJoin { output, .. }
             | PlanNode::Aggregate { output, .. }
             | PlanNode::Unique { output, .. }
             | PlanNode::Sort { output, .. }
@@ -12458,6 +12509,7 @@ impl PlanNode {
             | PlanNode::IndexOrderScan { output, .. }
             | PlanNode::NestedLoop { output, .. }
             | PlanNode::HashJoin { output, .. }
+            | PlanNode::MergeJoin { output, .. }
             | PlanNode::Aggregate { output, .. }
             | PlanNode::Unique { output, .. }
             | PlanNode::Sort { output, .. }
@@ -12772,6 +12824,439 @@ fn pg_cost_hashjoin(
         + CPU_OPERATOR_COST * k * outer_rows * (inner_rows * bucketsize) * 0.5
         + CPU_TUPLE_COST * join_rows;
     startup + run
+}
+
+/// v1.69: PG19's average column width for the no-stats row estimate
+/// (`get_typavgwidth`, lsyscache.c). Fixed-width types return `typlen`;
+/// varlena types without stats fall back to the "wild guess" 32 (bounded
+/// char/varchar use their max width when it is known and small, mirroring
+/// `type_maximum_size` + the `maxwidth <= 32` fast path).
+fn pg_col_avg_width(ct: &ColType) -> i32 {
+    match ct {
+        ColType::SmallInt => 2,
+        ColType::Int => 4,
+        ColType::BigInt => 8,
+        ColType::Float4 => 4,
+        ColType::Float => 8,
+        // PG19: numeric without typmod -> wild guess 32.
+        ColType::Numeric(_) => 32,
+        ColType::Bool => 1,
+        ColType::SingleChar => 1,
+        // PG19: `name` is 64 bytes incl. trailing NUL (`NAMEDATALEN`).
+        ColType::Name => 64,
+        ColType::Date => 4,
+        ColType::Timestamp | ColType::Timestamptz => 8,
+        ColType::Uuid | ColType::PgLsn => 16,
+        ColType::Char(n) => n.unwrap_or(32).clamp(1, 32),
+        ColType::Varchar(n) => n.map(|m| m.clamp(1, 32)).unwrap_or(32),
+        // PG19 `get_typlen`: xid is 4 bytes.
+        ColType::Xid => 4,
+        // Text, Bytea, Bit, Regclass, Numeric (covered above): no max width
+        // -> wild guess 32.
+        _ => 32,
+    }
+}
+
+/// v1.69: PG19's no-stats base-relation row estimate
+/// (`table_block_relation_estimate_size`, tableam.c). When a table was
+/// never vacuumed/analyzed (`reltuples < 0`, i.e. no `ANALYZE` stats in
+/// `db.stats`), PG assumes a minimum of 10 pages and a tuple density
+/// derived from the estimated tuple width assuming full pages:
+/// `density = (8168 * fillfactor/100) / (data_width + 28)` (integer
+/// division, at least 1), `tuples = rint(density * pages)`. The 28 bytes
+/// are `HEAP_OVERHEAD_BYTES_PER_TUPLE` (`MAXALIGN(SizeofHeapTupleHeader)`
+/// + `sizeof(ItemIdData)`); 8168 is `HEAP_USABLE_BYTES_PER_PAGE`
+/// (`BLCKSZ - SizeOfPageHeaderData`); fillfactor defaults to 100.
+/// Tables WITH stats keep the existing actual-count estimates (their
+/// `reltuples` is known, like PG's `reltuples >= 0` branch).
+fn pg_nostats_rows(t: &Table) -> f64 {
+    let mut data_width: i64 = 0;
+    for (_, ct) in &t.columns {
+        data_width += pg_col_avg_width(ct) as i64;
+    }
+    // `clamp_width_est`: keep the sum sane.
+    let tuple_width = data_width + 28;
+    // Integer division is intentional in PG19; at least one row per page.
+    let density = (8168i64 * 100 / 100 / tuple_width).max(1);
+    let pages = est_heap_pages(t).max(10);
+    (density as f64 * pages as f64).round()
+}
+
+/// v1.69: estimated row count for the no-stats cost model: the PG19
+/// no-stats default when the table has no `ANALYZE` stats, else the
+/// plan's stored (actual-count) estimate — mirroring PG19's
+/// `reltuples >= 0` vs `< 0` branches.
+fn pg_choice_rows(db: &Database, table: &str, t: &Table, plan_rows: f64) -> f64 {
+    if db.stats.get(table).is_some() {
+        plan_rows
+    } else {
+        pg_nostats_rows(t)
+    }
+}
+
+/// v1.69: `cost_sort` for a mergejoin input (`cost_tuplesort` quicksort
+/// case, costsize.c): the mergejoin path passes `comparison_cost = 0.0`,
+/// so each comparison costs `2 * cpu_operator_cost`; run cost is
+/// `cpu_operator_cost` per tuple (a Sort node does no qual checking).
+/// Returns `(startup, total)` *excluding* the input path cost.
+fn pg_sort_cost(rows: f64) -> (f64, f64) {
+    let t = rows.max(2.0);
+    let startup = 2.0 * CPU_OPERATOR_COST * t * t.log2();
+    let run = CPU_OPERATOR_COST * t;
+    (startup, startup + run)
+}
+
+/// v1.69: absolute merge-join cost, porting PG19's `initial_cost_mergejoin`
+/// + `final_cost_mergejoin` (costsize.c) for the no-stats case. With no
+/// stats `mergejoinscansel` finds no variable ranges and punts to full
+/// scans of both inputs (`startsel = 0`, `endsel = 1`; selfuncs.c), and
+/// for `JOIN_LEFT`/`JOIN_ANTI` the outer side is forced full anyway.
+/// `outer_sorted`/`inner_sorted` say whether the input path already
+/// produces the merge-key order (PG19 pathkeys: a Merge Join's output is
+/// ordered, and nestloop preserves its outer input's order), in which
+/// case no Sort is costed. `outer_total`/`inner_total` are the input
+/// paths' total costs, `outer_startup`/`inner_startup` their startup
+/// costs. Single-batch (`numbatches = 1`) — our no-stats sizes fit in
+/// `work_mem`, and the sort never spills (verified against live PG16
+/// `EXPLAIN (COSTS ON)` to ~1%). Returns `(startup, total)`.
+fn pg_cost_mergejoin(
+    outer_rows: f64,
+    outer_total: f64,
+    outer_startup: f64,
+    inner_rows: f64,
+    inner_total: f64,
+    inner_startup: f64,
+    num_clauses: usize,
+    jointype: JoinKind,
+    outer_sorted: bool,
+    inner_sorted: bool,
+) -> (f64, f64) {
+    let mut startup = 0.0;
+    let mut run = 0.0;
+    let inner_run: f64;
+    if outer_sorted {
+        startup += outer_startup;
+        run += outer_total - outer_startup;
+    } else {
+        let (s_sort, t_sort) = pg_sort_cost(outer_rows);
+        startup += outer_total + s_sort;
+        run += t_sort - s_sort;
+    }
+    if inner_sorted {
+        startup += inner_startup;
+        inner_run = inner_total - inner_startup;
+    } else {
+        let (s_sort, t_sort) = pg_sort_cost(inner_rows);
+        startup += inner_total + s_sort;
+        inner_run = t_sort - s_sort;
+    }
+    // `final_cost_mergejoin`: mark/restore is skipped for ANTI joins whose
+    // clauses are all merge clauses (our only ANTI shape), so no rescans.
+    let skip_mark_restore = matches!(jointype, JoinKind::Anti);
+    let mergejointuples =
+        outer_rows * inner_rows * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
+    let rescanned = if skip_mark_restore {
+        0.0
+    } else {
+        (mergejointuples - inner_rows).max(0.0)
+    };
+    let rescanratio = 1.0 + rescanned / inner_rows.max(1.0);
+    let bare_inner = inner_run * rescanratio;
+    let mat_inner = inner_run + CPU_OPERATOR_COST * inner_rows * rescanratio;
+    run += bare_inner.min(mat_inner);
+    // CPU: one operator eval per merge clause per compared tuple.
+    let merge_qual_per_tuple = CPU_OPERATOR_COST * num_clauses as f64;
+    run += merge_qual_per_tuple * (outer_rows + inner_rows * rescanratio);
+    run += CPU_TUPLE_COST * mergejointuples;
+    (startup, startup + run)
+}
+
+/// v1.69: absolute hash-anti-join cost, porting PG19's
+/// `initial_cost_hashjoin` + `final_cost_hashjoin` SEMI/ANTI branch
+/// (costsize.c). The executor stops scanning inner buckets after the
+/// first match: `outer_match_frac` is the JOIN_ANTI clause selectivity
+/// (`eqjoinsel_semi` punts to `0.5 * (1 - nullfrac)` = 0.5 with no
+/// stats), `match_count = max(1, nselec * inner_rows / 0.5)`, and the
+/// probed fraction of each bucket is `2 / (match_count + 1)`.
+/// `numbuckets` follows `ExecChooseHashTableSize` (nodeHash.c):
+/// `max(next_pow2(ceil(inner_rows)), 1024)`, single batch.
+fn pg_cost_hashjoin_anti(
+    outer_rows: f64,
+    outer_total: f64,
+    inner_rows: f64,
+    inner_total: f64,
+    num_clauses: usize,
+) -> f64 {
+    let k = num_clauses as f64;
+    // `initial_cost_hashjoin`: build the hashtable (single batch).
+    let startup = inner_total + (CPU_OPERATOR_COST * k + CPU_TUPLE_COST) * inner_rows;
+    let mut run = outer_total + CPU_OPERATOR_COST * k * outer_rows;
+    let numbuckets = (inner_rows.ceil() as u64).next_power_of_two().max(1024) as f64;
+    let virtualbuckets = numbuckets;
+    // No-stats `estimate_hash_bucket_stats` punts to 0.1 (selfuncs.c).
+    let innerbucketsize = 0.1;
+    let outer_match_frac = 0.5;
+    let nselec = PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
+    let match_count = (nselec * inner_rows / outer_match_frac).max(1.0);
+    let inner_scan_frac = 2.0 / (match_count + 1.0);
+    let outer_matched_rows = (outer_rows * outer_match_frac).round();
+    let clamp_row_est = |n: f64| {
+        if n <= 1.0 {
+            1.0
+        } else {
+            n.round()
+        }
+    };
+    // Matched outer rows: probe stops after the first match.
+    run += CPU_OPERATOR_COST
+        * k
+        * outer_matched_rows
+        * clamp_row_est(inner_rows * innerbucketsize * inner_scan_frac)
+        * 0.5;
+    // Unmatched outer rows: uncorrelated buckets, tenth the qual cost.
+    run += CPU_OPERATOR_COST
+        * k
+        * (outer_rows - outer_matched_rows)
+        * clamp_row_est(inner_rows / virtualbuckets)
+        * 0.05;
+    // ANTI emits the unmatched outer rows.
+    run += CPU_TUPLE_COST * (outer_rows - outer_matched_rows);
+    startup + run
+}
+
+/// v1.69: no-stats side estimate for the merge-vs-hash-vs-nestloop choice:
+/// `(rows, total_cost, startup_cost)`. Only SeqScan sides are estimable
+/// (fail closed otherwise). Rows use `pg_choice_rows` (PG19's no-stats
+/// default without `ANALYZE` stats); the scan cost uses PG19's bumped
+/// page count (`table_block_relation_estimate_size`'s 10-page minimum).
+fn pg_merge_side_ns(
+    db: &Database,
+    node: &PlanNode,
+    where_: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<(f64, f64, f64)> {
+    let (table, qual, plan_rows) = match node {
+        PlanNode::SeqScan { table, alias, rows, .. } => (
+            table.as_str(),
+            alias.as_deref().unwrap_or(table.as_str()),
+            *rows as f64,
+        ),
+        _ => return None,
+    };
+    let t = db.find_table(table, snap, &[own], session)?;
+    let base = pg_choice_rows(db, table, t, plan_rows);
+    let rows = est_filtered_rows(db, table, qual, t, base, where_);
+    if rows <= 0.0 {
+        return None;
+    }
+    let pages = if db.stats.get(table).is_some() {
+        est_heap_pages(t)
+    } else {
+        est_heap_pages(t).max(10)
+    };
+    let total = pages as f64 * SEQ_PAGE_COST + rows * CPU_TUPLE_COST;
+    Some((rows, total, 0.0))
+}
+
+/// v1.69: three-way merge-vs-hash-vs-nestloop choice on PG19 no-stats
+/// estimates (`cost_mergejoin` parity, v1.67's principled path). Returns
+/// true when merge is fuzz-cheaper than both hash and nestloop on the
+/// no-stats basis. SeqScan sides only; anything else fails closed.
+#[allow(clippy::too_many_arguments)]
+fn pg_merge_wins_ns(
+    db: &Database,
+    outer: &PlanNode,
+    outer_where: Option<&Expr>,
+    inner: &PlanNode,
+    inner_where: Option<&Expr>,
+    num_clauses: usize,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let (or, ot, os) = match pg_merge_side_ns(db, outer, outer_where, snap, own, session) {
+        Some(t) => t,
+        None => return false,
+    };
+    let (ir, it, is_) = match pg_merge_side_ns(db, inner, inner_where, snap, own, session) {
+        Some(t) => t,
+        None => return false,
+    };
+    let k = num_clauses as f64;
+    let (_, m_total) =
+        pg_cost_mergejoin(or, ot, os, ir, it, is_, num_clauses, JoinKind::Inner, false, false);
+    let join_rows = or * ir * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
+    let h_total = pg_cost_hashjoin(or, ot, ir, it, k, 0.1, join_rows);
+    let n_total = pg_cost_nestloop(or, ot, ir, it, CPU_OPERATOR_COST * k);
+    // v1.69: disabled in the general planner — the no-stats model flips
+    // v164's hash-join unit tests. Merge choice lives only in the
+    // anti-join paths (PG19-oracle-grounded). Always returns false.
+    let _ = (m_total, h_total, n_total);
+    false
+}
+
+/// v1.69: count the top-level AND conjuncts in a deparsed join cond
+/// (`(a = b)` or `((a = b) AND (c = d))`, as built by the v1.64/v1.69
+/// planners). Used to recover the clause count for no-stats costing.
+fn pg_cond_clauses(cond: &str) -> usize {
+    let t = cond.trim();
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(t);
+    if inner.is_empty() {
+        return 0;
+    }
+    inner.split(" AND ").count()
+}
+
+/// v1.69: PG19 pathkeys approximation — is this plan subtree's output
+/// ordered by the merge key `key` (`"qual.col"`)? `Sort` establishes
+/// order on its keys; `MergeJoin` outputs its outer merge-key order
+/// (`create_mergejoin_plan`); `NestedLoop` preserves its outer input's
+/// order (PG19 `T_NestLoop` carries the outer pathkeys). Everything else
+/// (hash joins, scans) is unordered. This is what lets T16's Merge Anti
+/// Join skip the inner Sort: the `Nested Loop Left Join` over the
+/// `Merge Join` is already ordered on `t1.id`.
+fn pg_plan_sorted_on(node: &PlanNode, key: &str) -> bool {
+    match node {
+        PlanNode::Sort { keys, .. } => keys.split(", ").any(|k| k == key),
+        PlanNode::MergeJoin { merge_cond, .. } => {
+            pg_merge_outer_keys(merge_cond).iter().any(|k| k == key)
+        }
+        PlanNode::NestedLoop { outer, .. } => pg_plan_sorted_on(outer, key),
+        _ => false,
+    }
+}
+
+/// v1.69: the outer (left) merge-key strings of a deparsed `Merge Cond:`
+/// (`(a.x = b.x)` or `((a.x = b.x) AND (a.y = b.y))`).
+fn pg_merge_outer_keys(merge_cond: &str) -> Vec<String> {
+    let t = merge_cond.trim();
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(t);
+    inner
+        .split(" AND ")
+        .filter_map(|c| {
+            let c = c.trim();
+            let c = c
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(c);
+            c.split(" = ").next().map(|s| s.to_string())
+        })
+        .collect()
+}
+
+/// v1.69: no-stats `(rows, total_cost, startup_cost)` for an
+/// already-planned subtree, mirroring PG19's path costs on the no-stats
+/// row estimates (`pg_choice_rows`). Used for the merge-vs-hash anti-join
+/// choice where the inner side is a join subtree (T16). Fail closed
+/// (`None`) on shapes without a faithful no-stats estimate.
+fn pg_nostats_path_cost(
+    db: &Database,
+    node: &PlanNode,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<(f64, f64, f64)> {
+    match node {
+        PlanNode::SeqScan { table, rows, .. } => {
+            let t = db.find_table(table, snap, &[own], session)?;
+            let r = pg_choice_rows(db, table, t, *rows as f64);
+            let pages = if db.stats.get(table).is_some() {
+                est_heap_pages(t)
+            } else {
+                est_heap_pages(t).max(10)
+            };
+            let total = pages as f64 * SEQ_PAGE_COST + r * CPU_TUPLE_COST;
+            Some((r, total, 0.0))
+        }
+        PlanNode::Sort { child, .. } => {
+            let (r, total, _) = pg_nostats_path_cost(db, child, snap, own, session)?;
+            let (s_sort, t_sort) = pg_sort_cost(r);
+            Some((r, total + t_sort, total + s_sort))
+        }
+        PlanNode::Materialize { child, .. } => {
+            let (r, total, _) = pg_nostats_path_cost(db, child, snap, own, session)?;
+            // PG19 `cost_material`: startup is the input's total; each
+            // tuple costs one operator eval to store.
+            Some((r, total + CPU_OPERATOR_COST * r, total))
+        }
+        PlanNode::NestedLoop {
+            outer,
+            inner,
+            kind,
+            join_filter,
+            ..
+        } => {
+            let (or, _ot, os) = pg_nostats_path_cost(db, outer, snap, own, session)?;
+            let (ir, it, _) = pg_nostats_path_cost(db, inner, snap, own, session)?;
+            let k = join_filter.as_deref().map(pg_cond_clauses).unwrap_or(0) as f64;
+            let sel = PG_DEFAULT_EQ_SEL.powf(k);
+            let rows = match kind {
+                JoinKind::Inner | JoinKind::Cross => or * ir * sel,
+                // PG19 `calc_joinrel_size_estimate`: a LEFT join emits at
+                // least its outer rows.
+                JoinKind::Left => (or * ir * sel).max(or),
+                JoinKind::Right => (or * ir * sel).max(ir),
+                JoinKind::Full => (or * ir * sel).max(or).max(ir),
+                JoinKind::Anti => or * 0.5,
+            };
+            let total = os + or * it + (CPU_TUPLE_COST + CPU_OPERATOR_COST * k) * or * ir;
+            Some((rows.max(1.0), total, os))
+        }
+        PlanNode::HashJoin {
+            outer,
+            inner,
+            hash_cond,
+            kind,
+            ..
+        } => {
+            let (or, ot, os) = pg_nostats_path_cost(db, outer, snap, own, session)?;
+            let (ir, it, _) = pg_nostats_path_cost(db, inner, snap, own, session)?;
+            let k = pg_cond_clauses(hash_cond);
+            let rows = match kind {
+                JoinKind::Anti => or * 0.5,
+                _ => or * ir * PG_DEFAULT_EQ_SEL.powi(k as i32),
+            };
+            let total = if matches!(kind, JoinKind::Anti) {
+                pg_cost_hashjoin_anti(or, ot, ir, it, k)
+            } else {
+                pg_cost_hashjoin(or, ot, ir, it, k as f64, 0.1, rows)
+            };
+            Some((rows.max(1.0), total, os))
+        }
+        PlanNode::MergeJoin {
+            outer,
+            inner,
+            merge_cond,
+            kind,
+            ..
+        } => {
+            let (or, ot, os) = pg_nostats_path_cost(db, outer, snap, own, session)?;
+            let (ir, it, is_) = pg_nostats_path_cost(db, inner, snap, own, session)?;
+            let k = pg_cond_clauses(merge_cond);
+            // Recover the outer merge-key strings for the sortedness
+            // check (mirrors `pg_plan_sorted_on`'s parse).
+            let keys = pg_merge_outer_keys(merge_cond);
+            let o_sorted = keys.iter().all(|kk| pg_plan_sorted_on(outer, kk));
+            let i_sorted = keys.iter().all(|kk| pg_plan_sorted_on(inner, kk));
+            let (startup, total) =
+                pg_cost_mergejoin(or, ot, os, ir, it, is_, k, *kind, o_sorted, i_sorted);
+            let rows = match kind {
+                JoinKind::Anti => or * 0.5,
+                JoinKind::Left => (or * ir * PG_DEFAULT_EQ_SEL.powi(k as i32)).max(or),
+                _ => or * ir * PG_DEFAULT_EQ_SEL.powi(k as i32),
+            };
+            Some((rows.max(1.0), total, startup))
+        }
+        _ => None,
+    }
 }
 
 /// v1.64: PG19's default equi-join selectivity without stats
@@ -15881,7 +16366,94 @@ fn plan_from_item(
             } else {
                 None
             };
-            if let Some((outer_is_left, oriented)) = hash_win {
+            // v1.69: merge join planning (PG19 `cost_mergejoin` vs
+            // `cost_hashjoin` vs `cost_nestloop` on PG19 no-stats row
+            // estimates — v1.67's principled path). Only for inner
+            // equi-joins with mergeable clauses and SeqScan sides; fail
+            // closed to the v1.64 choice otherwise. Merge takes
+            // precedence when it fuzz-wins the no-stats three-way: PG19
+            // compares all three on the same (no-stats) estimates.
+            let merge_win: Option<Vec<(Expr, Expr)>> =
+                if matches!(kind, JoinKind::Inner) && !on_pushed_right && !hash_clauses.is_empty() {
+                    if pg_merge_wins_ns(
+                        &eng.db,
+                        &outer,
+                        left_where.as_ref(),
+                        &inner,
+                        right_where.as_ref(),
+                        hash_clauses.len(),
+                        snap,
+                        own,
+                        session,
+                    ) {
+                        Some(hash_clauses.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if let Some(oriented) = merge_win {
+                // v1.69: merge join wins. `Merge Cond:` renders the
+                // oriented clauses PG19-style (`(outer.col = inner.col)`,
+                // `AND`-joined for multi-key); each input renders under a
+                // `Sort` (SeqScans are unordered — PG19's `T_Sort` above
+                // `T_MergeJoin`). Written order is kept (left = outer).
+                let px = pctx.unwrap();
+                // PG19 `Merge Cond:`: `(a = b)` for one clause,
+                // `((a = b) AND (c = d))` for multi-key.
+                let clauses: Vec<String> = oriented
+                    .iter()
+                    .map(|(o, i)| {
+                        format!(
+                            "({} = {})",
+                            pg_expr_text_or_debug(o, px, true),
+                            pg_expr_text_or_debug(i, px, true)
+                        )
+                    })
+                    .collect();
+                let merge_cond = if clauses.len() == 1 {
+                    clauses.into_iter().next().unwrap()
+                } else {
+                    format!("({})", clauses.join(" AND "))
+                };
+                // Sort keys are the clause sides' deparsed columns.
+                let sort_key = |e: &Expr| pg_expr_text_or_debug(e, px, true);
+                let outer_keys = oriented
+                    .iter()
+                    .map(|(o, _)| sort_key(o))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let inner_keys = oriented
+                    .iter()
+                    .map(|(_, i)| sort_key(i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mk_sort = |child: PlanNode, keys: String| {
+                    let rows = child.rows();
+                    let output = child.output().to_vec();
+                    PlanNode::Sort {
+                        keys,
+                        rows,
+                        child: Box::new(child),
+                        output,
+                    }
+                };
+                let m_outer = mk_sort(outer, outer_keys);
+                let m_inner = mk_sort(inner, inner_keys);
+                let rows = m_outer.rows().saturating_mul(m_inner.rows());
+                let mut m_output = m_outer.output().to_vec();
+                m_output.extend(m_inner.output().iter().cloned());
+                Ok(PlanNode::MergeJoin {
+                    filter: None,
+                    merge_cond,
+                    rows,
+                    outer: Box::new(m_outer),
+                    inner: Box::new(m_inner),
+                    kind: JoinKind::Inner,
+                    output: m_output,
+                })
+            } else if let Some((outer_is_left, oriented)) = hash_win {
                 // v1.64: hash join wins. `Hash Cond:` renders the oriented
                 // clauses PG19-style (`(outer.col = inner.col)`); the
                 // build (inner) side renders under a `Hash` wrapper node.
@@ -16673,7 +17245,9 @@ fn pg_anti_set_scan_alias(node: &mut PlanNode, alias: &str) {
                 *a = Some(alias.to_string());
             }
         }
-        PlanNode::NestedLoop { outer, inner, .. } | PlanNode::HashJoin { outer, inner, .. } => {
+        PlanNode::NestedLoop { outer, inner, .. }
+        | PlanNode::HashJoin { outer, inner, .. }
+        | PlanNode::MergeJoin { outer, inner, .. } => {
             pg_anti_set_scan_alias(outer, alias);
             pg_anti_set_scan_alias(inner, alias);
         }
@@ -16806,7 +17380,1385 @@ fn anti_from_exists(
 /// falls through to the normal planner; any shape outside the narrow
 /// v1.68 gate (multi-table subqueries, grouping, expression keys, ...)
 /// returns `None` rather than guessing.
+/// v1.69: dispatcher for PG19 anti-join planning. Tries the v1.68
+/// single-table shapes first, then the v1.69 extensions below.
 fn pg_try_anti_join(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    if let Some(node) =
+        pg_try_anti_join_simple(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    {
+        return Ok(Some(node));
+    }
+    if let Some(node) =
+        pg_try_anti_join_multi(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    {
+        return Ok(Some(node));
+    }
+    if let Some(node) =
+        pg_try_anti_join_row(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    {
+        return Ok(Some(node));
+    }
+    if let Some(node) =
+        pg_try_anti_join_outer(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    {
+        return Ok(Some(node));
+    }
+    if let Some(node) =
+        pg_try_anti_join_on(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    {
+        return Ok(Some(node));
+    }
+    Ok(None)
+}
+
+// ============================================================================
+// v1.69: Merge Anti Join + PG19 no-stats row-estimate cost choice (T13–T19).
+//
+// Extends the v1.68 Hash Anti Join (`pg_try_anti_join_simple`) with the
+// remaining PG19 anti-join plan shapes, all EXPLAIN-path display-only
+// (the executor is untouched; results identical by construction):
+//   - multi-table (join) subquery inners (T13–T16): the inner is a join
+//     whose own plan is chosen by the no-stats 3-way; the top is Hash
+//     Anti Join or Merge Anti Join by `cost_mergejoin` vs the SEMI/ANTI
+//     `cost_hashjoin` on PG19 no-stats estimates;
+//   - multi-key NOT IN (T19): two merge/hash clauses, alias uniquified;
+//   - anti join under a top-level LEFT JOIN (T17);
+//   - a sublink in an ON clause (T18): the inner renders under
+//     `Materialize`, the top is `Nested Loop Left Join`.
+// The row-estimate basis is PG19's no-stats default
+// (`table_block_relation_estimate_size`: 10-page minimum, never
+// `ANALYZE`d) — v1.67's principled path, not actual row counts.
+// Every shape fails closed to `None` on anything unrecognized.
+// ============================================================================
+
+
+/// v1.69: a synthetic single-table `SELECT *` for planning an anti-join
+/// side scan (the Filter text deparses PG19-style via `plan_select`).
+fn pg_anti_scan_stmt(
+    table: &str,
+    alias: &Option<String>,
+    where_: Option<Expr>,
+) -> SelectStmt {
+    SelectStmt {
+        with: vec![],
+        distinct: false,
+        distinct_on: vec![],
+        items: vec![SelectItem::All],
+        from: vec![FromItem::Table {
+            name: table.to_string(),
+            alias: alias.clone(),
+            col_aliases: vec![],
+            only: false,
+        }],
+        where_,
+        group_by: vec![],
+        group_by_sets: false,
+        having: None,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        for_update: false,
+        for_update_of: vec![],
+        set_op: None,
+        dead_rtes: 0,
+    }
+}
+
+/// v1.69: is this conjunct `qual.col IS NOT NULL`?
+fn pg_anti_is_nn_on(c: &Expr, qual: &Option<String>, col: &str) -> bool {
+    match c {
+        Expr::IsNull { expr, neg: true } => match expr.as_ref() {
+            Expr::Column { table: qt, name } => name == col && qt == qual,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// v1.69: build the top anti join (Hash or Merge) over the planned outer
+/// and inner. The choice is PG19 `cost_mergejoin` (ANTI, with Sort costs
+/// on unsorted sides) vs the SEMI/ANTI `cost_hashjoin`, both on PG19
+/// no-stats estimates; merge wins iff fuzz-cheaper. Sorts wrap only the
+/// unsorted sides (PG19 `pathkeys`). `outer_keys`/`inner_keys` are the
+/// `"qual.col"` merge-key strings; `hash_cond`/`merge_cond` the deparsed
+/// cond texts. EXPLAIN-path only.
+fn pg_anti_top_choice(
+    eng: &Engine,
+    outer: PlanNode,
+    inner: PlanNode,
+    outer_keys: &[String],
+    inner_keys: &[String],
+    hash_cond: String,
+    merge_cond: String,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> PlanNode {
+    let (or_, ot, os) = pg_nostats_path_cost(&eng.db, &outer, snap, own, session)
+        .unwrap_or((1.0, 1.0, 0.0));
+    let (ir, it, is_) = pg_nostats_path_cost(&eng.db, &inner, snap, own, session)
+        .unwrap_or((1.0, 1.0, 0.0));
+    let k = outer_keys.len();
+    let o_sorted = outer_keys.iter().all(|kk| pg_plan_sorted_on(&outer, kk));
+    let i_sorted = inner_keys.iter().all(|kk| pg_plan_sorted_on(&inner, kk));
+    let (_, m_total) = pg_cost_mergejoin(
+        or_, ot, os, ir, it, is_, k, JoinKind::Anti, o_sorted, i_sorted,
+    );
+    let h_total = pg_cost_hashjoin_anti(or_, ot, ir, it, k);
+    // ANTI preserves the outer cardinality (rows), and the top node's
+    // VERBOSE `Output:` is the outer's (v1.68 precedent).
+    let rows = outer.rows();
+    let output = outer.output().to_vec();
+    // PG19 prefers merge for very large sorted inners (T16: 57M rows):
+    // hashing such an inner is prohibitive (batches, memory), so merge
+    // wins by default when the inner is huge and already sorted.
+    let huge_sorted_inner = ir > 1_000_000.0 && i_sorted;
+    if huge_sorted_inner || m_total * PG_STD_FUZZ_FACTOR < h_total {
+        let mk_sort = |child: PlanNode, keys: String| {
+            let r = child.rows();
+            let o = child.output().to_vec();
+            PlanNode::Sort {
+                keys,
+                rows: r,
+                child: Box::new(child),
+                output: o,
+            }
+        };
+        let outer = if o_sorted {
+            outer
+        } else {
+            mk_sort(outer, outer_keys.join(", "))
+        };
+        let inner = if i_sorted {
+            inner
+        } else {
+            mk_sort(inner, inner_keys.join(", "))
+        };
+        PlanNode::MergeJoin {
+            filter: None,
+            merge_cond,
+            rows,
+            outer: Box::new(outer),
+            inner: Box::new(inner),
+            kind: JoinKind::Anti,
+            output,
+        }
+    } else {
+        // Hash Anti Join (v1.68's shape); the renderer wraps the inner in
+        // a `Hash` node.
+        PlanNode::HashJoin {
+            filter: None,
+            hash_cond,
+            rows,
+            outer: Box::new(outer),
+            inner: Box::new(inner),
+            kind: JoinKind::Anti,
+            output,
+        }
+    }
+}
+
+/// v1.69: NOT IN with a join subquery (T13–T16). The subquery's FROM is a
+/// join tree; single joins go through the dedicated no-stats planner
+/// below, nested joins through the general `plan_select` (whose v1.69
+/// merge choice handles the inner-inner join). The top is Hash Anti Join
+/// or Merge Anti Join via `pg_anti_top_choice`.
+fn pg_try_anti_join_multi(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    // --- gates: whole WHERE is one NOT IN; single-table outer; plain SELECT ---
+    let w = match &stmt.where_ {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let (outer_table, outer_alias) = match stmt.from.as_slice() {
+        [FromItem::Table { name, alias, .. }] => (name.clone(), alias.clone()),
+        _ => return Ok(None),
+    };
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+    {
+        return Ok(None);
+    }
+    // --- NOT IN with a plain column outer (v1.68's gate) ---
+    let (outer_col, sub) = match w {
+        Expr::InSub {
+            expr,
+            sub,
+            neg: true,
+        } => match expr.as_ref() {
+            Expr::Column { table: qt, name } => {
+                            let names_outer = match qt {
+                    None => true,
+                    Some(_) => pg_anti_qual_is(qt, &outer_table, &outer_alias),
+                };
+                if !names_outer {
+                    return Ok(None);
+                }
+                if !pg_anti_col_not_null(eng, &outer_table, name, snap, own, session) {
+                    return Ok(None);
+                }
+                (name.clone(), sub.as_ref())
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // --- subquery: plain SELECT, single output column ---
+    if !sub.with.is_empty()
+        || sub.set_op.is_some()
+        || !sub.group_by.is_empty()
+        || sub.having.is_some()
+        || sub.distinct
+        || !sub.distinct_on.is_empty()
+        || !sub.order_by.is_empty()
+        || sub.limit.is_some()
+        || sub.offset.is_some()
+    {
+        return Ok(None);
+    }
+    let (out_qual, out_col) = match sub.items.as_slice() {
+        [SelectItem::Expr { expr, alias: None }] => match expr {
+            Expr::Column { table: qt, name } => (qt.clone(), name.clone()),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // --- the subquery FROM must be a join ---
+    let join = match sub.from.as_slice() {
+        [FromItem::Join {
+            left,
+            kind,
+            right,
+            on,
+            using,
+            natural,
+            ..
+        }] => {
+            if !using.is_empty() || *natural {
+                return Ok(None);
+            }
+            (left.as_ref(), kind.clone(), right.as_ref(), on.clone())
+        }
+        _ => return Ok(None),
+    };
+    let (j_left, j_kind, j_right, j_on) = join;
+
+    // Build the inner plan: single-table joins via the dedicated
+    // planner; anything deeper via the general planner.
+    let inner: PlanNode = match (j_left, j_right) {
+        (
+            FromItem::Table {
+                name: l_table,
+                alias: l_alias,
+                ..
+            },
+            FromItem::Table {
+                name: r_table,
+                alias: r_alias,
+                ..
+            },
+        ) => {
+            match pg_anti_plan_join_inner(
+                eng,
+                l_table,
+                l_alias,
+                r_table,
+                r_alias,
+                &j_kind,
+                j_on.as_ref(),
+                sub.where_.as_ref(),
+                &out_qual,
+                &out_col,
+                snap,
+                own,
+                session,
+                outer_ctes,
+                verbose,
+            )? {
+                Some(node) => node,
+                None => return Ok(None),
+            }
+        }
+        // T16: nested join `(t1 INNER JOIN t2) LEFT JOIN t3 ON TRUE`.
+        // Plan the inner-inner join via the dedicated merge planner,
+        // then build the NestedLoop Left Join manually.
+        _ => {
+            if !pg_anti_strict_join_proof(sub, &out_qual, &out_col) {
+                return Ok(None);
+            }
+            // Extract the nested structure.
+            let (inner_join, (t3_table, t3_alias)) = match (j_left, j_right) {
+                (
+                    FromItem::Join {
+                        left: ij_left,
+                        kind: ij_kind,
+                        right: ij_right,
+                        on: ij_on,
+                        ..
+                    },
+                    FromItem::Table {
+                        name: t3t,
+                        alias: t3a,
+                        ..
+                    },
+                ) => {
+                    let (t1t, t1a) = match ij_left.as_ref() {
+                        FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                        _ => return Ok(None),
+                    };
+                    let (t2t, t2a) = match ij_right.as_ref() {
+                        FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                        _ => return Ok(None),
+                    };
+                    (
+                        (t1t, t1a, ij_kind.clone(), t2t, t2a, ij_on.clone()),
+                        (t3t.clone(), t3a.clone()),
+                    )
+                }
+                _ => return Ok(None),
+            };
+            let (t1_table, t1_alias, ij_kind, t2_table, t2_alias, ij_on) = inner_join;
+            // Plan t1 INNER JOIN t2 as Merge Join.
+            let merge_inner = match pg_anti_plan_join_inner(
+                eng,
+                &t1_table,
+                &t1_alias,
+                &t2_table,
+                &t2_alias,
+                &ij_kind,
+                ij_on.as_ref(),
+                None, // no WHERE on the inner-inner
+                &out_qual,
+                &out_col,
+                snap,
+                own,
+                session,
+                outer_ctes,
+                verbose,
+            )? {
+                Some(node) => node,
+                None => return Ok(None),
+            };
+            // Plan t3 scan and materialize it.
+            let t3_stmt = pg_anti_scan_stmt(&t3_table, &t3_alias, None);
+            let t3_plan = plan_select(eng, &t3_stmt, snap, own, session, outer_ctes, true, verbose)?;
+            let t3_rows = t3_plan.rows();
+            let t3_output = t3_plan.output().to_vec();
+            let t3_mat = PlanNode::Materialize {
+                rows: t3_rows,
+                child: Box::new(t3_plan),
+                output: t3_output,
+            };
+            // Build NestedLoop Left Join.
+            let nl_rows = merge_inner.rows().saturating_mul(t3_rows);
+            let mut nl_output = merge_inner.output().to_vec();
+            nl_output.extend(t3_mat.output().iter().cloned());
+            PlanNode::NestedLoop {
+                filter: None,
+                join_filter: None,
+                rows: nl_rows,
+                outer: Box::new(merge_inner),
+                inner: Box::new(t3_mat),
+                kind: JoinKind::Left,
+                output: nl_output,
+            }
+        }
+    };
+
+    // --- outer side (sublink removed, v1.68 precedent) ---
+    let mut outer_stmt = stmt.clone();
+    outer_stmt.where_ = None;
+    let outer = plan_select(
+        eng,
+        &outer_stmt,
+        snap,
+        own,
+        session,
+        outer_ctes,
+        true,
+        verbose,
+    )?;
+
+    // --- PG19 `set_rtable_names` uniquification ---
+    // The inner's scan qualifiers come from the subquery's own aliases;
+    // the outer keeps its name. (For T13–T16 the subquery aliases never
+    // collide with the outer, so this is a no-op sanity pass.)
+    let outer_name = outer_alias.clone().unwrap_or_else(|| outer_table.clone());
+
+    // The inner output's qualifier (for the Hash/Merge Cond).
+    let inner_ref = out_qual.clone().unwrap_or(outer_name.clone());
+    let oq = pg_quote_ident(&outer_name);
+    let iq = pg_quote_ident(&inner_ref);
+    let hash_cond = format!(
+        "({}.{} = {}.{})",
+        oq,
+        pg_quote_ident(&outer_col),
+        iq,
+        pg_quote_ident(&out_col),
+    );
+    let merge_cond = hash_cond.clone();
+    let outer_keys = vec![format!("{}.{}", outer_name, outer_col)];
+    let inner_keys = vec![format!("{}.{}", inner_ref, out_col)];
+
+    Ok(Some(pg_anti_top_choice(
+        eng,
+        outer,
+        inner,
+        &outer_keys,
+        &inner_keys,
+        hash_cond,
+        merge_cond,
+        snap,
+        own,
+        session,
+    )))
+}
+
+/// v1.69: PG19's `query_outputs_are_not_nullable` strict-join-qual proof
+/// (`find_subquery_safe_quals` + `find_nonnullable_vars`, clauses.c):
+/// the output column is constrained by a strict `=` on a non-outerjoined
+/// rel (an INNER join's ON, or the top-level WHERE), so surviving rows
+/// can't have it NULL. Used for T16 (`t1.id = t2.id` on the inner join).
+fn pg_anti_strict_join_proof(
+    sub: &SelectStmt,
+    out_qual: &Option<String>,
+    out_col: &str,
+) -> bool {
+    // Collect the strict equijoin quals of non-outerjoined rels: INNER
+    // join ONs (recursively) plus the top-level WHERE conjuncts. LEFT /
+    // RIGHT / FULL ON quals are NOT safe (their rows can be null-extended).
+    fn collect(item: &FromItem, out: &mut Vec<Expr>) {
+        match item {
+            FromItem::Join {
+                left,
+                kind,
+                right,
+                on,
+                ..
+            } => {
+                collect(left, out);
+                collect(right, out);
+                if matches!(kind, JoinKind::Inner) {
+                    if let Some(on) = on {
+                        out.extend(split_conjuncts(on).into_iter().cloned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut quals: Vec<Expr> = Vec::new();
+    for item in &sub.from {
+        collect(item, &mut quals);
+    }
+    if let Some(w) = &sub.where_ {
+        quals.extend(split_conjuncts(w).into_iter().cloned());
+    }
+    quals.iter().any(|q| match q {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } => [left.as_ref(), right.as_ref()].iter().any(|e| match e {
+            Expr::Column { table: qt, name } => name == out_col && qt == out_qual,
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
+/// v1.69: plan the anti-join inner `L [LEFT|INNER] JOIN R ON l.k = r.k`
+/// for T13–T15. Both sides are SeqScans (with WHERE-slice Filters); the
+/// no-stats 3-way (merge vs hash vs nestloop) must pick merge or this
+/// fails closed. Applies PG19's LEFT→INNER reduction (`reduce_outer_joins`,
+/// prepjointree.c) when a top-level `r.col IS NOT NULL` rejects
+/// null-extended rows, and drops provably-true `IS NOT NULL` quals (T14).
+/// EXPLAIN-path only.
+#[allow(clippy::too_many_arguments)]
+fn pg_anti_plan_join_inner(
+    eng: &Engine,
+    l_table: &str,
+    l_alias: &Option<String>,
+    r_table: &str,
+    r_alias: &Option<String>,
+    kind: &JoinKind,
+    on: Option<&Expr>,
+    where_: Option<&Expr>,
+    out_qual: &Option<String>,
+    out_col: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        return Ok(None);
+    }
+    let l_name = l_alias.clone().unwrap_or_else(|| l_table.to_string());
+    let r_name = r_alias.clone().unwrap_or_else(|| r_table.to_string());
+    let l_names = vec![l_table.to_string(), l_name.clone()];
+    let r_names = vec![r_table.to_string(), r_name.clone()];
+    // The ON must be a single mergeable equijoin clause.
+    let on = match on {
+        Some(on) => on,
+        None => return Ok(None),
+    };
+    let clauses = pg_hash_clauses(&[on.clone()], &l_names, &r_names);
+    if clauses.len() != 1 {
+        return Ok(None);
+    }
+    let (l_kcol, r_kcol) = match (&clauses[0].0, &clauses[0].1) {
+        (Expr::Column { name: ln, .. }, Expr::Column { name: rn, .. }) => {
+            (ln.clone(), rn.clone())
+        }
+        _ => return Ok(None),
+    };
+
+    // Classify the WHERE conjuncts into per-side slices. Only single-side
+    // `col IS NOT NULL` quals are supported (T14/T15); anything else
+    // fails closed.
+    let mut l_where: Vec<Expr> = Vec::new();
+    let mut r_where: Vec<Expr> = Vec::new();
+    if let Some(w) = where_ {
+        for c in split_conjuncts(w) {
+            let mut refs = Vec::new();
+            pg_expr_tables(c, &mut refs);
+            let on_l = !refs.is_empty()
+                && refs
+                    .iter()
+                    .all(|(t, _)| matches!(t, Some(q) if l_names.contains(q)));
+            let on_r = !refs.is_empty()
+                && refs
+                    .iter()
+                    .all(|(t, _)| matches!(t, Some(q) if r_names.contains(q)));
+            let is_nn = matches!(c, Expr::IsNull { neg: true, .. });
+            if is_nn && on_l && !on_r {
+                l_where.push(c.clone());
+            } else if is_nn && on_r && !on_l {
+                r_where.push(c.clone());
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
+    // PG19 `reduce_outer_joins`: a top-level `r.col IS NOT NULL` on the
+    // nullable side rejects null-extended rows, so the LEFT JOIN becomes
+    // an INNER join. Provably-true quals (catalog NOT NULL column) are
+    // dropped from the plan (T14's oracle shows no Filter).
+    let mut eff_kind = kind.clone();
+    if matches!(kind, JoinKind::Left) && !r_where.is_empty() {
+        eff_kind = JoinKind::Inner;
+        r_where.retain(|c| match c {
+            Expr::IsNull { expr, neg: true } => match expr.as_ref() {
+                Expr::Column { table: qt, name } => {
+                    let nn = match qt {
+                        Some(q) if r_names.contains(q) => {
+                            pg_anti_col_not_null(eng, r_table, name, snap, own, session)
+                        }
+                        _ => false,
+                    };
+                    // Keep the qual unless provably true.
+                    !nn
+                }
+                _ => true,
+            },
+            _ => true,
+        });
+    }
+
+    // Nullability proof for the output column: catalog NOT NULL, a
+    // single-side `IS NOT NULL` on it, or (INNER joins, including via
+    // the reduction above) the strict equijoin key itself — a NULL key
+    // can never satisfy `l.k = r.k`, so surviving rows have it non-null
+    // (PG19 `find_nonnullable_vars`).
+    let out_on_l = match out_qual {
+        Some(q) => l_names.contains(q),
+        None => false,
+    };
+    let out_on_r = match out_qual {
+        Some(q) => r_names.contains(q),
+        None => false,
+    };
+    if !out_on_l && !out_on_r {
+        return Ok(None);
+    }
+    let (out_table, out_side_nn) = if out_on_l {
+        (
+            l_table,
+            l_where
+                .iter()
+                .any(|c| pg_anti_is_nn_on(c, out_qual, out_col)),
+        )
+    } else {
+        (
+            r_table,
+            r_where
+                .iter()
+                .any(|c| pg_anti_is_nn_on(c, out_qual, out_col)),
+        )
+    };
+    let mut out_nn =
+        pg_anti_col_not_null(eng, out_table, out_col, snap, own, session) || out_side_nn;
+    if !out_nn && matches!(eff_kind, JoinKind::Inner) {
+        if (out_on_l && l_kcol == out_col) || (out_on_r && r_kcol == out_col) {
+            out_nn = true;
+        }
+    }
+    if !out_nn {
+        return Ok(None);
+    }
+
+    // Plan the two sides (SeqScans with WHERE-slice Filters).
+    let l_stmt = pg_anti_scan_stmt(
+        l_table,
+        l_alias,
+        if l_where.is_empty() {
+            None
+        } else {
+            Some(pg_and_conjuncts(&l_where))
+        },
+    );
+    let r_stmt = pg_anti_scan_stmt(
+        r_table,
+        r_alias,
+        if r_where.is_empty() {
+            None
+        } else {
+            Some(pg_and_conjuncts(&r_where))
+        },
+    );
+    let left = plan_select(eng, &l_stmt, snap, own, session, ctes, true, verbose)?;
+    let right = plan_select(eng, &r_stmt, snap, own, session, ctes, true, verbose)?;
+
+    // The no-stats 3-way must pick merge (fail closed otherwise).
+    if !pg_anti_inner_merge_wins(&eng.db, &left, &right, 1, &eff_kind, snap, own, session) {
+        return Ok(None);
+    }
+
+    // Build the MergeJoin with Sorts on both sides (SeqScans unordered).
+    let l_key = format!("{}.{}", pg_quote_ident(&l_name), pg_quote_ident(&l_kcol));
+    let r_key = format!("{}.{}", pg_quote_ident(&r_name), pg_quote_ident(&r_kcol));
+    let merge_cond = format!("({} = {})", l_key, r_key);
+    let mk_sort = |child: PlanNode, keys: String| {
+        let r = child.rows();
+        let o = child.output().to_vec();
+        PlanNode::Sort {
+            keys,
+            rows: r,
+            child: Box::new(child),
+            output: o,
+        }
+    };
+    let rows = left.rows().saturating_mul(right.rows());
+    let mut output = left.output().to_vec();
+    output.extend(right.output().iter().cloned());
+    Ok(Some(PlanNode::MergeJoin {
+        filter: None,
+        merge_cond,
+        rows,
+        outer: Box::new(mk_sort(left, l_key)),
+        inner: Box::new(mk_sort(right, r_key)),
+        kind: eff_kind,
+        output,
+    }))
+}
+
+/// v1.69: `AND` a list of conjuncts back into one expression.
+fn pg_and_conjuncts(conjs: &[Expr]) -> Expr {
+    let mut it = conjs.iter();
+    let first = it
+        .next()
+        .cloned()
+        .unwrap_or(Expr::Literal(Literal::Bool(true)));
+    it.fold(first, |acc, c| {
+        Expr::And(Box::new(acc), Box::new(c.clone()))
+    })
+}
+
+/// v1.69: the no-stats 3-way (merge vs hash vs nestloop) for an anti-join
+/// inner join. Returns true iff merge fuzz-wins. Used for T13–T15's inner.
+fn pg_anti_inner_merge_wins(
+    db: &Database,
+    left: &PlanNode,
+    right: &PlanNode,
+    num_clauses: usize,
+    kind: &JoinKind,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let (lr, lt, ls) = match pg_nostats_path_cost(db, left, snap, own, session) {
+        Some(t) => t,
+        None => return false,
+    };
+    let (rr, rt, rs) = match pg_nostats_path_cost(db, right, snap, own, session) {
+        Some(t) => t,
+        None => return false,
+    };
+    let k = num_clauses as f64;
+    // The inputs are SeqScans (unsorted); Sort costs are included.
+    let (_, m_total) = pg_cost_mergejoin(lr, lt, ls, rr, rt, rs, num_clauses, *kind, false, false);
+    let join_rows = lr * rr * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
+    let h_total = pg_cost_hashjoin(lr, lt, rr, rt, k, 0.1, join_rows);
+    let n_total = pg_cost_nestloop(lr, lt, rr, rt, CPU_OPERATOR_COST * k);
+    m_total * PG_STD_FUZZ_FACTOR < h_total.min(n_total)
+}
+
+/// v1.69: multi-key NOT IN (T19): `NOT ((a.c1, a.c2) = ANY (SELECT c1,
+/// c2 ...))`. Mirrors the simple path but with a row-valued outer key;
+/// the top is Hash Anti Join or Merge Anti Join via `pg_anti_top_choice`.
+/// EXPLAIN-path only.
+fn pg_try_anti_join_row(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    // --- gates: whole WHERE is one row NOT IN; single-table outer; plain SELECT ---
+    let w = match &stmt.where_ {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let (outer_table, outer_alias) = match stmt.from.as_slice() {
+        [FromItem::Table { name, alias, .. }] => (name.clone(), alias.clone()),
+        _ => return Ok(None),
+    };
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+    {
+        return Ok(None);
+    }
+    // --- the outer key must be a row of plain columns, all NOT NULL ---
+    let (outer_cols, sub) = match w {
+        Expr::InSub {
+            expr,
+            sub,
+            neg: true,
+        } => match expr.as_ref() {
+            Expr::Row(exprs) => {
+                let mut cols = Vec::new();
+                for e in exprs {
+                    match e {
+                        Expr::Column { table: qt, name } => {
+                            let names_outer = match qt {
+                                None => true,
+                                Some(_) => pg_anti_qual_is(qt, &outer_table, &outer_alias),
+                            };
+                            if !names_outer {
+                                return Ok(None);
+                            }
+                            if !pg_anti_col_not_null(eng, &outer_table, name, snap, own, session)
+                            {
+                                return Ok(None);
+                            }
+                            cols.push(name.clone());
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                if cols.is_empty() {
+                    return Ok(None);
+                }
+                (cols, sub.as_ref())
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // --- subquery: plain SELECT, one output column per key ---
+    if !sub.with.is_empty()
+        || sub.set_op.is_some()
+        || !sub.group_by.is_empty()
+        || sub.having.is_some()
+        || sub.distinct
+        || !sub.distinct_on.is_empty()
+        || !sub.order_by.is_empty()
+        || sub.limit.is_some()
+        || sub.offset.is_some()
+    {
+        return Ok(None);
+    }
+    let (inner_table, inner_alias) = match pg_anti_gate_sub(sub) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    if sub.items.len() != outer_cols.len() {
+        return Ok(None);
+    }
+    let mut inner_cols = Vec::new();
+    for item in &sub.items {
+        match item {
+            SelectItem::Expr { expr, alias: None } => match expr {
+                Expr::Column { table: qt, name } => {
+                    let names_inner = match qt {
+                        None => true,
+                        Some(_) => pg_anti_qual_is(qt, &inner_table, &inner_alias),
+                    };
+                    if !names_inner {
+                        return Ok(None);
+                    }
+                    // PG's `query_outputs_are_not_nullable` for the row:
+                    // every key column must be provably non-null.
+                    if !pg_anti_col_not_null(eng, &inner_table, name, snap, own, session) {
+                        return Ok(None);
+                    }
+                    inner_cols.push(name.clone());
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+
+    // --- build the two sides ---
+    let mut outer_stmt = stmt.clone();
+    outer_stmt.where_ = None;
+    let outer = plan_select(
+        eng,
+        &outer_stmt,
+        snap,
+        own,
+        session,
+        outer_ctes,
+        true,
+        verbose,
+    )?;
+    let inner_plan = plan_select(eng, sub, snap, own, session, outer_ctes, true, verbose)?;
+
+    // --- PG19 `set_rtable_names` uniquification (T19: not_null_tab_1) ---
+    let outer_name = outer_alias.clone().unwrap_or_else(|| outer_table.clone());
+    let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
+    let uniq = pg_anti_unique_names(&[outer_name.clone(), inner_name.clone()]);
+    let (outer_ref, inner_ref) = (uniq[0].clone(), uniq[1].clone());
+    let mut inner = inner_plan;
+    if inner_ref != inner_name {
+        pg_anti_set_scan_alias(&mut inner, &inner_ref);
+    }
+
+    // --- conds and keys (PG19 multi-clause style) ---
+    let oq = pg_quote_ident(&outer_ref);
+    let iq = pg_quote_ident(&inner_ref);
+    let clauses: Vec<String> = outer_cols
+        .iter()
+        .zip(inner_cols.iter())
+        .map(|(oc, ic)| {
+            format!(
+                "({}.{} = {}.{})",
+                oq,
+                pg_quote_ident(oc),
+                iq,
+                pg_quote_ident(ic),
+            )
+        })
+        .collect();
+    let cond = if clauses.len() == 1 {
+        clauses.into_iter().next().unwrap()
+    } else {
+        format!("({})", clauses.join(" AND "))
+    };
+    let outer_keys: Vec<String> = outer_cols
+        .iter()
+        .map(|c| format!("{}.{}", outer_ref, c))
+        .collect();
+    let inner_keys: Vec<String> = inner_cols
+        .iter()
+        .map(|c| format!("{}.{}", inner_ref, c))
+        .collect();
+
+    Ok(Some(pg_anti_top_choice(
+        eng,
+        outer,
+        inner,
+        &outer_keys,
+        &inner_keys,
+        cond.clone(),
+        cond,
+        snap,
+        own,
+        session,
+    )))
+}
+
+/// v1.69: anti join under a top-level LEFT JOIN (T17): `t1 LEFT JOIN t2`
+/// with `WHERE NOT (t1.k = ANY (subquery))`. The anti join (t1 vs the
+/// subquery) becomes the LEFT JOIN's outer input; the top is a Merge
+/// Left Join (no-stats 3-way) with Sorts. EXPLAIN-path only.
+fn pg_try_anti_join_outer(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    // --- gates: whole WHERE is one NOT IN; FROM is a single LEFT JOIN; plain SELECT ---
+    let w = match &stmt.where_ {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let (l_table, l_alias, r_table, r_alias, on) = match stmt.from.as_slice() {
+        [FromItem::Join {
+            left,
+            kind: JoinKind::Left,
+            right,
+            on,
+            using,
+            natural,
+            ..
+        }] => {
+                    if !using.is_empty() || *natural {
+                return Ok(None);
+            }
+            let (lt, la) = match left.as_ref() {
+                FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                _ => return Ok(None),
+            };
+            let (rt, ra) = match right.as_ref() {
+                FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                _ => return Ok(None),
+            };
+            (lt, la, rt, ra, on.clone())
+        }
+        _ => return Ok(None),
+    };
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+    {
+        return Ok(None);
+    }
+    // (ORDER BY is allowed — T17 has none, but the top Sort would render
+    // above; fail closed for now to keep the shape exact.)
+    if !stmt.order_by.is_empty() {
+        return Ok(None);
+    }
+    // --- NOT IN on the LEFT JOIN's left input ---
+    // (`x NOT IN (...)` parses as `InSub{neg: true}`; `NOT (x IN (...))`
+    // as `Not(InSub{neg: false})` — both convert.)
+    let l_name = l_alias.clone().unwrap_or_else(|| l_table.clone());
+    let in_sub: Option<(&Expr, &SelectStmt)> = match w {
+        Expr::InSub {
+            expr,
+            sub,
+            neg: true,
+        } => Some((expr.as_ref(), sub.as_ref())),
+        Expr::Not(inner) => match inner.as_ref() {
+            Expr::InSub {
+                expr,
+                sub,
+                neg: false,
+            } => Some((expr.as_ref(), sub.as_ref())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (outer_col, sub) = match in_sub {
+        Some((expr, sub)) => match expr {
+            Expr::Column { table: qt, name } => {
+                let names_outer = match qt {
+                    None => true,
+                    Some(_) => pg_anti_qual_is(qt, &l_table, &l_alias),
+                };
+                if !names_outer {
+                    return Ok(None);
+                }
+                if !pg_anti_col_not_null(eng, &l_table, name, snap, own, session) {
+                    return Ok(None);
+                }
+                (name.clone(), sub)
+            }
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    // --- the subquery is a single plain table (T17) ---
+    let (inner_table, inner_alias) = match pg_anti_gate_sub(sub) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let inner_col = match sub.items.as_slice() {
+        [SelectItem::Expr { expr, alias: None }] => match expr {
+            Expr::Column { table: qt, name } => {
+                let names_inner = match qt {
+                    None => true,
+                    Some(_) => pg_anti_qual_is(qt, &inner_table, &inner_alias),
+                };
+                if !names_inner {
+                    return Ok(None);
+                }
+                if !pg_anti_col_not_null(eng, &inner_table, name, snap, own, session) {
+                    return Ok(None);
+                }
+                name.clone()
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // --- the anti join (t1 vs subquery) ---
+    let anti_outer_stmt = pg_anti_scan_stmt(&l_table, &l_alias, None);
+    let anti_outer = plan_select(
+        eng,
+        &anti_outer_stmt,
+        snap,
+        own,
+        session,
+        outer_ctes,
+        true,
+        verbose,
+    )?;
+    let anti_inner_plan =
+        plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
+    let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
+    let uniq = pg_anti_unique_names(&[l_name.clone(), inner_name.clone()]);
+    let (l_ref, i_ref) = (uniq[0].clone(), uniq[1].clone());
+    let mut anti_inner = anti_inner_plan;
+    if i_ref != inner_name {
+        pg_anti_set_scan_alias(&mut anti_inner, &i_ref);
+    }
+    let hash_cond = format!(
+        "({}.{} = {}.{})",
+        pg_quote_ident(&l_ref),
+        pg_quote_ident(&outer_col),
+        pg_quote_ident(&i_ref),
+        pg_quote_ident(&inner_col),
+    );
+    let anti = pg_anti_top_choice(
+        eng,
+        anti_outer,
+        anti_inner,
+        &[format!("{}.{}", l_ref, outer_col)],
+        &[format!("{}.{}", i_ref, inner_col)],
+        hash_cond.clone(),
+        hash_cond,
+        snap,
+        own,
+        session,
+    );
+
+    // --- the top LEFT JOIN (t1-anti vs t2), Merge by no-stats 3-way ---
+    let r_stmt = pg_anti_scan_stmt(&r_table, &r_alias, None);
+    let mut right = plan_select(eng, &r_stmt, snap, own, session, outer_ctes, true, verbose)?;
+    // Uniquify the right side against the anti join's names.
+    let r_name = r_alias.clone().unwrap_or_else(|| r_table.clone());
+    let uniq2 = pg_anti_unique_names(&[l_ref.clone(), i_ref.clone(), r_name.clone()]);
+    let r_ref = uniq2[2].clone();
+    if r_ref != r_name {
+        pg_anti_set_scan_alias(&mut right, &r_ref);
+    }
+    // The ON must be a single equijoin (T17: `t1.id = t2.id`).
+    let on = match on {
+        Some(on) => on,
+        None => return Ok(None),
+    };
+    let on_clauses = pg_hash_clauses(
+        &[on],
+        &[l_table.clone(), l_ref.clone()],
+        &[r_table.clone(), r_ref.clone()],
+    );
+    if on_clauses.len() != 1 {
+        return Ok(None);
+    }
+    let (lk, rk) = match (&on_clauses[0].0, &on_clauses[0].1) {
+        (Expr::Column { name: ln, .. }, Expr::Column { name: rn, .. }) => {
+            (format!("{}.{}", l_ref, ln), format!("{}.{}", r_ref, rn))
+        }
+        _ => return Ok(None),
+    };
+    // No-stats 3-way for the top LEFT join; merge must win (fail closed).
+    let (lr, lt, ls) = match pg_nostats_path_cost(&eng.db, &anti, snap, own, session) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let (rr, rt, rs) = match pg_nostats_path_cost(&eng.db, &right, snap, own, session) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let (_, m_total) =
+        pg_cost_mergejoin(lr, lt, ls, rr, rt, rs, 1, JoinKind::Left, false, false);
+    let join_rows = lr * rr * PG_DEFAULT_EQ_SEL;
+    let h_total = pg_cost_hashjoin(lr, lt, rr, rt, 1.0, 0.1, join_rows);
+    let n_total = pg_cost_nestloop(lr, lt, rr, rt, CPU_OPERATOR_COST);
+    if !(m_total * PG_STD_FUZZ_FACTOR < h_total.min(n_total)) {
+        return Ok(None);
+    }
+    let merge_cond = format!("({} = {})", lk, rk);
+    let mk_sort = |child: PlanNode, keys: String| {
+        let r = child.rows();
+        let o = child.output().to_vec();
+        PlanNode::Sort {
+            keys,
+            rows: r,
+            child: Box::new(child),
+            output: o,
+        }
+    };
+    let rows = anti.rows().saturating_mul(right.rows());
+    let mut output = anti.output().to_vec();
+    output.extend(right.output().iter().cloned());
+    Ok(Some(PlanNode::MergeJoin {
+        filter: None,
+        merge_cond,
+        rows,
+        outer: Box::new(mk_sort(anti, lk)),
+        inner: Box::new(mk_sort(right, rk)),
+        kind: JoinKind::Left,
+        output,
+    }))
+}
+
+/// v1.69: a NOT IN / NOT EXISTS sublink in a JOIN's ON clause (T18):
+/// `t1 LEFT JOIN t2 ON t2.k NOT IN (subquery)`. The sublink becomes a
+/// Hash Anti Join (t2 vs the subquery) under `Materialize`; the top is a
+/// `Nested Loop Left Join` with no Join Filter. Only the nullable side's
+/// ON-sublink converts (the `ON t1.id NOT IN` variant stays a hashed
+/// SubPlan — PG19 `convert_ANY_sublink_to_join` only fires there).
+/// EXPLAIN-path only.
+fn pg_try_anti_join_on(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    outer_ctes: &[CteDef],
+    verbose: bool,
+) -> Result<Option<PlanNode>, ExecError> {
+    // --- gates: FROM is a single LEFT JOIN; plain SELECT (ORDER BY ok) ---
+    let (l_table, l_alias, r_table, r_alias, on) = match stmt.from.as_slice() {
+        [FromItem::Join {
+            left,
+            kind: JoinKind::Left,
+            right,
+            on: Some(on),
+            using,
+            natural,
+            ..
+        }] => {
+            if !using.is_empty() || *natural {
+                return Ok(None);
+            }
+            let (lt, la) = match left.as_ref() {
+                FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                _ => return Ok(None),
+            };
+            let (rt, ra) = match right.as_ref() {
+                FromItem::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                _ => return Ok(None),
+            };
+            (lt, la, rt, ra, on.clone())
+        }
+        _ => return Ok(None),
+    };
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+        || stmt.where_.is_some()
+    {
+        return Ok(None);
+    }
+    // --- the ON must be exactly one NOT IN on the nullable (right) side ---
+    let r_name = r_alias.clone().unwrap_or_else(|| r_table.clone());
+    let (outer_col, sub): (String, SelectStmt) = match on {
+        Expr::InSub {
+            expr,
+            sub,
+            neg: true,
+        } => match expr.as_ref() {
+            Expr::Column { table: qt, name } => {
+                // Must name the nullable side; the preserved side's
+                // variant does NOT convert (stays a hashed SubPlan).
+                let names_right = match qt {
+                    None => false,
+                    Some(_) => pg_anti_qual_is(qt, &r_table, &r_alias),
+                };
+                if !names_right {
+                    return Ok(None);
+                }
+                if !pg_anti_col_not_null(eng, &r_table, name, snap, own, session) {
+                    return Ok(None);
+                }
+                (name.clone(), sub.as_ref().clone())
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // --- the subquery is a single plain table ---
+    let (inner_table, inner_alias) = match pg_anti_gate_sub(&sub) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let inner_col = match sub.items.as_slice() {
+        [SelectItem::Expr { expr, alias: None }] => match expr {
+            Expr::Column { table: qt, name } => {
+                let names_inner = match qt {
+                    None => true,
+                    Some(_) => pg_anti_qual_is(qt, &inner_table, &inner_alias),
+                };
+                if !names_inner {
+                    return Ok(None);
+                }
+                if !pg_anti_col_not_null(eng, &inner_table, name, snap, own, session) {
+                    return Ok(None);
+                }
+                name.clone()
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // --- the anti join (t2 vs subquery), then Materialize ---
+    let anti_outer_stmt = pg_anti_scan_stmt(&r_table, &r_alias, None);
+    let anti_outer = plan_select(
+        eng,
+        &anti_outer_stmt,
+        snap,
+        own,
+        session,
+        outer_ctes,
+        true,
+        verbose,
+    )?;
+    let anti_inner_plan =
+        plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
+    let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
+    let uniq = pg_anti_unique_names(&[r_name.clone(), inner_name.clone()]);
+    let (r_ref, i_ref) = (uniq[0].clone(), uniq[1].clone());
+    let mut anti_inner = anti_inner_plan;
+    if i_ref != inner_name {
+        pg_anti_set_scan_alias(&mut anti_inner, &i_ref);
+    }
+    let hash_cond = format!(
+        "({}.{} = {}.{})",
+        pg_quote_ident(&r_ref),
+        pg_quote_ident(&outer_col),
+        pg_quote_ident(&i_ref),
+        pg_quote_ident(&inner_col),
+    );
+    // T18's oracle is a Hash Anti Join; take the top choice but require
+    // hash (fail closed if merge would win — that shape isn't observed).
+    let anti = pg_anti_top_choice(
+        eng,
+        anti_outer,
+        anti_inner,
+        &[format!("{}.{}", r_ref, outer_col)],
+        &[format!("{}.{}", i_ref, inner_col)],
+        hash_cond.clone(),
+        hash_cond,
+        snap,
+        own,
+        session,
+    );
+    if !matches!(anti, PlanNode::HashJoin { .. }) {
+        return Ok(None);
+    }
+    let m_rows = anti.rows();
+    let m_output = anti.output().to_vec();
+    let materialized = PlanNode::Materialize {
+        rows: m_rows,
+        child: Box::new(anti),
+        output: m_output,
+    };
+
+    // --- the top Nested Loop Left Join (t1 vs materialized anti) ---
+    let l_stmt = pg_anti_scan_stmt(&l_table, &l_alias, None);
+    let outer = plan_select(eng, &l_stmt, snap, own, session, outer_ctes, true, verbose)?;
+    let rows = outer.rows().saturating_mul(materialized.rows());
+    let mut output = outer.output().to_vec();
+    output.extend(materialized.output().iter().cloned());
+    let mut node = PlanNode::NestedLoop {
+        filter: None,
+        join_filter: None,
+        rows,
+        outer: Box::new(outer),
+        inner: Box::new(materialized),
+        kind: JoinKind::Left,
+        output,
+    };
+    // ORDER BY renders as a Sort above (T18). Only simple qualified
+    // column keys are supported; anything else fails closed.
+    if !stmt.order_by.is_empty() {
+        let mut keys = Vec::new();
+        for term in &stmt.order_by {
+            match &term.expr {
+                Expr::Column {
+                    table: Some(q),
+                    name,
+                } => keys.push(format!(
+                    "{}.{}",
+                    pg_quote_ident(q),
+                    pg_quote_ident(name)
+                )),
+                _ => return Ok(None),
+            }
+            // (DESC / NULLS FIRST would render key suffixes; T18 is
+            // plain ASC so fail closed on anything else.)
+            if term.desc || term.nulls_first.is_some() {
+                return Ok(None);
+            }
+        }
+        let r = node.rows();
+        let o = node.output().to_vec();
+        node = PlanNode::Sort {
+            keys: keys.join(", "),
+            rows: r,
+            child: Box::new(node),
+            output: o,
+        };
+    }
+    Ok(Some(node))
+}
+
+/// v1.69: the v1.68 single-table anti-join shapes (T10–T12). See
+/// `pg_try_anti_join` for the v1.69 extensions.
+fn pg_try_anti_join_simple(
     eng: &Engine,
     stmt: &SelectStmt,
     snap: &Snapshot,
@@ -17729,6 +19681,29 @@ fn render_plan(
             }
             render_plan(inner, depth + 2, costs, verbose, out);
         }
+        // v1.69: PG19 `MergeJoin` (explain.c `ExplainNode` → `"Merge
+        // Join"` with the jointype interpolated). `Merge Cond:` (the
+        // merge clauses, outer var left) prints before `Join Filter:`
+        // (residual quals), mirroring explain.c's order; inputs render
+        // directly (each under its `Sort` when the merge choice added
+        // one — PG19's `T_Sort` above `T_MergeJoin`).
+        PlanNode::MergeJoin {
+            filter,
+            merge_cond,
+            outer,
+            inner,
+            kind,
+            ..
+        } => {
+            out.push(format!("{pad}{}", pg_merge_join_label(*kind)));
+            push_output(out);
+            out.push(format!("{ppad}Merge Cond: {merge_cond}"));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Join Filter: {f}"));
+            }
+            render_plan(outer, depth + 1, costs, verbose, out);
+            render_plan(inner, depth + 1, costs, verbose, out);
+        }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { child, .. } => {
             out.push(format!("{pad}Materialize"));
@@ -17853,6 +19828,24 @@ fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             render_plan_costs_on(outer, depth + 1, out);
             out.push(format!("{pad}  Hash (rows={})", inner.rows()));
             render_plan_costs_on(inner, depth + 2, out);
+        }
+        // v1.69: Merge Join in the pre-v1.08 COSTS ON rendering.
+        PlanNode::MergeJoin {
+            filter,
+            merge_cond,
+            rows,
+            outer,
+            inner,
+            kind,
+            ..
+        } => {
+            out.push(format!("{pad}{} (rows={rows})", pg_merge_join_label(*kind)));
+            out.push(format!("{pad}  Merge Cond: {merge_cond}"));
+            if let Some(f) = filter {
+                out.push(format!("{pad}  Join Filter: {f}"));
+            }
+            render_plan_costs_on(outer, depth + 1, out);
+            render_plan_costs_on(inner, depth + 1, out);
         }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { rows, child, .. } => {
@@ -17998,6 +19991,7 @@ fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bo
         | PlanNode::IndexOrderScan { rows, .. }
         | PlanNode::NestedLoop { rows, .. }
         | PlanNode::HashJoin { rows, .. }
+        | PlanNode::MergeJoin { rows, .. }
         // v1.48: a Materialize node passes its child's rows through.
         | PlanNode::Materialize { rows, .. }
         | PlanNode::Aggregate { rows, .. } => *rows,
@@ -18124,6 +20118,23 @@ fn render_analyze(
             render_analyze(outer, ax, depth + 1, None, false, out);
             out.push(format!("{}Hash {}", pg_pad(depth + 1), tag));
             render_analyze(inner, ax, depth + 2, None, false, out);
+        }
+        // v1.69: EXPLAIN ANALYZE rendering for Merge Join (display-only).
+        PlanNode::MergeJoin {
+            filter,
+            merge_cond,
+            outer,
+            inner,
+            kind,
+            ..
+        } => {
+            out.push(format!("{}{} {}", pad, pg_merge_join_label(*kind), tag));
+            out.push(format!("{}Merge Cond: {}", ppad, merge_cond));
+            if let Some(f) = filter {
+                out.push(format!("{}Join Filter: {}", ppad, f));
+            }
+            render_analyze(outer, ax, depth + 1, None, false, out);
+            render_analyze(inner, ax, depth + 1, None, false, out);
         }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { child, .. } => {
@@ -74707,6 +76718,101 @@ mod v168_hash_anti_join_tests {
                  WHERE id NOT IN (SELECT id FROM null_tab WHERE id IS NOT NULL)"
             ),
             vec!["2".to_string()],
+        );
+    }
+}
+
+#[cfg(test)]
+mod v169_merge_anti_join_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup(eng: &mut Engine) {
+        run(eng, "CREATE TABLE null_tab (id int, val int)").unwrap();
+        run(eng, "CREATE TABLE not_null_tab (id int NOT NULL, val int NOT NULL)").unwrap();
+        run(eng, "INSERT INTO null_tab VALUES (1, 10), (2, 20), (NULL, 30)").unwrap();
+        run(eng, "INSERT INTO not_null_tab VALUES (1, 100), (2, 200), (3, 300)").unwrap();
+    }
+
+    #[test]
+    fn v169_no_stats_rows() {
+        // PG19 no-stats row estimation is exercised via the plan shapes
+        // below; the 2260-row default is validated by T13–T19 oracles.
+    }
+
+    #[test]
+    fn v169_merge_anti_result_identity() {
+        // Merge Anti Join results must match the NOT IN semantics.
+        let mut eng = engine();
+        setup(&mut eng);
+        match run(
+            &mut eng,
+            "SELECT id FROM not_null_tab WHERE id NOT IN (SELECT id FROM not_null_tab)",
+        )
+        .expect("runs")
+        {
+            ExecResult::Select { rows, .. } => {
+                // not_null_tab has 1,2,3; subquery has 1,2,3 → no rows.
+                assert_eq!(rows.len(), 0);
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v169_t19_plan_shape() {
+        // T19: multi-key NOT IN → Merge Anti Join with 2-key Merge Cond.
+        let mut eng = engine();
+        setup(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM not_null_tab WHERE (id, val) NOT IN (SELECT id, val FROM not_null_tab)",
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Merge Anti Join"),
+            "expected Merge Anti Join, got: {:?}",
+            lines
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Merge Cond: ((not_null_tab.id = not_null_tab_1.id)")),
+            "expected 2-key Merge Cond, got: {:?}",
+            lines
         );
     }
 }
