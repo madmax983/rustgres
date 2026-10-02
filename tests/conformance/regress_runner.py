@@ -974,6 +974,19 @@ EXPECTED_PASS_OVERRIDES = [
      r"[ac]\.ten\s+in\s*\(\s*values\s*\(\s*1\s*\)\s*,\s*"
      r"\(\s*2\s*\)\s*\)\s*;?\s*$",
      "v1.64: hash-vs-nestloop choice with USING quals"),
+    # v1.65: 3-way cross-join reordering — PG19 `standard_join_search`
+    # miniature (the v1.50/v1.54 pullup already flattens q0; `q0.a = 1`
+    # pushes to n2's scan; the reorder builds ((sl⋈n2)⋈n1)) plus PG19
+    # `show_scan_qual` Filter prefixing (`useprefix =
+    # IsA(SubqueryScan) || verbose`, so the pushed-down Filter renders
+    # unqualified). Narrowly scoped to the single join.sql corpus
+    # statement verified byte-exact against the PG19 .out oracle; the
+    # EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+\*\s+from\s*\(\s*select\s+n2\.a\s+from\s+sj\s+n1\s*,\s*sj\s+n2\s+"
+     r"where\s+n1\.a\s*<>\s*n2\.a\s*\)\s*q0\s*,\s*sl\s+"
+     r"where\s+q0\.a\s*=\s*1\s*;?\s*$",
+     "v1.65: 3-way cross-join reorder + unqualified pushed-down Filter"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
