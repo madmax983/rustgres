@@ -13059,34 +13059,51 @@ struct PgCrossLeaf {
     scan: f64,
 }
 
-/// v1.65: one level-2 pair: the winning order, its estimated output
-/// rows and cheapest nestloop path cost, and its join quals.
-struct PgPair165 {
-    outer: usize,
-    inner: usize,
+/// v1.66: one N-way DP joinrel — a leaf subset (bitmask) with its
+/// cheapest left-deep nestloop build (PG19 `standard_join_search`
+/// level-k rel, nestloop paths only). Level-2 rels are pairs (the
+/// v1.65 `PgPair165`, now uniform with higher levels: `sub` is the
+/// single outer leaf, `leaf` the inner leaf).
+#[derive(Clone)]
+struct PgJoinRel166 {
+    /// estimated output rows (`rows(sub) * rows(leaf) * sel(quals)`)
     rows: f64,
+    /// cheapest nestloop path cost to build this rel
     cost: f64,
+    /// winning build: subrel mask and the newly joined leaf
+    sub: u32,
+    leaf: usize,
+    /// true when the subrel is the outer side of the winning build
+    sub_outer: bool,
+    /// join quals newly coverable at this node (PG19
+    /// `distribute_qual_to_rels`: attached at the lowest join covering
+    /// all their tables)
     quals: Vec<Expr>,
+    /// estimated rows of the inner side of the winning build (the
+    /// v1.65 selective-first tie-break, generalized)
+    inner_rows: f64,
 }
 
-/// v1.65: leaves a level-2 pair may join at level 3 (PG19
-/// `join_search_one_level`): a pair with join clauses linking an
-/// outside leaf extends only via those clauses (PG19
+/// v1.66: leaves a DP rel (member leaf set `members`) may join at the
+/// next level (PG19 `join_search_one_level`): a rel with join clauses
+/// linking an outside leaf extends only via those clauses (PG19
 /// `make_rels_by_clause_joins`); otherwise it extends cartesianly with
 /// every remaining leaf (PG19 `make_rels_by_clauseless_joins`).
-fn pg_pair_extensions(rem: &[(Expr, Vec<usize>)], pair: &[usize]) -> Vec<usize> {
+/// Generalizes v1.65's `pg_pair_extensions` (which was pair-only) to
+/// N-way rels; `n` is the total leaf count.
+fn pg_subset_extensions(rem: &[(Expr, Vec<usize>)], members: &[usize], n: usize) -> Vec<usize> {
     let mut via_clause = Vec::new();
     for (_, s) in rem {
-        if s.iter().any(|x| pair.contains(x)) && !s.iter().all(|x| pair.contains(x)) {
+        if s.iter().any(|x| members.contains(x)) && !s.iter().all(|x| members.contains(x)) {
             for x in s {
-                if !pair.contains(x) && !via_clause.contains(x) {
+                if !members.contains(x) && !via_clause.contains(x) {
                     via_clause.push(*x);
                 }
             }
         }
     }
     if via_clause.is_empty() {
-        (0..3).filter(|x| !pair.contains(x)).collect()
+        (0..n).filter(|x| !members.contains(x)).collect()
     } else {
         via_clause
     }
@@ -13122,9 +13139,48 @@ fn pg_build_cross_nl(
     }
 }
 
-/// v1.65: PG19 `standard_join_search` (allpaths.c) for exactly three
-/// comma-join leaves, nestloop paths only. Returns the reordered plan,
-/// or `None` to keep the existing written-order path (fail closed).
+/// v1.66: build the winning N-way DP tree — the same construction as
+/// the v1.65 level-3 builder (`pg_build_cross_nl`), applied
+/// recursively down the DP's winning decomposition chain. A
+/// single-leaf subrel is the planned scan itself.
+fn pg_build_cross_dp(
+    rel: &PgJoinRel166,
+    rels: &[Option<PgJoinRel166>],
+    leaves: &[PgCrossLeaf],
+    px: &PgPlanCtx,
+) -> PlanNode {
+    let sub_node = if rel.sub.count_ones() == 1 {
+        leaves[rel.sub.trailing_zeros() as usize].node.clone()
+    } else {
+        let sub_rel = rels[rel.sub as usize]
+            .as_ref()
+            .expect("v1.66: DP subrel exists");
+        pg_build_cross_dp(sub_rel, rels, leaves, px)
+    };
+    let leaf_node = leaves[rel.leaf].node.clone();
+    if rel.sub_outer {
+        pg_build_cross_nl(sub_node, leaf_node, rel.quals.clone(), px)
+    } else {
+        pg_build_cross_nl(leaf_node, sub_node, rel.quals.clone(), px)
+    }
+}
+
+/// v1.66: PG19 `standard_join_search` (allpaths.c) for N-way
+/// comma-join products, nestloop paths only. Generalizes the v1.65
+/// 3-leaf miniature to 3..=8 leaves: level 2 tries all pairs × both
+/// orders; level k (3..=N) extends each level-(k-1) rel by one leaf per
+/// PG's clause-vs-clauseless rule (`join_search_one_level`); costs via
+/// `pg_cost_nestloop`; the winner minimizes the v1.65 lexicographic key
+/// (top_cost, sub_cost, sub_rows, sub_inner_rows) — the absolute
+/// `cost_nestloop` model first, then PG's empirical selective-first
+/// order (the t5 oracle builds the inner pair from the filtered rel);
+/// exact ties keep the written order (fail closed). Returns the
+/// reordered plan, or `None` to keep the existing written-order path
+/// (fail closed).
+///
+/// Bound: PG19 switches to GEQO at `geqo_threshold` (12) rels; rustgres
+/// fails closed beyond 8 leaves — 2^8 DP states are trivial to explore,
+/// and 8 is well clear of PG's heuristic threshold.
 ///
 /// Join quals attach at the lowest nestloop covering all their tables
 /// (PG19 `distribute_qual_to_rels`); per-leaf Filters are already on
@@ -13142,31 +13198,33 @@ fn pg_reorder_cross_join(
     px: &PgPlanCtx,
     stmt: &SelectStmt,
 ) -> Option<PlanNode> {
-    // v1.65 scope: exactly three base-table leaves (t5's shape).
     let mut items: Vec<&FromItem> = Vec::new();
     if !(pg_cross_leaf_one(left, &mut items) && pg_cross_leaf_one(right, &mut items)) {
         return None;
     }
-    if items.len() != 3 {
+    let n = items.len();
+    // v1.66: N-way DP for 3..=8 leaves (v1.65: exactly 3). Fewer than 3
+    // leaves use the pre-existing paths; more than 8 fail closed to the
+    // written order (PG19 would use GEQO past 12).
+    if n < 3 || n > 8 {
         return None;
     }
-    // WHERE distribution over the three leaves (PG19
-    // `distribute_qual_to_rels`, via the existing `pg_split_where`:
-    // single-leaf conjuncts become scan Filters, the rest stay at the
-    // join level).
+    // WHERE distribution over the leaves (PG19 `distribute_qual_to_rels`,
+    // via the existing `pg_split_where`: single-leaf conjuncts become
+    // scan Filters, the rest stay at the join level).
     let splits: Vec<(Vec<String>, Vec<String>)> = items
         .iter()
         .map(|it| pg_split_item(eng, it, snap, own, session, ctes))
         .collect();
     let (per_leaf, remainder) = match where_ {
         Some(w) => pg_split_where(w, &splits).ok()?,
-        None => (vec![Vec::new(), Vec::new(), Vec::new()], Vec::new()),
+        None => (vec![Vec::new(); n], Vec::new()),
     };
     // Plan each leaf exactly as the written-order path would; gate on
     // plain SeqScan leaves over resolvable base tables (the v1.63
-    // estimability gate, extended to three leaves). A planning error
+    // estimability gate, extended to N leaves). A planning error
     // falls back so the existing path can report it faithfully.
-    let mut leaves: Vec<PgCrossLeaf> = Vec::with_capacity(3);
+    let mut leaves: Vec<PgCrossLeaf> = Vec::with_capacity(n);
     for (it, cs) in items.iter().zip(per_leaf.iter()) {
         let lw = pg_fold_and(cs.clone());
         let node = plan_from_item(
@@ -13197,22 +13255,24 @@ fn pg_reorder_cross_join(
     // Leaf-index set per join-level conjunct; ambiguous, unresolvable
     // or const (empty) conjuncts cover every leaf (applied at the top
     // join), matching `pg_split_where`'s join-level placement.
+    let all: Vec<usize> = (0..n).collect();
     let rem: Vec<(Expr, Vec<usize>)> = remainder
         .into_iter()
         .map(|c| {
-            let mut set = pg_conjunct_leaf_set(&c, &splits).unwrap_or_else(|| vec![0, 1, 2]);
+            let mut set = pg_conjunct_leaf_set(&c, &splits).unwrap_or_else(|| all.clone());
             if set.is_empty() {
-                set = vec![0, 1, 2];
+                set = all.clone();
             }
             (c, set)
         })
         .collect();
-    // Level 2: all pairs, both orders (PG19 `make_join_rel` tries both
-    // for JOIN_INNER; `add_path` keeps the cheaper, ties keep the
-    // earlier-added = written order, mirrored by strict `<`).
-    let mut pairs: Vec<PgPair165> = Vec::with_capacity(3);
-    for i in 0..3usize {
-        for j in (i + 1)..3usize {
+    // DP table: mask -> cheapest left-deep nestloop build. Level 2: all
+    // pairs, both orders (PG19 `make_join_rel` tries both for JOIN_INNER;
+    // `add_path` keeps the cheaper, ties keep the earlier-added =
+    // written order, mirrored by strict `<`).
+    let mut rels: Vec<Option<PgJoinRel166>> = vec![None; 1 << n];
+    for i in 0..n {
+        for j in (i + 1)..n {
             let quals: Vec<Expr> = rem
                 .iter()
                 .filter(|(_, s)| s.as_slice() == [i, j])
@@ -13228,67 +13288,93 @@ fn pg_reorder_cross_join(
             } else {
                 (i, j, cost_ij)
             };
-            pairs.push(PgPair165 {
-                outer,
-                inner,
+            let mask = (1u32 << i) | (1u32 << j);
+            rels[mask as usize] = Some(PgJoinRel166 {
                 rows: li.rows * lj.rows * sel,
                 cost,
+                sub: 1u32 << outer,
+                leaf: inner,
+                sub_outer: true,
                 quals,
+                inner_rows: leaves[inner].rows,
             });
         }
     }
-    // Level 3: each pair joined with an allowed remaining leaf, both
-    // orders. The winner minimizes (top_cost, pair_cost, pair_rows,
-    // pair_inner_rows) lexicographically — the absolute `cost_nestloop`
-    // model first, then PG's empirical selective-first order (the t5
-    // oracle builds the inner pair from the filtered rel); exact ties
-    // keep the written order (fail closed).
-    let mut best_key: Option<(f64, f64, f64, f64)> = None;
-    let mut best: Option<(usize, usize, bool, Vec<Expr>)> = None;
-    for (pi, p) in pairs.iter().enumerate() {
-        let mut pset = [p.outer, p.inner];
-        pset.sort_unstable();
-        for r in pg_pair_extensions(&rem, &pset) {
-            let lr = &leaves[r];
-            // Top-level quals: join-level conjuncts not already applied
-            // at the pair (PG19: the top joinrel's own restrictinfo).
-            let top_quals: Vec<Expr> = rem
-                .iter()
-                .filter(|(_, s)| !(s.len() == 2 && s[0] == pset[0] && s[1] == pset[1]))
-                .map(|(c, _)| c.clone())
-                .collect();
-            let qp = CPU_OPERATOR_COST * top_quals.len() as f64;
-            let c_po = pg_cost_nestloop(p.rows, p.cost, lr.rows, lr.scan, qp);
-            let c_lo = pg_cost_nestloop(lr.rows, lr.scan, p.rows, p.cost, qp);
-            for (cost, pair_outer) in [(c_po, true), (c_lo, false)] {
-                let key = (cost, p.cost, p.rows, leaves[p.inner].rows);
-                let better = match best_key {
-                    None => true,
-                    Some(bk) => key < bk,
+    // Levels 3..=N: each level-(k-1) rel extends by one leaf per PG's
+    // clause-vs-clauseless rule (`join_search_one_level`,
+    // `make_rels_by_clause_joins` / `make_rels_by_clauseless_joins`).
+    // `r` visits leaves in decreasing order so the (T, r) visit order
+    // matches v1.65's pair order at N=3 (exact-tie determinism).
+    for k in 3..=n {
+        for mask in 0..(1u32 << n) {
+            if mask.count_ones() as usize != k {
+                continue;
+            }
+            let members: Vec<usize> =
+                (0..n).filter(|i| mask & (1u32 << i) != 0).collect();
+            let mut best_key: Option<(f64, f64, f64, f64)> = None;
+            let mut best: Option<PgJoinRel166> = None;
+            for &r in members.iter().rev() {
+                let sub = mask ^ (1u32 << r);
+                let Some(sub_rel) = rels[sub as usize].as_ref() else {
+                    continue;
                 };
-                if better {
-                    best_key = Some(key);
-                    best = Some((pi, r, pair_outer, top_quals.clone()));
+                let sub_members: Vec<usize> =
+                    (0..n).filter(|i| sub & (1u32 << i) != 0).collect();
+                if !pg_subset_extensions(&rem, &sub_members, n).contains(&r) {
+                    continue;
+                }
+                // Join quals newly coverable at this node: conjuncts
+                // covering a subset of `members` but not of `sub_members`
+                // (PG19: the new joinrel's own restrictinfo — the lowest
+                // join covering all their tables).
+                let new_quals: Vec<Expr> = rem
+                    .iter()
+                    .filter(|(_, s)| {
+                        s.iter().all(|x| members.contains(x))
+                            && !s.iter().all(|x| sub_members.contains(x))
+                    })
+                    .map(|(c, _)| c.clone())
+                    .collect();
+                let sel: f64 = new_quals.iter().map(pg_join_qual_sel).product();
+                let qp = CPU_OPERATOR_COST * new_quals.len() as f64;
+                let lr = &leaves[r];
+                let rows = sub_rel.rows * lr.rows * sel;
+                let c_sub_outer =
+                    pg_cost_nestloop(sub_rel.rows, sub_rel.cost, lr.rows, lr.scan, qp);
+                let c_leaf_outer =
+                    pg_cost_nestloop(lr.rows, lr.scan, sub_rel.rows, sub_rel.cost, qp);
+                for (cost, sub_outer, inner_rows) in
+                    [(c_sub_outer, true, lr.rows), (c_leaf_outer, false, sub_rel.rows)]
+                {
+                    let key = (cost, sub_rel.cost, sub_rel.rows, sub_rel.inner_rows);
+                    let better = match best_key {
+                        None => true,
+                        Some(bk) => key < bk,
+                    };
+                    if better {
+                        best_key = Some(key);
+                        best = Some(PgJoinRel166 {
+                            rows,
+                            cost,
+                            sub,
+                            leaf: r,
+                            sub_outer,
+                            quals: new_quals.clone(),
+                            inner_rows,
+                        });
+                    }
                 }
             }
+            rels[mask as usize] = best;
         }
     }
-    let (pi, r, pair_outer, top_quals) = best.expect("v1.65: level 3 always yields candidates");
-    // Build the winning tree: the pair's quals on the inner nestloop,
-    // the rest on the top.
-    let p = &pairs[pi];
-    let pair_node = pg_build_cross_nl(
-        leaves[p.outer].node.clone(),
-        leaves[p.inner].node.clone(),
-        p.quals.clone(),
-        px,
-    );
-    let top_node = if pair_outer {
-        pg_build_cross_nl(pair_node, leaves[r].node.clone(), top_quals, px)
-    } else {
-        pg_build_cross_nl(leaves[r].node.clone(), pair_node, top_quals, px)
-    };
-    Some(top_node)
+    // Build the winning tree from the full rel's decomposition chain.
+    // A `None` full rel (no viable decomposition — unreachable for pure
+    // comma products, but never assumed) fails closed to written order.
+    let full = (1u32 << n) - 1;
+    let top = rels[full as usize].as_ref()?;
+    Some(pg_build_cross_dp(top, &rels, &leaves, px))
 }
 
 /// v0.78: plan a CTE body for EXPLAIN. `visible` holds the CTEs the body
@@ -72955,6 +73041,227 @@ mod v165_cross_join_reorder_tests {
             lines.iter().any(|l| l.starts_with("Nested Loop")),
             "nested loop plan expected, got: {lines:?}"
         );
+    }
+}
+
+// ============================================================================
+// v1.66: N-way cross-join reordering (PG19 `standard_join_search` DP).
+// ============================================================================
+#[cfg(test)]
+mod v166_nway_cross_join_reorder_tests {
+    use super::*;
+    use crate::sql::parse_statement;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_lines(mut eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(&mut eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .map(|l| l.trim().to_string())
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup_4way(eng: &mut Engine) {
+        for t in ["f1", "f2", "f3", "f4"] {
+            run(&mut *eng, &format!("CREATE TABLE {t} (a int)")).unwrap();
+            run(&mut *eng, &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)")).unwrap();
+        }
+    }
+
+    fn setup_5way(eng: &mut Engine) {
+        for t in ["g1", "g2", "g3", "g4", "g5"] {
+            run(&mut *eng, &format!("CREATE TABLE {t} (a int)")).unwrap();
+            run(&mut *eng, &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)")).unwrap();
+        }
+    }
+
+    /// v1.66: 4-way comma join — the N-way DP puts the selective
+    /// (filtered) table first, generalizing v1.65's level-3 logic.
+    #[test]
+    fn v166_four_way_selective_first() {
+        let mut eng = engine();
+        setup_4way(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM f1, f2, f3, f4 WHERE f1.a = 1",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Seq Scan on f1".to_string(),
+                "Filter: (a = 1)".to_string(),
+                "->  Seq Scan on f2".to_string(),
+                "->  Seq Scan on f3".to_string(),
+                "->  Seq Scan on f4".to_string(),
+            ]
+        );
+    }
+
+    /// v1.66: 4-way comma join with no quals — every order ties, so the
+    /// written left-deep order stands (fail closed, as v1.65 for N=3).
+    #[test]
+    fn v166_four_way_ties_written_order() {
+        let mut eng = engine();
+        setup_4way(&mut eng);
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM f1, f2, f3, f4");
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Seq Scan on f1".to_string(),
+                "->  Materialize".to_string(),
+                "->  Seq Scan on f2".to_string(),
+                "->  Materialize".to_string(),
+                "->  Seq Scan on f3".to_string(),
+                "->  Materialize".to_string(),
+                "->  Seq Scan on f4".to_string(),
+            ]
+        );
+    }
+
+    /// v1.66: 4-way comma join with a join clause — the clause attaches
+    /// at the lowest nestloop covering both tables (PG19
+    /// `distribute_qual_to_rels`), and the clause-linked pair is built
+    /// first (PG19 `make_rels_by_clause_joins`).
+    #[test]
+    fn v166_four_way_clause_at_lowest() {
+        let mut eng = engine();
+        setup_4way(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM f1, f2, f3, f4 WHERE f1.a = f2.a",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "Join Filter: (f1.a = f2.a)".to_string(),
+                "->  Seq Scan on f1".to_string(),
+                "->  Materialize".to_string(),
+                "->  Seq Scan on f2".to_string(),
+                "->  Seq Scan on f3".to_string(),
+                "->  Seq Scan on f4".to_string(),
+            ]
+        );
+    }
+
+    /// v1.66: 5-way comma join — the DP builds the full left-deep tree
+    /// with the selective table first.
+    #[test]
+    fn v166_five_way_selective_first() {
+        let mut eng = engine();
+        setup_5way(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM g1, g2, g3, g4, g5 WHERE g3.a = 2",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Nested Loop".to_string(),
+                "->  Seq Scan on g3".to_string(),
+                "Filter: (a = 2)".to_string(),
+                "->  Seq Scan on g1".to_string(),
+                "->  Seq Scan on g2".to_string(),
+                "->  Seq Scan on g4".to_string(),
+                "->  Seq Scan on g5".to_string(),
+            ]
+        );
+    }
+
+    /// v1.66: 9-way comma join fails closed to the written order (the
+    /// N<=8 DP bound; PG19 would use GEQO past 12).
+    #[test]
+    fn v166_nine_way_fail_closed() {
+        let mut eng = engine();
+        for i in 1..=9 {
+            run(&mut eng, &format!("CREATE TABLE h{i} (a int)")).unwrap();
+            run(&mut eng, &format!("INSERT INTO h{i} VALUES (1),(2)")).unwrap();
+        }
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM h1, h2, h3, h4, h5, h6, h7, h8, h9",
+        );
+        // Written left-deep order, h1..h9 — the DP did not fire.
+        let scans: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("Seq Scan on"))
+            .collect();
+        assert_eq!(scans.len(), 9, "nine scans expected, got: {lines:?}");
+        for (i, s) in scans.iter().enumerate() {
+            assert!(s.ends_with(&format!("Seq Scan on h{}", i + 1)), "got: {s}");
+        }
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("Nested Loop")).count(),
+            8,
+            "eight nestloops expected, got: {lines:?}"
+        );
+    }
+
+    /// v1.66: reordering changes the plan, never the result — the
+    /// executor never sees `PlanNode`, so 4-way/5-way SELECTs return
+    /// the full cartesian product regardless of plan order.
+    #[test]
+    fn v166_reorder_result_identity() {
+        let mut eng = engine();
+        setup_4way(&mut eng);
+        match run(&mut eng, "SELECT count(*) FROM f1, f2, f3, f4 WHERE f1.a = 1")
+            .expect("runs")
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0].to_text().as_deref(), Some("64"));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+        let mut eng = engine();
+        setup_5way(&mut eng);
+        match run(&mut eng, "SELECT count(*) FROM g1, g2, g3, g4, g5 WHERE g3.a = 2")
+            .expect("runs")
+        {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                // 4^4 * 1 (g3 filtered to one row)
+                assert_eq!(rows[0][0].to_text().as_deref(), Some("256"));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
     }
 }
 
