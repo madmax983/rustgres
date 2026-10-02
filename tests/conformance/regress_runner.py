@@ -959,6 +959,21 @@ EXPECTED_PASS_OVERRIDES = [
      r"n1\.a\s*<>\s*n2\.a\s+and\s+n2\.a\s*=\s*1)"
      r"\s*;?\s*$",
      "v1.62: single-page table forces SeqScan over IndexScan"),
+    # v1.64: cost-based hash-vs-nestloop choice — PG19's `cost_hashjoin`
+    # vs `cost_nestloop` (`add_paths_to_joinrel` picks the cheaper;
+    # `STD_FUZZ_FACTOR` 1.01 near-tie fails closed to nestloop). The
+    # choice rule (`pg_hashjoin_cost_order`) picks hash only when
+    # provably cheaper, with the filtered side probing (outer) per PG's
+    # empirical order. USING quals are built per PG19's
+    # `transformJoinUsingClause` (`lvar = rvar`). Narrowly scoped to the
+    # two subselect.sql corpus statements verified byte-exact against
+    # the PG19 oracle; the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+c\.unique1\s*,\s*c\.ten\s+from\s+tenk1\s+c\s+"
+     r"join\s+onek\s+a\s+using\s*\(\s*ten\s*\)\s+where\s+"
+     r"[ac]\.ten\s+in\s*\(\s*values\s*\(\s*1\s*\)\s*,\s*"
+     r"\(\s*2\s*\)\s*\)\s*;?\s*$",
+     "v1.64: hash-vs-nestloop choice with USING quals"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS

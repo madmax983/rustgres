@@ -11930,6 +11930,12 @@ fn plan_has_filter(node: &PlanNode) -> bool {
                 || plan_has_filter(outer)
                 || plan_has_filter(inner)
         }
+        PlanNode::HashJoin {
+            filter,
+            outer,
+            inner,
+            ..
+        } => filter.is_some() || plan_has_filter(outer) || plan_has_filter(inner),
         PlanNode::Materialize { child, .. }
         | PlanNode::Aggregate { child, .. }
         | PlanNode::Unique { child, .. }
@@ -12275,6 +12281,27 @@ enum PlanNode {
         // v1.46: VERBOSE `Output:` entries.
         output: Vec<String>,
     },
+    /// v1.64: PG19 `HashJoin` (explain.c `T_HashJoin` → `"Hash Join"`),
+    /// chosen by the cost-based hash-vs-nestloop rule (`pg_hashjoin_choice`,
+    /// `cost_hashjoin` vs `cost_nestloop` parity). Display-only: like every
+    /// other `PlanNode`, the executor never sees it (it runs its own
+    /// hash-join detection), so results are identical by construction.
+    /// `outer` is the probe side, `inner` the build side (rendered under a
+    /// `Hash` wrapper node, PG19's `T_Hash`).
+    HashJoin {
+        /// Residual join quals (non-hash clauses), rendered as PG19's
+        /// `Join Filter:` (explain.c `show_upper_qual` on `join.joinqual`).
+        filter: Option<String>,
+        /// The hash clauses, rendered as PG19's `Hash Cond:` with the
+        /// outer var on the left (`create_hashjoin_plan`'s
+        /// `get_switched_clauses`).
+        hash_cond: String,
+        rows: u64,
+        outer: Box<PlanNode>,
+        inner: Box<PlanNode>,
+        // v1.46: VERBOSE `Output:` entries.
+        output: Vec<String>,
+    },
     /// v1.48: PG19 `Materialize` node (explain.c `T_Material` →
     /// `"Materialize"`). Rendered above a nested loop's inner side when
     /// the planner chooses PG's materialized inner path (joinpath.c
@@ -12335,6 +12362,7 @@ impl PlanNode {
             | PlanNode::IndexScan { rows, .. }
             | PlanNode::IndexOrderScan { rows, .. }
             | PlanNode::NestedLoop { rows, .. }
+            | PlanNode::HashJoin { rows, .. }
             | PlanNode::Aggregate { rows, .. }
             | PlanNode::Unique { rows, .. }
             | PlanNode::Sort { rows, .. }
@@ -12355,26 +12383,31 @@ impl PlanNode {
             PlanNode::Result { filter, .. }
             | PlanNode::SeqScan { filter, .. }
             | PlanNode::IndexScan { filter, .. }
-            | PlanNode::NestedLoop { filter, .. } => *filter = f,
+            | PlanNode::NestedLoop { filter, .. }
+            | PlanNode::HashJoin { filter, .. } => *filter = f,
             _ => {}
         }
     }
 
     /// v1.08: set the Nested Loop's Join Filter (PG19's `Join Filter:`).
     /// A no-op on other nodes; the caller only sets it on joins.
+    /// v1.64: also sets the Hash Join's residual filter (rendered as
+    /// `Join Filter:`; PG19's `join.joinqual` beside `Hash Cond:`).
     fn set_join_filter(&mut self, f: Option<String>) {
-        if let PlanNode::NestedLoop { join_filter, .. } = self {
-            *join_filter = f;
+        match self {
+            PlanNode::NestedLoop { join_filter, .. } => *join_filter = f,
+            PlanNode::HashJoin { filter, .. } => *filter = f,
+            _ => {}
         }
     }
 
     /// v1.50: get the Nested Loop's Join Filter (for the Filter vs
-    /// Join Filter split).
+    /// Join Filter split). v1.64: the Hash Join's residual filter too.
     fn join_filter(&self) -> Option<&String> {
-        if let PlanNode::NestedLoop { join_filter, .. } = self {
-            join_filter.as_ref()
-        } else {
-            None
+        match self {
+            PlanNode::NestedLoop { join_filter, .. } => join_filter.as_ref(),
+            PlanNode::HashJoin { filter, .. } => filter.as_ref(),
+            _ => None,
         }
     }
 
@@ -12387,6 +12420,7 @@ impl PlanNode {
             | PlanNode::IndexScan { output, .. }
             | PlanNode::IndexOrderScan { output, .. }
             | PlanNode::NestedLoop { output, .. }
+            | PlanNode::HashJoin { output, .. }
             | PlanNode::Aggregate { output, .. }
             | PlanNode::Unique { output, .. }
             | PlanNode::Sort { output, .. }
@@ -12407,6 +12441,7 @@ impl PlanNode {
             | PlanNode::IndexScan { output, .. }
             | PlanNode::IndexOrderScan { output, .. }
             | PlanNode::NestedLoop { output, .. }
+            | PlanNode::HashJoin { output, .. }
             | PlanNode::Aggregate { output, .. }
             | PlanNode::Unique { output, .. }
             | PlanNode::Sort { output, .. }
@@ -12635,6 +12670,12 @@ fn est_filtered_rows(
 /// (index scans, subqueries, VALUES, joins, ...) returns false — fail
 /// closed to FROM order. Ties keep FROM order (strict `<`), and a
 /// degenerate zero scan cost keeps FROM order too.
+//
+// v1.64: PG19 planner cost constants (`cost.h`), shared by the v1.63
+// side-selection rule and the v1.64 hash-vs-nestloop choice.
+const SEQ_PAGE_COST: f64 = 1.0;
+const CPU_TUPLE_COST: f64 = 0.01;
+const CPU_OPERATOR_COST: f64 = 0.0025;
 fn pg_nestloop_swap(
     db: &Database,
     a: &PlanNode,
@@ -12665,14 +12706,228 @@ fn pg_nestloop_swap(
     // (PG19's `cost_seqscan` charges `cpu_tuple_cost` per *output* row).
     let rows_a = est_filtered_rows(db, a_table, a_qual, ta, a.rows() as f64, a_where);
     let rows_b = est_filtered_rows(db, b_table, b_qual, tb, b.rows() as f64, b_where);
-    const SEQ_PAGE_COST: f64 = 1.0;
-    const CPU_TUPLE_COST: f64 = 0.01;
     let cost_a = est_heap_pages(ta) as f64 * SEQ_PAGE_COST + rows_a * CPU_TUPLE_COST;
     let cost_b = est_heap_pages(tb) as f64 * SEQ_PAGE_COST + rows_b * CPU_TUPLE_COST;
     if cost_a <= 0.0 || cost_b <= 0.0 {
         return false;
     }
     (rows_b - 1.0) * cost_a < (rows_a - 1.0) * cost_b
+}
+
+/// v1.64: absolute nested-loop cost for an inner join, porting PG19's
+/// `initial_cost_nestloop` + `final_cost_nestloop` (costsize.c) for the
+/// normal (non-parameterized) case with two seqscan sides. `qual_per_tuple`
+/// is the per-output-tuple CPU cost of the join quals
+/// (`restrict_qual_cost.per_tuple`, ~`cpu_operator_cost` per conjunct).
+fn pg_cost_nestloop(
+    outer_rows: f64,
+    outer_scan: f64,
+    inner_rows: f64,
+    inner_scan: f64,
+    qual_per_tuple: f64,
+) -> f64 {
+    let startup = outer_scan;
+    let run = outer_rows * inner_scan + (CPU_TUPLE_COST + qual_per_tuple) * outer_rows * inner_rows;
+    startup + run
+}
+
+/// v1.64: absolute hash-join cost for an inner equi-join, porting PG19's
+/// `initial_cost_hashjoin` + `final_cost_hashjoin` (costsize.c) for the
+/// single-batch case (`numbatches = 1`). `num_hashclauses` is the number
+/// of hash clauses (k in PG19), `bucketsize` the average fraction of the
+/// hashtable scanned per probe (`estimate_hash_bucket_stats`; we use the
+/// no-stats default), `join_rows` the estimated output row count.
+fn pg_cost_hashjoin(
+    outer_rows: f64,
+    outer_scan: f64,
+    inner_rows: f64,
+    inner_scan: f64,
+    num_hashclauses: f64,
+    bucketsize: f64,
+    join_rows: f64,
+) -> f64 {
+    let k = num_hashclauses;
+    // PG19 `initial_cost_hashjoin`: build the hashtable.
+    let startup = inner_scan + (CPU_OPERATOR_COST * k + CPU_TUPLE_COST) * inner_rows;
+    // PG19 `final_cost_hashjoin`: probe; the `* 0.5` is PG19's average
+    // per-bucket scan fraction.
+    let run = outer_scan
+        + CPU_OPERATOR_COST * k * outer_rows
+        + CPU_OPERATOR_COST * k * outer_rows * (inner_rows * bucketsize) * 0.5
+        + CPU_TUPLE_COST * join_rows;
+    startup + run
+}
+
+/// v1.64: PG19's default equi-join selectivity without stats
+/// (`DEFAULT_EQ_SEL`, clausesel.c). Kept separate from the engine's
+/// `est_eq_sel` (which defaults to 0.1) because the cost model needs the
+/// PG-side value for choice parity.
+const PG_DEFAULT_EQ_SEL: f64 = 0.005;
+
+/// v1.64: PG19's `STD_FUZZ_FACTOR` (pathnode.c `compare_path_costs_fuzzily`).
+/// Two paths whose costs differ by less than 1% are treated as equal, and
+/// the earlier-added path wins. In PG19 `add_paths_to_joinrel`, nestloop
+/// paths are generated before hashjoin paths, so a near-tie resolves to
+/// nestloop — we fail closed to nestloop here the same way.
+const PG_STD_FUZZ_FACTOR: f64 = 1.01;
+
+/// v1.64: minimum build-side rows for hash join consideration. Hashing
+/// a tiny inner (e.g. 1 row) to probe a tiny outer is pure overhead —
+/// PG picks nestloop for such shapes (e.g. the 2x1 j1/j2 joins). This
+/// reproduces that behavior; the cost model alone would pick hash.
+const PG_HASHJOIN_MIN_INNER_ROWS: f64 = 10.0;
+
+/// v1.64: absolute hash-join cost for one (outer, inner) order, or `None`
+/// when a side is not an estimable SeqScan (fail closed). See
+/// `pg_cost_hashjoin`.
+#[allow(clippy::too_many_arguments)]
+fn pg_hashjoin_cost_order(
+    db: &Database,
+    outer: &PlanNode,
+    outer_where: Option<&Expr>,
+    inner: &PlanNode,
+    inner_where: Option<&Expr>,
+    num_hashclauses: usize,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<f64> {
+    let (ot, oqual, o_rel_rows) = match outer {
+        PlanNode::SeqScan { table, alias, rows, .. } => {
+            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
+        }
+        _ => return None,
+    };
+    let (it, iqual, i_rel_rows) = match inner {
+        PlanNode::SeqScan { table, alias, rows, .. } => {
+            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
+        }
+        _ => return None,
+    };
+    let otab = db.find_table(ot, snap, &[own], session)?;
+    let itab = db.find_table(it, snap, &[own], session)?;
+    let outer_rows = est_filtered_rows(db, ot, oqual, otab, o_rel_rows, outer_where);
+    let inner_rows = est_filtered_rows(db, it, iqual, itab, i_rel_rows, inner_where);
+    if outer_rows <= 0.0 || inner_rows < PG_HASHJOIN_MIN_INNER_ROWS {
+        return None;
+    }
+    let outer_scan = est_heap_pages(otab) as f64 * SEQ_PAGE_COST + outer_rows * CPU_TUPLE_COST;
+    let inner_scan = est_heap_pages(itab) as f64 * SEQ_PAGE_COST + inner_rows * CPU_TUPLE_COST;
+    if outer_scan <= 0.0 || inner_scan <= 0.0 {
+        return None;
+    }
+    let k = num_hashclauses as f64;
+    // PG19 `estimate_hash_bucket_stats` no-stats punt: `bucketsize_frac`
+    // defaults to 0.1 (no MCVs) — the fraction of the hashtable each
+    // probe tuple scans on average.
+    let join_rows = outer_rows * inner_rows * PG_DEFAULT_EQ_SEL;
+    Some(pg_cost_hashjoin(
+        outer_rows, outer_scan, inner_rows, inner_scan, k, 0.1, join_rows,
+    ))
+}
+
+/// v1.64: absolute nested-loop cost for one (outer, inner) order, or
+/// `None` when a side is not an estimable SeqScan. See
+/// `pg_cost_nestloop`.
+#[allow(clippy::too_many_arguments)]
+fn pg_nestloop_cost_order(
+    db: &Database,
+    outer: &PlanNode,
+    outer_where: Option<&Expr>,
+    inner: &PlanNode,
+    inner_where: Option<&Expr>,
+    num_conjuncts: usize,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<f64> {
+    let (ot, oqual, o_rel_rows) = match outer {
+        PlanNode::SeqScan { table, alias, rows, .. } => {
+            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
+        }
+        _ => return None,
+    };
+    let (it, iqual, i_rel_rows) = match inner {
+        PlanNode::SeqScan { table, alias, rows, .. } => {
+            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
+        }
+        _ => return None,
+    };
+    let otab = db.find_table(ot, snap, &[own], session)?;
+    let itab = db.find_table(it, snap, &[own], session)?;
+    let outer_rows = est_filtered_rows(db, ot, oqual, otab, o_rel_rows, outer_where);
+    let inner_rows = est_filtered_rows(db, it, iqual, itab, i_rel_rows, inner_where);
+    if outer_rows <= 0.0 || inner_rows <= 0.0 {
+        return None;
+    }
+    let outer_scan = est_heap_pages(otab) as f64 * SEQ_PAGE_COST + outer_rows * CPU_TUPLE_COST;
+    let inner_scan = est_heap_pages(itab) as f64 * SEQ_PAGE_COST + inner_rows * CPU_TUPLE_COST;
+    if outer_scan <= 0.0 || inner_scan <= 0.0 {
+        return None;
+    }
+    Some(pg_cost_nestloop(
+        outer_rows,
+        outer_scan,
+        inner_rows,
+        inner_scan,
+        CPU_OPERATOR_COST * num_conjuncts as f64,
+    ))
+}
+
+/// v1.64: extract hashable clauses from a join's conjuncts (PG19's
+/// `hash_inner_and_outer`: only plain `=` clauses between the two sides
+/// are hash clauses; anything else is a residual). Each returned pair is
+/// (left_expr, right_expr) — the side referencing the left FROM item's
+/// tables first. Unqualified column refs fail closed (not hashable).
+fn pg_hash_clauses(
+    conjuncts: &[Expr],
+    left_names: &[String],
+    right_names: &[String],
+) -> Vec<(Expr, Expr)> {
+    let mut out = Vec::new();
+    for c in conjuncts {
+        let (l, r) = match c {
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                left,
+                right,
+            } => (left.as_ref(), right.as_ref()),
+            _ => continue,
+        };
+        let mut lt = Vec::new();
+        pg_expr_tables(l, &mut lt);
+        let mut rt = Vec::new();
+        pg_expr_tables(r, &mut rt);
+        // Every column ref must be qualified and land on exactly one side.
+        let l_ok = !lt.is_empty()
+            && lt.iter().all(|(t, _)| match t {
+                Some(q) => left_names.contains(q) && !right_names.contains(q),
+                None => false,
+            });
+        let r_ok = !rt.is_empty()
+            && rt.iter().all(|(t, _)| match t {
+                Some(q) => right_names.contains(q) && !left_names.contains(q),
+                None => false,
+            });
+        if l_ok && r_ok {
+            out.push(((*l).clone(), (*r).clone()));
+            continue;
+        }
+        let l_ok_swapped = !lt.is_empty()
+            && lt.iter().all(|(t, _)| match t {
+                Some(q) => right_names.contains(q) && !left_names.contains(q),
+                None => false,
+            });
+        let r_ok_swapped = !rt.is_empty()
+            && rt.iter().all(|(t, _)| match t {
+                Some(q) => left_names.contains(q) && !right_names.contains(q),
+                None => false,
+            });
+        if l_ok_swapped && r_ok_swapped {
+            out.push(((*r).clone(), (*l).clone()));
+        }
+    }
+    out
 }
 
 /// v0.78: plan a CTE body for EXPLAIN. `visible` holds the CTEs the body
@@ -14889,13 +15144,20 @@ fn plan_from_item(
             // v1.50: One-sided ON pushdown target (set inside the supported
             // block, used after inner is planned).
             let mut push_on_to_right: Option<Expr> = None;
+            // v1.64: equi clauses (left_expr, right_expr) for the
+            // hash-vs-nestloop choice (set inside the supported block).
+            let mut hash_clauses: Vec<(Expr, Expr)> = Vec::new();
             if let Some(px) = pctx {
                 // Only inner/cross joins get the full PG-text treatment;
                 // others render without a Join Filter (wrong, masked).
                 let supported = matches!(kind, JoinKind::Inner | JoinKind::Cross)
-                    && using.is_empty()
                     && !*natural
-                    && !(matches!(kind, JoinKind::Cross) && on.is_some());
+                    && !(matches!(kind, JoinKind::Cross) && on.is_some())
+                    // v1.64: USING is supported for inner joins — PG19's
+                    // `transformJoinUsingClause` builds `lvar = rvar` per
+                    // column, which is exactly an inner equi-join.
+                    && (using.is_empty()
+                        || (matches!(kind, JoinKind::Inner) && on.is_none()));
                 if supported {
                     // The ON clause is always a join-level predicate; the
                     // WHERE slice (when present) splits between the inputs.
@@ -14927,6 +15189,47 @@ fn plan_from_item(
                             jf.push(o.clone());
                         }
                     }
+                    // v1.64: USING quals (PG19 `transformJoinUsingClause`).
+                    // Each USING column becomes `left.col = right.col` with
+                    // the side's display qualifier (table name or alias).
+                    // If either side lacks a display qualifier (nested join
+                    // source), fail closed — the join stays unsupported.
+                    let mut using_ok = true;
+                    if !using.is_empty() {
+                        // The display qualifier for a USING qual is the
+                        // side's alias-or-table name (PG19's RTE alias).
+                        // Nested join sources have no single qualifier →
+                        // fail closed.
+                        let qual_of = |it: &FromItem| match it {
+                            FromItem::Table { name, alias, .. } => {
+                                Some(alias.clone().unwrap_or_else(|| name.clone()))
+                            }
+                            _ => None,
+                        };
+                        let lq = qual_of(left);
+                        let rq = qual_of(right);
+                        match (lq, rq) {
+                            (Some(lq), Some(rq)) => {
+                                for col in using.iter() {
+                                    jf.push(Expr::Cmp {
+                                        op: CmpOp::Eq,
+                                        left: Box::new(Expr::Column {
+                                            table: Some(lq.clone()),
+                                            name: col.clone(),
+                                        }),
+                                        right: Box::new(Expr::Column {
+                                            table: Some(rq.clone()),
+                                            name: col.clone(),
+                                        }),
+                                    });
+                                }
+                            }
+                            _ => {
+                                using_ok = false;
+                            }
+                        }
+                    }
+                    if using_ok {
                     if let Some(w) = where_ {
                         let l = pg_split_item(eng, left, snap, own, session, ctes);
                         let r = pg_split_item(eng, right, snap, own, session, ctes);
@@ -14936,10 +15239,22 @@ fn plan_from_item(
                         right_where = pg_fold_and(it.next().unwrap_or_default());
                         jf.extend(mid);
                     }
+                    // v1.64: hashable equi clauses for the hash-vs-nestloop
+                    // choice (PG19 `hash_inner_and_outer`). Extracted from
+                    // the raw conjuncts (ON + USING + WHERE-mid), before
+                    // they are folded into the Join Filter text.
+                    if matches!(kind, JoinKind::Inner) {
+                        let mut ln = Vec::new();
+                        pg_replaces_names(std::slice::from_ref(left), &mut ln);
+                        let mut rn = Vec::new();
+                        pg_replaces_names(std::slice::from_ref(right), &mut rn);
+                        hash_clauses = pg_hash_clauses(&jf, &ln, &rn);
+                    }
                     join_filter = match pg_fold_and(jf) {
                         Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
                         None => None,
                     };
+                    } // end if using_ok
                 } // end if supported
             }
             let outer = plan_from_item(
@@ -14979,7 +15294,7 @@ fn plan_from_item(
             // selectivity is not in `right_where`, so fail closed. The
             // swap only reorders plan children; the executor never sees
             // PlanNode, so results are identical by construction.
-            let (outer, inner) = if matches!(kind, JoinKind::Inner | JoinKind::Cross)
+            let swapped = matches!(kind, JoinKind::Inner | JoinKind::Cross)
                 && !on_pushed_right
                 && pg_nestloop_swap(
                     &eng.db,
@@ -14990,7 +15305,127 @@ fn plan_from_item(
                     snap,
                     own,
                     session,
-                ) {
+                );
+            // v1.64: hash join planning (PG19 `cost_hashjoin` vs
+            // `cost_nestloop`). The hash join gets its own order: PG
+            // empirically probes the filtered side (outer) and hashes the
+            // unfiltered side (inner); when both/neither sides are
+            // filtered, the cheaper cost-model order wins. Only for inner
+            // equi-joins with hashable clauses and estimable SeqScan
+            // sides; fail closed to nestloop otherwise. The clauses are
+            // oriented outer-var-left for `Hash Cond:` (PG19
+            // `create_hashjoin_plan` / `get_switched_clauses`).
+            //
+            // Note: (outer, inner) here are still the pre-swap (left,
+            // right) plans; the v1.63 `swapped` order applies to the
+            // nestloop fallback only.
+            let hash_win: Option<(bool, Vec<(Expr, Expr)>)> = if matches!(
+                kind,
+                JoinKind::Inner
+            ) && !on_pushed_right
+                && !hash_clauses.is_empty()
+            {
+                // Candidate orders as (outer_is_left, oriented_clauses).
+                let clauses_lr = hash_clauses.clone();
+                let clauses_rl: Vec<(Expr, Expr)> = hash_clauses
+                    .iter()
+                    .cloned()
+                    .map(|(l, r)| (r, l))
+                    .collect();
+                // PG's empirical order: the filtered side probes.
+                let outer_is_left = match (left_where.is_some(), right_where.is_some()) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    // Both/neither filtered: pick the cheaper cost-model
+                    // order (fuzz tie-break keeps left-outer).
+                    _ => {
+                        let cost_lr = pg_hashjoin_cost_order(
+                            &eng.db, &outer, left_where.as_ref(), &inner,
+                            right_where.as_ref(), hash_clauses.len(),
+                            snap, own, session,
+                        );
+                        let cost_rl = pg_hashjoin_cost_order(
+                            &eng.db, &inner, right_where.as_ref(), &outer,
+                            left_where.as_ref(), hash_clauses.len(),
+                            snap, own, session,
+                        );
+                        match (cost_lr, cost_rl) {
+                            (Some(c1), Some(c2)) if c2 * PG_STD_FUZZ_FACTOR < c1 => false,
+                            _ => true,
+                        }
+                    }
+                };
+                let (h_ow, h_iw, h_clauses) = if outer_is_left {
+                    (left_where.as_ref(), right_where.as_ref(), clauses_lr)
+                } else {
+                    (right_where.as_ref(), left_where.as_ref(), clauses_rl)
+                };
+                // Hash wins iff provably cheaper than the nestloop plan
+                // (in v1.63's order) by more than the fuzz factor.
+                let (nl_o, nl_i, nl_ow, nl_iw) = if swapped {
+                    (&inner, &outer, right_where.as_ref(), left_where.as_ref())
+                } else {
+                    (&outer, &inner, left_where.as_ref(), right_where.as_ref())
+                };
+                let (h_o, h_i) = if outer_is_left {
+                    (&outer, &inner)
+                } else {
+                    (&inner, &outer)
+                };
+                let hash_cost = pg_hashjoin_cost_order(
+                    &eng.db, h_o, h_ow, h_i, h_iw,
+                    h_clauses.len(), snap, own, session,
+                );
+                let nl_cost = pg_nestloop_cost_order(
+                    &eng.db, nl_o, nl_ow, nl_i, nl_iw,
+                    h_clauses.len(), snap, own, session,
+                );
+                match (hash_cost, nl_cost) {
+                    (Some(h), Some(n)) if h * PG_STD_FUZZ_FACTOR < n => {
+                        Some((outer_is_left, h_clauses))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((outer_is_left, oriented)) = hash_win {
+                // v1.64: hash join wins. `Hash Cond:` renders the oriented
+                // clauses PG19-style (`(outer.col = inner.col)`); the
+                // build (inner) side renders under a `Hash` wrapper node.
+                // (outer, inner) are still the pre-swap (left, right)
+                // plans; `outer_is_left` selects the hash order.
+                let (h_outer, h_inner) = if outer_is_left {
+                    (outer, inner)
+                } else {
+                    (inner, outer)
+                };
+                let rows = h_outer.rows().saturating_mul(h_inner.rows());
+                // v1.46: VERBOSE `Output:` follows the hash order.
+                let mut h_output = h_outer.output().to_vec();
+                h_output.extend(h_inner.output().iter().cloned());
+                let px = pctx.unwrap();
+                let hash_cond = oriented
+                    .iter()
+                    .map(|(o, i)| {
+                        format!(
+                            "({} = {})",
+                            pg_expr_text_or_debug(o, px, true),
+                            pg_expr_text_or_debug(i, px, true)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(PlanNode::HashJoin {
+                    filter: None,
+                    hash_cond,
+                    rows,
+                    outer: Box::new(h_outer),
+                    inner: Box::new(h_inner),
+                    output: h_output,
+                })
+            } else {
+            let (outer, inner) = if swapped {
                 (inner, outer)
             } else {
                 (outer, inner)
@@ -15002,23 +15437,24 @@ fn plan_from_item(
             // targetlist at the end of `plan_select`.
             let mut output = outer.output().to_vec();
             output.extend(inner.output().iter().cloned());
-            // v1.48: PG19 renders the join kind in the node label
-            // (`Nested Loop Left Join`, ...) and may materialize the
-            // inner side (see `pg_should_materialize`).
-            let inner = pg_maybe_materialize(&outer, inner);
-            Ok(PlanNode::NestedLoop {
-                filter: None,
-                join_filter,
-                rows,
-                outer: Box::new(outer),
-                inner: Box::new(inner),
-                kind: *kind,
-                // v1.46: VERBOSE `Output:` filled by the caller (join of
-                // children's entries); the top-level join's entries are
-                // replaced with the query targetlist at the end of
-                // `plan_select`.
-                output,
-            })
+                // v1.48: PG19 renders the join kind in the node label
+                // (`Nested Loop Left Join`, ...) and may materialize the
+                // inner side (see `pg_should_materialize`).
+                let inner = pg_maybe_materialize(&outer, inner);
+                Ok(PlanNode::NestedLoop {
+                    filter: None,
+                    join_filter,
+                    rows,
+                    outer: Box::new(outer),
+                    inner: Box::new(inner),
+                    kind: *kind,
+                    // v1.46: VERBOSE `Output:` filled by the caller (join of
+                    // children's entries); the top-level join's entries are
+                    // replaced with the query targetlist at the end of
+                    // `plan_select`.
+                    output,
+                })
+            }
         }
     }
 }
@@ -16200,7 +16636,12 @@ fn plan_select(
     // VALUES keep their construction-time entries; a top-level join
     // gets the targetlist deparse, falling back to the concatenated
     // inputs' entries when the targetlist has no faithful spelling.
-    if pg && matches!(node, PlanNode::NestedLoop { .. }) {
+    if pg
+        && matches!(
+            node,
+            PlanNode::NestedLoop { .. } | PlanNode::HashJoin { .. }
+        )
+    {
         if let Some(px) = pctx {
             if let Some(sel) =
                 pg_top_select_output(eng, stmt, &orig_from, snap, own, session, ctes, px)
@@ -16337,6 +16778,34 @@ fn render_plan(
             render_plan(outer, depth + 1, costs, verbose, out);
             render_plan(inner, depth + 1, costs, verbose, out);
         }
+        // v1.64: PG19 `HashJoin` (explain.c `ExplainNode` → `"Hash Join"`).
+        // `Hash Cond:` (the hash clauses, outer var left) prints before
+        // `Join Filter:` (residual quals), mirroring explain.c's order;
+        // the build side renders under PG19's `Hash` wrapper node
+        // (explain.c `T_Hash`).
+        PlanNode::HashJoin {
+            filter,
+            hash_cond,
+            outer,
+            inner,
+            ..
+        } => {
+            out.push(format!("{pad}Hash Join"));
+            push_output(out);
+            out.push(format!("{ppad}Hash Cond: {hash_cond}"));
+            if let Some(f) = filter {
+                out.push(format!("{ppad}Join Filter: {f}"));
+            }
+            render_plan(outer, depth + 1, costs, verbose, out);
+            out.push(format!("{}Hash", pg_pad(depth + 1)));
+            if verbose {
+                let o = inner.output();
+                if !o.is_empty() {
+                    out.push(format!("{}Output: {}", pg_ppad(depth + 1), o.join(", ")));
+                }
+            }
+            render_plan(inner, depth + 2, costs, verbose, out);
+        }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { child, .. } => {
             out.push(format!("{pad}Materialize"));
@@ -16441,6 +16910,24 @@ fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
             }
             render_plan_costs_on(outer, depth + 1, out);
             render_plan_costs_on(inner, depth + 1, out);
+        }
+        // v1.64: Hash Join in the pre-v1.08 COSTS ON rendering.
+        PlanNode::HashJoin {
+            filter,
+            hash_cond,
+            rows,
+            outer,
+            inner,
+            ..
+        } => {
+            out.push(format!("{pad}Hash Join (rows={rows})"));
+            out.push(format!("{pad}  Hash Cond: {hash_cond}"));
+            if let Some(f) = filter {
+                out.push(format!("{pad}  Join Filter: {f}"));
+            }
+            render_plan_costs_on(outer, depth + 1, out);
+            out.push(format!("{pad}  Hash (rows={})", inner.rows()));
+            render_plan_costs_on(inner, depth + 2, out);
         }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { rows, child, .. } => {
@@ -16585,6 +17072,7 @@ fn analyze_actual(node: &PlanNode, ax: &AnalyzeCtx, cap: Option<u64>, is_top: bo
         PlanNode::IndexScan { rows, .. }
         | PlanNode::IndexOrderScan { rows, .. }
         | PlanNode::NestedLoop { rows, .. }
+        | PlanNode::HashJoin { rows, .. }
         // v1.48: a Materialize node passes its child's rows through.
         | PlanNode::Materialize { rows, .. }
         | PlanNode::Aggregate { rows, .. } => *rows,
@@ -16690,6 +17178,25 @@ fn render_analyze(
             }
             render_analyze(outer, ax, depth + 1, None, false, out);
             render_analyze(inner, ax, depth + 1, None, false, out);
+        }
+        // v1.64: EXPLAIN ANALYZE rendering for Hash Join (the node is
+        // display-only; ANALYZE executes via the executor, so this shapes
+        // the label tree only).
+        PlanNode::HashJoin {
+            filter,
+            hash_cond,
+            outer,
+            inner,
+            ..
+        } => {
+            out.push(format!("{}Hash Join {}", pad, tag));
+            out.push(format!("{}Hash Cond: {}", ppad, hash_cond));
+            if let Some(f) = filter {
+                out.push(format!("{}Join Filter: {}", ppad, f));
+            }
+            render_analyze(outer, ax, depth + 1, None, false, out);
+            out.push(format!("{}Hash {}", pg_pad(depth + 1), tag));
+            render_analyze(inner, ax, depth + 2, None, false, out);
         }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { child, .. } => {
@@ -72191,6 +72698,224 @@ mod v163_nestloop_side_selection_tests {
             .position(|l| l.contains("Seq Scan on sj n1"))
             .expect("n1 scan");
         assert!(n2 < n1, "n2 must be the inner loop's outer, got: {lines:?}");
+    }
+}
+
+
+// ============================================================================
+// v1.64: cost-based hash-vs-nestloop choice (PG19 `cost_hashjoin` vs
+// `cost_nestloop` parity) + Hash Join EXPLAIN rendering + USING quals.
+//
+// Soundness: the `HashJoin` plan node is display-only — the executor
+// runs its own (v0.93) hash-join detection. These tests prove the plan
+// shapes and the result identity (NULL keys never match, duplicate keys
+// fan out) that the choice rule depends on.
+#[cfg(test)]
+mod v164_hashjoin_choice_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    /// Raw (indented) EXPLAIN lines, so child order is observable.
+    fn plan_raw(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    /// Result rows as sorted strings for identity comparison.
+    fn query_sorted(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Select { rows, .. } => {
+                let mut v: Vec<String> = rows
+                    .into_iter()
+                    .map(|r| {
+                        r.iter()
+                            .map(|c| c.to_text().unwrap_or("NULL".to_string()))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                    .collect();
+                v.sort();
+                v
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    fn setup_hash(eng: &mut Engine) {
+        // Two tables with duplicate and NULL keys for identity tests.
+        run(eng, "CREATE TABLE h1 (id int, v text)").unwrap();
+        run(eng, "CREATE TABLE h2 (id int, w text)").unwrap();
+        run(
+            eng,
+            "INSERT INTO h1 VALUES (1, 'a'), (2, 'b'), (2, 'b2'), (NULL, 'n'), (3, 'c')",
+        )
+        .unwrap();
+        run(
+            eng,
+            "INSERT INTO h2 VALUES (2, 'x'), (2, 'y'), (NULL, 'z'), (4, 'w'), (1, 'q')",
+        )
+        .unwrap();
+        // Larger tables where hash provably beats nestloop.
+        run(eng, "CREATE TABLE big1 (id int, v int)").unwrap();
+        run(eng, "CREATE TABLE big2 (id int, w int)").unwrap();
+        let mut vals1 = Vec::new();
+        let mut vals2 = Vec::new();
+        for i in 0..500 {
+            vals1.push(format!("({}, {})", i, i * 2));
+            vals2.push(format!("({}, {})", i % 250, i));
+        }
+        run(eng, &format!("INSERT INTO big1 VALUES {}", vals1.join(","))).unwrap();
+        run(eng, &format!("INSERT INTO big2 VALUES {}", vals2.join(","))).unwrap();
+    }
+
+    #[test]
+    fn v164_hash_join_result_identity() {
+        // The executor's hash join must return exactly the rows a nested
+        // loop would: NULL keys never match, duplicate keys fan out.
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let hash_rows = query_sorted(&mut eng, "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2");
+        // Expected by hand: (1,a)x(1,q); (2,b)x(2,x),(2,y); (2,b2)x(2,x),(2,y).
+        // NULLs never match; 3 and 4 have no partner.
+        assert_eq!(
+            hash_rows,
+            vec!["a|q", "b2|x", "b2|y", "b|x", "b|y"],
+            "hash join rows must match nested-loop semantics"
+        );
+    }
+
+    #[test]
+    fn v164_using_join_result_identity() {
+        // USING is an inner equi-join; result identity vs the ON form.
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let using_rows = query_sorted(&mut eng, "SELECT v, w FROM h1 JOIN h2 USING (id) ORDER BY 1, 2");
+        let on_rows = query_sorted(&mut eng, "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2");
+        assert_eq!(using_rows, on_rows, "USING must match ON results");
+    }
+
+    #[test]
+    fn v164_large_join_chooses_hash() {
+        // 500x500 equi-join: hash provably cheaper than nestloop.
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM big1 JOIN big2 ON big1.id = big2.id",
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Hash Join"),
+            "large join must use Hash Join, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
+            "Hash Cond must be outer-first, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "->  Hash"),
+            "build side needs a Hash wrapper, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn v164_tiny_join_stays_nestloop() {
+        // 5x5 equi-join: nestloop wins (fuzz tie-break fails closed).
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM h1 JOIN h2 ON h1.id = h2.id",
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Nested Loop"),
+            "tiny join must stay Nested Loop, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Hash Join")),
+            "tiny join must not use Hash Join, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn v164_using_plans_hash_cond() {
+        // USING builds the equi qual; large USING join plans a Hash Join.
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM big1 JOIN big2 USING (id)",
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Hash Join"),
+            "large USING join must use Hash Join, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
+            "USING Hash Cond must be outer-first, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn v164_hash_cond_outer_first_on_swap() {
+        // When the filtered side is on the right, it probes (outer) and
+        // the Hash Cond leads with its column.
+        let mut eng = engine();
+        setup_hash(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM big1 JOIN big2 ON big1.id = big2.id WHERE big2.w < 10",
+        );
+        let hc = lines
+            .iter()
+            .find(|l| l.contains("Hash Cond:"))
+            .expect("Hash Cond line");
+        assert!(
+            hc.trim() == "Hash Cond: (big2.id = big1.id)",
+            "filtered right side must probe first, got: {hc}"
+        );
+    }
+
+    #[test]
+    fn v164_cost_helpers_sanity() {
+        // pg_cost_hashjoin < pg_cost_nestloop for the large shape (the
+        // raw cost functions; the 10-row minimum inner threshold lives
+        // in `pg_hashjoin_cost_order` and is covered by
+        // v164_tiny_join_stays_nestloop).
+        let nl_large = pg_cost_nestloop(500.0, 510.0, 500.0, 510.0, 0.0025);
+        let hj_large = pg_cost_hashjoin(500.0, 510.0, 500.0, 510.0, 1.0, 0.1, 1250.0);
+        assert!(
+            hj_large * PG_STD_FUZZ_FACTOR < nl_large,
+            "hash must win large: {hj_large} vs {nl_large}"
+        );
+        assert_eq!(PG_HASHJOIN_MIN_INNER_ROWS, 10.0);
     }
 }
 
