@@ -6085,7 +6085,7 @@ fn assign_insert_indirection(
                     lower: Vec::new(),
                     elems: Vec::new(),
                 },
-                Value::Array(a) => a,
+                Value::Array(a) => *a,
                 _ => {
                     return Err(exec_err(
                         "42804",
@@ -6134,7 +6134,7 @@ fn assign_insert_indirection(
             let cur_elem = std::mem::replace(&mut arr.elems[pos], Value::Null);
             arr.elems[pos] =
                 assign_insert_indirection(eng, cur_elem, rest, val, &elem_ct, elem_comp, col_name)?;
-            Ok(Value::Array(arr))
+            Ok(Value::Array(Box::new(arr)))
         }
         ResolvedIndirection::Field(fname) => {
             let tname = match ctype {
@@ -33235,12 +33235,12 @@ fn percentile_cont_final(direct: &Value, vals: &[Value]) -> Result<Value, ExecEr
             }
             // PG19: "We make the output array the same shape as the
             // input".
-            Ok(Value::Array(ArrayVal {
+            Ok(Value::Array(Box::new(ArrayVal {
                 elem: ArrayElem::Float,
                 dims: a.dims.clone(),
                 lower: a.lower.clone(),
                 elems,
-            }))
+            })))
         }
         f => match percentile_fraction_value("percentile_cont", f)? {
             None => Ok(Value::Null),
@@ -33277,12 +33277,12 @@ fn percentile_disc_final(
                     Some(p) => elems.push(one(p)),
                 }
             }
-            Ok(Value::Array(ArrayVal {
+            Ok(Value::Array(Box::new(ArrayVal {
                 elem,
                 dims: a.dims.clone(),
                 lower: a.lower.clone(),
                 elems,
-            }))
+            })))
         }
         f => match percentile_fraction_value("percentile_disc", f)? {
             None => Ok(Value::Null),
@@ -34339,12 +34339,12 @@ fn order_key(
 fn cast_empty_array_ctor(expr: &Expr, to: &ColType) -> Option<Value> {
     match (expr, to) {
         (Expr::ArrayCtor { elems, .. }, ColType::Array(elem)) if elems.is_empty() => {
-            Some(Value::Array(ArrayVal {
+            Some(Value::Array(Box::new(ArrayVal {
                 elem: *elem,
                 dims: Vec::new(),
                 lower: Vec::new(),
                 elems: Vec::new(),
-            }))
+            })))
         }
         _ => None,
     }
@@ -34448,7 +34448,7 @@ fn array_ctor_from_vals(
                     if for_agg && idx == 0 && a.ndim() == 0 {
                         return Err(exec_err("2202E", "cannot accumulate empty arrays"));
                     }
-                    rows.push(a)
+                    rows.push(*a)
                 }
                 Value::Null => {
                     return Err(if for_agg {
@@ -34503,12 +34503,12 @@ fn array_ctor_from_vals(
         let mut lower = Vec::with_capacity(first.lower.len() + 1);
         lower.push(1);
         lower.extend(first.lower.iter().cloned());
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem: first.elem,
             dims,
             lower,
             elems: flat,
-        }));
+        })));
     }
     // Common element type, skipping NULLs (PG's unknown literals don't
     // constrain select_common_type; all-unknown resolves to text).
@@ -34529,12 +34529,12 @@ fn array_ctor_from_vals(
     for v in vals {
         out.push(eval_cast(&v, elem_ty)?);
     }
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem,
         dims: vec![out.len() as i32],
         lower: vec![1],
         elems: out,
-    }))
+    })))
 }
 
 /// v0.79: coerce an array subscript/slice-bound value to an integer, like
@@ -34617,12 +34617,12 @@ fn eval_slice_vals(
     // PG19 array_get_slice: more subscripts than dimensions is the
     // empty array, not an error.
     if bounds.len() > a.ndim() {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem: a.elem,
             dims: Vec::new(),
             lower: Vec::new(),
             elems: Vec::new(),
-        }));
+        })));
     }
     let bound = |v: Option<&Value>, dflt: i64| -> Result<i64, ExecError> {
         match v {
@@ -34645,12 +34645,12 @@ fn eval_slice_vals(
             (arr_lo, arr_hi)
         };
         if hi < lo {
-            return Ok(Value::Array(ArrayVal {
+            return Ok(Value::Array(Box::new(ArrayVal {
                 elem: a.elem,
                 dims: Vec::new(),
                 lower: Vec::new(),
                 elems: Vec::new(),
-            }));
+            })));
         }
         ranges.push(((lo - arr_lo) as usize, (hi - lo + 1) as usize));
     }
@@ -34679,12 +34679,12 @@ fn eval_slice_vals(
             pos[d] = 0;
         }
     }
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: a.elem,
         dims: ranges.iter().map(|(_, c)| *c as i32).collect(),
         lower: vec![1i32; ndim],
         elems,
-    }))
+    })))
 }
 
 /// v0.79: `=` / `<>` on arrays — PG19 `array_eq` semantics. Dimensions
@@ -34782,20 +34782,20 @@ fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecError> {
     // PG: concatenating with an empty (0-dim) array yields the other
     // side (retyped to the common element type).
     if x.ndim() == 0 {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem,
             dims: y.dims.clone(),
             lower: y.lower.clone(),
             elems: cast_all(y)?,
-        }));
+        })));
     }
     if y.ndim() == 0 {
-        return Ok(Value::Array(ArrayVal {
+        return Ok(Value::Array(Box::new(ArrayVal {
             elem,
             dims: x.dims.clone(),
             lower: x.lower.clone(),
             elems: cast_all(x)?,
-        }));
+        })));
     }
     if x.ndim() != y.ndim() || x.dims[1..] != y.dims[1..] {
         return Err(exec_err("2202E", "cannot concatenate incompatible arrays"));
@@ -34804,12 +34804,12 @@ fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecError> {
     elems.extend(cast_all(y)?);
     let mut dims = x.dims.clone();
     dims[0] += y.dims[0];
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem,
         dims,
         lower: x.lower.clone(),
         elems,
-    }))
+    })))
 }
 
 fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
@@ -34832,12 +34832,12 @@ fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
     } else {
         (vec![x.dims[0] + 1], x.lower.clone())
     };
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: x.elem,
         dims,
         lower,
         elems,
-    }))
+    })))
 }
 
 fn array_prepend_elem(y: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
@@ -34866,12 +34866,12 @@ fn array_prepend_elem(y: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> 
         // prepend"), so `0 || '{1,2}'::int[]` is `{0,1,2}`.
         (vec![y.dims[0] + 1], vec![y.lower[0]])
     };
-    Ok(Value::Array(ArrayVal {
+    Ok(Value::Array(Box::new(ArrayVal {
         elem: y.elem,
         dims,
         lower,
         elems,
-    }))
+    })))
 }
 
 /// v0.79: scalar array functions (PG19 arrayfuncs.c). NULL array (or
@@ -36150,12 +36150,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                     // Empty subquery over an array column: PG yields an
                     // empty array of the (flattened) element type.
                     let elem = crate::storage::ArrayElem::of(&col_ty);
-                    return Ok(Value::Array(ArrayVal {
+                    return Ok(Value::Array(Box::new(ArrayVal {
                         elem,
                         dims: Vec::new(),
                         lower: Vec::new(),
                         elems: Vec::new(),
-                    }));
+                    })));
                 }
                 array_ctor_from_vals(vals, true, false)
             } else {
@@ -36165,12 +36165,12 @@ fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, ExecError> 
                 for v in vals {
                     elems.push(eval_cast(&v, ty)?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims: vec![elems.len() as i32],
                     lower: vec![1],
                     elems,
-                }))
+                })))
             }
         }
         Expr::InSub { expr, sub, neg } => eval_in(q, scopes, expr, sub, *neg),
@@ -41108,19 +41108,21 @@ fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // PG); array-to-array casts retype element-wise, preserving
         // dims, lower bounds, and NULL elements.
         ColType::Array(elem) => match v {
-            Value::Text(s) | Value::BpChar(s) => parse_array_literal(s, elem).map(Value::Array),
+            Value::Text(s) | Value::BpChar(s) => {
+                parse_array_literal(s, elem).map(|a| Value::Array(Box::new(a)))
+            }
             Value::Array(a) => {
                 let ty = elem_scalar_type(elem);
                 let mut out = Vec::with_capacity(a.elems.len());
                 for e in &a.elems {
                     out.push(eval_cast(e, ty)?);
                 }
-                Ok(Value::Array(ArrayVal {
+                Ok(Value::Array(Box::new(ArrayVal {
                     elem,
                     dims: a.dims.clone(),
                     lower: a.lower.clone(),
                     elems: out,
-                }))
+                })))
             }
             other => Err(cast_err(other, &to.sql_name())),
         },
@@ -44680,12 +44682,12 @@ fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
                 true
             };
             let parts = parse_ident_parts(qual, strict)?;
-            Ok(Value::Array(crate::storage::ArrayVal {
+            Ok(Value::Array(Box::new(crate::storage::ArrayVal {
                 elem: crate::storage::ArrayElem::Text,
                 dims: vec![parts.len() as i32],
                 lower: vec![1],
                 elems: parts.into_iter().map(Value::text).collect(),
-            }))
+            })))
         }
         // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
         // quote_ident and quote_literal are STRICT (NULL -> NULL);
@@ -59604,12 +59606,12 @@ fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Xid => Value::Int(1),
         ColType::Tid => Value::Tid(0, 0), // v1.40
         ColType::Record | ColType::Composite => Value::Record(vec![]),
-        ColType::Array(elem) => Value::Array(crate::storage::ArrayVal {
+        ColType::Array(elem) => Value::Array(Box::new(crate::storage::ArrayVal {
             elem: *elem,
             dims: vec![1],
             lower: vec![1],
             elems: vec![dummy_value_of(&elem_scalar_type(*elem))],
-        }),
+        })),
     }
 }
 
@@ -64364,12 +64366,12 @@ mod variance_stress_tests {
         let arr = |x: i64, y: i64| {
             array_ctor_from_vals(vec![Value::Int(x), Value::Int(y)], false, false).unwrap()
         };
-        let empty_int_arr = Value::Array(crate::storage::ArrayVal {
+        let empty_int_arr = Value::Array(Box::new(crate::storage::ArrayVal {
             elem: crate::storage::ArrayElem::Int,
             dims: Vec::new(),
             lower: Vec::new(),
             elems: Vec::new(),
-        });
+        }));
         // NULL array input -> 22004 "cannot accumulate null arrays"
         let e = array_agg_final(vec![arr(1, 2), Value::Null], false).unwrap_err();
         assert_eq!(e.code, "22004");
