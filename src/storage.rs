@@ -910,15 +910,32 @@ impl Numeric {
     /// discriminant alone (PG19 hashes every special to 0, but our
     /// `cmp` distinguishes NaN/+Inf/-Inf, so the discriminant keeps
     /// the key consistent with `=`).
-    pub(crate) fn hash_key(&self) -> (u8, bool, BigUint, i32) {
+    pub(crate) fn hash_key(&self) -> (u8, bool, NumKeyMag, i32) {
         if self.special != NumericSpecial::Finite {
-            return (self.special as u8, false, BigUint::zero(), 0);
+            return (self.special as u8, false, NumKeyMag::Small(0), 0);
         }
         // Sign lives in `unscaled` on both paths (`from_big` stores
         // ±1 there when the big mantissa is present).
         let neg = self.unscaled < 0;
-        let mut mag = self.mag();
         let mut scale = self.scale.max(0);
+        // v1.70: `big: None` (every int-sourced key, and any numeric
+        // that fits in `i128`) strips trailing zeros on the `u128`
+        // magnitude directly — no `BigUint` involved, so no allocation.
+        // Only a genuine big-mantissa numeric takes the `mag()`/
+        // `div_rem_small` path below, same as before this change.
+        if self.big.is_none() {
+            let mut mag = self.unscaled.unsigned_abs();
+            while scale > 0 {
+                let (q, r) = (mag / 10, mag % 10);
+                if r != 0 {
+                    break;
+                }
+                mag = q;
+                scale -= 1;
+            }
+            return (NumericSpecial::Finite as u8, neg, NumKeyMag::Small(mag), scale);
+        }
+        let mut mag = self.mag();
         while scale > 0 {
             let (q, r) = mag.div_rem_small(10);
             if r != 0 {
@@ -927,6 +944,15 @@ impl Numeric {
             mag = q;
             scale -= 1;
         }
+        // A big-mantissa magnitude that fits in `u128` after stripping
+        // (or started out <= u128::MAX despite needing a `BigUint`
+        // instead of `i128`, e.g. between i128::MAX and u128::MAX) must
+        // still hash equal to the same value taking the `None` branch
+        // above, so it canonicalizes to `Small` too whenever it fits.
+        let mag = match mag.to_u128() {
+            Some(v) => NumKeyMag::Small(v),
+            None => NumKeyMag::Big(mag),
+        };
         (NumericSpecial::Finite as u8, neg, mag, scale)
     }
 
@@ -2454,6 +2480,21 @@ impl std::hash::Hash for BigUint {
     }
 }
 
+/// v1.70: canonical magnitude for [`Numeric::hash_key`]. The overwhelming
+/// majority of exact-numeric hash keys (every `smallint`/`int`/`bigint`,
+/// and any `numeric` whose value fits in `i128`) never need a `BigUint`
+/// at all — `Small` carries that magnitude as a plain `u128`, with no
+/// heap allocation. `Big` is only reached by a `numeric` whose magnitude
+/// genuinely exceeds `i128`'s range. `hash_key` guarantees the two never
+/// represent the same value: a `Big` magnitude that fits in `u128` is
+/// canonicalized down to `Small` before it is returned, so `Eq`/`Hash`
+/// stay consistent across both int- and numeric-sourced keys.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NumKeyMag {
+    Small(u128),
+    Big(BigUint),
+}
+
 impl BigUint {
     /// The value zero.
     pub(crate) fn zero() -> Self {
@@ -2778,6 +2819,19 @@ impl BigUint {
         let mut v: u64 = 0;
         for &limb in self.limbs.iter().rev() {
             v = v.checked_mul(1_000_000_000)?.checked_add(limb as u64)?;
+        }
+        Some(v)
+    }
+
+    /// Value as u128; None when it does not fit. Used by
+    /// [`Numeric::hash_key`] to canonicalize a big-mantissa magnitude
+    /// back down to [`NumKeyMag::Small`] whenever it fits, so it still
+    /// hashes/compares equal to the same value represented without a
+    /// `BigUint` (see that function).
+    pub(crate) fn to_u128(&self) -> Option<u128> {
+        let mut v: u128 = 0;
+        for &limb in self.limbs.iter().rev() {
+            v = v.checked_mul(1_000_000_000)?.checked_add(limb as u128)?;
         }
         Some(v)
     }

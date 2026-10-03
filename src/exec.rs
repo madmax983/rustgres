@@ -27923,7 +27923,7 @@ enum HashKeyPart {
     /// (PG19's hashint8 is likewise "compatible with the values
     /// produced by hashint4 and hashint2 for logically equal
     /// inputs", src/backend/access/hash/hashfunc.c).
-    ExactNum(u8, bool, crate::storage::BigUint, i32),
+    ExactNum(u8, bool, crate::storage::NumKeyMag, i32),
     /// Canonicalized f64 bits: `-0.0` -> `0.0`, NaN -> standard NaN
     /// (see `canon_float_key`).
     Float(u64),
@@ -31061,7 +31061,14 @@ fn value_key_numeric(out: &mut Vec<u8>, n: &crate::storage::Numeric) {
     let (special, neg, mag, scale) = n.hash_key();
     out.push(special);
     out.push(neg as u8);
-    let digits = mag.to_decimal_string();
+    // v1.70: `mag` avoids a `BigUint` entirely for the common case
+    // (see `Numeric::hash_key`/`NumKeyMag`); both arms render the exact
+    // same digit string for equal magnitudes (no leading zeros, "0" for
+    // zero), so the encoded bytes are unchanged either way.
+    let digits = match &mag {
+        crate::storage::NumKeyMag::Small(v) => v.to_string(),
+        crate::storage::NumKeyMag::Big(b) => b.to_decimal_string(),
+    };
     out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
     out.extend_from_slice(digits.as_bytes());
     out.extend_from_slice(&scale.to_be_bytes());
