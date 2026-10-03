@@ -2,6 +2,124 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Numeric::hash_key` allocates a `BigUint` for every exact-numeric hash key — fix — 2026-10-03
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/storage.rs`: `Numeric::hash_key` no longer calls `self.mag()`
+unconditionally. When `self.big` is `None` — every `smallint`/`int`/
+`bigint`-sourced key, and any `numeric` whose magnitude fits in `i128`,
+which between them cover the overwhelming majority of exact-numeric
+hash keys — it strips the same trailing-zero scale directly off
+`self.unscaled.unsigned_abs()` (a `u128`, no allocation) instead of
+promoting to a `BigUint` just to immediately tear it back down. Only a
+genuine big-mantissa `numeric` (`self.big: Some`) still takes the old
+`mag()`/`div_rem_small` path.
+
+The return type changes from `(u8, bool, BigUint, i32)` to `(u8, bool,
+NumKeyMag, i32)`, a new two-variant enum (`storage.rs`, next to
+`BigUint`): `NumKeyMag::Small(u128)` for the no-allocation case,
+`NumKeyMag::Big(BigUint)` for the genuine big-mantissa case. The two
+must never represent the same value, or `Eq`/`Hash` would disagree with
+the old single-representation encoding for a value that happens to
+cross the boundary; `Numeric::new`/`from_big`'s existing invariant
+(`big` is `Some` only when the magnitude doesn't fit `i128`) guarantees
+the `None` arm never needs `Big`, and the `Some` arm explicitly
+collapses to `Small` via a new `BigUint::to_u128` (modeled on the
+existing `to_u64`/`to_i128`) whenever the post-strip magnitude fits —
+covering both a big-mantissa value that strips down to something small
+(trailing zeros) and the edge case of a magnitude between `i128::MAX`
+and `u128::MAX` (needs `BigUint` because it doesn't fit `i128`, but
+does fit `u128`).
+
+Both call sites of `hash_key` (`exec.rs`) only needed to change where
+they read the magnitude back out: `hash_key_part`'s `HashKeyPart::ExactNum`
+variant field type changes from `BigUint` to `NumKeyMag` (its derived
+`PartialEq`/`Eq`/`Hash` carry over unchanged); `value_key_numeric`
+(the GROUP BY/DISTINCT/set-op byte-key encoder) matches on `NumKeyMag`
+to get the same decimal digit string either way (`v.to_string()` for
+`Small`, `b.to_decimal_string()` for `Big` — both render with no
+leading zeros and `"0"` for zero, so the encoded bytes are identical to
+before this change for every value).
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_join.py --count 100`), same machine,
+same session.
+
+Callgrind `Ir` (two runs each, before and after, to confirm
+determinism):
+
+| run | Ir |
+|---|---|
+| before, run 1 | 1,871,611,910 |
+| before, run 2 | 1,871,573,358 |
+| after, run 1 | 1,795,789,533 |
+| after, run 2 | 1,795,878,260 |
+
+Before-run pair agrees to within 0.002%; after-run pair agrees to
+within 0.005%. Using the two-run averages (1,871,592,634 before,
+1,795,833,896.5 after): **-4.05%** — real, but under this round's
+5%-of-profile `Ir` floor by itself (consistent with the baseline
+entry's self-cost breakdown: this call stack was never going to move
+`Ir` by much on its own).
+
+DHAT (same workload, one run each before/after):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total blocks | 651,427 | 450,525 | **-30.84%** |
+| Total bytes | 85,276,275 | 85,293,827 | +0.02% (noise) |
+| `<BigUint>::from_u128` call stack (blocks) | 200,900 | 0 | **-100%** |
+
+The targeted call stack (`Numeric::mag` <- `Numeric::hash_key` <-
+`hash_key_part`/`value_key_numeric` <- `exec_hash_join`) no longer
+appears in the DHAT profile at all — it allocated zero blocks, down
+from 200,900. The aggregate block count drops by almost exactly that
+amount (200,902, a 2-block measurement-noise difference), confirming
+nothing else on this path picked up a new allocation to compensate.
+Total bytes are flat: `NumKeyMag::Small(u128)` is 16 bytes inline
+inside the `HashKeyPart`/tuple value instead of a `Vec<u32>` handle (24
+bytes) pointing at a now-absent 1-2-limb heap block, so the byte count
+neither before nor after was ever where this fix's win showed up (the
+baseline entry already noted the byte share was small — 3.77% — because
+each freed allocation was tiny). The DHAT block-count floor (>=10%)
+clears by a 3x margin; the `Ir` floor does not clear on its own, but
+only one of the two is required.
+
+**Correctness, beyond the full test suite below**: hash-joining an
+`INT` column against a `NUMERIC` column (`tA.id = tB.id` with `tA.id
+INT`, `tB.id NUMERIC`, values `5`/`5.00`, `10`/`10.0`, `-3`/`-3`) still
+matches all three pairs through the hash path. Grouping a `NUMERIC`
+column containing `5`, `5.0`, `5.00` (one group, count 3), `-5`/`-5.00`
+(one group, count 2), `0`/`-0` (one group, count 2), and a 40-digit
+value that forces the big-mantissa path (its own group, count 1, never
+colliding with the small groups) all produce the expected grouping —
+exercising exactly the `Small`/`Big` boundary this change introduces.
+
+`cargo test --all-features`: 886/886 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features --
+-D warnings`: 595 pre-existing errors on both the pre-change and
+post-change tree (sorted-diff compared, same pre-existing toolchain/
+lint-version mismatch noted in every prior Bolt entry in this file);
+zero new. `tests/protocol_test_v093_hashjoin.py` (27/27 differential),
+`tests/protocol_test_v094_hashparity.py` (14/14 differential — the
+exact NUMERIC-hash-canonicalization suite this change touches),
+`tests/protocol_test_v092_agg.py` (33/33), and
+`tests/protocol_test{7,8,23}.py` (200/200, 93/93, 105/105, all exercise
+GROUP BY/DISTINCT) all pass unchanged.
+
+Before/after profiles not committed (binary valgrind output; the
+numbers above are reproducible from the commands in the baseline entry
+below, run on this tree before/after the diff in this commit).
+
+**Reproduce**: on this commit, repeat the Callgrind/DHAT commands in
+the baseline entry's "Reproduce" section; on the parent commit (the
+baseline), repeat them again to get the "before" numbers.
+
 ## Bolt: `Numeric::hash_key` allocates a `BigUint` for every exact-numeric hash key — baseline — 2026-10-03
 
 **Why this workload**: the last two profiling-focused Bolt rounds
