@@ -56,7 +56,12 @@ pub enum ColType {
     Timestamp,   // OID 1114 (v0.7)
     Timestamptz, // OID 1184 (v0.7)
     Bytea,       // OID 17 (v0.7)
-    Uuid,        // OID 2950 (v0.7)
+    // v1.39: PG's `bit` fixed-length bit-string type (OID 1560) — the
+    // result type of `x'...'`/`b'...'` literals (PG19 `bit_in`). The
+    // value's bit length is carried on the value itself (PG stores the
+    // typmod on the VarBit datum); `ColType` stays `Copy`.
+    Bit,  // OID 1560
+    Uuid, // OID 2950 (v0.7)
     // v0.37: PG's regclass type (OID 2205) — an OID that displays as
     // the relation name. Used for pg_class.reltoastrelid::regclass.
     Regclass, // OID 2205
@@ -70,6 +75,16 @@ pub enum ColType {
     // Number displayed as HIGH/LOW in uppercase hex, LOW zero-padded
     // to 8 digits (e.g. `0/016AE7F8`).
     PgLsn, // OID 3220
+    // v1.17: PG's `xid` transaction-id type (OID 28) — the type of the
+    // `xmin`/`xmax` system columns. Values are carried as `Value::Int`
+    // (engine xids fit in i64); display is unsigned decimal like PG's
+    // xidout, and `=`/`xidin` equality is plain integer equality like
+    // PG's xideq.
+    Xid, // OID 28
+    // v1.40: PG's `tid` tuple-identifier type (OID 27) — the type of the
+    // `ctid` system column. Values are carried as `Value::Tid(block,
+    // offset)`; display is PG's tidout `(b,o)`.
+    Tid, // OID 27
     // v0.73: PG's `record` pseudo-type (OID 2249) — the type of a
     // whole-row value (`tbl` / `tbl.*` in expression position). The
     // engine does not track per-table rowtype OIDs (a documented gap);
@@ -122,6 +137,11 @@ pub enum ArrayElem {
     Json,
     Record,
     PgLsn,
+    Xid,
+    // v1.39: `bit` arrays (`_bit`, OID 1561).
+    Bit,
+    // v1.40: `tid` arrays (`_tid`, OID 1010).
+    Tid,
 }
 
 impl ArrayElem {
@@ -132,6 +152,7 @@ impl ArrayElem {
             ColType::Array(e) => *e,
             ColType::Bool => ArrayElem::Bool,
             ColType::Bytea => ArrayElem::Bytea,
+            ColType::Bit => ArrayElem::Bit,
             ColType::SingleChar => ArrayElem::SingleChar,
             ColType::Name => ArrayElem::Name,
             ColType::SmallInt => ArrayElem::SmallInt,
@@ -153,6 +174,8 @@ impl ArrayElem {
             // v0.81: named composites are not arrayable yet.
             ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
+            ColType::Xid => ArrayElem::Xid,
+            ColType::Tid => ArrayElem::Tid, // v1.40
         }
     }
 
@@ -180,6 +203,10 @@ impl ArrayElem {
             ArrayElem::Json => 199,
             ArrayElem::Record => 2287,
             ArrayElem::PgLsn => 3221,
+            ArrayElem::Xid => 1011,
+            ArrayElem::Tid => 1010, // v1.40: PG's `_tid` (pg_type.dat)
+            // v1.39: PG's `_bit` array OID (pg_type.dat).
+            ArrayElem::Bit => 1561,
         }
     }
 
@@ -207,6 +234,9 @@ impl ArrayElem {
             ArrayElem::Json => "json",
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
+            ArrayElem::Xid => "xid",
+            ArrayElem::Bit => "bit",
+            ArrayElem::Tid => "tid", // v1.40
         }
     }
 
@@ -234,7 +264,96 @@ impl ArrayElem {
             ArrayElem::Json => "json",
             ArrayElem::Record => "record",
             ArrayElem::PgLsn => "pg_lsn",
+            ArrayElem::Xid => "xid",
+            ArrayElem::Bit => "bit",
+            ArrayElem::Tid => "tid", // v1.40
         }
+    }
+}
+
+/// v1.39: a fixed-length bit string — the value of PG19's `bit` type
+/// (OID 1560), produced by `x'...'`/`b'...'` literals via `bit_in`
+/// semantics. Mirrors PG's `VarBit` layout: `bitlen` significant bits
+/// stored big-endian in `bytes` (MSB first), with the unused low bits
+/// of the last byte zeroed (`bytes.len() == (bitlen + 7) / 8`, except
+/// `bitlen == 0` which stores no bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitString {
+    pub bitlen: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl BitString {
+    /// PG19 `bit_in` (varbit.c): `marker` is the normalized literal
+    /// prefix (`'b'` or `'x'`, case-insensitive at the scanner). Binary
+    /// digits must each be `0`/`1` (22P02 "not a valid binary digit");
+    /// hex digits must each be valid hex (22P02 "not a valid hexadecimal
+    /// digit"). A hex literal's bit length is 4x its digit count. The
+    /// error is always SQLSTATE 22P02; only the message is returned.
+    pub fn parse(marker: char, digits: &str) -> Result<BitString, String> {
+        let mut bits: Vec<u8> = Vec::new();
+        match marker {
+            'b' | 'B' => {
+                for ch in digits.chars() {
+                    match ch {
+                        '0' => bits.push(0),
+                        '1' => bits.push(1),
+                        // PG reports the offending character, e.g.
+                        // `"2" is not a valid binary digit`.
+                        _ => return Err(format!("\"{ch}\" is not a valid binary digit")),
+                    }
+                }
+            }
+            'x' | 'X' => {
+                for ch in digits.chars() {
+                    match ch.to_digit(16) {
+                        Some(d) => {
+                            bits.push((d >> 3) as u8 & 1);
+                            bits.push((d >> 2) as u8 & 1);
+                            bits.push((d >> 1) as u8 & 1);
+                            bits.push(d as u8 & 1);
+                        }
+                        // PG: `"g" is not a valid hexadecimal digit`.
+                        None => return Err(format!("\"{ch}\" is not a valid hexadecimal digit")),
+                    }
+                }
+            }
+            _ => return Err(format!("invalid bit-string prefix '{marker}'")),
+        }
+        let bitlen = bits.len() as u32;
+        let mut bytes = vec![0u8; (bits.len() + 7) / 8];
+        for (i, b) in bits.iter().enumerate() {
+            if *b == 1 {
+                bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        Ok(BitString { bitlen, bytes })
+    }
+
+    /// v1.39: PG19 `bit_in` on a raw input string (parameter values,
+    /// casts from text). A leading `b`/`B`/`x`/`X` selects the digit
+    /// base; otherwise the whole string is binary digits (varbit.c:
+    /// "This allows things like cast('1001' as bit) to work
+    /// transparently").
+    pub fn parse_input(s: &str) -> Result<BitString, String> {
+        let (marker, digits) = match s.chars().next() {
+            Some('b') | Some('B') | Some('x') | Some('X') => (s.chars().next().unwrap(), &s[1..]),
+            _ => ('b', s),
+        };
+        BitString::parse(marker, digits)
+    }
+
+    /// PG19 `bit_out`: the bit characters, MSB first.
+    pub fn to_bit_chars(&self) -> String {
+        let mut s = String::with_capacity(self.bitlen as usize);
+        for i in 0..self.bitlen as usize {
+            s.push(if self.bytes[i / 8] & (1 << (7 - (i % 8))) != 0 {
+                '1'
+            } else {
+                '0'
+            });
+        }
+        s
     }
 }
 
@@ -250,6 +369,8 @@ impl ColType {
             ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
             ColType::SingleChar => 18,    // "char" (v0.36)
             ColType::PgLsn => 3220,       // PG_LSN (v0.64)
+            ColType::Xid => 28,           // XID (v1.17)
+            ColType::Tid => 27,           // TID (v1.40)
             ColType::Bool => 16,          // BOOL
             ColType::Float => 701,        // FLOAT8
             ColType::Float4 => 700,       // FLOAT4
@@ -258,6 +379,7 @@ impl ColType {
             ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
             ColType::Bytea => 17,         // BYTEA
+            ColType::Bit => 1560,         // BIT (v1.39)
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
             ColType::Name => 19,          // NAME (v0.57)
@@ -295,8 +417,11 @@ impl ColType {
             ColType::Timestamp => "timestamp without time zone",
             ColType::Timestamptz => "timestamp with time zone",
             ColType::Bytea => "bytea",
+            ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
+            ColType::Xid => "xid",      // v1.17
+            ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
@@ -335,8 +460,11 @@ impl ColType {
             ColType::Timestamp => "timestamp",
             ColType::Timestamptz => "timestamptz",
             ColType::Bytea => "bytea",
+            ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
             ColType::PgLsn => "pg_lsn", // v0.64
+            ColType::Xid => "xid",      // v1.17
+            ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
@@ -770,6 +898,38 @@ impl Numeric {
         }
     }
 
+    /// v0.94: canonical `(special, negative, magnitude, scale)` for
+    /// hash-join keys. Equal finite numerics (per [`Numeric::cmp`])
+    /// must hash equal: `5`, `5.0`, `5.00`, and int4 `5` all reduce
+    /// to `(Finite, false, 5, 0)` here. All constructors strip
+    /// trailing zeros at build time, but PG19's own `hash_numeric`
+    /// (src/backend/utils/adt/numeric.c) is deliberately "paranoid"
+    /// about it — "Omit any leading or trailing zeros from the input
+    /// to the hash" — so the strip is redone here defensively rather
+    /// than trusting every construction site. Specials hash by
+    /// discriminant alone (PG19 hashes every special to 0, but our
+    /// `cmp` distinguishes NaN/+Inf/-Inf, so the discriminant keeps
+    /// the key consistent with `=`).
+    pub(crate) fn hash_key(&self) -> (u8, bool, BigUint, i32) {
+        if self.special != NumericSpecial::Finite {
+            return (self.special as u8, false, BigUint::zero(), 0);
+        }
+        // Sign lives in `unscaled` on both paths (`from_big` stores
+        // ±1 there when the big mantissa is present).
+        let neg = self.unscaled < 0;
+        let mut mag = self.mag();
+        let mut scale = self.scale.max(0);
+        while scale > 0 {
+            let (q, r) = mag.div_rem_small(10);
+            if r != 0 {
+                break;
+            }
+            mag = q;
+            scale -= 1;
+        }
+        (NumericSpecial::Finite as u8, neg, mag, scale)
+    }
+
     /// v0.63: true when the big-mantissa extension is in use.
     pub(crate) fn is_big(&self) -> bool {
         self.big.is_some()
@@ -1035,14 +1195,15 @@ impl Numeric {
             NumericSpecial::NaN => f64::NAN,
             NumericSpecial::PosInf => f64::INFINITY,
             NumericSpecial::NegInf => f64::NEG_INFINITY,
-            // v0.63: big magnitudes go through BigDec's f64 conversion
-            // (leading-digit based); the i128 path is unchanged.
-            NumericSpecial::Finite => match &self.big {
-                Some(_) => BigDec::from_numeric(self)
-                    .map(|d| d.to_f64())
-                    .unwrap_or(f64::NAN),
-                None => self.unscaled as f64 * 10f64.powi(-self.scale),
-            },
+            // v0.94: PG19 parity (numeric.c numeric_float8): the exact
+            // decimal rendering parsed with a correctly-rounded float
+            // parser (numeric_out -> float8in/strtod). The old
+            // `unscaled as f64 * 10f64.powi(-scale)` double-rounds: e.g.
+            // 1.000000000000000000001 became 0.9999999999999999 instead
+            // of 1.0, so `1.000000000000000000001::numeric = 1::float8`
+            // was false (PG: true). The BigDec leading-digits path had
+            // the same flaw (truncation, not round-to-nearest).
+            NumericSpecial::Finite => self.to_text().parse::<f64>().unwrap_or(f64::NAN),
         }
     }
 
@@ -2284,6 +2445,15 @@ pub(crate) struct BigUint {
     limbs: Vec<u32>,
 }
 
+// v0.93: Hash for the hash-join key. The limb vector is canonical (no
+// leading zero limbs), so hashing it is consistent with the derived
+// PartialEq — equal BigUints hash equal.
+impl std::hash::Hash for BigUint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.limbs.hash(state);
+    }
+}
+
 impl BigUint {
     /// The value zero.
     pub(crate) fn zero() -> Self {
@@ -2672,27 +2842,124 @@ impl BigUint {
         if self.cmp(other) == std::cmp::Ordering::Less {
             return (BigUint::zero(), self.clone());
         }
-        // Dividend bits, LSB-first: bit = limbs[0] & 1, then halve.
-        let mut tmp = self.clone();
-        let mut bits_lsb = Vec::new();
-        while !tmp.is_zero() {
-            bits_lsb.push(tmp.limbs[0] & 1 == 1);
-            tmp.div_small_assign(2);
+        // v0.90: Knuth Algorithm D (TAOCP 4.3.1) in base 1e9. The old
+        // bit-by-bit long division was O(bits^2) limb ops with a
+        // per-bit allocation; Algorithm D is O(n*m) with a tiny
+        // constant and no allocation in the inner loop (~1000x faster
+        // on 200-digit numerics: the numeric LN range-reduction spent
+        // ~1.6s per call in the old div_rem). Results are
+        // bit-identical to the old implementation (differential test
+        // `div_rem_knuth_matches_bitwise` below, plus the q*v+r==self
+        // / r<other invariant on random inputs).
+        const B: u64 = 1_000_000_000;
+        // Single-limb divisor: the O(n) schoolbook path.
+        if other.limbs.len() == 1 {
+            let (q, r) = self.div_rem_small(other.limbs[0]);
+            let rem = if r == 0 {
+                BigUint::zero()
+            } else {
+                BigUint { limbs: vec![r] }
+            };
+            return (q, rem);
         }
-        let mut q = BigUint::zero();
-        let mut r = BigUint::zero();
-        for &b in bits_lsb.iter().rev() {
-            r.mul_small_assign(2);
-            if b {
-                r.add_small_assign(1);
+        let n = other.limbs.len(); // >= 2
+        let m = self.limbs.len() - n; // >= 0: self >= other, both normalized
+        // D1: normalize. d = floor(B / (v[n-1] + 1)) >= 1; multiplying
+        // u and v by d makes v[n-1] >= B/2 without growing v past n
+        // limbs (d * (v[n-1] + 1) <= B).
+        let d = B / (other.limbs[n - 1] as u64 + 1);
+        debug_assert!(d >= 1);
+        let mut v = vec![0u64; n];
+        {
+            let mut carry: u64 = 0;
+            for (i, &limb) in other.limbs.iter().enumerate() {
+                let t = limb as u64 * d + carry;
+                v[i] = t % B;
+                carry = t / B;
             }
-            q.mul_small_assign(2);
-            if r.cmp(other) != std::cmp::Ordering::Less {
-                r.sub_assign(other);
-                q.add_small_assign(1);
-            }
+            debug_assert!(carry == 0);
         }
-        (q, r)
+        let mut u = vec![0u64; m + n + 1];
+        {
+            let mut carry: u64 = 0;
+            for (i, &limb) in self.limbs.iter().enumerate() {
+                let t = limb as u64 * d + carry;
+                u[i] = t % B;
+                carry = t / B;
+            }
+            u[self.limbs.len()] = carry;
+        }
+        debug_assert!(v[n - 1] >= B / 2);
+        let mut q = vec![0u32; m + 1];
+        // D2: j = m ..= 0.
+        for j in (0..=m).rev() {
+            // D3: qhat = (u[j+n]*B + u[j+n-1]) / v[n-1], corrected.
+            // u[j+n] < B and v[n-1] >= B/2, so the numerator < B^2
+            // and every product below < B^2 = 1e18 < 2^63.
+            let num = u[j + n] * B + u[j + n - 1];
+            let mut qhat = num / v[n - 1];
+            let mut rhat = num % v[n - 1];
+            while qhat >= B || qhat * v[n - 2] > B * rhat + u[j + n - 2] {
+                qhat -= 1;
+                rhat += v[n - 1];
+                if rhat >= B {
+                    break;
+                }
+            }
+            // D4+D5: u[j..=j+n] -= qhat * v[0..n], unsigned base-B
+            // subtract with borrow (all u64; p < B^2 + B + 2).
+            let mut borrow: u64 = 0;
+            for i in 0..n {
+                let p = qhat * v[i] + borrow;
+                let p_lo = p % B;
+                let p_hi = p / B;
+                let uj = u[j + i];
+                // Base-B digit subtract (NOT wrapping_sub: the digit
+                // base is 1e9, not 2^64).
+                if uj >= p_lo {
+                    u[j + i] = uj - p_lo;
+                    borrow = p_hi;
+                } else {
+                    u[j + i] = uj + B - p_lo;
+                    borrow = p_hi + 1;
+                }
+            }
+            // D6: add back while the (n+1)-limb segment is negative.
+            // qhat exceeds the true digit by at most 2 (Knuth Thm A),
+            // so this runs at most twice; the loop form is bulletproof
+            // regardless. On exit the top limb is exactly 0.
+            let mut qq = qhat;
+            let mut top = u[j + n] as i64 - borrow as i64;
+            while top < 0 {
+                let mut carry: u64 = 0;
+                for i in 0..n {
+                    let s = u[j + i] + v[i] + carry;
+                    u[j + i] = s % B;
+                    carry = s / B;
+                }
+                top += carry as i64;
+                qq -= 1;
+            }
+            u[j + n] = top as u64;
+            debug_assert!(qq < B);
+            q[j] = qq as u32;
+        }
+        // D8: unnormalize the remainder: u[0..n] / d (exact).
+        let mut rem = vec![0u32; n];
+        {
+            let mut carry: u64 = 0;
+            for i in (0..n).rev() {
+                let cur = carry * B + u[i];
+                rem[i] = (cur / d) as u32;
+                carry = cur % d;
+            }
+            debug_assert!(carry == 0);
+        }
+        let mut qout = BigUint { limbs: q };
+        qout.normalize();
+        let mut rout = BigUint { limbs: rem };
+        rout.normalize();
+        (qout, rout)
     }
 
     /// v0.67: exact value as u32; None when it does not fit. Used to
@@ -3913,6 +4180,11 @@ pub enum Value {
     Timestamptz(i64), // v0.7: micros since epoch, UTC
     Bytea(Vec<u8>),   // v0.7
     Uuid([u8; 16]),   // v0.7
+    // v1.39: PG's `bit` fixed-length bit string (OID 1560) — the value
+    // of `x'...'`/`b'...'` literals. The bit length rides on the value
+    // (PG's VarBit datum carries its typmod); display is the bit
+    // characters (`bit_out`).
+    BitString(BitString),
     // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
     // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
     PgLsn(u64),
@@ -3937,6 +4209,12 @@ pub enum Value {
     // so one more pointer's worth of indirection for actual array values
     // is negligible.
     Array(Box<ArrayVal>),
+    // v1.40: PG's `tid` tuple-identifier type (OID 27) — the type of the
+    // `ctid` system column. Carried as (block, offset); rustgres has no
+    // heap pages, so the block is always 0 and the offset is the row
+    // version's position in its table (SELECT) or the post-DML version's
+    // position (RETURNING). Displays as PG's tidout `(b,o)`.
+    Tid(u32, u32),
     Null,
 }
 
@@ -4090,6 +4368,8 @@ impl Value {
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
             Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
             Value::Bytea(b) => Some(bytea_text(b)),
+            // v1.39: PG19 `bit_out` — the bit characters.
+            Value::BitString(b) => Some(b.to_bit_chars()),
             Value::Uuid(u) => Some(uuid_text(u)),
             // v0.64: pg_lsn displays as HIGH/LOW uppercase hex, LOW
             // zero-padded to 8 digits (e.g. `0/016AE7F8`).
@@ -4099,6 +4379,8 @@ impl Value {
             Value::Record(fields) => Some(record_text(fields)),
             // v0.79: PG19 array_out: `{...}` with PG's quoting rules.
             Value::Array(a) => Some(a.to_literal()),
+            // v1.40: PG19 tidout: `(block,offset)`.
+            Value::Tid(b, o) => Some(format!("({b},{o})")),
             Value::Null => None,
         }
     }
@@ -4185,6 +4467,8 @@ impl Value {
             Value::Timestamp(_) => Cow::Borrowed("timestamp without time zone"),
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
             Value::Bytea(_) => Cow::Borrowed("bytea"),
+            Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
+            Value::Tid(_, _) => Cow::Borrowed("tid"), // v1.40
             Value::Uuid(_) => Cow::Borrowed("uuid"),
             Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
             Value::Record(_) => Cow::Borrowed("record"), // v0.73
@@ -4213,6 +4497,8 @@ impl Value {
             Value::Timestamp(_) => ColType::Timestamp,
             Value::Timestamptz(_) => ColType::Timestamptz,
             Value::Bytea(_) => ColType::Bytea,
+            Value::BitString(_) => ColType::Bit, // v1.39
+            Value::Tid(_, _) => ColType::Tid, // v1.40
             Value::Uuid(_) => ColType::Uuid,
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
             // v0.73: a whole-row value has composite (record) type.
@@ -4650,9 +4936,30 @@ impl RowVersion {
 #[derive(Clone, Debug)]
 pub struct Table {
     pub columns: Vec<(String, ColType)>,
+    /// v1.41: the real PostgreSQL attribute number per live column,
+    /// parallel to `columns`. PG never reuses attnums: `ALTER TABLE ADD
+    /// COLUMN` assigns `max(all attnums ever)+1`, so after DROP+ADD the
+    /// numbers have gaps (unlike the 1-based position). Reported by the
+    /// `pg_attribute` catalog view.
+    pub attnums: Vec<i16>,
+    /// v1.41: next attnum to assign (`max(attnums ever)+1`; 1-based).
+    /// Never decremented — dropped columns' numbers are not reused.
+    pub next_attnum: i16,
+    /// v1.41: `fillfactor` storage parameter (10–100, default 100),
+    /// from `WITH (fillfactor = N)` at CREATE TABLE. Drives the
+    /// `pg_relation_size` heap page simulation (PG19
+    /// `RelationGetTargetPageFreeSpace`).
+    pub fillfactor: u8,
     /// v0.81: named composite type per column, parallel to `columns`
     /// (`Some(name)` iff the column's `ColType` is `Composite`).
     pub composite_types: Vec<Option<String>>,
+    /// v0.85: domain name per column, parallel to `columns`
+    /// (`Some(d)` iff the column was declared with domain type `d`,
+    /// possibly as `d[]`).
+    pub domain_types: Vec<Option<String>>,
+    /// v0.85: iff `domain_types[i]` is `Some` and the column was
+    /// declared as `d[]`: the domain applies per array element.
+    pub domain_elem: Vec<bool>,
     pub rows: Vec<RowVersion>,
     /// Row-version id -> position in `rows`. Keeps id lookups O(1) so
     /// multi-row writes don't degrade to O(rows) per row.
@@ -4700,6 +5007,17 @@ pub struct Table {
     pub next_value_id: u32,
     /// v0.69: declarative partitioning metadata (`None` = not partitioned).
     pub partition: Option<PartitionInfo>,
+    /// v0.96: table inheritance parents (PG19 `pg_inherits`), in link
+    /// order. Names are relation names as written at CREATE/ALTER time;
+    /// resolved against the visible catalog on each use. Empty = no
+    /// parents (ordinary table).
+    pub inherits: Vec<String>,
+    /// v1.00: triggers defined on this table, in creation order (PG19
+    /// `pg_trigger`, simplified). Versions, WAL-replays, and
+    /// checkpoints with the table, so CREATE/DROP TRIGGER are fully
+    /// transactional. Only BEFORE INSERT FOR EACH ROW triggers fire
+    /// in v1.00.
+    pub triggers: Vec<crate::sql::TriggerDef>,
 }
 
 impl Table {
@@ -4712,8 +5030,17 @@ impl Table {
             .collect();
         Table {
             columns,
+            // v1.41: fresh tables get sequential attnums 1..=n.
+            attnums: (1..=n as i16).collect(),
+            next_attnum: n as i16 + 1,
+            // v1.41: default fillfactor 100 (`with_def` overrides from
+            // reloptions).
+            fillfactor: 100,
             // v0.81: no named composites by default.
             composite_types: vec![None; n],
+            // v0.85: no domain-typed columns by default.
+            domain_types: vec![None; n],
+            domain_elem: vec![false; n],
             rows: Vec::new(),
             row_index: HashMap::new(),
             created_xmin,
@@ -4739,20 +5066,38 @@ impl Table {
             next_value_id: 1,
             // v0.69: not partitioned by default.
             partition: None,
+            // v0.96: no inheritance parents by default.
+            inherits: Vec::new(),
+            // v1.00: no triggers by default.
+            triggers: Vec::new(),
         }
     }
 
     /// Build a table from a parsed v0.9 `TableDef` (constraints included).
     pub fn with_def(def: &TableDef, created_xmin: u64) -> Self {
         let mut t = Table::new(def.columns.clone(), created_xmin);
+        // v1.41: `WITH (fillfactor = N)` (validated 10–100 at exec by
+        // `validate_reloptions`; last wins, like PG).
+        for (name, val) in &def.reloptions {
+            if name == "fillfactor" {
+                if let Ok(n) = val.parse::<u8>() {
+                    t.fillfactor = n;
+                }
+            }
+        }
         t.not_null = def.not_null.clone();
         t.defaults = def.defaults.clone();
         t.checks = def.checks.clone();
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
         t.fks = def.fks.clone();
+        // v0.96: table inheritance links (pg_inherits equivalent).
+        t.inherits = def.inherits.clone();
         // v0.81: named composite types per column.
         t.composite_types = def.composite_types.clone();
+        // v0.85: domain type use per column.
+        t.domain_types = def.domain_types.clone();
+        t.domain_elem = def.domain_elem.clone();
         // v0.72: per-column STORAGE overrides (LIKE ... INCLUDING
         // STORAGE); `None` keeps the type default from `Table::new`.
         for (i, s) in def.storage.iter().enumerate() {
@@ -4820,6 +5165,27 @@ pub const NO_SESSION: u64 = u64::MAX;
 /// only the shell + LIKE-completion forms (no I/O functions, no
 /// composite/enum/range types): enough for the pg_regress float8
 /// cluster, which builds a float8 alias this way.
+/// v0.85: `CREATE DOMAIN` definition — a named type over a base type
+/// with CHECK constraints (PG19 coerce_to_domain). Stored on
+/// `ShellType`; WAL-logged and checkpointed like the composite
+/// definition.
+#[derive(Clone, Debug)]
+pub struct DomainDef {
+    /// The base type (builtins, `ColType::Array`, or `ColType::Composite`
+    /// for a named composite base).
+    pub base: ColType,
+    /// Named base type (`Some(name)` when `base` is `Composite` or when
+    /// the base is itself a domain); resolved at CREATE DOMAIN time.
+    pub base_named: Option<String>,
+    /// v0.85: domain-over-domain — the inner domain name. When set,
+    /// `base`/`base_named` are the inner domain's resolved base; checks
+    /// recurse into the inner domain first (PG19 checks innermost first).
+    pub base_domain: Option<String>,
+    pub checks: Vec<CheckDef>,
+    pub not_null: bool,
+    pub default: Option<DefaultExpr>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ShellType {
     /// Base type name from LIKE = <base>; None while still a shell.
@@ -4830,6 +5196,59 @@ pub struct ShellType {
     /// v0.82: WAL-logged and checkpointed; committed definitions survive
     /// restart (pre-v0.82 this was a documented gap).
     pub composite: Option<Vec<(String, ColType, Option<String>)>>,
+    /// v0.85: `CREATE DOMAIN` definition. None for shell/LIKE/composite
+    /// types; a type is never both composite and domain.
+    pub domain: Option<DomainDef>,
+}
+
+/// v0.86: a user-defined function definition. `arg_types` / `ret_type`
+/// are stored as written and resolved at call time (so a type created
+/// after the function still resolves). `body` is the raw body string;
+/// `parsed` is the body parsed once at CREATE time into its statement
+/// list (v1.32: SQL bodies may hold multiple statements; the executor
+/// runs them in order and takes the last statement's result).
+/// Re-parsed from `body` after WAL replay / checkpoint restore.
+#[derive(Clone, Debug)]
+pub struct FuncDef {
+    pub name: String,
+    pub arg_names: Vec<Option<String>>,
+    pub arg_types: Vec<String>,
+    pub ret_type: String,
+    pub returns_set: bool,
+    pub lang: crate::sql::FuncLang,
+    pub body: String,
+    pub parsed: Option<Vec<crate::sql::Stmt>>,
+    /// v1.01: parsed multi-statement plpgsql body (statement sequences +
+    /// EXCEPTION blocks). `Some` only when the v0.97 single-RETURN
+    /// desugar did not apply; then `body` holds the original source and
+    /// `parsed` is None. Rebuilt from `body` after WAL replay /
+    /// checkpoint restore.
+    pub plpgsql: Option<crate::sql::PlpgsqlBody>,
+    pub volatility: crate::sql::FuncVolatility,
+    pub strict: bool,
+}
+
+/// v1.38: a user-defined cast definition, keyed by (source, target)
+/// canonical type name in `Database::casts`. Only the binary method
+/// (`WITHOUT FUNCTION`) is supported; the context records whether the
+/// cast may be applied implicitly, on assignment, or explicitly only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CastDef {
+    pub context: crate::sql::CastContext,
+}
+
+/// v0.86: a user-defined operator definition: `name` (e.g. `=`, `?=`)
+/// mapping to `procedure` for `(leftarg, rightarg)`.
+#[derive(Clone, Debug)]
+pub struct OperDef {
+    pub name: String,
+    pub procedure: String,
+    pub leftarg: Option<String>,
+    pub rightarg: Option<String>,
+    pub commutator: Option<String>,
+    pub negator: Option<String>,
+    pub hashes: bool,
+    pub merges: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4852,6 +5271,11 @@ pub struct Database {
     /// DDL on them is still statement-atomic via the txn undo log
     /// (`WriteOp::CreateTempTable` / `WriteOp::DropTempTable`).
     pub temp_tables: HashMap<u64, HashMap<String, Table, FxBuildHasher>, FxBuildHasher>,
+    /// v0.87: session-local temporary indexes, keyed by session id then
+    /// index name. Like temp tables, these shadow nothing (index names
+    /// are session-scoped for temp tables) and are dropped when the
+    /// session ends. Never checkpointed, never WAL-logged.
+    pub temp_indexes: HashMap<u64, HashMap<String, Index, FxBuildHasher>, FxBuildHasher>,
     /// Secondary indexes by index name (v0.8). DDL is transactional: each
     /// definition carries creator/deleter xids, and entries for
     /// uncommitted row versions are filtered by visibility at scan time.
@@ -4867,6 +5291,23 @@ pub struct Database {
     /// they vanished on restart.) Types carry no xid, so a checkpoint
     /// may snapshot an uncommitted CREATE TYPE — a known minor gap.
     pub types: HashMap<String, ShellType, FxBuildHasher>,
+    /// v0.87: functions by name; each name maps to its overload list
+    /// (same name, different argument signatures). DDL is transactional
+    /// via WriteOp undo; committed definitions are WAL-logged and
+    /// checkpointed.
+    pub functions: HashMap<String, Vec<FuncDef>, FxBuildHasher>,
+    /// v0.86: operators by name; each name maps to the (usually
+    /// single) definitions for its arities. Transactional, WAL-logged
+    /// and checkpointed like functions.
+    pub operators: HashMap<String, Vec<OperDef>, FxBuildHasher>,
+    /// v1.38: user-defined casts by (source, target) canonical type
+    /// name. Only the binary (`WITHOUT FUNCTION`) method is supported.
+    /// Transactional via the statement undo log (`WriteOp::CreateCast`).
+    /// KNOWN GAP: not WAL-logged and not checkpointed (same precedent
+    /// as `stats` / `temp_indexes`) — a restart drops user-defined
+    /// casts. Full durability needs a new `WalRecord` variant plus a
+    /// checkpoint-format bump (RGSWAL14), disproportionate for now.
+    pub casts: HashMap<(String, String), CastDef, FxBuildHasher>,
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
     pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
@@ -4926,11 +5367,19 @@ pub struct ViewDef {
 #[derive(Clone, Debug)]
 pub struct Sequence {
     pub name: String,
+    /// v0.99: explicit `AS` data type (PG19 seqtypid); default bigint.
+    /// Stored (not inferred from bounds) so ALTER ... AS can reset
+    /// bounds per PG19 init_params.
+    pub seq_type: crate::sql::SeqType,
     pub start: i64,
     pub increment: i64,
     pub min_value: i64,
     pub max_value: i64,
     pub cycle: bool,
+    /// v0.98: CACHE size (PG19 `seqcache`; default 1). Stored for
+    /// catalog fidelity (pg_sequences.cache_size); the engine hands
+    /// out values one at a time.
+    pub cache: i64,
     /// Last value returned by nextval; None = never called.
     pub current: Option<i64>,
     /// Postgres `is_called`: false after setval(v,false) means the next
@@ -4956,20 +5405,26 @@ pub struct Sequence {
 impl Sequence {
     pub fn new(
         name: String,
+        // v0.99: explicit sequence data type (PG19 `AS`); drives
+        // default bounds and pg_sequences.data_type.
+        seq_type: crate::sql::SeqType,
         start: i64,
         increment: i64,
         min_value: i64,
         max_value: i64,
         cycle: bool,
+        cache: i64,
         created_xmin: u64,
     ) -> Self {
         Sequence {
             name,
+            seq_type,
             start,
             increment,
             min_value,
             max_value,
             cycle,
+            cache,
             current: None,
             is_called: false,
             created_xmin,
@@ -5005,8 +5460,14 @@ impl Database {
             db_acl: Vec::new(),
             // v0.22: session-local TEMP tables live here, keyed by session id.
             temp_tables: HashMap::default(),
+            temp_indexes: HashMap::default(),
             // v0.22: bounded shell-type registry.
             types: HashMap::default(),
+            // v0.86: user-defined functions and operators.
+            functions: HashMap::default(),
+            operators: HashMap::default(),
+            // v1.38: user-defined casts (in-memory; see the field docs).
+            casts: HashMap::default(),
             // v0.37: table OIDs for pg_class.
             next_oid: toast_consts::FIRST_USER_OID,
         };
@@ -5075,7 +5536,7 @@ impl Database {
         &self,
         name: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<&Table> {
         // v0.22: a session-local temp table shadows the permanent one.
@@ -5084,7 +5545,7 @@ impl Database {
         }
         self.tables
             .get(name)
-            .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, own)))
+            .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, owns)))
     }
 
     /// Mutable variant of [`Database::find_table`].
@@ -5092,7 +5553,7 @@ impl Database {
         &mut self,
         name: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<&mut Table> {
         // v0.22: a session-local temp table shadows the permanent one.
@@ -5105,7 +5566,7 @@ impl Database {
         }
         self.tables
             .get_mut(name)
-            .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, own)))
+            .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, owns)))
     }
 
     /// v0.22: drop all of a session's temp tables (disconnect cleanup).
@@ -5117,6 +5578,8 @@ impl Database {
     /// permanent table, and deleting it would corrupt that table.
     pub fn drop_session_temps(&mut self, session: u64) {
         self.temp_tables.remove(&session);
+        // v0.87: drop the session's temp indexes too.
+        self.temp_indexes.remove(&session);
     }
 
     /// The table version created by `own` (for WAL logging of DDL).
@@ -5172,6 +5635,66 @@ impl Database {
             .is_some_and(|m| m.contains_key(name))
     }
 
+    /// v0.96: all visible tables that inherit (directly or transitively)
+    /// from `parent`, in deterministic depth-first order (parent's own
+    /// name is never included). Cycle-safe: DDL rejects circular links,
+    /// but the visited set keeps a corrupt catalog from looping the
+    /// executor. Both permanent tables and this session's temp tables
+    /// are considered; other sessions' temp tables are invisible.
+    pub fn inheritance_descendants(
+        &self,
+        parent: &str,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+    ) -> Vec<String> {
+        // Direct children of `name`, sorted for determinism.
+        fn direct(
+            db: &Database,
+            name: &str,
+            snap: &Snapshot,
+            own: u64,
+            session: u64,
+        ) -> Vec<String> {
+            let mut kids: Vec<String> = Vec::new();
+            let mut consider = |tname: &String, t: &Table| {
+                if t.inherits.iter().any(|p| p == name) && tname != name {
+                    kids.push(tname.clone());
+                }
+            };
+            for (tname, vs) in &db.tables {
+                if let Some(t) = vs.iter().find(|t| table_visible(t, snap, &[own])) {
+                    consider(tname, t);
+                }
+            }
+            if let Some(tmps) = db.temp_tables.get(&session) {
+                for (tname, t) in tmps {
+                    consider(tname, t);
+                }
+            }
+            kids.sort();
+            kids.dedup();
+            kids
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(parent.to_string());
+        let mut stack: Vec<String> = direct(self, parent, snap, own, session)
+            .into_iter()
+            .rev()
+            .collect();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            out.push(name.clone());
+            let mut kids = direct(self, &name, snap, own, session);
+            kids.reverse();
+            stack.extend(kids);
+        }
+        out
+    }
+
     /// v0.22: is `row_id` held by any session's temp table? Row ids are
     /// globally unique, so this is unambiguous. Used to keep temp-table
     /// DML out of the WAL (PostgreSQL never WAL-logs temp-table data).
@@ -5185,11 +5708,13 @@ impl Database {
     /// it lives (permanent or temp table). Returns the removed values and
     /// whether the table was a session-local temp table — temp rows have
     /// no global index entries, so callers skip index cleanup for them.
-    fn remove_own_version(&mut self, row_id: u64, own: u64) -> Option<(Row, bool)> {
+    fn remove_own_version(&mut self, row_id: u64, owns: &[u64]) -> Option<(Row, bool)> {
         for vs in self.tables.values_mut() {
             for t in vs {
                 if let Some(pos) = t.row_pos(row_id) {
-                    if t.rows[pos].xmin == own {
+                    // v1.21: a version is ours if its xmin is any xid
+                    // owned by the transaction (top or sub-xid).
+                    if owns.contains(&t.rows[pos].xmin) {
                         let values = t.rows[pos].values.clone();
                         t.swap_remove_version(pos);
                         return Some((values, false));
@@ -5201,7 +5726,7 @@ impl Database {
         for tmps in self.temp_tables.values_mut() {
             for t in tmps.values_mut() {
                 if let Some(pos) = t.row_pos(row_id) {
-                    if t.rows[pos].xmin == own {
+                    if owns.contains(&t.rows[pos].xmin) {
                         let values = t.rows[pos].values.clone();
                         t.swap_remove_version(pos);
                         return Some((values, true));
@@ -5216,17 +5741,22 @@ impl Database {
     // -- v0.8: secondary index maintenance -------------------------------
 
     /// Index definition visible to (`snap`, `own`), if any.
-    pub fn find_index(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&Index> {
+    pub fn find_index(&self, name: &str, snap: &Snapshot, owns: &[u64]) -> Option<&Index> {
         self.indexes
             .get(name)
-            .filter(|ix| index_visible(&ix.def, snap, own))
+            .filter(|ix| index_visible(&ix.def, snap, owns))
     }
 
     /// Mutable twin of [`Database::find_index`].
-    pub fn find_index_mut(&mut self, name: &str, snap: &Snapshot, own: u64) -> Option<&mut Index> {
+    pub fn find_index_mut(
+        &mut self,
+        name: &str,
+        snap: &Snapshot,
+        owns: &[u64],
+    ) -> Option<&mut Index> {
         self.indexes
             .get_mut(name)
-            .filter(|ix| index_visible(&ix.def, snap, own))
+            .filter(|ix| index_visible(&ix.def, snap, owns))
     }
 
     /// All index definitions on `table` visible to (`snap`, `own`),
@@ -5235,21 +5765,28 @@ impl Database {
         &self,
         table: &str,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Vec<&Index> {
-        // v0.22: temp tables never have entries in the global index map
-        // (their PRIMARY KEY / UNIQUE constraints are enforced by a
-        // session-local scan instead), so no index is visible for them.
-        // Without this, a temp table would "see" a same-named permanent
-        // table's indexes and read the wrong rows.
+        // v0.87: temp tables use the session-local temp index map. A temp
+        // table must never see a same-named permanent table's indexes.
         if self.is_temp_table(session, table) {
-            return Vec::new();
+            let mut out: Vec<&Index> = self
+                .temp_indexes
+                .get(&session)
+                .map(|m| {
+                    m.values()
+                        .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, owns))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+            return out;
         }
         let mut out: Vec<&Index> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, own))
+            .filter(|ix| ix.def.table == table && index_visible(&ix.def, snap, owns))
             .collect();
         out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
         out
@@ -5269,7 +5806,9 @@ impl Database {
         let targets: Vec<(String, Vec<usize>)> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built or maintained).
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         for (name, cols) in targets {
@@ -5288,7 +5827,9 @@ impl Database {
         let targets: Vec<(String, Vec<usize>)> = self
             .indexes
             .values()
-            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0)
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built or maintained).
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         for (name, cols) in targets {
@@ -5313,19 +5854,24 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<String> {
-        let t = self.find_table(table, snap, own, session)?;
+        let t = self.find_table(table, snap, owns, session)?;
         // v0.22: temp tables have no backing indexes; enforce their
         // PRIMARY KEY / UNIQUE constraints with a session-local scan.
         if self.is_temp_table(session, table) {
             return self
-                .temp_scan_constraint(t, values, exclude_row_id, snap, own, None)
+                .temp_scan_constraint(t, values, exclude_row_id, snap, owns, None)
                 .map(|(name, _)| name);
         }
-        for ix in self.visible_indexes_for(table, snap, own, session) {
+        for ix in self.visible_indexes_for(table, snap, owns, session) {
             if !ix.def.unique {
+                continue;
+            }
+            // v0.88: expression / partial unique indexes are catalog-only
+            // (never built); nothing to check against.
+            if !ix.def.planner_usable {
                 continue;
             }
             let key = ix.key_for(values);
@@ -5342,10 +5888,10 @@ impl Database {
                 let alive = match t.row_pos(id) {
                     Some(pos) => {
                         let r = &t.rows[pos];
-                        if r.xmax == own {
+                        if owns.contains(&r.xmax) {
                             false // deleted by us: not a conflict
                         } else {
-                            r.xmin == own || row_visible(r, snap, own)
+                            owns.contains(&r.xmin) || row_visible(r, snap, owns)
                         }
                     }
                     None => false, // vacuumed away: cannot conflict
@@ -5370,7 +5916,7 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         only: Option<&str>,
     ) -> Option<(String, u64)> {
         let mut constraints: Vec<&UniqueDef> = t.uniques.iter().collect();
@@ -5392,10 +5938,10 @@ impl Database {
                 if Some(r.id) == exclude_row_id {
                     continue;
                 }
-                let alive = if r.xmax == own {
+                let alive = if owns.contains(&r.xmax) {
                     false // deleted by us: not a conflict
                 } else {
-                    r.xmin == own || row_visible(r, snap, own)
+                    owns.contains(&r.xmin) || row_visible(r, snap, owns)
                 };
                 if !alive {
                     continue;
@@ -5422,19 +5968,19 @@ impl Database {
         values: &[Value],
         exclude_row_id: Option<u64>,
         snap: &Snapshot,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<u64> {
-        let t = self.find_table(table, snap, own, session)?;
+        let t = self.find_table(table, snap, owns, session)?;
         // v0.22: temp tables have no backing indexes; match the arbiter
         // against the table's constraint definitions and scan.
         if self.is_temp_table(session, table) {
             return self
-                .temp_scan_constraint(t, values, exclude_row_id, snap, own, Some(index_name))
+                .temp_scan_constraint(t, values, exclude_row_id, snap, owns, Some(index_name))
                 .map(|(_, id)| id);
         }
         let ix = self
-            .visible_indexes_for(table, snap, own, session)
+            .visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .find(|ix| ix.def.name == index_name && ix.def.unique)?;
         let key = ix.key_for(values);
@@ -5449,10 +5995,10 @@ impl Database {
             let alive = match t.row_pos(id) {
                 Some(pos) => {
                     let r = &t.rows[pos];
-                    if r.xmax == own {
+                    if owns.contains(&r.xmax) {
                         false // deleted by us: not a conflict
                     } else {
-                        r.xmin == own || row_visible(r, snap, own)
+                        owns.contains(&r.xmin) || row_visible(r, snap, owns)
                     }
                 }
                 None => false, // vacuumed away: cannot conflict
@@ -5478,11 +6024,11 @@ impl Database {
         table: &str,
         values: &[Value],
         own_row_id: u64,
-        own: u64,
+        owns: &[u64],
         session: u64,
     ) -> Option<String> {
         // Fresh snapshot: everything committed as of now is visible.
-        // `own` is still in `active`; row_visible would accept our own
+        // `owns` are still in `active`; row_visible would accept our own
         // rows, so they are excluded explicitly by id below.
         let fresh = Snapshot {
             active: txns.active.iter().copied().collect(),
@@ -5493,9 +6039,14 @@ impl Database {
         if self.is_temp_table(session, table) {
             return None;
         }
-        let t = self.find_table(table, &fresh, own, session)?;
-        for ix in self.visible_indexes_for(table, &fresh, own, session) {
+        let t = self.find_table(table, &fresh, owns, session)?;
+        for ix in self.visible_indexes_for(table, &fresh, owns, session) {
             if !ix.def.unique {
+                continue;
+            }
+            // v0.88: expression / partial unique indexes are catalog-only
+            // (never built); nothing to check against.
+            if !ix.def.planner_usable {
                 continue;
             }
             let key = ix.key_for(values);
@@ -5513,7 +6064,7 @@ impl Database {
                     continue; // vacuumed away: cannot conflict
                 };
                 let r = &t.rows[pos];
-                if r.xmin != own && row_visible(r, &fresh, own) {
+                if !owns.contains(&r.xmin) && row_visible(r, &fresh, owns) {
                     return Some(ix.def.name.clone());
                 }
             }
@@ -5524,8 +6075,8 @@ impl Database {
 
 /// Index DDL visibility: like a table version, but definitions are stored
 /// flat (one live definition per name at a time — enforced at commit).
-fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
-    let created_ok = def.created_xmin == own
+pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bool {
+    let created_ok = owns.contains(&def.created_xmin)
         || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
     if !created_ok {
         return false;
@@ -5533,7 +6084,7 @@ fn index_visible(def: &IndexDef, snap: &Snapshot, own: u64) -> bool {
     if def.dropped_xmax == 0 {
         return true;
     }
-    if def.dropped_xmax == own {
+    if owns.contains(&def.dropped_xmax) {
         return false;
     }
     !(def.dropped_xmax < snap.next_xid && !snap.active.contains(&def.dropped_xmax))
@@ -5609,6 +6160,10 @@ pub struct Engine {
     /// (nextval/setval). Drained into `WriteOp::SeqAdvance` markers by the
     /// server after a successful statement, for commit-time WAL logging.
     pub seq_advanced: Vec<String>,
+    /// v0.98: session-local `lastval` state: session id -> most recent
+    /// `nextval` result in that session (any sequence). Like
+    /// `seq_currval`, kept for the session lifetime.
+    pub seq_lastval: HashMap<u64, i64>,
     /// v0.13: replication slots by name. Cluster-global, non-transactional;
     /// WAL-logged (ReplSlot* records) and checkpointed for durability.
     pub repl_slots: HashMap<String, ReplSlot>,
@@ -5637,6 +6192,7 @@ impl Engine {
             },
             seq_currval: HashMap::new(),
             seq_advanced: Vec::new(),
+            seq_lastval: HashMap::new(),
             // v0.13: replication slots.
             repl_slots: HashMap::new(),
             // v0.81: catalog epoch for parse-cache invalidation.
@@ -5788,11 +6344,28 @@ impl Engine {
     /// by the given dead main-table versions' toast flags. No-op when the
     /// table has no toast table or no dead version was toasted.
     fn vacuum_toast_chunks(&mut self, name: &str, dead: &[(u64, Row, Vec<u32>)]) {
-        let vids: Vec<u32> = dead
+        let mut vids: Vec<u32> = dead
             .iter()
             .flat_map(|(_, _, toast)| toast.iter().copied())
             .filter(|v| *v != 0)
             .collect();
+        if vids.is_empty() {
+            return;
+        }
+        // v1.05: a surviving row version may still reference a dead
+        // version's value id (unchanged toasted columns reuse the old
+        // id — PG19's toast_tuple_init TOASTCOL_IGNORE). Only reap ids
+        // no remaining row version references; anything else is live
+        // data, and pruning its toast_info would corrupt
+        // pg_column_compression for the surviving rows.
+        if let Some(versions) = self.db.tables.get(name) {
+            let live: std::collections::HashSet<u32> = versions
+                .iter()
+                .flat_map(|t| t.rows.iter())
+                .flat_map(|v| v.toast.iter().copied())
+                .collect();
+            vids.retain(|v| !live.contains(v));
+        }
         if vids.is_empty() {
             return;
         }
@@ -5838,6 +6411,20 @@ impl Engine {
         for (id, values) in &gone {
             self.db.index_remove_row(&toast_name, *id, values);
         }
+        // v1.05: prune the reaped value ids' provenance from the main
+        // table's `toast_info`. Stale entries are unreachable through
+        // live row flags, but they would otherwise accumulate forever
+        // (every UPDATE/DELETE mints fresh value ids); pruning keeps
+        // the metadata lifecycle tied to the chunks'. `vids` was already
+        // filtered above to ids no surviving version references, so a
+        // reused value's provenance survives vacuum with its chunks.
+        if let Some(versions) = self.db.tables.get_mut(name) {
+            for t in versions.iter_mut() {
+                for vid in &vids {
+                    t.toast_info.remove(vid);
+                }
+            }
+        }
     }
 
     /// Vacuum every table. Returns (table, removed) per table touched.
@@ -5852,6 +6439,36 @@ impl Engine {
         }
         out.sort();
         out
+    }
+
+    /// v0.85: vacuum a session-local temp table. Returns `Some(removed)`
+    /// when the session owns a temp table by that name, `None` otherwise
+    /// (the caller falls back to the permanent table). Temp tables are
+    /// single-version, so this removes versions dead to all snapshots;
+    /// index entries for removed versions are cleaned up like the
+    /// permanent-table path.
+    pub fn vacuum_temp_table(&mut self, session: u64, name: &str) -> Option<usize> {
+        let txns = &self.txns;
+        let mut dead: Vec<(u64, Row, Vec<u32>)> = Vec::new();
+        let removed;
+        {
+            let tmps = self.db.temp_tables.get_mut(&session)?;
+            let t = tmps.get_mut(name)?;
+            for v in t.rows.iter().filter(|v| version_dead_to_all(txns, v)) {
+                dead.push((v.id, v.values.clone(), v.toast.clone()));
+            }
+            let before = t.rows.len();
+            t.rows.retain(|v| !version_dead_to_all(txns, v));
+            removed = before - t.rows.len();
+            if removed > 0 {
+                t.rebuild_row_index();
+            }
+        }
+        // Index cleanup needs `&mut self`; the temp-table borrow ends above.
+        for (id, values, _) in &dead {
+            self.db.index_remove_row(name, *id, values);
+        }
+        Some(removed)
     }
 }
 
@@ -5877,23 +6494,34 @@ pub fn version_dead_to_all(txns: &TxnManager, v: &RowVersion) -> bool {
 }
 
 /// Row-version visibility for (`snap`, `own`).
-pub fn row_visible(v: &RowVersion, snap: &Snapshot, own: u64) -> bool {
-    let xmin_ok = v.xmin == own || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
+pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
+    // v1.21: `owns` is every xid owned by the reading transaction (top +
+    // sub-xids). A transaction sees its own sub-xid rows even when the
+    // snapshot predates the sub-xid allocation (RepeatableRead).
+    if owns.len() == 1 && v.xmin == 2 {
+        let bt = std::backtrace::Backtrace::capture();
+        let s = format!("{}", bt);
+        for line in s.lines().take(25) {
+            eprintln!("BT: {}", line);
+        }
+    }
+    let xmin_ok =
+        owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
     if !xmin_ok {
         return false;
     }
     if v.xmax == 0 {
         return true;
     }
-    if v.xmax == own {
+    if owns.contains(&v.xmax) {
         return false;
     }
     !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax))
 }
 
-/// Table-version visibility for (`snap`, `own`).
-pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
-    let created_ok = t.created_xmin == own
+/// Table-version visibility for (`snap`, `owns`).
+pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
+    let created_ok = owns.contains(&t.created_xmin)
         || (t.created_xmin < snap.next_xid && !snap.active.contains(&t.created_xmin));
     if !created_ok {
         return false;
@@ -5901,7 +6529,7 @@ pub fn table_visible(t: &Table, snap: &Snapshot, own: u64) -> bool {
     if t.dropped_xmax == 0 {
         return true;
     }
-    if t.dropped_xmax == own {
+    if owns.contains(&t.dropped_xmax) {
         return false;
     }
     !(t.dropped_xmax < snap.next_xid && !snap.active.contains(&t.dropped_xmax))
@@ -6310,12 +6938,55 @@ pub enum WriteOp {
         name: String,
         prev: Option<ShellType>,
     },
+    // --- v0.86: CREATE/DROP FUNCTION and CREATE/DROP OPERATOR.
+    // Functions/operators live in `Database::functions` /
+    // `Database::operators` (not the versioned catalog); the op
+    // carries the previous entry so undo restores it exactly.
+    // Committed DDL is WAL-logged and checkpointed.
+    CreateFunction {
+        name: String,
+        /// v0.87: the specific overload that was added (for precise undo).
+        added: FuncDef,
+        prev: Option<FuncDef>,
+    },
+    DropFunction {
+        name: String,
+        prev: Option<FuncDef>,
+    },
+    CreateOperator {
+        name: String,
+        prev: Vec<OperDef>,
+    },
+    DropOperator {
+        name: String,
+        prev: Vec<OperDef>,
+    },
+    // --- v1.38: CREATE CAST. Casts live in `Database::casts` (not the
+    // versioned catalog and not WAL-logged — see the field docs); the
+    // op carries the previous entry so statement-undo / ROLLBACK
+    // restores it exactly.
+    CreateCast {
+        src: String,
+        dst: String,
+        prev: Option<CastDef>,
+    },
     // --- v0.8: index DDL. DropIndex carries the whole index so undo can
     // restore the definition and its entries exactly.
     CreateIndex {
         name: String,
     },
     DropIndex {
+        name: String,
+        index: Index,
+    },
+    /// v0.87: temp index DDL (session-local). Like temp tables, these are
+    /// never WAL-logged and vanish with the session.
+    CreateTempIndex {
+        session: u64,
+        name: String,
+    },
+    DropTempIndex {
+        session: u64,
         name: String,
         index: Index,
     },
@@ -6372,23 +7043,90 @@ pub enum WriteOp {
     DbAcl {
         prev: Vec<AclEntry>,
     },
+    // --- v1.05: the lazy toast-table safety net links the new toast
+    // table OID onto the main table (`pg_class.reltoastrelid`). The
+    // link is a catalog mutation: it is staged as a write op so
+    // ROLLBACK restores the previous link and the WAL replays it
+    // (`WalRecord::SetToastRelid`, RGSWAL19). `prev` is the link the
+    // table had before (0 when the table had no toast table).
+    SetToastRelid {
+        table: String,
+        toast_relid: u32,
+        prev: u32,
+    },
 }
 
 /// Undo a single write op. Each undo is conditional on the version still
 /// being ours: a concurrent transaction may have overwritten xmax after
 /// us (last-writer-wins, no row locking in v0.5), in which case their
 /// op owns the version now and ours must not clobber it.
-pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
+///
+/// v1.05: drop `toast_info` entries for value ids that no row version
+/// of `table` references anymore. Called when rolling back an INSERT or
+/// UPDATE: the aborted row version (and its chunks) are physically
+/// removed, and without this the freshly minted value ids would linger
+/// in `toast_info` as unreachable orphans (commit-time vacuum only sees
+/// dead versions, never aborted ones). A vid referenced by ANY remaining
+/// version — live, dead, or still-xmax'd — is kept; vacuum reaps the
+/// dead ones' ids later.
+fn prune_orphan_toast_info(eng: &mut Engine, table: &str, vids: &[u32]) {
+    let mut uniq: Vec<u32> = vids.to_vec();
+    uniq.sort_unstable();
+    uniq.dedup();
+    uniq.retain(|v| *v != 0);
+    if uniq.is_empty() {
+        return;
+    }
+    let Some(versions) = eng.db.tables.get(table) else {
+        return;
+    };
+    // Toast tables never carry toast_info; only main tables do.
+    if versions.iter().all(|t| t.toast_info.is_empty()) {
+        return;
+    }
+    let referenced: std::collections::HashSet<u32> = versions
+        .iter()
+        .flat_map(|t| t.rows.iter())
+        .flat_map(|v| v.toast.iter().copied())
+        .collect();
+    let orphans: Vec<u32> = uniq
+        .into_iter()
+        .filter(|v| !referenced.contains(v))
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    if let Some(versions) = eng.db.tables.get_mut(table) {
+        for t in versions.iter_mut() {
+            for v in &orphans {
+                t.toast_info.remove(v);
+            }
+        }
+    }
+}
+
+pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
     match op {
         WriteOp::InsertRow { table, row_id } => {
             // v0.22: the row may live in a session-local temp table
             // (`remove_own_version` searches both). Only permanent-table
             // rows have global index entries to clean up.
-            if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, own) {
+            // v1.05: capture the toast flags before removal so the
+            // orphan-metadata prune below knows which value ids died
+            // with this version.
+            let doomed: Vec<u32> = eng
+                .db
+                .find_row_version(*row_id)
+                .map(|v| v.toast.clone())
+                .unwrap_or_default();
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*row_id, owns) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *row_id, &values);
                 }
             }
+            // v1.05: an aborted INSERT must not leave its fresh value
+            // ids in toast_info as orphans.
+            prune_orphan_toast_info(eng, table, &doomed);
         }
         WriteOp::DeleteRow {
             table: _,
@@ -6396,7 +7134,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
         } => {
             if let Some(v) = eng.db.find_row_version_mut(*row_id) {
-                if v.xmax == own {
+                if owns.contains(&v.xmax) {
                     v.xmax = *prev_xmax;
                 }
             }
@@ -6413,20 +7151,31 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             prev_xmax,
             old_values: _,
         } => {
-            if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, own) {
+            // v1.05: capture the new version's toast flags before
+            // removal for the orphan-metadata prune below.
+            let doomed: Vec<u32> = eng
+                .db
+                .find_row_version(*new_id)
+                .map(|v| v.toast.clone())
+                .unwrap_or_default();
+            if let Some((values, is_temp)) = eng.db.remove_own_version(*new_id, owns) {
                 if !is_temp {
                     eng.db.index_remove_row(table, *new_id, &values);
                 }
             }
             if let Some(v) = eng.db.find_row_version_mut(*old_id) {
-                if v.xmax == own {
+                if owns.contains(&v.xmax) {
                     v.xmax = *prev_xmax;
                 }
             }
+            // v1.05: an aborted UPDATE must not leave its fresh value
+            // ids in toast_info as orphans. (A reused old id is still
+            // referenced by the restored old version, so it is kept.)
+            prune_orphan_toast_info(eng, table, &doomed);
         }
         WriteOp::CreateTable { name } => {
             if let Some(versions) = eng.db.tables.get_mut(name) {
-                if let Some(pos) = versions.iter().position(|t| t.created_xmin == own) {
+                if let Some(pos) = versions.iter().position(|t| owns.contains(&t.created_xmin)) {
                     versions.swap_remove(pos);
                 }
                 if versions.is_empty() {
@@ -6436,7 +7185,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::DropTable { name, prev_xmax } => {
             if let Some(versions) = eng.db.tables.get_mut(name) {
-                if let Some(t) = versions.iter_mut().find(|t| t.dropped_xmax == own) {
+                if let Some(t) = versions.iter_mut().find(|t| owns.contains(&t.dropped_xmax)) {
                     t.dropped_xmax = *prev_xmax;
                 }
             }
@@ -6500,6 +7249,60 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 eng.db.types.remove(name);
             }
         },
+        // --- v0.86: function/operator DDL undos. Restore the previous
+        // entry, or remove the name when there was none.
+        // v0.87: function DDL undo is overload-aware. `prev` is the
+        // specific overload that was replaced (CREATE OR REPLACE) or
+        // dropped (DROP).
+        WriteOp::CreateFunction { name, added, prev } => {
+            let overloads = eng.db.functions.entry(name.clone()).or_default();
+            // Remove the specific overload that was added, by signature.
+            overloads.retain(|e| {
+                !(e.arg_types.len() == added.arg_types.len()
+                    && e.arg_types
+                        .iter()
+                        .zip(added.arg_types.iter())
+                        .all(|(a, b)| a == b))
+            });
+            // Restore the replaced overload, if any.
+            if let Some(f) = prev {
+                overloads.push(f.clone());
+            }
+            if overloads.is_empty() {
+                eng.db.functions.remove(name);
+            }
+        }
+        WriteOp::DropFunction { name, prev } => match prev {
+            Some(f) => {
+                // Re-insert the dropped overload.
+                eng.db
+                    .functions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(f.clone());
+            }
+            None => {}
+        },
+        WriteOp::CreateOperator { name, prev } | WriteOp::DropOperator { name, prev } => {
+            if prev.is_empty() {
+                eng.db.operators.remove(name);
+            } else {
+                eng.db.operators.insert(name.clone(), prev.clone());
+            }
+        }
+        // --- v1.38: cast DDL undo. Restore the previous entry, or
+        // remove the key when there was none.
+        WriteOp::CreateCast { src, dst, prev } => {
+            let key = (src.clone(), dst.clone());
+            match prev {
+                Some(def) => {
+                    eng.db.casts.insert(key, *def);
+                }
+                None => {
+                    eng.db.casts.remove(&key);
+                }
+            }
+        }
         WriteOp::CreateIndex { name } => {
             // Undo a CREATE INDEX: drop the definition (and its entries)
             // iff it is still ours — a concurrent DROP INDEX of the same
@@ -6508,7 +7311,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .db
                 .indexes
                 .get(name)
-                .map(|ix| ix.def.created_xmin == own)
+                .map(|ix| owns.contains(&ix.def.created_xmin))
                 .unwrap_or(false);
             if ours {
                 eng.db.indexes.remove(name);
@@ -6521,10 +7324,46 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .db
                 .indexes
                 .get(name)
-                .map(|ix| ix.def.dropped_xmax == own)
+                .map(|ix| owns.contains(&ix.def.dropped_xmax))
                 .unwrap_or(false);
             if ours {
                 eng.db.indexes.insert(name.clone(), index.clone());
+            }
+        }
+        WriteOp::CreateTempIndex { session, name } => {
+            // Undo a CREATE INDEX on a temp table: drop iff still ours.
+            let ours = eng
+                .db
+                .temp_indexes
+                .get(session)
+                .and_then(|m| m.get(name))
+                .map(|ix| owns.contains(&ix.def.created_xmin))
+                .unwrap_or(false);
+            if ours {
+                if let Some(m) = eng.db.temp_indexes.get_mut(session) {
+                    m.remove(name);
+                }
+            }
+        }
+        WriteOp::DropTempIndex {
+            session,
+            name,
+            index,
+        } => {
+            // Undo a DROP INDEX on a temp table: restore iff still ours.
+            let ours = eng
+                .db
+                .temp_indexes
+                .get(session)
+                .and_then(|m| m.get(name))
+                .map(|ix| owns.contains(&ix.def.dropped_xmax))
+                .unwrap_or(false);
+            if ours {
+                eng.db
+                    .temp_indexes
+                    .entry(*session)
+                    .or_default()
+                    .insert(name.clone(), index.clone());
             }
         }
         // --- v0.9 undos ---
@@ -6538,7 +7377,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
             // then restore the previous table under its original name.
             let target = renamed_to.as_deref().unwrap_or(name);
             if let Some(versions) = eng.db.tables.get_mut(target) {
-                versions.retain(|t| t.created_xmin != own);
+                versions.retain(|t| !owns.contains(&t.created_xmin));
                 if versions.is_empty() {
                     eng.db.tables.remove(target);
                 }
@@ -6562,7 +7401,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 for ix in eng.db.indexes.values_mut() {
                     let ours = ix.def.table == *name
                         || renamed_to.as_deref().is_some_and(|rt| ix.def.table == rt);
-                    if ours && ix.def.dropped_xmax == 0 {
+                    // v0.88: expression / partial indexes are catalog-only
+                    // (never built); their trees are always empty.
+                    if ours && ix.def.dropped_xmax == 0 && ix.def.planner_usable {
                         ix.tree.clear();
                         for (values, id) in &rows {
                             let key = ix.key_for(values);
@@ -6574,7 +7415,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::CreateView { name } => {
             if let Some(versions) = eng.db.views.get_mut(name) {
-                versions.retain(|v| v.created_xmin != own);
+                versions.retain(|v| !owns.contains(&v.created_xmin));
                 if versions.is_empty() {
                     eng.db.views.remove(name);
                 }
@@ -6586,8 +7427,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .views
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|v| v.created_xmin == view.created_xmin && v.dropped_xmax == own)
+                    vs.iter().any(|v| {
+                        v.created_xmin == view.created_xmin && owns.contains(&v.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -6605,7 +7447,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         }
         WriteOp::CreateSequence { name } => {
             if let Some(versions) = eng.db.sequences.get_mut(name) {
-                versions.retain(|s| s.created_xmin != own);
+                versions.retain(|s| !owns.contains(&s.created_xmin));
                 if versions.is_empty() {
                     eng.db.sequences.remove(name);
                 }
@@ -6617,8 +7459,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .sequences
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|s| s.created_xmin == seq.created_xmin && s.dropped_xmax == own)
+                    vs.iter().any(|s| {
+                        s.created_xmin == seq.created_xmin && owns.contains(&s.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -6656,7 +7499,7 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         // being ours, like the table/version cases above.
         WriteOp::CreateRole { name } => {
             if let Some(versions) = eng.db.roles.get_mut(name) {
-                versions.retain(|r| r.created_xmin != own);
+                versions.retain(|r| !owns.contains(&r.created_xmin));
                 if versions.is_empty() {
                     eng.db.roles.remove(name);
                 }
@@ -6668,8 +7511,9 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
                 .roles
                 .get(name)
                 .map(|vs| {
-                    vs.iter()
-                        .any(|r| r.created_xmin == prev.created_xmin && r.dropped_xmax == own)
+                    vs.iter().any(|r| {
+                        r.created_xmin == prev.created_xmin && owns.contains(&r.dropped_xmax)
+                    })
                 })
                 .unwrap_or(false);
             if ours {
@@ -6698,12 +7542,51 @@ pub fn undo_write_op(eng: &mut Engine, own: u64, op: &WriteOp) {
         WriteOp::DbAcl { prev } => {
             eng.db.db_acl = prev.clone();
         }
+        // --- v1.05: undo the lazy reltoastrelid link, but only if the
+        // version still carries the value we set (conditional like the
+        // other undos; only the lazy path writes this field, so in
+        // practice the guard always holds).
+        WriteOp::SetToastRelid {
+            table,
+            toast_relid,
+            prev,
+        } => {
+            if let Some(versions) = eng.db.tables.get_mut(table) {
+                for t in versions.iter_mut() {
+                    if t.toast_relid == *toast_relid {
+                        t.toast_relid = *prev;
+                    }
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.94: `Numeric::to_f64` is correctly rounded (PG19 numeric_float8
+    /// does numeric_out -> float8in/strtod). The old
+    /// `unscaled as f64 * 10f64.powi(-scale)` double-rounded, so
+    /// 1.000000000000000000001 became 0.9999999999999999 instead of 1.0.
+    #[test]
+    fn numeric_to_f64_correctly_rounded() {
+        let n = Numeric::parse("1.000000000000000000001").unwrap();
+        assert_eq!(n.to_f64(), 1.0);
+        let n = Numeric::parse("0.1").unwrap();
+        assert_eq!(n.to_f64(), 0.1);
+        let n = Numeric::parse("123456789012345678901234567890").unwrap();
+        assert_eq!(n.to_f64(), 1.2345678901234568e29);
+        assert_eq!(Numeric::parse("NaN").unwrap().to_f64().is_nan(), true);
+        assert_eq!(Numeric::parse("Infinity").unwrap().to_f64(), f64::INFINITY);
+        assert_eq!(
+            Numeric::parse("-Infinity").unwrap().to_f64(),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(Numeric::parse("0").unwrap().to_f64(), 0.0);
+        assert_eq!(Numeric::parse("-0.0").unwrap().to_f64(), 0.0);
+    }
 
     /// v0.57: `namein` truncates at 63 bytes (NAMEDATALEN-1) without
     /// error, staying on a UTF-8 char boundary.
@@ -6798,7 +7681,7 @@ mod tests {
         let eng = engine_with_table();
         let v = &eng.db.tables["t"][0].rows[0];
         // xid 1 committed (below next_xid=10, not active).
-        assert!(row_visible(v, &snap(&[], 10), 99));
+        assert!(row_visible(v, &snap(&[], 10), &[99]));
     }
 
     #[test]
@@ -6807,9 +7690,9 @@ mod tests {
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmin = 7;
         // xid 7 still active: invisible to everyone else...
-        assert!(!row_visible(&v, &snap(&[7], 10), 99));
+        assert!(!row_visible(&v, &snap(&[7], 10), &[99]));
         // ...but visible to its owner.
-        assert!(row_visible(&v, &snap(&[7], 10), 7));
+        assert!(row_visible(&v, &snap(&[7], 10), &[7]));
     }
 
     #[test]
@@ -6817,11 +7700,11 @@ mod tests {
         let eng = engine_with_table();
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmax = 8; // deleter still active: delete not yet visible
-        assert!(row_visible(&v, &snap(&[8], 10), 99));
+        assert!(row_visible(&v, &snap(&[8], 10), &[99]));
         // Deleter committed (gone from active): version invisible.
-        assert!(!row_visible(&v, &snap(&[], 10), 99));
+        assert!(!row_visible(&v, &snap(&[], 10), &[99]));
         // But a snapshot taken while the deleter was active still sees it.
-        assert!(row_visible(&v, &snap(&[8], 10), 99));
+        assert!(row_visible(&v, &snap(&[8], 10), &[99]));
     }
 
     #[test]
@@ -6829,7 +7712,7 @@ mod tests {
         let eng = engine_with_table();
         let mut v = eng.db.tables["t"][0].rows[0].clone();
         v.xmax = 7;
-        assert!(!row_visible(&v, &snap(&[7], 10), 7));
+        assert!(!row_visible(&v, &snap(&[7], 10), &[7]));
     }
 
     #[test]
@@ -6885,7 +7768,7 @@ mod tests {
         });
         undo_write_op(
             &mut eng,
-            7,
+            &[7],
             &WriteOp::InsertRow {
                 table: "t".to_string(),
                 row_id: 9,
@@ -6905,11 +7788,11 @@ mod tests {
         };
         // Someone else overwrote xmax after us: our undo must not clobber.
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = 8;
-        undo_write_op(&mut eng, 7, &op);
+        undo_write_op(&mut eng, &[7], &op);
         assert_eq!(eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax, 8);
         // Still ours: restore.
         eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax = 7;
-        undo_write_op(&mut eng, 7, &op);
+        undo_write_op(&mut eng, &[7], &op);
         assert_eq!(eng.db.tables.get_mut("t").unwrap()[0].rows[0].xmax, 0);
     }
 
@@ -7073,6 +7956,216 @@ mod tests {
         let diff = a.sub(&b);
         let tiny = BigDec::parse_decimal("0.0000000000001").unwrap();
         assert_eq!(diff.cmp(&tiny), Ordering::Equal);
+    }
+
+    // --- v1.05: TOAST lifecycle ---
+    #[test]
+    fn v105_rollback_prunes_orphan_toast_info() {
+        // Rolling back an INSERT removes the row and its chunks; the
+        // fresh value id must not linger in toast_info as an orphan.
+        // A value id still referenced by a surviving version is kept.
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        for vid in [5u32, 6u32] {
+            t.toast_info.insert(
+                vid,
+                ToastInfo {
+                    compressed: false,
+                    method: ToastCompression::Pglz,
+                },
+            );
+        }
+        // Live version referencing vid 6.
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("live".into())]),
+            xmin: 1,
+            xmax: 0,
+            toast: vec![6],
+        });
+        // Aborted insert's version referencing vid 5 (xmin = our xid).
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("doomed".into())]),
+            xmin: 9,
+            xmax: 0,
+            toast: vec![5],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        undo_write_op(
+            &mut eng,
+            &[9],
+            &WriteOp::InsertRow {
+                table: "t".into(),
+                row_id: 2,
+            },
+        );
+        let t = &eng.db.tables["t"][0];
+        assert_eq!(t.rows.len(), 1);
+        assert!(!t.toast_info.contains_key(&5), "orphan vid 5 pruned");
+        assert!(t.toast_info.contains_key(&6), "live vid 6 kept");
+    }
+
+    #[test]
+    fn v105_rollback_update_keeps_reused_vid_info() {
+        // Rolling back an UPDATE that reused the old value id (unchanged
+        // column) must keep that id's toast_info: the restored old
+        // version still references it.
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        t.toast_info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: ToastCompression::Pglz,
+            },
+        );
+        // Old version (xmax'd by our update), new version (reused vid).
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("v".into())]),
+            xmin: 1,
+            xmax: 9,
+            toast: vec![7],
+        });
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("v".into())]),
+            xmin: 9,
+            xmax: 0,
+            toast: vec![7],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        undo_write_op(
+            &mut eng,
+            &[9],
+            &WriteOp::UpdateRow {
+                table: "t".into(),
+                old_id: 1,
+                new_id: 2,
+                prev_xmax: 0,
+                old_values: Row::new(vec![Value::Text("v".into())]),
+            },
+        );
+        let t = &eng.db.tables["t"][0];
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].xmax, 0);
+        assert!(t.toast_info.contains_key(&7), "reused vid 7 kept");
+    }
+
+    #[test]
+    fn v105_undo_set_toast_relid_restores_prev() {
+        // Undoing the lazy reltoastrelid link restores the previous
+        // link; a version that no longer carries our value is left
+        // alone (conditional like the other undos).
+        let mut eng = Engine::new();
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.toast_relid = 16385;
+        eng.db.tables.insert("t".into(), vec![t]);
+        let op = WriteOp::SetToastRelid {
+            table: "t".into(),
+            toast_relid: 16385,
+            prev: 0,
+        };
+        undo_write_op(&mut eng, &[9], &op);
+        assert_eq!(eng.db.tables["t"][0].toast_relid, 0);
+        // Conditional: a changed link is not clobbered.
+        eng.db.tables.get_mut("t").unwrap()[0].toast_relid = 17000;
+        undo_write_op(&mut eng, &[9], &op);
+        assert_eq!(eng.db.tables["t"][0].toast_relid, 17000);
+    }
+
+    #[test]
+    fn v105_vacuum_prunes_toast_info_of_reaped_chunks() {
+        // vacuum_toast_chunks removes the dead versions' chunk rows AND
+        // prunes their value ids from the main table's toast_info, so
+        // the metadata lifecycle tracks the chunks'.
+        let mut eng = Engine::new();
+        // Main table with a toast table linked.
+        let mut t = Table::new(vec![("a".to_string(), ColType::Text)], 1);
+        t.oid = 16384;
+        t.toast_relid = 16385;
+        t.toast_info.insert(
+            5u32,
+            ToastInfo {
+                compressed: false,
+                method: ToastCompression::Pglz,
+            },
+        );
+        t.toast_info.insert(
+            6u32,
+            ToastInfo {
+                compressed: true,
+                method: ToastCompression::Pglz,
+            },
+        );
+        // Dead version (xmax committed, no active snapshots) toasted
+        // with vid 5; live version toasted with vid 6.
+        t.push_version(RowVersion {
+            id: 1,
+            values: Row::new(vec![Value::Text("old".into())]),
+            xmin: 1,
+            xmax: 8,
+            toast: vec![5],
+        });
+        t.push_version(RowVersion {
+            id: 2,
+            values: Row::new(vec![Value::Text("new".into())]),
+            xmin: 8,
+            xmax: 0,
+            toast: vec![6],
+        });
+        eng.db.tables.insert("t".into(), vec![t]);
+        // Toast table with chunks for both vids.
+        let mut tt = Table::new(
+            vec![
+                ("chunk_id".to_string(), ColType::Int),
+                ("chunk_seq".to_string(), ColType::Int),
+                ("chunk_data".to_string(), ColType::Bytea),
+            ],
+            1,
+        );
+        tt.oid = 16385;
+        for (cid, vid) in [(10u64, 5i64), (11u64, 6i64)] {
+            tt.push_version(RowVersion {
+                id: cid,
+                values: Row::new(vec![
+                    Value::Int(vid),
+                    Value::Int(0),
+                    Value::Bytea(vec![1, 2, 3]),
+                ]),
+                xmin: 1,
+                xmax: 0,
+                toast: Vec::new(),
+            });
+        }
+        eng.db
+            .tables
+            .insert("pg_toast.pg_toast_16384".into(), vec![tt]);
+        eng.txns.next_xid = 20;
+
+        // table_name_by_oid must resolve 16385 -> the toast table name.
+        let n = eng.vacuum_table("t");
+        assert_eq!(n, 1);
+        // Dead version gone; its chunk gone; live chunk kept.
+        let tt = &eng.db.tables["pg_toast.pg_toast_16384"][0];
+        let vids: Vec<i64> = tt
+            .rows
+            .iter()
+            .map(|r| match r.values.0[0] {
+                Value::Int(v) => v,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(vids, vec![6]);
+        // toast_info pruned for the reaped vid only.
+        let t = &eng.db.tables["t"][0];
+        assert!(!t.toast_info.contains_key(&5));
+        assert!(t.toast_info.contains_key(&6));
     }
 }
 
@@ -8088,6 +9181,206 @@ mod v067_numeric_edge_tests {
         // Zero dividend.
         let (q, r) = BigUint::zero().div_rem_small(7);
         assert!(q.is_zero() && r == 0);
+    }
+
+    #[test]
+    fn div_rem_knuth_invariant() {
+        // v0.90: Knuth Algorithm D differential test. q*v + r == u and
+        // r < v uniquely determine (q, r), so checking the invariant on
+        // random multi-limb inputs is a complete correctness proof
+        // (no reference implementation needed).
+        fn xorshift64(x: &mut u64) -> u64 {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x
+        }
+        let mut x: u64 = 0xB7E151628AED2A6B;
+        for _ in 0..300 {
+            let mut u = BigUint::zero();
+            for _ in 0..(xorshift64(&mut x) % 6 + 1) {
+                u.limbs.push((xorshift64(&mut x) % 1_000_000_000) as u32);
+            }
+            u.normalize();
+            if u.is_zero() {
+                u.limbs.push(1);
+            }
+            let mut v = BigUint::zero();
+            for _ in 0..(xorshift64(&mut x) % 6 + 1) {
+                v.limbs.push((xorshift64(&mut x) % 1_000_000_000) as u32);
+            }
+            v.normalize();
+            if v.is_zero() {
+                v.limbs.push(1);
+            }
+            let (q, r) = u.div_rem(&v);
+            // Invariant 1: r < v.
+            assert!(
+                r.cmp(&v) == std::cmp::Ordering::Less,
+                "remainder >= divisor: u={} v={}",
+                u.to_decimal_string(),
+                v.to_decimal_string()
+            );
+            // Invariant 2: q * v + r == u.
+            let mut check = q.mul(&v);
+            check.add_assign(&r);
+            assert_eq!(
+                check,
+                u,
+                "q*v+r != u: u={} v={}",
+                u.to_decimal_string(),
+                v.to_decimal_string()
+            );
+        }
+        // Edge cases: u < v, u == v, exact division, powers of 10,
+        // divisor with top limb < B/2 (forces d > 1 normalization),
+        // single-limb fast path vs general path agreement.
+        let cases = [
+            ("1", "999999999999999999"),
+            (
+                "123456789012345678901234567890",
+                "123456789012345678901234567890",
+            ),
+            ("1000000000000000000000000000000", "3"),
+            (
+                "999999999999999999999999999999",
+                "999999999999999999999999999999",
+            ),
+            ("123456789", "987654321987654321"),
+            ("1000000000000000000", "999999999"),
+            ("555555555555555555555555555", "777777777777777777"),
+            ("100000000000000000000000000000000000000", "1000000007"),
+            ("18446744073709551615", "4294967297"),
+            (
+                "99999999999999999999999999999999999999",
+                "1000000000000000003",
+            ),
+        ];
+        for (us, vs) in cases {
+            let u = BigUint::from_decimal_str(us);
+            let v = BigUint::from_decimal_str(vs);
+            let (q, r) = u.div_rem(&v);
+            assert!(
+                r.cmp(&v) == std::cmp::Ordering::Less,
+                "remainder >= divisor for {us}/{vs}"
+            );
+            let mut check = q.mul(&v);
+            check.add_assign(&r);
+            assert_eq!(check, u, "q*v+r != u for {us}/{vs}");
+        }
+        // Cross-check against Python-style big-int truth for a few
+        // hand-computed values.
+        let (q, r) = BigUint::from_decimal_str("1000000000000000000000000000000")
+            .div_rem(&BigUint::from_decimal_str("3"));
+        assert_eq!(q.to_decimal_string(), "333333333333333333333333333333");
+        assert_eq!(r.to_decimal_string(), "1");
+        let (q, r) = BigUint::from_decimal_str("123456789012345678901234567890")
+            .div_rem(&BigUint::from_decimal_str("987654321"));
+        assert_eq!(q.to_decimal_string(), "124999998873437499901");
+        assert_eq!(r.to_decimal_string(), "574845669");
+    }
+
+    /// v0.90: test-only copy of the pre-v0.90 bit-by-bit `div_rem`
+    /// (binary long division). Used for differential testing against
+    /// the Knuth Algorithm D replacement.
+    fn div_rem_bitwise_old(u: &BigUint, v: &BigUint) -> (BigUint, BigUint) {
+        debug_assert!(!v.is_zero());
+        if u.cmp(v) == std::cmp::Ordering::Less {
+            return (BigUint::zero(), u.clone());
+        }
+        // Dividend bits, LSB-first: bit = limbs[0] & 1, then halve.
+        let mut tmp = u.clone();
+        let mut bits_lsb = Vec::new();
+        while !tmp.is_zero() {
+            bits_lsb.push(tmp.limbs[0] & 1 == 1);
+            tmp.div_small_assign(2);
+        }
+        let mut q = BigUint::zero();
+        let mut r = BigUint::zero();
+        for &b in bits_lsb.iter().rev() {
+            r.mul_small_assign(2);
+            if b {
+                r.add_small_assign(1);
+            }
+            q.mul_small_assign(2);
+            if r.cmp(v) != std::cmp::Ordering::Less {
+                r.sub_assign(v);
+                q.add_small_assign(1);
+            }
+        }
+        (q, r)
+    }
+
+    #[test]
+    fn div_rem_knuth_matches_bitwise_differential() {
+        // v0.90: differential test — the new Knuth Algorithm D
+        // implementation must produce bit-identical (q, r) to the old
+        // bit-by-bit algorithm on random multi-limb inputs, including
+        // cases that exercise qhat correction and the add-back step.
+        fn xorshift64(x: &mut u64) -> u64 {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x
+        }
+        let mut x: u64 = 0xDEADBEEFCAFEBABE;
+        for i in 0..200 {
+            // Vary limb counts to hit normalization (d>1) and
+            // qhat-correction paths.
+            let n_limbs = (xorshift64(&mut x) % 5 + 1) as usize;
+            let m_limbs = (xorshift64(&mut x) % 4 + 1) as usize;
+            let mut u = BigUint::zero();
+            for _ in 0..n_limbs {
+                // Include edge values: 0, B-1, and values that force
+                // qhat to be too large.
+                let limb = match xorshift64(&mut x) % 10 {
+                    0 => 0,
+                    1 => 999_999_999,
+                    2 => 999_999_998, // forces qhat correction
+                    _ => (xorshift64(&mut x) % 1_000_000_000) as u32,
+                };
+                u.limbs.push(limb);
+            }
+            u.normalize();
+            if u.is_zero() {
+                u.limbs.push(1);
+            }
+            let mut v = BigUint::zero();
+            for _ in 0..m_limbs {
+                let limb = match xorshift64(&mut x) % 10 {
+                    0 => 1, // small divisor
+                    1 => 999_999_999,
+                    2 => 500_000_000, // top limb < B/2, forces d>1
+                    _ => (xorshift64(&mut x) % 1_000_000_000) as u32,
+                };
+                v.limbs.push(limb);
+            }
+            v.normalize();
+            if v.is_zero() {
+                v.limbs.push(1);
+            }
+            // Ensure u >= v for interesting cases (else both return
+            // (0, u) trivially).
+            if u.cmp(&v) == std::cmp::Ordering::Less {
+                std::mem::swap(&mut u, &mut v);
+            }
+            let (q_new, r_new) = u.div_rem(&v);
+            let (q_old, r_old) = div_rem_bitwise_old(&u, &v);
+            assert_eq!(
+                q_new,
+                q_old,
+                "quotient mismatch on iter {i}: u={} v={}",
+                u.to_decimal_string(),
+                v.to_decimal_string()
+            );
+            assert_eq!(
+                r_new,
+                r_old,
+                "remainder mismatch on iter {i}: u={} v={}",
+                u.to_decimal_string(),
+                v.to_decimal_string()
+            );
+        }
     }
 
     #[test]

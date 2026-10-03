@@ -73,6 +73,16 @@ pub(crate) struct Session {
     /// v0.11: authenticated role name (lowercased). Every statement's
     /// privilege checks key off this.
     role: String,
+    /// v1.07: session user at authentication time (lowercased). `SET
+    /// ROLE` changes `role`; `RESET ROLE` / `SET ROLE NONE` restore it
+    /// (PG19: the role GUC resets to the session user).
+    session_user: String,
+    /// v1.07: validated-but-unmodeled session GUCs (planner knobs like
+    /// `enable_seqscan`, formatting knobs like `extra_float_digits`).
+    /// Values are PG19-validated and stored in canonical text form;
+    /// absence means the compiled default (see `guc_default`). The
+    /// transaction GUC stack reverts in-transaction changes, like PG.
+    gucs: HashMap<String, String>,
     stmts: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
     /// v0.74: SQL-level `PREPARE name AS ...` statements, separate from
@@ -102,6 +112,14 @@ pub(crate) struct Session {
     /// compressor TOAST uses for columns without an explicit
     /// `COMPRESSION` method. Default is pglz.
     default_toast_compression: crate::storage::ToastCompression,
+    /// v1.00: notices (e.g. `RAISE NOTICE` from trigger bodies)
+    /// pending delivery to the client. Execution paths append here;
+    /// the protocol handlers drain and send them as NoticeResponse
+    /// ('N') before the completion tag.
+    pending_notices: Vec<String>,
+    /// v1.04: WARNING-severity notices pending delivery (see
+    /// `queue_warning`); drained alongside `pending_notices`.
+    pending_warnings: Vec<String>,
     /// v0.81: parsed-AST cache for the extended protocol. Keyed by the
     /// exact query text of a Parse message; each entry records the
     /// catalog epoch it was parsed under. A hit (epoch matches) skips
@@ -158,6 +176,11 @@ struct Txn {
     deferrable: Option<bool>,
     /// Pinned at the first data statement for RR/SERIALIZABLE.
     snapshot: Option<Snapshot>,
+    /// v1.07: PG19's `FirstSnapshotSet` — set when the first statement
+    /// snapshot is taken inside this transaction. `SET TRANSACTION`'s
+    /// check hooks forbid characteristic changes afterwards (and in a
+    /// subtransaction), like PG19.
+    first_snapshot_set: bool,
     /// Uncommitted writes, in order: the undo log (abort / ROLLBACK TO)
     /// and the commit-time WAL source.
     writes: Vec<WriteOp>,
@@ -165,11 +188,37 @@ struct Txn {
     /// back to a savepoint undoes staged writes AND releases the row locks
     /// taken after it, like Postgres.
     savepoints: Vec<(String, usize, usize)>,
+    /// v1.21: subtransaction xid scopes for PG19 savepoint xmin semantics,
+    /// in lockstep with `savepoints` (one entry per savepoint). Each scope
+    /// gets its own xid (eagerly via `alloc_xid` at SAVEPOINT); writes made
+    /// inside the savepoint stamp this xid as their xmin, like PG19's
+    /// `GetCurrentTransactionId` returning the subtransaction's xid.
+    /// ROLLBACK TO SAVEPOINT replaces the named scope with a fresh xid
+    /// (PG19 aborts the subtransaction and restarts it with the same name),
+    /// so post-rollback writes get a NEW xid. RELEASE drops the scope.
+    /// Sub-xids are deliberately NOT registered in `txns.active` (documented
+    /// v1.21: sub-xid stack for the current savepoint scope, in lockstep
+    /// with `savepoints`. The innermost xid is stamped on new row
+    /// versions (PG19 `GetCurrentTransactionId`). Truncated on RELEASE
+    /// and ROLLBACK TO.
+    sub_xids: Vec<u64>,
+    /// v1.21: every sub-xid ever allocated by this transaction, in
+    /// allocation order. Never truncated until transaction end — a
+    /// released savepoint's rows remain visible to (and undoable by)
+    /// the transaction, so their xids must stay in the ownership set.
+    owned_xids: Vec<u64>,
     /// v0.16: cursor marks in lockstep with `savepoints`.
     cursor_marks: Vec<CursorMark>,
     /// A failed statement aborts the transaction (Postgres semantics):
     /// only ROLLBACK / ROLLBACK TO / COMMIT are accepted afterwards.
     failed: bool,
+    /// v1.04: PG19's implicit transaction block for a multi-statement
+    /// simple Query: the Query's commands run in one transaction that
+    /// commits when the Query string is exhausted. COMMIT/ROLLBACK
+    /// inside it end the block with a WARNING and start a fresh one;
+    /// BEGIN converts it to a regular transaction; savepoint commands
+    /// are rejected, like PostgreSQL.
+    implicit: bool,
     /// v0.66: GUC change stack for SET / SET LOCAL / RESET transaction
     /// semantics (PG19 guc.c: GUC_ACTION_SET persists at commit but
     /// reverts on abort; GUC_ACTION_LOCAL reverts at commit AND abort).
@@ -179,15 +228,60 @@ struct Txn {
     /// ROLLBACK TO SAVEPOINT cancels SET/SET LOCAL effects made after
     /// the savepoint, like Postgres.
     guc_marks: Vec<usize>,
+    /// v1.07: transaction characteristics (read_only, level,
+    /// deferrable) at each savepoint, in lockstep with `savepoints` —
+    /// PG19 restores the parent's characteristics on both ROLLBACK TO
+    /// and RELEASE SAVEPOINT.
+    txn_char_marks: Vec<(Option<bool>, IsolationLevel, Option<bool>)>,
+}
+
+impl Txn {
+    /// v1.21: xid to stamp on new row versions — the innermost savepoint
+    /// scope's sub-xid, or the top-level xid when no savepoint is active.
+    /// Mirrors PG19's `GetCurrentTransactionId` (subtransactions get their
+    /// own xids, which `heap_insert` stamps into xmin).
+    fn write_xid(&self) -> u64 {
+        self.sub_xids.last().copied().unwrap_or(self.xid)
+    }
+
+    /// v1.21: every xid owned by this transaction (top + all allocated
+    /// sub-xids, including released ones), for visibility and undo.
+    /// A released savepoint's rows stay visible to the transaction, and
+    /// a ROLLBACK TO an outer savepoint must undo writes done under
+    /// released inner savepoints.
+    fn all_xids(&self) -> Vec<u64> {
+        let mut v = Vec::with_capacity(self.owned_xids.len() + 1);
+        v.push(self.xid);
+        v.extend_from_slice(&self.owned_xids);
+        v
+    }
 }
 
 /// v0.66: snapshot of one stateful GUC's session value, for the
 /// transaction GUC stack.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SavedGuc {
     ReadOnly(Option<bool>),
     ByteaOutput(crate::storage::ByteaOutput),
     Toast(crate::storage::ToastCompression),
+    /// v1.07: validated-but-unmodeled GUCs (planner knobs etc.): the
+    /// pre-change entry of `session.gucs` (None = was at default).
+    Generic(Option<String>),
+    /// v1.07: `SET TRANSACTION` characteristics: pre-change values of
+    /// the current transaction's read-only flag, isolation level and
+    /// deferrable flag. (PG19 routes SET TRANSACTION through the GUC
+    /// stack: ROLLBACK TO SAVEPOINT reverts them.)
+    TxnChars {
+        read_only: Option<bool>,
+        level: IsolationLevel,
+        deferrable: Option<bool>,
+    },
+    /// v1.07: `default_transaction_isolation` session default.
+    DefaultTxnLevel(Option<IsolationLevel>),
+    /// v1.07: `default_transaction_deferrable` session default.
+    DefaultTxnDeferrable(Option<bool>),
+    /// v1.07: `SET ROLE`: the pre-change `session.role`.
+    Role(String),
 }
 
 /// v0.66: one in-transaction GUC change.
@@ -208,6 +302,15 @@ fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
         "default_transaction_read_only" => Some(SavedGuc::ReadOnly(session.default_txn_read_only)),
         "bytea_output" => Some(SavedGuc::ByteaOutput(session.bytea_output)),
         "default_toast_compression" => Some(SavedGuc::Toast(session.default_toast_compression)),
+        // v1.07: unmodeled GUCs live in `session.gucs`.
+        _ if is_generic_guc(name) => Some(SavedGuc::Generic(session.gucs.get(name).cloned())),
+        "default_transaction_isolation" => {
+            Some(SavedGuc::DefaultTxnLevel(session.default_txn_level))
+        }
+        "default_transaction_deferrable" => Some(SavedGuc::DefaultTxnDeferrable(
+            session.default_txn_deferrable,
+        )),
+        "role" => Some(SavedGuc::Role(session.role.clone())),
         _ => None,
     }
 }
@@ -223,6 +326,41 @@ fn restore_saved_guc(session: &mut Session, name: &str, saved: SavedGuc) {
         }
         ("default_toast_compression", SavedGuc::Toast(v)) => {
             session.default_toast_compression = v;
+        }
+        // v1.07: unmodeled GUCs.
+        (n, SavedGuc::Generic(v)) if is_generic_guc(n) => match v {
+            Some(s) => {
+                session.gucs.insert(n.to_string(), s);
+            }
+            None => {
+                session.gucs.remove(n);
+            }
+        },
+        ("default_transaction_isolation", SavedGuc::DefaultTxnLevel(v)) => {
+            session.default_txn_level = v;
+        }
+        ("default_transaction_deferrable", SavedGuc::DefaultTxnDeferrable(v)) => {
+            session.default_txn_deferrable = v;
+        }
+        ("role", SavedGuc::Role(r)) => {
+            session.role = r;
+        }
+        // v1.07: transaction characteristics revert only while the
+        // transaction is still open (ROLLBACK TO SAVEPOINT); at
+        // transaction end the Txn is gone and there is nothing to do.
+        (
+            _,
+            SavedGuc::TxnChars {
+                read_only,
+                level,
+                deferrable,
+            },
+        ) => {
+            if let Some(t) = session.txn.as_mut() {
+                t.read_only = read_only;
+                t.level = level;
+                t.deferrable = deferrable;
+            }
         }
         _ => {}
     }
@@ -298,7 +436,10 @@ impl Session {
     pub(crate) fn new(role: String) -> Self {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
+            session_user: role.clone(),
             role,
+            // v1.07: no unmodeled GUCs set on a fresh session.
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -313,6 +454,9 @@ impl Session {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices on a fresh session.
+            pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parsed-AST cache starts empty.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -326,6 +470,10 @@ impl Session {
 /// materialized (columns + rows + position); FETCH advances `pos`.
 /// (Named `SqlCursor` — `protocol::Cursor` is the wire-protocol cursor.)
 pub(crate) struct SqlCursor {
+    /// v0.89: lazy query — `Some` until the first FETCH materializes
+    /// it (PG19 defers query errors to FETCH, not DECLARE). `None`
+    /// once materialized.
+    query: Option<sql::SelectStmt>,
     cols: Vec<(String, ColType)>,
     rows: Vec<Row>,
     /// Current row index: -1 = before the first row, rows.len() = after
@@ -333,13 +481,19 @@ pub(crate) struct SqlCursor {
     /// retrieved).
     pos: i64,
     with_hold: bool,
+    /// v0.89: set when a FETCH raised an error — the portal is "dead
+    /// to the world" (PG19); further FETCHes get `portal cannot be run`
+    /// instead of re-executing.
+    dead: bool,
 }
 
 /// v0.16: cursor state captured at SAVEPOINT time, kept in lockstep with
 /// `Txn::savepoints`. On ROLLBACK TO, cursor positions rewind and cursors
 /// created after the savepoint are closed — like Postgres.
 struct CursorMark {
-    positions: HashMap<String, i64>,
+    // v0.89: fetch positions are NOT rewound by ROLLBACK TO (PG19
+    // keeps them); only the cursor set is restored, closing cursors
+    // declared after the savepoint.
     names: HashSet<String>,
 }
 
@@ -928,6 +1082,61 @@ pub(crate) fn send_error(stream: &mut Writer, code: &str, message: &str) -> io::
     send_error_detail(stream, code, message, None)
 }
 
+/// v1.00: send a NoticeResponse ('N') for a `RAISE NOTICE` message.
+/// Severity is NOTICE, code is 00000 (like PG's successful-completion
+/// notices from plpgsql RAISE).
+pub(crate) fn send_notice(stream: &mut Writer, message: &str) -> io::Result<()> {
+    let mut b = MsgBuilder::new(b'N');
+    b.u8(b'S')
+        .cstr("NOTICE")
+        .u8(b'V')
+        .cstr("NOTICE")
+        .u8(b'C')
+        .cstr("00000")
+        .u8(b'M')
+        .cstr(message);
+    b.send(stream)
+}
+
+/// v1.04: send a NoticeResponse ('N') with WARNING severity and SQLSTATE
+/// 01000, like PG19's warnings (e.g. COMMIT/ROLLBACK with no transaction
+/// in progress inside a multi-statement simple Query).
+pub(crate) fn send_warning(stream: &mut Writer, message: &str) -> io::Result<()> {
+    let mut b = MsgBuilder::new(b'N');
+    b.u8(b'S')
+        .cstr("WARNING")
+        .u8(b'V')
+        .cstr("WARNING")
+        .u8(b'C')
+        .cstr("01000")
+        .u8(b'M')
+        .cstr(message);
+    b.send(stream)
+}
+
+/// v1.00: drain `session.pending_notices`, sending each as a
+/// NoticeResponse. Called before the CommandComplete of a successful
+/// statement (PG sends notices before the completion tag).
+/// v1.04: warnings queued by `queue_warning` go first, with WARNING
+/// severity (a statement never produces both at once).
+fn drain_notices(stream: &mut Writer, session: &mut Session) -> io::Result<()> {
+    for warning in std::mem::take(&mut session.pending_warnings) {
+        send_warning(stream, &warning)?;
+    }
+    for notice in std::mem::take(&mut session.pending_notices) {
+        send_notice(stream, &notice)?;
+    }
+    Ok(())
+}
+
+/// v1.04: queue a WARNING-severity notice for the client (drained before
+/// the next CommandComplete). Used for PG19's "there is no transaction
+/// in progress" warning on COMMIT/ROLLBACK inside the implicit
+/// transaction block of a multi-statement simple Query.
+fn queue_warning(session: &mut Session, message: &str) {
+    session.pending_warnings.push(message.to_string());
+}
+
 /// v0.71: ErrorResponse with an optional PG-style DETAIL (`D`) field.
 pub(crate) fn send_error_detail(
     stream: &mut Writer,
@@ -1000,10 +1209,13 @@ fn parse_msg<T>(
 // ---------------------------------------------------------------------------
 
 /// Run one simple-protocol Query message. The message may hold several
-/// `;`-separated statements; each runs in its own implicit transaction
-/// (statement-atomic), or inside the session's explicit transaction when
-/// one is open. On the first error the remaining statements are skipped,
-/// like Postgres. Exactly one ReadyForQuery closes the message.
+/// `;`-separated statements. v1.04: like Postgres, a Query carrying more
+/// than one statement runs its commands in a single implicit transaction
+/// block (committed when the Query string is exhausted) when the session
+/// has no explicit transaction open; a lone statement keeps the old
+/// statement-atomic behavior. On the first error the remaining statements
+/// are skipped and the implicit block is aborted, like Postgres. Exactly
+/// one ReadyForQuery closes the message.
 fn handle_query(
     reader: &mut TcpStream,
     stream: &mut Writer,
@@ -1019,8 +1231,15 @@ fn handle_query(
         return Ok(());
     }
 
-    for one in sql::split_statements(sql_text) {
-        let stmt = match sql::parse_statement(&one) {
+    let statements = sql::split_statements(sql_text);
+    // v1.04: PG19 implicit transaction block (see Txn::implicit).
+    let implicit = statements.len() > 1 && session.txn.is_none();
+    if implicit {
+        begin_implicit_txn(engine, session);
+    }
+    let last_idx = statements.len().saturating_sub(1);
+    for (idx, one) in statements.iter().enumerate() {
+        let stmt = match sql::parse_statement(one) {
             Err(e) => {
                 let msg = if e.code == "42601" {
                     format!("syntax error: {}", e.message)
@@ -1029,9 +1248,11 @@ fn handle_query(
                 };
                 send_error(stream, e.code, &msg)?;
                 // v0.77: PG aborts the transaction on ANY error —
-                // including a simple-protocol parse error — so mark the
-                // txn failed before skipping the rest of the message.
-                if let Some(t) = session.txn.as_mut() {
+                // including a simple-protocol parse error. In the
+                // implicit block that means aborting the whole block.
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                } else if let Some(t) = session.txn.as_mut() {
                     t.failed = true;
                 }
                 break;
@@ -1044,7 +1265,9 @@ fn handle_query(
             send_exec_error(stream, &e)?;
             // v0.77: same abort rule for the parameter-substitution
             // error as for parse errors above.
-            if let Some(t) = session.txn.as_mut() {
+            if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                abort_implicit_txn(engine, session);
+            } else if let Some(t) = session.txn.as_mut() {
                 t.failed = true;
             }
             break;
@@ -1080,12 +1303,24 @@ fn handle_query(
                 if e.kind() != io::ErrorKind::InvalidData {
                     return Err(e);
                 }
+                // v1.04: a COPY statement error aborts the implicit block
+                // too (like any other statement error).
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                    break;
+                }
             }
             continue;
         }
         match run_statement(engine, wal, session, &stmt) {
             Err(e) => {
                 send_exec_error(stream, &e)?;
+                // v1.04: a statement error aborts PG19's implicit block
+                // (the whole Query is one transaction); an explicit
+                // transaction was already marked failed by run_statement.
+                if session.txn.as_ref().is_some_and(|t| t.implicit) {
+                    abort_implicit_txn(engine, session);
+                }
                 break;
             }
             Ok(ExecResult::Select { columns, rows }) => {
@@ -1094,6 +1329,8 @@ fn handle_query(
                 for row in &rows {
                     send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
+                // v1.00: notices before the completion tag.
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C')
                     .cstr(&format!("SELECT {}", rows.len()))
                     .send(stream)?;
@@ -1104,9 +1341,11 @@ fn handle_query(
                 for row in &rows {
                     send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                 }
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr("EXPLAIN").send(stream)?;
             }
             Ok(ExecResult::Command { tag }) => {
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
             // v0.10: DML with RETURNING sends rows like a SELECT, then the
@@ -1120,8 +1359,24 @@ fn handle_query(
                         send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
                     }
                 }
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
             }
+        }
+        // v1.04: COMMIT/ROLLBACK inside the implicit block ends it (with
+        // a warning); the rest of the Query string runs in a fresh one.
+        if implicit && idx != last_idx && session.txn.is_none() {
+            begin_implicit_txn(engine, session);
+        }
+    }
+
+    // v1.04: a Query string that never saw BEGIN leaves no transaction
+    // behind — commit the surviving implicit block, like Postgres (an
+    // explicit transaction, which BEGIN converted the implicit block
+    // into, stays open past the Query).
+    if implicit && session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if let Err(e) = commit_implicit_txn(engine, wal, session) {
+            send_exec_error(stream, &e)?;
         }
     }
 
@@ -1209,15 +1464,24 @@ fn copy_to_fetch(
     if session.txn.is_some() {
         let t = session.txn.as_mut().unwrap();
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
+        let write_xid = t.write_xid();
+        eprintln!(
+            "DEBUG txn_execute write_xid={} all_xids={:?}",
+            write_xid,
+            t.all_xids()
+        );
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid,
+            all_xids: t.all_xids(),
             level,
             session: session.sid,
             role: &session.role,
             read_only: t.read_only == Some(true),
             writes: &mut t.writes,
             default_toast_compression: session.default_toast_compression,
+            notices: Vec::new(),
         };
         match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
             Ok(r) => Ok(r),
@@ -1234,11 +1498,14 @@ fn copy_to_fetch(
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid: xid,
+                all_xids: vec![xid],
                 level: IsolationLevel::ReadCommitted,
                 session: session.sid,
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut writes,
             };
             exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
@@ -1354,14 +1621,18 @@ fn copy_from_ingest(
         let t = session.txn.as_mut().unwrap();
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
         let r = {
+            let write_xid = t.write_xid();
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid,
+                all_xids: t.all_xids(),
                 level,
                 session: session.sid,
                 role: &session.role,
                 read_only: t.read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut t.writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1379,11 +1650,14 @@ fn copy_from_ingest(
             let mut ctx = StmtCtx {
                 snap: &snap,
                 own: xid,
+                write_xid: xid,
+                all_xids: vec![xid],
                 level: IsolationLevel::ReadCommitted,
                 session: session.sid,
                 role: &session.role,
                 read_only: session.default_txn_read_only == Some(true),
                 default_toast_compression: session.default_toast_compression,
+                notices: Vec::new(),
                 writes: &mut writes,
             };
             exec::copy_from_rows(&mut *guard, &mut ctx, table, columns, parsed)
@@ -1395,7 +1669,7 @@ fn copy_from_ingest(
                 let records = match wal::records_for_commit(&guard, xid, &writes, session.sid) {
                     Ok(r) => r,
                     Err(msg) => {
-                        undo_all(&mut guard, xid, &writes);
+                        undo_all(&mut guard, &[xid], &writes);
                         retire_txn(&mut guard, xid);
                         auto_vacuum(&mut guard, &writes);
                         return Err(exec::ExecError {
@@ -1409,7 +1683,7 @@ fn copy_from_ingest(
                     }
                 };
                 if let Err(e) = lock_wal(wal).append_batch(&records) {
-                    undo_all(&mut guard, xid, &writes);
+                    undo_all(&mut guard, &[xid], &writes);
                     retire_txn(&mut guard, xid);
                     auto_vacuum(&mut guard, &writes);
                     return Err(exec::ExecError {
@@ -1423,7 +1697,7 @@ fn copy_from_ingest(
                 Ok(n)
             }
             Err(e) => {
-                undo_all(&mut guard, xid, &writes);
+                undo_all(&mut guard, &[xid], &writes);
                 retire_txn(&mut guard, xid);
                 auto_vacuum(&mut guard, &writes);
                 Err(e)
@@ -1731,8 +2005,6 @@ pub(crate) fn cursor_window_for_test(
 }
 
 fn cursor_declare(
-    engine: &Arc<Mutex<Engine>>,
-    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     name: &str,
     query: &sql::SelectStmt,
@@ -1750,48 +2022,94 @@ fn cursor_declare(
             message: format!("cursor \"{}\" already exists", name),
         });
     }
-    let sel = Stmt::Select(query.clone());
-    let result = if session.txn.is_some() {
-        txn_execute(engine, session, &sel)
-    } else {
-        autocommit_execute(
-            engine,
-            wal,
-            session.sid,
-            &session.role,
-            session.default_txn_read_only == Some(true),
-            session.default_toast_compression,
-            &sel,
-        )
-    };
-    match result {
-        Ok(ExecResult::Select { columns, rows }) => {
-            session.cursors.insert(
-                name.to_string(),
-                SqlCursor {
-                    cols: columns,
-                    rows,
-                    pos: -1,
-                    with_hold,
-                },
-            );
-            Ok(cmd("DECLARE CURSOR"))
-        }
-        Ok(_) => Err(ExecError {
-            detail: None,
-            code: "XX000",
-            message: "internal error: DECLARE query did not return rows".to_string(),
-        }),
-        Err(e) => Err(e),
-    }
+    // v0.89: PG19 does not execute the query at DECLARE — the portal is
+    // created lazily and query errors (e.g. division by zero) surface
+    // at the first FETCH, not here.
+    session.cursors.insert(
+        name.to_string(),
+        SqlCursor {
+            query: Some(query.clone()),
+            cols: Vec::new(),
+            rows: Vec::new(),
+            pos: -1,
+            with_hold,
+            dead: false,
+        },
+    );
+    Ok(cmd("DECLARE CURSOR"))
 }
 
 fn cursor_fetch(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
     name: &str,
     dir: &FetchDir,
     is_move: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.89: existence and liveness check; take the lazy query out so
+    // the materialization below can borrow `session` mutably.
+    let query = {
+        let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
+            detail: None,
+            code: "34000",
+            message: format!("cursor \"{}\" does not exist", name),
+        })?;
+        if cur.dead {
+            // PG19: a portal that raised an error is "dead to the
+            // world" — it stays present but cannot be run (55000).
+            return Err(ExecError {
+                detail: None,
+                code: "55000",
+                message: format!("portal \"{}\" cannot be run", name),
+            });
+        }
+        cur.query.take()
+    };
+    // v0.89: first FETCH materializes the DECLARE query. An execution
+    // error (e.g. division by zero) marks the portal dead and aborts
+    // the transaction (via txn_execute), like PG19.
+    if let Some(query) = query {
+        let sel = Stmt::Select(query);
+        let result: Result<ExecResult, ExecError> = if session.txn.is_some() {
+            txn_execute(engine, session, &sel)
+        } else {
+            match autocommit_execute(
+                engine,
+                wal,
+                session.sid,
+                &session.role,
+                session.default_txn_read_only == Some(true),
+                session.default_toast_compression,
+                &sel,
+            ) {
+                Ok((r, notices)) => {
+                    session.pending_notices.extend(notices);
+                    Ok(r)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let cur = session.cursors.get_mut(name).expect("cursor checked above");
+        match result {
+            Ok(ExecResult::Select { columns, rows }) => {
+                cur.cols = columns;
+                cur.rows = rows;
+            }
+            Ok(_) => {
+                cur.dead = true;
+                return Err(ExecError {
+                    detail: None,
+                    code: "XX000",
+                    message: "internal error: DECLARE query did not return rows".to_string(),
+                });
+            }
+            Err(e) => {
+                cur.dead = true;
+                return Err(e);
+            }
+        }
+    }
     let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
         detail: None,
         code: "34000",
@@ -1863,10 +2181,26 @@ fn effective_read_only(session: &Session) -> bool {
 /// command name for the 25006 error when the statement writes or locks
 /// rows and the session is read-only; None when the statement is a
 /// pure read (or transaction/session control, which must stay usable).
-fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
+/// v0.17: which DML/DDL statements a read-only transaction rejects.
+/// v0.89: PostgreSQL lets a read-only transaction write TEMPORARY
+/// tables (only permanent relations are protected), so statements
+/// whose every written target is a session-temp table are allowed;
+/// `CREATE TEMP TABLE` / `CREATE TEMP ... AS` are allowed too.
+fn read_only_violation(
+    db: &crate::storage::Database,
+    session: &Session,
+    stmt: &Stmt,
+) -> Option<&'static str> {
+    /// Every name in `names` resolves to a session-temp table.
+    fn all_temp(db: &crate::storage::Database, session: &Session, names: &[String]) -> bool {
+        !names.is_empty() && names.iter().all(|n| db.is_temp_table(session.sid, n))
+    }
     match stmt {
+        Stmt::Insert { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Insert { .. } => Some("INSERT"),
+        Stmt::Update { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Update { .. } => Some("UPDATE"),
+        Stmt::Delete { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Delete { .. } => Some("DELETE"),
         // COPY FROM STDIN writes; COPY TO STDOUT is a read.
         Stmt::Copy { to_stdout, .. } => {
@@ -1876,15 +2210,23 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
                 Some("COPY")
             }
         }
+        Stmt::Truncate { tables, .. } if all_temp(db, session, tables) => None,
         Stmt::Truncate { .. } => Some("TRUNCATE"),
         Stmt::Select(s) if s.for_update => Some("SELECT FOR UPDATE"),
         // DDL (schema and privilege changes are writes).
+        Stmt::CreateTable { temp: true, .. } => None,
         Stmt::CreateTable { .. } => Some("CREATE TABLE"),
         // v0.48: CTAS is a write too (PG19: "cannot execute CREATE
         // TABLE AS in a read-only transaction").
+        Stmt::CreateTableAs { temp: true, .. } => None,
         Stmt::CreateTableAs { .. } => Some("CREATE TABLE AS"),
+        Stmt::AlterTable { name, .. } if all_temp(db, session, std::slice::from_ref(name)) => None,
         Stmt::AlterTable { .. } => Some("ALTER TABLE"),
+        Stmt::DropTable { names, .. } if all_temp(db, session, names) => None,
         Stmt::DropTable { .. } => Some("DROP TABLE"),
+        Stmt::CreateIndex { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => {
+            None
+        }
         Stmt::CreateIndex { .. } => Some("CREATE INDEX"),
         Stmt::DropIndex { .. } => Some("DROP INDEX"),
         Stmt::CreateView { .. } => Some("CREATE VIEW"),
@@ -1895,6 +2237,10 @@ fn read_only_violation(stmt: &Stmt) -> Option<&'static str> {
         // v0.22: bounded CREATE TYPE.
         Stmt::CreateType { .. } => Some("CREATE TYPE"),
         Stmt::DropType { .. } => Some("DROP TYPE"),
+        // v0.85: domain DDL.
+        Stmt::CreateDomain { .. } => Some("CREATE DOMAIN"),
+        Stmt::AlterDomain { .. } => Some("ALTER DOMAIN"),
+        Stmt::DropDomain { .. } => Some("DROP DOMAIN"),
         Stmt::CreateRole { .. } => Some("CREATE ROLE"),
         Stmt::AlterRole { .. } => Some("ALTER ROLE"),
         Stmt::DropRole { .. } => Some("DROP ROLE"),
@@ -1936,6 +2282,7 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
                 .txn
                 .as_ref()
                 .map(|t| t.level)
+                .or(session.next_txn_level)
                 .or(session.default_txn_level)
                 .unwrap_or(IsolationLevel::ReadCommitted);
             Some(
@@ -1947,6 +2294,71 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
                 .to_string(),
             )
         }
+        // v1.07: `default_transaction_isolation` (read committed when
+        // unset).
+        "default_transaction_isolation" => Some(
+            match session
+                .default_txn_level
+                .unwrap_or(IsolationLevel::ReadCommitted)
+            {
+                IsolationLevel::ReadCommitted => "read committed",
+                IsolationLevel::RepeatableRead => "repeatable read",
+                IsolationLevel::Serializable => "serializable",
+            }
+            .to_string(),
+        ),
+        // v1.07: `default_transaction_deferrable` (off when unset).
+        "default_transaction_deferrable" => Some(
+            (if session.default_txn_deferrable == Some(true) {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        // v1.07: current-transaction read-only/deferrable (PG19).
+        "transaction_read_only" => Some(
+            (if session
+                .txn
+                .as_ref()
+                .and_then(|t| t.read_only)
+                .or(session.next_txn_read_only)
+                .or(session.default_txn_read_only)
+                .unwrap_or(false)
+            {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        "transaction_deferrable" => Some(
+            (if session
+                .txn
+                .as_ref()
+                .and_then(|t| t.deferrable)
+                .or(session.next_txn_deferrable)
+                .or(session.default_txn_deferrable)
+                .unwrap_or(false)
+            {
+                "on"
+            } else {
+                "off"
+            })
+            .to_string(),
+        ),
+        // v1.07: `role` / `session_user` (PG19).
+        "role" => Some(session.role.clone()),
+        "session_user" => Some(session.session_user.clone()),
+        // v1.07: generic validated GUCs (stored value or compiled
+        // default).
+        _ if is_generic_guc(name) => Some(
+            session
+                .gucs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| guc_default(name).to_string()),
+        ),
         _ => None,
     }
 }
@@ -1956,24 +2368,37 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
 /// no-op returning the SET tag (PG would emit a WARNING; we have no
 /// NOTICE channel). Unlike PG we accept it after the first statement;
 /// the new modes apply going forward.
+/// v1.07: PG19 semantics — the modes go through the check hooks
+/// (`check_transaction_read_only/isolation/deferrable`, all 25001):
+/// read-only -> read-write is forbidden in a subtransaction and after
+/// the first snapshot; isolation changes are forbidden after the first
+/// snapshot and in a subtransaction; deferrable changes are forbidden
+/// in a subtransaction and after the first snapshot. Successful changes
+/// push a GUC-stack entry so ROLLBACK TO SAVEPOINT reverts them (PG19
+/// routes SET TRANSACTION through the GUC stack). `SET TRANSACTION
+/// SNAPSHOT 'id'` validates the identifier (22023 on bad chars) and
+/// reports 42704 for a well-formed but unknown snapshot — we do not
+/// implement imported snapshots.
 fn stmt_set_transaction(
     session: &mut Session,
     level: Option<IsolationLevel>,
     read_only: Option<bool>,
     deferrable: Option<bool>,
+    snapshot: Option<String>,
+    local: bool,
 ) -> Result<ExecResult, ExecError> {
-    if let Some(t) = session.txn.as_mut() {
-        // Inside a transaction: apply to the current transaction (PG).
-        if let Some(l) = level {
-            t.level = l;
-        }
-        if let Some(ro) = read_only {
-            t.read_only = Some(ro);
-        }
-        if let Some(d) = deferrable {
-            t.deferrable = Some(d);
-        }
-    } else {
+    // PG19: SET LOCAL is rejected outside a transaction block (the
+    // generic SET LOCAL check in stmt_set_guc does not cover this
+    // path).
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
+    if let Some(id) = snapshot {
+        return stmt_set_transaction_snapshot(session, &id);
+    }
+    let Some(t) = session.txn.as_mut() else {
         // Outside: store for the NEXT transaction (one-shot).
         if level.is_some() {
             session.next_txn_level = level;
@@ -1984,7 +2409,185 @@ fn stmt_set_transaction(
         if deferrable.is_some() {
             session.next_txn_deferrable = deferrable;
         }
+        return Ok(ExecResult::Command {
+            tag: "SET".to_string(),
+        });
+    };
+    // Inside a transaction: run PG19's check hooks.
+    let subtxn = !t.savepoints.is_empty();
+    let snap_set = t.first_snapshot_set;
+    let err_25001 = |msg: &str| ExecError {
+        detail: None,
+        code: "25001",
+        message: msg.to_string(),
+    };
+    // check_transaction_read_only: r/o -> r/w is forbidden in a
+    // subtransaction and after the first snapshot.
+    if let Some(ro) = read_only {
+        let cur_ro = t
+            .read_only
+            .or(session.default_txn_read_only)
+            .unwrap_or(false);
+        if !ro && cur_ro {
+            if subtxn {
+                return Err(err_25001(
+                    "cannot set transaction read-write mode inside a read-only transaction",
+                ));
+            }
+            if snap_set {
+                return Err(err_25001(
+                    "transaction read-write mode must be set before any query",
+                ));
+            }
+        }
     }
+    // check_transaction_isolation: changes forbidden after the first
+    // snapshot; subtransactions may only set the existing value.
+    if let Some(l) = level {
+        if l != t.level {
+            if snap_set {
+                return Err(err_25001(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                ));
+            }
+            if subtxn {
+                return Err(err_25001(
+                    "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                ));
+            }
+        }
+    }
+    // check_transaction_deferrable: forbidden in a subtransaction and
+    // after the first snapshot (PG checks the subtransaction first,
+    // unconditionally).
+    if deferrable.is_some() {
+        if subtxn {
+            return Err(err_25001(
+                "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+            ));
+        }
+        if snap_set {
+            return Err(err_25001(
+                "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+            ));
+        }
+    }
+    // All checks passed: record the pre-change characteristics for
+    // ROLLBACK TO SAVEPOINT, then apply.
+    let changed = level.is_some_and(|l| l != t.level)
+        || read_only.is_some_and(|ro| Some(ro) != t.read_only)
+        || deferrable.is_some_and(|d| Some(d) != t.deferrable);
+    if changed {
+        t.guc_stack.push(GucStackEntry {
+            name: "transaction_characteristics",
+            is_local: local,
+            saved: SavedGuc::TxnChars {
+                read_only: t.read_only,
+                level: t.level,
+                deferrable: t.deferrable,
+            },
+        });
+    }
+    if let Some(l) = level {
+        t.level = l;
+    }
+    if let Some(ro) = read_only {
+        t.read_only = Some(ro);
+    }
+    if let Some(d) = deferrable {
+        t.deferrable = Some(d);
+    }
+    Ok(ExecResult::Command {
+        tag: "SET".to_string(),
+    })
+}
+
+/// v1.07: `SET TRANSACTION SNAPSHOT 'snapshot-id'` (PG19). The
+/// identifier may only contain `0-9`, `A-F` and `-` (22023
+/// "invalid snapshot identifier" otherwise); a well-formed but
+/// unknown id is 42704 ("snapshot ... does not exist") — we do not
+/// implement imported snapshots.
+fn stmt_set_transaction_snapshot(session: &mut Session, id: &str) -> Result<ExecResult, ExecError> {
+    if session.txn.is_none() {
+        // PG19: WarnNoTransactionBlock — a warning, statement succeeds.
+        return Ok(ExecResult::Command {
+            tag: "SET".to_string(),
+        });
+    }
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c) || c == '-')
+    {
+        return Err(ExecError {
+            detail: None,
+            code: "22023",
+            message: format!("invalid snapshot identifier: {:?}", id),
+        });
+    }
+    Err(ExecError {
+        detail: None,
+        code: "42704",
+        message: format!("snapshot {:?} does not exist", id),
+    })
+}
+
+/// v1.07: SET ROLE (the "role" GUC; PG19 `check_role`/`assign_role`).
+/// `None` (RESET ROLE / `SET ROLE NONE`) restores the session user.
+/// Otherwise the target role must exist (42704) and the session user
+/// must be a superuser or a member of it (42501,
+/// "permission denied to set role").
+fn stmt_set_role(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    target: Option<String>,
+    local: bool,
+) -> Result<ExecResult, ExecError> {
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
+    let new_role = match target {
+        None => session.session_user.clone(),
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            let guard = lock_engine(engine);
+            let snap = guard.take_snapshot();
+            if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42704",
+                    message: format!("role \"{}\" does not exist", name),
+                });
+            }
+            // PG19 `member_can_set_role`: a superuser, or the session
+            // user is a member of the target role.
+            let allowed = crate::storage::is_superuser_snap(
+                &guard.db,
+                &session.session_user,
+                &snap,
+                u64::MAX,
+            ) || crate::storage::role_closure(
+                &guard.db,
+                &session.session_user,
+                &snap,
+                u64::MAX,
+            )
+            .iter()
+            .any(|r| r == &name);
+            if !allowed {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42501",
+                    message: format!("permission denied to set role \"{}\"", name),
+                });
+            }
+            name
+        }
+    };
+    push_guc_entry(session, "role", local);
+    session.role = new_role;
     Ok(ExecResult::Command {
         tag: "SET".to_string(),
     })
@@ -1999,7 +2602,278 @@ fn parse_bool_guc(s: &str) -> Option<bool> {
     }
 }
 
-/// v0.17: `SET name = value`. Only `default_transaction_read_only` is
+/// v1.07: isolation-level GUC spellings (`default_transaction_isolation`,
+/// `transaction_isolation`). `read uncommitted` folds to read committed,
+/// like PG19.
+fn parse_isolation_guc(s: &str) -> Option<IsolationLevel> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "serializable" => Some(IsolationLevel::Serializable),
+        "repeatable read" => Some(IsolationLevel::RepeatableRead),
+        "read committed" | "read uncommitted" => Some(IsolationLevel::ReadCommitted),
+        _ => None,
+    }
+}
+
+/// v1.07: GUCs accepted with PG19-compatible validation but no engine
+/// effect (planner knobs, `extra_float_digits`, `work_mem`, ...).
+/// Values are validated like PG19 and stored in canonical text form in
+/// `session.gucs`; absence means the compiled default (`guc_default`).
+/// In-transaction changes revert via the GUC stack, like PG.
+fn is_generic_guc(name: &str) -> bool {
+    matches!(
+        name,
+        "enable_seqscan"
+            | "enable_indexscan"
+            | "enable_bitmapscan"
+            | "enable_indexonlyscan"
+            | "enable_hashagg"
+            | "enable_hashjoin"
+            | "enable_mergejoin"
+            | "enable_nestloop"
+            | "enable_sort"
+            | "enable_memoize"
+            | "enable_partitionwise_join"
+            | "geqo"
+            | "extra_float_digits"
+            | "work_mem"
+            | "geqo_threshold"
+            | "join_collapse_limit"
+            | "from_collapse_limit"
+            | "jit_above_cost"
+            | "parallel_setup_cost"
+            | "parallel_tuple_cost"
+            | "min_parallel_table_scan_size"
+            | "min_parallel_index_scan_size"
+            | "max_parallel_workers_per_gather"
+            | "max_parallel_workers"
+            | "max_worker_processes"
+            | "plan_cache_mode"
+            | "lc_numeric"
+            | "standard_conforming_strings"
+    )
+}
+
+/// v1.07: compiled default of a generic GUC, in canonical text form
+/// (PG19 `boot_val`s).
+fn guc_default(name: &str) -> &'static str {
+    match name {
+        "enable_partitionwise_join" => "off",
+        "extra_float_digits" => "1",
+        "work_mem" => "4MB",
+        "geqo_threshold" => "12",
+        "join_collapse_limit" | "from_collapse_limit" => "8",
+        "jit_above_cost" => "100000",
+        "parallel_setup_cost" => "1000",
+        "parallel_tuple_cost" => "0.1",
+        "min_parallel_table_scan_size" => "1024",
+        "min_parallel_index_scan_size" => "64",
+        "max_parallel_workers_per_gather" => "2",
+        "plan_cache_mode" => "auto",
+        "lc_numeric" => "C",
+        "standard_conforming_strings" => "on",
+        _ => "on",
+    }
+}
+
+/// v1.07: parse a PG19 memory-size GUC value (`work_mem`) into kB.
+/// Accepts a bare integer (kB) or a `kB`/`MB`/`GB` suffix
+/// (case-insensitive, `B` optional).
+fn parse_memory_kb(s: &str) -> Option<i64> {
+    let t = s.trim();
+    // Strip an optional trailing 'B'/'b', then the unit letter.
+    let t = t.strip_suffix(|c| c == 'B' || c == 'b').unwrap_or(t);
+    let (num, mult) = if let Some(n) = t.strip_suffix(|c| c == 'k' || c == 'K') {
+        (n, 1i64)
+    } else if let Some(n) = t.strip_suffix(|c| c == 'm' || c == 'M') {
+        (n, 1024)
+    } else if let Some(n) = t.strip_suffix(|c| c == 'g' || c == 'G') {
+        (n, 1024 * 1024)
+    } else {
+        (t, 1)
+    };
+    num.trim().parse::<i64>().ok()?.checked_mul(mult)
+}
+
+/// v1.07: validate a value for a generic GUC like PG19, returning the
+/// canonical text form. 22023 on invalid/out-of-range values, except
+/// `standard_conforming_strings = off` which is 0A000 (PG19:
+/// "non-standard string literals are not supported").
+fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
+    let invalid = || ExecError {
+        detail: None,
+        code: "22023",
+        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+    };
+    match name {
+        // Boolean planner knobs (PG19: all default on except
+        // enable_partitionwise_join).
+        "enable_seqscan"
+        | "enable_indexscan"
+        | "enable_bitmapscan"
+        | "enable_indexonlyscan"
+        | "enable_hashagg"
+        | "enable_hashjoin"
+        | "enable_mergejoin"
+        | "enable_nestloop"
+        | "enable_sort"
+        | "enable_memoize"
+        | "enable_partitionwise_join"
+        | "geqo" => parse_bool_guc(value)
+            .map(|b| (if b { "on" } else { "off" }).to_string())
+            .ok_or_else(invalid),
+        "extra_float_digits" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(-15..=3).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "work_mem" => {
+            let kb = parse_memory_kb(value).ok_or_else(invalid)?;
+            if kb < 64 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "\"{}\" is outside the valid range for parameter \"work_mem\" (64kB .. 2097151MB)",
+                        value
+                    ),
+                });
+            }
+            Ok(format!("{}kB", kb))
+        }
+        "geqo_threshold" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 2 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"geqo_threshold\" (2 .. 2147483647)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "join_collapse_limit" | "from_collapse_limit" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 1 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\" (1 .. 2147483647)",
+                        value, name
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "jit_above_cost" | "parallel_setup_cost" | "parallel_tuple_cost" => {
+            let f: f64 = value.trim().parse().map_err(|_| invalid())?;
+            let min = if name == "jit_above_cost" { -1.0 } else { 0.0 };
+            if f < min {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(value.trim().to_string())
+        }
+        "min_parallel_table_scan_size"
+        | "min_parallel_index_scan_size"
+        | "max_parallel_workers_per_gather"
+        | "max_parallel_workers"
+        | "max_worker_processes" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if i < 0 {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        "plan_cache_mode" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "force_generic_plan" | "force_custom_plan" => {
+                Ok(value.trim().to_ascii_lowercase())
+            }
+            _ => Err(invalid()),
+        },
+        // v1.07: locale name; accepted without catalog validation.
+        "lc_numeric" => Ok(value.to_string()),
+        "standard_conforming_strings" => {
+            let b = parse_bool_guc(value).ok_or_else(invalid)?;
+            if !b {
+                return Err(ExecError {
+                    detail: None,
+                    code: "0A000",
+                    message: "non-standard string literals are not supported".to_string(),
+                });
+            }
+            Ok("on".to_string())
+        }
+        _ => Err(ExecError {
+            detail: None,
+            code: "42704",
+            message: format!("unrecognized configuration parameter \"{}\"", name),
+        }),
+    }
+}
+
+/// v1.07: map a generic GUC name to its `&'static str` for the GUC
+/// stack (all generic GUC names are fixed string literals).
+fn name_to_static(name: &str) -> &'static str {
+    match name {
+        "enable_seqscan" => "enable_seqscan",
+        "enable_indexscan" => "enable_indexscan",
+        "enable_bitmapscan" => "enable_bitmapscan",
+        "enable_indexonlyscan" => "enable_indexonlyscan",
+        "enable_hashagg" => "enable_hashagg",
+        "enable_hashjoin" => "enable_hashjoin",
+        "enable_mergejoin" => "enable_mergejoin",
+        "enable_nestloop" => "enable_nestloop",
+        "enable_sort" => "enable_sort",
+        "enable_memoize" => "enable_memoize",
+        "enable_partitionwise_join" => "enable_partitionwise_join",
+        "geqo" => "geqo",
+        "extra_float_digits" => "extra_float_digits",
+        "work_mem" => "work_mem",
+        "geqo_threshold" => "geqo_threshold",
+        "join_collapse_limit" => "join_collapse_limit",
+        "from_collapse_limit" => "from_collapse_limit",
+        "jit_above_cost" => "jit_above_cost",
+        "parallel_setup_cost" => "parallel_setup_cost",
+        "parallel_tuple_cost" => "parallel_tuple_cost",
+        "min_parallel_table_scan_size" => "min_parallel_table_scan_size",
+        "min_parallel_index_scan_size" => "min_parallel_index_scan_size",
+        "max_parallel_workers_per_gather" => "max_parallel_workers_per_gather",
+        "max_parallel_workers" => "max_parallel_workers",
+        "max_worker_processes" => "max_worker_processes",
+        "plan_cache_mode" => "plan_cache_mode",
+        "lc_numeric" => "lc_numeric",
+        "standard_conforming_strings" => "standard_conforming_strings",
+        _ => "unrecognized",
+    }
+}
+
+/// v1.07: `SET name = value`. Only `default_transaction_read_only` is
 /// honored; unknown parameters are 42704 (undefined_object), like PG.
 /// v0.29: `bytea_output` (hex|escape) added.
 /// v0.66: `local` (from `SET LOCAL`) makes the change
@@ -2021,16 +2895,17 @@ fn stmt_set_guc(
     }
     match name {
         "default_transaction_read_only" => {
+            // v1.07: `SET ... TO DEFAULT` is a reset (None), like PG.
             let ro = match value {
-                SetValue::Default => false,
-                SetValue::Str(s) => parse_bool_guc(s).ok_or_else(|| ExecError {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                })?,
+                })?),
             };
             push_guc_entry(session, "default_transaction_read_only", local);
-            session.default_txn_read_only = Some(ro);
+            session.default_txn_read_only = ro;
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
@@ -2077,53 +2952,96 @@ fn stmt_set_guc(
                 tag: "SET".to_string(),
             })
         }
-        // v0.64: parallel-planner GUCs are accepted as no-ops (we have
-        // no cost-based planner or parallel scan to tune, but PG
-        // accepts them and regression tests SET them). Values are
-        // validated like PG's where cheap: costs are non-negative
-        // numbers, worker counts are non-negative integers.
-        "parallel_setup_cost" | "parallel_tuple_cost" => match value {
-            SetValue::Default => Ok(ExecResult::Command {
+        // v1.07: `default_transaction_isolation` session default (PG19
+        // enum GUC). `read uncommitted` folds to read committed, like PG.
+        "default_transaction_isolation" => {
+            let level = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            push_guc_entry(session, "default_transaction_isolation", local);
+            session.default_txn_level = level;
+            Ok(ExecResult::Command {
                 tag: "SET".to_string(),
-            }),
-            SetValue::Str(s) => {
-                let ok = s.parse::<f64>().map(|f| f >= 0.0).unwrap_or(false);
-                if ok {
-                    Ok(ExecResult::Command {
-                        tag: "SET".to_string(),
-                    })
-                } else {
-                    Err(ExecError {
-                        detail: None,
-                        code: "22023",
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                    })
+            })
+        }
+        // v1.07: `default_transaction_deferrable` session default (PG19
+        // bool GUC; not directly exercised by the regression files, but
+        // SET SESSION CHARACTERISTICS can set it).
+        "default_transaction_deferrable" => {
+            let d = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            push_guc_entry(session, "default_transaction_deferrable", local);
+            session.default_txn_deferrable = d;
+            Ok(ExecResult::Command {
+                tag: "SET".to_string(),
+            })
+        }
+        // v1.07: the current-transaction characteristics as GUCs (PG19
+        // routes SET TRANSACTION through SetPGVariable on these).
+        "transaction_isolation" => {
+            let level = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, level, None, None, None, local)
+        }
+        "transaction_read_only" => {
+            let ro = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, None, ro, None, None, local)
+        }
+        "transaction_deferrable" => {
+            let d = match value {
+                SetValue::Default => None,
+                SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
+                })?),
+            };
+            stmt_set_transaction(session, None, None, d, None, local)
+        }
+        // v1.07: validated-but-unmodeled GUCs (planner knobs,
+        // `extra_float_digits`, `work_mem`, ...): PG19-validated and
+        // stored; RESET restores the compiled default. `SET ... TO
+        // DEFAULT` is a reset, like PG.
+        _ if is_generic_guc(name) => {
+            match value {
+                SetValue::Default => {
+                    push_guc_entry(session, name_to_static(name), local);
+                    session.gucs.remove(name);
+                }
+                SetValue::Str(s) => {
+                    let canon = validate_generic_guc(name, s)?;
+                    push_guc_entry(session, name_to_static(name), local);
+                    session.gucs.insert(name.to_string(), canon);
                 }
             }
-        },
-        "max_parallel_workers_per_gather"
-        | "max_parallel_workers"
-        | "max_worker_processes"
-        | "min_parallel_table_scan_size"
-        | "min_parallel_index_scan_size" => match value {
-            SetValue::Default => Ok(ExecResult::Command {
+            Ok(ExecResult::Command {
                 tag: "SET".to_string(),
-            }),
-            SetValue::Str(s) => {
-                let ok = s.parse::<i64>().map(|i| i >= 0).unwrap_or(false);
-                if ok {
-                    Ok(ExecResult::Command {
-                        tag: "SET".to_string(),
-                    })
-                } else {
-                    Err(ExecError {
-                        detail: None,
-                        code: "22023",
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
-                    })
-                }
-            }
-        },
+            })
+        }
         // v0.68: read-only (PGC_INTERNAL, PG19 guc.c) GUCs are known
         // parameters, so SET on them is 55P02
         // ERRCODE_CANT_CHANGE_RUNTIME_PARAM (`parameter "x" cannot be
@@ -2133,6 +3051,14 @@ fn stmt_set_guc(
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
+        // v1.07: generic GUCs reset to their compiled default.
+        _ if is_generic_guc(name) => {
+            push_guc_entry(session, name_to_static(name), false);
+            session.gucs.remove(name);
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             detail: None,
             code: "42704",
@@ -2165,6 +3091,9 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
 /// v0.66: RESET inside a transaction pushes a stack entry, like SET —
 /// a RESET in an aborted transaction reverts to the pre-transaction
 /// value (PG19).
+/// v1.07: `RESET transaction_isolation/read_only/deferrable` is 0A000
+/// (GUC_NO_RESET in PG19: "parameter ... cannot be reset");
+/// `RESET role` restores the session user.
 fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecError> {
     match name {
         "all" => {
@@ -2174,9 +3103,23 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             push_guc_entry(session, "default_transaction_read_only", false);
             push_guc_entry(session, "bytea_output", false);
             push_guc_entry(session, "default_toast_compression", false);
+            push_guc_entry(session, "default_transaction_isolation", false);
+            push_guc_entry(session, "default_transaction_deferrable", false);
+            push_guc_entry(session, "role", false);
             session.default_txn_read_only = None;
             session.bytea_output = crate::storage::ByteaOutput::Hex;
             session.default_toast_compression = crate::storage::ToastCompression::default();
+            session.default_txn_level = None;
+            session.default_txn_deferrable = None;
+            session.role = session.session_user.clone();
+            // v1.07: generic GUCs reset to their compiled defaults.
+            // (PG19's RESET ALL skips GUC_NO_RESET ones; the
+            // transaction_* GUCs are not resettable anyway.)
+            let names: Vec<String> = session.gucs.keys().cloned().collect();
+            for n in &names {
+                push_guc_entry(session, name_to_static(n), false);
+            }
+            session.gucs.clear();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -2184,6 +3127,40 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         "default_transaction_read_only" => {
             push_guc_entry(session, "default_transaction_read_only", false);
             session.default_txn_read_only = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: `default_transaction_isolation` resets to the
+        // compiled default (read committed).
+        "default_transaction_isolation" => {
+            push_guc_entry(session, "default_transaction_isolation", false);
+            session.default_txn_level = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: `default_transaction_deferrable` resets to not set.
+        "default_transaction_deferrable" => {
+            push_guc_entry(session, "default_transaction_deferrable", false);
+            session.default_txn_deferrable = None;
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
+        // v1.07: the current-transaction GUCs cannot be reset (PG19
+        // GUC_NO_RESET).
+        "transaction_isolation" | "transaction_read_only" | "transaction_deferrable" => {
+            Err(ExecError {
+                detail: None,
+                code: "0A000",
+                message: format!("parameter \"{}\" cannot be reset", name),
+            })
+        }
+        // v1.07: RESET ROLE restores the session user (PG19).
+        "role" => {
+            push_guc_entry(session, "role", false);
+            session.role = session.session_user.clone();
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
             })
@@ -2211,6 +3188,14 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
+        // v1.07: generic GUCs reset to their compiled default.
+        _ if is_generic_guc(name) => {
+            push_guc_entry(session, name_to_static(name), false);
+            session.gucs.remove(name);
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         _ => Err(ExecError {
             detail: None,
             code: "42704",
@@ -2237,15 +3222,19 @@ fn resolve_sql_execute(
             code: "26000",
             message: format!("prepared statement \"{}\" does not exist", name),
         })?;
+    // v1.58: PG19 (prepare.c EvaluateParams) reports the arity
+    // mismatch as 42601 with the expected/got counts in the detail.
     if !prepared.types.is_empty() && args.len() != prepared.types.len() {
         return Err(ExecError {
-            detail: None,
-            code: "42P02",
-            message: format!(
-                "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
-                name,
+            detail: Some(format!(
+                "Expected {} parameters but got {}.",
                 prepared.types.len(),
                 args.len()
+            )),
+            code: "42601",
+            message: format!(
+                "wrong number of parameters for prepared statement \"{}\"",
+                name
             ),
         });
     }
@@ -2275,10 +3264,33 @@ fn run_statement(
     // v0.74: SQL-level EXECUTE resolves to the stored prepared
     // statement with its arguments bound, so the checks below see the
     // real statement. (PREPARE/DEALLOCATE are handled in the match.)
+    // v1.58: EXPLAIN EXECUTE — resolve the inner Execute the same way
+    // (PG19 ExplainExecuteQuery evaluates the EXECUTE arguments and
+    // plans the prepared statement with them bound: custom-plan
+    // semantics), so the planner sees a plain SELECT.
     let owned;
     let stmt = match stmt {
         Stmt::Execute { name, args } => {
             owned = resolve_sql_execute(engine, session, name, args)?;
+            &owned
+        }
+        Stmt::Explain {
+            stmt: inner,
+            analyze,
+            costs,
+            opts,
+        } if matches!(inner.as_ref(), Stmt::Execute { .. }) => {
+            let (name, args) = match inner.as_ref() {
+                Stmt::Execute { name, args } => (name.clone(), args.clone()),
+                _ => unreachable!("guarded by matches! above"),
+            };
+            let resolved = resolve_sql_execute(engine, session, &name, &args)?;
+            owned = Stmt::Explain {
+                stmt: Box::new(resolved),
+                analyze: *analyze,
+                costs: *costs,
+                opts: opts.clone(),
+            };
             &owned
         }
         other => other,
@@ -2298,7 +3310,14 @@ fn run_statement(
     // session control stay usable so the mode can always be exited.
     // Like any statement error, this aborts the transaction.
     if effective_read_only(session) {
-        if let Some(cmd) = read_only_violation(stmt) {
+        // v0.89: temp-table awareness needs the catalog, so take the
+        // engine lock briefly (the same lock run_statement would take
+        // for execution anyway).
+        let violation = {
+            let guard = lock_engine(engine);
+            read_only_violation(&guard.db, session, stmt)
+        };
+        if let Some(cmd) = violation {
             if let Some(t) = session.txn.as_mut() {
                 t.failed = true;
             }
@@ -2361,15 +3380,29 @@ fn run_statement(
             })
         }
         Stmt::Deallocate { name } => {
+            // v1.58: PG19 (prepare.c DeallocateQuery/DropPreparedStatement)
+            // raises 26000 for an unknown name; the command tag is
+            // DEALLOCATE ALL when no name is given (utility.c).
             match name {
                 Some(n) => {
-                    session.sql_prepared.remove(n);
+                    if session.sql_prepared.remove(n).is_none() {
+                        return Err(ExecError {
+                            detail: None,
+                            code: "26000",
+                            message: format!("prepared statement \"{}\" does not exist", n),
+                        });
+                    }
+                    Ok(ExecResult::Command {
+                        tag: "DEALLOCATE".to_string(),
+                    })
                 }
-                None => session.sql_prepared.clear(),
+                None => {
+                    session.sql_prepared.clear();
+                    Ok(ExecResult::Command {
+                        tag: "DEALLOCATE ALL".to_string(),
+                    })
+                }
             }
-            Ok(ExecResult::Command {
-                tag: "DEALLOCATE".to_string(),
-            })
         }
         Stmt::Execute { .. } => Err(ExecError {
             detail: None,
@@ -2382,10 +3415,10 @@ fn run_statement(
             name,
             query,
             with_hold,
-        } => cursor_declare(engine, wal, session, name, query, *with_hold),
-        Stmt::Fetch { name, dir } => cursor_fetch(session, name, dir, false),
+        } => cursor_declare(session, name, query, *with_hold),
+        Stmt::Fetch { name, dir } => cursor_fetch(engine, wal, session, name, dir, false),
         Stmt::Close { name } => cursor_close(session, name.as_deref()),
-        Stmt::Move { name, dir } => cursor_fetch(session, name, dir, true),
+        Stmt::Move { name, dir } => cursor_fetch(engine, wal, session, name, dir, true),
         Stmt::Vacuum {
             table,
             verbose,
@@ -2397,7 +3430,7 @@ fn run_statement(
                 let a = Stmt::Analyze {
                     table: table.clone(),
                 };
-                autocommit_execute(
+                let (_, notices) = autocommit_execute(
                     engine,
                     wal,
                     session.sid,
@@ -2406,6 +3439,9 @@ fn run_statement(
                     session.default_toast_compression,
                     &a,
                 )?;
+                // v1.00: trigger RAISE NOTICE output (ANALYZE has no
+                // triggers, but keep the plumbing uniform).
+                session.pending_notices.extend(notices);
             }
             Ok(out)
         }
@@ -2414,33 +3450,59 @@ fn run_statement(
             level,
             read_only,
             deferrable,
-        } => stmt_set_transaction(session, *level, *read_only, *deferrable),
+            snapshot,
+        } => stmt_set_transaction(
+            session,
+            *level,
+            *read_only,
+            *deferrable,
+            snapshot.clone(),
+            false,
+        ),
         Stmt::SetSessionCharacteristics {
             level,
             read_only,
             deferrable,
         } => {
+            // v1.07: PG19 implements this as SET of the three
+            // `default_transaction_*` GUCs (transactional, like PG).
             if let Some(l) = level {
+                push_guc_entry(session, "default_transaction_isolation", false);
                 session.default_txn_level = Some(*l);
             }
             if let Some(ro) = read_only {
+                push_guc_entry(session, "default_transaction_read_only", false);
                 session.default_txn_read_only = Some(*ro);
             }
             if let Some(d) = deferrable {
+                push_guc_entry(session, "default_transaction_deferrable", false);
                 session.default_txn_deferrable = Some(*d);
             }
             Ok(ExecResult::Command {
                 tag: "SET".to_string(),
             })
         }
-        Stmt::Set { name, value, local } => stmt_set_guc(session, name, value, *local),
+        Stmt::Set { name, value, local } => {
+            // v1.07: SET ROLE is the "role" GUC (PG19); it needs the
+            // engine for the role-existence/membership check.
+            if name == "role" {
+                let target = match value {
+                    SetValue::Default => None,
+                    SetValue::Str(s) if s.eq_ignore_ascii_case("none") => None,
+                    SetValue::Str(s) => Some(s.clone()),
+                };
+                stmt_set_role(engine, session, target, *local)
+            } else {
+                stmt_set_guc(session, name, value, *local)
+            }
+        }
         Stmt::Show { name } => stmt_show_guc(session, name),
         Stmt::Reset { name } => stmt_reset_guc(session, name),
         _ => {
             if session.txn.is_some() {
                 txn_execute(engine, session, stmt)
             } else {
-                autocommit_execute(
+                match autocommit_execute(
                     engine,
                     wal,
                     session.sid,
@@ -2448,7 +3510,14 @@ fn run_statement(
                     session.default_txn_read_only == Some(true),
                     session.default_toast_compression,
                     stmt,
-                )
+                ) {
+                    Ok((r, notices)) => {
+                        // v1.00: trigger RAISE NOTICE output.
+                        session.pending_notices.extend(notices);
+                        Ok(r)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     };
@@ -2494,6 +3563,9 @@ fn stmt_snapshot(engine: &mut Engine, txn: Option<&mut Txn>) -> (Snapshot, u64, 
                     }
                 },
             };
+            // v1.07: taking a snapshot marks PG19's `FirstSnapshotSet`,
+            // which forbids late `SET TRANSACTION` changes.
+            t.first_snapshot_set = true;
             (snap, xid, level)
         }
         None => (engine.take_snapshot(), 0, IsolationLevel::ReadCommitted),
@@ -2516,18 +3588,27 @@ fn txn_execute(
         .expect("txn_execute called without a transaction");
     let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut *t));
     let result = {
+        let write_xid = t.write_xid();
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid,
+            all_xids: t.all_xids(),
             level,
             session: session.sid,
             role: &session.role,
             read_only: t.read_only == Some(true),
             default_toast_compression: session.default_toast_compression,
+            notices: Vec::new(),
             writes: &mut t.writes,
         };
-        exec::execute(&mut *guard, &mut ctx, stmt)
+        let r = exec::execute(&mut *guard, &mut ctx, stmt);
+        // v1.00: collect trigger RAISE NOTICE output for the client.
+        let notices = std::mem::take(&mut ctx.notices);
+        (r, notices)
     };
+    let (result, notices) = result;
+    session.pending_notices.extend(notices);
     // v0.9: sequence advances are non-transactional: on success, stage
     // their commit-time WAL markers. (On failure the in-memory advance
     // still stands, like Postgres; there is just nothing to log yet.)
@@ -2566,23 +3647,29 @@ fn autocommit_execute(
     // v0.41: session's `default_toast_compression` GUC.
     default_toast_compression: crate::storage::ToastCompression,
     stmt: &Stmt,
-) -> Result<ExecResult, ExecError> {
+) -> Result<(ExecResult, Vec<String>), ExecError> {
     let mut guard = lock_engine(engine);
     let xid = guard.begin_txn();
     let snap = guard.take_snapshot();
     let mut writes: Vec<WriteOp> = Vec::new();
-    let result = {
+    let (result, notices) = {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
+            write_xid: xid,
+            all_xids: vec![xid],
             level: IsolationLevel::ReadCommitted,
             session: sid,
             role,
             read_only,
             default_toast_compression,
+            notices: Vec::new(),
             writes: &mut writes,
         };
-        exec::execute(&mut *guard, &mut ctx, stmt)
+        let r = exec::execute(&mut *guard, &mut ctx, stmt);
+        // v1.00: collect trigger RAISE NOTICE output for the client.
+        let notices = std::mem::take(&mut ctx.notices);
+        (r, notices)
     };
     // v0.9: stage sequence-advance WAL markers on success (see
     // txn_execute for the semantics).
@@ -2600,7 +3687,7 @@ fn autocommit_execute(
     let result = match result {
         Ok(r) => r,
         Err(e) => {
-            undo_all(&mut guard, xid, &writes);
+            undo_all(&mut guard, &[xid], &writes);
             retire_txn(&mut guard, xid);
             return Err(e);
         }
@@ -2614,7 +3701,7 @@ fn autocommit_execute(
     let records = match wal::records_for_commit(&guard, xid, &writes, sid) {
         Ok(r) => r,
         Err(msg) => {
-            undo_all(&mut guard, xid, &writes);
+            undo_all(&mut guard, &[xid], &writes);
             retire_txn(&mut guard, xid);
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
@@ -2629,20 +3716,20 @@ fn autocommit_execute(
     };
     // Lock order is always engine -> wal.
     if let Err(e) = lock_wal(wal).append_batch(&records) {
-        undo_all(&mut guard, xid, &writes);
+        undo_all(&mut guard, &[xid], &writes);
         retire_txn(&mut guard, xid);
         auto_vacuum(&mut guard, &writes);
         return Err(wal_err(e));
     }
     retire_txn(&mut guard, xid);
     auto_vacuum(&mut guard, &writes);
-    Ok(result)
+    Ok((result, notices))
 }
 
 /// Undo every op, newest first (abort / failed autocommit / WAL failure).
-fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
+fn undo_all(engine: &mut Engine, owns: &[u64], writes: &[WriteOp]) {
     for op in writes.iter().rev() {
-        undo_write_op(engine, own, op);
+        undo_write_op(engine, owns, op);
     }
 }
 
@@ -2652,6 +3739,15 @@ fn undo_all(engine: &mut Engine, own: u64, writes: &[WriteOp]) {
 fn retire_txn(engine: &mut Engine, xid: u64) {
     engine.end_txn(xid);
     engine.release_txn_locks(xid);
+}
+
+/// v1.21: retire the top xid and every owned sub-xid (they were registered
+/// active via begin_txn for isolation).
+fn retire_txn_family(engine: &mut Engine, t: &Txn) {
+    for &sub in &t.owned_xids {
+        engine.end_txn(sub);
+    }
+    retire_txn(engine, t.xid);
 }
 
 /// Best-effort cleanup after a commit or abort: reclaim versions that are
@@ -2692,7 +3788,21 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DropTempTable { .. }
             | WriteOp::AlterTempTable { .. }
             | WriteOp::CreateType { .. }
-            | WriteOp::DropType { .. } => continue,
+            | WriteOp::DropType { .. }
+            // v0.86: function/operator DDL likewise leaves no dead row
+            // versions to reap.
+            | WriteOp::CreateFunction { .. }
+            | WriteOp::DropFunction { .. }
+            | WriteOp::CreateOperator { .. }
+            | WriteOp::DropOperator { .. }
+            // v1.38: cast DDL likewise leaves no dead row versions.
+            | WriteOp::CreateCast { .. }
+            // v0.87: temp index DDL leaves no dead row versions to reap.
+            | WriteOp::CreateTempIndex { .. }
+            | WriteOp::DropTempIndex { .. }
+            // v1.05: the reltoastrelid link is a catalog field update —
+            // no row versions die.
+            | WriteOp::SetToastRelid { .. } => continue,
         };
         if !names.contains(&name) {
             names.push(name);
@@ -2703,61 +3813,99 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
     }
 }
 
-fn txn_begin(
-    engine: &Arc<Mutex<Engine>>,
-    session: &mut Session,
-    level: IsolationLevel,
-    read_only: Option<bool>,
-    deferrable: Option<bool>,
-) -> Result<ExecResult, ExecError> {
-    if session.txn.is_some() {
-        // Postgres: WARNING "there is already a transaction in progress",
-        // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
-        return Ok(cmd("BEGIN"));
-    }
+/// v1.04: start PG19's implicit transaction block for a multi-statement
+/// simple Query. The block covers the Query's commands and commits when
+/// the Query string is exhausted (unless transaction-control statements
+/// convert or end it first). Read-committed, honoring the session's
+/// default read-only mode like an autocommit statement would.
+fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
     let xid = lock_engine(engine).begin_txn();
+    // v1.07: apply the one-shot next-transaction characteristics, then
+    // the session defaults, like the explicit BEGIN path (PG19).
     session.txn = Some(Txn {
         xid,
-        level,
-        read_only,
-        deferrable,
+        level: session
+            .next_txn_level
+            .take()
+            .or(session.default_txn_level)
+            .unwrap_or(IsolationLevel::ReadCommitted),
+        read_only: session
+            .next_txn_read_only
+            .take()
+            .or(session.default_txn_read_only),
+        deferrable: session
+            .next_txn_deferrable
+            .take()
+            .or(session.default_txn_deferrable),
         snapshot: None,
+        first_snapshot_set: false,
         writes: Vec::new(),
         savepoints: Vec::new(),
+        sub_xids: Vec::new(),
+        owned_xids: Vec::new(),
         cursor_marks: Vec::new(),
         failed: false,
-        // v0.66: fresh GUC stack per transaction.
+        implicit: true,
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
+        txn_char_marks: Vec::new(),
     });
-    Ok(cmd("BEGIN"))
 }
 
-fn txn_commit(
+/// v1.04: abort PG19's implicit transaction block after a statement
+/// error: undo the staged writes, retire the xid, and leave the session
+/// with no transaction (the rest of the Query string is skipped by the
+/// caller). Cursors die and in-transaction GUC changes revert, exactly
+/// like an aborted explicit transaction.
+fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
+    if let Some(t) = session.txn.take() {
+        debug_assert!(t.implicit, "abort_implicit_txn on explicit txn");
+        let mut guard = lock_engine(engine);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
+        auto_vacuum(&mut guard, &t.writes);
+        drop(guard);
+        // v0.16: every cursor dies with the aborted transaction.
+        session.cursors.clear();
+        // v0.66: an aborted transaction reverts every in-transaction GUC
+        // change (SET and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
+    }
+}
+
+/// v1.04: commit the surviving implicit block when the Query string is
+/// exhausted with no explicit transaction left open. Silent (no warning)
+/// — this is the normal end-of-string commit. Returns the commit outcome
+/// for the caller to report if durability failed.
+fn commit_implicit_txn(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &mut Session,
-    chain: bool,
 ) -> Result<ExecResult, ExecError> {
-    let t = match session.txn.take() {
-        None => {
-            // Postgres: WARNING, no-op. AND CHAIN without a transaction
-            // still starts a new one with default characteristics; the
-            // tag stays COMMIT.
-            if chain {
-                txn_begin(engine, session, IsolationLevel::ReadCommitted, None, None)?;
-            }
-            return Ok(cmd("COMMIT"));
-        }
-        Some(t) => t,
-    };
-    // Remember characteristics for AND CHAIN before the txn is consumed.
-    let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
+    let t = session
+        .txn
+        .take()
+        .expect("commit_implicit_txn without a txn");
+    debug_assert!(t.implicit, "commit_implicit_txn on explicit txn");
+    commit_taken_txn(engine, wal, session, t)
+}
+
+/// Commit (or roll back, when already failed) an already-taken
+/// transaction: WAL-log and fsync the staged writes, retire the xid,
+/// and run the commit-time cleanup. Shared by explicit COMMIT and the
+/// v1.04 implicit-block paths. AND CHAIN handling stays with the
+/// callers.
+fn commit_taken_txn(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    t: Txn,
+) -> Result<ExecResult, ExecError> {
     let mut guard = lock_engine(engine);
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction
@@ -2766,10 +3914,6 @@ fn txn_commit(
         // v0.66: an aborted transaction reverts every in-transaction
         // GUC change (SET and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
-        if chain {
-            // AND CHAIN: new transaction with the same characteristics.
-            return txn_begin(engine, session, level, read_only, deferrable);
-        }
         return Ok(cmd("ROLLBACK"));
     }
     // Derive the records from the write log and make them durable BEFORE
@@ -2803,7 +3947,7 @@ fn txn_commit(
         session.txn = Some(t);
         return Err(wal_err(e));
     }
-    retire_txn(&mut guard, t.xid);
+    retire_txn_family(&mut guard, &t);
     auto_vacuum(&mut guard, &t.writes);
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
@@ -2811,14 +3955,108 @@ fn txn_commit(
     // v0.66: SET LOCAL effects end with the transaction (commit or
     // not); plain SET/RESET persist for the session, like PG19.
     revert_guc_stack(session, t.guc_stack, true);
+    Ok(cmd("COMMIT"))
+}
+
+fn txn_begin(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    level: IsolationLevel,
+    read_only: Option<bool>,
+    deferrable: Option<bool>,
+) -> Result<ExecResult, ExecError> {
+    if let Some(t) = session.txn.as_mut() {
+        // v1.04: BEGIN converts PG19's implicit transaction block into
+        // a regular one, which may then extend past the Query string.
+        // Statement options still apply, like PostgreSQL.
+        if t.implicit {
+            t.implicit = false;
+            t.level = level;
+            t.read_only = read_only;
+            t.deferrable = deferrable;
+            return Ok(cmd("BEGIN"));
+        }
+        // Postgres: WARNING "there is already a transaction in progress",
+        // otherwise a no-op. No NOTICE channel in v0.5, so plain no-op.
+        return Ok(cmd("BEGIN"));
+    }
+    let xid = lock_engine(engine).begin_txn();
+    session.txn = Some(Txn {
+        xid,
+        level,
+        read_only,
+        deferrable,
+        snapshot: None,
+        first_snapshot_set: false,
+        writes: Vec::new(),
+        savepoints: Vec::new(),
+        sub_xids: Vec::new(),
+        owned_xids: Vec::new(),
+        cursor_marks: Vec::new(),
+        failed: false,
+        implicit: false,
+        // v0.66: fresh GUC stack per transaction.
+        guc_stack: Vec::new(),
+        guc_marks: Vec::new(),
+        txn_char_marks: Vec::new(),
+    });
+    Ok(cmd("BEGIN"))
+}
+
+fn txn_commit(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    chain: bool,
+) -> Result<ExecResult, ExecError> {
+    if session.txn.is_none() {
+        // v0.89: plain COMMIT outside a transaction is PG's WARNING
+        // no-op, but COMMIT AND CHAIN requires a transaction block
+        // (PG19: 25001 "COMMIT AND CHAIN can only be used in transaction
+        // blocks").
+        if chain {
+            return Err(ExecError {
+                detail: None,
+                code: "25001",
+                message: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
+            });
+        }
+        return Ok(cmd("COMMIT"));
+    }
+    // v1.04: COMMIT inside PG19's implicit transaction block commits
+    // the block but warns — the client never began a transaction. The
+    // caller (handle_query) starts a fresh implicit block for the rest
+    // of the Query string.
+    if session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if chain {
+            return Err(err_25001(
+                "COMMIT AND CHAIN can only be used in transaction blocks",
+            ));
+        }
+        let t = session
+            .txn
+            .take()
+            .expect("implicit transaction checked above");
+        commit_taken_txn(engine, wal, session, t)?;
+        queue_warning(session, "there is no transaction in progress");
+        return Ok(cmd("COMMIT"));
+    }
+    let t = session.txn.take().expect("transaction checked above");
+    // Remember characteristics for AND CHAIN before the txn is consumed.
+    let (level, read_only, deferrable) = (t.level, t.read_only, t.deferrable);
+    let was_failed = t.failed;
+    let out = commit_taken_txn(engine, wal, session, t)?;
     if chain {
         // AND CHAIN: immediately start a new transaction with the same
-        // characteristics as the just-committed one (SQL standard). The
-        // command tag stays COMMIT — PostgreSQL reports the command that
-        // ran, not the implicitly started transaction.
+        // characteristics as the just-committed one (SQL standard).
         txn_begin(engine, session, level, read_only, deferrable)?;
+        // Tag quirk, preserved from the pre-v1.04 code: on an aborted
+        // transaction the reported tag is the new transaction's BEGIN;
+        // otherwise the command tag stays COMMIT — PostgreSQL reports
+        // the command that ran, not the implicitly started transaction.
+        return Ok(if was_failed { cmd("BEGIN") } else { out });
     }
-    Ok(cmd("COMMIT"))
+    Ok(out)
 }
 
 /// Snapshot the committed engine and truncate the WAL.
@@ -2847,9 +4085,7 @@ fn txn_vacuum(
     verbose: bool,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
-        return Err(err_25001(
-            "VACUUM cannot be executed inside a transaction block",
-        ));
+        return Err(err_25001("VACUUM cannot run inside a transaction block"));
     }
     let mut guard = lock_engine(engine);
     // v0.11: VACUUM requires ownership (or superuser), like PostgreSQL.
@@ -2860,7 +4096,7 @@ fn txn_vacuum(
         next_xid: guard.txns.next_xid,
     };
     let is_owner = |db: &crate::storage::Database, snap: &crate::storage::Snapshot, name: &str| {
-        db.find_table(name, snap, u64::MAX, session.sid)
+        db.find_table(name, snap, &[u64::MAX], session.sid)
             .map(|t| {
                 t.owner == session.role
                     || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
@@ -2868,7 +4104,13 @@ fn txn_vacuum(
             .unwrap_or(false)
     };
     if let Some(name) = table {
-        if !guard.db.tables.contains_key(name) {
+        // v0.85: resolve temp tables too — `find_table` checks the
+        // session's temp tables first, like ANALYZE does.
+        if guard
+            .db
+            .find_table(name, &snap, &[u64::MAX], session.sid)
+            .is_none()
+        {
             return Err(ExecError {
                 detail: None,
                 code: "42P01",
@@ -2883,10 +4125,21 @@ fn txn_vacuum(
             });
         }
     }
+    // v0.85: vacuum a temp table when the name resolves to one; otherwise
+    // the permanent table.
+    let vacuum_one = |guard: &mut std::sync::MutexGuard<crate::storage::Engine>,
+                      sid: u64,
+                      name: &str|
+     -> usize {
+        if let Some(n) = guard.vacuum_temp_table(sid, name) {
+            return n;
+        }
+        guard.vacuum_table(name)
+    };
     if !verbose {
         match table {
             Some(name) => {
-                guard.vacuum_table(name);
+                vacuum_one(&mut guard, session.sid, name);
             }
             None => {
                 // Plain VACUUM only touches tables this role owns
@@ -2908,7 +4161,7 @@ fn txn_vacuum(
     let mut rows: Vec<Row> = Vec::new();
     match table {
         Some(name) => {
-            let n = guard.vacuum_table(name);
+            let n = vacuum_one(&mut guard, session.sid, name);
             rows.push(Row::new(vec![Value::text(format!(
                 "table \"{}\": removed {} dead row version(s)",
                 name, n
@@ -2937,12 +4190,47 @@ fn txn_rollback(
     session: &mut Session,
     chain: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v0.89: ROLLBACK AND CHAIN outside a transaction block is 25001
+    // in PG19 ("ROLLBACK AND CHAIN can only be used in transaction
+    // blocks"); plain ROLLBACK stays the WARNING no-op.
+    if session.txn.is_none() && chain {
+        return Err(err_25001(
+            "ROLLBACK AND CHAIN can only be used in transaction blocks",
+        ));
+    }
+    // v1.04: ROLLBACK inside PG19's implicit transaction block aborts
+    // the block but warns — the client never began a transaction. The
+    // caller (handle_query) starts a fresh implicit block for the rest
+    // of the Query string.
+    if session.txn.as_ref().is_some_and(|t| t.implicit) {
+        if chain {
+            return Err(err_25001(
+                "ROLLBACK AND CHAIN can only be used in transaction blocks",
+            ));
+        }
+        let t = session
+            .txn
+            .take()
+            .expect("implicit transaction checked above");
+        let mut guard = lock_engine(engine);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
+        auto_vacuum(&mut guard, &t.writes);
+        drop(guard);
+        // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
+        session.cursors.clear();
+        // v0.66: rollback reverts every in-transaction GUC change (SET
+        // and SET LOCAL), like PG19.
+        revert_guc_stack(session, t.guc_stack, false);
+        queue_warning(session, "there is no transaction in progress");
+        return Ok(cmd("ROLLBACK"));
+    }
     // Remember characteristics for AND CHAIN before the txn is consumed.
     let chained = if let Some(t) = session.txn.take() {
         let chained = (t.level, t.read_only, t.deferrable);
         let mut guard = lock_engine(engine);
-        undo_all(&mut guard, t.xid, &t.writes);
-        retire_txn(&mut guard, t.xid);
+        undo_all(&mut guard, &t.all_xids(), &t.writes);
+        retire_txn_family(&mut guard, &t);
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
@@ -2955,10 +4243,11 @@ fn txn_rollback(
     };
     if chain {
         // AND CHAIN: new transaction with the same characteristics as the
-        // just-rolled-back one (or defaults if there was no transaction).
-        // The command tag stays ROLLBACK, like PostgreSQL.
+        // just-rolled-back one (v0.89: chain without a transaction is
+        // rejected above, so `chained` is always `Some` here). The
+        // command tag stays ROLLBACK, like PostgreSQL.
         let (level, read_only, deferrable) =
-            chained.unwrap_or((IsolationLevel::ReadCommitted, None, None));
+            chained.expect("CHAIN without a transaction is rejected above");
         txn_begin(engine, session, level, read_only, deferrable)?;
     }
     Ok(cmd("ROLLBACK"))
@@ -2974,21 +4263,36 @@ fn txn_savepoint(
             "SAVEPOINT can only be used in transaction blocks",
         )),
         Some(t) => {
+            // v1.04: savepoint commands are rejected in PG19's implicit
+            // transaction block, like PostgreSQL.
+            if t.implicit {
+                return Err(err_25001(
+                    "SAVEPOINT can only be used in transaction blocks",
+                ));
+            }
             // A savepoint is a position in the write log plus the current
             // row-lock count — no copies.
             let xid = t.xid;
-            let locks = lock_engine(engine).txn_lock_count(xid);
+            let mut guard = lock_engine(engine);
+            let locks = guard.txn_lock_count(xid);
+            // v1.21: the new savepoint scope gets its own sub-xid (PG19
+            // AssignTransactionId, eager — the burn is unobservable).
+            // Registered active via begin_txn so other sessions'
+            // snapshots see it as in-progress (isolation).
+            let sub = guard.begin_txn();
+            drop(guard);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
+            t.sub_xids.push(sub);
+            t.owned_xids.push(sub);
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
             // effects made after the savepoint (PG19).
             t.guc_marks.push(t.guc_stack.len());
-            // v0.16: also snapshot cursor positions and the cursor set.
+            // v1.07: record the transaction characteristics for PG19's
+            // savepoint restore (both ROLLBACK TO and RELEASE).
+            t.txn_char_marks.push((t.read_only, t.level, t.deferrable));
+            // v0.16: also snapshot the cursor set (v0.89: positions are
+            // no longer rewound — PG19 keeps them across ROLLBACK TO).
             t.cursor_marks.push(CursorMark {
-                positions: session
-                    .cursors
-                    .iter()
-                    .map(|(k, c)| (k.clone(), c.pos))
-                    .collect(),
                 names: session.cursors.keys().cloned().collect(),
             });
             Ok(cmd("SAVEPOINT"))
@@ -3006,6 +4310,13 @@ fn txn_rollback_to(
         .txn
         .as_mut()
         .ok_or_else(|| err_25001("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"))?;
+    // v1.04: savepoint commands are rejected in PG19's implicit
+    // transaction block, like PostgreSQL.
+    if t.implicit {
+        return Err(err_25001(
+            "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+        ));
+    }
     let idx = t
         .savepoints
         .iter()
@@ -3018,6 +4329,9 @@ fn txn_rollback_to(
     let to = t.savepoints[idx].1;
     let keep_locks = t.savepoints[idx].2;
     let xid = t.xid;
+    // v1.21: undo must recognize versions stamped with any of the
+    // transaction's xids (top or sub-xids from savepoint scopes).
+    let owns = t.all_xids();
     // Undo everything staged after the savepoint, newest first. Each undo
     // is conditional on the version still being ours (see undo_write_op).
     // v0.9: sequence advances are non-transactional — they survive
@@ -3027,7 +4341,7 @@ fn txn_rollback_to(
         if matches!(op, WriteOp::SeqAdvance { .. }) {
             kept_seq.push(op);
         } else {
-            undo_write_op(&mut guard, xid, &op);
+            undo_write_op(&mut guard, &owns, &op);
         }
     }
     t.writes.extend(kept_seq.into_iter().rev());
@@ -3037,6 +4351,14 @@ fn txn_rollback_to(
     // Savepoints established after the named one are destroyed; the named
     // one stays valid. Rolling back also recovers from an aborted txn.
     t.savepoints.truncate(idx + 1);
+    // v1.21: PG19 aborts the savepoint's subtransaction and restarts it
+    // with the same name — the surviving scope gets a FRESH sub-xid so
+    // post-rollback writes are distinguishable from pre-rollback ones.
+    // Registered active for isolation (see txn_savepoint).
+    t.sub_xids.truncate(idx);
+    let repl = guard.begin_txn();
+    t.sub_xids.push(repl);
+    t.owned_xids.push(repl);
     t.failed = false;
     // v0.66: SET/SET LOCAL effects after the savepoint are canceled,
     // newest first (PG19). The marks established after the named
@@ -3044,24 +4366,31 @@ fn txn_rollback_to(
     let guc_to = t.guc_marks[idx];
     let undone: Vec<GucStackEntry> = t.guc_stack.drain(guc_to..).rev().collect();
     t.guc_marks.truncate(idx + 1);
+    // v1.07: PG19 restores the parent transaction's characteristics on
+    // ROLLBACK TO SAVEPOINT (the TxnChars stack entries do this too;
+    // the explicit mark is authoritative).
+    let (mark_ro, mark_level, mark_def) = t.txn_char_marks[idx];
+    t.read_only = mark_ro;
+    t.level = mark_level;
+    t.deferrable = mark_def;
+    t.txn_char_marks.truncate(idx + 1);
     // The GUC borrow ends here (`t` is dead); restore the canceled
     // effects newest-first, like a mini-abort of the savepoint tail.
     for e in undone {
         restore_saved_guc(session, e.name, e.saved);
     }
-    // v0.16: rewind cursor positions to the savepoint and close cursors
-    // created after it — like Postgres. (NLL: `t` is dead after this.)
-    let mark = session
+    // v0.16: close cursors created after the savepoint (their DECLARE
+    // is undone, like Postgres). v0.89: fetch positions of surviving
+    // cursors are NOT rewound — PG19 keeps the portal position across
+    // ROLLBACK TO SAVEPOINT (verified against the authentic
+    // transactions.out: `FETCH 10 FROM c` returns rows 10-19 after the
+    // rollback, not 0-9 again).
+    let names = session
         .txn
         .as_ref()
         .and_then(|t| t.cursor_marks.get(idx))
-        .map(|m| (m.positions.clone(), m.names.clone()));
-    if let Some((positions, names)) = mark {
-        for (k, c) in session.cursors.iter_mut() {
-            if let Some(p) = positions.get(k) {
-                c.pos = *p;
-            }
-        }
+        .map(|m| m.names.clone());
+    if let Some(names) = names {
         session.cursors.retain(|k, _| names.contains(k));
     }
     session
@@ -3078,6 +4407,13 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         .txn
         .as_mut()
         .ok_or_else(|| err_25001("RELEASE SAVEPOINT can only be used in transaction blocks"))?;
+    // v1.04: savepoint commands are rejected in PG19's implicit
+    // transaction block, like PostgreSQL.
+    if t.implicit {
+        return Err(err_25001(
+            "RELEASE SAVEPOINT can only be used in transaction blocks",
+        ));
+    }
     let idx = t
         .savepoints
         .iter()
@@ -3089,12 +4425,23 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         })?;
     // Destroys the named savepoint and all established after it.
     t.savepoints.truncate(idx);
+    // v1.21: the sub-xid scopes die with their savepoints. The rows keep
+    // their stamped xmins (PG19: released subtransactions keep their xids).
+    t.sub_xids.truncate(idx);
     // v0.16: cursor marks die with their savepoints.
     t.cursor_marks.truncate(idx);
     // v0.66: the GUC marks die with their savepoints too, but the
     // stacked GUC changes are NOT canceled by RELEASE (PG >= 8.3):
     // they still revert at transaction end.
     t.guc_marks.truncate(idx);
+    // v1.07: PG19 restores the parent transaction's characteristics on
+    // RELEASE SAVEPOINT (subcommit restores XactReadOnly etc.), even
+    // though the generic GUC changes survive.
+    let (mark_ro, mark_level, mark_def) = t.txn_char_marks[idx];
+    t.read_only = mark_ro;
+    t.level = mark_level;
+    t.deferrable = mark_def;
+    t.txn_char_marks.truncate(idx);
     Ok(cmd("RELEASE"))
 }
 
@@ -3584,6 +4931,8 @@ fn handle_execute(
                 session.portals.get_mut(&portal_name).unwrap().explain = true;
             }
             Ok(ExecResult::Command { tag }) => {
+                // v1.00: notices before the completion tag.
+                drain_notices(stream, session)?;
                 MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
                 let portal = session.portals.get_mut(&portal_name).unwrap();
                 portal.done = true;
@@ -3602,36 +4951,45 @@ fn handle_execute(
     }
 
     // Emit up to max_rows (<= 0 means all rows).
-    let portal = session.portals.get_mut(&portal_name).unwrap();
-    let pending = portal.pending.as_mut().expect("pending rows");
-    let remaining = pending.rows.len() - pending.pos;
-    let n = if max_rows <= 0 {
-        remaining
-    } else {
-        std::cmp::min(max_rows as usize, remaining)
-    };
-    let mut row_buf = Vec::new();
-    for row in pending.rows.iter().skip(pending.pos).take(n) {
-        send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
-    }
-    pending.pos += n;
-    if pending.pos < pending.rows.len() {
-        MsgBuilder::new(b's').send(stream)?; // PortalSuspended
-    } else {
-        let total = pending.rows.len();
-        // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
-        // v0.10: DML (INSERT/UPDATE/DELETE) completes with its own tag.
-        let tag = if portal.explain {
-            "EXPLAIN".to_string()
-        } else if let Some(t) = portal.dml_tag.clone() {
-            t
+    let completion: Option<String> = {
+        let portal = session.portals.get_mut(&portal_name).unwrap();
+        let pending = portal.pending.as_mut().expect("pending rows");
+        let remaining = pending.rows.len() - pending.pos;
+        let n = if max_rows <= 0 {
+            remaining
         } else {
-            format!("SELECT {}", total)
+            std::cmp::min(max_rows as usize, remaining)
         };
+        let mut row_buf = Vec::new();
+        for row in pending.rows.iter().skip(pending.pos).take(n) {
+            send_data_row_buf(stream, row, &mut row_buf, session.bytea_output)?;
+        }
+        pending.pos += n;
+        if pending.pos < pending.rows.len() {
+            MsgBuilder::new(b's').send(stream)?; // PortalSuspended
+            None
+        } else {
+            let total = pending.rows.len();
+            // v0.8: EXPLAIN completes with the "EXPLAIN" tag, like Postgres.
+            // v0.10: DML (INSERT/UPDATE/DELETE) completes with its own tag.
+            let tag = if portal.explain {
+                "EXPLAIN".to_string()
+            } else if let Some(t) = portal.dml_tag.clone() {
+                t
+            } else {
+                format!("SELECT {}", total)
+            };
+            portal.pending = None;
+            portal.done = true;
+            portal.last_tag = Some(tag.clone());
+            Some(tag)
+        }
+    };
+    // v1.00: notices before the completion tag (the portal borrow has
+    // ended, so session is free).
+    if let Some(tag) = completion {
+        drain_notices(stream, session)?;
         MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
-        portal.pending = None;
-        portal.done = true;
-        portal.last_tag = Some(tag);
     }
     stream.flush()?;
     Ok(())
@@ -3739,6 +5097,8 @@ mod tests {
         let session = Session {
             sid: 4242,
             role: "postgres".to_string(),
+            session_user: "postgres".to_string(),
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -3752,6 +5112,9 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices.
+            pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -3763,12 +5126,17 @@ mod tests {
                 read_only: None,
                 deferrable: None,
                 snapshot: None,
+                first_snapshot_set: false,
                 writes: Vec::new(),
                 savepoints: Vec::new(),
+                sub_xids: Vec::new(),
+                owned_xids: Vec::new(),
                 cursor_marks: Vec::new(),
                 failed: false,
+                implicit: false,
                 guc_stack: Vec::new(),
                 guc_marks: Vec::new(),
+                txn_char_marks: Vec::new(),
             }),
         };
         (engine, session)
@@ -3858,7 +5226,7 @@ mod tests {
             }
         }
         assert_eq!(engine.db.tables["t"][0].rows.len(), 2);
-        undo_all(&mut engine, xid, &writes);
+        undo_all(&mut engine, &[xid], &writes);
         assert!(engine.db.tables["t"][0].rows.is_empty());
     }
 
@@ -3926,6 +5294,8 @@ mod tests {
         Session {
             sid: 4243,
             role: "postgres".to_string(),
+            session_user: "postgres".to_string(),
+            gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
             sql_prepared: HashMap::new(),
@@ -3940,6 +5310,9 @@ mod tests {
             next_txn_deferrable: None,
             bytea_output: crate::storage::ByteaOutput::default(),
             default_toast_compression: crate::storage::ToastCompression::default(),
+            // v1.00: no pending notices.
+            pending_notices: Vec::new(),
+            pending_warnings: Vec::new(),
             // v0.81: parse cache.
             parse_cache: HashMap::new(),
             parse_cache_order: std::collections::VecDeque::new(),
@@ -4253,7 +5626,7 @@ mod tests {
 
     #[test]
     fn v81_is_catalog_changing_ddl() {
-        use crate::sql::{Stmt, parse_statement};
+        use crate::sql::parse_statement;
         // DDL statements bump the catalog epoch.
         for sql in [
             "CREATE TABLE t (a int)",
@@ -4280,5 +5653,629 @@ mod tests {
                 sql
             );
         }
+    }
+
+    // v1.04: PG19 implicit transaction block for multi-statement simple
+    // Query strings.
+
+    #[test]
+    fn v104_implicit_begin_and_end_of_string_commit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-commit");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let t = session.txn.as_ref().expect("implicit txn begun");
+        assert!(t.implicit, "implicit flag must be set");
+        commit_implicit_txn(&engine, &wal, &mut session).expect("commits");
+        assert!(session.txn.is_none(), "block ends at end of Query string");
+        assert!(
+            session.pending_warnings.is_empty(),
+            "normal end-of-string commit is silent"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-commit"));
+    }
+
+    #[test]
+    fn v104_implicit_abort_clears_txn() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        abort_implicit_txn(&engine, &mut session);
+        assert!(session.txn.is_none(), "aborted block leaves no txn");
+    }
+
+    #[test]
+    fn v104_begin_converts_implicit_to_explicit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let xid = session.txn.as_ref().unwrap().xid;
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        let t = session.txn.as_ref().expect("still in a transaction");
+        assert!(!t.implicit, "BEGIN converts the implicit block");
+        assert_eq!(t.xid, xid, "conversion keeps the same transaction");
+    }
+
+    #[test]
+    fn v104_commit_inside_implicit_warns_and_ends_block() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-commit-warn");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let out = txn_commit(&engine, &wal, &mut session, false).unwrap();
+        match out {
+            ExecResult::Command { tag } => assert_eq!(tag, "COMMIT"),
+            other => panic!("expected COMMIT tag, got {:?}", other),
+        }
+        assert!(session.txn.is_none(), "in-Q COMMIT ends the block");
+        assert_eq!(
+            session.pending_warnings,
+            vec!["there is no transaction in progress".to_string()],
+            "PG19 warning is queued"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-commit-warn"));
+    }
+
+    #[test]
+    fn v104_rollback_inside_implicit_warns_and_ends_block() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let out = txn_rollback(&engine, &mut session, false).unwrap();
+        match out {
+            ExecResult::Command { tag } => assert_eq!(tag, "ROLLBACK"),
+            other => panic!("expected ROLLBACK tag, got {:?}", other),
+        }
+        assert!(session.txn.is_none(), "in-Q ROLLBACK ends the block");
+        assert_eq!(
+            session.pending_warnings,
+            vec!["there is no transaction in progress".to_string()],
+            "PG19 warning is queued"
+        );
+    }
+
+    #[test]
+    fn v104_savepoint_commands_rejected_in_implicit() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        for (name, r) in [
+            ("savepoint", txn_savepoint(&engine, &mut session, "sp")),
+            ("rollback-to", txn_rollback_to(&engine, &mut session, "sp")),
+            ("release", txn_release(&mut session, "sp")),
+        ] {
+            let e = r.expect_err(&format!("{} must fail in implicit block", name));
+            assert_eq!(e.code, "25001", "{} SQLSTATE", name);
+        }
+        assert!(
+            session.txn.as_ref().is_some_and(|t| t.implicit),
+            "rejected savepoint commands leave the block intact"
+        );
+    }
+
+    #[test]
+    fn v104_chain_in_implicit_rejected() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-implicit-chain");
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        let e = txn_commit(&engine, &wal, &mut session, true)
+            .expect_err("COMMIT AND CHAIN must fail in implicit block");
+        assert_eq!(e.code, "25001");
+        let e = txn_rollback(&engine, &mut session, true)
+            .expect_err("ROLLBACK AND CHAIN must fail in implicit block");
+        assert_eq!(e.code, "25001");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-implicit-chain"));
+    }
+
+    #[test]
+    fn v104_explicit_txn_has_no_implicit_behavior() {
+        // Regression: ordinary explicit transactions never warn and
+        // never carry the implicit flag.
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal("rg104-explicit");
+        let mut session = session_no_txn();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!session.txn.as_ref().unwrap().implicit);
+        txn_commit(&engine, &wal, &mut session, false).unwrap();
+        assert!(
+            session.pending_warnings.is_empty(),
+            "no warning on explicit COMMIT"
+        );
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rg104-explicit"));
+    }
+    // v1.07: generic GUC validation (PG19-compatible).
+    #[test]
+    fn v107_generic_guc_validation() {
+        // Booleans accept PG spellings.
+        assert_eq!(
+            validate_generic_guc("enable_seqscan", "off").unwrap(),
+            "off"
+        );
+        assert_eq!(validate_generic_guc("enable_seqscan", "0").unwrap(), "off");
+        assert_eq!(validate_generic_guc("enable_seqscan", "on").unwrap(), "on");
+        let e = validate_generic_guc("enable_seqscan", "maybe").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // extra_float_digits range.
+        assert_eq!(
+            validate_generic_guc("extra_float_digits", "-1").unwrap(),
+            "-1"
+        );
+        let e = validate_generic_guc("extra_float_digits", "4").unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert!(e.message.contains("-15 .. 3"));
+        // work_mem minimum.
+        assert_eq!(validate_generic_guc("work_mem", "64MB").unwrap(), "65536kB");
+        let e = validate_generic_guc("work_mem", "32kB").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // plan_cache_mode enum.
+        assert_eq!(
+            validate_generic_guc("plan_cache_mode", "force_generic_plan").unwrap(),
+            "force_generic_plan"
+        );
+        let e = validate_generic_guc("plan_cache_mode", "sometimes").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // standard_conforming_strings = off is 0A000.
+        let e = validate_generic_guc("standard_conforming_strings", "off").unwrap_err();
+        assert_eq!(e.code, "0A000");
+    }
+
+    // v1.07: generic GUC SET/SHOW/RESET round-trip.
+    #[test]
+    fn v107_generic_guc_roundtrip() {
+        let mut session = session_no_txn();
+        let set = |s: &mut Session, n: &str, v: &str| {
+            stmt_set_guc(s, n, &SetValue::Str(v.to_string()), false).unwrap();
+        };
+        // Defaults.
+        assert_eq!(show_text(&session, "enable_seqscan"), "on");
+        assert_eq!(show_text(&session, "enable_partitionwise_join"), "off");
+        assert_eq!(show_text(&session, "extra_float_digits"), "1");
+        assert_eq!(show_text(&session, "work_mem"), "4MB");
+        assert_eq!(show_text(&session, "plan_cache_mode"), "auto");
+        // SET + SHOW.
+        set(&mut session, "enable_seqscan", "off");
+        assert_eq!(show_text(&session, "enable_seqscan"), "off");
+        set(&mut session, "extra_float_digits", "-2");
+        assert_eq!(show_text(&session, "extra_float_digits"), "-2");
+        // RESET restores the default.
+        stmt_reset_guc(&mut session, "enable_seqscan").unwrap();
+        assert_eq!(show_text(&session, "enable_seqscan"), "on");
+        stmt_reset_guc(&mut session, "extra_float_digits").unwrap();
+        assert_eq!(show_text(&session, "extra_float_digits"), "1");
+        // Unknown GUC is still 42704.
+        let e = stmt_set_guc(
+            &mut session,
+            "no_such_guc",
+            &SetValue::Str("1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "42704");
+    }
+
+    // v1.07: default_transaction_isolation SET/SHOW/RESET.
+    #[test]
+    fn v107_default_txn_isolation() {
+        let mut session = session_no_txn();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "read committed"
+        );
+        stmt_set_guc(
+            &mut session,
+            "default_transaction_isolation",
+            &SetValue::Str("serializable".into()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "serializable"
+        );
+        stmt_reset_guc(&mut session, "default_transaction_isolation").unwrap();
+        assert_eq!(
+            show_text(&session, "default_transaction_isolation"),
+            "read committed"
+        );
+        let e = stmt_set_guc(
+            &mut session,
+            "default_transaction_isolation",
+            &SetValue::Str("chaos".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "22023");
+    }
+
+    // v1.07: RESET of current-transaction GUCs is 0A000.
+    #[test]
+    fn v107_reset_current_txn_guc_is_0a000() {
+        let mut session = session_no_txn();
+        for name in [
+            "transaction_isolation",
+            "transaction_read_only",
+            "transaction_deferrable",
+        ] {
+            let e = stmt_reset_guc(&mut session, name).unwrap_err();
+            assert_eq!(e.code, "0A000", "{}", name);
+        }
+    }
+
+    // v1.07: SET TRANSACTION checks (25001) inside a transaction.
+    #[test]
+    fn v107_set_transaction_checks() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        // Isolation change before any snapshot is fine.
+        stmt_set_transaction(
+            &mut session,
+            Some(IsolationLevel::Serializable),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            session.txn.as_ref().unwrap().level,
+            IsolationLevel::Serializable
+        );
+        // Simulate a snapshot having been taken.
+        session.txn.as_mut().unwrap().first_snapshot_set = true;
+        // Isolation change after first snapshot: 25001.
+        let e = stmt_set_transaction(
+            &mut session,
+            Some(IsolationLevel::ReadCommitted),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "25001");
+        // read-write after a read-only transaction has taken a snapshot: 25001.
+        session.txn.as_mut().unwrap().read_only = Some(true);
+        let e =
+            stmt_set_transaction(&mut session, None, Some(false), None, None, false).unwrap_err();
+        assert_eq!(e.code, "25001");
+        assert!(e.message.contains("before any query"));
+    }
+
+    // v1.07: SET TRANSACTION SNAPSHOT identifier validation.
+    #[test]
+    fn v107_set_transaction_snapshot_validation() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        // Outside a transaction: succeeds (PG warns).
+        stmt_set_transaction(&mut session, None, None, None, Some("0003".into()), false).unwrap();
+        txn_begin(
+            &engine,
+            &mut session,
+            IsolationLevel::ReadCommitted,
+            None,
+            None,
+        )
+        .unwrap();
+        // Bad characters: 22023.
+        let e = stmt_set_transaction(&mut session, None, None, None, Some("abc".into()), false)
+            .unwrap_err();
+        assert_eq!(e.code, "22023");
+        // Well-formed but unknown: 42704.
+        let e = stmt_set_transaction(
+            &mut session,
+            None,
+            None,
+            None,
+            Some("0003-A1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "42704");
+    }
+
+    // v1.07: SET ROLE / RESET ROLE.
+    #[test]
+    fn v107_set_reset_role() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let mut session = session_no_txn();
+        // session_user is postgres (superuser); SET ROLE to an unknown role: 42704.
+        let e = stmt_set_role(&engine, &mut session, Some("nosuchrole".into()), false).unwrap_err();
+        assert_eq!(e.code, "42704");
+        // RESET ROLE restores the session user.
+        session.role = "someone".to_string();
+        stmt_set_role(&engine, &mut session, None, false).unwrap();
+        assert_eq!(session.role, "postgres");
+        assert_eq!(show_text(&session, "role"), "postgres");
+        assert_eq!(show_text(&session, "session_user"), "postgres");
+    }
+
+    // ------------------------------------------------------------------
+    // v1.58: SQL-level PREPARE / EXECUTE / DEALLOCATE + EXPLAIN EXECUTE.
+    // PG19 grounding: prepare.c (PrepareQuery/ExecuteQuery/
+    // DeallocateQuery/ExplainExecuteQuery) and tcop/utility.c tags.
+    // ------------------------------------------------------------------
+
+    fn v158_setup(tag: &str) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        let wal = scratch_wal(&format!("rg158-prepare-{tag}"));
+        let mut session = session_no_txn();
+        begin_implicit_txn(&engine, &mut session);
+        for sql in [
+            "CREATE TABLE t (a int, b numeric, c text, d bool)",
+            "INSERT INTO t VALUES (1, 1.5, 'one', true), (2, 2.5, 'two', false), (3, NULL, 'three', true)",
+        ] {
+            let stmt = crate::sql::parse_statement(sql).expect("parses");
+            run_statement(&engine, &wal, &mut session, &stmt).expect("setup");
+        }
+        commit_implicit_txn(&engine, &wal, &mut session).expect("commits");
+        (engine, wal, session)
+    }
+
+    fn v158_run(
+        engine: &Arc<Mutex<Engine>>,
+        wal: &Arc<Mutex<Wal>>,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecResult, ExecError> {
+        let stmt = crate::sql::parse_statement(sql).expect("parses");
+        run_statement(engine, wal, session, &stmt)
+    }
+
+    /// Render every result row as a `|`-joined string of values.
+    fn v158_rows(res: ExecResult) -> Vec<String> {
+        match res {
+            ExecResult::Select { rows, .. } => rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect(),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    /// EXPLAIN plan lines as plain strings.
+    fn v158_plan(res: ExecResult) -> Vec<String> {
+        match res {
+            ExecResult::Explain { rows, .. } => rows
+                .iter()
+                .map(|r| r[0].to_text().unwrap_or_default())
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    /// v1.58: PREPARE + EXECUTE returns exactly the rows of the
+    /// equivalent direct query (result identity).
+    #[test]
+    fn v158_prepare_execute_result_identity() {
+        let (engine, wal, mut session) = v158_setup("identity");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int) AS SELECT a, c FROM t WHERE a > $1 ORDER BY a",
+        )
+        .expect("prepare");
+        let via_execute =
+            v158_rows(v158_run(&engine, &wal, &mut session, "EXECUTE q(1)").expect("execute"));
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a, c FROM t WHERE a > 1 ORDER BY a",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert_eq!(via_execute, vec!["2|two", "3|three"]);
+    }
+
+    /// v1.58: result identity across parameter types (int, numeric,
+    /// text, bool), including a NULL argument.
+    #[test]
+    fn v158_prepare_execute_param_types() {
+        let (engine, wal, mut session) = v158_setup("ptypes");
+        // int + numeric + text + bool in one statement.
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q4 (int, numeric, text, bool) AS SELECT a FROM t WHERE a = $1 AND b = $2 AND c = $3 AND d = $4",
+        )
+        .expect("prepare");
+        let via_execute = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXECUTE q4(2, 2.5, 'two', false)",
+            )
+            .expect("execute"),
+        );
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a FROM t WHERE a = 2 AND b = 2.5 AND c = 'two' AND d = false",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert_eq!(via_execute, vec!["2"]);
+        // NULL argument: `a = NULL` is never true, like the direct query.
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE qn (int) AS SELECT a FROM t WHERE a = $1",
+        )
+        .expect("prepare");
+        let via_execute =
+            v158_rows(v158_run(&engine, &wal, &mut session, "EXECUTE qn(NULL)").expect("execute"));
+        let direct = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a FROM t WHERE a = NULL",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert!(via_execute.is_empty());
+    }
+
+    /// v1.58: EXPLAIN EXECUTE plans the prepared statement with the
+    /// arguments bound (PG19 custom-plan semantics) — the plan is
+    /// identical to EXPLAIN of the substituted direct query.
+    #[test]
+    fn v158_explain_execute_matches_direct() {
+        let (engine, wal, mut session) = v158_setup("explain");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int) AS SELECT a FROM t WHERE a > $1",
+        )
+        .expect("prepare");
+        let via_execute = v158_plan(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXPLAIN (COSTS OFF) EXECUTE q(1)",
+            )
+            .expect("explain execute"),
+        );
+        let direct = v158_plan(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "EXPLAIN (COSTS OFF) SELECT a FROM t WHERE a > 1",
+            )
+            .expect("direct"),
+        );
+        assert_eq!(via_execute, direct);
+        assert!(via_execute.iter().any(|l| l.contains("Seq Scan on t")));
+    }
+
+    /// v1.58: EXECUTE of an unknown name is 26000 (PG19
+    /// ERRCODE_UNDEFINED_PSTATEMENT).
+    #[test]
+    fn v158_execute_unknown_name() {
+        let (engine, wal, mut session) = v158_setup("unknown");
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+        assert_eq!(e.message, "prepared statement \"nope\" does not exist");
+        // Same for EXPLAIN EXECUTE.
+        let e = v158_run(&engine, &wal, &mut session, "EXPLAIN EXECUTE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+    }
+
+    /// v1.58: duplicate PREPARE is 42P05 (PG19
+    /// ERRCODE_DUPLICATE_PSTATEMENT).
+    #[test]
+    fn v158_prepare_duplicate() {
+        let (engine, wal, mut session) = v158_setup("dup");
+        v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 1").expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 2").unwrap_err();
+        assert_eq!(e.code, "42P05");
+        assert_eq!(e.message, "prepared statement \"q\" already exists");
+    }
+
+    /// v1.58: wrong argument count is 42601 with PG's detail line
+    /// (PG19 prepare.c EvaluateParams).
+    #[test]
+    fn v158_execute_wrong_arity() {
+        let (engine, wal, mut session) = v158_setup("arity");
+        v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "PREPARE q (int, int) AS SELECT $1 + $2",
+        )
+        .expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE q(1)").unwrap_err();
+        assert_eq!(e.code, "42601");
+        assert_eq!(
+            e.message,
+            "wrong number of parameters for prepared statement \"q\""
+        );
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Expected 2 parameters but got 1.")
+        );
+    }
+
+    /// v1.58: DEALLOCATE of an unknown name is 26000 (PG19
+    /// DropPreparedStatement); DEALLOCATE ALL clears everything and
+    /// reports the PG tag.
+    #[test]
+    fn v158_deallocate_semantics() {
+        let (engine, wal, mut session) = v158_setup("dealloc");
+        let e = v158_run(&engine, &wal, &mut session, "DEALLOCATE nope").unwrap_err();
+        assert_eq!(e.code, "26000");
+        assert_eq!(e.message, "prepared statement \"nope\" does not exist");
+        v158_run(&engine, &wal, &mut session, "PREPARE q AS SELECT 1").expect("prepare");
+        // The optional PREPARE keyword parses (PG19 gram.y).
+        match v158_run(&engine, &wal, &mut session, "DEALLOCATE PREPARE q").expect("deallocate") {
+            ExecResult::Command { tag } => assert_eq!(tag, "DEALLOCATE"),
+            other => panic!("expected Command, got {:?}", other),
+        }
+        // Gone now.
+        let e = v158_run(&engine, &wal, &mut session, "EXECUTE q").unwrap_err();
+        assert_eq!(e.code, "26000");
+        // DEALLOCATE ALL clears the rest with PG's tag.
+        v158_run(&engine, &wal, &mut session, "PREPARE q1 AS SELECT 1").expect("prepare");
+        v158_run(&engine, &wal, &mut session, "PREPARE q2 AS SELECT 2").expect("prepare");
+        match v158_run(&engine, &wal, &mut session, "DEALLOCATE ALL").expect("deallocate all") {
+            ExecResult::Command { tag } => assert_eq!(tag, "DEALLOCATE ALL"),
+            other => panic!("expected Command, got {:?}", other),
+        }
+        assert!(session.sql_prepared.is_empty());
+    }
+
+    /// v1.58: prepared statements are session-scoped — a second
+    /// session cannot see (or execute) the first session's statements.
+    #[test]
+    fn v158_prepared_statements_are_session_scoped() {
+        let (engine, wal, mut session_a) = v158_setup("scoped");
+        let mut session_b = session_no_txn();
+        v158_run(&engine, &wal, &mut session_a, "PREPARE q AS SELECT 1").expect("prepare");
+        let e = v158_run(&engine, &wal, &mut session_b, "EXECUTE q").unwrap_err();
+        assert_eq!(e.code, "26000");
+        // And deallocating in B does not touch A's statement.
+        v158_run(&engine, &wal, &mut session_b, "DEALLOCATE ALL").expect("deallocate all");
+        v158_rows(v158_run(&engine, &wal, &mut session_a, "EXECUTE q").expect("execute"));
     }
 }

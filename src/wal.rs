@@ -23,10 +23,41 @@
 //! order, so replay rebuilds exactly the published version chains with
 //! identical xmin/xmax — and therefore identical visibility.
 //!
-//! Format version 12 (`RGSWAL12` / `RGSCHK10`) is NOT compatible with v0.81
-//! or earlier: v0.82 WAL-logs type DDL (`CreateType`/`DropType` records)
-//! and checkpoints the type catalog. Like every format bump, old data
+//! Format version 20 (`RGSWAL20` / `RGSCHK16`) is NOT compatible with v1.40
+//! or earlier: v1.41 WAL-logs and checkpoints the real PG attribute
+//! numbers (`attnums`/`next_attnum`) and the `fillfactor` storage
+//! parameter on `CreateTable`/`AlterTable` records and table images.
+//! Like every format bump, old data directories are refused with a
+//! clear error instead of being misread.
+//!
+//! Format version 19 (`RGSWAL19` / `RGSCHK15`) is NOT compatible with v1.04
+//! or earlier: v1.05 WAL-logs the lazy toast-table reltoastrelid link
+//! (`WalRecord::SetToastRelid`, record tag 28). The checkpoint format is
+//! unchanged. Like every format bump, old data directories are refused
+//! with a clear error instead of being misread.
+//!
+//! Format version 18 (`RGSWAL18` / `RGSCHK15`) is NOT compatible with v0.98
+//! or earlier: v0.99 WAL-logs and checkpoints the sequence data type
+//! (`WalSequence.seq_type`). Like every format bump, old data directories
+//! are refused with a clear error instead of being misread.
+//!
+//! Format version 17 (`RGSWAL17` / `RGSCHK14`) is NOT compatible with v0.97
+//! or earlier: v0.98 WAL-logs and checkpoints the sequence CACHE size
+//! (`WalSequence.cache`). Like every format bump, old data directories
+//! are refused with a clear error instead of being misread.
+//!
+//! Format version 16 (`RGSWAL16` / `RGSCHK13`) is NOT compatible with v0.95
+//! or earlier: v0.96 WAL-logs table inheritance links (`inherits` on
+//! `CreateTable`/`AlterTable`) and checkpoints them in table images.
+//! Like every format bump, old data directories are refused with a
+//! clear error instead of being misread.
+//!
+//! Format version 14 (`RGSWAL14` / `RGSCHK12`) is NOT compatible with v0.85
+//! or earlier: v0.86 WAL-logs function/operator DDL (`CreateFunction` /
+//! `DropFunction` / `CreateOperator` / `DropOperator`) and checkpoints
+//! the function/operator catalogs. Like every format bump, old data
 //! directories are refused with a clear error instead of being misread.
+//! v0.85 was `RGSWAL13` / `RGSCHK11`; v0.82 was `RGSWAL12` / `RGSCHK10`;
 //! v0.72 was `RGSWAL11` / `RGSCHK09`.
 //!
 //! Records are grouped into per-commit *batches*. A batch is one
@@ -129,14 +160,29 @@ use crate::storage::{
 const WAL_NAME: &str = "wal.log";
 const CHKPT_NAME: &str = "checkpoint.dat";
 const CHKPT_TMP: &str = "checkpoint.dat.tmp";
-const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK10";
+const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v0.72: version 11 adds the `is_partitioned` flag to partition
 /// metadata. v10 checkpoints are refused; remove
 /// the data directory to start fresh (same policy as prior bumps).
 /// v0.82: version 12 adds the named/shell type catalog (`eng.db.types`),
 /// so CREATE TYPE survives checkpoint/restart. v11 checkpoints are
 /// refused; remove the data directory to start fresh.
-const CHKPT_VERSION: u32 = 12;
+/// v0.85: version 13 adds domain definitions to the type catalog and
+/// per-column composite/domain type use to table images. v12
+/// checkpoints are refused; remove the data directory to start fresh.
+/// v0.86: version 14 adds the function/operator catalogs
+/// (`eng.db.functions` / `eng.db.operators`). v13 checkpoints are
+/// refused; remove the data directory to start fresh.
+/// v0.88: version 15 adds per-column direction / null-placement /
+/// expression sources and the partial predicate to index images. v14
+/// checkpoints are refused; remove the data directory to start fresh.
+/// v0.96: version 16 adds the inheritance parent links (`inherits`) to
+/// table images. v15 checkpoints are refused; remove the data
+/// directory to start fresh.
+/// v0.98: version 17 adds the sequence CACHE size to sequence
+/// images. v16 checkpoints are refused; remove the data directory
+/// to start fresh.
+const CHKPT_VERSION: u32 = 17;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -154,9 +200,26 @@ const CHKPT_VERSION: u32 = 12;
 /// not just a compressed flag. Old `RGSWAL09` files are refused loudly.
 /// v0.72: `RGSWAL11` — partition metadata carries the `is_partitioned`
 /// flag. Old `RGSWAL10` files are refused loudly.
-/// v0.82: `RGSWAL12` — new `CreateType` / `DropType` records (tags 22/23)
-/// WAL-log type DDL. Old `RGSWAL11` files are refused loudly.
-const WAL_MAGIC: &[u8; 8] = b"RGSWAL12";
+/// v0.85: `RGSWAL13` — `CreateType` carries the domain definition
+/// (base type + s-expr CHECKs/DEFAULT); `CreateTable`/`AlterTable`
+/// carry per-column `composite_types`/`domain_types`/`domain_elem`.
+/// Old `RGSWAL12` files are refused loudly.
+/// v0.86: `RGSWAL14` — function/operator DDL records
+/// (`CreateFunction`/`DropFunction`/`CreateOperator`/`DropOperator`,
+/// tags 24-27). Old `RGSWAL13` files are refused loudly.
+/// v0.88: `RGSWAL15` — `CreateIndex` carries per-column direction /
+/// null-placement / expression sources plus the partial predicate.
+/// Old `RGSWAL14` files are refused loudly.
+/// v0.96: `RGSWAL16` — `CreateTable`/`AlterTable` carry the
+/// inheritance parent links (`inherits`). Old `RGSWAL15` files are
+/// refused loudly.
+/// v0.99: `RGSWAL18` — sequence records carry the data type.
+/// v1.05: `RGSWAL19` — new `SetToastRelid` record (tag 28).
+/// Old `RGSWAL18` files are refused loudly.
+/// v1.41: `RGSWAL20` — `CreateTable`/`AlterTable` carry `attnums`,
+/// `next_attnum`, and `fillfactor`. Old `RGSWAL19` files are refused
+/// loudly.
+const WAL_MAGIC: &[u8; 8] = b"RGSWAL20";
 const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -279,6 +342,24 @@ pub enum WalRecord {
         /// v0.41: per-column explicit compression methods as
         /// ToastCompression codes, 0 = default (`col_compression`).
         col_compression: Vec<u8>,
+        /// v0.85: named composite type per column (`composite_types`);
+        /// empty on old records.
+        composite_types: Vec<Option<String>>,
+        /// v0.85: domain type per column (`domain_types`); empty on old
+        /// records.
+        domain_types: Vec<Option<String>>,
+        /// v0.85: domain applies to array elements (`domain_elem`); empty
+        /// on old records.
+        domain_elem: Vec<bool>,
+        /// v0.96: inheritance parent links (`inherits`); empty on old
+        /// records.
+        inherits: Vec<String>,
+        /// v1.41: real PG attribute numbers per column (`attnums`) and
+        /// the never-reused next-attnum counter (`next_attnum`).
+        attnums: Vec<i16>,
+        next_attnum: i16,
+        /// v1.41: `fillfactor` storage parameter (10–100).
+        fillfactor: u8,
         xmin: u64,
     },
     InsertRows {
@@ -318,6 +399,16 @@ pub enum WalRecord {
         unique: bool,
         /// v0.9: constraint-owned backing index.
         internal: bool,
+        /// v0.88: per-key-column DESC flags (parallel to `columns`).
+        desc: Vec<bool>,
+        /// v0.88: per-key-column NULLS FIRST flags (parallel to
+        /// `columns`).
+        nulls_first: Vec<bool>,
+        /// v0.88: per-key-column expression source (`Some`) vs plain
+        /// column (`None`); parallel to `columns`.
+        exprs: Vec<Option<String>>,
+        /// v0.88: partial-index predicate source, if any.
+        predicate: Option<String>,
         xmin: u64,
     },
     DropIndex {
@@ -348,6 +439,23 @@ pub enum WalRecord {
         /// v0.41: per-column explicit compression methods as
         /// ToastCompression codes, 0 = default (`col_compression`).
         col_compression: Vec<u8>,
+        /// v0.85: named composite type per column (`composite_types`);
+        /// empty on old records.
+        composite_types: Vec<Option<String>>,
+        /// v0.85: domain type per column (`domain_types`); empty on old
+        /// records.
+        domain_types: Vec<Option<String>>,
+        /// v0.85: domain applies to array elements (`domain_elem`); empty
+        /// on old records.
+        domain_elem: Vec<bool>,
+        /// v0.96: inheritance parent links (`inherits`); empty on old
+        /// records.
+        inherits: Vec<String>,
+        /// v1.41: real PG attribute numbers per column (`attnums`),
+        /// the never-reused next-attnum counter, and `fillfactor`.
+        attnums: Vec<i16>,
+        next_attnum: i16,
+        fillfactor: u8,
         next_value_id: u32,
         /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
@@ -428,12 +536,67 @@ pub enum WalRecord {
         name: String,
         like_base: Option<String>,
         composite: Option<Vec<(String, ColType, Option<String>)>>,
+        /// v0.85: domain definition (None for shell/LIKE/composite types).
+        domain: Option<WalDomain>,
         xmin: u64,
     },
     DropType {
         name: String,
         xmax: u64,
     },
+    // --- v0.86: function/operator DDL. CREATE carries the full
+    // definition so replay rebuilds the catalog entry exactly; DROP
+    // removes it. The function body travels as the raw string and is
+    // re-parsed on replay.
+    CreateFunction {
+        name: String,
+        arg_names: Vec<Option<String>>,
+        arg_types: Vec<String>,
+        ret_type: String,
+        returns_set: bool,
+        lang: u8,
+        body: String,
+        volatility: u8,
+        strict: bool,
+        xmin: u64,
+    },
+    DropFunction {
+        name: String,
+        /// v0.87: the specific overload's argument types.
+        arg_types: Vec<String>,
+        xmax: u64,
+    },
+    CreateOperator {
+        name: String,
+        defs: Vec<WalOperDef>,
+        xmin: u64,
+    },
+    DropOperator {
+        name: String,
+        xmax: u64,
+    },
+    // --- v1.05: the lazy toast-table safety net's reltoastrelid link
+    // (`pg_class.reltoastrelid`). Staged by
+    // `WriteOp::SetToastRelid`; replay sets the link on the table's
+    // live version (creating nothing — the toast table itself rides in
+    // its own CreateTable record).
+    SetToastRelid {
+        name: String,
+        toast_relid: u32,
+        xmin: u64,
+    },
+}
+
+/// v0.86: one operator definition in WAL/checkpoint form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalOperDef {
+    pub procedure: String,
+    pub leftarg: Option<String>,
+    pub rightarg: Option<String>,
+    pub commutator: Option<String>,
+    pub negator: Option<String>,
+    pub hashes: bool,
+    pub merges: bool,
 }
 
 /// One GRANT entry in WAL/checkpoint form (v0.11).
@@ -441,6 +604,20 @@ pub enum WalRecord {
 pub struct WalAcl {
     pub role: String,
     pub privs: u32,
+}
+
+/// v0.85: a domain definition in WAL/checkpoint form. CHECKs and the
+/// DEFAULT travel as s-expr strings (`sql::encode_domain_checks` /
+/// `encode_domain_default`); the base type uses the binary `col_type`
+/// codec.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalDomain {
+    pub base: ColType,
+    pub base_named: Option<String>,
+    pub base_domain: Option<String>,
+    pub checks: String,
+    pub not_null: bool,
+    pub default: String,
 }
 
 impl WalAcl {
@@ -554,11 +731,16 @@ impl WalRole {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalSequence {
     pub name: String,
+    /// v0.99: sequence data type (0 = smallint, 1 = integer, 2 = bigint).
+    pub seq_type: u8,
     pub start: i64,
     pub increment: i64,
     pub min_value: i64,
     pub max_value: i64,
     pub cycle: bool,
+    /// v0.98: CACHE size (Postgres default 1). Stored for catalog
+    /// fidelity; the engine hands out values one at a time.
+    pub cache: i64,
     /// Last value returned by nextval; i64::MIN sentinel = never called.
     pub current: i64,
     pub current_is_set: bool,
@@ -574,11 +756,17 @@ impl WalSequence {
     pub fn of(s: &crate::storage::Sequence) -> Self {
         WalSequence {
             name: s.name.clone(),
+            seq_type: match s.seq_type {
+                crate::sql::SeqType::SmallInt => 0,
+                crate::sql::SeqType::Integer => 1,
+                crate::sql::SeqType::BigInt => 2,
+            },
             start: s.start,
             increment: s.increment,
             min_value: s.min_value,
             max_value: s.max_value,
             cycle: s.cycle,
+            cache: s.cache,
             current: s.current.unwrap_or(i64::MIN),
             current_is_set: s.current.is_some(),
             is_called: s.is_called,
@@ -591,11 +779,17 @@ impl WalSequence {
     pub fn into_sequence(self, created_xmin: u64) -> crate::storage::Sequence {
         crate::storage::Sequence {
             name: self.name,
+            seq_type: match self.seq_type {
+                0 => crate::sql::SeqType::SmallInt,
+                1 => crate::sql::SeqType::Integer,
+                _ => crate::sql::SeqType::BigInt,
+            },
             start: self.start,
             increment: self.increment,
             min_value: self.min_value,
             max_value: self.max_value,
             cycle: self.cycle,
+            cache: self.cache,
             current: if self.current_is_set {
                 Some(self.current)
             } else {
@@ -1114,6 +1308,21 @@ impl Enc {
                 self.u8(21);
                 return;
             }
+            // v1.17: xid; tag appends after v0.81's.
+            ColType::Xid => {
+                self.u8(24);
+                return;
+            }
+            // v1.39: bit; tag appends after v1.17's.
+            ColType::Bit => {
+                self.u8(25);
+                return;
+            }
+            // v1.40: tid; tag appends after v1.39's.
+            ColType::Tid => {
+                self.u8(26);
+                return;
+            }
             // v0.78: array; tag appends after v0.73's, then the PG array
             // OID (which identifies the element type). Arrays never
             // appear as table columns — no DDL support — but the codec
@@ -1217,9 +1426,33 @@ impl Enc {
                     self.value(e);
                 }
             }
-            // v0.73: records never persist (INSERT/CTAS coerce or reject
-            // them first); encoding one is an internal bug.
-            Value::Record(_) => panic!("wal: whole-row record values are never stored"),
+            // v0.84: composite values (tag 18) — field count, then
+            // (name, value) pairs. Reachable for whole-column
+            // composite inserts (the v0.73 panic wrongly assumed
+            // records never persist) and for composite arrays built
+            // by INSERT target indirection.
+            Value::Record(fields) => {
+                self.u8(18);
+                self.u32(fields.len() as u32);
+                for (name, val) in fields {
+                    self.str(name);
+                    self.value(val);
+                }
+            }
+            // v1.39: bit-string values (tag 19) — bit length, then the
+            // bytes (the length matters: trailing bits are padding).
+            Value::BitString(b) => {
+                self.u8(19);
+                self.u32(b.bitlen);
+                self.u32(b.bytes.len() as u32);
+                self.bytes(&b.bytes);
+            }
+            // v1.40: tid values; tag appends after v1.39's.
+            Value::Tid(b, o) => {
+                self.u8(20);
+                self.u32(*b);
+                self.u32(*o);
+            }
         }
     }
 
@@ -1243,6 +1476,13 @@ impl Enc {
                 oid,
                 toast_relid,
                 col_compression,
+                composite_types,
+                domain_types,
+                domain_elem,
+                inherits,
+                attnums,
+                next_attnum,
+                fillfactor,
                 xmin,
             } => {
                 self.u8(1);
@@ -1259,6 +1499,19 @@ impl Enc {
                 for m in col_compression {
                     self.u8(*m);
                 }
+                // v0.85: composite/domain type use per column.
+                self.opt_str_list(composite_types);
+                self.opt_str_list(domain_types);
+                self.bool_list(domain_elem);
+                // v0.96: inheritance parent links.
+                self.str_list(inherits);
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                self.u32(attnums.len() as u32);
+                for a in attnums {
+                    self.i16(*a);
+                }
+                self.i16(*next_attnum);
+                self.u8(*fillfactor);
                 self.u64(*xmin);
             }
             WalRecord::InsertRows { table, rows } => {
@@ -1329,6 +1582,10 @@ impl Enc {
                 columns,
                 unique,
                 internal,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
                 xmin,
             } => {
                 self.u8(5);
@@ -1340,6 +1597,18 @@ impl Enc {
                 }
                 self.u8(*unique as u8);
                 self.u8(*internal as u8);
+                // v0.88: per-column direction / null placement /
+                // expression sources, plus the partial predicate.
+                self.bool_list(desc);
+                self.bool_list(nulls_first);
+                self.opt_str_list(exprs);
+                match predicate {
+                    Some(p) => {
+                        self.u8(1);
+                        self.str(p);
+                    }
+                    None => self.u8(0),
+                }
                 self.u64(*xmin);
             }
             WalRecord::DropIndex { name, xmax } => {
@@ -1360,6 +1629,13 @@ impl Enc {
                 toast_target,
                 col_storage,
                 col_compression,
+                composite_types,
+                domain_types,
+                domain_elem,
+                inherits,
+                attnums,
+                next_attnum,
+                fillfactor,
                 next_value_id,
                 toast_info,
                 xmin,
@@ -1385,6 +1661,19 @@ impl Enc {
                 for m in col_compression {
                     self.u8(*m);
                 }
+                // v0.85: composite/domain type use per column.
+                self.opt_str_list(composite_types);
+                self.opt_str_list(domain_types);
+                self.bool_list(domain_elem);
+                // v0.96: inheritance parent links.
+                self.str_list(inherits);
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                self.u32(attnums.len() as u32);
+                for a in attnums {
+                    self.i16(*a);
+                }
+                self.i16(*next_attnum);
+                self.u8(*fillfactor);
                 self.u32(*next_value_id);
                 self.u32(toast_info.len() as u32);
                 for (k, c) in toast_info {
@@ -1501,6 +1790,7 @@ impl Enc {
                 name,
                 like_base,
                 composite,
+                domain,
                 xmin,
             } => {
                 self.u8(22);
@@ -1530,12 +1820,142 @@ impl Enc {
                     }
                     None => self.u8(0),
                 }
+                // v0.85: domain definition (present only for domains).
+                match domain {
+                    Some(d) => {
+                        self.u8(1);
+                        self.col_type(&d.base);
+                        match &d.base_named {
+                            Some(n) => {
+                                self.u8(1);
+                                self.str(n);
+                            }
+                            None => self.u8(0),
+                        }
+                        match &d.base_domain {
+                            Some(n) => {
+                                self.u8(1);
+                                self.str(n);
+                            }
+                            None => self.u8(0),
+                        }
+                        self.u8(if d.not_null { 1 } else { 0 });
+                        self.str(&d.checks);
+                        self.str(&d.default);
+                    }
+                    None => self.u8(0),
+                }
                 self.u64(*xmin);
             }
             WalRecord::DropType { name, xmax } => {
                 self.u8(23);
                 self.str(name);
                 self.u64(*xmax);
+            }
+            // v0.86: function/operator DDL (tags 24/25/26/27).
+            WalRecord::CreateFunction {
+                name,
+                arg_names,
+                arg_types,
+                ret_type,
+                returns_set,
+                lang,
+                body,
+                volatility,
+                strict,
+                xmin,
+            } => {
+                self.u8(24);
+                self.str(name);
+                self.u32(arg_names.len() as u32);
+                for n in arg_names {
+                    match n {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                }
+                self.u32(arg_types.len() as u32);
+                for t in arg_types {
+                    self.str(t);
+                }
+                self.str(ret_type);
+                self.u8(if *returns_set { 1 } else { 0 });
+                self.u8(*lang);
+                self.str(body);
+                self.u8(*volatility);
+                self.u8(if *strict { 1 } else { 0 });
+                self.u64(*xmin);
+            }
+            WalRecord::DropFunction {
+                name,
+                arg_types,
+                xmax,
+            } => {
+                self.u8(25);
+                self.str(name);
+                self.u32(arg_types.len() as u32);
+                for t in arg_types {
+                    self.str(t);
+                }
+                self.u64(*xmax);
+            }
+            WalRecord::CreateOperator { name, defs, xmin } => {
+                self.u8(26);
+                self.str(name);
+                self.u32(defs.len() as u32);
+                for d in defs {
+                    self.str(&d.procedure);
+                    match &d.leftarg {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.rightarg {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.commutator {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    match &d.negator {
+                        Some(s) => {
+                            self.u8(1);
+                            self.str(s);
+                        }
+                        None => self.u8(0),
+                    }
+                    self.u8(if d.hashes { 1 } else { 0 });
+                    self.u8(if d.merges { 1 } else { 0 });
+                }
+                self.u64(*xmin);
+            }
+            WalRecord::DropOperator { name, xmax } => {
+                self.u8(27);
+                self.str(name);
+                self.u64(*xmax);
+            }
+            // v1.05: lazy reltoastrelid link (RGSWAL19).
+            WalRecord::SetToastRelid {
+                name,
+                toast_relid,
+                xmin,
+            } => {
+                self.u8(28);
+                self.str(name);
+                self.u32(*toast_relid);
+                self.u64(*xmin);
             }
         }
     }
@@ -1545,6 +1965,36 @@ impl Enc {
         for e in acl {
             self.str(&e.role);
             self.u32(e.privs);
+        }
+    }
+
+    /// v0.85: encode a `Vec<Option<String>>` (composite/domain type names).
+    fn opt_str_list(&mut self, v: &[Option<String>]) {
+        self.u32(v.len() as u32);
+        for o in v {
+            match o {
+                Some(s) => {
+                    self.u8(1);
+                    self.str(s);
+                }
+                None => self.u8(0),
+            }
+        }
+    }
+
+    /// v0.85: encode a `Vec<bool>` (domain_elem).
+    fn bool_list(&mut self, v: &[bool]) {
+        self.u32(v.len() as u32);
+        for b in v {
+            self.u8(if *b { 1 } else { 0 });
+        }
+    }
+
+    /// v0.96: encode a `Vec<String>` (inheritance parent links).
+    fn str_list(&mut self, v: &[String]) {
+        self.u32(v.len() as u32);
+        for s in v {
+            self.str(s);
         }
     }
 
@@ -1595,11 +2045,15 @@ impl Enc {
 
     fn sequence(&mut self, s: &WalSequence) {
         self.str(&s.name);
+        // v0.99: sequence data type.
+        self.u8(s.seq_type);
         self.i64(s.start);
         self.i64(s.increment);
         self.i64(s.min_value);
         self.i64(s.max_value);
         self.u8(s.cycle as u8);
+        // v0.98: sequence cache size.
+        self.i64(s.cache);
         self.i64(s.current);
         self.u8(s.current_is_set as u8);
         self.u8(s.is_called as u8);
@@ -1748,6 +2202,12 @@ impl<'a> Dec<'a> {
             20 => Ok(ColType::Record),
             // v0.81: named composite marker.
             23 => Ok(ColType::Composite),
+            // v1.17: xid.
+            24 => Ok(ColType::Xid),
+            // v1.39: bit.
+            25 => Ok(ColType::Bit),
+            // v1.40: tid.
+            26 => Ok(ColType::Tid),
             21 => Ok(ColType::Json),
             // v0.78: array, then the PG array OID identifying the
             // element type.
@@ -1774,6 +2234,9 @@ impl<'a> Dec<'a> {
                     199 => ArrayElem::Json,
                     2287 => ArrayElem::Record,
                     3221 => ArrayElem::PgLsn,
+                    1011 => ArrayElem::Xid,
+                    // v1.39: _bit.
+                    1561 => ArrayElem::Bit,
                     t => return Err(self.err(&format!("unknown array element OID {}", t))),
                 };
                 Ok(ColType::Array(elem))
@@ -1823,6 +2286,8 @@ impl<'a> Dec<'a> {
             15 => Ok(Value::SingleChar(self.u8()?)),
             // v0.64: pg_lsn.
             16 => Ok(Value::PgLsn(self.u64()?)),
+            // v1.40: tid.
+            20 => Ok(Value::Tid(self.u32()?, self.u32()?)),
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -1846,6 +2311,27 @@ impl<'a> Dec<'a> {
                     lower,
                     elems,
                 })))
+            }
+            // v0.84: composite values (tag 18; mirrors the encoder).
+            18 => {
+                let n = self.u32()? as usize;
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let name = self.str()?;
+                    let val = self.value()?;
+                    fields.push((name, val));
+                }
+                Ok(Value::Record(fields))
+            }
+            // v1.39: bit-string values (tag 19; mirrors the encoder).
+            19 => {
+                let bitlen = self.u32()?;
+                let n = self.u32()? as usize;
+                let bytes = self.take(n)?.to_vec();
+                Ok(Value::BitString(crate::storage::BitString {
+                    bitlen,
+                    bytes,
+                }))
             }
             t => Err(self.err(&format!("unknown value tag {}", t))),
         }
@@ -1876,6 +2362,10 @@ impl<'a> Dec<'a> {
             199 => Ok(ArrayElem::Json),
             2287 => Ok(ArrayElem::Record),
             3221 => Ok(ArrayElem::PgLsn),
+            // v1.39: _bit.
+            1561 => Ok(ArrayElem::Bit),
+            // v1.40: _tid.
+            1010 => Ok(ArrayElem::Tid),
             t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }
@@ -1940,6 +2430,20 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_compression {
                     col_compression.push(self.u8()?);
                 }
+                // v0.85: composite/domain type use per column.
+                let composite_types = self.opt_str_list_d()?;
+                let domain_types = self.opt_str_list_d()?;
+                let domain_elem = self.bool_list_d()?;
+                // v0.96: inheritance parent links.
+                let inherits = self.str_list_d()?;
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                let n_attnums = self.u32()? as usize;
+                let mut attnums = Vec::with_capacity(n_attnums);
+                for _ in 0..n_attnums {
+                    attnums.push(self.i16()?);
+                }
+                let next_attnum = self.i16()?;
+                let fillfactor = self.u8()?;
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateTable {
                     name,
@@ -1951,6 +2455,13 @@ impl<'a> Dec<'a> {
                     oid,
                     toast_relid,
                     col_compression,
+                    composite_types,
+                    domain_types,
+                    domain_elem,
+                    inherits,
+                    attnums,
+                    next_attnum,
+                    fillfactor,
                     xmin,
                 })
             }
@@ -2018,6 +2529,17 @@ impl<'a> Dec<'a> {
                 }
                 let unique = self.u8()? != 0;
                 let internal = self.u8()? != 0;
+                // v0.88 (RGSWAL15): per-column direction / null
+                // placement / expression sources, partial predicate.
+                let desc = self.bool_list_d()?;
+                let nulls_first = self.bool_list_d()?;
+                let exprs = self.opt_str_list_d()?;
+                let has_predicate = self.u8()? != 0;
+                let predicate = if has_predicate {
+                    Some(self.str()?)
+                } else {
+                    None
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateIndex {
                     name,
@@ -2025,6 +2547,10 @@ impl<'a> Dec<'a> {
                     columns,
                     unique,
                     internal,
+                    desc,
+                    nulls_first,
+                    exprs,
+                    predicate,
                     xmin,
                 })
             }
@@ -2057,6 +2583,20 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_compression {
                     col_compression.push(self.u8()?);
                 }
+                // v0.85: composite/domain type use per column.
+                let composite_types = self.opt_str_list_d()?;
+                let domain_types = self.opt_str_list_d()?;
+                let domain_elem = self.bool_list_d()?;
+                // v0.96: inheritance parent links.
+                let inherits = self.str_list_d()?;
+                // v1.41: attnums (i16 list), next_attnum, fillfactor.
+                let n_attnums = self.u32()? as usize;
+                let mut attnums = Vec::with_capacity(n_attnums);
+                for _ in 0..n_attnums {
+                    attnums.push(self.i16()?);
+                }
+                let next_attnum = self.i16()?;
+                let fillfactor = self.u8()?;
                 let next_value_id = self.u32()?;
                 let n_ti = self.u32()? as usize;
                 let mut toast_info = Vec::with_capacity(n_ti);
@@ -2077,6 +2617,13 @@ impl<'a> Dec<'a> {
                     toast_target,
                     col_storage,
                     col_compression,
+                    composite_types,
+                    domain_types,
+                    domain_elem,
+                    inherits,
+                    attnums,
+                    next_attnum,
+                    fillfactor,
                     next_value_id,
                     toast_info,
                     xmin,
@@ -2224,11 +2771,39 @@ impl<'a> Dec<'a> {
                 } else {
                     None
                 };
+                // v0.85: domain definition.
+                let domain = if self.u8()? != 0 {
+                    let base = self.col_type()?;
+                    let base_named = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let base_domain = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let not_null = self.u8()? != 0;
+                    let checks = self.str()?;
+                    let default = self.str()?;
+                    Some(WalDomain {
+                        base,
+                        base_named,
+                        base_domain,
+                        checks,
+                        not_null,
+                        default,
+                    })
+                } else {
+                    None
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateType {
                     name,
                     like_base,
                     composite,
+                    domain,
                     xmin,
                 })
             }
@@ -2237,17 +2812,129 @@ impl<'a> Dec<'a> {
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropType { name, xmax })
             }
+            // v0.86: function/operator DDL.
+            24 => {
+                let name = self.str()?;
+                let n = self.u32()? as usize;
+                let mut arg_names = Vec::with_capacity(n);
+                for _ in 0..n {
+                    arg_names.push(if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    });
+                }
+                let n = self.u32()? as usize;
+                let mut arg_types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    arg_types.push(self.str()?);
+                }
+                let ret_type = self.str()?;
+                let returns_set = self.u8()? != 0;
+                let lang = self.u8()?;
+                let body = self.str()?;
+                let volatility = self.u8()?;
+                let strict = self.u8()? != 0;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateFunction {
+                    name,
+                    arg_names,
+                    arg_types,
+                    ret_type,
+                    returns_set,
+                    lang,
+                    body,
+                    volatility,
+                    strict,
+                    xmin,
+                })
+            }
+            25 => {
+                let name = self.str()?;
+                let n_args = self.u32()? as usize;
+                let mut arg_types = Vec::with_capacity(n_args);
+                for _ in 0..n_args {
+                    arg_types.push(self.str()?);
+                }
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropFunction {
+                    name,
+                    arg_types,
+                    xmax,
+                })
+            }
+            26 => {
+                let name = self.str()?;
+                let n = self.u32()? as usize;
+                let mut defs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let procedure = self.str()?;
+                    let leftarg = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let rightarg = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let commutator = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let negator = if self.u8()? != 0 {
+                        Some(self.str()?)
+                    } else {
+                        None
+                    };
+                    let hashes = self.u8()? != 0;
+                    let merges = self.u8()? != 0;
+                    defs.push(WalOperDef {
+                        procedure,
+                        leftarg,
+                        rightarg,
+                        commutator,
+                        negator,
+                        hashes,
+                        merges,
+                    });
+                }
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreateOperator { name, defs, xmin })
+            }
+            27 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropOperator { name, xmax })
+            }
+            // v1.05: lazy reltoastrelid link (RGSWAL19).
+            28 => {
+                let name = self.str()?;
+                let toast_relid = self.u32()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::SetToastRelid {
+                    name,
+                    toast_relid,
+                    xmin,
+                })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
 
     fn sequence(&mut self) -> Result<WalSequence, String> {
         let name = self.str()?;
+        // v0.99: sequence data type.
+        let seq_type = self.u8()?;
         let start = self.i64()?;
         let increment = self.i64()?;
         let min_value = self.i64()?;
         let max_value = self.i64()?;
         let cycle = self.u8()? != 0;
+        // v0.98: sequence cache size.
+        let cache = self.i64()?;
         let current = self.i64()?;
         let current_is_set = self.u8()? != 0;
         let is_called = self.u8()? != 0;
@@ -2269,11 +2956,13 @@ impl<'a> Dec<'a> {
         };
         Ok(WalSequence {
             name,
+            seq_type,
             start,
             increment,
             min_value,
             max_value,
             cycle,
+            cache,
             current,
             current_is_set,
             is_called,
@@ -2291,6 +2980,40 @@ impl<'a> Dec<'a> {
                 role: self.str()?,
                 privs: self.u32()?,
             });
+        }
+        Ok(out)
+    }
+
+    /// v0.85: decode a `Vec<Option<String>>` (composite/domain type names).
+    fn opt_str_list_d(&mut self) -> Result<Vec<Option<String>>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(if self.u8()? != 0 {
+                Some(self.str()?)
+            } else {
+                None
+            });
+        }
+        Ok(out)
+    }
+
+    /// v0.85: decode a `Vec<bool>` (domain_elem).
+    fn bool_list_d(&mut self) -> Result<Vec<bool>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.u8()? != 0);
+        }
+        Ok(out)
+    }
+
+    /// v0.96: decode a `Vec<String>` (inheritance parent links).
+    fn str_list_d(&mut self) -> Result<Vec<String>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.str()?);
         }
         Ok(out)
     }
@@ -2411,7 +3134,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::DropView { xmax: xmin, .. }
         | WalRecord::CreateSequence { xmin, .. }
         | WalRecord::DropSequence { xmax: xmin, .. }
-        | WalRecord::AlterSequence { xmin, .. } => {
+        | WalRecord::AlterSequence { xmin, .. }
+        // v1.05: the lazy reltoastrelid link carries its xid too.
+        | WalRecord::SetToastRelid { xmin, .. } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
@@ -2535,16 +3260,34 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             name,
             like_base,
             composite,
+            domain,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmin + 1;
             }
+            // v0.85: restore the domain definition from the s-expr
+            // strings. A corrupt record fails replay loudly rather than
+            // silently dropping constraints.
+            let domain = match domain {
+                Some(d) => Some(crate::storage::DomainDef {
+                    base: d.base.clone(),
+                    base_named: d.base_named.clone(),
+                    base_domain: d.base_domain.clone(),
+                    checks: crate::sql::decode_domain_checks(&d.checks)
+                        .map_err(|e| format!("corrupt domain checks in WAL: {}", e))?,
+                    not_null: d.not_null,
+                    default: crate::sql::decode_domain_default(&d.default)
+                        .map_err(|e| format!("corrupt domain default in WAL: {}", e))?,
+                }),
+                None => None,
+            };
             eng.db.types.insert(
                 name.clone(),
                 crate::storage::ShellType {
                     like_base: like_base.clone(),
                     composite: composite.clone(),
+                    domain,
                 },
             );
         }
@@ -2553,6 +3296,110 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 eng.txns.next_xid = *xmax + 1;
             }
             eng.db.types.remove(name);
+        }
+        // v0.86: function/operator DDL replay — rebuild the catalog
+        // entries exactly. The body is re-parsed; a corrupt body fails
+        // replay loudly.
+        WalRecord::CreateFunction {
+            name,
+            arg_names,
+            arg_types,
+            ret_type,
+            returns_set,
+            lang,
+            body,
+            volatility,
+            strict,
+            xmin,
+        } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            let lang = match lang {
+                0 => crate::sql::FuncLang::Sql,
+                1 => crate::sql::FuncLang::Internal,
+                2 => crate::sql::FuncLang::Plpgsql,
+                _ => return Err(format!("corrupt function language in WAL: {}", lang)),
+            };
+            let volatility = match volatility {
+                0 => crate::sql::FuncVolatility::Volatile,
+                1 => crate::sql::FuncVolatility::Stable,
+                2 => crate::sql::FuncVolatility::Immutable,
+                _ => {
+                    return Err(format!(
+                        "corrupt function volatility in WAL: {}",
+                        volatility
+                    ));
+                }
+            };
+            let (parsed, plpgsql) =
+                crate::exec::rebuild_function_bodies(lang, arg_names, body, *returns_set);
+            // v0.87: replay appends to the overload list (replacing any
+            // existing overload with the same signature).
+            {
+                let def = crate::storage::FuncDef {
+                    name: name.clone(),
+                    arg_names: arg_names.clone(),
+                    arg_types: arg_types.clone(),
+                    ret_type: ret_type.clone(),
+                    returns_set: *returns_set,
+                    lang,
+                    body: body.clone(),
+                    parsed,
+                    // v1.01: multi-statement plpgsql bodies.
+                    plpgsql,
+                    volatility,
+                    strict: *strict,
+                };
+                let overloads = eng.db.functions.entry(name.clone()).or_default();
+                if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
+                    *slot = def;
+                } else {
+                    overloads.push(def);
+                }
+            }
+        }
+        WalRecord::DropFunction {
+            name,
+            arg_types,
+            xmax,
+        } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            // v0.87: remove the specific overload by signature.
+            if let Some(overloads) = eng.db.functions.get_mut(name) {
+                overloads.retain(|f| &f.arg_types != arg_types);
+                if overloads.is_empty() {
+                    eng.db.functions.remove(name);
+                }
+            }
+        }
+        WalRecord::CreateOperator { name, defs, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            eng.db.operators.insert(
+                name.clone(),
+                defs.iter()
+                    .map(|d| crate::storage::OperDef {
+                        name: name.clone(),
+                        procedure: d.procedure.clone(),
+                        leftarg: d.leftarg.clone(),
+                        rightarg: d.rightarg.clone(),
+                        commutator: d.commutator.clone(),
+                        negator: d.negator.clone(),
+                        hashes: d.hashes,
+                        merges: d.merges,
+                    })
+                    .collect(),
+            );
+        }
+        WalRecord::DropOperator { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            eng.db.operators.remove(name);
         }
     }
     match r {
@@ -2563,7 +3410,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::AlterRole { .. }
         | WalRecord::DbAcl { .. }
         | WalRecord::CreateType { .. }
-        | WalRecord::DropType { .. } => {}
+        | WalRecord::DropType { .. }
+        // v0.86: function/operator records likewise.
+        | WalRecord::CreateFunction { .. }
+        | WalRecord::DropFunction { .. }
+        | WalRecord::CreateOperator { .. }
+        | WalRecord::DropOperator { .. } => {}
         // v0.13: replication slot records are applied here.
         WalRecord::ReplSlotCreate {
             name,
@@ -2606,9 +3458,21 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             oid,
             toast_relid,
             col_compression,
+            composite_types,
+            domain_types,
+            domain_elem,
+            inherits,
+            attnums,
+            next_attnum,
+            fillfactor,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.41: restore attnums, the next-attnum counter, and
+            // fillfactor.
+            t.attnums = attnums.clone();
+            t.next_attnum = *next_attnum;
+            t.fillfactor = *fillfactor;
             // v0.11
             t.owner = owner.clone();
             t.acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
@@ -2616,6 +3480,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // v0.37: restore the table OID and its toast table link.
             t.oid = *oid;
             t.toast_relid = *toast_relid;
+            // v0.96: restore inheritance parent links.
+            t.inherits = inherits.clone();
+            // v0.85: restore composite/domain type use (empty vecs on old
+            // records mean "no domain use").
+            t.composite_types = composite_types.clone();
+            t.domain_types = domain_types.clone();
+            t.domain_elem = domain_elem.clone();
             // v0.41: restore per-column compression methods (0 = default).
             t.col_compression = col_compression
                 .iter()
@@ -2796,17 +3667,39 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             columns,
             unique,
             internal,
+            desc,
+            nulls_first,
+            exprs,
+            predicate,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
             // every row present comes from a committed batch, so indexing
             // all versions is correct (visibility filters at scan time).
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built); their definitions still round-trip for fidelity.
             let built: Option<Index> = (|| {
                 let t = live_table(eng, table)?;
-                let mut cols = Vec::with_capacity(columns.len());
-                for c in columns {
-                    cols.push(t.column_index(c)?);
+                let n = columns.len();
+                let mut cols = Vec::with_capacity(n);
+                let mut any_expr = false;
+                for (i, c) in columns.iter().enumerate() {
+                    let is_expr = exprs.get(i).and_then(|e| e.as_ref()).is_some();
+                    if is_expr {
+                        any_expr = true;
+                        cols.push(usize::MAX);
+                    } else {
+                        cols.push(t.column_index(c)?);
+                    }
                 }
+                let pad_bool = |v: &[bool]| {
+                    let mut out = v.to_vec();
+                    out.resize(n, false);
+                    out
+                };
+                let mut ex = exprs.clone();
+                ex.resize(n, None);
+                let planner_usable = !any_expr && predicate.is_none();
                 let mut ix = Index::new(IndexDef {
                     name: name.clone(),
                     table: table.clone(),
@@ -2816,10 +3709,17 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     internal: *internal,
                     created_xmin: *xmin,
                     dropped_xmax: 0,
+                    desc: pad_bool(desc),
+                    nulls_first: pad_bool(nulls_first),
+                    exprs: ex,
+                    predicate: predicate.clone(),
+                    planner_usable,
                 });
-                for r in &t.rows {
-                    let key = ix.key_for(&r.values);
-                    ix.insert(key, r.id);
+                if planner_usable {
+                    for r in &t.rows {
+                        let key = ix.key_for(&r.values);
+                        ix.insert(key, r.id);
+                    }
                 }
                 Some(ix)
             })();
@@ -2851,6 +3751,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             toast_target,
             col_storage,
             col_compression,
+            composite_types,
+            domain_types,
+            domain_elem,
+            inherits,
+            attnums,
+            next_attnum,
+            fillfactor,
             next_value_id,
             toast_info,
             xmin,
@@ -2861,6 +3768,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 prev.dropped_xmax = *xmin;
             }
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.41: restore attnums, the next-attnum counter, and
+            // fillfactor.
+            t.attnums = attnums.clone();
+            t.next_attnum = *next_attnum;
+            t.fillfactor = *fillfactor;
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
@@ -2900,6 +3812,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .max(toast_relid.wrapping_add(1));
             t.toast_target = *toast_target;
             t.col_storage = col_storage.clone();
+            // v0.85: restore composite/domain type use (empty vecs on old
+            // records mean "no domain use").
+            t.composite_types = composite_types.clone();
+            t.domain_types = domain_types.clone();
+            t.domain_elem = domain_elem.clone();
+            // v0.96: restore inheritance parent links.
+            t.inherits = inherits.clone();
             // v0.41: per-column compression methods (0 = default).
             t.col_compression = col_compression
                 .iter()
@@ -3010,6 +3929,21 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 ),
             }
         }
+        // v1.05: replay the lazy reltoastrelid link onto the table's
+        // live version. The toast table itself was created by its own
+        // CreateTable record earlier in the log (op order is
+        // preserved), so only the link needs restoring here.
+        WalRecord::SetToastRelid {
+            name, toast_relid, ..
+        } => match live_table(eng, name) {
+            Some(t) => {
+                t.toast_relid = *toast_relid;
+            }
+            None => eprintln!(
+                "WAL replay: skipping SetToastRelid \"{}\": no live table",
+                name
+            ),
+        },
     }
     Ok(())
 }
@@ -3068,10 +4002,14 @@ pub fn records_for_commit(
                 // statement-time check ran; committing would create a
                 // duplicate key. Fail the commit (40001 at the call site)
                 // instead of corrupting the unique index.
-                if let Some(cname) = eng
-                    .db
-                    .committed_unique_violation(&eng.txns, table, &values, *row_id, own, session)
-                {
+                if let Some(cname) = eng.db.committed_unique_violation(
+                    &eng.txns,
+                    table,
+                    &values,
+                    *row_id,
+                    &[own],
+                    session,
+                ) {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\" \
                          (committed by a concurrent transaction)",
@@ -3260,8 +4198,39 @@ pub fn records_for_commit(
                         .iter()
                         .map(|m| m.map(|m| m.code()).unwrap_or(0))
                         .collect(),
+                    // v0.85: composite/domain type use.
+                    composite_types: ours.composite_types.clone(),
+                    domain_types: ours.domain_types.clone(),
+                    domain_elem: ours.domain_elem.clone(),
+                    // v0.96: inheritance parent links.
+                    inherits: ours.inherits.clone(),
+                    // v1.41: attnums, next_attnum, fillfactor.
+                    attnums: ours.attnums.clone(),
+                    next_attnum: ours.next_attnum,
+                    fillfactor: ours.fillfactor,
                     xmin: own,
                 });
+            }
+            // v1.05: the lazy reltoastrelid link. Only log when the
+            // table's live version still carries the link we set
+            // (conditional like the other ops); replay restores it.
+            WriteOp::SetToastRelid {
+                table, toast_relid, ..
+            } => {
+                let linked = eng
+                    .db
+                    .tables
+                    .get(table)
+                    .and_then(|vs| vs.iter().find(|t| t.dropped_xmax == 0))
+                    .is_some_and(|t| t.toast_relid == *toast_relid);
+                if linked {
+                    out.push(WalRecord::SetToastRelid {
+                        name: table.clone(),
+                        toast_relid: *toast_relid,
+                        xmin: own,
+                    });
+                }
+                i += 1;
             }
             // v0.9: ALTER TABLE swaps the table version; log the latest
             // version this transaction created.
@@ -3296,6 +4265,16 @@ pub fn records_for_commit(
                         .iter()
                         .map(|m| m.map(|m| m.code()).unwrap_or(0))
                         .collect(),
+                    // v0.85: composite/domain type use.
+                    composite_types: ours.composite_types.clone(),
+                    domain_types: ours.domain_types.clone(),
+                    domain_elem: ours.domain_elem.clone(),
+                    // v0.96: inheritance parent links.
+                    inherits: ours.inherits.clone(),
+                    // v1.41: attnums, next_attnum, fillfactor.
+                    attnums: ours.attnums.clone(),
+                    next_attnum: ours.next_attnum,
+                    fillfactor: ours.fillfactor,
                     next_value_id: ours.next_value_id,
                     toast_info: ours
                         .toast_info
@@ -3530,6 +4509,17 @@ pub fn records_for_commit(
                         name: name.clone(),
                         like_base: st.like_base.clone(),
                         composite: st.composite.clone(),
+                        // v0.85: domain definitions travel as s-expr
+                        // strings (sql::encode_domain_checks /
+                        // encode_domain_default).
+                        domain: st.domain.as_ref().map(|d| WalDomain {
+                            base: d.base.clone(),
+                            base_named: d.base_named.clone(),
+                            base_domain: d.base_domain.clone(),
+                            checks: crate::sql::encode_domain_checks(&d.checks),
+                            not_null: d.not_null,
+                            default: crate::sql::encode_domain_default(&d.default),
+                        }),
                         xmin: own,
                     });
                 }
@@ -3540,6 +4530,94 @@ pub fn records_for_commit(
                     name: name.clone(),
                     xmax: own,
                 });
+                i += 1;
+            }
+            // v0.86: function/operator DDL is WAL-logged (definitions
+            // survive checkpoint/restart). The new definition is read
+            // from the catalog maps, which the executor updated; absent
+            // means a later DROP in the same txn removed it, so only
+            // the drop is logged.
+            // v0.87: WAL-log the specific overload that was added.
+            WriteOp::CreateFunction { name, added, .. } => {
+                if eng
+                    .db
+                    .functions
+                    .get(name)
+                    .is_some_and(|ovs| ovs.iter().any(|f| f.arg_types == added.arg_types))
+                {
+                    let f = added;
+                    out.push(WalRecord::CreateFunction {
+                        name: name.clone(),
+                        arg_names: f.arg_names.clone(),
+                        arg_types: f.arg_types.clone(),
+                        ret_type: f.ret_type.clone(),
+                        returns_set: f.returns_set,
+                        lang: match f.lang {
+                            crate::sql::FuncLang::Sql => 0,
+                            crate::sql::FuncLang::Internal => 1,
+                            // v0.97: bounded plpgsql (body desugared to
+                            // SQL at CREATE; the lang tag round-trips so
+                            // restored catalogs keep the declared
+                            // language).
+                            crate::sql::FuncLang::Plpgsql => 2,
+                        },
+                        body: f.body.clone(),
+                        volatility: match f.volatility {
+                            crate::sql::FuncVolatility::Volatile => 0,
+                            crate::sql::FuncVolatility::Stable => 1,
+                            crate::sql::FuncVolatility::Immutable => 2,
+                        },
+                        strict: f.strict,
+                        xmin: own,
+                    });
+                }
+                i += 1;
+            }
+            // v0.87: WAL-log the specific overload's signature.
+            WriteOp::DropFunction { name, prev, .. } => {
+                let arg_types = prev
+                    .as_ref()
+                    .map(|f| f.arg_types.clone())
+                    .unwrap_or_default();
+                out.push(WalRecord::DropFunction {
+                    name: name.clone(),
+                    arg_types,
+                    xmax: own,
+                });
+                i += 1;
+            }
+            WriteOp::CreateOperator { name, .. } => {
+                if let Some(defs) = eng.db.operators.get(name) {
+                    out.push(WalRecord::CreateOperator {
+                        name: name.clone(),
+                        defs: defs
+                            .iter()
+                            .map(|d| WalOperDef {
+                                procedure: d.procedure.clone(),
+                                leftarg: d.leftarg.clone(),
+                                rightarg: d.rightarg.clone(),
+                                commutator: d.commutator.clone(),
+                                negator: d.negator.clone(),
+                                hashes: d.hashes,
+                                merges: d.merges,
+                            })
+                            .collect(),
+                        xmin: own,
+                    });
+                }
+                i += 1;
+            }
+            WriteOp::DropOperator { name, .. } => {
+                out.push(WalRecord::DropOperator {
+                    name: name.clone(),
+                    xmax: own,
+                });
+                i += 1;
+            }
+            // v1.38: cast DDL is deliberately NOT WAL-logged (documented
+            // known gap on `Database::casts`): user-defined casts are
+            // in-memory and do not survive restart.
+            WriteOp::CreateCast { .. } => {
                 i += 1;
             }
             WriteOp::CreateIndex { name } => {
@@ -3568,8 +4646,18 @@ pub fn records_for_commit(
                     columns: ix.def.col_names.clone(),
                     unique: ix.def.unique,
                     internal: ix.def.internal,
+                    desc: ix.def.desc.clone(),
+                    nulls_first: ix.def.nulls_first.clone(),
+                    exprs: ix.def.exprs.clone(),
+                    predicate: ix.def.predicate.clone(),
                     xmin: own,
                 });
+            }
+            // v0.87: temp index DDL is never WAL-logged (session-local,
+            // dies with the session, like temp tables).
+            WriteOp::CreateTempIndex { .. } | WriteOp::DropTempIndex { .. } => {
+                i += 1;
+                continue;
             }
             WriteOp::DropIndex { name, .. } => {
                 let won = eng
@@ -3931,6 +5019,14 @@ impl Wal {
                 body.u64(t.created_xmin);
                 body.u64(dropped_xmax);
                 body.columns(&t.columns);
+                // v1.41: real PG attnums, the next-attnum counter, and
+                // fillfactor.
+                body.u32(t.attnums.len() as u32);
+                for a in &t.attnums {
+                    body.i16(*a);
+                }
+                body.i16(t.next_attnum);
+                body.u8(t.fillfactor);
                 // v0.9: constraint/default metadata.
                 body.str(&crate::sql::encode_constraints(t));
                 // v0.11: owner and ACL.
@@ -3951,6 +5047,10 @@ impl Wal {
                 for m in &t.col_compression {
                     body.u8(m.map(|m| m.code()).unwrap_or(0));
                 }
+                // v0.85: composite/domain type use per column.
+                body.opt_str_list(&t.composite_types);
+                body.opt_str_list(&t.domain_types);
+                body.bool_list(&t.domain_elem);
                 let mut toast_keys: Vec<u32> = t.toast_info.keys().copied().collect();
                 toast_keys.sort_unstable();
                 body.u32(toast_keys.len() as u32);
@@ -4054,6 +5154,8 @@ impl Wal {
                 } else {
                     body.u8(0);
                 }
+                // v0.96: inheritance parent links.
+                body.str_list(&t.inherits);
                 n_versions += 1;
             }
         }
@@ -4084,6 +5186,18 @@ impl Wal {
             ix_body.u8(ix.def.unique as u8);
             // v0.9: persist the constraint-owned flag.
             ix_body.u8(ix.def.internal as u8);
+            // v0.88: per-column direction / null placement / expression
+            // sources, plus the partial predicate.
+            ix_body.bool_list(&ix.def.desc);
+            ix_body.bool_list(&ix.def.nulls_first);
+            ix_body.opt_str_list(&ix.def.exprs);
+            match &ix.def.predicate {
+                Some(p) => {
+                    ix_body.u8(1);
+                    ix_body.str(p);
+                }
+                None => ix_body.u8(0),
+            }
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -4230,6 +5344,121 @@ impl Wal {
                 }
                 None => img.u8(0),
             }
+            // v0.85: domain definition (present only for domains).
+            match &st.domain {
+                Some(d) => {
+                    img.u8(1);
+                    img.col_type(&d.base);
+                    match &d.base_named {
+                        Some(n) => {
+                            img.u8(1);
+                            img.str(n);
+                        }
+                        None => img.u8(0),
+                    }
+                    match &d.base_domain {
+                        Some(n) => {
+                            img.u8(1);
+                            img.str(n);
+                        }
+                        None => img.u8(0),
+                    }
+                    img.u8(if d.not_null { 1 } else { 0 });
+                    img.str(&crate::sql::encode_domain_checks(&d.checks));
+                    img.str(&crate::sql::encode_domain_default(&d.default));
+                }
+                None => img.u8(0),
+            }
+        }
+
+        // v0.86: user-defined functions (`eng.db.functions`). Sorted
+        // for a deterministic image. Like types, functions carry no
+        // xid; snapshotting the live map is strictly better than
+        // dropping them (an uncommitted CREATE FUNCTION caught by a
+        // checkpoint is a known minor gap, as with types).
+        // v0.87: checkpoint each overload.
+        let mut f_names: Vec<&String> = eng.db.functions.keys().collect();
+        f_names.sort();
+        img.u32(f_names.len() as u32);
+        for name in f_names {
+            let overloads = &eng.db.functions[name];
+            img.str(name);
+            img.u32(overloads.len() as u32);
+            for f in overloads {
+                img.u32(f.arg_names.len() as u32);
+                for n in &f.arg_names {
+                    match n {
+                        Some(s) => {
+                            img.u8(1);
+                            img.str(s);
+                        }
+                        None => img.u8(0),
+                    }
+                }
+                img.u32(f.arg_types.len() as u32);
+                for t in &f.arg_types {
+                    img.str(t);
+                }
+                img.str(&f.ret_type);
+                img.u8(if f.returns_set { 1 } else { 0 });
+                img.u8(match f.lang {
+                    crate::sql::FuncLang::Sql => 0,
+                    crate::sql::FuncLang::Internal => 1,
+                    // v0.97: bounded plpgsql.
+                    crate::sql::FuncLang::Plpgsql => 2,
+                });
+                img.str(&f.body);
+                img.u8(match f.volatility {
+                    crate::sql::FuncVolatility::Volatile => 0,
+                    crate::sql::FuncVolatility::Stable => 1,
+                    crate::sql::FuncVolatility::Immutable => 2,
+                });
+                img.u8(if f.strict { 1 } else { 0 });
+            }
+        }
+
+        // v0.86: user-defined operators (`eng.db.operators`), same
+        // treatment as functions.
+        let mut o_names: Vec<&String> = eng.db.operators.keys().collect();
+        o_names.sort();
+        img.u32(o_names.len() as u32);
+        for name in o_names {
+            let defs = &eng.db.operators[name];
+            img.str(name);
+            img.u32(defs.len() as u32);
+            for d in defs {
+                img.str(&d.procedure);
+                match &d.leftarg {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.rightarg {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.commutator {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &d.negator {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                img.u8(if d.hashes { 1 } else { 0 });
+                img.u8(if d.merges { 1 } else { 0 });
+            }
         }
 
         // 2. Write tmp file + fsync.
@@ -4357,6 +5586,14 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let columns = d.columns().map_err(|e| bad(&e))?;
+        // v1.41: real PG attnums, the next-attnum counter, fillfactor.
+        let n_attnums = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut attnums = Vec::with_capacity(n_attnums);
+        for _ in 0..n_attnums {
+            attnums.push(d.i16().map_err(|e| bad(&e))?);
+        }
+        let next_attnum = d.i16().map_err(|e| bad(&e))?;
+        let fillfactor = d.u8().map_err(|e| bad(&e))?;
         // v0.9: constraint/default metadata.
         let constraints = d.str().map_err(|e| bad(&e))?;
         // v0.11: owner and ACL.
@@ -4397,6 +5634,30 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             };
             col_compression.push(method);
         }
+        // v0.85: composite/domain type use per column.
+        let n_ct = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut composite_types = Vec::with_capacity(n_ct);
+        for _ in 0..n_ct {
+            composite_types.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            });
+        }
+        let n_dt = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut domain_types = Vec::with_capacity(n_dt);
+        for _ in 0..n_dt {
+            domain_types.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            });
+        }
+        let n_de = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut domain_elem = Vec::with_capacity(n_de);
+        for _ in 0..n_de {
+            domain_elem.push(d.u8().map_err(|e| bad(&e))? != 0);
+        }
         let n_toast_info = d.u32().map_err(|e| bad(&e))? as usize;
         let mut toast_info = std::collections::HashMap::new();
         for _ in 0..n_toast_info {
@@ -4436,6 +5697,10 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         let mut __t = Table::new(columns, created_xmin);
         __t.dropped_xmax = dropped_xmax;
+        // v1.41: restore attnums, next_attnum, fillfactor.
+        __t.attnums = attnums;
+        __t.next_attnum = next_attnum;
+        __t.fillfactor = fillfactor;
         // v0.11
         __t.owner = owner;
         __t.acl = acl;
@@ -4448,6 +5713,10 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         __t.col_compression = col_compression;
         __t.toast_info = toast_info;
         __t.next_value_id = next_value_id;
+        // v0.85: composite/domain type use.
+        __t.composite_types = composite_types;
+        __t.domain_types = domain_types;
+        __t.domain_elem = domain_elem;
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;
@@ -4553,6 +5822,8 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 is_partitioned,
             });
         }
+        // v0.96: inheritance parent links (format version 16).
+        __t.inherits = d.str_list_d().map_err(|e| bad(&e))?;
         eng.db.tables.entry(name).or_default().push(__t);
     }
     // v0.8: index definitions, then rebuild entries from the decoded
@@ -4569,6 +5840,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let unique = d.u8().map_err(|e| bad(&e))? != 0;
         // v0.9: constraint-owned flag.
         let internal = d.u8().map_err(|e| bad(&e))? != 0;
+        // v0.88: per-column direction / null placement / expression
+        // sources, plus the partial predicate.
+        let mut desc = d.bool_list_d().map_err(|e| bad(&e))?;
+        let mut nulls_first = d.bool_list_d().map_err(|e| bad(&e))?;
+        let mut exprs = d.opt_str_list_d().map_err(|e| bad(&e))?;
+        let has_predicate = d.u8().map_err(|e| bad(&e))? != 0;
+        let predicate = if has_predicate {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        desc.resize(n_cols, false);
+        nulls_first.resize(n_cols, false);
+        exprs.resize(n_cols, None);
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -4590,11 +5875,20 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 .find(|t| t.dropped_xmax == 0)
                 .ok_or_else(|| bad_idx(format!("no live version of table \"{}\"", table)))?;
             let mut cols = Vec::with_capacity(col_names.len());
-            for c in &col_names {
-                cols.push(t.column_index(c).ok_or_else(|| {
-                    bad_idx(format!("unknown column \"{}\" in table \"{}\"", c, table))
-                })?);
+            let mut any_expr = false;
+            for (i, c) in col_names.iter().enumerate() {
+                if exprs[i].is_some() {
+                    any_expr = true;
+                    cols.push(usize::MAX);
+                } else {
+                    cols.push(t.column_index(c).ok_or_else(|| {
+                        bad_idx(format!("unknown column \"{}\" in table \"{}\"", c, table))
+                    })?);
+                }
             }
+            // v0.88: expression / partial indexes are catalog-only (never
+            // built); their definitions still round-trip for fidelity.
+            let planner_usable = !any_expr && predicate.is_none();
             let mut ix = Index::new(IndexDef {
                 name: name.clone(),
                 table: table.clone(),
@@ -4604,10 +5898,17 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 internal,
                 created_xmin,
                 dropped_xmax,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
+                planner_usable,
             });
-            for r in &t.rows {
-                let key = ix.key_for(&r.values);
-                ix.insert(key, r.id);
+            if planner_usable {
+                for r in &t.rows {
+                    let key = ix.key_for(&r.values);
+                    ix.insert(key, r.id);
+                }
             }
             ix
         };
@@ -4743,13 +6044,140 @@ fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         } else {
             None
         };
+        // v0.85: domain definition.
+        let domain = if d.u8().map_err(|e| bad(&e))? != 0 {
+            let base = d.col_type().map_err(|e| bad(&e))?;
+            let base_named = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let base_domain = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let not_null = d.u8().map_err(|e| bad(&e))? != 0;
+            let checks = d.str().map_err(|e| bad(&e))?;
+            let default = d.str().map_err(|e| bad(&e))?;
+            Some(crate::storage::DomainDef {
+                base,
+                base_named,
+                base_domain,
+                checks: crate::sql::decode_domain_checks(&checks).map_err(|e| bad(&e))?,
+                not_null,
+                default: crate::sql::decode_domain_default(&default).map_err(|e| bad(&e))?,
+            })
+        } else {
+            None
+        };
         eng.db.types.insert(
             name,
             crate::storage::ShellType {
                 like_base,
                 composite,
+                domain,
             },
         );
+    }
+    // v0.87: user-defined functions (overload lists).
+    let n_funcs = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_funcs {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let n_overloads = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut overloads = Vec::with_capacity(n_overloads);
+        for _ in 0..n_overloads {
+            let n = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut arg_names = Vec::with_capacity(n);
+            for _ in 0..n {
+                arg_names.push(if d.u8().map_err(|e| bad(&e))? != 0 {
+                    Some(d.str().map_err(|e| bad(&e))?)
+                } else {
+                    None
+                });
+            }
+            let n = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut arg_types = Vec::with_capacity(n);
+            for _ in 0..n {
+                arg_types.push(d.str().map_err(|e| bad(&e))?);
+            }
+            let ret_type = d.str().map_err(|e| bad(&e))?;
+            let returns_set = d.u8().map_err(|e| bad(&e))? != 0;
+            let lang = match d.u8().map_err(|e| bad(&e))? {
+                0 => crate::sql::FuncLang::Sql,
+                1 => crate::sql::FuncLang::Internal,
+                2 => crate::sql::FuncLang::Plpgsql,
+                b => return Err(bad(&format!("corrupt function language {}", b))),
+            };
+            let body = d.str().map_err(|e| bad(&e))?;
+            let volatility = match d.u8().map_err(|e| bad(&e))? {
+                0 => crate::sql::FuncVolatility::Volatile,
+                1 => crate::sql::FuncVolatility::Stable,
+                2 => crate::sql::FuncVolatility::Immutable,
+                b => return Err(bad(&format!("corrupt function volatility {}", b))),
+            };
+            let strict = d.u8().map_err(|e| bad(&e))? != 0;
+            let (parsed, plpgsql) =
+                crate::exec::rebuild_function_bodies(lang, &arg_names, &body, returns_set);
+            overloads.push(crate::storage::FuncDef {
+                name: name.clone(),
+                arg_names,
+                arg_types,
+                ret_type,
+                returns_set,
+                lang,
+                body,
+                parsed,
+                // v1.01: multi-statement plpgsql bodies.
+                plpgsql,
+                volatility,
+                strict,
+            });
+        }
+        eng.db.functions.insert(name, overloads);
+    }
+    // v0.86: user-defined operators.
+    let n_ops = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_ops {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut defs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let procedure = d.str().map_err(|e| bad(&e))?;
+            let leftarg = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let rightarg = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let commutator = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let negator = if d.u8().map_err(|e| bad(&e))? != 0 {
+                Some(d.str().map_err(|e| bad(&e))?)
+            } else {
+                None
+            };
+            let hashes = d.u8().map_err(|e| bad(&e))? != 0;
+            let merges = d.u8().map_err(|e| bad(&e))? != 0;
+            defs.push(crate::storage::OperDef {
+                name: name.clone(),
+                procedure,
+                leftarg,
+                rightarg,
+                commutator,
+                negator,
+                hashes,
+                merges,
+            });
+        }
+        eng.db.operators.insert(name, defs);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
@@ -4875,6 +6303,14 @@ mod tests {
                 oid: 16384,
                 toast_relid: 16385,
                 col_compression: vec![0],
+                composite_types: vec![None],
+                domain_types: vec![None],
+                domain_elem: vec![false],
+                inherits: vec![],
+                // v1.41
+                attnums: vec![1],
+                next_attnum: 2,
+                fillfactor: 100,
                 xmin: 3,
             },
             WalRecord::InsertRows {
@@ -4960,10 +6396,71 @@ mod tests {
                 confirmed_flush_lsn: 0x1_0000_0100,
             },
             WalRecord::ReplSlotDrop { name: "s1".into() },
+            // v1.05: lazy reltoastrelid link.
+            WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 42,
+            },
         ];
         for c in &cases {
             assert_eq!(&roundtrip(c), c);
         }
+    }
+
+    #[test]
+    fn v96_create_table_inherits_roundtrip() {
+        // v0.96: the `inherits` parent links survive WAL encode/decode
+        // on both CreateTable and AlterTable records.
+        let empty_constraints =
+            "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+        let create = WalRecord::CreateTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints.clone(),
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec!["p1".to_string(), "p2".to_string()],
+            // v1.41
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            xmin: 3,
+        };
+        assert_eq!(&roundtrip(&create), &create);
+        let alter = WalRecord::AlterTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints,
+            copy_rows: true,
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            toast_target: 0,
+            col_storage: vec![0],
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec!["p1".to_string()],
+            // v1.41
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            next_value_id: 1,
+            toast_info: vec![],
+            xmin: 4,
+        };
+        assert_eq!(&roundtrip(&alter), &alter);
     }
 
     #[test]
@@ -5087,6 +6584,14 @@ mod tests {
                 oid: 16384,
                 toast_relid: 0,
                 col_compression: vec![0],
+                composite_types: vec![None],
+                domain_types: vec![None],
+                domain_elem: vec![false],
+                inherits: vec![],
+                // v1.41
+                attnums: vec![1],
+                next_attnum: 2,
+                fillfactor: 100,
                 xmin: 4,
             },
         )
@@ -5159,6 +6664,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eng.txns.next_xid, 10);
+    }
+
+    #[test]
+    fn v105_set_toast_relid_apply_and_emit() {
+        // v1.05: the lazy reltoastrelid link replays onto the live table
+        // version (and folds its xid), and records_for_commit emits it
+        // from the write op — but skips a stale op whose link moved on.
+        let mut eng = Engine::new();
+        eng.db
+            .tables
+            .entry("t".into())
+            .or_default()
+            .push(Table::new(vec![("a".into(), ColType::Int)], 4));
+        apply_record(
+            &mut eng,
+            &WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 7,
+            },
+        )
+        .unwrap();
+        let t = eng.db.tables["t"]
+            .iter()
+            .find(|t| t.dropped_xmax == 0)
+            .unwrap();
+        assert_eq!(t.toast_relid, 16385);
+        assert!(eng.txns.next_xid >= 8);
+        // Missing table: warning, not an error.
+        apply_record(
+            &mut eng,
+            &WalRecord::SetToastRelid {
+                name: "nope".into(),
+                toast_relid: 1,
+                xmin: 7,
+            },
+        )
+        .unwrap();
+
+        let writes = vec![WriteOp::SetToastRelid {
+            table: "t".into(),
+            toast_relid: 16385,
+            prev: 0,
+        }];
+        let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+        assert_eq!(
+            recs,
+            vec![WalRecord::SetToastRelid {
+                name: "t".into(),
+                toast_relid: 16385,
+                xmin: 9,
+            }]
+        );
+        // Stale op: the link no longer matches, so nothing is logged.
+        eng.db
+            .tables
+            .get_mut("t")
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .toast_relid = 0;
+        let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+        assert!(recs.is_empty());
     }
 
     #[test]
@@ -5280,5 +6848,53 @@ mod tests {
             assert_eq!(d.col_type().unwrap(), t);
             d.end().unwrap();
         }
+    }
+
+    #[test]
+    fn v088_create_index_metadata_roundtrip() {
+        // v0.88: CreateIndex carries per-column direction / null-placement
+        // / expression sources plus the partial predicate (RGSWAL15).
+        let rec = WalRecord::CreateIndex {
+            name: "ix".into(),
+            table: "t".into(),
+            columns: vec!["a".into(), "(a + b)".into()],
+            unique: true,
+            internal: false,
+            desc: vec![true, false],
+            nulls_first: vec![false, true],
+            exprs: vec![None, Some("a + b".into())],
+            predicate: Some("b > 0".into()),
+            xmin: 42,
+        };
+        let mut e = Enc::new();
+        e.record(&rec);
+        let mut d = Dec::new(&e.buf);
+        match d.record().unwrap() {
+            WalRecord::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                internal,
+                desc,
+                nulls_first,
+                exprs,
+                predicate,
+                xmin,
+            } => {
+                assert_eq!(name, "ix");
+                assert_eq!(table, "t");
+                assert_eq!(columns, vec!["a".to_string(), "(a + b)".to_string()]);
+                assert!(unique);
+                assert!(!internal);
+                assert_eq!(desc, vec![true, false]);
+                assert_eq!(nulls_first, vec![false, true]);
+                assert_eq!(exprs, vec![None, Some("a + b".to_string())]);
+                assert_eq!(predicate, Some("b > 0".to_string()));
+                assert_eq!(xmin, 42);
+            }
+            other => panic!("expected CreateIndex, got {:?}", other),
+        }
+        d.end().unwrap();
     }
 }

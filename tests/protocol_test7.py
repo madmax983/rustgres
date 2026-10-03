@@ -338,17 +338,22 @@ def t_promotion():
         check("int+numeric->numeric", one(c, "SELECT 1 + 1.5::numeric") == "2.5")
         check("real+double->double", one(c, "SELECT 1.5::real + 2.5") == "4")
         check("int division truncates", one(c, "SELECT 7/2") == "3")
-        check("double division", one(c, "SELECT 7.0/2") == "3.5")
-        check("numeric division", one(c, "SELECT 7::numeric/2") == "3.5")
-        check("int power", one(c, "SELECT 2^3") == "8")
-        check("numeric power exact", one(c, "SELECT 1.5::numeric^2") == "2.25")
-        check("float power", one(c, "SELECT 2.0^0.5") == "1.4142135623730951")
+        # PG19 numeric division: div rscale = 16 sig digits (select_div_scale),
+        # printed in full by numeric_out (no trailing-zero stripping).
+        check("double division", one(c, "SELECT 7.0/2") == "3.5000000000000000")
+        check("numeric division", one(c, "SELECT 7::numeric/2") == "3.5000000000000000")
+        # PG19 power_var_int: rscale = 16 - int(exp*log10(base)); full dscale printed.
+        check("int power", one(c, "SELECT 2^3") == "8.0000000000000000")
+        check("numeric power exact", one(c, "SELECT 1.5::numeric^2") == "2.2500000000000000")
+        # PG19 general power path: rscale = 16 - int(0.4343*exp*ln(base)) = 16 here;
+        # sqrt(2) at 16dp rounds to ...950.
+        check("float power", one(c, "SELECT 2.0^0.5") == "1.4142135623730950")
         check("mod ints", one(c, "SELECT 10 % 3") == "1")
         check("mod numeric", one(c, "SELECT 10.5::numeric % 3") == "1.5")
         check("mod negative dividend",
               one(c, "SELECT (-10) % 3") == "-1")
         check("unary minus binds tighter than ^",
-              one(c, "SELECT -2^2") == "4")  # PG parses as (-2)^2
+              one(c, "SELECT -2^2") == "4.0000000000000000")  # PG parses as (-2)^2
         check("bigint literal", one(c, "SELECT 9223372036854775807") == "9223372036854775807")
         check("numeric literal stays exact",
               one(c, "SELECT 0.1::numeric + 0.2::numeric") == "0.3")
@@ -429,8 +434,9 @@ def t_functions():
               and one(c, "SELECT round(2.4::numeric)") == "2")
         check("floor/ceil", one(c, "SELECT floor(2.9)") == "2"
               and one(c, "SELECT ceil(2.1)") == "3")
-        check("sqrt", one(c, "SELECT sqrt(2.0)") == "1.4142135623730951"
-              and one(c, "SELECT sqrt(16::numeric)") == "4")
+        # PG19 numeric_sqrt: rscale = 16 - sweight = 15 here (not the float8 dsqrt value).
+        check("sqrt", one(c, "SELECT sqrt(2.0)") == "1.414213562373095"
+              and one(c, "SELECT sqrt(16::numeric)") == "4.000000000000000")
         # sqrt(negative) -> 2201F in PG for both numeric and float8.
         check("sqrt negative -> 2201F", errcode(c, "SELECT sqrt(-1::numeric)") == "2201F")
         # v0.18: decimal literals are numeric, so sqrt(-1.0) errors like PG.
@@ -440,7 +446,8 @@ def t_functions():
               errcode(c, "SELECT sqrt(-1.0::float8)") == "2201F")
         check("mod()", one(c, "SELECT mod(10, 3)") == "1")
         check("mod by zero -> 22012", errcode(c, "SELECT mod(10, 0)") == "22012")
-        check("power()", one(c, "SELECT power(2, 10)") == "1024")
+        # PG19 power_var_int(2,10): rscale = 16 - int(10*log10(2)) = 13.
+        check("power()", one(c, "SELECT power(2, 10)") == "1024.0000000000000")
         # Datetime.
         check("current_date format",
               len(one(c, "SELECT current_date")) == 10)
@@ -521,14 +528,18 @@ def t_operators():
         check("BETWEEN", one(c, "SELECT 5 BETWEEN 1 AND 10") == "t"
               and one(c, "SELECT 5 NOT BETWEEN 1 AND 10") == "f"
               and one(c, "SELECT 'b' BETWEEN 'a' AND 'c'") == "t")
-        check("concat ints", one(c, "SELECT 1 || 2") == "12")
+        # PG19 grounding (pg_operator.dat oids 2779/2780): || exists only as
+        # text||anynonarray and anynonarray||text; integer||integer has no
+        # operator and no implicit int->text cast, so PG19 raises 42883.
+        check("concat ints -> 42883 (PG19: no integer || integer operator)",
+              errcode(c, "SELECT 1 || 2") == "42883")
         check("concat bytea", one(c, "SELECT '\\xaa'::bytea || '\\xbb'::bytea")
               == "\\xaabb")
         check("bytea = bytea", one(c, "SELECT '\\xaa'::bytea = '\\xaa'::bytea") == "t")
         check("uuid = uuid",
               one(c, "SELECT 'a0b1c2d3-e4f5-4678-9abc-def012345678'::uuid = "
                      "'A0B1C2D3-E4F5-4678-9ABC-DEF012345678'::uuid") == "t")
-        check("^ binds tighter than *", one(c, "SELECT 2 * 3^2") == "18")
+        check("^ binds tighter than *", one(c, "SELECT 2 * 3^2") == "18.0000000000000000")
         c.close()
     finally:
         srv.cleanup()
@@ -706,8 +717,9 @@ def t_mvcc_new_types():
             "'ffffffff-ffff-ffff-ffff-ffffffffffff')")
         c.q("BEGIN")
         c.q("UPDATE m SET n = n * 2 WHERE id = 1")
+        # PG numeric mul: result dscale = 1 + 0, so 10.5*2 displays as 21.0.
         check("own txn sees doubled numeric",
-              one(c, "SELECT n FROM m WHERE id = 1") == "21")
+              one(c, "SELECT n FROM m WHERE id = 1") == "21.0")
         c.q("ROLLBACK")
         check("rollback restores numeric",
               one(c, "SELECT n FROM m WHERE id = 1") == "10.5")

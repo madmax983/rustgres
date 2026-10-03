@@ -1,0 +1,34 @@
+# Valgrind suppressions for rustgres (v0.92+).
+#
+# rust-std-thread-tls: Rust's std internally allocates 48 bytes for the
+# main thread's Thread handle during `std::thread::current::init_current`
+# (via mpmc::context::Context TLS init). Valgrind reports it as "possibly
+# lost" because the pointer lives in thread-local storage it cannot scan.
+# This is 100% libstd bookkeeping — no rustgres frame appears in the
+# allocation stack — and is a well-known Rust-on-Valgrind artifact, not a
+# leak in rustgres code.
+{
+   rust-std-thread-tls-possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   fun:alloc
+   ...
+   fun:__rust_std_internal_init_fn
+   ...
+}
+# session-counts-static: the `SESSION_COUNTS` process-lifetime global
+# (`&'static Mutex<HashMap<String, usize>>` via OnceLock) allocates the
+# role-name String (8 bytes for "postgres") and the HashMap's RawTable
+# (148 bytes) on first connection. These live until process exit BY DESIGN
+# — they are not leaks. Valgrind reports them as "possibly lost" because
+# it cannot trace the pointer through Rust's OnceLock statics.
+{
+   rustgres-session-counts-static
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:*finish_login*
+   ...
+}

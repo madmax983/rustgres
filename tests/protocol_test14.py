@@ -369,6 +369,11 @@ def t_nameless_index(c):
     c.q("CREATE TABLE t_idx (a int, b int)")
     _, _, codes, _ = c.q("CREATE INDEX ON t_idx (a, b)")
     check("k-nameless-create", not codes, f"{codes}")
+    # v1.62: PG19's cost model never index-scans a single-page relation,
+    # so seed past one heap page — this check is about the auto-name
+    # rendering in EXPLAIN, not the scan choice.
+    for i in range(400):
+        c.q(f"INSERT INTO t_idx VALUES ({i}, {i})")
     # PG auto-name convention: <table>_<cols>_idx — visible in EXPLAIN.
     _, rows, codes, _ = c.q("EXPLAIN SELECT * FROM t_idx WHERE a = 1 AND b = 2")
     plan = " ".join(r[0] for r in rows)
@@ -427,13 +432,14 @@ def t_txn_syntax(c):
     _, _, codes, _ = c.q("START TRANSACTION READ WRITE")
     check("k-start-rw", not codes, f"{codes}")
     c.q("ROLLBACK")
-    # COMMIT AND CHAIN with no open transaction: still COMMIT tag, and a
-    # chained transaction is now open (next INSERT must be committable).
+    # v0.94: PG19 parity (xact.c EndTransactionBlock): COMMIT AND CHAIN
+    # with no open transaction raises 25001 "can only be used in
+    # transaction blocks" (plain COMMIT only warns). No chained txn opens.
     tags, _, codes, _ = c.q("COMMIT AND CHAIN")
-    check("k-chain-no-txn", not codes, f"{codes}")
-    check("k-chain-no-txn-tag", tags == ["COMMIT"], f"{tags}")
+    check("k-chain-no-txn", codes == ["25001"], f"{codes}")
+    check("k-chain-no-txn-tag", tags == [], f"{tags}")
+    # Session is still idle: INSERT autocommits, no COMMIT needed.
     c.q("INSERT INTO t_txn VALUES (6)")
-    c.q("COMMIT")
     _, rows, codes, _ = c.q("SELECT x FROM t_txn WHERE x = 6")
     check("k-chain-no-txn-rows", not codes and rows == [("6",)], f"{rows} {codes}")
     c.q("DROP TABLE t_txn")

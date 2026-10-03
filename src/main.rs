@@ -7,7 +7,7 @@
 mod copy;
 mod crypto;
 mod datetime;
-mod exec;
+pub(crate) mod exec;
 mod fxhash;
 mod index;
 mod net;
@@ -76,6 +76,14 @@ fn port() -> u16 {
 fn main() {
     let port = port();
     let data_dir = data_dir();
+    // v0.90: honor PGDATESTYLE like real PG (pg_regress sets
+    // `PGDATESTYLE=Postgres, MDY`). When the Postgres style is selected,
+    // date output renders MM-DD-YYYY; otherwise ISO YYYY-MM-DD.
+    if let Ok(ds) = std::env::var("PGDATESTYLE") {
+        if ds.to_ascii_lowercase().contains("postgres") {
+            crate::datetime::set_datestyle_postgres(true);
+        }
+    }
     // Crash recovery: load the latest checkpoint, replay WAL frames after
     // it. A missing/empty data dir yields an empty database — the server
     // keeps its in-memory behavior when there is no state.
@@ -95,6 +103,16 @@ fn main() {
     );
     let engine = Arc::new(Mutex::new(engine));
     let wal = Arc::new(Mutex::new(wal));
+    // v0.92: test-only clean-exit mode for Valgrind/memcheck. When
+    // `RUSTGRES_MAX_CONN` is set, the server exits 0 after serving that
+    // many connections (joining their handlers), instead of running
+    // forever. This gives Valgrind a normal process exit to report
+    // against; production never sets the variable.
+    let max_conn: Option<u64> = std::env::var("RUSTGRES_MAX_CONN")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut served: u64 = 0;
+    let mut handlers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -107,9 +125,20 @@ fn main() {
                 }
                 let engine = Arc::clone(&engine);
                 let wal = Arc::clone(&wal);
-                std::thread::spawn(move || server::handle_connection(stream, engine, wal));
+                handlers.push(std::thread::spawn(move || {
+                    server::handle_connection(stream, engine, wal)
+                }));
+                served += 1;
+                if max_conn.is_some_and(|m| served >= m) {
+                    break;
+                }
             }
             Err(e) => eprintln!("accept error: {}", e),
         }
+    }
+    // v0.92: in max-conn mode, join handlers so Valgrind sees a clean
+    // exit (no detached threads with live allocations).
+    for h in handlers {
+        let _ = h.join();
     }
 }

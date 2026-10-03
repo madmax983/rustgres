@@ -272,8 +272,19 @@ fn pglz_compress_payload(input: &[u8]) -> Option<Vec<u8>> {
     if slen < PGLZ_MIN_INPUT {
         return None;
     }
-    // Default strategy: the payload must beat 75% of the input.
-    let result_max = slen * PGLZ_RESULT_PCT / 100;
+    // Default strategy: the payload must beat 75% of the input, i.e.
+    // `min_comp_rate` ("need_rate") is 25 and
+    // `result_max = (slen * (100 - need_rate)) / 100`. PG switches to a
+    // division-first approximation for `slen > INT_MAX/100` to avoid
+    // 32-bit overflow; replicate the branch so even >20MB inputs agree
+    // byte-for-byte on the accept/reject gate.
+    let need_rate = 100 - PGLZ_RESULT_PCT;
+    debug_assert!((1..=99).contains(&need_rate));
+    let result_max = if slen > (i32::MAX as usize) / 100 {
+        (slen / 100) * PGLZ_RESULT_PCT
+    } else {
+        (slen * PGLZ_RESULT_PCT) / 100
+    };
     // PG sizes the active hash table from the input length.
     let hashsz = if slen < 128 {
         512
@@ -371,11 +382,19 @@ pub fn decompress_pglz(input: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let orig_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    decompress_pglz_raw(&input[4..], orig_len)
+}
+
+/// Raw PGLZ stream decompressor: PG19's `pglz_decompress()` with
+/// `check_complete = true`, without rustgres's 4-byte length framing.
+/// Test-only; split out so the v1.06 decompressor differential can feed
+/// PG19-produced (and mutated) payloads directly.
+#[cfg(test)]
+fn decompress_pglz_raw(src: &[u8], orig_len: usize) -> Option<Vec<u8>> {
     // Sanity cap: refuse absurd allocation requests from corrupt data.
     if orig_len > 1_000_000_000 {
         return None;
     }
-    let src = &input[4..];
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut sp = 0usize;
     // PG reads one control byte per group of up to eight items, least
@@ -773,14 +792,35 @@ fn toastable_bytes(v: &Value) -> Option<Vec<u8>> {
 /// order (was: compress-all then externalize-biggest), externalized
 /// columns now count the 20-byte toast pointer (was: zero), and the
 /// limit is `target - hoff` (was: `target`).
+///
+/// v1.05: `reuse` carries the UPDATE fast path from PG19's
+/// `toast_tuple_init` (`TOASTCOL_IGNORE`): `reuse[i] = Some(compressed)`
+/// means column `i`'s datum is unchanged from the old row version, so
+/// the new version keeps the old external toast pointer — the planner
+/// presets `External`/`CompressedExternal` (by the old value's
+/// compression flag) and every round skips the column. The slice must
+/// parallel `values`; `None` toasts normally. Unchanged columns count
+/// the toast-pointer width (not their datum bytes) toward the row
+/// width, exactly as PG19 measures the new tuple.
 pub fn plan_toast(
     table: &Table,
     values: &[Value],
     compress_ok: bool,
     default_method: crate::storage::ToastCompression,
+    reuse: &[Option<bool>],
 ) -> Vec<ToastPlan> {
     let n = values.len();
     let mut plan = vec![ToastPlan::Plain; n];
+    // v1.05: preset reused columns before any round runs.
+    for (i, r) in reuse.iter().enumerate().take(n) {
+        if let Some(compressed) = r {
+            plan[i] = if *compressed {
+                ToastPlan::CompressedExternal
+            } else {
+                ToastPlan::External
+            };
+        }
+    }
     // Only toastable columns with toastable values participate.
     let eligible: Vec<usize> = (0..n)
         .filter(|&i| {
@@ -796,8 +836,20 @@ pub fn plan_toast(
     if eligible.is_empty() {
         return plan;
     }
-    // Row width PG would measure: sum of toastable payloads.
-    let width: usize = eligible.iter().map(|&i| toastable_size(&values[i])).sum();
+    // Row width PG would measure: sum of toastable payloads. v1.05:
+    // reused (unchanged) columns already carry a toast pointer in the
+    // new tuple, so they count the pointer width, not their datum
+    // bytes — mirroring PG19's heap_compute_data_size on the new tuple.
+    let width: usize = eligible
+        .iter()
+        .map(|&i| {
+            if reuse.get(i).copied().flatten().is_some() {
+                TOAST_POINTER_SIZE
+            } else {
+                toastable_size(&values[i])
+            }
+        })
+        .sum();
     if width <= toast_consts::TOAST_TUPLE_THRESHOLD as usize {
         return plan;
     }
@@ -957,6 +1009,50 @@ pub fn plan_toast(
     }
 
     plan
+}
+
+/// v1.05: the per-column reuse mask for an UPDATE's new row version —
+/// PG19's unchanged-column fast path in `toast_tuple_init`
+/// (`toast_helper.c`, REL_19_STABLE: columns whose datum is unchanged
+/// keep the old external toast pointer, `TOASTCOL_IGNORE`, instead of
+/// being re-toasted).
+///
+/// `old_values`/`old_toast` are the superseded version's detoasted
+/// values and per-column toast flags in table column order; `values`
+/// is the new version's. Returns `Some(compressed)` for a column whose
+/// old value was toasted, whose detoasted bytes are unchanged, and
+/// whose value id still has provenance in `toast_info` — the bool is
+/// the old value's compression flag, so the planner presets the
+/// matching external plan. All other columns return `None` (toast
+/// normally; their old chunks are deleted by the caller).
+///
+/// Byte-equality is a deliberate, unobservable superset of PG19's rule
+/// (which keys off the column not being in the UPDATE's SET list):
+/// value ids are engine-internal (never exposed in SQL), and a
+/// SET-to-the-identical-bytes value reuses the identical chunk rows,
+/// so no query can distinguish the two.
+pub fn toast_update_reuse(
+    old_values: &[Value],
+    old_toast: &[u32],
+    values: &[Value],
+    toast_info: &std::collections::HashMap<u32, ToastInfo>,
+) -> Vec<Option<bool>> {
+    let n = values.len();
+    (0..n)
+        .map(|i| {
+            let vid = old_toast.get(i).copied().unwrap_or(0);
+            if vid == 0 {
+                return None;
+            }
+            let info = toast_info.get(&vid)?;
+            let old_bytes = old_values.get(i).and_then(toastable_bytes);
+            let new_bytes = values.get(i).and_then(toastable_bytes);
+            match (old_bytes, new_bytes) {
+                (Some(o), Some(nw)) if o == nw => Some(info.compressed),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// PG's `toast_tuple_find_biggest_attribute`: index of the largest
@@ -1330,5 +1426,406 @@ mod tests {
         assert_ne!(p, l);
         assert_eq!(decompress_pglz(&p).unwrap(), data);
         assert_eq!(decompress_lz4(&l).unwrap(), data);
+    }
+    // --- v1.05: UPDATE toast reuse (PG19 TOASTCOL_IGNORE) ---
+
+    fn wide_text(seed: u64, n: usize) -> String {
+        // Deterministic incompressible text (PGLZ gives up on it).
+        let mut x: u64 = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (b'a' + ((x >> 33) % 26) as u8) as char
+            })
+            .collect()
+    }
+
+    fn text_table() -> Table {
+        Table::new(
+            vec![
+                ("a".to_string(), crate::storage::ColType::Text),
+                ("b".to_string(), crate::storage::ColType::Text),
+            ],
+            1,
+        )
+    }
+
+    #[test]
+    fn update_reuse_unchanged_column() {
+        let old_values = vec![
+            Value::Text(wide_text(1, 6000).into()),
+            Value::Text("small".to_string().into()),
+        ];
+        let new_values = vec![
+            Value::Text(wide_text(1, 6000).into()), // identical bytes
+            Value::Text("changed".to_string().into()),
+        ];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&old_values, &[7, 0], &new_values, &info);
+        assert_eq!(reuse, vec![Some(false), None]);
+    }
+
+    #[test]
+    fn update_reuse_changed_column_not_reused() {
+        let old_values = vec![Value::Text(wide_text(1, 6000).into())];
+        let new_values = vec![Value::Text(wide_text(2, 6000).into())];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            7u32,
+            ToastInfo {
+                compressed: false,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&old_values, &[7], &new_values, &info);
+        assert_eq!(reuse, vec![None]);
+    }
+
+    #[test]
+    fn update_reuse_missing_provenance_not_reused() {
+        // Value id with no toast_info entry (e.g. metadata already
+        // pruned): never reuse a pointer we cannot describe.
+        let _t = text_table();
+        let v = vec![Value::Text(wide_text(1, 6000).into())];
+        let reuse = toast_update_reuse(&v, &[7], &v, &std::collections::HashMap::new());
+        assert_eq!(reuse, vec![None]);
+    }
+
+    #[test]
+    fn update_reuse_compressed_flag_carried() {
+        let v = vec![Value::Text(wide_text(1, 6000).into())];
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            9u32,
+            ToastInfo {
+                compressed: true,
+                method: crate::storage::ToastCompression::Pglz,
+            },
+        );
+        let reuse = toast_update_reuse(&v, &[9], &v, &info);
+        assert_eq!(reuse, vec![Some(true)]);
+    }
+
+    #[test]
+    fn plan_toast_reuse_presets_external_and_skips_rounds() {
+        let t = text_table();
+        // Column 0: 6000 incompressible bytes, unchanged (reuse).
+        // Column 1: 6000 incompressible bytes, changed.
+        let w = wide_text(42, 6000);
+        let values = vec![
+            Value::Text(w.clone().into()),
+            Value::Text(wide_text(43, 6000).into()),
+        ];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[Some(false), None],
+        );
+        // Reused column keeps its external pointer; the changed column
+        // is externalized by the rounds.
+        assert_eq!(plan[0], ToastPlan::External);
+        assert_eq!(plan[1], ToastPlan::External);
+    }
+
+    #[test]
+    fn plan_toast_reuse_counts_pointer_width() {
+        let t = text_table();
+        // Only the reused column is wide; the other is small. The row
+        // must NOT toast the small column: the reused column counts 20
+        // bytes, keeping the width under the threshold.
+        let values = vec![
+            Value::Text(wide_text(7, 6000).into()),
+            Value::Text("tiny".to_string().into()),
+        ];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[Some(false), None],
+        );
+        assert_eq!(plan[0], ToastPlan::External);
+        assert_eq!(plan[1], ToastPlan::Plain);
+    }
+
+    #[test]
+    fn plan_toast_no_reuse_unchanged_behavior() {
+        // Without reuse the planner behaves exactly as before: a wide
+        // incompressible column externalizes.
+        let t = text_table();
+        let values = vec![Value::Text(wide_text(11, 6000).into())];
+        let plan = plan_toast(
+            &t,
+            &values,
+            true,
+            crate::storage::ToastCompression::Pglz,
+            &[None],
+        );
+        assert_eq!(plan[0], ToastPlan::External);
+    }
+
+    // --- v1.06: byte-exact PG19 vectors (always on) ---
+    //
+    // These payloads were produced by the genuine PG19 `pglz_compress()`
+    // (REL_19_STABLE `src/common/pg_lzcompress.c`, default strategy,
+    // compiled by the C harness in the v106 evidence dir) and are
+    // embedded so every build asserts byte-identity without the harness.
+    const V106_PG19_VECTORS: &[(&[u8], &[u8])] = &[
+        // 32 'A's: literal + 3-byte long tag (len 31 -> 0x0f/0x01/0x0d).
+        (
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &[0x02, 0x41, 0x0f, 0x01, 0x0d],
+        ),
+        // High bytes (>= 0x80): exercises the signed-char hash path.
+        (
+            &[
+                0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff,
+                0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9,
+                0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff,
+                0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9,
+                0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff,
+                0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9, 0x80, 0xff, 0xc3, 0xa9,
+            ],
+            &[0x10, 0x80, 0xff, 0xc3, 0xa9, 0x0f, 0x04, 0x3a],
+        ),
+    ];
+
+    #[test]
+    fn v106_pglz_pg19_vectors() {
+        for (i, (input, expected)) in V106_PG19_VECTORS.iter().enumerate() {
+            let got = pglz_compress_payload(input)
+                .unwrap_or_else(|| panic!("vector {i}: PG19 compresses, we refuse"));
+            assert_eq!(
+                got.as_slice(),
+                *expected,
+                "vector {i}: payload not byte-identical to PG19"
+            );
+            // And the framed form round-trips.
+            let framed = compress_pglz(input).unwrap();
+            assert_eq!(&framed[4..], *expected);
+            assert_eq!(decompress_pglz(&framed).unwrap().as_slice(), *input);
+        }
+        // Programmatic long vectors (same bytes the C harness saw).
+        let q300 = vec![b'Q'; 300];
+        assert_eq!(
+            pglz_compress_payload(&q300).unwrap().as_slice(),
+            &[0x06, 0x51, 0x0f, 0x01, 0xff, 0x0f, 0x01, 0x08]
+        );
+        let ab80: Vec<u8> = b"ab".repeat(40);
+        assert_eq!(
+            pglz_compress_payload(&ab80).unwrap().as_slice(),
+            &[0x04, 0x61, 0x62, 0x0f, 0x02, 0x3c]
+        );
+        let text: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".repeat(8);
+        assert_eq!(
+            pglz_compress_payload(&text).unwrap().as_slice(),
+            &[
+                0x00, 0x54, 0x68, 0x65, 0x20, 0x71, 0x75, 0x69, 0x63, 0x00, 0x6b, 0x20, 0x62, 0x72,
+                0x6f, 0x77, 0x6e, 0x20, 0x00, 0x66, 0x6f, 0x78, 0x20, 0x6a, 0x75, 0x6d, 0x70, 0x00,
+                0x73, 0x20, 0x6f, 0x76, 0x65, 0x72, 0x20, 0x74, 0x00, 0x68, 0x65, 0x20, 0x6c, 0x61,
+                0x7a, 0x79, 0x20, 0x60, 0x64, 0x6f, 0x67, 0x2e, 0x20, 0x0f, 0x2d, 0xff, 0x0f, 0x2d,
+                0x18,
+            ]
+        );
+        // Refusal parity on the small-input gate.
+        assert!(pglz_compress_payload(&[b'A'; 31]).is_none());
+        assert!(pglz_compress_payload(&[b'A'; 32]).is_some());
+    }
+
+    // --- v1.06: PGLZ byte-compatibility differential vs real PG19 ---
+    //
+    // `v106_pglz_differential_vs_pg19` is the dev-loop differential: it
+    // compares `pglz_compress_payload` byte-for-byte against the genuine
+    // PG19 `pglz_compress()` (REL_19_STABLE `src/common/pg_lzcompress.c`,
+    // compiled by the C harness in the v106 evidence dir). It runs only
+    // when PGLZ_DIFF_INPUTS/PGLZ_DIFF_REF point at the corpus and the
+    // C-produced reference file; otherwise it passes trivially. When
+    // PGLZ_DIFF_WRITE_RUST is set it also writes the Rust payloads in the
+    // same framing so the C `pglz_decompress()` harness can cross-check
+    // the other direction. Every C success is additionally round-tripped
+    // through the Rust decompressor here (framed), proving PG19-produced
+    // bytes decompress correctly.
+
+    fn read_u32le(buf: &[u8], pos: &mut usize) -> u32 {
+        let v = u32::from_le_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
+        *pos += 4;
+        v
+    }
+
+    #[test]
+    fn v106_pglz_differential_vs_pg19() {
+        let inputs_path = match std::env::var("PGLZ_DIFF_INPUTS") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let ref_path = match std::env::var("PGLZ_DIFF_REF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let inputs_raw = std::fs::read(&inputs_path).expect("read corpus");
+        let ref_raw = std::fs::read(&ref_path).expect("read reference");
+        let mut ip = 0usize;
+        let mut rp = 0usize;
+        let n = read_u32le(&inputs_raw, &mut ip) as usize;
+        let rn = read_u32le(&ref_raw, &mut rp) as usize;
+        assert_eq!(n, rn, "corpus/reference count mismatch");
+        let mut mismatches = 0usize;
+        let mut checked = 0usize;
+        let mut rust_out: Vec<u8> = Vec::new();
+        let write_rust = std::env::var("PGLZ_DIFF_WRITE_RUST").is_ok();
+        if write_rust {
+            rust_out.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        for i in 0..n {
+            let ilen = read_u32le(&inputs_raw, &mut ip) as usize;
+            let input = &inputs_raw[ip..ip + ilen];
+            ip += ilen;
+            let rlen = i32::from_le_bytes([
+                ref_raw[rp],
+                ref_raw[rp + 1],
+                ref_raw[rp + 2],
+                ref_raw[rp + 3],
+            ]);
+            rp += 4;
+            let expected: Option<&[u8]> = if rlen < 0 {
+                None
+            } else {
+                let e = &ref_raw[rp..rp + rlen as usize];
+                rp += rlen as usize;
+                Some(e)
+            };
+            let got = pglz_compress_payload(input);
+            checked += 1;
+            let same = match (&got, expected) {
+                (None, None) => true,
+                (Some(g), Some(e)) => g.as_slice() == e,
+                _ => false,
+            };
+            if !same {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    eprintln!(
+                        "MISMATCH #{i}: input_len={ilen} rust={} pg19={}",
+                        got.as_ref().map(|g| g.len() as i64).unwrap_or(-1),
+                        rlen,
+                    );
+                    eprintln!("  input sha: {:x?}", {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        input.hash(&mut h);
+                        h.finish()
+                    });
+                }
+            }
+            if write_rust {
+                match &got {
+                    None => rust_out.extend_from_slice(&(-1i32).to_le_bytes()),
+                    Some(g) => {
+                        rust_out.extend_from_slice(&(g.len() as u32).to_le_bytes());
+                        rust_out.extend_from_slice(g);
+                    }
+                }
+            }
+            // Cross-decompress: every PG19 success must round-trip
+            // through the Rust decompressor (framed like compress_pglz).
+            if let Some(e) = expected {
+                let mut framed = Vec::with_capacity(e.len() + 4);
+                framed.extend_from_slice(&(input.len() as u32).to_le_bytes());
+                framed.extend_from_slice(e);
+                assert_eq!(
+                    decompress_pglz(&framed).as_deref(),
+                    Some(input),
+                    "rust decompress of PG19 bytes failed at item {i}"
+                );
+            }
+        }
+        if write_rust {
+            std::fs::write(std::env::var("PGLZ_DIFF_WRITE_RUST").unwrap(), &rust_out)
+                .expect("write rust outputs");
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches}/{checked} inputs diverge from PG19 pglz_compress"
+        );
+        eprintln!("differential OK: {checked} inputs byte-identical to PG19");
+    }
+
+    // --- v1.06: decompressor differential vs real PG19 ---
+    //
+    // `v106_pglz_decompress_differential` feeds mutated (and valid) raw
+    // PGLZ payloads to both the genuine PG19 `pglz_decompress()` (via the
+    // C harness) and the Rust `decompress_pglz_raw`, and requires
+    // identical accept/reject decisions and identical output bytes.
+    // Env-gated like the compressor differential; passes trivially when
+    // PGLZ_DIFF_DINPUTS/PGLZ_DIFF_DREF are unset.
+    #[test]
+    fn v106_pglz_decompress_differential() {
+        let inputs_path = match std::env::var("PGLZ_DIFF_DINPUTS") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let ref_path = match std::env::var("PGLZ_DIFF_DREF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let inputs_raw = std::fs::read(&inputs_path).expect("read dcorpus");
+        let ref_raw = std::fs::read(&ref_path).expect("read dreference");
+        let mut ip = 0usize;
+        let mut rp = 0usize;
+        let n = read_u32le(&inputs_raw, &mut ip) as usize;
+        let rn = read_u32le(&ref_raw, &mut rp) as usize;
+        assert_eq!(n, rn, "dcorpus/dreference count mismatch");
+        let mut mismatches = 0usize;
+        for i in 0..n {
+            let rawsize = read_u32le(&inputs_raw, &mut ip) as usize;
+            let slen = read_u32le(&inputs_raw, &mut ip) as usize;
+            let payload = &inputs_raw[ip..ip + slen];
+            ip += slen;
+            let rlen = i32::from_le_bytes([
+                ref_raw[rp],
+                ref_raw[rp + 1],
+                ref_raw[rp + 2],
+                ref_raw[rp + 3],
+            ]);
+            rp += 4;
+            let expected: Option<&[u8]> = if rlen < 0 {
+                None
+            } else {
+                let e = &ref_raw[rp..rp + rlen as usize];
+                rp += rlen as usize;
+                Some(e)
+            };
+            let got = decompress_pglz_raw(payload, rawsize);
+            let same = match (&got, expected) {
+                (None, None) => true,
+                (Some(g), Some(e)) => g.as_slice() == e,
+                _ => false,
+            };
+            if !same {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    eprintln!(
+                        "DECOMP MISMATCH #{i}: rawsize={rawsize} slen={slen} rust={} pg19={}",
+                        got.as_ref().map(|g| g.len() as i64).unwrap_or(-1),
+                        rlen,
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches}/{n} payloads diverge from PG19 pglz_decompress"
+        );
+        eprintln!("decompress differential OK: {n} payloads agree with PG19");
     }
 }

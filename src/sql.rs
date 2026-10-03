@@ -51,6 +51,15 @@ fn err(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v1.30: outcome of `parse_ordered_set_call`. `NotWithinGroup` means
+/// the call is not an ordered-set aggregate after all (only possible
+/// for `rank` / `dense_rank`, which double as window functions) — the
+/// caller rewinds and parses it through the generic path instead.
+enum ParseOsError {
+    NotWithinGroup,
+    Sql(SqlError),
+}
+
 /// A parse-time 42883 (undefined function), like Postgres.
 fn err_undefined(msg: impl Into<String>) -> SqlError {
     SqlError {
@@ -73,6 +82,25 @@ fn err_typmod(msg: impl Into<String>) -> SqlError {
     SqlError {
         message: msg.into(),
         code: "22023",
+    }
+}
+
+/// v1.45: a parse-time 22023 (invalid_parameter_value), like PG19's
+/// explain_state.c rejecting bad EXPLAIN option values or option
+/// combinations (e.g. `EXPLAIN option WAL requires ANALYZE`).
+fn err_invalid_param(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "22023",
+    }
+}
+
+/// v1.39: a parse-time 22P02 (invalid_text_representation), like PG19's
+/// `bit_in` rejecting a bad digit in an `x'...'`/`b'...'` literal.
+fn err_invalid_text(msg: impl Into<String>) -> SqlError {
+    SqlError {
+        message: msg.into(),
+        code: "22P02",
     }
 }
 
@@ -99,6 +127,11 @@ enum Token {
     Str(String),
     UStr(String),   // v0.19: U&'...' raw content (UESCAPE handled by parser)
     UIdent(String), // v0.24: U&"..." raw identifier content (UESCAPE handled by parser)
+    // v1.39: `x'...'`/`b'...'` bit-string literal (PG19 scan.l xhstart):
+    // the char is the normalized lowercase marker ('x' or 'b'), the
+    // String is the raw digit content (validated by the parser with
+    // `bit_in` semantics, not the lexer).
+    BitStr(char, String),
     Param(u32),     // $N parameter placeholder, 1-based
     LParen,
     RParen,
@@ -113,6 +146,7 @@ enum Token {
     Slash,   // v0.7: `/`
     Percent, // v0.7: `%`
     Eq,
+    FatArrow,      // v0.95: `=>` named-argument operator (PG19)
     Dot,           // v0.6: qualified refs (t.col)
     Lt,            // v0.6: <
     Gt,            // v0.6: >
@@ -135,6 +169,12 @@ enum Token {
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
     Caret,         // v0.7: `^` exponentiation
     StarEq,        // v0.81: `*=` PG19 record-image equality (record_image_eq)
+    /// v0.86: user-defined operator name starting with `?` (e.g. `?=`).
+    /// Only `?`-led sequences lex here; every other operator character
+    /// already has its own token. Used in `CREATE OPERATOR`'s name
+    /// position; the expression parser rejects it (42601) since custom
+    /// operators are not overloadable into expressions.
+    Op(String),
     EOF,
 }
 
@@ -487,6 +527,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             toks.push(Token::Str(unescape_e_string(&s)?));
             continue;
         }
+        // v1.39: `x'...'`/`b'...'` bit-string literal prefixes (PG19
+        // scan.l xhstart: no space allowed between the prefix and the
+        // quote, and the scanner prepends the marker to the literal).
+        // Validation happens in the parser (`bit_in` semantics); the
+        // lexer only captures the raw digits.
+        if (c == 'x' || c == 'X' || c == 'b' || c == 'B')
+            && i + 1 < chars.len()
+            && chars[i + 1] == '\''
+        {
+            let marker = c.to_ascii_lowercase();
+            i += 1; // consume the prefix, now at the quote
+            let s = parse_single_quoted(&chars, &mut i)?;
+            toks.push(Token::BitStr(marker, s));
+            continue;
+        }
         match c {
             '(' => {
                 toks.push(Token::LParen);
@@ -531,8 +586,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 i += 1;
             }
             '=' => {
-                toks.push(Token::Eq);
-                i += 1;
+                // v0.95: `=>` is the named-argument operator (PG19); a
+                // bare `=` is equality.
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    toks.push(Token::FatArrow);
+                    i += 2;
+                } else {
+                    toks.push(Token::Eq);
+                    i += 1;
+                }
             }
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '<' {
@@ -794,6 +856,24 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 };
                 toks.push(Token::Ident(word));
             }
+            // v0.86: `?`-led operator names (e.g. `?=` in
+            // `CREATE OPERATOR ?=`). `?` previously errored, so no
+            // working statement can contain one; lex `?` plus any
+            // following operator characters as a single Op token.
+            '?' => {
+                let start = i;
+                i += 1;
+                while i < chars.len()
+                    && matches!(
+                        chars[i],
+                        '=' | '?' | '!' | '~' | '@' | '#' | '%' | '^' | '&' | '|'
+                    )
+                {
+                    i += 1;
+                }
+                let op: String = chars[start..i].iter().collect();
+                toks.push(Token::Op(op));
+            }
             _ => return Err(err(format!("unexpected character '{}'", c))),
         }
     }
@@ -823,6 +903,9 @@ pub enum Literal {
     Timestamptz(i64), // v0.7: micros since epoch, UTC
     Bytea(Vec<u8>),   // v0.7
     Uuid([u8; 16]),   // v0.7
+    // v1.39: a validated `x'...'`/`b'...'` bit-string literal (PG19
+    // `bit_in`); the marker's case was normalized by the lexer.
+    BitString(crate::storage::BitString),
     Null,
 }
 
@@ -844,6 +927,7 @@ impl Literal {
             Literal::Timestamptz(_) => "timestamp with time zone",
             Literal::Bytea(_) => "bytea",
             Literal::Uuid(_) => "uuid",
+            Literal::BitString(_) => "bit", // v1.39
             Literal::Null => "unknown",
         }
     }
@@ -866,6 +950,7 @@ impl Literal {
             Literal::Timestamptz(_) => ColType::Timestamptz,
             Literal::Bytea(_) => ColType::Bytea,
             Literal::Uuid(_) => ColType::Uuid,
+            Literal::BitString(_) => ColType::Bit, // v1.39
             // Postgres would say "unknown"; text is a fine stand-in.
             Literal::Null => ColType::Text,
         }
@@ -897,6 +982,7 @@ impl Literal {
             Literal::Timestamptz(m) => Value::Timestamptz(m),
             Literal::Bytea(b) => Value::Bytea(b),
             Literal::Uuid(u) => Value::Uuid(u),
+            Literal::BitString(b) => Value::BitString(b), // v1.39
             Literal::Null => Value::Null,
         }
     }
@@ -914,6 +1000,21 @@ pub enum CmpOp {
     /// v0.81: `*=` — PG19 `record_image_eq` (byte-oriented identity for
     /// fast sorting/grouping; e.g. numeric `1.00` is NOT `*=` `1.0`).
     ImageEq,
+}
+
+/// v0.87: the operator in an `Expr::Quantified` — either a builtin
+/// comparison or a user-defined operator name (e.g. `?=`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuantOp {
+    Cmp(CmpOp),
+    User(String),
+}
+
+/// v0.87: `ANY`/`SOME` (existential) vs `ALL` (universal) quantification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantKind {
+    Any,
+    All,
 }
 
 impl CmpOp {
@@ -947,6 +1048,9 @@ pub enum AggFunc {
     VariancePop,
     StddevSamp,
     StddevPop,
+    // v0.91: `array_agg(x)` — collect non-null inputs into a 1-D array
+    // (multidimensional when the input is itself an array, like PG).
+    ArrayAgg,
 }
 
 impl AggFunc {
@@ -963,8 +1067,67 @@ impl AggFunc {
             AggFunc::VariancePop => "var_pop",
             AggFunc::StddevSamp => "stddev",
             AggFunc::StddevPop => "stddev_pop",
+            AggFunc::ArrayAgg => "array_agg",
         }
     }
+}
+
+/// v1.30: PG19 ordered-set aggregates (`aggkind = 'o'` / `'h'` in
+/// pg_aggregate.dat), called with `WITHIN GROUP (ORDER BY ...)`
+/// (PG19 gram.y `within_group_clause`). `Rank` / `DenseRank` /
+/// `PercentRank` / `CumeDist` are the hypothetical-set aggregates;
+/// the window functions of the same names are the separate
+/// `WindowFunc` variants (disambiguated by the WITHIN GROUP keyword).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderedSetAgg {
+    PercentileCont,
+    PercentileDisc,
+    Mode,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+}
+
+impl OrderedSetAgg {
+    pub fn name(&self) -> &'static str {
+        match self {
+            OrderedSetAgg::PercentileCont => "percentile_cont",
+            OrderedSetAgg::PercentileDisc => "percentile_disc",
+            OrderedSetAgg::Mode => "mode",
+            OrderedSetAgg::Rank => "rank",
+            OrderedSetAgg::DenseRank => "dense_rank",
+            OrderedSetAgg::PercentRank => "percent_rank",
+            OrderedSetAgg::CumeDist => "cume_dist",
+        }
+    }
+
+    /// PG19 `aggkind`: `'h'` for the hypothetical-set aggregates,
+    /// `'o'` for the plain ordered-set ones (pg_aggregate.dat).
+    pub fn is_hypothetical(&self) -> bool {
+        matches!(
+            self,
+            OrderedSetAgg::Rank
+                | OrderedSetAgg::DenseRank
+                | OrderedSetAgg::PercentRank
+                | OrderedSetAgg::CumeDist
+        )
+    }
+}
+
+/// v1.30: is `name` one of PG19's ordered-set aggregate names
+/// (pg_aggregate.dat `aggkind = 'o'` / `'h'`)?
+pub fn is_ordered_set_agg_name(name: &str) -> bool {
+    matches!(
+        name,
+        "percentile_cont"
+            | "percentile_disc"
+            | "mode"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+    )
 }
 
 /// Binary arithmetic operators (v0.7).
@@ -1030,6 +1193,10 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         to: ColType,
+        /// v0.93: func-style cast spelling (`float8(x)`): PG19 names the
+        /// output column after the type name as written. `None` for
+        /// `x::type` / `CAST(x AS type)` syntax.
+        written: Option<String>,
     },
     /// v0.81: cast to a named composite type (`ROW(...)::t_rec`). The
     /// name is resolved against the type catalog at execution time
@@ -1083,6 +1250,13 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// v0.95: `name => expr` named function argument (PG19). The parser
+    /// produces this inside `Func.args`; the executor resolves it against
+    /// the function signature before evaluation.
+    NamedArg {
+        name: String,
+        expr: Box<Expr>,
+    },
     /// v0.7: `extract(field FROM expr)`.
     Extract {
         field: String,
@@ -1130,6 +1304,31 @@ pub enum Expr {
         distinct: bool,
         /// v0.7: second argument (string_agg's delimiter).
         arg2: Option<Box<Expr>>,
+        /// v0.92: `ORDER BY` inside the aggregate call (PG19 docs
+        /// §4.2.7: allowed in any aggregate; evaluated per input row
+        /// before accumulation).
+        agg_order_by: Vec<OrderTerm>,
+        /// v1.29: `FILTER (WHERE ...)` (PG19 gram.y `filter_clause`):
+        /// only input rows where this evaluates to TRUE feed the
+        /// aggregate's transition. Groups are still formed from all
+        /// rows; evaluated per input row in row scope.
+        filter: Option<Box<Expr>>,
+    },
+    /// v1.30: PG19 ordered-set aggregate, e.g.
+    /// `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` or
+    /// `rank(5) WITHIN GROUP (ORDER BY x)` (PG19 gram.y
+    /// `within_group_clause`). `direct_args` are the parenthesized
+    /// arguments, evaluated once per group (PG19 nodeAgg.c evaluates
+    /// them against the group's representative input tuple); the
+    /// WITHIN GROUP sort keys are the aggregated args, sorted (with
+    /// the terms' ASC/DESC and NULLS ordering) before the final
+    /// function runs. `filter` is the v1.29 `FILTER (WHERE ...)`
+    /// clause, applied to input rows before the sort.
+    WithinGroup {
+        func: OrderedSetAgg,
+        direct_args: Vec<Expr>,
+        within_order_by: Vec<OrderTerm>,
+        filter: Option<Box<Expr>>,
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
@@ -1175,11 +1374,31 @@ pub enum Expr {
     WholeRow {
         qual: String,
     },
-    /// `[NOT] IN (subquery)`.
+    /// `[NOT] IN (subquery)`. v0.87: `expr` may be an `Expr::Row` for
+    /// row-wise `[NOT] IN (SELECT ...)` (PG19).
     InSub {
         expr: Box<Expr>,
         sub: Box<SelectStmt>,
         neg: bool,
+    },
+    /// v0.87: quantified comparison `expr op ANY|ALL|SOME (subquery)`
+    /// (PG19) for operators beyond `= ANY`/`<> ALL` (which desugar to
+    /// `InSub`). `left` may be an `Expr::Row` for row-wise quantification.
+    /// `op` is a builtin `CmpOp` or a user-defined operator name.
+    Quantified {
+        left: Box<Expr>,
+        op: QuantOp,
+        quant: QuantKind,
+        sub: Box<SelectStmt>,
+    },
+    /// v0.87: user-defined binary operator `left OP right` (PG19), e.g.
+    /// `?=` from `CREATE OPERATOR`. Resolved at plan time by
+    /// (name, leftarg, rightarg); evaluated by calling the operator's
+    /// procedure.
+    UserOp {
+        op: String,
+        left: Box<Expr>,
+        right: Box<Expr>,
     },
     /// `[NOT] EXISTS (subquery)`.
     Exists {
@@ -1198,6 +1417,14 @@ pub enum Expr {
         order_by: Vec<OrderTerm>,
         frame: WindowFrame,
         wid: usize,
+        /// v1.29: `FILTER (WHERE ...)` on a windowed aggregate (PG19
+        /// parse_func.c keeps `wfunc->aggfilter`; only meaningful when
+        /// `func` is `WindowFunc::Agg`).
+        filter: Option<Box<Expr>>,
+        /// v1.31: PG19 `opt_window_exclusion_clause` (`EXCLUDE ...`
+        /// after the frame extent). Participates in window identity
+        /// like `filter`.
+        exclusion: FrameExclusion,
     },
 }
 
@@ -1220,11 +1447,28 @@ pub enum WindowFunc {
 /// v0.10: window frame. `Default` follows the Postgres rule: with ORDER BY
 /// it is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, otherwise
 /// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+/// v1.31: `Groups` (PG19 gram.y `GROUPS frame_extent`): bounds count
+/// peer groups (rows indistinguishable by the window ORDER BY), not
+/// physical rows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowFrame {
     Default,
     Rows { start: FrameBound, end: FrameBound },
     Range { start: FrameBound, end: FrameBound },
+    Groups { start: FrameBound, end: FrameBound },
+}
+
+/// v1.31: PG19 `opt_window_exclusion_clause` — `EXCLUDE CURRENT ROW` /
+/// `EXCLUDE GROUP` / `EXCLUDE TIES` / `EXCLUDE NO OTHERS` after the frame
+/// extent. Absent and `EXCLUDE NO OTHERS` are both `NoOthers` (PG folds
+/// them to "no exclusion bits").
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum FrameExclusion {
+    #[default]
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 /// v0.10: one end of a window frame.
@@ -1257,31 +1501,47 @@ pub enum FromItem {
         /// v0.20: `FROM tbl [AS] x (a, b, c)` — column aliases rename the
         /// table's output columns positionally.
         col_aliases: Vec<String>,
+        /// v0.96: `FROM ONLY tbl` — scan just the named table, excluding
+        /// inheritance children (PG19; default scans include them).
+        only: bool,
     },
     /// `(SELECT ...) [AS] alias` — the alias is required, like Postgres.
     /// v0.23: `[(cols)]` column aliases rename the subquery's output
     /// columns positionally (previously parsed but discarded).
+    /// v1.10: `LATERAL (SELECT ...)` — the subquery may reference
+    /// FROM items to its left and is evaluated once per left row
+    /// (PG19 `LATERAL_P select_with_parens`, which also covers
+    /// `LATERAL (VALUES ...)`).
     Derived {
         sub: Box<SelectStmt>,
         alias: String,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     /// v0.14: `(VALUES (e, ...) [, ...]) [AS] alias` — PG names the
     /// columns `column1`, `column2`, ... when no column aliases are given.
     /// v0.21: `[(col, ...)]` column aliases.
+    /// v1.10: `LATERAL (VALUES ...)` — row expressions may reference
+    /// FROM items to the left (PG19 `select_with_parens` covers
+    /// `VALUES`; PG's own regress suite uses this shape).
     Values {
         rows: Vec<Vec<Expr>>,
         alias: String,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     /// v0.32: `func(args) [AS] alias [(cols)]` — set-returning table
-    /// function (currently `regexp_split_to_table`). Correlated (LATERAL)
-    /// references are not supported: args see the outer scope only.
+    /// function. v0.46: a function whose args reference earlier FROM
+    /// items is evaluated once per left row (implicit LATERAL, PG19).
+    /// v0.87: explicit `LATERAL` before a table function is accepted
+    /// (PG19); an uncorrelated function under explicit LATERAL is a
+    /// plain cross join either way.
     Function {
         name: String,
         args: Vec<Expr>,
         alias: Option<String>,
         col_aliases: Vec<String>,
+        lateral: bool,
     },
     Join {
         left: Box<FromItem>,
@@ -1314,6 +1574,13 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// v1.68: PG19 `JOIN_ANTI` (primnodes.h) — the anti-join produced by
+    /// `convert_ANY_sublink_to_join` / `convert_EXISTS_sublink_to_join`
+    /// (subselect.c) for `NOT IN` / `NOT EXISTS`. EXPLAIN renders it
+    /// interpolated into the node label (`Hash Anti Join`, explain.c
+    /// `ExplainNode`). Never produced by the SQL parser (there is no
+    /// `ANTI JOIN` syntax); only by the EXPLAIN planner.
+    Anti,
 }
 
 /// A full SELECT statement (v0.6).
@@ -1344,11 +1611,32 @@ pub struct SelectStmt {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub for_update: bool,
+    /// v1.14: `FOR UPDATE OF tbl [, ...]` — the locking targets (PG19).
+    /// Empty when absent or for bare `FOR UPDATE` (which locks all tables).
+    pub for_update_of: Vec<String>,
     /// v0.44: set-operation root when this statement is the carrier of a
     /// `UNION` / `INTERSECT` / `EXCEPT` query. When `Some`, the fields
     /// above are empty/ignored and the query is `set_op`'s branches.
     /// `None` for plain SELECTs (zero behavior change).
     pub set_op: Option<Box<SetOpRoot>>,
+    /// v1.54: PG19's dead rtable entries from `pull_up_simple_subquery`
+    /// (prepjointree.c): a pulled-up subquery's RTE stays in the rtable
+    /// (with `subquery = NULL`), so `es->rtable_size` — the EXPLAIN
+    /// `useprefix` rule — counts it. The parser always sets 0; the
+    /// EXPLAIN-path pullup sets the number of spliced Deriveds.
+    /// Consulted only by PG-text rendering (`pg_rtable_size` call
+    /// sites); never by execution.
+    pub dead_rtes: usize,
+}
+
+/// v1.54: `AS [NOT] MATERIALIZED` CTE hint (PG12+, PG19 gram.y
+/// `materialized` opt). Recorded by the parser; the planner's CTE-inlining
+/// gate (`SS_process_ctes`) honors it. `Default` = no hint given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CteMaterialize {
+    Default,
+    Materialized,
+    NotMaterialized,
 }
 
 /// v0.10: one Common Table Expression.
@@ -1358,6 +1646,8 @@ pub struct CteDef {
     pub col_aliases: Vec<String>,
     pub body: CteBody,
     pub recursive: bool,
+    /// v1.54: the `AS [NOT] MATERIALIZED` hint (`Default` when absent).
+    pub materialized: CteMaterialize,
 }
 
 /// v0.44: an empty `SelectStmt` shell, used as the carrier of a
@@ -1377,7 +1667,9 @@ fn empty_select() -> SelectStmt {
         limit: None,
         offset: None,
         for_update: false,
+        for_update_of: Vec::new(),
         set_op: None,
+        dead_rtes: 0,
     }
 }
 
@@ -1422,7 +1714,7 @@ pub struct SetOpRoot {
 /// v0.10: a CTE body. Plain CTEs hold one SELECT; recursive CTEs hold the
 /// `non_recursive UNION [ALL] recursive` pair (UNION elsewhere is not
 /// supported in v0.10).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum CteBody {
     Simple(SelectStmt),
     Union {
@@ -1430,6 +1722,36 @@ pub enum CteBody {
         right: Box<SelectStmt>,
         all: bool,
     },
+    // v1.39: a data-modifying CTE body — `(INSERT/UPDATE/DELETE ...
+    // [RETURNING ...])` (PG19 parse_cte.c). The DML runs when the CTE is
+    // materialized; its RETURNING rows become the CTE's rows. An empty
+    // RETURNING list means zero columns.
+    Dml(Box<Stmt>),
+}
+
+// v1.39: manual PartialEq — `Stmt` does not implement PartialEq (several
+// of its field types don't), so the derived impl cannot cover
+// `CteBody::Dml`. DML bodies are never compared in this engine; two
+// DML bodies compare unequal.
+impl PartialEq for CteBody {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CteBody::Simple(a), CteBody::Simple(b)) => a == b,
+            (
+                CteBody::Union {
+                    left: a,
+                    right: b,
+                    all: c,
+                },
+                CteBody::Union {
+                    left: d,
+                    right: e,
+                    all: f,
+                },
+            ) => a == d && b == e && c == f,
+            _ => false,
+        }
+    }
 }
 
 /// v0.22: UPDATE/DELETE graduated to full predicate expressions (see
@@ -1447,6 +1769,31 @@ pub enum InsertValue {
     /// v0.24: a general expression in INSERT VALUES
     /// (e.g. `VALUES (repeat('x', 3))`).
     Expr(Expr),
+}
+
+/// v0.84: one target of an INSERT column list — a column name with
+/// optional PG19 indirection (`f2[1]`, `f3.if2`, `f4[1].if2[1]`).
+/// Empty `indirection` is a whole-column target.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsertTarget {
+    pub name: String,
+    pub indirection: Vec<InsertIndirection>,
+}
+
+/// v0.84: one indirection step on an INSERT target (PG19 gram.y
+/// `opt_indirection` / `indirection_el`, restricted to what INSERT
+/// targets can carry).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertIndirection {
+    /// `[e1][e2]...` — adjacent bracket pairs merge into ONE step with
+    /// several indices (PG19: "Adjacent A_Indices nodes have to be
+    /// treated as a single multidimensional subscript operation").
+    Index(Vec<Expr>),
+    /// `.field`
+    Field(String),
+    /// `[l:u]` slice — parsed so the error can be PG-shaped; rejected
+    /// at execution (0A000, unsupported).
+    Slice,
 }
 
 /// One `ORDER BY` sort key: expression + direction + explicit NULL
@@ -1562,6 +1909,15 @@ pub struct TableDef {
     /// (`Some(name)` iff the column's `ColType` is `Composite`); resolved
     /// against the type catalog at execution time.
     pub composite_types: Vec<Option<String>>,
+    /// v0.85: domain name per column, parallel to `columns`
+    /// (`Some(d)` iff the column was declared with domain type `d`,
+    /// possibly as `d[]`); resolved against the type catalog at
+    /// execution time.
+    pub domain_types: Vec<Option<String>>,
+    /// v0.85: iff `domain_types[i]` is `Some` and the column was
+    /// declared as `d[]` (array of domain): the domain applies per
+    /// array element, not to the whole column value.
+    pub domain_elem: Vec<bool>,
     pub not_null: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
     /// v0.65: per-column serial pseudo-type marker (parallel to
@@ -1598,6 +1954,10 @@ pub struct TableDef {
     /// CREATE time. Querying a parent does NOT yet include children's
     /// rows (no inheritance expansion in scans).
     pub inherits: Vec<String>,
+    /// v0.96: table-constraint `NOT NULL` columns that named no local
+    /// column (legal only with `INHERITS`); applied to the merged
+    /// column list at exec, 42703 when still missing.
+    pub deferred_not_null: Vec<String>,
 }
 
 /// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
@@ -1724,29 +2084,88 @@ pub enum AlterAction {
         child: String,
         bound: PartBoundDef,
     },
+    /// v0.96: `ALTER TABLE child INHERIT parent` (PG19 table inheritance).
+    /// The parent must exist; every parent column must already exist in
+    /// the child with an exactly matching type, and parent NOT NULL
+    /// columns must be NOT NULL in the child (42804 otherwise). The
+    /// link is recorded; columns are never added or reordered.
+    Inherit {
+        parent: String,
+    },
+    /// v0.96: `ALTER TABLE child NO INHERIT parent` — drops the
+    /// inheritance link only; the child's columns and data are kept.
+    /// A missing link is 42P01, like PostgreSQL.
+    NoInherit {
+        parent: String,
+    },
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
 /// (ALTER) or the Postgres default (CREATE).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SequenceOpts {
+    /// v0.99: explicit `AS smallint | int | bigint` (PG19; default bigint).
+    pub seq_type: Option<SeqType>,
     pub start: Option<i64>,
     pub increment: Option<i64>,
     pub min_value: Option<i64>,
     pub max_value: Option<i64>,
+    /// v0.99: `NO MINVALUE` / `NO MAXVALUE` — reset to the type default
+    /// (PG19 init_params). Distinct from `None` (keep current on ALTER).
+    pub reset_min: bool,
+    pub reset_max: bool,
     pub cycle: Option<bool>,
     pub restart: Option<i64>,
+    /// v0.98: `CACHE n` (Postgres default 1).
+    pub cache: Option<i64>,
+    /// v0.98: `OWNED BY table.col` / `OWNED BY NONE`. `None` =
+    /// unspecified (ALTER keeps the current owner link).
+    pub owned_by: Option<OwnedBySpec>,
+}
+
+/// v0.99: explicit sequence data type (`AS smallint | int | bigint`,
+/// PG19; anything else is 22023 "sequence type must be smallint,
+/// integer, or bigint").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqType {
+    SmallInt,
+    Integer,
+    BigInt,
+}
+
+impl SeqType {
+    pub fn pg_name(self) -> &'static str {
+        match self {
+            SeqType::SmallInt => "smallint",
+            SeqType::Integer => "integer",
+            SeqType::BigInt => "bigint",
+        }
+    }
+    pub fn min_value(self) -> i64 {
+        match self {
+            SeqType::SmallInt => i64::from(i16::MIN),
+            SeqType::Integer => i64::from(i32::MIN),
+            SeqType::BigInt => i64::MIN,
+        }
+    }
+    pub fn max_value(self) -> i64 {
+        match self {
+            SeqType::SmallInt => i64::from(i16::MAX),
+            SeqType::Integer => i64::from(i32::MAX),
+            SeqType::BigInt => i64::MAX,
+        }
+    }
+}
+
+/// v0.98: `OWNED BY` target in CREATE/ALTER SEQUENCE (PG19
+/// SequenceOptions / AlterSeqStmt).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OwnedBySpec {
+    Table { table: String, column: String },
+    None_,
 }
 
 impl SequenceOpts {
-    /// `NO MINVALUE` / `NO MAXVALUE` sentinel: Postgres uses 1 /
-    /// 2^63-1 for ascending sequences.
-    pub fn no_minvalue() -> i64 {
-        1
-    }
-    pub fn no_maxvalue() -> i64 {
-        i64::MAX
-    }
     /// Bare `RESTART` (no WITH value) resets to the sequence's start.
     pub const RESTART_SENTINEL: i64 = i64::MIN;
 }
@@ -1873,6 +2292,8 @@ impl TableDef {
         TableDef {
             columns: Vec::new(),
             composite_types: Vec::new(),
+            domain_types: Vec::new(),
+            domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -1886,6 +2307,7 @@ impl TableDef {
             likes: Vec::new(),
             reloptions: Vec::new(),
             inherits: Vec::new(),
+            deferred_not_null: Vec::new(),
         }
     }
 }
@@ -1909,10 +2331,16 @@ fn def_add_pkey(
     def: &mut TableDef,
     name: Option<String>,
     cols: &[String],
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check and the NOT NULL marking are deferred to exec,
+    // which validates against the merged column list.
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     if def.pkey.is_some() {
@@ -1922,9 +2350,11 @@ fn def_add_pkey(
     if def_constraint_name_exists(def, &cname) {
         return Err(err(format!("constraint \"{}\" already exists", cname)));
     }
-    for c in cols {
-        let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
-        def.not_null[i] = true;
+    if !defer_col_check {
+        for c in cols {
+            let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
+            def.not_null[i] = true;
+        }
     }
     def.pkey = Some(UniqueDef {
         name: cname,
@@ -1939,10 +2369,15 @@ fn def_add_unique(
     name: Option<String>,
     cols: &[String],
     col: &str,
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check is deferred to exec (see def_add_pkey).
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     let cname = name.unwrap_or_else(|| format!("{}_{}_key", table, col));
@@ -1996,10 +2431,15 @@ fn def_add_fk(
     name: Option<String>,
     cols: &[String],
     tail: ParsedFkTail,
+    // v0.96: with `INHERITS`, columns may come from the parents; the
+    // existence check is deferred to exec (see def_add_pkey).
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
-    for c in cols {
-        if !def_col_exists(def, c) {
-            return Err(err(format!("column \"{}\" does not exist", c)));
+    if !defer_col_check {
+        for c in cols {
+            if !def_col_exists(def, c) {
+                return Err(err(format!("column \"{}\" does not exist", c)));
+            }
         }
     }
     let cname = name.unwrap_or_else(|| format!("{}_{}_fkey", table, cols[0]));
@@ -2017,7 +2457,15 @@ fn def_add_fk(
     Ok(())
 }
 
-fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlError> {
+/// v0.96: `inherits` (already parsed) relaxes two rules when non-empty:
+/// a column list with no local columns is legal (parents supply them),
+/// and table-constraint column references are validated against the
+/// merged column list at exec instead of here.
+fn build_table_def(
+    table: &str,
+    items: Vec<TableItem>,
+    inherits: &[String],
+) -> Result<TableDef, SqlError> {
     let mut def = TableDef::empty();
     // Pass 1: columns.
     for item in &items {
@@ -2034,6 +2482,10 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
             // v0.81: named composite type travels to exec for catalog
             // resolution.
             def.composite_types.push(c.composite_name.clone());
+            // v0.85: domain slots travel alongside; exec resolves the
+            // named type to a domain (or not) and fills them in.
+            def.domain_types.push(None);
+            def.domain_elem.push(false);
             def.not_null.push(false);
             def.defaults.push(None);
             // v0.65: serial marker (with kind) travels to exec for
@@ -2054,7 +2506,7 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
     // PostgreSQL; only a list that intended columns but produced none
     // (and no LIKE) is an error.
     let has_like = items.iter().any(|i| matches!(i, TableItem::Like(_)));
-    if def.columns.is_empty() && !has_like && !items.is_empty() {
+    if def.columns.is_empty() && !has_like && !items.is_empty() && inherits.is_empty() {
         return Err(err(
             "syntax error: table must have at least one column".to_string()
         ));
@@ -2092,10 +2544,15 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                             n.clone(),
                             std::slice::from_ref(&c.name),
                             &c.name,
+                            false,
                         )?,
-                        ColCon::PKey(n) => {
-                            def_add_pkey(table, &mut def, n.clone(), std::slice::from_ref(&c.name))?
-                        }
+                        ColCon::PKey(n) => def_add_pkey(
+                            table,
+                            &mut def,
+                            n.clone(),
+                            std::slice::from_ref(&c.name),
+                            false,
+                        )?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
                         ColCon::Check(n, e) => {
                             def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?
@@ -2111,15 +2568,25 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                                 on_delete: tail.on_delete,
                                 on_update: tail.on_update,
                             },
+                            false,
                         )?,
                     }
                 }
             }
             TableItem::TableCon(tc) => match tc {
-                ParsedTableCon::PKey(n, cols) => def_add_pkey(table, &mut def, n.clone(), cols)?,
+                ParsedTableCon::PKey(n, cols) => {
+                    def_add_pkey(table, &mut def, n.clone(), cols, !inherits.is_empty())?
+                }
                 ParsedTableCon::Unique(n, cols) => {
                     let first = cols[0].clone();
-                    def_add_unique(table, &mut def, n.clone(), cols, &first)?
+                    def_add_unique(
+                        table,
+                        &mut def,
+                        n.clone(),
+                        cols,
+                        &first,
+                        !inherits.is_empty(),
+                    )?
                 }
                 ParsedTableCon::Check(n, e) => {
                     def_add_check(table, &mut def, n.clone(), e.clone(), table)?
@@ -2130,11 +2597,16 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                 ParsedTableCon::NotNull { col, .. } => {
                     if let Some(i) = def.columns.iter().position(|(n, _)| n == col) {
                         def.not_null[i] = true;
-                    } else {
+                    } else if inherits.is_empty() {
                         return Err(err(format!(
                             "syntax error: column \"{}\" of relation \"{}\" does not exist",
                             col, table
                         )));
+                    } else {
+                        // v0.96: with INHERITS the column may come from a
+                        // parent; the NOT NULL is applied to the merged
+                        // columns at exec.
+                        def.deferred_not_null.push(col.clone());
                     }
                 }
                 ParsedTableCon::Fk {
@@ -2152,6 +2624,7 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
                         on_delete: tail.on_delete,
                         on_update: tail.on_update,
                     },
+                    !inherits.is_empty(),
                 )?,
             },
         }
@@ -2162,6 +2635,8 @@ fn build_table_def(table: &str, items: Vec<TableItem>) -> Result<TableDef, SqlEr
 /// Collect `(qualifier, name)` of every column reference in an expression.
 pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => collect_col_refs(expr, out),
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
@@ -2236,11 +2711,19 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Literal(_)
         | Expr::Param(_)
         | Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Exists { .. }
         | Expr::ResolvedCol { .. } => {}
+        // v0.87: quantified comparison — the left side is outer-scope
+        // (the subquery has its own scope, like InSub).
+        Expr::Quantified { left, .. } => collect_col_refs(left, out),
+        Expr::UserOp { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
         // v0.79: array expressions — collect from elements/operands.
         Expr::ArrayCtor { elems, .. } => {
             for e in elems {
@@ -2354,6 +2837,1813 @@ pub enum FetchDir {
     Last,
 }
 
+/// v0.86: a single `CREATE FUNCTION` argument: the optional argument
+/// name and the declared type name as written.
+#[derive(Clone, Debug)]
+pub struct FuncArg {
+    pub name: Option<String>,
+    pub type_name: String,
+}
+
+/// v0.86: function languages we can execute. `plpgsql` is accepted only
+/// for the bounded single-`RETURN` subset (v0.97): a body of the form
+/// `BEGIN RETURN <expr>; END` is desugared to `SELECT <expr>` at CREATE
+/// time (see `desugar_plpgsql_body`); anything else in plpgsql is an
+/// honest 0A000. v1.32: unknown language names are no longer rejected by
+/// the parser — the executor resolves them and raises 42883
+/// (`language "%s" does not exist`, like PG19's proclang.c
+/// `get_language_oid`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuncLang {
+    Sql,
+    Internal,
+    /// v0.97: bounded plpgsql (single RETURN statement bodies only).
+    Plpgsql,
+}
+
+/// v0.97: one `ALTER DOMAIN` action (PG19 AlterDomainStmt, bounded to
+/// the domain-constraint forms; OWNER/RENAME/SET SCHEMA stay
+/// unsupported). `AddConstraint.name` is `None` when the statement
+/// omitted `CONSTRAINT name` — the executor auto-names it
+/// `<domain>_check[N]` like CREATE DOMAIN does.
+#[derive(Clone, Debug)]
+pub enum AlterDomainAction {
+    AddConstraint { name: Option<String>, expr: Expr },
+    DropConstraint { name: String, if_exists: bool },
+    SetNotNull,
+    DropNotNull,
+    SetDefault(DefaultExpr),
+    DropDefault,
+}
+
+/// v0.97: desugar a bounded-plpgsql function body to a SQL SELECT body.
+///
+/// Accepts (case-insensitively, whitespace-tolerant) exactly:
+/// `BEGIN RETURN <expr>; END` — a single RETURN statement. `<expr>` must
+/// not contain a semicolon. Returns `SELECT <expr>` preserving the
+/// expression's original text, or an error describing why the body is
+/// outside the supported subset (the caller maps this to 0A000). This
+/// is deliberately not a plpgsql parser: real plpgsql (variables,
+/// control flow, multi-statement bodies, EXCEPTION blocks, ...) stays
+/// unsupported.
+pub fn desugar_plpgsql_body(body: &str) -> Result<String, String> {
+    let unsupported = || {
+        format!(
+            "only single-RETURN plpgsql bodies (BEGIN RETURN expr; END) are supported, got: {}",
+            body.chars().take(60).collect::<String>()
+        )
+    };
+    /// Strip an ASCII keyword (case-insensitive) from the front of `s`,
+    /// requiring a word boundary after it. Returns the remainder.
+    fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+        let rest = s.get(..kw.len())?;
+        if !rest.eq_ignore_ascii_case(kw) {
+            return None;
+        }
+        let after = s.get(kw.len()..)?;
+        // Word boundary: next char must not be ident-continue. The
+        // keyword itself may be followed by end-of-string.
+        if let Some(c) = after.chars().next() {
+            if c.is_alphanumeric() || c == '_' {
+                return None;
+            }
+        }
+        Some(after)
+    }
+    let t = body.trim();
+    let t = match t.strip_suffix(';') {
+        Some(s) => s.trim_end(),
+        None => t,
+    };
+    let inner = strip_kw(t, "begin").ok_or_else(unsupported)?;
+    // The body must end with the END keyword (word boundary before it).
+    // Find it by scanning from the end: strip trailing whitespace, then
+    // require the last 3 chars to be "end" with a boundary before.
+    let inner = inner.trim_end();
+    if inner.len() < 3 || !inner[inner.len() - 3..].eq_ignore_ascii_case("end") {
+        return Err(unsupported());
+    }
+    let before_end = &inner[..inner.len() - 3];
+    if let Some(c) = before_end.chars().last() {
+        if c.is_alphanumeric() || c == '_' {
+            return Err(unsupported());
+        }
+    }
+    let stmts = before_end.trim();
+    let expr = strip_kw(stmts, "return").ok_or_else(unsupported)?.trim();
+    let expr = match expr.strip_suffix(';') {
+        Some(s) => s.trim_end(),
+        None => expr,
+    };
+    if expr.is_empty() || expr.contains(';') {
+        return Err(unsupported());
+    }
+    Ok(format!("SELECT {}", expr))
+}
+
+// ---------------------------------------------------------------------------
+// v1.01: bounded PL/pgSQL statement sequences + EXCEPTION blocks.
+//
+// PG19 grounding:
+// - Grammar: `pl_block` / `exception_sect` / `proc_exceptions` /
+//   `proc_conditions` (`src/pl/plpgsql/src/pl_gram.y`).
+// - Condition name -> SQLSTATE: `plpgsql_parse_err_condition`
+//   (`pl_comp.c`) over `exception_label_map` (generated `plerrcodes.h`).
+// - Trap semantics: `exec_stmt_block` / `exception_matches_conditions`
+//   (`pl_exec.c`): the first WHEN clause whose condition list matches
+//   wins; exact SQLSTATE match, category match for `...000` conditions,
+//   OTHERS matches everything except query_canceled (57014) and
+//   assert_failure (P0004); the trapped error aborts the block's
+//   subtransaction; errors raised inside a handler propagate untrapped.
+// - Missing trailing RETURN: `add_dummy_return` (`pl_comp.c`) appends an
+//   implicit `RETURN NULL` outside the exception block.
+//
+// Deliberate deviations from PG19:
+// - No subtransactions: a trapped error does NOT roll back the effects
+//   of statements that ran before it in the body (rustgres has no
+//   subtransaction machinery; ANALYZE — the only supported utility
+//   statement — has no transactional effects to roll back anyway).
+// - No variables: no DECLARE section, no assignments, and no
+//   SQLSTATE/SQLERRM magic variables inside handlers.
+// - Statement subset: each statement is `RETURN <expr>` or a supported
+//   utility statement (currently only ANALYZE). Anything else is an
+//   honest 0A000 at CREATE; a malformed RETURN expression is 42601; an
+//   unknown condition name is 42704 (`unrecognized exception condition`,
+//   like PG's ERRCODE_UNDEFINED_OBJECT).
+// ---------------------------------------------------------------------------
+
+/// v1.01: one statement of a bounded PL/pgSQL body.
+#[derive(Clone, Debug)]
+pub enum PlpgsqlStmt {
+    /// `RETURN <expr>`: stored as the parsed `SELECT <expr>` so the
+    /// executor reuses `subst_params` + `run_select` verbatim. Always
+    /// `Stmt::Select` (enforced at parse).
+    Return(Stmt),
+    /// A supported utility statement, parsed at CREATE (currently only
+    /// `Stmt::Analyze`); executed for side effects, results discarded.
+    Utility(Stmt),
+    /// v1.02: `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+    /// Reuses the v1.00 trigger-body [`RaiseLevel`] enum and the shared
+    /// `%-format` evaluator (`format_raise_message` in exec.rs) — the
+    /// parse shape mirrors the trigger-body RAISE. Unsupported levels
+    /// (DEBUG/LOG/INFO/WARNING) are rejected at parse with 0A000, like
+    /// trigger bodies.
+    Raise {
+        level: RaiseLevel,
+        format: String,
+        args: Vec<Expr>,
+    },
+    /// v1.03: `var := <expr>` — scalar assignment to a DECLAREd variable.
+    /// Stored as the parsed `SELECT <expr>` (always `Stmt::Select`,
+    /// enforced at parse) plus the variable name; the executor evaluates
+    /// it like a RETURN and writes the value into the variable's slot.
+    Assign { var: String, select: Stmt },
+    /// v1.03: `FOR var IN <query> LOOP <stmts> END LOOP` — the loop
+    /// variable must be DECLAREd. The query is a row-producing `SELECT`
+    /// or `EXPLAIN` (always parsed, enforced at parse); each row binds
+    /// the variable to the row's first column, coerced to its declared
+    /// type. Only `Assign` and `ReturnNext` are allowed in the body.
+    ForQuery {
+        var: String,
+        query: Stmt,
+        body: Vec<PlpgsqlStmt>,
+    },
+    /// v1.03: `RETURN NEXT <expr>` — only valid in `RETURNS SETOF`
+    /// functions (enforced at parse). Stored as the parsed
+    /// `SELECT <expr>` (always `Stmt::Select`); the executor appends the
+    /// row to the result set and continues.
+    ReturnNext(Stmt),
+}
+
+/// v1.01: one `WHEN <conditions> THEN <statements>` clause.
+#[derive(Clone, Debug)]
+pub struct PlpgsqlHandler {
+    /// Trapped SQLSTATEs in source order (one condition name may expand
+    /// to several codes, like PG's `PLpgSQL_condition` list). The
+    /// pseudo-condition OTHERS is stored as the sentinel
+    /// `PLPGSQL_OTHERS_SENTINEL`.
+    pub sqlstates: Vec<String>,
+    pub stmts: Vec<PlpgsqlStmt>,
+}
+
+/// v1.01: a parsed bounded PL/pgSQL body:
+/// `[DECLARE <decls>] BEGIN <stmts> [EXCEPTION <handlers>] END`.
+#[derive(Clone, Debug)]
+pub struct PlpgsqlBody {
+    /// v1.03: scalar variable declarations from an optional `DECLARE`
+    /// section (empty when the body has none).
+    pub decls: Vec<PlpgsqlDecl>,
+    pub stmts: Vec<PlpgsqlStmt>,
+    pub handlers: Vec<PlpgsqlHandler>,
+}
+
+/// v1.03: one scalar variable declaration (`name type`) from a plpgsql
+/// `DECLARE` section. No initializers, no row/record types.
+#[derive(Clone, Debug)]
+pub struct PlpgsqlDecl {
+    pub name: String,
+    pub type_name: String,
+}
+
+/// v1.01: sentinel for the OTHERS pseudo-condition (never a real
+/// SQLSTATE; PG keeps it as the `PLPGSQL_OTHERS` enum value in
+/// `pl_comp.c`).
+const PLPGSQL_OTHERS_SENTINEL: &str = "OTHERS";
+
+static PLPGSQL_CONDITIONS: &[(&str, &str)] = &[
+    ("active_sql_transaction", "25001"),
+    ("admin_shutdown", "57P01"),
+    ("ambiguous_alias", "42P09"),
+    ("ambiguous_column", "42702"),
+    ("ambiguous_function", "42725"),
+    ("ambiguous_parameter", "42P08"),
+    ("array_subscript_error", "2202E"),
+    ("assert_failure", "P0004"),
+    ("bad_copy_file_format", "22P04"),
+    ("branch_transaction_already_active", "25002"),
+    ("cannot_coerce", "42846"),
+    ("cannot_connect_now", "57P03"),
+    ("cant_change_runtime_param", "55P02"),
+    ("cardinality_violation", "21000"),
+    ("case_not_found", "20000"),
+    ("character_not_in_repertoire", "22021"),
+    ("check_violation", "23514"),
+    ("collation_mismatch", "42P21"),
+    ("config_file_error", "F0000"),
+    ("configuration_limit_exceeded", "53400"),
+    ("connection_does_not_exist", "08003"),
+    ("connection_exception", "08000"),
+    ("connection_failure", "08006"),
+    ("containing_sql_not_permitted", "38001"),
+    ("crash_shutdown", "57P02"),
+    ("data_corrupted", "XX001"),
+    ("data_exception", "22000"),
+    ("database_dropped", "57P04"),
+    ("datatype_mismatch", "42804"),
+    ("datetime_field_overflow", "22008"),
+    ("deadlock_detected", "40P01"),
+    ("dependent_objects_still_exist", "2BP01"),
+    ("dependent_privilege_descriptors_still_exist", "2B000"),
+    ("diagnostics_exception", "0Z000"),
+    ("disk_full", "53100"),
+    ("division_by_zero", "22012"),
+    ("duplicate_alias", "42712"),
+    ("duplicate_column", "42701"),
+    ("duplicate_cursor", "42P03"),
+    ("duplicate_database", "42P04"),
+    ("duplicate_file", "58P02"),
+    ("duplicate_function", "42723"),
+    ("duplicate_json_object_key_value", "22030"),
+    ("duplicate_object", "42710"),
+    ("duplicate_prepared_statement", "42P05"),
+    ("duplicate_schema", "42P06"),
+    ("duplicate_table", "42P07"),
+    ("error_in_assignment", "22005"),
+    ("escape_character_conflict", "2200B"),
+    ("event_trigger_protocol_violated", "39P03"),
+    ("exclusion_violation", "23P01"),
+    ("external_routine_exception", "38000"),
+    ("external_routine_invocation_exception", "39000"),
+    ("fdw_column_name_not_found", "HV005"),
+    ("fdw_dynamic_parameter_value_needed", "HV002"),
+    ("fdw_error", "HV000"),
+    ("fdw_function_sequence_error", "HV010"),
+    ("fdw_inconsistent_descriptor_information", "HV021"),
+    ("fdw_invalid_attribute_value", "HV024"),
+    ("fdw_invalid_column_name", "HV007"),
+    ("fdw_invalid_column_number", "HV008"),
+    ("fdw_invalid_data_type", "HV004"),
+    ("fdw_invalid_data_type_descriptors", "HV006"),
+    ("fdw_invalid_descriptor_field_identifier", "HV091"),
+    ("fdw_invalid_handle", "HV00B"),
+    ("fdw_invalid_option_index", "HV00C"),
+    ("fdw_invalid_option_name", "HV00D"),
+    ("fdw_invalid_string_format", "HV00A"),
+    ("fdw_invalid_string_length_or_buffer_length", "HV090"),
+    ("fdw_invalid_use_of_null_pointer", "HV009"),
+    ("fdw_no_schemas", "HV00P"),
+    ("fdw_option_name_not_found", "HV00J"),
+    ("fdw_out_of_memory", "HV001"),
+    ("fdw_reply_handle", "HV00K"),
+    ("fdw_schema_not_found", "HV00Q"),
+    ("fdw_table_not_found", "HV00R"),
+    ("fdw_too_many_handles", "HV014"),
+    ("fdw_unable_to_create_execution", "HV00L"),
+    ("fdw_unable_to_create_reply", "HV00M"),
+    ("fdw_unable_to_establish_connection", "HV00N"),
+    ("feature_not_supported", "0A000"),
+    ("file_name_too_long", "58P03"),
+    ("floating_point_exception", "22P01"),
+    ("foreign_key_violation", "23503"),
+    ("function_executed_no_return_statement", "2F005"),
+    ("generated_always", "428C9"),
+    ("grouping_error", "42803"),
+    ("held_cursor_requires_same_isolation_level", "25008"),
+    ("idle_in_transaction_session_timeout", "25P03"),
+    ("idle_session_timeout", "57P05"),
+    ("in_failed_sql_transaction", "25P02"),
+    ("inappropriate_access_mode_for_branch_transaction", "25003"),
+    (
+        "inappropriate_isolation_level_for_branch_transaction",
+        "25004",
+    ),
+    ("indeterminate_collation", "42P22"),
+    ("indeterminate_datatype", "42P18"),
+    ("index_corrupted", "XX002"),
+    ("indicator_overflow", "22022"),
+    ("insufficient_privilege", "42501"),
+    ("insufficient_resources", "53000"),
+    ("integrity_constraint_violation", "23000"),
+    ("internal_error", "XX000"),
+    ("interval_field_overflow", "22015"),
+    ("invalid_argument_for_logarithm", "2201E"),
+    ("invalid_argument_for_nth_value_function", "22016"),
+    ("invalid_argument_for_ntile_function", "22014"),
+    ("invalid_argument_for_power_function", "2201F"),
+    ("invalid_argument_for_sql_json_datetime_function", "22031"),
+    ("invalid_argument_for_width_bucket_function", "2201G"),
+    ("invalid_argument_for_xquery", "10608"),
+    ("invalid_authorization_specification", "28000"),
+    ("invalid_binary_representation", "22P03"),
+    ("invalid_catalog_name", "3D000"),
+    ("invalid_character_value_for_cast", "22018"),
+    ("invalid_column_definition", "42611"),
+    ("invalid_column_reference", "42P10"),
+    ("invalid_cursor_definition", "42P11"),
+    ("invalid_cursor_name", "34000"),
+    ("invalid_cursor_state", "24000"),
+    ("invalid_database_definition", "42P12"),
+    ("invalid_datetime_format", "22007"),
+    ("invalid_escape_character", "22019"),
+    ("invalid_escape_octet", "2200D"),
+    ("invalid_escape_sequence", "22025"),
+    ("invalid_foreign_key", "42830"),
+    ("invalid_function_definition", "42P13"),
+    ("invalid_grant_operation", "0LP01"),
+    ("invalid_grantor", "0L000"),
+    ("invalid_indicator_parameter_value", "22010"),
+    ("invalid_json_text", "22032"),
+    ("invalid_locator_specification", "0F001"),
+    ("invalid_name", "42602"),
+    ("invalid_object_definition", "42P17"),
+    ("invalid_parameter_value", "22023"),
+    ("invalid_password", "28P01"),
+    ("invalid_preceding_or_following_size", "22013"),
+    ("invalid_prepared_statement_definition", "42P14"),
+    ("invalid_recursion", "42P19"),
+    ("invalid_regular_expression", "2201B"),
+    ("invalid_role_specification", "0P000"),
+    ("invalid_row_count_in_limit_clause", "2201W"),
+    ("invalid_row_count_in_result_offset_clause", "2201X"),
+    ("invalid_savepoint_specification", "3B001"),
+    ("invalid_schema_definition", "42P15"),
+    ("invalid_schema_name", "3F000"),
+    ("invalid_sql_json_subscript", "22033"),
+    ("invalid_sql_statement_name", "26000"),
+    ("invalid_sqlstate_returned", "39001"),
+    ("invalid_table_definition", "42P16"),
+    ("invalid_tablesample_argument", "2202H"),
+    ("invalid_tablesample_repeat", "2202G"),
+    ("invalid_text_representation", "22P02"),
+    ("invalid_time_zone_displacement_value", "22009"),
+    ("invalid_transaction_initiation", "0B000"),
+    ("invalid_transaction_state", "25000"),
+    ("invalid_transaction_termination", "2D000"),
+    ("invalid_use_of_escape_character", "2200C"),
+    ("invalid_xml_comment", "2200S"),
+    ("invalid_xml_content", "2200N"),
+    ("invalid_xml_document", "2200M"),
+    ("invalid_xml_processing_instruction", "2200T"),
+    ("io_error", "58030"),
+    ("locator_exception", "0F000"),
+    ("lock_file_exists", "F0001"),
+    ("lock_not_available", "55P03"),
+    ("modifying_sql_data_not_permitted", "2F002"),
+    ("modifying_sql_data_not_permitted", "38002"),
+    ("more_than_one_sql_json_item", "22034"),
+    ("most_specific_type_mismatch", "2200G"),
+    ("name_too_long", "42622"),
+    ("no_active_sql_transaction", "25P01"),
+    ("no_active_sql_transaction_for_branch_transaction", "25005"),
+    ("no_data_found", "P0002"),
+    ("no_sql_json_item", "22035"),
+    ("non_numeric_sql_json_item", "22036"),
+    ("non_unique_keys_in_a_json_object", "22037"),
+    ("nonstandard_use_of_escape_character", "22P06"),
+    ("not_an_xml_document", "2200L"),
+    ("not_null_violation", "23502"),
+    ("null_value_no_indicator_parameter", "22002"),
+    ("null_value_not_allowed", "22004"),
+    ("null_value_not_allowed", "39004"),
+    ("numeric_value_out_of_range", "22003"),
+    ("object_in_use", "55006"),
+    ("object_not_in_prerequisite_state", "55000"),
+    ("operator_intervention", "57000"),
+    ("out_of_memory", "53200"),
+    ("plpgsql_error", "P0000"),
+    ("program_limit_exceeded", "54000"),
+    ("prohibited_sql_statement_attempted", "2F003"),
+    ("prohibited_sql_statement_attempted", "38003"),
+    ("protocol_violation", "08P01"),
+    ("query_canceled", "57014"),
+    ("raise_exception", "P0001"),
+    ("read_only_sql_transaction", "25006"),
+    ("reading_sql_data_not_permitted", "2F004"),
+    ("reading_sql_data_not_permitted", "38004"),
+    ("reserved_name", "42939"),
+    ("restrict_violation", "23001"),
+    ("savepoint_exception", "3B000"),
+    ("schema_and_data_statement_mixing_not_supported", "25007"),
+    ("sequence_generator_limit_exceeded", "2200H"),
+    ("serialization_failure", "40001"),
+    ("singleton_sql_json_item_required", "22038"),
+    ("sql_json_array_not_found", "22039"),
+    ("sql_json_item_cannot_be_cast_to_target_type", "2203G"),
+    ("sql_json_member_not_found", "2203A"),
+    ("sql_json_number_not_found", "2203B"),
+    ("sql_json_object_not_found", "2203C"),
+    ("sql_json_scalar_required", "2203F"),
+    ("sql_routine_exception", "2F000"),
+    ("sql_statement_not_yet_complete", "03000"),
+    ("sqlclient_unable_to_establish_sqlconnection", "08001"),
+    ("sqlserver_rejected_establishment_of_sqlconnection", "08004"),
+    ("srf_protocol_violated", "39P02"),
+    (
+        "stacked_diagnostics_accessed_without_active_handler",
+        "0Z002",
+    ),
+    ("statement_completion_unknown", "40003"),
+    ("statement_too_complex", "54001"),
+    ("string_data_length_mismatch", "22026"),
+    ("string_data_right_truncation", "22001"),
+    ("substring_error", "22011"),
+    ("syntax_error", "42601"),
+    ("syntax_error_or_access_rule_violation", "42000"),
+    ("system_error", "58000"),
+    ("too_many_arguments", "54023"),
+    ("too_many_columns", "54011"),
+    ("too_many_connections", "53300"),
+    ("too_many_json_array_elements", "2203D"),
+    ("too_many_json_object_members", "2203E"),
+    ("too_many_rows", "P0003"),
+    ("transaction_integrity_constraint_violation", "40002"),
+    ("transaction_resolution_unknown", "08007"),
+    ("transaction_rollback", "40000"),
+    ("transaction_timeout", "25P04"),
+    ("trigger_protocol_violated", "39P01"),
+    ("triggered_action_exception", "09000"),
+    ("triggered_data_change_violation", "27000"),
+    ("trim_error", "22027"),
+    ("undefined_column", "42703"),
+    ("undefined_file", "58P01"),
+    ("undefined_function", "42883"),
+    ("undefined_object", "42704"),
+    ("undefined_parameter", "42P02"),
+    ("undefined_table", "42P01"),
+    ("unique_violation", "23505"),
+    ("unsafe_new_enum_value_usage", "55P04"),
+    ("unterminated_c_string", "22024"),
+    ("untranslatable_character", "22P05"),
+    ("windowing_error", "42P20"),
+    ("with_check_option_violation", "44000"),
+    ("wrong_object_type", "42809"),
+    ("zero_length_character_string", "2200F"),
+];
+
+/// v1.01: resolve one WHEN condition name to its SQLSTATE list (PG19
+/// `plpgsql_parse_err_condition`, `pl_comp.c`). Names are folded to
+/// lowercase like PG's unquoted identifiers; `others` yields the OTHERS
+/// sentinel; one name may map to several codes (duplicate labels in
+/// `errcodes.txt`, e.g. `null_value_not_allowed`). Unknown names are
+/// 42704, mirroring PG's ERRCODE_UNDEFINED_OBJECT `unrecognized
+/// exception condition`.
+fn plpgsql_condition_named(name: &str) -> Result<Vec<String>, SqlError> {
+    let folded = name.to_ascii_lowercase();
+    if folded == "others" {
+        return Ok(vec![PLPGSQL_OTHERS_SENTINEL.to_string()]);
+    }
+    let lo = PLPGSQL_CONDITIONS.partition_point(|e| e.0 < folded.as_str());
+    let mut out = Vec::new();
+    for (n, code) in &PLPGSQL_CONDITIONS[lo..] {
+        if *n != folded.as_str() {
+            break;
+        }
+        out.push((*code).to_string());
+    }
+    if out.is_empty() {
+        return Err(SqlError {
+            message: format!("unrecognized exception condition \"{}\"", name),
+            code: "42704",
+        });
+    }
+    Ok(out)
+}
+
+/// v1.01: does a trapped SQLSTATE match a raised error code? (PG19
+/// `exception_matches_conditions`, `pl_exec.c`: exact match; category
+/// match when the condition is a `...000` class code, i.e. PG's
+/// `ERRCODE_IS_CATEGORY` / `ERRCODE_TO_CATEGORY`; OTHERS matches
+/// everything except 57014 query_canceled and P0004 assert_failure.)
+pub fn plpgsql_condition_matches(condition: &str, code: &str) -> bool {
+    if condition == PLPGSQL_OTHERS_SENTINEL {
+        return code != "57014" && code != "P0004";
+    }
+    if condition == code {
+        return true;
+    }
+    let cb = condition.as_bytes();
+    let eb = code.as_bytes();
+    cb.len() == 5 && eb.len() == 5 && cb[2..] == *b"000" && cb[..2] == eb[..2]
+}
+
+/// Strip an ASCII keyword (case-insensitive) from the front of `s`,
+/// requiring a word boundary after it. Returns the remainder.
+fn plpgsql_strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = s.get(..kw.len())?;
+    if !rest.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let after = s.get(kw.len()..)?;
+    // Word boundary: next char must not be ident-continue. The keyword
+    // itself may be followed by end-of-string.
+    if let Some(c) = after.chars().next() {
+        if c.is_alphanumeric() || c == '_' {
+            return None;
+        }
+    }
+    Some(after)
+}
+
+/// Does `s` start with `kw` (case-insensitive, word boundary)?
+fn plpgsql_starts_with_kw(s: &str, kw: &str) -> bool {
+    plpgsql_strip_kw(s.trim_start(), kw).is_some()
+}
+
+/// Strip a trailing END keyword (word boundary before it) from `s`.
+/// Returns the remainder, or None if `s` does not end with END.
+fn plpgsql_strip_end(s: &str) -> Option<&str> {
+    let t = s.trim_end();
+    if t.len() < 3 || !t[t.len() - 3..].eq_ignore_ascii_case("end") {
+        return None;
+    }
+    let before = &t[..t.len() - 3];
+    if let Some(c) = before.chars().last() {
+        if c.is_alphanumeric() || c == '_' {
+            return None;
+        }
+    }
+    Some(before)
+}
+
+/// v1.01: split a plpgsql body on top-level `;`, respecting
+/// single-quoted strings (`''` escapes), double-quoted identifiers
+/// (`""` escapes), `--` / `/* */` comments, and `$tag$...$tag$`
+/// dollar-quoted strings. `$1`-style parameters are NOT dollar quotes
+/// (the char after `$` must not start a digit-led tag).
+fn split_plpgsql_chunks(body: &str) -> Vec<String> {
+    /// Length of the dollar-quote opening delimiter at `chars[i]`
+    /// (`$$` or `$tag$`), or None if this `$` opens no dollar quote.
+    fn dollar_open_len(chars: &[char], i: usize) -> Option<usize> {
+        if chars[i] != '$' {
+            return None;
+        }
+        let mut j = i + 1;
+        if j < chars.len() && chars[j] == '$' {
+            return Some(2);
+        }
+        let tag_start = j;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j == tag_start || chars[tag_start].is_ascii_digit() {
+            return None;
+        }
+        if j < chars.len() && chars[j] == '$' {
+            Some(j - i + 1)
+        } else {
+            None
+        }
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' => {
+                let q = c;
+                cur.push(q);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    cur.push(d);
+                    i += 1;
+                    if d == q {
+                        if i < chars.len() && chars[i] == q {
+                            cur.push(q);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if i + 1 < chars.len() && chars[i + 1] == '-' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                cur.push('/');
+                cur.push('*');
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+                if i + 1 < chars.len() {
+                    cur.push('*');
+                    cur.push('/');
+                    i += 2;
+                }
+            }
+            '$' => match dollar_open_len(&chars, i) {
+                Some(len) => {
+                    // Copy through the matching close delimiter; an
+                    // unterminated quote swallows the rest (the
+                    // statement parse will fail on it later).
+                    let mut j = i + len;
+                    let mut end = chars.len();
+                    while j + len <= chars.len() {
+                        if chars[j..j + len] == chars[i..i + len] {
+                            end = j + len;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    cur.extend(chars[i..end].iter());
+                    i = end;
+                }
+                None => {
+                    cur.push(c);
+                    i += 1;
+                }
+            },
+            ';' => {
+                chunks.push(std::mem::take(&mut cur));
+                i += 1;
+            }
+            _ => {
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    chunks.push(cur);
+    chunks
+}
+
+/// v1.01: parse one plpgsql statement — `RETURN <expr>` or a supported
+/// utility statement. Anything else is an honest 0A000 (outside the
+/// bounded subset); a malformed RETURN expression is 42601.
+/// v1.02: split `s` on top-level commas: commas inside quotes
+/// (single-quoted with `''` escapes, double-quoted), comments are not
+/// produced here (the body chunker strips them), or nested
+/// `(...)` / `[...]` do not split. Used for the RAISE argument list.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: usize = 0;
+    let mut start: usize = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                let q = c;
+                while let Some((_, d)) = chars.next() {
+                    if d == q {
+                        if chars.peek().is_some_and(|(_, e)| *e == q) {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// v1.02: parse `RAISE <level> '<format>' [, <expr> ...]` (the RAISE
+/// keyword already stripped). PG19 pl_gram.y `stmt_raise`.
+///
+/// Only NOTICE and EXCEPTION are supported in the bounded grammar;
+/// any other level (DEBUG/LOG/INFO/WARNING) is an honest 0A000,
+/// mirroring the v1.00 trigger-body rule. Each argument parses as a
+/// scalar expression via the same `SELECT <expr>` trick the RETURN
+/// path uses, so the named-argument `rewrite_func_arg_refs` machinery
+/// in exec.rs applies to RAISE args unchanged.
+fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let rest = rest.trim_start();
+    // Level word (word boundary, like plpgsql_strip_kw).
+    let mut lvl_len = 0;
+    for (i, c) in rest.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            lvl_len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let (lvl_word, after_lvl) = rest.split_at(lvl_len);
+    let level = match lvl_word.to_ascii_lowercase().as_str() {
+        "notice" => RaiseLevel::Notice,
+        "exception" => RaiseLevel::Exception,
+        _ => {
+            return Err(SqlError {
+                message: format!(
+                    "RAISE level '{}' is not supported in plpgsql function bodies",
+                    lvl_word
+                ),
+                code: "0A000",
+            });
+        }
+    };
+    // Format string: a single-quoted literal with '' escapes.
+    let after_lvl = after_lvl.trim_start();
+    let lit = after_lvl
+        .strip_prefix('\'')
+        .ok_or_else(|| syntax("RAISE requires a format string literal".to_string()))?;
+    let mut format = String::new();
+    let mut chars = lit.char_indices().peekable();
+    let mut end_byte: Option<usize> = None;
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if chars.peek().is_some_and(|(_, d)| *d == '\'') {
+                format.push('\'');
+                chars.next();
+            } else {
+                end_byte = Some(i);
+                break;
+            }
+        } else {
+            format.push(c);
+        }
+    }
+    let end_byte =
+        end_byte.ok_or_else(|| syntax("unterminated string literal in RAISE".to_string()))?;
+    let after_fmt = lit[end_byte + 1..].trim_start();
+    // Optional `, <expr> ...` argument list.
+    let mut args = Vec::new();
+    if !after_fmt.is_empty() {
+        let list = after_fmt
+            .strip_prefix(',')
+            .ok_or_else(|| syntax("expected ',' after RAISE format string".to_string()))?;
+        for part in split_top_level_commas(list) {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(syntax(
+                    "empty expression in RAISE argument list".to_string(),
+                ));
+            }
+            let stmt = parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
+                message: format!("syntax error in RAISE argument: {}", e.message),
+                code: "42601",
+            })?;
+            let Stmt::Select(sel) = stmt else {
+                return Err(SqlError {
+                    message: "internal error: RAISE argument did not parse as SELECT".to_string(),
+                    code: "XX000",
+                });
+            };
+            let mut items = sel.items.into_iter();
+            match (items.next(), items.next()) {
+                (Some(SelectItem::Expr { expr, .. }), None) => args.push(expr),
+                _ => {
+                    return Err(syntax(format!(
+                        "RAISE argument is not a scalar expression: {}",
+                        part.chars().take(40).collect::<String>()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(PlpgsqlStmt::Raise {
+        level,
+        format,
+        args,
+    })
+}
+
+// ============================================================================
+// v1.03: plpgsql DECLARE / := / FOR..LOOP / RETURN NEXT
+// ============================================================================
+
+/// Skip a `$tag$...$tag$` (or `$$...$$`) dollar-quoted string starting at
+/// `chars[i] == '$'`. Returns the index just past the closing delimiter,
+/// or `None` if this `$` opens no dollar quote (`$1`-style parameters
+/// are not dollar quotes: the char after `$` must not start a digit-led
+/// tag).
+fn plpgsql_dollar_skip(chars: &[char], i: usize) -> Option<usize> {
+    if chars[i] != '$' {
+        return None;
+    }
+    let mut j = i + 1;
+    if j < chars.len() && chars[j] == '$' {
+        j += 1;
+        while j + 1 < chars.len() && !(chars[j] == '$' && chars[j + 1] == '$') {
+            j += 1;
+        }
+        return Some((j + 2).min(chars.len()));
+    }
+    let tag_start = j;
+    while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    if j == tag_start || chars[tag_start].is_ascii_digit() {
+        return None;
+    }
+    if j < chars.len() && chars[j] == '$' {
+        let delim: Vec<char> = chars[i..=j].to_vec();
+        let dl = delim.len();
+        let mut k = j + 1;
+        while k + dl <= chars.len() && chars[k..k + dl] != delim[..] {
+            k += 1;
+        }
+        return Some((k + dl).min(chars.len()));
+    }
+    None
+}
+
+/// Byte positions of every occurrence of `tok` in `s`, skipping
+/// single/double-quoted strings, `--` / `/* */` comments, and
+/// `$tag$...$tag$` dollar quotes. When `word` is true the match also
+/// requires identifier word boundaries (for keywords); when false any
+/// occurrence counts (for the `:=` operator).
+fn plpgsql_find_token(s: &str, tok: &str, word: bool) -> Vec<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let byte_off: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    let tok_chars: Vec<char> = tok.chars().collect();
+    let tl = tok_chars.len();
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if c == '$' {
+            if let Some(next) = plpgsql_dollar_skip(&chars, i) {
+                i = next;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if i + tl <= chars.len() && chars[i..i + tl] == tok_chars[..] {
+            let mut ok = true;
+            if word {
+                // `tok` is ASCII here, so byte slicing is safe.
+                let b = byte_off[i];
+                if !s[b..b + tok.len()].eq_ignore_ascii_case(tok) {
+                    ok = false;
+                } else {
+                    let before_ok =
+                        i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                    let after_ok = i + tl == chars.len()
+                        || !(chars[i + tl].is_alphanumeric() || chars[i + tl] == '_');
+                    ok = before_ok && after_ok;
+                }
+            }
+            if ok {
+                pos.push(byte_off[i]);
+            }
+        }
+        i += 1;
+    }
+    pos
+}
+
+/// Byte positions of keyword `kw` (case-insensitive, word boundaries)
+/// outside strings/comments/dollar quotes.
+fn plpgsql_kw_positions(s: &str, kw: &str) -> Vec<usize> {
+    plpgsql_find_token(s, kw, true)
+}
+
+/// Byte index of the first `:=` outside strings/comments/dollar quotes.
+fn plpgsql_find_assign(s: &str) -> Option<usize> {
+    plpgsql_find_token(s, ":=", false).into_iter().next()
+}
+
+/// Does `s` end with `END LOOP` (word boundaries, case-insensitive)?
+/// A trailing quote always defeats the match, so a string literal
+/// ending in the words `end loop` can never falsely close a FOR loop.
+fn plpgsql_ends_with_end_loop(s: &str) -> bool {
+    let t = s.trim_end();
+    if t.len() < 8 || !t[t.len() - 8..].eq_ignore_ascii_case("end loop") {
+        return false;
+    }
+    match t[..t.len() - 8].chars().last() {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '_'),
+    }
+}
+
+/// Strip a trailing `END LOOP` (word boundaries, case-insensitive) from
+/// `s`. Returns the remainder, or `None`.
+fn plpgsql_strip_end_loop(s: &str) -> Option<&str> {
+    if !plpgsql_ends_with_end_loop(s) {
+        return None;
+    }
+    let t = s.trim_end();
+    Some(t[..t.len() - 8].trim_end())
+}
+
+/// v1.03: parse `RETURN <expr>` (the `RETURN` keyword already stripped).
+fn parse_plpgsql_return(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let expr = rest.trim();
+    if expr.is_empty() {
+        return Err(SqlError {
+            message: "RETURN requires an expression".to_string(),
+            code: "42601",
+        });
+    }
+    let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+        message: format!("syntax error in RETURN expression: {}", e.message),
+        code: "42601",
+    })?;
+    if !matches!(stmt, Stmt::Select(_)) {
+        return Err(SqlError {
+            message: "internal error: RETURN did not parse as SELECT".to_string(),
+            code: "XX000",
+        });
+    }
+    Ok(PlpgsqlStmt::Return(stmt))
+}
+
+/// v1.03: parse `RETURN NEXT <expr>` (both keywords already stripped).
+fn parse_plpgsql_return_next(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let expr = rest.trim();
+    if expr.is_empty() {
+        return Err(SqlError {
+            message: "RETURN NEXT requires an expression".to_string(),
+            code: "42601",
+        });
+    }
+    let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+        message: format!("syntax error in RETURN NEXT expression: {}", e.message),
+        code: "42601",
+    })?;
+    if !matches!(stmt, Stmt::Select(_)) {
+        return Err(SqlError {
+            message: "internal error: RETURN NEXT did not parse as SELECT".to_string(),
+            code: "XX000",
+        });
+    }
+    Ok(PlpgsqlStmt::ReturnNext(stmt))
+}
+
+/// v1.03: parse `var := <expr>` (the statement is known to contain a
+/// depth-0 `:=`). The variable name is validated against the DECLAREd
+/// names at CREATE time, not here.
+fn parse_plpgsql_assign(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = text.trim();
+    let op =
+        plpgsql_find_assign(t).ok_or_else(|| syntax("bad assignment statement".to_string()))?;
+    let (lhs, rhs) = t.split_at(op);
+    let (var, var_rest) =
+        split_ident(lhs).ok_or_else(|| syntax(format!("bad assignment target: {}", lhs.trim())))?;
+    if !var_rest.trim().is_empty() {
+        return Err(syntax(format!("bad assignment target: {}", lhs.trim())));
+    }
+    let expr = rhs[2..].trim();
+    if expr.is_empty() {
+        return Err(syntax(":= requires an expression".to_string()));
+    }
+    let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+        message: format!("syntax error in assignment expression: {}", e.message),
+        code: "42601",
+    })?;
+    if !matches!(stmt, Stmt::Select(_)) {
+        return Err(SqlError {
+            message: "internal error: assignment did not parse as SELECT".to_string(),
+            code: "XX000",
+        });
+    }
+    Ok(PlpgsqlStmt::Assign { var, select: stmt })
+}
+
+/// v1.03: parse one `name type` declaration (trailing `;` already split
+/// off). Only plain scalar `name type` is accepted: no initializers,
+/// no CONSTANT, no constraints (bounded subset, 0A000).
+fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let unsupported = |msg: String| SqlError {
+        message: msg,
+        code: "0A000",
+    };
+    let t = text.trim();
+    if plpgsql_starts_with_kw(t, "constant") {
+        return Err(unsupported(
+            "CONSTANT variable declarations are not supported".to_string(),
+        ));
+    }
+    let (name, rest) =
+        split_ident(t).ok_or_else(|| syntax(format!("bad variable declaration: {}", t)))?;
+    let type_name = rest.trim();
+    if type_name.is_empty() {
+        return Err(syntax(format!("declaration of \"{}\" needs a type", name)));
+    }
+    // Anything beyond a bare type name (constraints, defaults) is out
+    // of the bounded subset.
+    for kw in ["not", "null", "default", "collate", "check", "references"] {
+        if !plpgsql_kw_positions(type_name, kw).is_empty() {
+            return Err(unsupported(format!(
+                "only plain \"name type\" declarations are supported, got: {}",
+                t
+            )));
+        }
+    }
+    Ok(PlpgsqlDecl {
+        name,
+        type_name: type_name.to_string(),
+    })
+}
+
+/// v1.03: parse a `DECLARE` section (text between `DECLARE` and the
+/// `BEGIN` that opens the body block).
+fn parse_plpgsql_decls(decl_text: &str) -> Result<Vec<PlpgsqlDecl>, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let unsupported = |msg: String| SqlError {
+        message: msg,
+        code: "0A000",
+    };
+    let mut decls = Vec::new();
+    for chunk in split_plpgsql_chunks(decl_text) {
+        let t = chunk.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if plpgsql_find_assign(t).is_some() {
+            return Err(unsupported(format!(
+                "variable initializers (:=) are not supported in DECLARE: {}",
+                t.chars().take(40).collect::<String>()
+            )));
+        }
+        let decl = parse_plpgsql_decl(t)?;
+        if decls.iter().any(|d: &PlpgsqlDecl| d.name == decl.name) {
+            return Err(syntax(format!(
+                "duplicate variable declaration: \"{}\"",
+                decl.name
+            )));
+        }
+        decls.push(decl);
+    }
+    if decls.is_empty() {
+        return Err(syntax(
+            "DECLARE section without variable declarations".to_string(),
+        ));
+    }
+    Ok(decls)
+}
+
+/// v1.03: parse one statement of a FOR-loop body. Only `:=` assignment,
+/// `RETURN NEXT`, and bare `RETURN` are allowed (bounded subset).
+fn parse_plpgsql_for_body_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let t = text.trim();
+    if let Some(rest) = plpgsql_strip_kw(t, "return") {
+        if let Some(after) = plpgsql_strip_kw(rest.trim(), "next") {
+            return parse_plpgsql_return_next(after);
+        }
+        return parse_plpgsql_return(rest);
+    }
+    if plpgsql_find_assign(t).is_some() {
+        return parse_plpgsql_assign(t);
+    }
+    Err(SqlError {
+        message: format!(
+            "unsupported statement in FOR loop body (only :=, RETURN, and RETURN NEXT are supported): {}",
+            t.chars().take(60).collect::<String>()
+        ),
+        code: "0A000",
+    })
+}
+
+/// v1.03: parse `FOR var IN <query> LOOP <stmts> END LOOP` (`text`
+/// includes the trailing `END LOOP`). The query must be a `SELECT` or
+/// `EXPLAIN`; the loop variable must be DECLAREd (checked at CREATE).
+/// Nested FOR loops are not supported (0A000).
+fn parse_plpgsql_for(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = text.trim();
+    let rest = plpgsql_strip_kw(t, "for").ok_or_else(|| syntax("expected FOR".to_string()))?;
+    let (var, rest) =
+        split_ident(rest).ok_or_else(|| syntax("FOR requires a loop variable".to_string()))?;
+    let rest = plpgsql_strip_kw(rest.trim_start(), "in")
+        .ok_or_else(|| syntax("expected IN after FOR loop variable".to_string()))?;
+    // Find LOOP: the query is the first depth-0 `LOOP`-terminated prefix
+    // that parses as a statement (a column named `loop` must not end the
+    // query early).
+    let mut found: Option<(&str, &str)> = None;
+    let mut first_err: Option<SqlError> = None;
+    for lp in plpgsql_kw_positions(rest, "loop") {
+        let q = rest[..lp].trim();
+        if q.is_empty() {
+            continue;
+        }
+        match parse_statement(q) {
+            Ok(_) => {
+                found = Some((q, rest[lp + 4..].trim()));
+                break;
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    let (query_text, body_after) = found.ok_or_else(|| {
+        first_err.unwrap_or_else(|| syntax("FOR requires IN <query> LOOP".to_string()))
+    })?;
+    let inner = plpgsql_strip_end_loop(body_after)
+        .ok_or_else(|| syntax("FOR loop without END LOOP".to_string()))?;
+    let query = parse_statement(query_text).map_err(|e| SqlError {
+        message: format!("syntax error in FOR loop query: {}", e.message),
+        code: "42601",
+    })?;
+    match query {
+        Stmt::Select(_) | Stmt::Explain { .. } => {}
+        _ => {
+            return Err(syntax(
+                "FOR loop query must be SELECT or EXPLAIN".to_string(),
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    for chunk in split_plpgsql_chunks(inner) {
+        let c = chunk.trim();
+        if c.is_empty() {
+            continue;
+        }
+        let stmt = parse_plpgsql_for_body_stmt(c)?;
+        plpgsql_push_stmt(&mut body, stmt, "FOR loop body")?;
+    }
+    Ok(PlpgsqlStmt::ForQuery { var, query, body })
+}
+
+/// v1.03: reject RETURN/RETURN NEXT placement against the function's
+/// declared shape: `RETURN <expr>` is illegal in a `RETURNS SETOF`
+/// function (use `RETURN NEXT`), and `RETURN NEXT` is illegal in a
+/// scalar function (PG19 pl_comp.c `check_sql_stmt` equivalents).
+fn plpgsql_validate_returns(
+    stmts: &[PlpgsqlStmt],
+    handlers: &[PlpgsqlHandler],
+    returns_set: bool,
+) -> Result<(), SqlError> {
+    fn walk(stmts: &[PlpgsqlStmt], returns_set: bool) -> Result<(), SqlError> {
+        for s in stmts {
+            match s {
+                PlpgsqlStmt::Return(_) if returns_set => {
+                    return Err(SqlError {
+                        message: "RETURN with a value cannot be used in a function returning set; use RETURN NEXT".to_string(),
+                        code: "42601",
+                    });
+                }
+                PlpgsqlStmt::ReturnNext(_) if !returns_set => {
+                    return Err(SqlError {
+                        message: "RETURN NEXT cannot be used in a non-SETOF function".to_string(),
+                        code: "42601",
+                    });
+                }
+                PlpgsqlStmt::ForQuery { body, .. } => walk(body, returns_set)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(stmts, returns_set)?;
+    for h in handlers {
+        walk(&h.stmts, returns_set)?;
+    }
+    Ok(())
+}
+
+/// v1.03: every `FOR` loop variable and `:=` assignment target must be
+/// DECLAREd (PG requires a declared variable for both; an undeclared
+/// name is 42601 at CREATE, like PG's plpgsql validator).
+fn plpgsql_validate_vars(
+    decls: &[PlpgsqlDecl],
+    stmts: &[PlpgsqlStmt],
+    handlers: &[PlpgsqlHandler],
+) -> Result<(), SqlError> {
+    fn walk(stmts: &[PlpgsqlStmt], decls: &[PlpgsqlDecl]) -> Result<(), SqlError> {
+        for s in stmts {
+            match s {
+                PlpgsqlStmt::ForQuery { var, body, .. } => {
+                    if !decls.iter().any(|d| d.name == *var) {
+                        return Err(SqlError {
+                            message: format!("FOR loop variable \"{}\" is not declared", var),
+                            code: "42601",
+                        });
+                    }
+                    walk(body, decls)?;
+                }
+                PlpgsqlStmt::Assign { var, .. } => {
+                    if !decls.iter().any(|d| d.name == *var) {
+                        return Err(SqlError {
+                            message: format!("assignment target \"{}\" is not declared", var),
+                            code: "42601",
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(stmts, decls)?;
+    for h in handlers {
+        walk(&h.stmts, decls)?;
+    }
+    Ok(())
+}
+
+fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+    fn unsupported(text: &str) -> SqlError {
+        SqlError {
+            message: format!(
+                "unsupported statement in plpgsql body (only RETURN, RETURN NEXT, :=, FOR..LOOP, RAISE, and ANALYZE are supported): {}",
+                text.chars().take(60).collect::<String>()
+            ),
+            code: "0A000",
+        }
+    }
+    let t = text.trim();
+    if let Some(rest) = plpgsql_strip_kw(t, "return") {
+        // v1.03: `RETURN NEXT <expr>` (SETOF functions only; placement is
+        // validated against `returns_set` in `parse_plpgsql_body`).
+        if let Some(after) = plpgsql_strip_kw(rest.trim(), "next") {
+            return parse_plpgsql_return_next(after);
+        }
+        return parse_plpgsql_return(rest);
+    }
+    // v1.02: `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+    if let Some(rest) = plpgsql_strip_kw(t, "raise") {
+        return parse_plpgsql_raise(rest);
+    }
+    // v1.03: `var := <expr>` scalar assignment.
+    if plpgsql_find_assign(t).is_some() {
+        return parse_plpgsql_assign(t);
+    }
+    let stmt = parse_statement(t).map_err(|_| unsupported(t))?;
+    match stmt {
+        Stmt::Analyze { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
+        _ => Err(unsupported(t)),
+    }
+}
+
+/// v1.01: parse one WHEN condition (`name` or `SQLSTATE 'code'`,
+/// PG19 pl_gram.y `proc_condition`). Returns the condition's SQLSTATEs
+/// and the unconsumed remainder.
+fn parse_plpgsql_condition(p: &str) -> Result<(Vec<String>, &str), SqlError> {
+    let p = p.trim_start();
+    if let Some(after) = plpgsql_strip_kw(p, "sqlstate") {
+        let lit = after.trim_start();
+        let rest = lit.strip_prefix('\'').ok_or_else(|| SqlError {
+            message: "SQLSTATE condition requires a string literal".to_string(),
+            code: "42601",
+        })?;
+        let end = rest.find('\'').ok_or_else(|| SqlError {
+            message: "SQLSTATE condition requires a string literal".to_string(),
+            code: "42601",
+        })?;
+        let code = &rest[..end];
+        // PG validates: exactly 5 chars of 0-9A-Z (pl_gram.y).
+        if code.len() != 5
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+        {
+            return Err(SqlError {
+                message: "invalid SQLSTATE code".to_string(),
+                code: "42601",
+            });
+        }
+        return Ok((vec![code.to_string()], &rest[end + 1..]));
+    }
+    let mut id_len = 0;
+    for (i, c) in p.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            id_len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if id_len == 0 {
+        return Err(SqlError {
+            message: "syntax error in WHEN condition".to_string(),
+            code: "42601",
+        });
+    }
+    let (name, restp) = p.split_at(id_len);
+    Ok((plpgsql_condition_named(name)?, restp))
+}
+
+/// v1.01: parse one `WHEN <conditions> THEN <statement>` clause (the
+/// WHEN keyword already stripped; PG19 pl_gram.y `proc_exception`).
+/// Conditions are `cond [OR cond ...]`; each condition is a name or
+/// `SQLSTATE 'code'`.
+fn parse_plpgsql_when(rest: &str) -> Result<PlpgsqlHandler, SqlError> {
+    let mut sqlstates = Vec::new();
+    let mut p = rest;
+    loop {
+        let (codes, restp) = parse_plpgsql_condition(p)?;
+        sqlstates.extend(codes);
+        p = restp.trim_start();
+        if let Some(after) = plpgsql_strip_kw(p, "or") {
+            p = after;
+            continue;
+        }
+        break;
+    }
+    let after = plpgsql_strip_kw(p, "then").ok_or_else(|| SqlError {
+        message: "expected THEN in WHEN clause".to_string(),
+        code: "42601",
+    })?;
+    let stmt_text = after.trim();
+    if stmt_text.is_empty() {
+        return Err(SqlError {
+            message: "WHEN ... THEN requires a statement".to_string(),
+            code: "42601",
+        });
+    }
+    Ok(PlpgsqlHandler {
+        sqlstates,
+        stmts: vec![parse_plpgsql_stmt(stmt_text)?],
+    })
+}
+
+/// v1.01: append an implicit `RETURN NULL` unless the statement list
+/// already ends with RETURN (PG19 `add_dummy_return`, `pl_comp.c`).
+fn plpgsql_ensure_trailing_return(stmts: &mut Vec<PlpgsqlStmt>) -> Result<(), SqlError> {
+    let needs = !matches!(stmts.last(), Some(PlpgsqlStmt::Return(_)));
+    if needs {
+        let null_sel = parse_statement("SELECT NULL").map_err(|e| SqlError {
+            message: format!("internal error building implicit RETURN: {}", e.message),
+            code: "XX000",
+        })?;
+        stmts.push(PlpgsqlStmt::Return(null_sel));
+    }
+    Ok(())
+}
+
+/// v1.01: push a statement onto a bounded statement list, enforcing
+/// that RETURN ends the list: at most one RETURN per list and nothing
+/// may follow it. (PG would treat a second RETURN as dead code; the
+/// bounded subset keeps that case an honest 0A000.)
+fn plpgsql_push_stmt(
+    stmts: &mut Vec<PlpgsqlStmt>,
+    stmt: PlpgsqlStmt,
+    ctx: &str,
+) -> Result<(), SqlError> {
+    if stmts.iter().any(|s| matches!(s, PlpgsqlStmt::Return(_))) {
+        return Err(SqlError {
+            message: format!("statement after RETURN in plpgsql {ctx}"),
+            code: "0A000",
+        });
+    }
+    stmts.push(stmt);
+    Ok(())
+}
+
+/// v1.01: parse a bounded PL/pgSQL body:
+/// `[DECLARE <decls>] BEGIN <stmts> [EXCEPTION <handlers>] END`
+/// (PG19 pl_gram.y `pl_block` / `decl_sect` / `exception_sect`; no labels).
+///
+/// Each statement is `RETURN <expr>`, `RETURN NEXT <expr>` (SETOF only),
+/// `var := <expr>`, `FOR var IN <query> LOOP <stmts> END LOOP`, `RAISE`,
+/// or a supported utility statement (currently only ANALYZE); each
+/// handler is `WHEN <cond> [OR <cond> ...] THEN <statement>`, and
+/// further `;`-separated statements after the THEN belong to the same
+/// handler until the next WHEN or END.
+///
+/// `returns_set` selects the function's declared shape so RETURN /
+/// RETURN NEXT placement can be validated the way PG's validator does
+/// at CREATE time.
+pub fn parse_plpgsql_body(body: &str, returns_set: bool) -> Result<PlpgsqlBody, SqlError> {
+    let unsupported = |msg: String| SqlError {
+        message: msg,
+        code: "0A000",
+    };
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    // v1.03: optional DECLARE section before BEGIN.
+    let mut decls: Vec<PlpgsqlDecl> = Vec::new();
+    let mut code = body;
+    if plpgsql_starts_with_kw(body.trim_start(), "declare") {
+        let after = plpgsql_strip_kw(body.trim_start(), "declare").unwrap_or("");
+        let bp = plpgsql_kw_positions(after, "begin")
+            .into_iter()
+            .next()
+            .ok_or_else(|| syntax("DECLARE section without BEGIN".to_string()))?;
+        decls = parse_plpgsql_decls(after[..bp].trim())?;
+        code = after[bp..].trim_start();
+    }
+    let mut chunks = split_plpgsql_chunks(code);
+    while chunks.last().is_some_and(|c| c.trim().is_empty()) {
+        chunks.pop();
+    }
+    let n = chunks.len();
+    if n == 0 {
+        return Err(unsupported("empty plpgsql body".to_string()));
+    }
+    // Statement texts in order: first chunk (BEGIN stripped), middle
+    // chunks, last chunk (END stripped).
+    let mut texts: Vec<String> = Vec::with_capacity(n);
+    if n == 1 {
+        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
+            unsupported(format!(
+                "plpgsql body must start with BEGIN, got: {}",
+                chunks[0].trim().chars().take(40).collect::<String>()
+            ))
+        })?;
+        let inner = plpgsql_strip_end(rest)
+            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
+        texts.push(inner.trim().to_string());
+    } else {
+        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
+            unsupported(format!(
+                "plpgsql body must start with BEGIN, got: {}",
+                chunks[0].trim().chars().take(40).collect::<String>()
+            ))
+        })?;
+        texts.push(rest.trim().to_string());
+        for c in &chunks[1..n - 1] {
+            texts.push(c.trim().to_string());
+        }
+        let inner = plpgsql_strip_end(&chunks[n - 1])
+            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
+        texts.push(inner.trim().to_string());
+    }
+    let mut stmts: Vec<PlpgsqlStmt> = Vec::new();
+    let mut handlers: Vec<PlpgsqlHandler> = Vec::new();
+    let mut cur_handler: Option<PlpgsqlHandler> = None;
+    let mut in_exception = false;
+    // v1.03: FOR..LOOP spans `;`-separated chunks, so walk by index and
+    // accumulate loop chunks until one ends with END LOOP.
+    let mut i = 0;
+    while i < texts.len() {
+        let t = texts[i].trim();
+        if !t.is_empty() && plpgsql_starts_with_kw(t, "for") {
+            let mut buf = String::new();
+            let mut j = i;
+            let mut closed = false;
+            while j < texts.len() {
+                if !buf.is_empty() {
+                    buf.push_str(";\n");
+                }
+                buf.push_str(texts[j].trim());
+                if plpgsql_ends_with_end_loop(texts[j].trim()) {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !closed {
+                return Err(syntax("FOR loop without END LOOP".to_string()));
+            }
+            let stmt = parse_plpgsql_for(&buf)?;
+            if in_exception {
+                let h = cur_handler
+                    .as_mut()
+                    .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
+                plpgsql_push_stmt(&mut h.stmts, stmt, "WHEN handler")?;
+            } else {
+                plpgsql_push_stmt(&mut stmts, stmt, "body")?;
+            }
+            i = j + 1;
+            continue;
+        }
+        if !in_exception {
+            if let Some(after) = plpgsql_strip_kw(t, "exception") {
+                in_exception = true;
+                let after = after.trim();
+                if after.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let w = plpgsql_strip_kw(after, "when")
+                    .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
+                cur_handler = Some(parse_plpgsql_when(w)?);
+                i += 1;
+                continue;
+            }
+            if t.is_empty() {
+                i += 1;
+                continue;
+            }
+            if plpgsql_starts_with_kw(t, "when") {
+                return Err(syntax("WHEN outside EXCEPTION section".to_string()));
+            }
+            let stmt = parse_plpgsql_stmt(t)?;
+            plpgsql_push_stmt(&mut stmts, stmt, "body")?;
+        } else {
+            if t.is_empty() {
+                i += 1;
+                continue;
+            }
+            if plpgsql_starts_with_kw(t, "exception") {
+                return Err(syntax("duplicate EXCEPTION section".to_string()));
+            }
+            if let Some(w) = plpgsql_strip_kw(t, "when") {
+                if let Some(h) = cur_handler.take() {
+                    handlers.push(h);
+                }
+                cur_handler = Some(parse_plpgsql_when(w)?);
+                i += 1;
+                continue;
+            }
+            let h = cur_handler
+                .as_mut()
+                .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
+            let stmt = parse_plpgsql_stmt(t)?;
+            plpgsql_push_stmt(&mut h.stmts, stmt, "WHEN handler")?;
+        }
+        i += 1;
+    }
+    if let Some(h) = cur_handler.take() {
+        handlers.push(h);
+    }
+    if in_exception && handlers.is_empty() {
+        return Err(syntax("EXCEPTION section without WHEN clause".to_string()));
+    }
+    // v1.03: validate RETURN / RETURN NEXT against the declared shape,
+    // and that every FOR variable / := target is DECLAREd.
+    plpgsql_validate_returns(&stmts, &handlers, returns_set)?;
+    plpgsql_validate_vars(&decls, &stmts, &handlers)?;
+    // v1.03: a SETOF function returns its accumulated rows; no dummy
+    // RETURN is appended (PG19 `add_dummy_return` only applies to
+    // scalar functions).
+    if !returns_set {
+        plpgsql_ensure_trailing_return(&mut stmts)?;
+        for h in &mut handlers {
+            plpgsql_ensure_trailing_return(&mut h.stmts)?;
+        }
+    }
+    Ok(PlpgsqlBody {
+        decls,
+        stmts,
+        handlers,
+    })
+}
+
+/// v1.00: parse a bounded trigger-function body (`RETURNS trigger`,
+/// `LANGUAGE plpgsql`) into [`TriggerBodyStmt`]s. The grammar is
+/// deliberately small — `BEGIN <stmt>; ... END` where each statement is
+/// one of:
+/// - `NEW.<col> = <expr>` or `NEW.<col> := <expr>` (assignment)
+/// - `RETURN NEW` | `RETURN OLD` | `RETURN NULL`
+/// - `RAISE NOTICE '<format>' [, <expr> ...]` |
+///   `RAISE EXCEPTION '<format>' [, <expr> ...]`
+///
+/// Expressions reuse the main SQL expression parser. Anything else is a
+/// 42601 syntax error (like PG's plpgsql validator at CREATE time).
+pub fn parse_trigger_body(body: &str) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+    let tokens = tokenize(body)?;
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        unnamed_seq: 0,
+        allow_similar_to: true,
+    };
+    p.parse_trigger_body_stmts()
+}
+
+/// v0.86: `VOLATILE` / `STABLE` / `IMMUTABLE` markers. Stored for
+/// catalog fidelity; the executor does not yet reorder or cache on
+/// volatility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuncVolatility {
+    Volatile,
+    Stable,
+    Immutable,
+}
+
+/// v0.88: one key column of `CREATE INDEX`. Either a plain column
+/// (`name`) or an index expression (`expr`, the source text — stored
+/// for catalog fidelity; the v0.88 planner does not evaluate it).
+#[derive(Clone, Debug)]
+pub struct IndexColSpec {
+    pub name: Option<String>,
+    pub expr: Option<String>,
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
+// ---------------------------------------------------------------------------
+// v1.00: triggers (PG19 `CreateTrigStmt`, bounded). BEFORE INSERT
+// FOR EACH ROW triggers fire in the executor (NEW assignment,
+// RETURN NEW/NULL, RAISE NOTICE); AFTER triggers and other events are
+// parsed and cataloged but never fired (documented gap).
+// ---------------------------------------------------------------------------
+
+/// v1.00: trigger timing (PG19 `TRIGGER_BEFORE` / `TRIGGER_AFTER`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// v1.00: trigger event bitmask (PG19 `TRIGGER_INSERT` etc., simplified
+/// to one bit per event so it fits in a single WAL/checkpoint byte).
+pub mod trig_event {
+    /// INSERT event.
+    pub const INSERT: u8 = 1;
+    /// DELETE event.
+    pub const DELETE: u8 = 2;
+    /// UPDATE event.
+    pub const UPDATE: u8 = 4;
+    /// TRUNCATE event (parsed; never fired in v1.00).
+    pub const TRUNCATE: u8 = 8;
+}
+
+/// v1.00: a trigger definition as parsed from `CREATE TRIGGER`. Stored
+/// on the table's catalog entry (`storage::Table.triggers`) so it
+/// versions, WAL-replays, and checkpoints with the table. `args` are
+/// the `EXECUTE FUNCTION f(args)` argument source texts (debug format);
+/// v1.00 accepts them syntactically but does not pass them to the
+/// function (no `TG_ARGV`).
+#[derive(Clone, Debug)]
+pub struct TriggerDef {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub events: u8,
+    pub for_each_row: bool,
+    pub function: String,
+    /// v1.00: accepted syntactically, not passed to the function (no
+    /// `TG_ARGV`). Kept so the DDL round-trips faithfully.
+    #[allow(dead_code)]
+    pub args: Vec<String>,
+}
+
+/// v1.00: one statement of a bounded trigger-function body
+/// (`RETURNS trigger`, `LANGUAGE plpgsql`). This is a separate,
+/// deliberately small grammar — not an expansion of the bounded
+/// PL/pgSQL function body (`desugar_plpgsql_body`): it supports exactly
+/// what BEFORE ROW triggers need.
+#[derive(Clone, Debug)]
+pub enum TriggerBodyStmt {
+    /// `NEW.col = <expr>` or `NEW.col := <expr>`.
+    Assign { col: String, expr: Expr },
+    /// `RETURN NEW`.
+    ReturnNew,
+    /// `RETURN OLD`.
+    ReturnOld,
+    /// `RETURN NULL` — the row is skipped (like PG19).
+    ReturnNull,
+    /// `RAISE <level> '<format>' [, <expr> ...]`.
+    Raise {
+        level: RaiseLevel,
+        format: String,
+        args: Vec<Expr>,
+    },
+}
+
+/// v1.00: `RAISE` levels supported in trigger bodies. Anything else
+/// (DEBUG, LOG, INFO, WARNING) is rejected at parse time with 0A000.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaiseLevel {
+    Notice,
+    Exception,
+}
+
+/// v1.38: `CREATE CAST` coercion method (PG19 `CoercionMethod`).
+/// Only `Binary` (`WITHOUT FUNCTION`) is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastMethod {
+    Binary,
+    Function,
+    InOut,
+}
+
+/// v1.38: `CREATE CAST` coercion context (PG19 `CoercionContext`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// v1.45: PG19 EXPLAIN option set, mirroring `ExplainState` fields consumed
+/// by `explain_state.c`'s `ParseExplainOptionList`. Only `analyze`/`costs`
+/// affect plan output today; every other option is parsed and validated
+/// exactly like PG19 (including the options PG19 accepts but we do not
+/// render yet) and stored here for future versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainOpts {
+    pub verbose: bool,
+    pub buffers: bool,
+    pub wal: bool,
+    pub timing: bool,
+    pub summary: bool,
+    pub settings: bool,
+    pub memory: bool,
+    pub generic_plan: bool,
+    pub io: bool,
+    pub serialize: ExplainSerialize,
+    pub format: ExplainFormat,
+}
+
+impl Default for ExplainOpts {
+    fn default() -> Self {
+        ExplainOpts {
+            verbose: false,
+            buffers: false,
+            wal: false,
+            timing: false,
+            summary: false,
+            settings: false,
+            memory: false,
+            generic_plan: false,
+            io: false,
+            serialize: ExplainSerialize::None,
+            format: ExplainFormat::Text,
+        }
+    }
+}
+
+/// v1.45: PG19 `EXPLAIN (SERIALIZE ...)` value (`explain_state.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainSerialize {
+    None,
+    Text,
+    Binary,
+}
+
+/// v1.45: PG19 `EXPLAIN (FORMAT ...)` value (`explain_state.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFormat {
+    Text,
+    Xml,
+    Json,
+    Yaml,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     CreateTable {
@@ -2403,6 +4693,9 @@ pub enum Stmt {
     },
     AlterSequence {
         name: String,
+        // v0.98: IF EXISTS was parsed but dropped before; now honored
+        // (missing sequence -> NOTICE, like PG19).
+        if_exists: bool,
         opts: SequenceOpts,
     },
     DropSequence {
@@ -2426,6 +4719,120 @@ pub enum Stmt {
     DropType {
         names: Vec<String>,
         if_exists: bool,
+    },
+    // --- v1.38: CREATE CAST (bounded): only the WITHOUT FUNCTION
+    // (binary) method is executed; WITH FUNCTION / WITH INOUT parse
+    // and are honestly rejected at execution time (0A000).
+    CreateCast {
+        src: String,
+        dst: String,
+        method: CastMethod,
+        context: CastContext,
+    },
+    // --- v0.85: CREATE DOMAIN (bounded): a named type over a base
+    // type with optional CHECK constraints, NOT NULL, and DEFAULT.
+    // `base_named` carries the named type for a composite or domain
+    // base (None for builtins); resolved against the type catalog at
+    // execution time.
+    CreateDomain {
+        name: String,
+        base: ColType,
+        base_named: Option<String>,
+        checks: Vec<CheckDef>,
+        not_null: bool,
+        default: Option<DefaultExpr>,
+    },
+    DropDomain {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    // --- v0.97: ALTER DOMAIN (PG19 AlterDomainStmt, bounded) ---
+    AlterDomain {
+        name: String,
+        action: AlterDomainAction,
+    },
+    /// v1.09: `ALTER FUNCTION name(argtypes) {VOLATILE|STABLE|IMMUTABLE}`
+    /// (PG19 AlterFunctionStmt, volatility action only).
+    AlterFunction {
+        name: String,
+        arg_types: Vec<String>,
+        volatility: FuncVolatility,
+    },
+    // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
+    // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
+    // desugared to SQL at CREATE). Only `LANGUAGE sql`, `LANGUAGE
+    // plpgsql` and `LANGUAGE internal` are supported; any other
+    // language (C, ...) is rejected at parse time with 42601. `args` carries the optional argument
+    // names (for named references like `t.col` in the body) and the
+    // declared type names. `body` is the raw function-body string;
+    // the executor parses it once at CREATE time. `or_replace`
+    // implements CREATE OR REPLACE (42723 without it on duplicates).
+    // v1.32: `lang_name` is the raw LANGUAGE name as written (PG19
+    // parses any name; the executor resolves it, 42883 if unknown).
+    CreateFunction {
+        name: String,
+        args: Vec<FuncArg>,
+        ret_type: String,
+        returns_set: bool,
+        lang_name: String,
+        body: String,
+        or_replace: bool,
+        volatility: FuncVolatility,
+        strict: bool,
+    },
+    DropFunction {
+        name: String,
+        arg_types: Vec<String>,
+        if_exists: bool,
+        /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
+        cascade: bool,
+    },
+    // --- v1.00: CREATE TRIGGER (bounded, PG19 `CreateTrigStmt`) ---
+    CreateTrigger {
+        name: String,
+        table: String,
+        timing: TriggerTiming,
+        /// Bitmask of `trig_event::*`.
+        events: u8,
+        for_each_row: bool,
+        function: String,
+        /// `EXECUTE FUNCTION f(args)` argument source texts.
+        args: Vec<String>,
+        /// v1.00: `WHEN (...)` is parsed; the executor does not
+        /// evaluate it (documented gap).
+        when: Option<Expr>,
+        /// `CONSTRAINT` triggers are cataloged; enforcement is a gap.
+        is_constraint: bool,
+    },
+    /// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`.
+    DropOperator {
+        name: String,
+        leftarg: Option<String>,
+        rightarg: Option<String>,
+        if_exists: bool,
+        /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
+        cascade: bool,
+    },
+    // --- v0.86: CREATE OPERATOR (bounded): registers a user-defined
+    // operator name mapping to a function (`PROCEDURE`). Only the
+    // equality use in `[NOT] IN` subqueries is wired to user operators;
+    // general expression use stays 42601.
+    CreateOperator {
+        name: String,
+        procedure: String,
+        leftarg: Option<String>,
+        rightarg: Option<String>,
+        commutator: Option<String>,
+        negator: Option<String>,
+        hashes: bool,
+        merges: bool,
     },
     // --- v0.11: roles and privileges ---
     CreateRole {
@@ -2478,7 +4885,8 @@ pub enum Stmt {
     },
     Insert {
         table: String,
-        columns: Option<Vec<String>>,
+        /// v0.84: targets carry PG19 indirection (`f2[1]`, `f3.if2`).
+        columns: Option<Vec<InsertTarget>>,
         rows: Vec<Vec<InsertValue>>,
         /// v0.10: `INSERT INTO ... SELECT ...` source (mutually exclusive
         /// with `rows`).
@@ -2606,17 +5014,31 @@ pub enum Stmt {
     CreateIndex {
         name: String,
         table: String,
-        columns: Vec<String>,
+        columns: Vec<IndexColSpec>,
         unique: bool,
         if_not_exists: bool,
+        /// v0.88: partial-index predicate source (`WHERE ...`), if any.
+        predicate: Option<String>,
     },
     DropIndex {
-        name: String,
+        names: Vec<String>,
         if_exists: bool,
     },
     // --- v0.8: EXPLAIN (planned, never executed)
+    // v1.03: `analyze` preserves the ANALYZE option; true means the inner
+    // SELECT is executed once and actual row counts are rendered.
+    // v1.08: `costs` preserves the COSTS option (default true, like
+    // Postgres); false omits the `(rows=N)` estimate suffix from every
+    // node line in the planning-only text renderer.
+    // v1.45: `opts` carries the full PG19 option set, parsed and validated
+    // per explain_state.c ParseExplainOptionList. Only analyze/costs affect
+    // output today; the rest are accepted (or rejected exactly like PG19)
+    // and stored for future versions.
     Explain {
         stmt: Box<Stmt>,
+        analyze: bool,
+        costs: bool,
+        opts: ExplainOpts,
     },
     // --- v0.8: ANALYZE (statistics collection)
     Analyze {
@@ -2630,6 +5052,9 @@ pub enum Stmt {
         level: Option<IsolationLevel>,
         read_only: Option<bool>,
         deferrable: Option<bool>,
+        /// v1.07: `SET TRANSACTION SNAPSHOT 'snapshot-id'` — imported
+        /// snapshot id (PG19 special syntax, not combinable with modes).
+        snapshot: Option<String>,
     },
     /// `SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]` —
     /// defaults for subsequent transactions of this session.
@@ -2702,6 +5127,11 @@ impl Stmt {
                 | Stmt::DropSequence { .. }
                 | Stmt::CreateType { .. }
                 | Stmt::DropType { .. }
+                | Stmt::CreateCast { .. }
+                | Stmt::CreateDomain { .. }
+                | Stmt::AlterDomain { .. }
+                | Stmt::DropDomain { .. }
+                | Stmt::AlterFunction { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }
                 | Stmt::CreateStatistics
@@ -2812,7 +5242,7 @@ impl Stmt {
                 m
             }
             Stmt::Select(sel) => max_param_select(sel),
-            Stmt::Explain { stmt } => stmt.max_param(),
+            Stmt::Explain { stmt, .. } => stmt.max_param(),
             Stmt::Update {
                 sets,
                 from,
@@ -2870,6 +5300,8 @@ fn max_param_ctes(ctes: &[CteDef]) -> usize {
             CteBody::Union { left, right, .. } => {
                 m = m.max(max_param_select(left).max(max_param_select(right)));
             }
+            // v1.39: params inside a data-modifying CTE body.
+            CteBody::Dml(stmt) => m = m.max(stmt.max_param()),
         }
     }
     m
@@ -2955,6 +5387,8 @@ fn max_param_from(f: &FromItem) -> usize {
 
 fn max_param_expr(e: &Expr) -> usize {
     match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => max_param_expr(expr),
         Expr::Param(n) => *n as usize,
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
@@ -3014,9 +5448,26 @@ fn max_param_expr(e: &Expr) -> usize {
             .map(max_param_expr)
             .unwrap_or(0)
             .max(arg2.as_deref().map(max_param_expr).unwrap_or(0)),
+        // v1.30: ordered-set aggregate — params may hide in direct
+        // args, the WITHIN GROUP sort keys, or the FILTER.
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => direct_args
+            .iter()
+            .map(max_param_expr)
+            .chain(within_order_by.iter().map(|o| max_param_expr(&o.expr)))
+            .chain(filter.as_deref().map(max_param_expr))
+            .max()
+            .unwrap_or(0),
         Expr::ScalarSub(s) => max_param_select(s),
         Expr::ArraySubquery(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
+        // v0.87: quantified comparison and user operator.
+        Expr::Quantified { left, sub, .. } => max_param_expr(left).max(max_param_select(sub)),
+        Expr::UserOp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Exists { sub, .. } => max_param_select(sub),
         // v0.10: window functions.
         Expr::Window {
@@ -3154,6 +5605,100 @@ struct WindowSpec {
     partition_by: Vec<Expr>,
     order_by: Vec<OrderTerm>,
     frame: WindowFrame,
+    /// v1.31: PG19 `opt_window_exclusion_clause`.
+    exclusion: FrameExclusion,
+}
+
+/// v0.88: render a token slice back to SQL-ish source text, for stored
+/// index expressions / partial-index predicates (catalog fidelity
+/// only — never re-parsed for evaluation). Spacing is canonical, not
+/// verbatim: `a * a`, `id1 % 1000 = 1`.
+fn tokens_to_sql(toks: &[Token]) -> String {
+    fn text(t: &Token) -> String {
+        match t {
+            Token::Ident(s) => s.clone(),
+            Token::QIdent(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+            Token::Number(s) => s.clone(),
+            Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            // v1.39: render a bit-string literal back in `x'...'` form
+            // (catalog fidelity only).
+            Token::BitStr(marker, s) => format!("{}'{}'", marker, s),
+            Token::UStr(s) => format!("U&'{}'", s.replace('\'', "''")),
+            Token::UIdent(s) => format!("U&\"{}\"", s.replace('"', "\"\"")),
+            Token::Param(n) => format!("${}", n),
+            Token::Op(s) => s.clone(),
+            Token::LParen => "(".to_string(),
+            Token::RParen => ")".to_string(),
+            Token::LBracket => "[".to_string(),
+            Token::RBracket => "]".to_string(),
+            Token::Colon => ":".to_string(),
+            Token::Comma => ",".to_string(),
+            Token::Semi => ";".to_string(),
+            Token::Star => "*".to_string(),
+            Token::Plus => "+".to_string(),
+            Token::Minus => "-".to_string(),
+            Token::Slash => "/".to_string(),
+            Token::Percent => "%".to_string(),
+            Token::Eq => "=".to_string(),
+            Token::FatArrow => "=>".to_string(),
+            Token::Dot => ".".to_string(),
+            Token::Lt => "<".to_string(),
+            Token::Gt => ">".to_string(),
+            Token::LtEq => "<=".to_string(),
+            Token::GtEq => ">=".to_string(),
+            Token::Neq => "<>".to_string(),
+            Token::ColonColon => "::".to_string(),
+            Token::PipePipe => "||".to_string(),
+            Token::Pipe => "|".to_string(),
+            Token::Amp => "&".to_string(),
+            Token::Hash => "#".to_string(),
+            Token::Tilde => "~".to_string(),
+            Token::TildeStar => "~*".to_string(),
+            Token::BangTilde => "!~".to_string(),
+            Token::BangTildeStar => "!~*".to_string(),
+            Token::Shl => "<<".to_string(),
+            Token::Shr => ">>".to_string(),
+            Token::At => "@".to_string(),
+            Token::PipeSlash => "|/".to_string(),
+            Token::PipePipeSlash => "||/".to_string(),
+            Token::Caret => "^".to_string(),
+            Token::StarEq => "*=".to_string(),
+            Token::EOF => String::new(),
+        }
+    }
+    /// No space before these (closers and infix punctuation).
+    fn no_space_before(t: &Token) -> bool {
+        matches!(
+            t,
+            Token::RParen
+                | Token::Comma
+                | Token::Semi
+                | Token::Dot
+                | Token::RBracket
+                | Token::ColonColon
+                | Token::EOF
+        )
+    }
+    /// No space after these (openers and prefix punctuation).
+    fn no_space_after(t: &Token) -> bool {
+        matches!(
+            t,
+            Token::LParen | Token::LBracket | Token::Dot | Token::ColonColon | Token::At
+        )
+    }
+    let mut out = String::new();
+    let mut prev: Option<&Token> = None;
+    for t in toks {
+        if let Token::EOF = t {
+            break;
+        }
+        if !out.is_empty() && !no_space_before(t) && !prev.is_some_and(no_space_after) {
+            out.push(' ');
+        }
+        out.push_str(&text(t));
+        prev = Some(t);
+    }
+    out
 }
 
 struct Parser {
@@ -3177,6 +5722,13 @@ impl Parser {
     /// Token after the next one (for `qual.*` / `NOT IN` lookahead).
     fn peek2(&self) -> &Token {
         self.tokens.get(self.pos + 1).unwrap_or(&Token::EOF)
+    }
+
+    /// v1.30: is the next input `WITHIN GROUP` (PG19 gram.y
+    /// `within_group_clause`)?
+    fn peek_is_within(&self) -> bool {
+        matches!(self.peek(), Token::Ident(s) if s == "within")
+            && matches!(self.peek2(), Token::Ident(s) if s == "group")
     }
 
     /// Third token (for `qual.*` vs `qual.col` disambiguation).
@@ -3232,6 +5784,43 @@ impl Parser {
             self.pos += 1;
         }
         t
+    }
+
+    /// v1.10: consume `lateral` as the FROM-item keyword only where
+    /// PG19's gram.y has a `LATERAL_P` production (`LATERAL_P
+    /// func_table`, `LATERAL_P select_with_parens`). Anywhere else it
+    /// stays an ordinary identifier, so `FROM lateral` (a table named
+    /// `lateral`) keeps working like PG19, where LATERAL is unreserved.
+    fn eat_lateral_keyword(&mut self) -> bool {
+        if !matches!(self.peek(), Token::Ident(s) if s == "lateral") {
+            return false;
+        }
+        let mut j = self.pos + 1;
+        if matches!(self.tokens.get(j), Some(Token::LParen)) {
+            // `LATERAL (` — the keyword only when redundant parens give
+            // way to SELECT/WITH/VALUES (PG's `select_with_parens`
+            // covers `VALUES`, so `LATERAL (VALUES ...)` is legal).
+            loop {
+                j += 1;
+                if !matches!(self.tokens.get(j), Some(Token::LParen)) {
+                    break;
+                }
+            }
+            if matches!(self.tokens.get(j), Some(Token::Ident(s)) if s == "select" || s == "with" || s == "values")
+            {
+                self.pos += 1;
+                return true;
+            }
+            return false;
+        }
+        // `LATERAL func_name (` — the noise-word case.
+        if matches!(self.tokens.get(j), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 1), Some(Token::LParen))
+        {
+            self.pos += 1;
+            return true;
+        }
+        false
     }
 
     fn eat_keyword(&mut self, kw: &str) -> bool {
@@ -3471,36 +6060,161 @@ impl Parser {
             }
             // --- v0.8: EXPLAIN / ANALYZE
             "explain" => {
-                if self.eat_keyword("analyze") {
+                // v1.03: EXPLAIN (ANALYZE, ...) now executes the inner SELECT
+                // once and renders actual row counts (bounded: text format
+                // only). Bare EXPLAIN ANALYZE (no parens) remains 0A000.
+                let mut analyze = false;
+                // v1.08: COSTS defaults true (Postgres behavior); an explicit
+                // COSTS OFF/FALSE/0 omits the `(rows=N)` estimates.
+                let mut costs = true;
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("analyze")) {
                     return Err(SqlError {
-                        message: "EXPLAIN ANALYZE is not supported yet".to_string(),
+                        message: "unsupported: bare EXPLAIN ANALYZE (use EXPLAIN (ANALYZE, ...))"
+                            .to_string(),
                         code: "0A000",
                     });
                 }
-                // v0.77: EXPLAIN (option, ...) — parse and ignore the options
-                // (COSTS, VERBOSE, BUFFERS, TIMING, SUMMARY, SETTINGS, FORMAT).
-                // The options don't affect rustgres's plan output format, but
-                // accepting the syntax avoids a 42601 that would (correctly)
-                // abort an explicit transaction in the conformance suite.
+                // v1.45: EXPLAIN (option, ...) — full PG19 option set, parsed
+                // and validated per gram.y ExplainStmt/utility_option_list
+                // and explain_state.c ParseExplainOptionList. Only ANALYZE
+                // (v1.03) and COSTS (v1.08) affect output; the rest are
+                // accepted (or rejected exactly like PG19) and stored in
+                // ExplainOpts for future versions. Accepting the syntax
+                // avoids a 42601 that would (correctly) abort an explicit
+                // transaction in the conformance suite. Duplicate options
+                // are accepted with last-wins semantics (Postgres behavior).
+                let mut opts = ExplainOpts::default();
                 if matches!(self.peek(), Token::LParen) {
                     let _ = self.next(); // consume '('
                     loop {
                         // Option name: identifier.
-                        match self.next() {
-                            Token::Ident(_) => {}
+                        let opt_name = match self.next() {
+                            Token::Ident(name) => name,
                             other => {
                                 return Err(err(format!(
                                     "syntax error: unexpected {:?} in EXPLAIN options",
                                     other
                                 )));
                             }
-                        }
+                        };
                         // Optional value: boolean keyword, number, string, or identifier.
-                        match self.peek() {
-                            Token::Number(_) | Token::Str(_) | Token::Ident(_) => {
-                                let _ = self.next();
+                        // v1.45: PG19 utility_option_list also accepts a
+                        // quoted identifier as the value (ColLabel); its case
+                        // is preserved (unlike unquoted identifiers, which the
+                        // tokenizer folds like PG's scanner).
+                        let opt_val: Option<String> = match self.peek() {
+                            Token::Number(_)
+                            | Token::Str(_)
+                            | Token::Ident(_)
+                            | Token::QIdent(_) => match self.next() {
+                                Token::Number(n) => Some(n),
+                                Token::Str(s) => Some(s),
+                                Token::Ident(id) => Some(id),
+                                Token::QIdent(id) => Some(id),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        // v1.45: PG19 defGetBoolean (define.c): a bare option
+                        // means true; 0/1/true/false/on/off (case-insensitive)
+                        // map to booleans; anything else is 42601
+                        // "<name> requires a Boolean value". PG's lexer folds
+                        // unquoted names to lowercase, so the message uses the
+                        // lowercased name.
+                        let opt_lc = opt_name.to_lowercase();
+                        let bool_val = |val: &Option<String>| -> Result<bool, SqlError> {
+                            match val.as_deref() {
+                                None => Ok(true),
+                                Some(v)
+                                    if v.eq_ignore_ascii_case("true")
+                                        || v.eq_ignore_ascii_case("on")
+                                        || v == "1" =>
+                                {
+                                    Ok(true)
+                                }
+                                Some(v)
+                                    if v.eq_ignore_ascii_case("false")
+                                        || v.eq_ignore_ascii_case("off")
+                                        || v == "0" =>
+                                {
+                                    Ok(false)
+                                }
+                                _ => Err(err(format!("{opt_lc} requires a Boolean value"))),
                             }
-                            _ => {}
+                        };
+                        if opt_name.eq_ignore_ascii_case("analyze") {
+                            // v1.03: ANALYZE selects the actual-rows path.
+                            analyze = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("costs") {
+                            // v1.08: COSTS OFF omits the `(rows=N)` estimate
+                            // suffix from the planning-only text renderer.
+                            costs = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("verbose") {
+                            opts.verbose = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("buffers") {
+                            opts.buffers = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("wal") {
+                            opts.wal = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("timing") {
+                            opts.timing = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("summary") {
+                            opts.summary = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("settings") {
+                            opts.settings = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("memory") {
+                            opts.memory = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("generic_plan") {
+                            opts.generic_plan = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("io") {
+                            opts.io = bool_val(&opt_val)?;
+                        } else if opt_name.eq_ignore_ascii_case("serialize") {
+                            // v1.45: PG19: bare SERIALIZE means text;
+                            // off/none/text/binary accepted, else 22023.
+                            // PG19 compares the raw value case-sensitively
+                            // (strcmp); the tokenizer already folds unquoted
+                            // identifiers to lowercase like PG's scanner, so
+                            // a quoted "TEXT" is still rejected.
+                            opts.serialize = match opt_val.as_deref() {
+                                None => ExplainSerialize::Text,
+                                Some(v) if v == "off" || v == "none" => {
+                                    ExplainSerialize::None
+                                }
+                                Some(v) if v == "text" => ExplainSerialize::Text,
+                                Some(v) if v == "binary" => {
+                                    ExplainSerialize::Binary
+                                }
+                                Some(v) => {
+                                    return Err(err_invalid_param(format!(
+                                        "unrecognized value for EXPLAIN option \"serialize\": \"{v}\""
+                                    )));
+                                }
+                            };
+                        } else if opt_name.eq_ignore_ascii_case("format") {
+                            // v1.45: PG19: text/xml/json/yaml, else 22023; a
+                            // bare FORMAT is 42601 "format requires a parameter".
+                            // PG19 compares the raw value case-sensitively
+                            // (strcmp); the tokenizer already folds unquoted
+                            // identifiers to lowercase like PG's scanner, so
+                            // a quoted "JSON" is still rejected.
+                            opts.format = match opt_val.as_deref() {
+                                None => {
+                                    return Err(err(format!("{opt_lc} requires a parameter")));
+                                }
+                                Some(v) if v == "text" => ExplainFormat::Text,
+                                Some(v) if v == "xml" => ExplainFormat::Xml,
+                                Some(v) if v == "json" => ExplainFormat::Json,
+                                Some(v) if v == "yaml" => ExplainFormat::Yaml,
+                                Some(v) => {
+                                    return Err(err_invalid_param(format!(
+                                        "unrecognized value for EXPLAIN option \"format\": \"{v}\""
+                                    )));
+                                }
+                            };
+                        } else {
+                            // v1.08: PG19 rejects unknown EXPLAIN options with 42601.
+                            return Err(err(format!(
+                                "unrecognized EXPLAIN option \"{opt_name}\""
+                            )));
                         }
                         match self.next() {
                             Token::Comma => continue,
@@ -3513,6 +6227,35 @@ impl Parser {
                             }
                         }
                     }
+                    // v1.45: PG19 cross-option validation (explain_state.c),
+                    // in PG's check order. All 22023 invalid_parameter_value.
+                    // (Note: BUFFERS has no requires-ANALYZE check in PG19.)
+                    if opts.wal && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option WAL requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.timing && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option TIMING requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.io && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option IO requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.serialize != ExplainSerialize::None && !analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN option SERIALIZE requires ANALYZE".to_string(),
+                        ));
+                    }
+                    if opts.generic_plan && analyze {
+                        return Err(err_invalid_param(
+                            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
+                                .to_string(),
+                        ));
+                    }
                 }
                 let inner_kw = match self.next() {
                     Token::Ident(s) => s,
@@ -3521,11 +6264,21 @@ impl Parser {
                     }
                 };
                 let inner = self.parse_top_kw(inner_kw)?;
+                // v1.58: EXPLAIN EXECUTE — PG19 (explain.c ExplainExecuteQuery)
+                // plans the named prepared statement with the EXECUTE
+                // arguments bound (custom plan). The inner Execute is
+                // resolved to its bound statement in run_statement before
+                // the planner sees it.
                 match inner {
-                    Stmt::Select(_) => Ok(Stmt::Explain {
+                    Stmt::Select(_) | Stmt::Execute { .. } => Ok(Stmt::Explain {
                         stmt: Box::new(inner),
+                        analyze,
+                        costs,
+                        opts,
                     }),
-                    _ => Err(err("EXPLAIN only supports SELECT statements".to_string())),
+                    _ => Err(err(
+                        "EXPLAIN only supports SELECT and EXECUTE statements".to_string()
+                    )),
                 }
             }
             "analyze" => {
@@ -3543,11 +6296,14 @@ impl Parser {
             "alter" => match self.peek() {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
+                Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
+                Token::Ident(s) if s == "function" => self.parse_alter_function(),
                 Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
                 _ => Err(err(
-                    "syntax error: expected TABLE, SEQUENCE or ROLE after ALTER".to_string(),
+                    "syntax error: expected TABLE, SEQUENCE, DOMAIN, FUNCTION or ROLE after ALTER"
+                        .to_string(),
                 )),
             },
             // --- v0.17: SET / SHOW / RESET
@@ -3760,9 +6516,14 @@ impl Parser {
                 }
             }
             "bytea" => Ok(ColType::Bytea),
+            // v1.39: PG's `bit` type (OID 1560). `bit(n)` typmod is not
+            // accepted yet (fail-closed: the value carries its own bit
+            // length, so enforcement would need per-value checks).
+            "bit" => Ok(ColType::Bit),
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
+            "xid" => Ok(ColType::Xid),      // v1.17
             // v0.81: not a builtin — treat as a (possibly) named composite
             // type; the name is resolved against the type catalog at
             // execution time (42704 if undefined).
@@ -3857,6 +6618,7 @@ impl Parser {
                 | "uuid"
                 | "regclass"
                 | "pg_lsn" // v0.64
+                | "xid" // v1.17
         )
     }
 
@@ -3864,6 +6626,33 @@ impl Parser {
         // v0.11: CREATE ROLE / USER / GROUP
         if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_create_role();
+        }
+        // v0.86: CREATE [OR REPLACE] FUNCTION and CREATE OPERATOR.
+        // OR REPLACE is consumed here (parse_create_function expects
+        // to start at FUNCTION).
+        if matches!(self.peek(), Token::Ident(s) if s == "or") {
+            // Peek past `or` for `replace` without consuming on mismatch.
+            let is_or_replace = matches!(self.peek2(), Token::Ident(s) if s == "replace");
+            if is_or_replace {
+                self.next(); // 'or'
+                self.next(); // 'replace'
+                if matches!(self.peek(), Token::Ident(s) if s == "function") {
+                    return self.parse_create_function(true);
+                }
+                return Err(err(
+                    "syntax error: OR REPLACE is only supported for CREATE FUNCTION".to_string(),
+                ));
+            }
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "function") {
+            return self.parse_create_function(false);
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "operator") {
+            return self.parse_create_operator();
+        }
+        // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
+        if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            return self.parse_create_trigger();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -3885,10 +6674,70 @@ impl Parser {
             };
             self.expect_keyword("on")?;
             let table = self.expect_ident()?;
+            // v0.88: `USING btree` may appear between the table and the
+            // column list. v0.89: rustgres only implements btree, so any
+            // other access method is 0A000 (feature not supported) rather
+            // than silently misbehaving as a btree.
+            if self.eat_keyword("using") {
+                let method = self.expect_ident()?;
+                if method != "btree" {
+                    return Err(SqlError {
+                        message: format!("index access method \"{method}\" is not supported"),
+                        code: "0A000",
+                    });
+                }
+            }
             self.expect(Token::LParen, "'('")?;
             let mut columns = Vec::new();
             loop {
-                columns.push(self.expect_ident()?);
+                // v0.88: `(expr)` is an index expression; anything else
+                // must be a plain column name. v0.99: a bare function
+                // call (`expensivefunc(x)`) is also an expression (PG19
+                // index_elem: ColId | func_expr | (a_expr)).
+                let (name_opt, expr_opt) = if matches!(self.peek(), Token::LParen) {
+                    self.next(); // consume the expression's '('
+                    let start = self.pos;
+                    let _ = self.parse_or()?;
+                    let src = tokens_to_sql(&self.tokens[start..self.pos]);
+                    self.expect(Token::RParen, "')'")?;
+                    (None, Some(src))
+                } else {
+                    let start = self.pos;
+                    let name = self.expect_ident()?;
+                    if matches!(self.peek(), Token::LParen) {
+                        // Function call: rewind and capture the full
+                        // expression source.
+                        self.pos = start;
+                        let _ = self.parse_or()?;
+                        let src = tokens_to_sql(&self.tokens[start..self.pos]);
+                        (None, Some(src))
+                    } else {
+                        (Some(name), None)
+                    }
+                };
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                let nulls_first = if self.eat_keyword("nulls") {
+                    if self.eat_keyword("first") {
+                        true
+                    } else {
+                        self.expect_keyword("last")?;
+                        false
+                    }
+                } else {
+                    // PG defaults: ASC → NULLS LAST, DESC → NULLS FIRST.
+                    desc
+                };
+                columns.push(IndexColSpec {
+                    name: name_opt,
+                    expr: expr_opt,
+                    desc,
+                    nulls_first,
+                });
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -3905,8 +6754,27 @@ impl Parser {
                     "syntax error: index requires at least one column".to_string()
                 ));
             }
+            // v0.88: partial index predicate.
+            let predicate = if self.eat_keyword("where") {
+                let start = self.pos;
+                let _ = self.parse_or()?;
+                Some(tokens_to_sql(&self.tokens[start..self.pos]))
+            } else {
+                None
+            };
             let name = if name.is_empty() {
-                format!("{}_{}_idx", table, columns.join("_"))
+                let key_part: Vec<String> = columns
+                    .iter()
+                    .map(|c| {
+                        c.name.clone().unwrap_or_else(|| {
+                            // PG mangles expression auto-names; "expr" is
+                            // unambiguous and cannot collide with a real
+                            // column list's mangling.
+                            "expr".to_string()
+                        })
+                    })
+                    .collect();
+                format!("{}_{}_idx", table, key_part.join("_"))
             } else {
                 name
             };
@@ -3916,6 +6784,7 @@ impl Parser {
                 columns,
                 unique,
                 if_not_exists,
+                predicate,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -3935,6 +6804,15 @@ impl Parser {
         // parenthesized completion form with LIKE = <base>.
         if matches!(self.peek(), Token::Ident(s) if s == "type") {
             return self.parse_create_type();
+        }
+        // v0.85: CREATE DOMAIN name AS type [constraints...].
+        if matches!(self.peek(), Token::Ident(s) if s == "domain") {
+            return self.parse_create_domain();
+        }
+        // v1.38: CREATE CAST (sourcetype AS targettype) WITHOUT FUNCTION
+        // | WITH FUNCTION funcname | WITH INOUT [AS IMPLICIT | AS ASSIGNMENT].
+        if matches!(self.peek(), Token::Ident(s) if s == "cast") {
+            return self.parse_create_cast();
         }
         // v0.75: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
         // cols FROM table. Accepted as a no-op (statistics are not used
@@ -4065,14 +6943,16 @@ impl Parser {
                 }
             }
         } // v0.74: end of non-empty column list; `()` handled above.
-        let mut def = build_table_def(&name, items)?;
-        // v0.77: `INHERITS (parent [, ...])` — table inheritance. The
-        // child copies the parents' columns at exec; recorded in the
-        // def for future inheritance-expansion support.
+        // v0.96: `INHERITS (parent [, ...])` — table inheritance. Parsed
+        // before `build_table_def` so a constraint-only (or empty) column
+        // list is legal when parents supply the columns (PG19 merges the
+        // parents' columns at CREATE time); table-constraint column
+        // references are validated against the merged columns at exec.
+        let mut inherits: Vec<String> = Vec::new();
         if self.eat_keyword("inherits") {
             self.expect(Token::LParen, "'('")?;
             loop {
-                def.inherits.push(self.expect_ident()?);
+                inherits.push(self.expect_ident()?);
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -4085,6 +6965,8 @@ impl Parser {
                 }
             }
         }
+        let mut def = build_table_def(&name, items, &inherits)?;
+        def.inherits = inherits;
         // v0.72: `WITH (storage_parameter = value, ...)` (PG19
         // reloptions). Parsed into the def; exec validates the
         // recognized parameters (fillfactor range) and records them.
@@ -4123,6 +7005,8 @@ impl Parser {
         let def = TableDef {
             columns: Vec::new(), // inherited from parent at exec
             composite_types: Vec::new(),
+            domain_types: Vec::new(),
+            domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
@@ -4141,6 +7025,7 @@ impl Parser {
             likes: Vec::new(),
             reloptions: Vec::new(),
             inherits: Vec::new(),
+            deferred_not_null: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -4881,6 +7766,17 @@ impl Parser {
             let new_name = self.expect_ident()?;
             return Ok(AlterAction::RenameTo { new_name });
         }
+        // v0.96: `ALTER TABLE child INHERIT parent` /
+        // `ALTER TABLE child NO INHERIT parent` (PG19).
+        if self.eat_keyword("inherit") {
+            let parent = self.expect_ident()?;
+            return Ok(AlterAction::Inherit { parent });
+        }
+        if self.eat_keyword("no") {
+            self.expect_keyword("inherit")?;
+            let parent = self.expect_ident()?;
+            return Ok(AlterAction::NoInherit { parent });
+        }
         Err(err(
             "syntax error: expected ADD, DROP, ALTER or RENAME".to_string()
         ))
@@ -5054,26 +7950,977 @@ impl Parser {
         })
     }
 
-    /// ALTER SEQUENCE name [options...] — all options optional.
+    /// v1.38: `CREATE CAST (sourcetype AS targettype) WITHOUT FUNCTION
+    /// | WITH FUNCTION funcname [(args)] | WITH INOUT [AS IMPLICIT |
+    /// AS ASSIGNMENT]` — PG19 gram.y `CreateCastStmt`, bounded: the
+    /// type names are parsed as (optionally schema-qualified)
+    /// identifiers; only WITHOUT FUNCTION is executed, the other
+    /// methods parse and are rejected at execution time (0A000).
+    fn parse_create_cast(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("cast")?;
+        self.expect(Token::LParen, "'('")?;
+        let src = self.parse_cast_type_name()?;
+        self.expect_keyword("as")?;
+        let dst = self.parse_cast_type_name()?;
+        self.expect(Token::RParen, "')'")?;
+        let method = if self.eat_keyword("without") {
+            self.expect_keyword("function")?;
+            CastMethod::Binary
+        } else if self.eat_keyword("with") {
+            if self.eat_keyword("function") {
+                // Function name, optionally with an argument list —
+                // consumed and ignored (the method is unimplemented).
+                let _ = self.expect_ident()?;
+                if *self.peek() == Token::LParen {
+                    self.next();
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match self.next() {
+                            Token::LParen => depth += 1,
+                            Token::RParen => depth -= 1,
+                            Token::EOF => {
+                                return Err(err(
+                                    "syntax error: unterminated function argument list".to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                CastMethod::Function
+            } else if self.eat_keyword("inout") {
+                CastMethod::InOut
+            } else {
+                return Err(err(
+                    "syntax error: expected FUNCTION or INOUT after WITH".to_string()
+                ));
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected WITHOUT FUNCTION, WITH FUNCTION, or WITH INOUT".to_string(),
+            ));
+        };
+        let context = if self.eat_keyword("as") {
+            if self.eat_keyword("implicit") {
+                CastContext::Implicit
+            } else if self.eat_keyword("assignment") {
+                CastContext::Assignment
+            } else {
+                return Err(err(
+                    "syntax error: expected IMPLICIT or ASSIGNMENT".to_string()
+                ));
+            }
+        } else {
+            CastContext::Explicit
+        };
+        Ok(Stmt::CreateCast {
+            src,
+            dst,
+            method,
+            context,
+        })
+    }
+
+    /// v1.38: a type name in `CREATE CAST` — an optionally
+    /// schema-qualified identifier (the qualifier is accepted and
+    /// ignored, like `parse_type_name`). The tokenizer already folds
+    /// unquoted names to lowercase.
+    fn parse_cast_type_name(&mut self) -> Result<String, SqlError> {
+        let name = self.expect_ident()?;
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+            self.next(); // '.'
+            return self.expect_ident();
+        }
+        Ok(name)
+    }
+
+    /// v0.86: `CREATE [OR REPLACE] FUNCTION name ([argname] type
+    /// [, ...]) RETURNS [SETOF] type [LANGUAGE lang] [IMMUTABLE |
+    /// STABLE | VOLATILE] [STRICT] AS 'body'` — PG19 CreateFunctionStmt,
+    /// bounded to `LANGUAGE sql`, `LANGUAGE internal`, and the bounded
+    /// `LANGUAGE plpgsql` subset. Like PG19's gram.y, ANY language name
+    /// parses here; unknown languages are rejected at CREATE time with
+    /// 42883 (`language "%s" does not exist`, proclang.c
+    /// `get_language_oid`), not at parse time. Argument types are stored
+    /// as written and resolved at execution; the body string is parsed
+    /// once at execution time.
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                args.push(self.parse_func_arg()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        self.expect_keyword("returns")?;
+        let returns_set = self.eat_keyword("setof");
+        let ret_type = self.parse_func_type_name()?;
+        let mut lang_name: Option<String> = None;
+        let mut body: Option<String> = None;
+        let mut volatility = FuncVolatility::Volatile;
+        let mut strict = false;
+        loop {
+            if self.eat_keyword("language") {
+                // v1.32: PG19 parses any language name (gram.y
+                // CreateFunctionStmt); unknown languages fail at CREATE
+                // with 42883 in the executor (proclang.c
+                // get_language_oid), not here.
+                lang_name = Some(self.expect_ident()?);
+            } else if self.eat_keyword("immutable") {
+                volatility = FuncVolatility::Immutable;
+            } else if self.eat_keyword("stable") {
+                volatility = FuncVolatility::Stable;
+            } else if self.eat_keyword("volatile") {
+                volatility = FuncVolatility::Volatile;
+            } else if self.eat_keyword("strict") {
+                strict = true;
+            } else if self.eat_keyword("parallel") {
+                // v1.09: PARALLEL {UNSAFE|RESTRICTED|SAFE} (PG19). A
+                // planner hint like COST: parsed and validated but not
+                // stored — the executor has no parallel query execution.
+                let kw = self.expect_ident()?;
+                match kw.to_ascii_uppercase().as_str() {
+                    "UNSAFE" | "RESTRICTED" | "SAFE" => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected UNSAFE, RESTRICTED or SAFE after PARALLEL, found {}",
+                            other
+                        )));
+                    }
+                };
+            } else if self.eat_keyword("cost") {
+                // v0.99: COST is a planner hint (PG19); parsed and
+                // validated but not stored (the executor has no
+                // cost-based planner).
+                match self.next() {
+                    Token::Number(raw) => {
+                        let v: f64 = raw
+                            .parse()
+                            .map_err(|_| err(format!("invalid COST value: {}", raw)))?;
+                        if v <= 0.0 {
+                            return Err(err(format!("COST must be positive, got {}", raw)));
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected number after COST, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("as") {
+                match self.next() {
+                    Token::Str(s) => {
+                        // PG allows several AS items (body, obj file);
+                        // the first is the body (for LANGUAGE internal,
+                        // the C symbol name).
+                        if body.is_none() {
+                            body = Some(s);
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected function body string, found {:?}",
+                            other
+                        )));
+                    }
+                }
+                // A second `AS '...'` (C obj file) is consumed the same
+                // way on the next loop iteration.
+                if self.eat_keyword("as") {
+                    match self.next() {
+                        Token::Str(_) => {}
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected function body string, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        // PG19 defaults the language to "sql" when a body is present
+        // (functioncmds.c CreateFunction); this parser always requires
+        // AS 'body', so the default is unconditional here.
+        let lang_name = lang_name.unwrap_or_else(|| "sql".to_string());
+        let body = body.ok_or_else(|| err("syntax error: expected AS 'body'".to_string()))?;
+        Ok(Stmt::CreateFunction {
+            name,
+            args,
+            ret_type,
+            returns_set,
+            lang_name,
+            body,
+            or_replace,
+            volatility,
+            strict,
+        })
+    }
+
+    /// v0.86: one function argument: `[name] type`. A lone identifier
+    /// followed by `,` or `)` is the type; otherwise the first
+    /// identifier is the argument name. (Limitation: multi-word type
+    /// names like `double precision` require an argument name, except
+    /// `double precision` itself which is special-cased.)
+    fn parse_func_arg(&mut self) -> Result<FuncArg, SqlError> {
+        let w1 = self.expect_ident()?;
+        let bare_type = matches!(self.peek(), Token::Comma | Token::RParen)
+            || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"));
+        if bare_type {
+            let type_name = if w1 == "double" {
+                self.next(); // 'precision'
+                "double precision".to_string()
+            } else {
+                w1
+            };
+            Ok(FuncArg {
+                name: None,
+                type_name,
+            })
+        } else {
+            let type_name = self.parse_func_type_name()?;
+            Ok(FuncArg {
+                name: Some(w1),
+                type_name,
+            })
+        }
+    }
+
+    /// v0.86: a type name as written for function signatures: an
+    /// optionally schema-qualified identifier (`pg_catalog.int4`
+    /// keeps `int4`). Array `[]` suffixes are rejected (bounded).
+    fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
+        let mut name = self.expect_ident()?;
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+            self.next(); // '.'
+            name = self.expect_ident()?;
+        }
+        if *self.peek() == Token::LBracket {
+            return Err(err(
+                "array argument/return types are not supported".to_string()
+            ));
+        }
+        Ok(name)
+    }
+
+    /// v0.86: `DROP FUNCTION [IF EXISTS] name ([type [, ...]])`.
+    /// Argument names are accepted and ignored (PG allows them).
+    fn parse_drop_function(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                let arg = self.parse_func_arg()?;
+                arg_types.push(arg.type_name);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        // v0.87: optional CASCADE / RESTRICT (PG19; RESTRICT default).
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::DropFunction {
+            name,
+            arg_types,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v1.00: `CREATE [CONSTRAINT] TRIGGER name {BEFORE|AFTER|INSTEAD OF}
+    /// event [OR event ...] ON table [WHEN (...)] FOR EACH {ROW|STATEMENT}
+    /// EXECUTE {FUNCTION|PROCEDURE} func(args)` (PG19 `CreateTrigStmt`,
+    /// bounded). Timing, events, row/statement granularity, the function
+    /// name, and WHEN are all parsed; only BEFORE INSERT FOR EACH ROW
+    /// triggers fire in v1.00.
+    fn parse_create_trigger(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("trigger")?;
+        // v1.00: PG19 `CONSTRAINT TRIGGER` (parsed; enforcement is a
+        // documented gap, like WHEN below).
+        let is_constraint = self.eat_keyword("constraint");
+        let name = self.expect_ident()?;
+        let timing = if self.eat_keyword("before") {
+            TriggerTiming::Before
+        } else if self.eat_keyword("after") {
+            TriggerTiming::After
+        } else if self.eat_keyword("instead") {
+            // PG19: INSTEAD OF is only valid on views; rustgres has no
+            // view triggers at all, so this is an honest 0A000.
+            self.expect_keyword("of")?;
+            return Err(SqlError {
+                message: "INSTEAD OF triggers are not supported".to_string(),
+                code: "0A000",
+            });
+        } else {
+            return Err(err(
+                "syntax error: expected BEFORE, AFTER, or INSTEAD OF".to_string()
+            ));
+        };
+        let mut events: u8 = 0;
+        loop {
+            if self.eat_keyword("insert") {
+                events |= trig_event::INSERT;
+            } else if self.eat_keyword("delete") {
+                events |= trig_event::DELETE;
+            } else if self.eat_keyword("update") {
+                events |= trig_event::UPDATE;
+            } else if self.eat_keyword("truncate") {
+                events |= trig_event::TRUNCATE;
+            } else {
+                break;
+            }
+            if !self.eat_keyword("or") {
+                break;
+            }
+        }
+        if events == 0 {
+            return Err(err(
+                "syntax error: expected INSERT, DELETE, UPDATE, or TRUNCATE".to_string(),
+            ));
+        }
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        // Optional WHEN clause (parsed; not evaluated in v1.00).
+        let when = if self.eat_keyword("when") {
+            self.expect(Token::LParen, "'('")?;
+            let expr = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            Some(expr)
+        } else {
+            None
+        };
+        self.expect_keyword("for")?;
+        self.expect_keyword("each")?;
+        let for_each_row = if self.eat_keyword("row") {
+            true
+        } else if self.eat_keyword("statement") {
+            false
+        } else {
+            return Err(err("syntax error: expected ROW or STATEMENT".to_string()));
+        };
+        self.expect_keyword("execute")?;
+        // PG19 accepts both FUNCTION and PROCEDURE here.
+        if !(self.eat_keyword("function") || self.eat_keyword("procedure")) {
+            return Err(err(
+                "syntax error: expected FUNCTION or PROCEDURE".to_string()
+            ));
+        }
+        let function = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            loop {
+                let arg = self.parse_or()?;
+                // v1.00: trigger arguments are accepted syntactically
+                // and stored as source text, but not passed to the
+                // function (no TG_ARGV).
+                args.push(format!("{:?}", arg));
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next(); // ','
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Stmt::CreateTrigger {
+            name,
+            table,
+            timing,
+            events,
+            for_each_row,
+            function,
+            args,
+            when,
+            is_constraint,
+        })
+    }
+
+    /// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`
+    /// (PG19 `DropStmt` with `OBJECT_TRIGGER`).
+    fn parse_drop_trigger(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("trigger")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::DropTrigger {
+            name,
+            table,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v1.00: parse the statement list of a trigger-function body (see
+    /// [`parse_trigger_body`]). The parser is positioned at the first
+    /// token of the body; it must start with `BEGIN` and end with `END`.
+    fn parse_trigger_body_stmts(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+        self.expect_keyword("begin")?;
+        let mut stmts = Vec::new();
+        loop {
+            // `END` terminates the body (an optional trailing `;`
+            // before it is allowed).
+            if matches!(self.peek(), Token::Ident(s) if s == "end") {
+                self.next();
+                break;
+            }
+            stmts.push(self.parse_trigger_body_stmt()?);
+            // Statements are `;`-separated; the `;` before `END` is
+            // optional.
+            if matches!(self.peek(), Token::Semi) {
+                self.next();
+            } else if !matches!(self.peek(), Token::Ident(s) if s == "end") {
+                return Err(err(format!(
+                    "syntax error in trigger body: expected ';' or END, found {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        // Nothing may follow END (an optional trailing `;` is allowed,
+        // like PG's plpgsql).
+        if matches!(self.peek(), Token::Semi) {
+            self.next();
+        }
+        match self.next() {
+            Token::EOF => Ok(stmts),
+            other => Err(err(format!(
+                "syntax error in trigger body: unexpected {:?} after END",
+                other
+            ))),
+        }
+    }
+
+    /// v1.00: parse one trigger-body statement (see [`parse_trigger_body`]).
+    fn parse_trigger_body_stmt(&mut self) -> Result<TriggerBodyStmt, SqlError> {
+        // Assignment: `NEW.<col> = <expr>` or `NEW.<col> := <expr>`.
+        // (`OLD` assignments are rejected: PG forbids them.)
+        if matches!(self.peek(), Token::Ident(s) if s == "new")
+            && matches!(self.peek2(), Token::Dot)
+        {
+            self.next(); // 'new'
+            self.next(); // '.'
+            let col = self.expect_ident()?;
+            // `=` or `:=` (the lexer produces Colon + Eq for `:=`).
+            if matches!(self.peek(), Token::Eq) {
+                self.next();
+            } else if matches!(self.peek(), Token::Colon) && matches!(self.peek2(), Token::Eq) {
+                self.next();
+                self.next();
+            } else {
+                return Err(err(format!(
+                    "syntax error in trigger body: expected '=' or ':=', found {:?}",
+                    self.peek()
+                )));
+            }
+            let expr = self.parse_or()?;
+            return Ok(TriggerBodyStmt::Assign { col, expr });
+        }
+        // `RETURN NEW | OLD | NULL`.
+        if matches!(self.peek(), Token::Ident(s) if s == "return") {
+            self.next();
+            match self.next() {
+                Token::Ident(s) if s == "new" => return Ok(TriggerBodyStmt::ReturnNew),
+                Token::Ident(s) if s == "old" => return Ok(TriggerBodyStmt::ReturnOld),
+                Token::Ident(s) if s == "null" => return Ok(TriggerBodyStmt::ReturnNull),
+                other => {
+                    return Err(err(format!(
+                        "syntax error in trigger body: expected NEW, OLD, or NULL after RETURN, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        // `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+        if matches!(self.peek(), Token::Ident(s) if s == "raise") {
+            self.next();
+            let level = match self.next() {
+                Token::Ident(s) if s == "notice" => RaiseLevel::Notice,
+                Token::Ident(s) if s == "exception" => RaiseLevel::Exception,
+                other => {
+                    return Err(SqlError {
+                        message: format!(
+                            "RAISE level {:?} is not supported in trigger bodies",
+                            other
+                        ),
+                        code: "0A000",
+                    });
+                }
+            };
+            let format = match self.next() {
+                Token::Str(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error in trigger body: expected format string after RAISE, found {:?}",
+                        other
+                    )));
+                }
+            };
+            let mut args = Vec::new();
+            while matches!(self.peek(), Token::Comma) {
+                self.next(); // ','
+                args.push(self.parse_or()?);
+            }
+            return Ok(TriggerBodyStmt::Raise {
+                level,
+                format,
+                args,
+            });
+        }
+        Err(err(format!(
+            "syntax error in trigger body: unexpected {:?}",
+            self.peek()
+        )))
+    }
+
+    /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`
+    /// (PG19 DropOpStmt; `NONE` for a missing side).
+    fn parse_drop_operator(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_operator_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let leftarg = self.parse_op_arg_type()?;
+        self.expect(Token::Comma, "','")?;
+        let rightarg = self.parse_op_arg_type()?;
+        self.expect(Token::RParen, "')'")?;
+        // v0.87: optional CASCADE / RESTRICT (PG19; RESTRICT default).
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::DropOperator {
+            name,
+            leftarg,
+            rightarg,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// Parse one side of a DROP OPERATOR signature: a type name or NONE.
+    /// Returns the raw type name text (validation happens at execution).
+    fn parse_op_arg_type(&mut self) -> Result<Option<String>, SqlError> {
+        if matches!(self.peek(), Token::Ident(s) if s == "none") {
+            self.next();
+            return Ok(None);
+        }
+        let first = self.expect_ident()?;
+        // Bounded multiword builtins.
+        let name = match first.as_str() {
+            "double" => {
+                self.expect_keyword("precision")?;
+                "double precision".to_string()
+            }
+            "character" => {
+                self.expect_keyword("varying")?;
+                "character varying".to_string()
+            }
+            _ => first,
+        };
+        Ok(Some(name))
+    }
+
+    /// Parse an operator name: `=` or a `?`-led `Token::Op`.
+    fn parse_operator_name(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Eq => Ok("=".to_string()),
+            Token::Op(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected operator name, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// v0.86: `CREATE OPERATOR name (PROCEDURE = func [, LEFTARG =
+    /// type] [, RIGHTARG = type] [, COMMUTATOR = op] [, NEGATOR = op]
+    /// [, HASHES] [, MERGES])` — PG19 DefineOpStmt, bounded: the name
+    /// is `=` or a `?`-led operator; only PROCEDURE/LEFTARG/RIGHTARG
+    /// affect execution (IN-subquery equality), the rest are stored.
+    fn parse_create_operator(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        let name = self.parse_operator_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut procedure: Option<String> = None;
+        let mut leftarg: Option<String> = None;
+        let mut rightarg: Option<String> = None;
+        let mut commutator: Option<String> = None;
+        let mut negator: Option<String> = None;
+        let mut hashes = false;
+        let mut merges = false;
+        loop {
+            if self.eat_keyword("hashes") {
+                hashes = true;
+            } else if self.eat_keyword("merges") {
+                merges = true;
+            } else {
+                let opt = self.expect_ident()?;
+                self.expect(Token::Eq, "'='")?;
+                match opt.as_str() {
+                    "procedure" => procedure = Some(self.expect_ident()?),
+                    "leftarg" => leftarg = Some(self.parse_func_type_name()?),
+                    "rightarg" => rightarg = Some(self.parse_func_type_name()?),
+                    "commutator" => commutator = Some(self.parse_oper_name()?),
+                    "negator" => negator = Some(self.parse_oper_name()?),
+                    // v0.86: RESTRICT / JOIN selectivity estimators are
+                    // parsed and ignored (bounded: no planner use).
+                    "restrict" | "join" => {
+                        let _ = self.expect_ident()?;
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: unknown operator option \"{}\"",
+                            other
+                        )));
+                    }
+                }
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        let procedure =
+            procedure.ok_or_else(|| err("syntax error: expected PROCEDURE".to_string()))?;
+        Ok(Stmt::CreateOperator {
+            name,
+            procedure,
+            leftarg,
+            rightarg,
+            commutator,
+            negator,
+            hashes,
+            merges,
+        })
+    }
+
+    /// v0.86: an operator name inside CREATE OPERATOR options
+    /// (`=` or a `?`-led name).
+    fn parse_oper_name(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Eq => Ok("=".to_string()),
+            Token::Op(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected operator name, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// v0.85: `CREATE DOMAIN name AS type [CONSTRAINT cname] CHECK
+    /// (expr) [...] [NOT NULL | NULL] [DEFAULT expr]` — PG19
+    /// CreateDomainStmt, bounded to the supported constraint kinds
+    /// (CHECK / NOT NULL / DEFAULT; no UNIQUE/PKEY/FK on domains).
+    fn parse_create_domain(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("domain")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("as")?;
+        let (base, base_named) = self.parse_type_name()?;
+        let mut checks = Vec::new();
+        let mut not_null = false;
+        let mut default = None;
+        loop {
+            let cname = if self.eat_keyword("constraint") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            if self.eat_keyword("check") {
+                self.expect(Token::LParen, "'('")?;
+                let e = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                validate_constraint_expr(&e, "CHECK")?;
+                // PG19 auto-names domain checks `<domain>_check`,
+                // `<domain>_check1`, ... (ChooseConstraintName).
+                let cname = cname.unwrap_or_else(|| {
+                    let mut n = format!("{}_check", name);
+                    let mut i = 1;
+                    while checks.iter().any(|c: &CheckDef| c.name == n) {
+                        n = format!("{}_check{}", name, i);
+                        i += 1;
+                    }
+                    n
+                });
+                checks.push(CheckDef {
+                    name: cname,
+                    expr: e,
+                    not_valid: false,
+                    kind: CheckKind::Check,
+                });
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on NOT NULL".to_string()
+                    ));
+                }
+                not_null = true;
+            } else if self.eat_keyword("null") {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on NULL".to_string()
+                    ));
+                }
+                not_null = false;
+            } else if self.eat_keyword("default") {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: CONSTRAINT name not allowed on DEFAULT".to_string()
+                    ));
+                }
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                default = Some(classify_default(e)?);
+            } else {
+                if cname.is_some() {
+                    return Err(err(
+                        "syntax error: expected constraint type after CONSTRAINT name".to_string(),
+                    ));
+                }
+                break;
+            }
+        }
+        Ok(Stmt::CreateDomain {
+            name,
+            base,
+            base_named,
+            checks,
+            not_null,
+            default,
+        })
+    }
+
+    /// ALTER SEQUENCE name [IF EXISTS] [options...] — all options optional.
     fn parse_alter_sequence(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("sequence")?;
-        if self.eat_keyword("if") {
+        let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
-        }
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
         let opts = self.parse_sequence_opts()?;
-        Ok(Stmt::AlterSequence { name, opts })
+        Ok(Stmt::AlterSequence {
+            name,
+            if_exists,
+            opts,
+        })
+    }
+
+    /// v0.97: `ALTER DOMAIN name <action>` (PG19 AlterDomainStmt,
+    /// bounded). Actions: `ADD [CONSTRAINT name] CHECK (expr)`,
+    /// `DROP CONSTRAINT [IF EXISTS] name`, `SET NOT NULL`,
+    /// `DROP NOT NULL`, `SET DEFAULT expr`, `DROP DEFAULT`.
+    /// OWNER TO / RENAME / SET SCHEMA / VALIDATE CONSTRAINT are not
+    /// supported (honest 0A000 via the fallthrough).
+    fn parse_alter_domain(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("domain")?;
+        let name = self.expect_ident()?;
+        let action = if self.eat_keyword("add") {
+            let cname = if self.eat_keyword("constraint") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect_keyword("check")?;
+            self.expect(Token::LParen, "'('")?;
+            let e = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            validate_constraint_expr(&e, "CHECK")?;
+            AlterDomainAction::AddConstraint {
+                name: cname,
+                expr: e,
+            }
+        } else if self.eat_keyword("drop") {
+            if self.eat_keyword("constraint") {
+                let if_exists = if self.eat_keyword("if") {
+                    self.expect_keyword("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let cname = self.expect_ident()?;
+                AlterDomainAction::DropConstraint {
+                    name: cname,
+                    if_exists,
+                }
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                AlterDomainAction::DropNotNull
+            } else if self.eat_keyword("default") {
+                AlterDomainAction::DropDefault
+            } else {
+                return Err(err(
+                    "syntax error: expected CONSTRAINT, NOT NULL or DEFAULT after ALTER DOMAIN ... DROP"
+                        .to_string(),
+                ));
+            }
+        } else if self.eat_keyword("set") {
+            if self.eat_keyword("not") {
+                self.expect_keyword("null")?;
+                AlterDomainAction::SetNotNull
+            } else if self.eat_keyword("default") {
+                let e = self.parse_or()?;
+                validate_constraint_expr(&e, "DEFAULT")?;
+                AlterDomainAction::SetDefault(classify_default(e)?)
+            } else {
+                return Err(err(
+                    "syntax error: expected NOT NULL or DEFAULT after ALTER DOMAIN ... SET"
+                        .to_string(),
+                ));
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected ADD, DROP or SET after ALTER DOMAIN name".to_string(),
+            ));
+        };
+        Ok(Stmt::AlterDomain { name, action })
+    }
+
+    /// v1.09: `ALTER FUNCTION name([argtype [, ...]])
+    /// {VOLATILE|STABLE|IMMUTABLE}` (PG19 AlterFunctionStmt, volatility
+    /// action only). Other actions (STRICT, COST, ROWS, SET, OWNER TO,
+    /// RENAME) are an honest 0A000.
+    fn parse_alter_function(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("function")?;
+        let name = self.expect_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                // Argument can be `[name] type`; we only need the type
+                // for signature matching.
+                let first = self.expect_ident()?;
+                let type_name = if *self.peek() != Token::Comma && *self.peek() != Token::RParen {
+                    // Two identifiers: first was the arg name.
+                    let second = self.expect_ident()?;
+                    // Handle multi-word types like "double precision".
+                    if second.eq_ignore_ascii_case("precision")
+                        && first.eq_ignore_ascii_case("double")
+                    {
+                        "double precision".to_string()
+                    } else {
+                        second
+                    }
+                } else {
+                    first
+                };
+                arg_types.push(type_name);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        let volatility = if self.eat_keyword("immutable") {
+            FuncVolatility::Immutable
+        } else if self.eat_keyword("stable") {
+            FuncVolatility::Stable
+        } else if self.eat_keyword("volatile") {
+            FuncVolatility::Volatile
+        } else {
+            return Err(SqlError {
+                message:
+                    "only VOLATILE, STABLE and IMMUTABLE actions are supported in ALTER FUNCTION"
+                        .to_string(),
+                code: "0A000",
+            });
+        };
+        Ok(Stmt::AlterFunction {
+            name,
+            arg_types,
+            volatility,
+        })
     }
 
     fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {
         let mut opts = SequenceOpts::default();
         loop {
-            if self.eat_keyword("start") {
-                if self.eat_keyword("with") {
-                    opts.start = Some(self.parse_seq_int("START")?);
-                } else {
-                    return Err(err("syntax error: expected WITH after START".to_string()));
+            if self.eat_keyword("as") {
+                // v0.99: `AS smallint | int | bigint` (PG19; anything
+                // else is a 22023 at execution).
+                if opts.seq_type.is_some() {
+                    return Err(err(
+                        "syntax error: duplicate AS in sequence options".to_string()
+                    ));
                 }
+                opts.seq_type = Some(self.parse_seq_type()?);
+            } else if self.eat_keyword("start") {
+                // v0.98: PG19 is START [ WITH ] start — bare START n is legal.
+                let _ = self.eat_keyword("with");
+                opts.start = Some(self.parse_seq_int("START")?);
             } else if self.eat_keyword("increment") {
                 if self.eat_keyword("by") {
                     opts.increment = Some(self.parse_seq_int("INCREMENT")?);
@@ -5084,9 +8931,9 @@ impl Parser {
                 opts.min_value = Some(self.parse_seq_int("MINVALUE")?);
             } else if self.eat_keyword("no") {
                 if self.eat_keyword("minvalue") {
-                    opts.min_value = Some(SequenceOpts::no_minvalue());
+                    opts.reset_min = true;
                 } else if self.eat_keyword("maxvalue") {
-                    opts.max_value = Some(SequenceOpts::no_maxvalue());
+                    opts.reset_max = true;
                 } else if self.eat_keyword("cycle") {
                     opts.cycle = Some(false);
                 } else {
@@ -5098,6 +8945,20 @@ impl Parser {
                 opts.max_value = Some(self.parse_seq_int("MAXVALUE")?);
             } else if self.eat_keyword("cycle") {
                 opts.cycle = Some(true);
+            } else if self.eat_keyword("cache") {
+                // v0.98: CACHE n (PG19; validated in sequence_params).
+                opts.cache = Some(self.parse_seq_int("CACHE")?);
+            } else if self.eat_keyword("owned") {
+                // v0.98: OWNED BY table.col / OWNED BY NONE (PG19).
+                self.expect_keyword("by")?;
+                if self.eat_keyword("none") {
+                    opts.owned_by = Some(OwnedBySpec::None_);
+                } else {
+                    let table = self.expect_ident()?;
+                    self.expect(Token::Dot, "'.'")?;
+                    let column = self.expect_ident()?;
+                    opts.owned_by = Some(OwnedBySpec::Table { table, column });
+                }
             } else if self.eat_keyword("restart") {
                 if self.eat_keyword("with") {
                     opts.restart = Some(self.parse_seq_int("RESTART")?);
@@ -5109,6 +8970,23 @@ impl Parser {
             }
         }
         Ok(opts)
+    }
+
+    fn parse_seq_type(&mut self) -> Result<SeqType, SqlError> {
+        // PG19 accepts smallint / integer / int / bigint here; anything
+        // else is 22023 (invalid_parameter_value), not a syntax error.
+        if self.eat_keyword("smallint") {
+            Ok(SeqType::SmallInt)
+        } else if self.eat_keyword("bigint") {
+            Ok(SeqType::BigInt)
+        } else if self.eat_keyword("integer") || self.eat_keyword("int") {
+            Ok(SeqType::Integer)
+        } else {
+            Err(SqlError {
+                message: "sequence type must be smallint, integer, or bigint".to_string(),
+                code: "22023",
+            })
+        }
     }
 
     fn parse_seq_int(&mut self, what: &str) -> Result<i64, SqlError> {
@@ -5174,6 +9052,15 @@ impl Parser {
                     None => Err(err("invalid Unicode escape")),
                 }
             }
+            // v1.39: `x'...'`/`b'...'` bit-string literal. The digits are
+            // validated here with PG19 `bit_in` semantics (22P02 on a bad
+            // digit), because PG raises it during parse analysis.
+            Token::BitStr(marker, raw) => {
+                match crate::storage::BitString::parse(marker, raw.as_str()) {
+                    Ok(bs) => Ok(Literal::BitString(bs)),
+                    Err(msg) => Err(err_invalid_text(msg)),
+                }
+            }
             Token::Ident(s) => match s.as_str() {
                 "true" => Ok(Literal::Bool(true)),
                 "false" => Ok(Literal::Bool(false)),
@@ -5202,7 +9089,7 @@ impl Parser {
             self.next();
             let mut cols = Vec::new();
             loop {
-                cols.push(self.expect_ident()?);
+                cols.push(self.parse_insert_target()?);
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
@@ -5274,6 +9161,63 @@ impl Parser {
             returning,
             with: Vec::new(),
         })
+    }
+
+    /// v0.84: one INSERT column-list target — a column name with
+    /// optional PG19 indirection (`f2[1]`, `f3.if2`, `f4[1].if2[1]`).
+    /// Adjacent `[..][..]` pairs merge into one multi-index step
+    /// (PG19 gram.y); a `[l:u]` slice parses to `InsertIndirection::Slice`
+    /// so execution can reject it with a PG-shaped 0A000.
+    fn parse_insert_target(&mut self) -> Result<InsertTarget, SqlError> {
+        let name = self.expect_ident()?;
+        let mut indirection = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.next(); // consume '.'
+                    let field = self.expect_ident()?;
+                    indirection.push(InsertIndirection::Field(field));
+                }
+                Token::LBracket => {
+                    self.next(); // consume '['
+                    // Slice form `[l:u]` / `[:u]` / `[l:]` — PG19
+                    // `indirection_el` allows it; not assignable here.
+                    let is_slice = if *self.peek() == Token::Colon {
+                        self.next();
+                        if *self.peek() != Token::RBracket {
+                            let _ = self.parse_or()?;
+                        }
+                        self.expect(Token::RBracket, "']'")?;
+                        true
+                    } else {
+                        let first = self.parse_or()?;
+                        if *self.peek() == Token::Colon {
+                            self.next(); // consume ':'
+                            if *self.peek() != Token::RBracket {
+                                let _ = self.parse_or()?;
+                            }
+                            self.expect(Token::RBracket, "']'")?;
+                            true
+                        } else {
+                            self.expect(Token::RBracket, "']'")?;
+                            // Merge with a preceding adjacent Index step.
+                            match indirection.last_mut() {
+                                Some(InsertIndirection::Index(idxs)) => {
+                                    idxs.push(first);
+                                }
+                                _ => indirection.push(InsertIndirection::Index(vec![first])),
+                            }
+                            false
+                        }
+                    };
+                    if is_slice {
+                        indirection.push(InsertIndirection::Slice);
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(InsertTarget { name, indirection })
     }
 
     /// v0.10: `RETURNING * | expr [, ...]` after INSERT/UPDATE/DELETE.
@@ -5427,16 +9371,31 @@ impl Parser {
                 Vec::new()
             };
             self.expect_keyword("as")?;
-            // v0.75: `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTE hints
-            // (PG12+). The hint is accepted and ignored — CTEs are always
-            // evaluated per reference here.
-            if self.eat_keyword("not") {
+            // v1.54: `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTE hints
+            // (PG12+). Recorded in `CteDef.materialized` for the
+            // planner's CTE-inlining gate (PG19 `SS_process_ctes`); no
+            // longer ignored.
+            let materialized = if self.eat_keyword("not") {
                 self.expect_keyword("materialized")?;
+                CteMaterialize::NotMaterialized
+            } else if self.eat_keyword("materialized") {
+                CteMaterialize::Materialized
             } else {
-                let _ = self.eat_keyword("materialized");
-            }
+                CteMaterialize::Default
+            };
             self.expect(Token::LParen, "'('")?;
             let body = self.parse_cte_body(recursive)?;
+            // v1.39: PG19 parse_cte.c — a recursive query must not contain
+            // a data-modifying statement (42P19).
+            if recursive && matches!(body, CteBody::Dml(_)) {
+                return Err(SqlError {
+                    message: format!(
+                        "recursive query \"{}\" must not contain data-modifying statements",
+                        name
+                    ),
+                    code: "42P19",
+                });
+            }
             self.expect(Token::RParen, "')'")?;
             if ctes.iter().any(|c: &CteDef| c.name == name) {
                 return Err(err(format!("duplicate CTE name \"{}\"", name)));
@@ -5446,6 +9405,7 @@ impl Parser {
                 col_aliases,
                 body,
                 recursive,
+                materialized,
             });
             if *self.peek() == Token::Comma {
                 self.next();
@@ -5523,6 +9483,22 @@ impl Parser {
         }
         // The body must start with SELECT (or VALUES in a non-recursive
         // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
+        // v1.39: or with a data-modifying statement — `WITH x AS
+        // (INSERT/UPDATE/DELETE ... [RETURNING ...])` (PG19 parse_cte.c).
+        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete")
+        {
+            let kw = match self.next() {
+                Token::Ident(kw) => kw,
+                _ => unreachable!("peeked Ident above"),
+            };
+            let stmt = match kw.as_str() {
+                "insert" => self.parse_insert()?,
+                "update" => self.parse_update()?,
+                "delete" => self.parse_delete()?,
+                _ => unreachable!("peeked DML keyword above"),
+            };
+            return Ok(CteBody::Dml(Box::new(stmt)));
+        }
         let is_values = match self.next() {
             Token::Ident(kw) if kw == "select" => false,
             Token::Ident(kw) if kw == "values" && !recursive => true,
@@ -6006,8 +9982,15 @@ impl Parser {
                 // v0.54: `IN (VALUES (v1), (v2), ...)` — a VALUES list
                 // desugars exactly like a value list. Each row must hold
                 // one column (like PG's "subquery has too many columns").
+                // v0.87: row-wise `(a, b) IN (VALUES ...)` desugars to an
+                // OR of ANDed equalities (the old parse_row_in logic,
+                // now reached via `Expr::Row`).
                 self.next();
                 let rows = self.parse_values_rows()?;
+                self.expect(Token::RParen, "')'")?;
+                if let Expr::Row(row_items) = &left {
+                    return self.desugar_row_in_values(row_items.clone(), rows, neg);
+                }
                 let mut items = Vec::with_capacity(rows.len());
                 for row in rows {
                     if row.len() != 1 {
@@ -6018,7 +10001,6 @@ impl Parser {
                     }
                     items.push(row.into_iter().next().unwrap());
                 }
-                self.expect(Token::RParen, "')'")?;
                 items
             } else {
                 let mut items = vec![self.parse_or()?];
@@ -6029,6 +10011,25 @@ impl Parser {
                 self.expect(Token::RParen, "')'")?;
                 items
             };
+            // v0.87: row-wise `(a, b) IN ((1, 2), (3, 4))` — the list items
+            // must be row constructors of matching arity; desugars like
+            // the VALUES form.
+            if let Expr::Row(row_items) = &left {
+                let n = row_items.len();
+                let mut rows: Vec<Vec<Expr>> = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Expr::Row(elems) if elems.len() == n => rows.push(elems),
+                        _ => {
+                            return Err(err(
+                                "syntax error: row-wise IN list items must be row constructors of matching arity"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                return self.desugar_row_in_values(row_items.clone(), rows, neg);
+            }
             let mut expr = Expr::Cmp {
                 op: CmpOp::Eq,
                 left: Box::new(left.clone()),
@@ -6049,15 +10050,18 @@ impl Parser {
             }
             return Ok(expr);
         }
-        let op = match self.peek() {
-            Token::Eq => Some(CmpOp::Eq),
-            Token::Neq => Some(CmpOp::Ne),
-            Token::Lt => Some(CmpOp::Lt),
-            Token::LtEq => Some(CmpOp::Le),
-            Token::Gt => Some(CmpOp::Gt),
-            Token::GtEq => Some(CmpOp::Ge),
+        let op: Option<QuantOp> = match self.peek() {
+            Token::Eq => Some(QuantOp::Cmp(CmpOp::Eq)),
+            Token::Neq => Some(QuantOp::Cmp(CmpOp::Ne)),
+            Token::Lt => Some(QuantOp::Cmp(CmpOp::Lt)),
+            Token::LtEq => Some(QuantOp::Cmp(CmpOp::Le)),
+            Token::Gt => Some(QuantOp::Cmp(CmpOp::Gt)),
+            Token::GtEq => Some(QuantOp::Cmp(CmpOp::Ge)),
             // v0.81: `*=` record-image equality.
-            Token::StarEq => Some(CmpOp::ImageEq),
+            Token::StarEq => Some(QuantOp::Cmp(CmpOp::ImageEq)),
+            // v0.87: user-defined operator (e.g. `?=` from CREATE
+            // OPERATOR) in expression position (PG19).
+            Token::Op(name) => Some(QuantOp::User(name.clone())),
             _ => None,
         };
         let mut expr = match op {
@@ -6065,6 +10069,7 @@ impl Parser {
                 self.next();
                 // v0.76: quantified comparisons `op ANY|ALL|SOME (...)`
                 // (PG19). The operand is a subquery or a VALUES list.
+                // v0.87: `op` may be a user-defined operator.
                 if matches!(self.peek(), Token::Ident(s) if s == "any" || s == "all" || s == "some")
                 {
                     let quant = if let Token::Ident(s) = self.next() {
@@ -6074,11 +10079,23 @@ impl Parser {
                     };
                     return self.parse_quantified(left, op, &quant);
                 }
-                let right = self.parse_bitor()?;
-                Expr::Cmp {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
+                match op {
+                    QuantOp::Cmp(cmp) => {
+                        let right = self.parse_bitor()?;
+                        Expr::Cmp {
+                            op: cmp,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    }
+                    QuantOp::User(name) => {
+                        let right = self.parse_bitor()?;
+                        Expr::UserOp {
+                            op: name,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    }
                 }
             }
             None => left,
@@ -6137,15 +10154,51 @@ impl Parser {
     /// quantified comparison (PG19). `ANY`/`SOME` desugar to an OR chain,
     /// `ALL` to an AND chain, preserving PG's three-valued logic. A
     /// `VALUES` list must hold single-column rows. `= ANY (SELECT ...)`
-    /// is `IN`, `<> ALL (SELECT ...)` is `NOT IN`; other operators over
-    /// a subquery are not supported yet.
-    fn parse_quantified(&mut self, left: Expr, op: CmpOp, quant: &str) -> Result<Expr, SqlError> {
+    /// is `IN`, `<> ALL (SELECT ...)` is `NOT IN`.
+    /// v0.87: other operators (and user-defined operators like `?=`)
+    /// over a subquery produce `Expr::Quantified`, evaluated by the
+    /// executor with PG's three-valued logic. `left` may be an
+    /// `Expr::Row` for row-wise quantification.
+    fn parse_quantified(&mut self, left: Expr, op: QuantOp, quant: &str) -> Result<Expr, SqlError> {
+        let quant_kind = if quant == "all" {
+            QuantKind::All
+        } else {
+            QuantKind::Any
+        };
         self.expect(Token::LParen, "'('")?;
         // VALUES list form.
         if matches!(self.peek(), Token::Ident(s) if s == "values") {
             self.next();
             let rows = self.parse_values_rows()?;
             self.expect(Token::RParen, "')'")?;
+            // v0.87: row-wise `(a, b) = ANY (VALUES ...)` desugars via
+            // the row-IN path; other row-wise ops over VALUES are 0A000.
+            if let Expr::Row(row_items) = &left {
+                match (&op, quant_kind) {
+                    (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
+                        return self.desugar_row_in_values(row_items.clone(), rows, false);
+                    }
+                    (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
+                        return self.desugar_row_in_values(row_items.clone(), rows, true);
+                    }
+                    _ => {
+                        return Err(SqlError {
+                            message: "row-wise quantified comparison over VALUES is not supported"
+                                .to_string(),
+                            code: "0A000",
+                        });
+                    }
+                }
+            }
+            let op = match op {
+                QuantOp::Cmp(c) => c,
+                QuantOp::User(_) => {
+                    return Err(SqlError {
+                        message: "user-defined operator over VALUES is not supported".to_string(),
+                        code: "0A000",
+                    });
+                }
+            };
             let mut items = Vec::with_capacity(rows.len());
             for row in rows {
                 if row.len() != 1 {
@@ -6179,27 +10232,59 @@ impl Parser {
             }
             return Ok(expr);
         }
-        // Subquery form: only `= ANY/SOME` and `<> ALL` desugar cleanly.
-        if !matches!(self.peek(), Token::Ident(s) if s == "select") {
-            return Err(err(
-                "syntax error: expected SELECT or VALUES after ANY/ALL/SOME".to_string(),
-            ));
-        }
-        let sub = self.parse_subquery()?;
-        self.expect(Token::RParen, "')'")?;
-        let is_eq = matches!(op, CmpOp::Eq);
-        let is_ne = matches!(op, CmpOp::Ne);
-        if (quant == "all" && is_ne) || ((quant == "any" || quant == "some") && is_eq) {
-            return Ok(Expr::InSub {
-                expr: Box::new(left),
+        // Subquery form.
+        if matches!(self.peek(), Token::Ident(s) if s == "select") {
+            let sub = self.parse_subquery()?;
+            self.expect(Token::RParen, "')'")?;
+            // `= ANY/SOME` is `IN`, `<> ALL` is `NOT IN` (scalar or row-wise).
+            match (&op, quant_kind) {
+                (QuantOp::Cmp(CmpOp::Eq), QuantKind::Any) => {
+                    return Ok(Expr::InSub {
+                        expr: Box::new(left),
+                        sub: Box::new(sub),
+                        neg: false,
+                    });
+                }
+                (QuantOp::Cmp(CmpOp::Ne), QuantKind::All) => {
+                    return Ok(Expr::InSub {
+                        expr: Box::new(left),
+                        sub: Box::new(sub),
+                        neg: true,
+                    });
+                }
+                _ => {}
+            }
+            return Ok(Expr::Quantified {
+                left: Box::new(left),
+                op,
+                quant: quant_kind,
                 sub: Box::new(sub),
-                neg: quant == "all",
             });
         }
-        Err(err(format!(
-            "quantified comparison with operator {:?} over a subquery is not supported",
-            op
-        )))
+        // v0.91: array form — `expr op ANY|ALL|SOME (array_expr)`
+        // (PG19). Desugared to the hidden `__any_all_array` builtin
+        // (same trick as the `__variadic` marker): the executor
+        // iterates the array with PG's three-valued ANY/ALL logic.
+        let arr = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        let op_txt = match &op {
+            QuantOp::Cmp(c) => c.sql().to_string(),
+            QuantOp::User(name) => format!("user:{}", name),
+        };
+        let quant_txt = if quant_kind == QuantKind::All {
+            "all"
+        } else {
+            "any"
+        };
+        Ok(Expr::Func {
+            name: "__any_all_array".to_string(),
+            args: vec![
+                left,
+                Expr::Literal(Literal::Text(op_txt.into())),
+                Expr::Literal(Literal::Text(quant_txt.into())),
+                arr,
+            ],
+        })
     }
 
     /// `SELECT ...` inside parentheses (the `SELECT` keyword not yet consumed).
@@ -6413,6 +10498,7 @@ impl Parser {
             expr = Expr::Cast {
                 expr: Box::new(expr),
                 to,
+                written: None,
             };
             // v0.79: subscripts/slices bind to the cast result too —
             // `('...'::int[])[1]` and `('...'::int[])[1]::text`, like
@@ -6556,10 +10642,12 @@ impl Parser {
                         self.allow_similar_to = save_similar;
                         let first = first?;
                         if *self.peek() == Token::Comma {
-                            // v0.54: row constructor `(e1, e2, ...)`. The
-                            // only supported use is row-wise
-                            // `[NOT] IN (VALUES ...)`, desugared here;
-                            // anything else is a syntax error.
+                            // v0.87: row constructor `(e1, e2, ...)` (PG19).
+                            // Produces `Expr::Row`; the `[NOT] IN`,
+                            // `ANY`/`ALL` handlers deal with it (row-wise
+                            // comparisons). Previously this only allowed
+                            // row-wise `[NOT] IN (VALUES ...)` and errored
+                            // otherwise.
                             let mut items = vec![first];
                             while *self.peek() == Token::Comma {
                                 self.next();
@@ -6570,7 +10658,7 @@ impl Parser {
                                 items.push(e?);
                             }
                             self.expect(Token::RParen, "')'")?;
-                            return self.parse_row_in(items);
+                            return Ok(Expr::Row(items));
                         }
                         self.expect(Token::RParen, "')'")?;
                         Ok(first)
@@ -6582,7 +10670,9 @@ impl Parser {
                 self.next();
                 Ok(Expr::Param(n))
             }
-            Token::Number(_) | Token::Str(_) | Token::UStr(_) => {
+            Token::Number(_) | Token::Str(_) | Token::UStr(_) | Token::BitStr(_, _) => {
+                // v1.39: bit-string literals lex to Token::BitStr;
+                // parse_literal validates them (22P02 on a bad digit).
                 // v0.19: adjacent string literals concatenate
                 // ('a' 'b' -> 'ab', per SQL standard).
                 let mut lit = self.parse_literal()?;
@@ -6670,6 +10760,7 @@ impl Parser {
                     return Ok(Expr::Cast {
                         expr: Box::new(expr),
                         to,
+                        written: None,
                     });
                 }
                 // Typed literal: DATE '2026-01-01', TIMESTAMP '...', etc.
@@ -6685,6 +10776,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
+                                written: None,
                             });
                         }
                     }
@@ -6738,6 +10830,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
+                                written: None,
                             });
                         }
                     }
@@ -6752,6 +10845,7 @@ impl Parser {
                     return Ok(Expr::Cast {
                         expr: Box::new(expr),
                         to: ColType::SingleChar,
+                        written: None,
                     });
                 }
                 // Quoted function call `"name"(...)`?
@@ -6789,23 +10883,18 @@ impl Parser {
     /// three-valued row-comparison logic. Any other use of a row
     /// constructor — including row-wise `IN (subquery)` — is a syntax
     /// error here.
-    fn parse_row_in(&mut self, items: Vec<Expr>) -> Result<Expr, SqlError> {
-        let neg = if self.eat_keyword("not") {
-            self.expect_keyword("in")?;
-            true
-        } else {
-            self.expect_keyword("in")?;
-            false
-        };
-        self.expect(Token::LParen, "'('")?;
-        if !matches!(self.peek(), Token::Ident(s) if s == "values") {
-            return Err(err(
-                "syntax error: row-wise IN with a subquery is not supported".to_string(),
-            ));
-        }
-        self.next();
-        let rows = self.parse_values_rows()?;
-        self.expect(Token::RParen, "')'")?;
+    /// v0.87: row-wise `(a, b, ...) [NOT] IN (VALUES ...)` desugared to
+    /// an OR of ANDed equalities, preserving PG's three-valued logic
+    /// (NULL comparisons propagate through AND/OR). Refactored from the
+    /// v0.54 `parse_row_in` (which consumed the `IN (VALUES ...)` itself);
+    /// the row now arrives as `Expr::Row` and the VALUES rows are parsed
+    /// by the caller.
+    fn desugar_row_in_values(
+        &mut self,
+        items: Vec<Expr>,
+        rows: Vec<Vec<Expr>>,
+        neg: bool,
+    ) -> Result<Expr, SqlError> {
         let n = items.len();
         let mut expr: Option<Expr> = None;
         for row in rows {
@@ -7051,6 +11140,7 @@ impl Parser {
                             return Ok(Expr::Cast {
                                 expr: Box::new(expr),
                                 to,
+                                written: Some(name.clone()),
                             });
                         }
                     }
@@ -7071,6 +11161,20 @@ impl Parser {
             "grouping" => return self.parse_grouping(),
             _ => {}
         }
+        // v1.30: PG19 ordered-set aggregates (`WITHIN GROUP`).
+        // `rank` / `dense_rank` without WITHIN GROUP rewind and parse
+        // as window functions through the generic path below
+        // (unchanged behavior).
+        if is_ordered_set_agg_name(&name) {
+            let save = self.pos;
+            match self.parse_ordered_set_call(&name) {
+                Ok(expr) => return Ok(expr),
+                Err(ParseOsError::NotWithinGroup) => {
+                    self.pos = save;
+                }
+                Err(ParseOsError::Sql(e)) => return Err(e),
+            }
+        }
         let agg = match name.as_str() {
             "count" => Some(AggFunc::Count),
             "sum" => Some(AggFunc::Sum),
@@ -7083,6 +11187,7 @@ impl Parser {
             "var_pop" => Some(AggFunc::VariancePop),
             "stddev" | "stddev_samp" => Some(AggFunc::StddevSamp),
             "stddev_pop" => Some(AggFunc::StddevPop),
+            "array_agg" => Some(AggFunc::ArrayAgg),
             _ => None,
         };
         if let Some(func) = agg {
@@ -7103,31 +11208,103 @@ impl Parser {
             } else {
                 None
             };
-            self.expect(Token::RParen, "')'")?;
+            // v0.92: `agg(x ORDER BY ...)` — PG19 allows ORDER BY inside
+            // any aggregate call (docs §4.2.7). With DISTINCT, PG
+            // requires every ORDER BY expression to match an aggregate
+            // argument (parse_agg.c).
             let mut args = Vec::new();
             if let Some(a) = arg {
-                args.push(*a);
+                args.push(a);
             }
             if let Some(a) = arg2 {
-                args.push(*a);
+                args.push(a);
             }
+            let agg_order_by = if self.eat_keyword("order") {
+                self.expect_keyword("by")?;
+                let mut terms = Vec::new();
+                loop {
+                    terms.push(self.parse_order_term()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                if distinct && !terms.iter().all(|t| args.iter().any(|a| **a == t.expr)) {
+                    // v0.92: PG19 parse_clause.c transformDistinctClause
+                    // (is_agg=true): 42P10 with this exact message.
+                    return Err(SqlError {
+                        message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list".to_string(),
+                        code: "42P10",
+                    });
+                }
+                terms
+            } else {
+                Vec::new()
+            };
+            self.expect(Token::RParen, "')'")?;
+            // v1.30: PG19 parse_func.c 42809 — WITHIN GROUP on a
+            // non-ordered-set aggregate; PG19 gram.y 42601 for the
+            // ORDER BY / DISTINCT combinations.
+            if self.peek_is_within() {
+                if !agg_order_by.is_empty() {
+                    return Err(SqlError {
+                        message: "cannot use multiple ORDER BY clauses with WITHIN GROUP"
+                            .to_string(),
+                        code: "42601",
+                    });
+                }
+                if distinct {
+                    return Err(SqlError {
+                        message: "cannot use DISTINCT with WITHIN GROUP".to_string(),
+                        code: "42601",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "{} is not an ordered-set aggregate, so it cannot have WITHIN GROUP",
+                        name
+                    ),
+                    code: "42809",
+                });
+            }
+            // v1.29: `FILTER (WHERE ...)` (PG19 gram.y: the filter
+            // clause follows the function application, before OVER).
+            let filter = self.parse_filter_clause()?;
             let mut expr = Expr::Agg {
                 func: func.clone(),
-                arg: args.first().cloned().map(Box::new),
+                arg: args.first().cloned(),
                 distinct,
-                arg2: args.get(1).cloned().map(Box::new),
+                arg2: args.get(1).cloned(),
+                agg_order_by: agg_order_by.clone(),
+                filter: filter.clone(),
             };
             // v0.10: `<agg>(...) OVER (...)` — windowed aggregate.
             if self.eat_keyword("over") {
+                // v0.92: PG19 parse_func.c rejects ORDER BY inside a
+                // windowed aggregate call: 0A000 "aggregate ORDER BY is
+                // not implemented for window functions".
+                if !agg_order_by.is_empty() {
+                    return Err(SqlError {
+                        message: "aggregate ORDER BY is not implemented for window functions"
+                            .to_string(),
+                        code: "0A000",
+                    });
+                }
                 let spec = self.parse_window_spec()?;
                 expr = Expr::Window {
                     func: WindowFunc::Agg(func),
-                    args,
+                    args: args.into_iter().map(|a| *a).collect(),
                     distinct,
                     partition_by: spec.partition_by,
                     order_by: spec.order_by,
                     frame: spec.frame,
                     wid: 0,
+                    // v1.29: PG19 parse_func.c keeps aggfilter on
+                    // windowed aggregates.
+                    filter,
+                    // v1.31: PG19 opt_window_exclusion_clause.
+                    exclusion: spec.exclusion,
                 };
             }
             return Ok(expr);
@@ -7140,7 +11317,32 @@ impl Parser {
             let mut args = Vec::new();
             if *self.peek() != Token::RParen {
                 loop {
-                    args.push(self.parse_or()?);
+                    // v0.95: `name => expr` named-argument syntax (PG19).
+                    // Stored as `Expr::NamedArg`; the executor resolves
+                    // it against the function signature.
+                    if matches!(self.peek(), Token::Ident(_))
+                        && matches!(self.peek2(), Token::FatArrow)
+                    {
+                        let arg_name = self.expect_ident()?;
+                        self.next(); // consume '=>'
+                        let val = self.parse_or()?;
+                        args.push(Expr::NamedArg {
+                            name: arg_name,
+                            expr: Box::new(val),
+                        });
+                    // v0.90: `VARIADIC expr` — marks the argument for
+                    // array expansion (PG19). Parsed as a `__variadic`
+                    // marker func; exec.rs expands it in function-call
+                    // evaluation.
+                    } else if self.eat_keyword("variadic") {
+                        let inner = self.parse_or()?;
+                        args.push(Expr::Func {
+                            name: "__variadic".to_string(),
+                            args: vec![inner],
+                        });
+                    } else {
+                        args.push(self.parse_or()?);
+                    }
                     if *self.peek() == Token::Comma {
                         self.next();
                         continue;
@@ -7149,8 +11351,80 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen, "')'")?;
+            // v1.30: PG19 parse_func.c — WITHIN GROUP on something
+            // that is not an ordered-set aggregate (42809). PG19
+            // raises 42883 for unknown names because its catalog
+            // lookup fails first; rustgres resolves unknown names at
+            // execution, so the WITHIN GROUP kind check applies
+            // uniformly (deliberate approximation).
+            if self.peek_is_within() {
+                let is_window_fn = matches!(
+                    name.as_str(),
+                    "row_number"
+                        | "rank"
+                        | "dense_rank"
+                        | "ntile"
+                        | "lag"
+                        | "lead"
+                        | "first_value"
+                        | "last_value"
+                        | "nth_value"
+                );
+                if is_window_fn {
+                    return Err(SqlError {
+                        message: format!("window function {} cannot have WITHIN GROUP", name),
+                        code: "42809",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "WITHIN GROUP specified, but {} is not an aggregate function",
+                        name
+                    ),
+                    code: "42809",
+                });
+            }
             if is_builtin_fn(&name) {
                 check_builtin_arity(&name, args.len())?;
+            }
+            // v1.29: FILTER on a non-aggregate call (PG19 parse_func.c):
+            // 42803 "FILTER specified, but %s is not an aggregate
+            // function" — except on a true window function with OVER
+            // following, which is 0A000 "FILTER is not implemented for
+            // non-aggregate window functions".
+            if self.eat_keyword("filter") {
+                self.expect(Token::LParen, "'('")?;
+                self.expect_keyword("where")?;
+                let _ = self.parse_or()?;
+                self.expect(Token::RParen, "')'")?;
+                let followed_by_over =
+                    matches!(self.peek(), Token::Ident(s) if s == "over");
+                let is_window_fn = matches!(
+                    name.as_str(),
+                    "row_number"
+                        | "rank"
+                        | "dense_rank"
+                        | "ntile"
+                        | "lag"
+                        | "lead"
+                        | "first_value"
+                        | "last_value"
+                        | "nth_value"
+                );
+                if is_window_fn && followed_by_over {
+                    return Err(SqlError {
+                        message: "FILTER is not implemented for non-aggregate window functions"
+                            .to_string(),
+                        code: "0A000",
+                    });
+                }
+                return Err(SqlError {
+                    message: format!(
+                        "FILTER specified, but {} is not an aggregate function",
+                        name
+                    ),
+                    code: "42803",
+                });
             }
             // v0.10: `<func>(...) OVER (...)` — window function.
             if self.eat_keyword("over") {
@@ -7183,6 +11457,11 @@ impl Parser {
                     order_by: spec.order_by,
                     frame: spec.frame,
                     wid: 0,
+                    // v1.29: FILTER on a non-aggregate window function is
+                    // rejected above (0A000); no filter reaches this node.
+                    filter: None,
+                    // v1.31: PG19 opt_window_exclusion_clause.
+                    exclusion: spec.exclusion,
                 });
             }
             return Ok(Expr::Func { name, args });
@@ -7195,6 +11474,161 @@ impl Parser {
 
     /// v0.10: the parenthesized part of `OVER (...)`: optional PARTITION BY,
     /// optional ORDER BY, optional frame clause.
+    /// v1.29: `FILTER (WHERE expr)` (PG19 gram.y `filter_clause`).
+    /// Returns None when no FILTER follows; the caller decides whether
+    /// a present FILTER is legal on the parsed call.
+    fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>, SqlError> {
+        if !self.eat_keyword("filter") {
+            return Ok(None);
+        }
+        self.expect(Token::LParen, "'('")?;
+        self.expect_keyword("where")?;
+        let e = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(Some(Box::new(e)))
+    }
+
+    /// v1.30: parse a PG19 ordered-set aggregate call —
+    /// `name(direct_args) WITHIN GROUP (ORDER BY ...) [FILTER ...]`
+    /// (PG19 gram.y `within_group_clause`). The caller has already
+    /// established that `name` is an ordered-set aggregate name and
+    /// that the `(` has not been consumed yet.
+    ///
+    /// Returns `ParseOsError::NotWithinGroup` when no WITHIN GROUP
+    /// follows and the name doubles as a window function
+    /// (`rank` / `dense_rank`); the caller rewinds and parses through
+    /// the generic path. Any other ordered-set name without WITHIN
+    /// GROUP is PG19's 42809 ("WITHIN GROUP is required for
+    /// ordered-set aggregate %s").
+    fn parse_ordered_set_call(&mut self, name: &str) -> Result<Expr, ParseOsError> {
+        let func = match name {
+            "percentile_cont" => OrderedSetAgg::PercentileCont,
+            "percentile_disc" => OrderedSetAgg::PercentileDisc,
+            "mode" => OrderedSetAgg::Mode,
+            "rank" => OrderedSetAgg::Rank,
+            "dense_rank" => OrderedSetAgg::DenseRank,
+            "percent_rank" => OrderedSetAgg::PercentRank,
+            "cume_dist" => OrderedSetAgg::CumeDist,
+            _ => {
+                return Err(ParseOsError::Sql(err(format!(
+                    "unknown ordered-set aggregate {name}"
+                ))));
+            }
+        };
+        // Parenthesized direct args — same arg grammar as generic
+        // calls (named-notation and VARIADIC accepted by the parser;
+        // PG19 rejects DISTINCT / VARIADIC with WITHIN GROUP below).
+        self.expect(Token::LParen, "'('")
+            .map_err(ParseOsError::Sql)?;
+        let distinct = self.eat_keyword("distinct");
+        let mut direct_args: Vec<Expr> = Vec::new();
+        let mut saw_variadic = false;
+        if *self.peek() != Token::RParen {
+            loop {
+                if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::FatArrow)
+                {
+                    let arg_name = self.expect_ident().map_err(ParseOsError::Sql)?;
+                    self.next(); // consume '=>'
+                    let val = self.parse_or().map_err(ParseOsError::Sql)?;
+                    direct_args.push(Expr::NamedArg {
+                        name: arg_name,
+                        expr: Box::new(val),
+                    });
+                } else if self.eat_keyword("variadic") {
+                    saw_variadic = true;
+                    direct_args.push(self.parse_or().map_err(ParseOsError::Sql)?);
+                } else {
+                    direct_args.push(self.parse_or().map_err(ParseOsError::Sql)?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")
+            .map_err(ParseOsError::Sql)?;
+        if !self.peek_is_within() {
+            if matches!(func, OrderedSetAgg::Rank | OrderedSetAgg::DenseRank) {
+                return Err(ParseOsError::NotWithinGroup);
+            }
+            return Err(ParseOsError::Sql(SqlError {
+                message: format!("WITHIN GROUP is required for ordered-set aggregate {name}"),
+                code: "42809",
+            }));
+        }
+        // PG19 gram.y: DISTINCT, VARIADIC, or a second ORDER BY with
+        // WITHIN GROUP are all 42601.
+        if distinct {
+            return Err(ParseOsError::Sql(SqlError {
+                message: "cannot use DISTINCT with WITHIN GROUP".to_string(),
+                code: "42601",
+            }));
+        }
+        if saw_variadic {
+            return Err(ParseOsError::Sql(SqlError {
+                message: "cannot use VARIADIC with WITHIN GROUP".to_string(),
+                code: "42601",
+            }));
+        }
+        // `WITHIN GROUP (ORDER BY ...)` — the ORDER BY keywords are
+        // consumed before the sort terms (the terms themselves are
+        // full order items with ASC/DESC and NULLS FIRST/LAST).
+        self.eat_keyword("within");
+        self.expect_keyword("group").map_err(ParseOsError::Sql)?;
+        self.expect(Token::LParen, "'('")
+            .map_err(ParseOsError::Sql)?;
+        if !self.eat_keyword("order") {
+            return Err(ParseOsError::Sql(err(
+                "syntax error: expected ORDER BY in WITHIN GROUP",
+            )));
+        }
+        self.expect_keyword("by").map_err(ParseOsError::Sql)?;
+        let mut within_order_by = Vec::new();
+        loop {
+            within_order_by.push(self.parse_order_term().map_err(ParseOsError::Sql)?);
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")
+            .map_err(ParseOsError::Sql)?;
+        // FILTER follows WITHIN GROUP (PG19 gram.y clause order),
+        // then the OVER rejection (PG19 parse_func.c 0A000).
+        let filter = self.parse_filter_clause().map_err(ParseOsError::Sql)?;
+        if self.eat_keyword("over") {
+            return Err(ParseOsError::Sql(SqlError {
+                message: format!("OVER is not supported for ordered-set aggregate {name}"),
+                code: "0A000",
+            }));
+        }
+        // Arity: PG19 resolves the ordered-set signatures by direct /
+        // aggregated arg counts (a mismatch is 42883 "undefined
+        // function", like a signature miss). Hypothetical-set
+        // aggregates take exactly one direct arg per sort key.
+        let want_direct = match func {
+            OrderedSetAgg::PercentileCont | OrderedSetAgg::PercentileDisc => 1,
+            OrderedSetAgg::Mode => 0,
+            _ => within_order_by.len(),
+        };
+        if direct_args.len() != want_direct {
+            // PG19's undefined-function hint style (the parser has no
+            // type info, so the signature renders without arg types).
+            return Err(ParseOsError::Sql(err_undefined(format!(
+                "function {name}() does not exist\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts."
+            ))));
+        }
+        Ok(Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            filter,
+        })
+    }
+
     fn parse_window_spec(&mut self) -> Result<WindowSpec, SqlError> {
         self.expect(Token::LParen, "'('")?;
         let mut partition_by = Vec::new();
@@ -7221,28 +11655,38 @@ impl Parser {
                 break;
             }
         }
-        let frame = self.parse_window_frame()?;
+        let (frame, exclusion) = self.parse_window_frame()?;
         self.expect(Token::RParen, "')'")?;
         Ok(WindowSpec {
             partition_by,
             order_by,
             frame,
+            exclusion,
         })
     }
 
     /// v0.10: `[ROWS|RANGE] BETWEEN <bound> AND <bound>`,
     /// `[ROWS|RANGE] <bound>`, or absent (Default).
-    fn parse_window_frame(&mut self) -> Result<WindowFrame, SqlError> {
+    /// v1.31: `GROUPS` mode (PG19 gram.y `GROUPS frame_extent`) and the
+    /// trailing `EXCLUDE ...` clause (PG19 `opt_window_exclusion_clause`,
+    /// only valid after a frame extent). Returns the frame plus the
+    /// exclusion (`NoOthers` when absent).
+    fn parse_window_frame(&mut self) -> Result<(WindowFrame, FrameExclusion), SqlError> {
+        // v0.78-style keyword guard: only treat `groups` as the frame
+        // mode when it starts the frame clause; anywhere else it stays
+        // an ordinary identifier.
         let mode = if self.eat_keyword("rows") {
-            Some(false)
+            Some(0)
         } else if self.eat_keyword("range") {
-            Some(true)
+            Some(1)
+        } else if self.eat_keyword("groups") {
+            Some(2)
         } else {
             None
         };
         let mode = match mode {
             Some(m) => m,
-            None => return Ok(WindowFrame::Default),
+            None => return Ok((WindowFrame::Default, FrameExclusion::NoOthers)),
         };
         let (start, end) = if self.eat_keyword("between") {
             let s = self.parse_frame_bound()?;
@@ -7253,6 +11697,8 @@ impl Parser {
             // `<bound>` alone = `BETWEEN <bound> AND CURRENT ROW`.
             (self.parse_frame_bound()?, FrameBound::CurrentRow)
         };
+        // v1.31: PG19 gram.y `opt_window_exclusion_clause`.
+        let exclusion = self.parse_frame_exclusion()?;
         // Frame sanity: start must not come after end.
         let rank = |b: &FrameBound| match b {
             FrameBound::UnboundedPreceding => 0,
@@ -7267,11 +11713,39 @@ impl Parser {
                     .to_string(),
             ));
         }
-        if mode {
-            Ok(WindowFrame::Range { start, end })
-        } else {
-            Ok(WindowFrame::Rows { start, end })
+        let frame = match mode {
+            1 => WindowFrame::Range { start, end },
+            2 => WindowFrame::Groups { start, end },
+            _ => WindowFrame::Rows { start, end },
+        };
+        Ok((frame, exclusion))
+    }
+
+    /// v1.31: PG19 gram.y `opt_window_exclusion_clause`:
+    /// `EXCLUDE CURRENT ROW | EXCLUDE GROUP | EXCLUDE TIES |
+    /// EXCLUDE NO OTHERS`, or absent (`NoOthers`).
+    fn parse_frame_exclusion(&mut self) -> Result<FrameExclusion, SqlError> {
+        if !self.eat_keyword("exclude") {
+            return Ok(FrameExclusion::NoOthers);
         }
+        if self.eat_keyword("current") {
+            self.expect_keyword("row")?;
+            return Ok(FrameExclusion::CurrentRow);
+        }
+        if self.eat_keyword("group") {
+            return Ok(FrameExclusion::Group);
+        }
+        if self.eat_keyword("ties") {
+            return Ok(FrameExclusion::Ties);
+        }
+        if self.eat_keyword("no") {
+            self.expect_keyword("others")?;
+            return Ok(FrameExclusion::NoOthers);
+        }
+        Err(err(format!(
+            "syntax error: expected CURRENT ROW, GROUP, TIES or NO OTHERS after EXCLUDE, found {:?}",
+            self.peek()
+        )))
     }
 
     /// v0.10: one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`,
@@ -7610,11 +12084,24 @@ impl Parser {
             } else {
                 break;
             }
-            // Modes are comma-separated; a missing comma ends the list.
+            // v1.07: PG19's `TransactionModeList` accepts comma-separated
+            // AND adjacent modes ("SET TRANSACTION READ WRITE READ ONLY"
+            // is valid PG). A comma is consumed; a following mode keyword
+            // continues the loop; anything else ends the list.
             if *self.peek() == Token::Comma {
                 self.next();
             } else {
-                break;
+                match self.peek() {
+                    Token::Ident(id)
+                        if id == "isolation"
+                            || id == "read"
+                            || id == "not"
+                            || id == "deferrable" =>
+                    {
+                        // Adjacent mode — continue without a comma.
+                    }
+                    _ => break,
+                }
             }
         }
         Ok((level, read_only, deferrable))
@@ -7624,12 +12111,32 @@ impl Parser {
     /// or `SET name = value` / `SET name TO value`.
     fn parse_set(&mut self) -> Result<Stmt, SqlError> {
         if self.eat_keyword("transaction") {
+            // v1.07: SET TRANSACTION SNAPSHOT 'snapshot-id' (PG19 special
+            // syntax, not combinable with other modes).
+            if self.eat_keyword("snapshot") {
+                let id = match self.next() {
+                    Token::Str(s) => s,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected snapshot identifier string, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                return Ok(Stmt::SetTransaction {
+                    level: None,
+                    read_only: None,
+                    deferrable: None,
+                    snapshot: Some(id),
+                });
+            }
             // SET TRANSACTION transaction_mode [, ...]
             let (level, read_only, deferrable) = self.parse_txn_modes()?;
             return Ok(Stmt::SetTransaction {
                 level,
                 read_only,
                 deferrable,
+                snapshot: None,
             });
         }
         if self.eat_keyword("session") {
@@ -7655,6 +12162,21 @@ impl Parser {
             self.eat_keyword("session");
         }
         let name = self.expect_ident()?;
+        // v1.07: SET [LOCAL|SESSION] ROLE name|NONE — PG19 treats this as
+        // the "role" GUC; the bare form (no TO) is the SQL-standard syntax.
+        // `SET ROLE TO 'name'` / `SET role = 'name'` go through the generic
+        // path below.
+        if name == "role"
+            && *self.peek() != Token::Eq
+            && !matches!(self.peek(), Token::Ident(s) if s == "to")
+        {
+            let role_name = self.expect_ident()?;
+            return Ok(Stmt::Set {
+                name,
+                value: SetValue::Str(role_name),
+                local,
+            });
+        }
         if self.eat_keyword("to") {
             // consumed TO
         } else if *self.peek() == Token::Eq {
@@ -7672,6 +12194,31 @@ impl Parser {
                 self.next();
                 SetValue::Str(num)
             }
+            // v1.07: signed numeric values, e.g. `SET extra_float_digits = -1`.
+            Token::Minus => match self.next() {
+                Token::Number(num) => {
+                    self.next();
+                    SetValue::Str(format!("-{}", num))
+                }
+                other => {
+                    return Err(err(format!(
+                        "syntax error: unexpected SET value {:?}",
+                        other
+                    )));
+                }
+            },
+            Token::Plus => match self.next() {
+                Token::Number(num) => {
+                    self.next();
+                    SetValue::Str(num)
+                }
+                other => {
+                    return Err(err(format!(
+                        "syntax error: unexpected SET value {:?}",
+                        other
+                    )));
+                }
+            },
             Token::Ident(kw) => {
                 // A bare keyword value (ON, OFF, TRUE, ...): fold to the
                 // lowercased keyword text. DEFAULT resets the parameter.
@@ -7881,8 +12428,10 @@ impl Parser {
         Ok(Stmt::Execute { name, args })
     }
 
-    // `DEALLOCATE name` / `DEALLOCATE ALL`.
+    // `DEALLOCATE [PREPARE] name` / `DEALLOCATE [PREPARE] ALL` (PG19).
+    // v1.58: the PREPARE keyword is optional noise per gram.y.
     fn parse_deallocate(&mut self) -> Result<Stmt, SqlError> {
+        let _ = self.eat_keyword("prepare");
         let name = if self.eat_keyword("all") {
             None
         } else {
@@ -8038,27 +12587,18 @@ impl Parser {
     }
 
     fn parse_fetch(&mut self) -> Result<Stmt, SqlError> {
-        // FETCH [ direction ] { FROM | IN } name
+        // v0.89: FETCH [ direction [ FROM | IN ] ] name — PG19 lets the
+        // FROM/IN keywords be omitted (`FETCH ok` == `FETCH NEXT FROM ok`).
         let dir = self.parse_fetch_dir()?;
-        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
-            return Err(err(format!(
-                "syntax error: expected FROM or IN in FETCH, found {:?}",
-                self.peek()
-            )));
-        }
+        let _ = self.eat_keyword("from") || self.eat_keyword("in");
         let name = self.expect_ident()?;
         Ok(Stmt::Fetch { name, dir })
     }
 
     fn parse_move(&mut self) -> Result<Stmt, SqlError> {
-        // MOVE [ direction ] { FROM | IN } name
+        // MOVE [ direction [ FROM | IN ] ] name — FROM/IN optional (PG19).
         let dir = self.parse_fetch_dir()?;
-        if !(self.eat_keyword("from") || self.eat_keyword("in")) {
-            return Err(err(format!(
-                "syntax error: expected FROM or IN in MOVE, found {:?}",
-                self.peek()
-            )));
-        }
+        let _ = self.eat_keyword("from") || self.eat_keyword("in");
         let name = self.expect_ident()?;
         Ok(Stmt::Move { name, dir })
     }
@@ -8133,6 +12673,34 @@ impl Parser {
         })
     }
 
+    /// v1.12: true when the next token can legally follow an (empty)
+    /// select target list, i.e. it starts a following clause, a set
+    /// operation, or terminates the select core. Mirrors PG19 gram.y's
+    /// `opt_target_list` (which may be empty in any simple SELECT).
+    /// Only consulted when no target items have been parsed yet.
+    fn select_core_follows(&mut self) -> bool {
+        match self.peek() {
+            Token::Ident(kw) => matches!(
+                kw.as_str(),
+                "from"
+                    | "where"
+                    | "group"
+                    | "having"
+                    | "order"
+                    | "limit"
+                    | "offset"
+                    | "fetch"
+                    | "for"
+                    | "window"
+                    | "union"
+                    | "intersect"
+                    | "except"
+            ),
+            Token::RParen | Token::Semi | Token::EOF => true,
+            _ => false,
+        }
+    }
+
     /// The body of a SELECT after the `SELECT` keyword was consumed.
     /// v0.44: the SELECT core: `SELECT [DISTINCT] ... HAVING`, without the
     /// trailing `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` (see
@@ -8167,6 +12735,17 @@ impl Parser {
         };
         let mut items = Vec::new();
         loop {
+            // v0.87: zero-target-list SELECT (`SELECT WHERE false`): if no
+            // items yet and WHERE follows, stop (PG19 allows it).
+            // v1.12: PG19's gram.y lets opt_target_list be empty in ANY
+            // simple SELECT (`SELECT;`, `SELECT FROM t`), not just before
+            // WHERE. Break on any clause keyword or select-core
+            // terminator when no items have been parsed yet. (FROM etc.
+            // are reserved words, so no valid expression starts with
+            // them; only the first token is affected.)
+            if items.is_empty() && self.select_core_follows() {
+                break;
+            }
             // `*`
             if *self.peek() == Token::Star {
                 self.next();
@@ -8197,9 +12776,13 @@ impl Parser {
             }
             break;
         }
-        if items.is_empty() {
-            return Err(err("syntax error: SELECT requires a select list"));
-        }
+        // v1.12: the items loop above already breaks with an empty list
+        // only when a following clause/terminator was seen
+        // (select_core_follows), which PG19's grammar permits for any
+        // simple SELECT: gram.y's opt_target_list has an /* EMPTY */
+        // alternative (~/workspace/pg19src/pg19/src/backend/parser/gram.y,
+        // lines 17540-17542; simple_select at 13201). No post-loop
+        // rejection needed.
         let from = if self.eat_keyword("from") {
             self.parse_from()?
         } else {
@@ -8235,7 +12818,9 @@ impl Parser {
             limit: None,
             offset: None,
             for_update: false,
+            for_update_of: Vec::new(),
             set_op: None,
+            dead_rtes: 0,
         })
     }
 
@@ -8351,10 +12936,27 @@ impl Parser {
         } else {
             false
         };
+        // v1.14: `FOR UPDATE OF tbl [, ...]` (PG19). The table names are
+        // validated against the FROM items by the executor.
+        let for_update_of = if for_update && self.eat_keyword("of") {
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            names
+        } else {
+            Vec::new()
+        };
         sel.order_by = order_by;
         sel.limit = limit;
         sel.offset = offset;
         sel.for_update = for_update;
+        sel.for_update_of = for_update_of;
         Ok(())
     }
 
@@ -8607,6 +13209,8 @@ impl Parser {
             // PG auto-names the VALUES RTE; the name never surfaces.
             alias: "_values".to_string(),
             col_aliases: Vec::new(),
+            // v1.10: desugared top-level VALUES is never LATERAL.
+            lateral: false,
         }];
         sel
     }
@@ -8619,6 +13223,8 @@ impl Parser {
             name,
             alias: None,
             col_aliases: Vec::new(),
+            // v0.96: `TABLE name` never carries ONLY.
+            only: false,
         }];
         sel
     }
@@ -8710,6 +13316,7 @@ impl Parser {
             carrier.limit = tail.limit;
             carrier.offset = tail.offset;
             carrier.for_update = tail.for_update;
+            carrier.for_update_of = tail.for_update_of;
         }
         Ok(carrier)
     }
@@ -8921,25 +13528,117 @@ impl Parser {
     }
 
     fn parse_from_primary(&mut self) -> Result<FromItem, SqlError> {
-        if *self.peek() == Token::LParen {
-            self.next();
-            // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
-            // Only consume an extra '(' when it opens a subquery or VALUES —
-            // never a VALUES row tuple like (1, 2).
-            let mut extra = 0;
-            while *self.peek() == Token::LParen
-                && matches!(self.peek2(), Token::Ident(s) if s == "select" || s == "values")
-            {
-                self.next();
-                extra += 1;
+        // v1.10: explicit `LATERAL` (PG19 gram.y `table_ref`:
+        // `LATERAL_P func_table` and `LATERAL_P select_with_parens` —
+        // the latter covers both `(SELECT ...)` and `(VALUES ...)`.
+        // There is NO `LATERAL_P relation_expr` production, so
+        // `LATERAL tbl` is a syntax error in PG. LATERAL is unreserved
+        // in PG19, so a table genuinely named `lateral` keeps working:
+        // the keyword is taken only before `(` opening a
+        // subquery/VALUES, or before `func_name (` (the noise-word
+        // case, since function args may reference earlier FROM items
+        // with or without the keyword).
+        let lateral = self.eat_lateral_keyword();
+        // v0.96: `FROM ONLY tbl` / `FROM ONLY (tbl)` (PG19) — scan just
+        // the named table, excluding inheritance children. `only` is an
+        // unreserved keyword in PG, so a table literally named `only`
+        // keeps working: the ONLY form is taken when `only` is followed
+        // by `(` or by a non-terminator identifier (the table name). A
+        // bare `FROM only` (followed by WHERE, `,`, `)`, `;`, EOF, or a
+        // join keyword) still parses as a table named `only`. The one
+        // genuinely ambiguous shape, `FROM only t1` (table `only`
+        // aliased `t1`), resolves as the ONLY form, matching PG's
+        // keyword reading.
+        let only = if matches!(self.peek(), Token::Ident(s) if s == "only") {
+            let save = self.pos;
+            self.next(); // 'only'
+            let is_only_form = match self.peek() {
+                Token::LParen => true,
+                Token::Ident(s)
+                    if !(s == "where"
+                        || s == "group"
+                        || s == "order"
+                        || s == "limit"
+                        || s == "offset"
+                        || s == "having"
+                        || s == "window"
+                        || s == "for"
+                        || s == "join"
+                        || s == "inner"
+                        || s == "left"
+                        || s == "right"
+                        || s == "full"
+                        || s == "cross"
+                        || s == "natural"
+                        || s == "on"
+                        || s == "using"
+                        || s == "union"
+                        || s == "intersect"
+                        || s == "except") =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if is_only_form {
+                // Rewind to just after 'only'; the table ref parses next.
+                self.pos = save + 1;
+                true
+            } else {
+                // A table named `only`: fully rewind; parse normally.
+                self.pos = save;
+                false
             }
-            let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
+        } else {
+            false
+        };
+        if *self.peek() == Token::LParen {
+            // v1.27: PG19 `select_with_parens` — a parenthesized query
+            // whose top level is a set operation, e.g.
+            // `FROM ((SELECT ...) UNION ALL (SELECT ...)) t`. The
+            // redundant-paren loop below would mis-consume the inner '('
+            // and choke on the set operator; probe for a top-level setop
+            // first (the same `paren_has_top_level_setop` check
+            // `parse_primary` uses) and parse the whole parenthesized
+            // setop query directly. This branch runs after
+            // `eat_lateral_keyword`, so `LATERAL ((SELECT ...) UNION ...)`
+            // is covered too.
+            let setop_paren = self.paren_has_top_level_setop();
+            // Tracks whether the inner derived table already got its alias
+            // (so the outer alias becomes optional).
+            let mut inner_aliased = false;
+            let mut item = if setop_paren {
+                self.next(); // consume '('
+                let left = self.parse_set_operand()?;
+                let carrier = self.parse_set_chain(left, 1)?;
+                let sub = self.finish_select_query(carrier)?;
+                self.expect(Token::RParen, "')'")?;
+                FromItem::Derived {
+                    sub: Box::new(sub),
+                    alias: String::new(),
+                    col_aliases: Vec::new(),
+                    lateral,
+                }
+            } else {
+                self.next();
+                // v0.14: PostgreSQL allows redundant parens: FROM ((SELECT ...)).
+                // Only consume an extra '(' when it opens a subquery or VALUES —
+                // never a VALUES row tuple like (1, 2).
+                let mut extra = 0;
+                while *self.peek() == Token::LParen
+                    && matches!(self.peek2(), Token::Ident(s) if s == "select" || s == "values")
+                {
+                    self.next();
+                    extra += 1;
+                }
+                let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
                 self.next();
                 let rows = self.parse_values_rows()?;
                 FromItem::Values {
                     rows,
                     alias: String::new(),
                     col_aliases: Vec::new(),
+                    lateral,
                 }
             } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
                 // v0.76: `(WITH ... SELECT ...)` derived tables are now
@@ -8950,6 +13649,7 @@ impl Parser {
                     sub: Box::new(sub),
                     alias: String::new(),
                     col_aliases: Vec::new(),
+                    lateral,
                 }
             } else {
                 // v0.23: parenthesized joined table (or bare table):
@@ -8961,10 +13661,8 @@ impl Parser {
             // `((select ...) s LEFT JOIN t ...)`. If we consumed extra '('
             // and the derived table's ')' is not followed by another ')',
             // the extra '(' was the derived table's own paren, not a
-            // redundant one.
-            // Tracks whether the inner derived table already got its alias
-            // (so the outer alias becomes optional).
-            let mut inner_aliased = false;
+            // redundant one. (`inner_aliased` is declared above so the
+            // v1.27 setop branch shares the alias code below.)
             if extra > 0 && matches!(item, FromItem::Derived { .. } | FromItem::Values { .. }) {
                 // Consume the derived table's ')'.
                 self.expect(Token::RParen, "')'")?;
@@ -9002,6 +13700,10 @@ impl Parser {
             for _ in 0..=extra {
                 self.expect(Token::RParen, "')'")?;
             }
+                item
+            }; // end of the non-setop `else` branch; the v1.27 setop branch
+               // rejoins here with `item` already built and `inner_aliased`
+               // false.
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
             // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
             // v0.23: `(a JOIN b ...) [AS] x [(cols)]` — the alias is
@@ -9039,6 +13741,12 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     // v0.75: don't clobber an inner alias when the outer
                     // alias is absent (`((query) alias)`).
                     if alias.is_some() || !inner_aliased {
@@ -9053,6 +13761,12 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     // v0.75: don't clobber an inner alias when the outer
                     // alias is absent (`((query) alias)`).
                     if alias.is_some() || !inner_aliased {
@@ -9067,14 +13781,23 @@ impl Parser {
                     col_aliases: c,
                     ..
                 } => {
+                    // v0.96: ONLY applies to plain table references (PG19).
+                    if only {
+                        return Err(err(
+                            "syntax error: ONLY may only be applied to a table name".to_string(),
+                        ));
+                    }
                     *a = alias;
                     *c = col_aliases;
                 }
                 FromItem::Table {
                     alias: a,
                     col_aliases: c,
+                    only: o,
                     ..
                 } => {
+                    // v0.96: `FROM ONLY (tbl)`.
+                    *o = only;
                     if a.is_some() && alias.is_some() {
                         return Err(err(format!(
                             "table name \"{}\" specified more than once",
@@ -9090,8 +13813,32 @@ impl Parser {
                 // non-parenthesized branch with alias already set).
                 FromItem::Function { .. } => {}
             }
+            // v1.10: `LATERAL` before a parenthesized join has no PG19
+            // production (`LATERAL_P` covers only functions and
+            // `select_with_parens`); PG reports a syntax error. (The
+            // keyword gate above means `lateral` is only true here for
+            // `((SELECT ...) ... JOIN ...)` shapes.)
+            if lateral && matches!(item, FromItem::Join { .. }) {
+                return Err(err(
+                    "syntax error: LATERAL cannot precede a parenthesized join".to_string(),
+                ));
+            }
             Ok(item)
         } else {
+            // v1.12: an unquoted reserved keyword (e.g. WHERE, GROUP)
+            // cannot be a table name (PG19 gram.y: relation_expr takes a
+            // qualified name, and reserved words are not valid there).
+            // Quoted identifiers ("where") are still fine. Without this,
+            // `SELECT FROM where` would parse `where` as a table and fail
+            // later with 42P01 instead of the correct 42601 syntax error.
+            if let Token::Ident(s) = self.peek() {
+                if is_reserved(s) {
+                    return Err(err(format!(
+                        "syntax error: \"{}\" is a reserved keyword and cannot be a table name",
+                        s
+                    )));
+                }
+            }
             let name = self.expect_ident()?;
             // v0.9: schema-qualified names, so the information_schema
             // catalog views are reachable (`FROM information_schema.tables`).
@@ -9123,15 +13870,21 @@ impl Parser {
                     args,
                     alias,
                     col_aliases,
+                    lateral,
                 });
             }
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
             let col_aliases = self.parse_col_alias_list()?;
+            // v1.10: `lateral` is only true here before `func_name (`
+            // (the gate in eat_lateral_keyword); a bare `LATERAL tbl`
+            // never sets it — PG19 has no such production, and the word
+            // falls back to a table named `lateral` instead.
             Ok(FromItem::Table {
                 name,
                 alias,
                 col_aliases,
+                only,
             })
         }
     }
@@ -9200,8 +13953,16 @@ impl Parser {
             } else {
                 false
             };
-            let name = self.expect_ident()?;
-            return Ok(Stmt::DropIndex { name, if_exists });
+            // v0.88: `DROP INDEX a, b, c` (PG allows a name list).
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next(); // ','
+            }
+            return Ok(Stmt::DropIndex { names, if_exists });
         }
         // v0.9: DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
         if self.eat_keyword("view") {
@@ -9267,6 +14028,40 @@ impl Parser {
             }
             self.parse_cascade_opt()?;
             return Ok(Stmt::DropType { names, if_exists });
+        }
+        // v0.85: DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
+        // — mirrors DROP TYPE (dependents are not tracked).
+        if self.eat_keyword("domain") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            self.parse_cascade_opt()?;
+            return Ok(Stmt::DropDomain { names, if_exists });
+        }
+        // v0.86: DROP FUNCTION [IF EXISTS] name ([type [, ...]]).
+        // Argument names are accepted and ignored (PG allows them).
+        if matches!(self.peek(), Token::Ident(s) if s == "function") {
+            return self.parse_drop_function();
+        }
+        // v0.86: DROP OPERATOR [IF EXISTS] name (lefttype, righttype)
+        // (PG19; use NONE for a missing side).
+        if matches!(self.peek(), Token::Ident(s) if s == "operator") {
+            return self.parse_drop_operator();
+        }
+        // v1.00: DROP TRIGGER [IF EXISTS] name ON table (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            return self.parse_drop_trigger();
         }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
@@ -9757,6 +14552,36 @@ pub fn split_statements(input: &str) -> Vec<String> {
             i += 2;
             continue;
         }
+        if c == '$' {
+            // v0.98: dollar-quoted string: $tag$ ... $tag$, where the tag
+            // follows identifier rules (or is empty for `$$`). A `$`
+            // followed by a digit (e.g. `$1`) is a parameter reference,
+            // not a quote opener.
+            let mut j = i + 1;
+            let tag_start = j;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let tag: String = chars[tag_start..j].iter().collect();
+            let valid_tag = j < chars.len()
+                && chars[j] == '$'
+                && (tag.is_empty()
+                    || tag
+                        .chars()
+                        .next()
+                        .is_some_and(|c0| c0.is_alphabetic() || c0 == '_'));
+            if valid_tag {
+                let closer: Vec<char> = format!("${}$", tag).chars().collect();
+                i = j + 1; // past the opening $tag$
+                while i + closer.len() <= chars.len() && chars[i..i + closer.len()] != closer[..] {
+                    i += 1;
+                }
+                i += closer.len(); // past the closing $tag$ (or EOF)
+                continue;
+            }
+            // Not a quote opener (e.g. `$1`); fall through to normal
+            // handling below.
+        }
         if c == ';' {
             let seg: String = chars[start..i].iter().collect();
             if !seg.trim().is_empty() {
@@ -9786,6 +14611,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         | "substring" | "substr" | "trim" | "position" | "replace" | "split_part"
         | "concat" | "concat_ws" | "to_hex" | "to_oct" | "to_bin"
         | "left" | "right" | "reverse"
+        // v0.95: parse_ident.
+        | "parse_ident"
         // math
         | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod"
         | "sign"
@@ -9798,7 +14625,8 @@ pub fn is_builtin_fn(name: &str) -> bool {
         // conditional
         | "coalesce" | "nullif" | "greatest" | "least"
         // v0.9: sequence functions
-        | "nextval" | "currval" | "setval"
+        // v0.98: lastval()
+        | "nextval" | "currval" | "setval" | "lastval"
         // v0.14: PostgreSQL internal operator-function aliases
         | "booleq" | "boolne" | "int4eq" | "texteq"
         // v0.73: row_to_json(record) -> json (json.c).
@@ -9837,6 +14665,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.9: setval(name, value [, is_called])
         "nextval" | "currval" => n == 1,
+        // v0.98: lastval() takes no arguments.
+        "lastval" => n == 0,
         "setval" => n == 2 || n == 3,
         // v0.14: PostgreSQL internal operator-function aliases
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
@@ -9849,6 +14679,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "array_ndims" => n == 1,
         "array_lower" | "array_upper" => n == 2,
         "unnest" => n == 1,
+        // v0.95: parse_ident(qualname text [, strict bool]).
+        "parse_ident" => n == 1 || n == 2,
         _ => false,
     };
     if ok {
@@ -10050,11 +14882,13 @@ fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>> {
             )));
         }
     };
-    if sel.for_update {
+    if sel.for_update && sel.for_update_of.is_empty() {
         return Some(Err(err(
             "SELECT FOR UPDATE is not allowed in a view".to_string()
         )));
     }
+    // v1.14: `FOR UPDATE OF tbl` is allowed in a view (PG19); only bare
+    // `FOR UPDATE` is rejected.
     let mut deps = Vec::new();
     collect_table_refs(&sel, &mut deps);
     deps.sort();
@@ -10117,10 +14951,22 @@ fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 /// and no volatile sequence calls other than the recognized nextval form.
 pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
     match e {
+        // v0.95: named args make no sense in a constraint expression.
+        Expr::NamedArg { .. } => Err(err(format!(
+            "cannot use named argument in {} constraint",
+            what
+        ))),
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
-            Err(err(format!("cannot use subquery in {} constraint", what)))
+        // v1.30: ordered-set aggregates are aggregates too.
+        Expr::WithinGroup { .. } => {
+            Err(err(format!("cannot use aggregate in {} constraint", what)))
         }
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
+        | Expr::Exists { .. } => Err(err(format!("cannot use subquery in {} constraint", what))),
         Expr::Param(_) => Err(err(format!("cannot use parameter in {} constraint", what))),
         Expr::ResolvedCol { .. } => Err(err(format!("invalid expression in {}", what))),
         Expr::Column { .. } | Expr::WholeRow { .. } | Expr::Literal(_) => Ok(()),
@@ -10223,7 +15069,9 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::Func { name, args } => {
             // v0.9: nextval is allowed in DEFAULT (Postgres auto-increment),
             // but no sequence functions in CHECK (must be immutable).
-            if name == "nextval" || name == "currval" || name == "setval" {
+            // v0.98: lastval joins the volatile sequence functions barred
+            // from constraints.
+            if name == "nextval" || name == "currval" || name == "setval" || name == "lastval" {
                 if what != "DEFAULT" || name != "nextval" {
                     return Err(err(format!(
                         "cannot use sequence function in {} constraint",
@@ -10290,6 +15138,14 @@ fn encode_literal(lit: &Literal, out: &mut String) {
                 out.push_str(&format!("{:02x}", byte));
             }
         }
+        // v1.39: bit length plus hex bytes (the length matters: the
+        // last byte's low bits are padding).
+        Literal::BitString(b) => {
+            out.push_str(&format!("bit {} ", b.bitlen));
+            for byte in &b.bytes {
+                out.push_str(&format!("{:02x}", byte));
+            }
+        }
         Literal::Uuid(u) => {
             out.push_str("uuid ");
             for byte in u {
@@ -10303,6 +15159,8 @@ fn encode_literal(lit: &Literal, out: &mut String) {
 
 fn encode_expr_inner(e: &Expr, out: &mut String) {
     match e {
+        // v0.95: named args encode transparently.
+        Expr::NamedArg { expr, .. } => encode_expr_inner(expr, out),
         Expr::Column { table, name } => {
             out.push_str("(col ");
             sexpr_escape(table.as_deref().unwrap_or(""), out);
@@ -10338,7 +15196,7 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(right, out);
             out.push(')');
         }
-        Expr::Cast { expr, to } => {
+        Expr::Cast { expr, to, .. } => {
             out.push_str(&format!("(cast {} ", to.sql_name()));
             encode_expr_inner(expr, out);
             out.push(')');
@@ -10575,9 +15433,12 @@ fn encode_expr_inner(e: &Expr, out: &mut String) {
         // Aggregates, subqueries, windows and pre-resolved columns can never
         // appear in a persisted CHECK / DEFAULT (validated at parse time).
         Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::UserOp { .. }
         | Expr::Exists { .. }
         | Expr::Window { .. }
         | Expr::ResolvedCol { .. } => {
@@ -10620,6 +15481,24 @@ impl<'a> SexprParser<'a> {
         while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
             self.chars.next();
         }
+    }
+    /// v0.85: peek whether the next atom (without consuming) equals `want`.
+    /// Used for `nil` bounds and `_` placeholders.
+    fn peek_atom_is(&mut self, want: &str) -> bool {
+        self.ws();
+        let s: String = self
+            .chars
+            .clone()
+            .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ')')
+            .collect();
+        s == want
+    }
+    /// v0.85: peek whether the upcoming text starts with `prefix`.
+    /// Used to distinguish `(when ...)` sublists in CASE encodings.
+    fn peek_starts_with(&mut self, prefix: &str) -> bool {
+        self.ws();
+        let s: String = self.chars.clone().take(prefix.len()).collect();
+        s == prefix
     }
     fn atom(&mut self) -> Result<String, String> {
         self.ws();
@@ -10716,6 +15595,7 @@ impl<'a> SexprParser<'a> {
                 Expr::Cast {
                     expr: Box::new(x),
                     to,
+                    written: None,
                 }
             }
             "concat" => {
@@ -10859,6 +15739,138 @@ impl<'a> SexprParser<'a> {
                     neg,
                 }
             }
+            // v0.85: array subscript / slice / constructors, composite
+            // field access, row constructors, named casts, CASE — the
+            // encoder (`encode_expr_inner`) produces these heads.
+            "subscript" => {
+                let array = self.expr()?;
+                let mut indices = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    indices.push(self.expr()?);
+                }
+                Expr::Subscript {
+                    array: Box::new(array),
+                    indices,
+                }
+            }
+            "fieldacc" => {
+                let field = self.atom()?;
+                let expr = self.expr()?;
+                Expr::FieldAccess {
+                    expr: Box::new(expr),
+                    field,
+                }
+            }
+            "slice" => {
+                let array = self.expr()?;
+                let mut bounds = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    let low = if self.peek_atom_is("nil") {
+                        self.atom()?;
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    let high = if self.peek_atom_is("nil") {
+                        self.atom()?;
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    bounds.push((low, high));
+                }
+                Expr::Slice {
+                    array: Box::new(array),
+                    bounds,
+                }
+            }
+            "array" => {
+                let nested = self.atom()? == "nested";
+                let mut elems = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    elems.push(self.expr()?);
+                }
+                Expr::ArrayCtor { elems, nested }
+            }
+            "row" => {
+                let mut elems = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    elems.push(self.expr()?);
+                }
+                Expr::Row(elems)
+            }
+            "castnamed" => {
+                let name = self.atom()?;
+                let expr = self.expr()?;
+                Expr::CastNamed {
+                    expr: Box::new(expr),
+                    name,
+                }
+            }
+            "case" => {
+                let operand = if self.peek_atom_is("_") {
+                    self.atom()?;
+                    None
+                } else {
+                    Some(Box::new(self.expr()?))
+                };
+                let mut whens = Vec::new();
+                loop {
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        break;
+                    }
+                    // Peek: a `(when ...)` sublist vs the final else.
+                    // The else is the last element; whens are `(when k r)`.
+                    // We distinguish by looking ahead for "(when".
+                    if self.peek_starts_with("(when") {
+                        self.open()?;
+                        let w = self.atom()?;
+                        if w != "when" {
+                            return Err("expected when in case encoding".into());
+                        }
+                        let k = self.expr()?;
+                        let r = self.expr()?;
+                        self.close()?;
+                        whens.push((Box::new(k), Box::new(r)));
+                    } else {
+                        break;
+                    }
+                }
+                let else_ = if self.peek_atom_is("_") {
+                    self.atom()?;
+                    None
+                } else {
+                    // Could be `)` already (no else and no whens tail).
+                    self.ws();
+                    if self.chars.peek() == Some(&')') {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    }
+                };
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_,
+                }
+            }
             o => return Err(format!("bad expr head {}", o)),
         };
         self.close()?;
@@ -10886,6 +15898,15 @@ impl<'a> SexprParser<'a> {
             "bytea" => {
                 let hex = self.atom()?;
                 Literal::Bytea(hex_decode(&hex)?)
+            }
+            // v1.39: `(lit bit <bitlen> <hexbytes>)`.
+            "bit" => {
+                let bitlen: u32 = self.atom()?.parse().map_err(|_| "bad bitlen")?;
+                let bytes = hex_decode(&self.atom()?)?;
+                if bytes.len() != ((bitlen as usize + 7) / 8) {
+                    return Err("bad bit bytes".into());
+                }
+                Literal::BitString(crate::storage::BitString { bitlen, bytes })
             }
             "uuid" => {
                 let hex = self.atom()?;
@@ -10934,6 +15955,7 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "timestamp" | "timestamp without time zone" => ColType::Timestamp,
         "timestamptz" | "timestamp with time zone" => ColType::Timestamptz,
         "bytea" => ColType::Bytea,
+        "bit" => ColType::Bit, // v1.39
         "uuid" => ColType::Uuid,
         o => return Err(format!("bad column type {}", o)),
     })
@@ -11263,6 +16285,96 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     })
 }
 
+/// v0.85: encode a domain's CHECK list as an s-expr. WAL and checkpoint
+/// records carry it as a length-prefixed string (the binary record
+/// layer has no expression codec; the s-expr layer does).
+pub fn encode_domain_checks(checks: &[CheckDef]) -> String {
+    let mut out = String::from("(domainchecks");
+    for c in checks {
+        out.push('(');
+        sexpr_escape(&c.name, &mut out);
+        out.push(' ');
+        encode_expr_inner(&c.expr, &mut out);
+        out.push(')');
+    }
+    out.push(')');
+    out
+}
+
+/// v0.85: decode `encode_domain_checks`. Domain checks are always
+/// `CheckKind::Check` (23514 on violation).
+pub fn decode_domain_checks(s: &str) -> Result<Vec<CheckDef>, String> {
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    if p.atom()? != "domainchecks" {
+        return Err("bad domain checks encoding".into());
+    }
+    let mut checks = Vec::new();
+    loop {
+        p.ws();
+        if p.chars.peek() == Some(&')') {
+            p.chars.next();
+            break;
+        }
+        p.open()?;
+        let name = p.atom()?;
+        let expr = p.expr()?;
+        p.close()?;
+        checks.push(CheckDef {
+            name,
+            expr,
+            not_valid: false,
+            kind: CheckKind::Check,
+        });
+    }
+    p.ws();
+    if p.chars.peek().is_some() {
+        return Err("trailing data in domain checks encoding".into());
+    }
+    Ok(checks)
+}
+
+/// v0.85: encode a domain DEFAULT as an s-expr (`-` = none), mirroring
+/// `encode_default`.
+pub fn encode_domain_default(d: &Option<DefaultExpr>) -> String {
+    match d {
+        Some(dd) => {
+            let mut out = String::new();
+            encode_default(dd, &mut out);
+            out
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// v0.85: decode `encode_domain_default`. Reuses the constraint
+/// decoder's default forms (`(default-lit ...)`, `(default-nextval
+/// ...)`, `(default-expr ...)`).
+pub fn decode_domain_default(s: &str) -> Result<Option<DefaultExpr>, String> {
+    if s == "-" {
+        return Ok(None);
+    }
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    let tag = p.atom()?;
+    let d = match tag.as_str() {
+        "default-lit" => {
+            p.open()?;
+            if p.atom()? != "lit" {
+                return Err("bad domain default-lit head".into());
+            }
+            let lit = p.literal()?;
+            p.close()?;
+            DefaultExpr::Lit(lit)
+        }
+        "default-nextval" => DefaultExpr::Nextval(p.atom()?),
+        "default-expr" => DefaultExpr::Expr(p.expr()?),
+        _ => return Err(format!("bad domain default encoding: {}", tag)),
+    };
+    p.close()?;
+    Ok(Some(d))
+}
+
 // --- v0.70: focused parser tests for PARTITION BY keys -----------------------
 #[cfg(test)]
 mod partition_by_tests {
@@ -11432,5 +16544,518 @@ mod v72_ddl_tests {
             Stmt::AlterTable { actions, .. } => assert_eq!(actions.len(), 1),
             other => panic!("expected ALTER TABLE, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod v107_set_tests {
+    use super::*;
+
+    #[test]
+    fn set_transaction_adjacent_modes() {
+        // v1.07: PG19 accepts adjacent (comma-less) transaction modes.
+        match parse_statement("SET TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
+            .expect("parses")
+        {
+            Stmt::SetTransaction {
+                level,
+                read_only,
+                snapshot,
+                ..
+            } => {
+                assert_eq!(level, Some(IsolationLevel::Serializable));
+                assert_eq!(read_only, Some(false));
+                assert_eq!(snapshot, None);
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+        match parse_statement("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .expect("parses")
+        {
+            Stmt::SetTransaction {
+                level, read_only, ..
+            } => {
+                assert_eq!(level, Some(IsolationLevel::RepeatableRead));
+                assert_eq!(read_only, Some(true));
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_transaction_snapshot() {
+        // v1.07: SET TRANSACTION SNAPSHOT 'id'.
+        match parse_statement("SET TRANSACTION SNAPSHOT '0003-A1'").expect("parses") {
+            Stmt::SetTransaction {
+                snapshot, level, ..
+            } => {
+                assert_eq!(snapshot, Some("0003-A1".to_string()));
+                assert_eq!(level, None);
+            }
+            other => panic!("expected SetTransaction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_role_bare() {
+        // v1.07: bare SET ROLE name (PG19).
+        match parse_statement("SET ROLE regress_insert_other_user").expect("parses") {
+            Stmt::Set { name, value, .. } => {
+                assert_eq!(name, "role");
+                match value {
+                    SetValue::Str(s) => assert_eq!(s, "regress_insert_other_user"),
+                    other => panic!("expected Str, got {:?}", other),
+                }
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_signed_numeric_value() {
+        // v1.07: signed numeric SET values (e.g. extra_float_digits = -1).
+        match parse_statement("SET extra_float_digits = -1").expect("parses") {
+            Stmt::Set { name, value, .. } => {
+                assert_eq!(name, "extra_float_digits");
+                match value {
+                    SetValue::Str(s) => assert_eq!(s, "-1"),
+                    other => panic!("expected Str, got {:?}", other),
+                }
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod v108_explain_costs_tests {
+    use super::*;
+
+    fn explain_costs(sql: &str) -> (bool, bool) {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Explain { analyze, costs, .. } => (analyze, costs),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn costs_defaults_true() {
+        let (_, costs) = explain_costs("EXPLAIN SELECT 1");
+        assert!(costs);
+        let (_, costs) = explain_costs("EXPLAIN (VERBOSE) SELECT 1");
+        assert!(costs);
+    }
+
+    #[test]
+    fn costs_off_forms() {
+        for sql in [
+            "EXPLAIN (COSTS OFF) SELECT 1",
+            "EXPLAIN (COSTS FALSE) SELECT 1",
+            "EXPLAIN (COSTS off) SELECT 1",
+            "EXPLAIN (COSTS 0) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(!costs, "expected costs=false for {sql}");
+        }
+    }
+
+    #[test]
+    fn costs_on_forms() {
+        for sql in [
+            "EXPLAIN (COSTS) SELECT 1",
+            "EXPLAIN (COSTS ON) SELECT 1",
+            "EXPLAIN (COSTS TRUE) SELECT 1",
+            "EXPLAIN (COSTS 1) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(costs, "expected costs=true for {sql}");
+        }
+    }
+
+    #[test]
+    fn costs_duplicate_last_wins() {
+        // v1.08: PG19 processes options sequentially; duplicates are valid,
+        // last value wins.
+        let (_, costs) = explain_costs("EXPLAIN (COSTS OFF, COSTS ON) SELECT 1");
+        assert!(costs);
+        let (_, costs) = explain_costs("EXPLAIN (COSTS ON, COSTS OFF) SELECT 1");
+        assert!(!costs);
+    }
+
+    #[test]
+    fn costs_invalid_boolean_errors() {
+        // v1.45: PG19 defGetBoolean message ("<name> requires a Boolean
+        // value", lowercase name — PG's lexer folds unquoted names).
+        let err = parse_statement("EXPLAIN (COSTS foo) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "42601");
+        assert!(
+            err.message.contains("costs requires a Boolean value"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unknown_option_errors_42601() {
+        let err = parse_statement("EXPLAIN (FOOBAR) SELECT 1").unwrap_err();
+        assert_eq!(err.code, "42601");
+        assert!(
+            err.message.contains("unrecognized EXPLAIN option"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn known_inert_options_accepted() {
+        // v1.08: known non-COSTS options remain accepted and inert.
+        for sql in [
+            "EXPLAIN (VERBOSE, COSTS OFF) SELECT 1",
+            "EXPLAIN (BUFFERS, COSTS OFF) SELECT 1",
+            "EXPLAIN (TIMING OFF, COSTS OFF) SELECT 1",
+        ] {
+            let (_, costs) = explain_costs(sql);
+            assert!(!costs, "expected costs=false for {sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod v145_explain_options_tests {
+    use super::*;
+
+    fn explain_opts(sql: &str) -> (bool, bool, ExplainOpts) {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Explain {
+                analyze,
+                costs,
+                opts,
+                ..
+            } => (analyze, costs, opts),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn parse_err(sql: &str) -> SqlError {
+        parse_statement(sql).unwrap_err()
+    }
+
+    #[test]
+    fn new_options_accepted() {
+        // v1.45: PG19's generic_plan and io are recognized (were 42601).
+        let (_, _, opts) = explain_opts("EXPLAIN (GENERIC_PLAN, COSTS OFF) SELECT 1");
+        assert!(opts.generic_plan);
+        let (_, _, opts) = explain_opts("EXPLAIN (ANALYZE, IO, COSTS OFF) SELECT 1");
+        assert!(opts.io);
+    }
+
+    #[test]
+    fn boolean_forms_all_options() {
+        // v1.45: defGetBoolean semantics on every boolean option.
+        for (sql, val) in [
+            ("EXPLAIN (WAL, ANALYZE) SELECT 1", true),
+            ("EXPLAIN (WAL OFF, ANALYZE) SELECT 1", false),
+            ("EXPLAIN (WAL 0, ANALYZE) SELECT 1", false),
+            ("EXPLAIN (WAL 1, ANALYZE) SELECT 1", true),
+            ("EXPLAIN (MEMORY ON, COSTS OFF) SELECT 1", true),
+            ("EXPLAIN (SETTINGS FALSE, COSTS OFF) SELECT 1", false),
+        ] {
+            let _ = explain_opts(sql);
+            let _ = val;
+        }
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL, ANALYZE) SELECT 1");
+        assert!(opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL OFF, ANALYZE) SELECT 1");
+        assert!(!opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (MEMORY ON, COSTS OFF) SELECT 1");
+        assert!(opts.memory);
+    }
+
+    #[test]
+    fn boolean_garbage_rejected_pg_message() {
+        // v1.45: PG19 defGetBoolean error text and code.
+        for opt in ["ANALYZE", "COSTS", "VERBOSE", "WAL", "TIMING", "IO"] {
+            let err = parse_err(&format!("EXPLAIN ({opt} FOO) SELECT 1"));
+            assert_eq!(err.code, "42601", "option {opt}");
+            assert_eq!(
+                err.message,
+                format!("{} requires a Boolean value", opt.to_lowercase()),
+                "option {opt}"
+            );
+        }
+        // Integer other than 0/1 is rejected like PG19.
+        let err = parse_err("EXPLAIN (COSTS 2) SELECT 1");
+        assert_eq!(err.code, "42601");
+        assert!(err.message.contains("costs requires a Boolean value"));
+    }
+
+    #[test]
+    fn requires_analyze_options() {
+        // v1.45: PG19 requires ANALYZE for WAL/TIMING/IO/true and
+        // SERIALIZE != none; all 22023 with PG's exact text. BUFFERS has
+        // no such check in PG19.
+        for (sql, opt) in [
+            ("EXPLAIN (WAL) SELECT 1", "WAL"),
+            ("EXPLAIN (TIMING) SELECT 1", "TIMING"),
+            ("EXPLAIN (IO) SELECT 1", "IO"),
+            ("EXPLAIN (SERIALIZE TEXT) SELECT 1", "SERIALIZE"),
+            ("EXPLAIN (SERIALIZE BINARY) SELECT 1", "SERIALIZE"),
+            ("EXPLAIN (SERIALIZE) SELECT 1", "SERIALIZE"),
+        ] {
+            let err = parse_err(sql);
+            assert_eq!(err.code, "22023", "{sql}");
+            assert_eq!(err.message, format!("EXPLAIN option {opt} requires ANALYZE"), "{sql}");
+        }
+        // False/off variants do NOT require ANALYZE.
+        for sql in [
+            "EXPLAIN (WAL OFF) SELECT 1",
+            "EXPLAIN (TIMING OFF) SELECT 1",
+            "EXPLAIN (IO FALSE) SELECT 1",
+            "EXPLAIN (SERIALIZE OFF) SELECT 1",
+            "EXPLAIN (SERIALIZE NONE) SELECT 1",
+            "EXPLAIN (BUFFERS) SELECT 1",
+            "EXPLAIN (BUFFERS OFF) SELECT 1",
+        ] {
+            explain_opts(sql);
+        }
+        // With ANALYZE, all are fine.
+        let (_, _, opts) = explain_opts("EXPLAIN (ANALYZE, WAL, TIMING, IO, SERIALIZE BINARY) SELECT 1");
+        assert!(opts.wal && opts.timing && opts.io);
+        assert_eq!(opts.serialize, ExplainSerialize::Binary);
+    }
+
+    #[test]
+    fn generic_plan_analyze_conflict() {
+        // v1.45: PG19's exact 22023 text.
+        let err = parse_err("EXPLAIN (GENERIC_PLAN, ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
+        );
+        // Either order.
+        let err = parse_err("EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1");
+        assert_eq!(err.code, "22023");
+        // GENERIC_PLAN alone is fine.
+        let (_, _, opts) = explain_opts("EXPLAIN (GENERIC_PLAN) SELECT 1");
+        assert!(opts.generic_plan);
+    }
+
+    #[test]
+    fn serialize_values() {
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::None);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE TEXT, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Text);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE BINARY, ANALYZE) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Binary);
+        // Bare SERIALIZE means text (and thus requires ANALYZE).
+        let err = parse_err("EXPLAIN (SERIALIZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        // Bad value: PG19's exact 22023 text. Unquoted BOGUS is folded
+        // to lowercase by the tokenizer (like PG's scanner); a quoted
+        // "TEXT" keeps its case and is rejected (PG19 strcmp).
+        let err = parse_err("EXPLAIN (SERIALIZE BOGUS, ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"serialize\": \"bogus\""
+        );
+        let err = parse_err("EXPLAIN (SERIALIZE \"TEXT\", ANALYZE) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"serialize\": \"TEXT\""
+        );
+    }
+
+    #[test]
+    fn format_values() {
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT TEXT) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Text);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT XML) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Xml);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT JSON) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Json);
+        let (_, _, opts) = explain_opts("EXPLAIN (FORMAT YAML) SELECT 1");
+        assert_eq!(opts.format, ExplainFormat::Yaml);
+        // Bad value: PG19's exact 22023 text. Unquoted BOGUS is folded
+        // to lowercase by the tokenizer; a quoted "JSON" keeps its case and
+        // is rejected (PG19 strcmp on the raw value).
+        let err = parse_err("EXPLAIN (FORMAT BOGUS) SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"format\": \"bogus\""
+        );
+        let err = parse_err("EXPLAIN (FORMAT \"JSON\") SELECT 1");
+        assert_eq!(err.code, "22023");
+        assert_eq!(
+            err.message,
+            "unrecognized value for EXPLAIN option \"format\": \"JSON\""
+        );
+        // Bare FORMAT: PG19's 42601 "format requires a parameter".
+        let err = parse_err("EXPLAIN (FORMAT) SELECT 1");
+        assert_eq!(err.code, "42601");
+        assert_eq!(err.message, "format requires a parameter");
+    }
+
+    #[test]
+    fn duplicate_last_wins_new_options() {
+        let (_, _, opts) = explain_opts("EXPLAIN (WAL, ANALYZE, WAL OFF) SELECT 1");
+        assert!(!opts.wal);
+        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE, SERIALIZE TEXT) SELECT 1");
+        assert_eq!(opts.serialize, ExplainSerialize::Text);
+    }
+}
+
+#[cfg(test)]
+mod v109_function_tests {
+    use super::*;
+
+    fn create_fn(sql: &str) -> Stmt {
+        parse_statement(sql).expect("parses")
+    }
+
+    #[test]
+    fn parallel_safe_parses() {
+        // v1.09: PARALLEL SAFE is accepted (planner hint, like COST).
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql IMMUTABLE PARALLEL SAFE AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_restricted_parses() {
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL RESTRICTED AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_unsafe_parses() {
+        match create_fn(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL UNSAFE AS 'SELECT $1';",
+        ) {
+            Stmt::CreateFunction { .. } => {}
+            other => panic!("expected CreateFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parallel_bogus_rejected() {
+        // v1.09: invalid PARALLEL value is a syntax error.
+        let err = parse_statement(
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql PARALLEL BOGUS AS 'SELECT $1';",
+        )
+        .expect_err("should fail");
+        assert!(err.message.contains("PARALLEL"), "message: {}", err.message);
+    }
+
+    #[test]
+    fn alter_function_immutable_parses() {
+        // v1.09: ALTER FUNCTION ... IMMUTABLE.
+        match create_fn("ALTER FUNCTION f(int) IMMUTABLE;") {
+            Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility,
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(arg_types, vec!["int".to_string()]);
+                assert_eq!(volatility, FuncVolatility::Immutable);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_stable_parses() {
+        match create_fn("ALTER FUNCTION f(text, int) STABLE;") {
+            Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility,
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(arg_types.len(), 2);
+                assert_eq!(volatility, FuncVolatility::Stable);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_volatile_parses() {
+        match create_fn("ALTER FUNCTION f() VOLATILE;") {
+            Stmt::AlterFunction { volatility, .. } => {
+                assert_eq!(volatility, FuncVolatility::Volatile);
+            }
+            other => panic!("expected AlterFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn alter_function_other_action_rejected() {
+        // v1.09: only volatility actions are supported; STRICT etc. are 0A000.
+        let err = parse_statement("ALTER FUNCTION f(int) STRICT;").expect_err("should fail");
+        assert_eq!(err.code, "0A000", "message: {}", err.message);
+    }
+}
+
+#[cfg(test)]
+mod for_update_of_tests {
+    use super::*;
+
+    fn select_stmt(sql: &str) -> SelectStmt {
+        match parse_statement(sql).expect("parses") {
+            Stmt::Select(s) => s,
+            other => panic!("expected SELECT, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_for_update_has_empty_of() {
+        // v1.14: bare FOR UPDATE leaves for_update_of empty.
+        let s = select_stmt("select a from t for update");
+        assert!(s.for_update);
+        assert!(s.for_update_of.is_empty());
+    }
+
+    #[test]
+    fn for_update_of_single_table() {
+        // v1.14: FOR UPDATE OF tbl parses the target list.
+        let s = select_stmt("select a from t1, t2 for update of t1");
+        assert!(s.for_update);
+        assert_eq!(s.for_update_of, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn for_update_of_multiple_tables() {
+        // v1.14: comma-separated OF list.
+        let s = select_stmt("select a from t1, t2 for update of t1, t2");
+        assert!(s.for_update);
+        assert_eq!(s.for_update_of, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[test]
+    fn for_update_of_alias() {
+        // v1.14: OF names may be aliases.
+        let s = select_stmt("select a from t1 as x for update of x");
+        assert_eq!(s.for_update_of, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn no_for_update_no_of() {
+        // v1.14: without FOR UPDATE there is no OF list.
+        let s = select_stmt("select a from t");
+        assert!(!s.for_update);
+        assert!(s.for_update_of.is_empty());
     }
 }

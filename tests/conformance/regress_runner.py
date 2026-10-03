@@ -54,31 +54,31 @@ STMT_TIMEOUT = 30.0
 # ---------------------------------------------------------------------------
 
 TESTS = [
-    # (name, need_tenk, need_onek): tenk1/tenk2 for the join/subselect/union
+    # (name, need_tenk, need_onek, need_road): tenk1/tenk2 for the join/subselect/union
     # families; onek/onek2 for the select/subselect/join families (PG's
     # test_setup.sql builds onek/onek2 as 1000-row slices of tenk1).
-    ("boolean", False, False),
-    ("char", False, False),
-    ("name", False, False),
-    ("text", False, False),
-    ("varchar", False, False),
-    ("int2", False, False),
-    ("int4", False, False),
-    ("int8", False, False),
-    ("float4", False, False),
-    ("float8", False, False),
-    ("numeric", False, False),
-    ("strings", False, False),
-    ("select", False, True),
-    ("select_distinct", False, True),
-    ("select_having", False, False),
-    ("case", False, False),
-    ("union", True, False),
-    ("subselect", True, True),
-    ("join", True, True),
-    ("transactions", False, False),
-    ("insert", False, False),
-    ("delete", False, False),
+    ("boolean", False, False, False),
+    ("char", False, False, False),
+    ("name", False, False, False),
+    ("text", False, False, False),
+    ("varchar", False, False, False),
+    ("int2", False, False, False),
+    ("int4", False, False, False),
+    ("int8", False, False, False),
+    ("float4", False, False, False),
+    ("float8", False, False, False),
+    ("numeric", False, False, False),
+    ("strings", False, False, False),
+    ("select", False, True, False),
+    ("select_distinct", False, True, False),
+    ("select_having", False, False, False),
+    ("case", False, False, False),
+    ("union", True, False, False),
+    ("subselect", True, True, True),
+    ("join", True, True, False),
+    ("transactions", True, False, False),
+    ("insert", False, False, False),
+    ("delete", False, False, False),
 ]
 
 # ---------------------------------------------------------------------------
@@ -128,22 +128,39 @@ class Conn:
                 return
 
     def q(self, sql):
-        """Returns dict(oids, colnames, rows, err_codes, tag)."""
+        """Returns dict(oids, colnames, rows, err_codes, tag, sets).
+
+        `sets` is the per-result-set breakdown of one simple Query:
+        a list of dict(oids, colnames, rows, err_codes, tag), one entry
+        per RowDescription/DataRow/CommandComplete group (an ErrorResponse
+        attaches to the set it terminates). The top-level keys keep
+        their historical aggregated meaning (rows concatenated, last
+        tag, all error codes) for single-statement callers.
+        """
         self.s.sendall(msg(b"Q", cstr(sql)))
-        oids, names, rows, codes = [], [], [], []
-        tag = ""
+        sets = []
+        cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": "",
+               # v1.12: a zero-column SELECT still emits RowDescription (T)
+               # with 0 fields; record that so is_quiet_set can tell it
+               # apart from a utility that emits no RowDescription at all.
+               "saw_desc": False}
+        all_oids, all_names, all_rows, all_codes = [], [], [], []
+        all_tag = ""
         while True:
             t, p = self._read_msg()
             if t == b"T":
+                cur["saw_desc"] = True
                 (n,) = struct.unpack("!h", p[:2])
                 pos = 2
                 for _ in range(n):
                     e = p.index(b"\x00", pos)
-                    names.append(p[pos:e].decode())
+                    all_names.append(p[pos:e].decode())
+                    cur["colnames"].append(p[pos:e].decode())
                     pos = e + 1 + 6  # table oid + attr no
                     (oid,) = struct.unpack("!i", p[pos : pos + 4])
                     pos += 4
-                    oids.append(oid)
+                    all_oids.append(oid)
+                    cur["oids"].append(oid)
                     pos += 2 + 4 + 2  # typlen, typmod, format
             elif t == b"D":
                 (n,) = struct.unpack("!h", p[:2])
@@ -156,23 +173,36 @@ class Conn:
                     else:
                         r.append(p[pos : pos + ln].decode())
                         pos += ln
-                rows.append(r)
+                all_rows.append(r)
+                cur["rows"].append(r)
             elif t == b"E":
                 fields, pos = {}, 0
                 while p[pos] != 0:
                     e = p.index(b"\x00", pos + 1)
                     fields[chr(p[pos])] = p[pos + 1 : e].decode()
                     pos = e + 1
-                codes.append(fields.get("C", "?"))
+                all_codes.append(fields.get("C", "?"))
+                cur["err_codes"].append(fields.get("C", "?"))
             elif t == b"C":
-                tag = p[:-1].decode()
+                all_tag = p[:-1].decode()
+                cur["tag"] = all_tag
+                sets.append(cur)
+                cur = {"oids": [], "colnames": [], "rows": [], "err_codes": [], "tag": "",
+                       "saw_desc": False}
             elif t == b"Z":
+                # Flush any open set (e.g. an error arrived before any
+                # completion tag); guarantee at least one set.
+                if cur["oids"] or cur["colnames"] or cur["rows"] or cur["err_codes"] or cur["tag"] or cur["saw_desc"]:
+                    sets.append(cur)
+                if not sets:
+                    sets.append(cur)
                 return {
-                    "oids": oids,
-                    "colnames": names,
-                    "rows": rows,
-                    "err_codes": codes,
-                    "tag": tag,
+                    "oids": all_oids,
+                    "colnames": all_names,
+                    "rows": all_rows,
+                    "err_codes": all_codes,
+                    "tag": all_tag,
+                    "sets": sets,
                 }
 
     def copy_stdin(self, sql, data_lines):
@@ -241,7 +271,14 @@ class Server:
         self.proc = None
 
     def start(self):
-        env = dict(os.environ, RUSTGRES_DATA_DIR=self.data_dir)
+        # v0.93: real pg_regress runs with PGDATESTYLE=Postgres,MDY (the
+        # expected .out files were generated that way, e.g. text.out's
+        # `03-09-2010`); the engine honors it since v0.90.
+        env = dict(
+            os.environ,
+            RUSTGRES_DATA_DIR=self.data_dir,
+            PGDATESTYLE="Postgres,MDY",
+        )
         self.proc = subprocess.Popen(
             [BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
@@ -356,6 +393,18 @@ def split_statements(text):
                 flush()
                 line_start = True
                 continue
+            if c == "\\" and nxt == ";":
+                # v1.04: psql escaped semicolon — NOT a statement
+                # terminator. psql sends the whole thing as one Query
+                # message (unescaping `\;` to `;`), so the splitter must
+                # not break here. The raw `\;` stays in the item text
+                # (the .out echo contains it); run_test unescapes via
+                # psql_unescape() at execution time.
+                buf.append(c)
+                buf.append(nxt)
+                i += 2
+                line_start = False
+                continue
             if c == "-" and nxt == "-":
                 state = "linecomment"
                 i += 2
@@ -451,6 +500,65 @@ def split_statements(text):
     flush()
     return items
 
+
+def psql_unescape(text):
+    """Undo psql's backslash-semicolon escaping outside quoted regions.
+
+    psql does not treat `\\;` as a statement terminator; it sends the
+    Query with the backslash removed (`\\;` -> `;`). Quoted regions
+    (single/double-quoted strings, dollar-quoted bodies) keep their
+    backslashes literally, like psql's query buffer.
+    """
+    out = []
+    i, n = 0, len(text)
+    state = "normal"  # normal | squote | dquote | dollar
+    dollar_tag = ""
+    while i < n:
+        c = text[i]
+        if state == "normal":
+            if c == "\\" and i + 1 < n and text[i + 1] == ";":
+                out.append(";")
+                i += 2
+                continue
+            if c == "'":
+                state = "squote"
+            elif c == '"':
+                state = "dquote"
+            elif c == "$":
+                m = re.match(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$", text[i:])
+                if m:
+                    state = "dollar"
+                    dollar_tag = m.group(0)
+            out.append(c)
+            i += 1
+            continue
+        if state == "squote":
+            out.append(c)
+            i += 1
+            if c == "'":
+                if i < n and text[i] == "'":
+                    out.append("'")
+                    i += 1
+                else:
+                    state = "normal"
+            continue
+        if state == "dquote":
+            out.append(c)
+            if c == '"':
+                state = "normal"
+            i += 1
+            continue
+        # dollar-quoted body: backslashes are literal.
+        if text.startswith(dollar_tag, i):
+            out.append(dollar_tag)
+            i += len(dollar_tag)
+            state = "normal"
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Expected-output parser (psql aligned format)
 # ---------------------------------------------------------------------------
@@ -541,12 +649,38 @@ def parse_expected_block(lines, pos, null_display):
             pos += 1
         return Expected("error"), pos
 
+    # v1.12: zero-column result. psql renders a zero-target-list SELECT
+    # as the bare `--` separator line plus `(N rows)` — no header line
+    # and no data rows (e.g. `SELECT;` -> `--` / `(1 row)`). Parse it as
+    # a table with zero columns so row counts are actually verified.
+    # This is unambiguous here: the block is parsed positionally right
+    # after the statement echo, and a `(N rows)` marker only ever
+    # terminates a query result.
+    if line.strip() == "--" and pos + 1 < n:
+        m0 = re.match(r"^\((\d+) rows?\)$", lines[pos + 1].strip())
+        if m0:
+            count0 = int(m0.group(1))
+            return (
+                Expected(
+                    "table",
+                    colnames=[],
+                    rows=[[] for _ in range(count0)],
+                    count=count0,
+                ),
+                pos + 2,
+            )
+
     # psql table: header line, dashes line, data rows, "(N rows)".
     # The dashes line must be at least as wide as the header: this keeps a
     # following "--" comment line (or the next statement echo) from being
     # misread as a table separator, which used to desync the whole file.
+    # v1.04: the header itself must not be a "--" comment line either —
+    # two consecutive comment lines ("--" / "--") otherwise parse as a
+    # bogus table, which desyncs every later echo lookup (seen in name.out
+    # via parse_expected_blocks' second parse).
     if (
         pos + 1 < n
+        and not line.strip().startswith("--")
         and re.match(r"^-+(\+-+)*$", lines[pos + 1].strip())
         and len(lines[pos + 1].strip()) >= len(line.rstrip())
     ):
@@ -662,29 +796,259 @@ def norm_expected_cell(cell, null_display):
 # (regex, reason) -- matched against the statement text, case-insensitive.
 # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
 # (UNION_PATTERN removed in v0.44: UNION/INTERSECT/EXCEPT are supported.)
+# v1.09: statements that were EXPECTED-FAIL but are now genuinely
+# supported. Checked BEFORE EXPECTED_FAIL_PATTERNS; a match means the
+# statement must PASS (otherwise it's a REAL-FAIL).
+EXPECTED_PASS_OVERRIDES = [
+    # v1.10: explicit LATERAL derived tables and VALUES are supported
+    # for SELECT (correlated per left row, ON/USING, LEFT null-extension,
+    # cross-nest visibility, RIGHT/FULL 42P10 rule). Excludes: EXPLAIN
+    # (stays masked), UPDATE (lateral in UPDATE...FROM is still an
+    # error in PG), parenthesized setops in FROM (unsupported),
+    # and statements using unsupported features or hitting scoping
+    # edge cases that fail for non-lateral reasons.
+    # v1.26: aggregates at their own query level (PG 42803) and the
+    # ambiguous-table-reference case (PG 42P09) are now genuinely
+    # detected, so their exclusions are removed.
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!\s*update\b)(?!.*\bunion\b.*\blateral\b|\blateral\b.*\bunion\b)"
+     r"(?!.*\binformation_schema\b)"
+     r"(?!.*\blateral\b\s*\(\s*select\s+i8\.q1,\s*t2\.f1\b)"
+     r"(?!.*\bjoin\s*\(\s*select\s+i42\.f1\b)"
+     r"(?!.*\bleft\s+join\s*\(\s*select\s+b\.q1\s+as\s+bx\b)"
+     r"(?!.*\blateral\b\s*\(\s*select\s+\*\s+from\s+tenk1\s+t2,\s*lateral\b)"
+     r"(?!.*\bwidth_bucket\b.*\blateral\b|\blateral\b.*\bwidth_bucket\b)"
+     r"(?!.*\blateral\b\s*\(\s*values\s*\(\s*\w+\.\*\s*\))"
+     r"(?!.*\blateral\b\s*\(\s*with\s+recursive\b)"
+     r".*\blateral\b",
+     "v1.10: explicit LATERAL supported"),
+    # v1.09: PARALLEL {UNSAFE|RESTRICTED|SAFE} is parsed/validated (planner
+    # hint, like COST). The distinct_func plpgsql bodies are bounded
+    # single-RETURN and now succeed.
+    (r"(?is)^\s*create\s+(or\s+replace\s+)?function\s+distinct_func\b.*\bparallel\s+(unsafe|restricted|safe)\b",
+     "v1.09: PARALLEL option supported"),
+    # v1.09: user-defined SRFs in the SELECT targetlist fan out (PG19
+    # ProjectSet). sillysrf is a SQL-language SRF.
+    (r"(?is)^\s*create\s+(or\s+replace\s+)?function\s+sillysrf\b",
+     "v1.09: SQL SRF CREATE supported"),
+    (r"(?i)\bsillysrf\s*\(", "v1.09: user SRF in targetlist supported"),
+    # v1.09: ALTER FUNCTION ... {VOLATILE|STABLE|IMMUTABLE} is supported.
+    (r"(?is)^\s*alter\s+function\b.*\b(volatile|stable|immutable)\b\s*;?\s*$",
+     "v1.09: ALTER FUNCTION volatility supported"),
+    # v1.11: array[...] literals are supported (ARRAY[...] constructor,
+    # subscripts incl. on subquery results, = ANY(array), unnest(array),
+    # VARIADIC array args, VALUES/UNION/INTERSECT/EXCEPT with array
+    # columns). Excludes: CREATE FUNCTION bodies and their callees
+    # (make_ad), domain/enum types (arrdomain, casetestenum), the
+    # tattle() test function (CREATE FUNCTION), composite-column
+    # inserts (inserttest/inserttestb f3), and varbit (unsupported).
+    (r"(?is)^(?!\s*create\s+(or\s+replace\s+)?function\b)"
+     r"(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!.*\bmake_ad\b)(?!.*\barrdomain\b)"
+     r"(?!.*\bcasetestenum\b)(?!.*\benum_range\b)"
+     r"(?!.*\btattle\b)(?!.*\bunnest\s*\()"
+     r"(?!.*\binserttest\w*\b)"
+     r"(?!.*\bvarbit\b)"
+     r"(?!.*\(\s*select\s+array\b)"
+     r"(?!.*\barray\s*\[[^\]]*\]\s*\)\s*\[)"
+     r".*\barray\s*\[",
+     "v1.11: array[...] literal supported"),
+    # v1.11: row(...) constructors are supported (record values, record
+    # comparison, row-valued subqueries, VALUES/UNION/INTERSECT/EXCEPT
+    # with record columns). Excludes: varbit (unsupported type),
+    # CREATE TYPE composites (t_rec, ct1), whole-row Vars (row(x.*)),
+    # SQL-function callees (mki8, mki4), and composite-column inserts
+    # (inserttest/inserttestb).
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r"(?!.*\bvarbit\b)(?!.*\bt_rec\b)(?!.*\bct1\b)"
+     r"(?!.*\brow\s*\(\s*\w+\.\*\s*\))(?!.*\bmki[84]\b)"
+     r"(?!.*\binserttest\w*\b)"
+     r".*\brow\s*\(",
+     "v1.11: row() constructor supported"),
+    # v1.12: zero-target-list SELECT is supported (PG19 gram.y
+    # opt_target_list may be empty in any simple SELECT): `SELECT;`,
+    # `SELECT FROM ...`, including through UNION/INTERSECT/EXCEPT and
+    # CTEs — the executor produces genuine zero-column rows. Excludes:
+    # EXPLAIN (stays masked), CREATE FUNCTION bodies.
+    (r"(?is)^(?!\s*create\s+(or\s+replace\s+)?function\b)"
+     r"(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r".*(\bselect\s+from\b|\bselect\s+(union|intersect|except)\s+select\b)",
+     "v1.12: zero-target-list SELECT supported"),
+    # v1.15: quote_ident/quote_literal/quote_nullable are supported
+    # (PG19 quote.c semantics: E'' syntax on backslash, keyword-aware
+    # identifier quoting). The narrow quote_*() mask is removed; any
+    # statement using these functions must pass.
+    (r"(?i)\bquote_(ident|literal|nullable)\s*\(",
+     "v1.15: quote_*() supported"),
+    # v1.16: declarative partitioning is supported (RANGE/LIST/HASH,
+    # expression keys, defaults, multilevel routing, ATTACH, parent
+    # UPDATE/DELETE, ON CONFLICT, triggers during routing). The four
+    # broad "declarative partitioning unsupported" masks are removed;
+    # any statement using these DDL shapes must pass. Excludes:
+    # EXPLAIN (stays masked), and statements that fail for unrelated
+    # reasons (they classify under their own masks, e.g. the v1.13
+    # pg_attribute/CTE-DML residuals).
+    (r"(?is)^(?!\s*(?:--[^\n]*\n\s*)*explain\b)(?!.*\bexplain\b)"
+     r".*(\bpartition\s+by\b|\battach\s+partition\b"
+     r"|\bpartition\s+of\b|\bfor\s+values\s+(in|from|with)\b)",
+     "v1.16: declarative partitioning supported"),
+    # v1.23: PG19 FigureColnameInternal names a subscript/slice over a
+    # parenthesized array expression after the operand (`(SELECT
+    # ARRAY[1,2,3])[1]`, `(array[1,2])[(SELECT ...)]` -> `array`). The
+    # v1.11 array override explicitly excludes these shapes; they are
+    # now genuinely supported and must pass.
+    (r"(?i)\(\s*(select\s+)?array\s*\[[^\]]*\]\)+\s*\[",
+     "v1.23: subscript over parenthesized array[...] supported"),
+    # v1.25: PG19 width_bucket_float8 (float.c) computes in float64 —
+    # the all-float8 overload now takes the verbatim port. The
+    # 1.797e+308/5e-324 LATERAL overflow statement (numeric.sql:946)
+    # must pass; the v1.10 mask below is retired.
+    (r"(?is)\bwidth_bucket\s*\(\s*oper\s*,\s*low\s*,\s*high\s*,\s*cnt\s*\)"
+     r".*\b1\.797e\+308::float8",
+     "v1.25: width_bucket float8 overload supported"),
+    # v1.45: useless-LEFT-JOIN removal (simple case) — the planner now
+    # drops `L LEFT JOIN R ON L.c = R.id` when R.id is unique and R is
+    # unreferenced, so these EXPLAIN (COSTS OFF) statements genuinely pass.
+    # Narrowly scoped to the three corpus statements verified against the
+    # PG19 .out oracles (join.sql "test join removal" block + partitioned
+    # table case); the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+(a|b)\.\*\s+from\s+(a|b)\s+left\s+join\s+"
+     r"(b|c|parted_b)(\s+pb)?\s+on\s+\w+\.\w+\s*=\s*\w+\.id\s*;?\s*$",
+     "v1.45: simple useless LEFT JOIN removed"),
+    # v1.60: immutable-function const-fold pullup — the planner now folds
+    # `f_immutable_int4(1)` (IMMUTABLE, constant args) at plan time
+    # (PG19 `simplify_function`) and pulls the constant up out of the
+    # function scan (PG19 `pull_up_constant_function`), so the const-false
+    # qual plans as `Result` + `Replaces:` + `One-Time Filter: false`.
+    # Narrowly scoped to the single join.out corpus statement verified
+    # against the PG19 oracle; the EXPLAIN-with-options mask stays for
+    # the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+unique1\s+from\s+tenk1\s*,\s*f_immutable_int4\s*\(\s*1\s*\)"
+     r"\s+x\s+where\s+x\s*=\s*42\s*;?\s*$",
+     "v1.60: immutable function-scan const pullup"),
+    # v1.61: redundant-DISTINCT LIMIT 1 — PG19 `create_distinct_paths`
+    # (planner.c:5394-5416) plans `LIMIT 1` instead of `Unique` when every
+    # DISTINCT key is provably single-valued (here: `four = 0` pins the
+    # column, `1,2,3` are literals). Narrowly scoped to the two
+    # select_distinct.sql corpus statements verified byte-exact against
+    # the PG19 oracle (the `AND two <> 0` variant has an additional
+    # pre-existing Filter-conjunct-order divergence); the
+    # EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+distinct\s+four\s*(,\s*1\s*,\s*2\s*,\s*3\s*)?"
+     r"from\s+tenk1\s+where\s+four\s*=\s*0\s*;?\s*$",
+     "v1.61: redundant DISTINCT keys plan as LIMIT 1"),
+    # v1.62: tiny-table SeqScan choice — PG19's cost model (costsize.c)
+    # never picks an index scan on a single-page relation (the index
+    # path's I/O floor is one random_page_cost plus the index descent
+    # vs one seq_page_cost for the seq scan), so `plan_access_path`
+    # now forces SeqScan when the table's heap fits in one page.
+    # Narrowly scoped to the four join.sql corpus statements verified
+    # against the PG19 .out oracle. v1.63: the two nestloop side-swap
+    # siblings (t3/t4) now match the oracle byte-exactly — cost-based
+    # side selection (`pg_nestloop_swap`, cost_nestloop parity) puts the
+    # selective side outer — not just as multisets. The fifth sibling
+    # (q0/sl) additionally needs cost-based join reordering, out of
+    # scope; the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"(?:select\s+\*\s+from\s+sj\s+j1\s*,\s*sj\s+j2\s+where\s+"
+     r"j1\.b\s*=\s*j2\.b\s+and\s+(?:j1\.a\s*=\s*2(\s+and\s+j2\.a\s*=\s*3)?|2\s*=\s*j2\.a)"
+     r"|select\s+n2\.a\s+from\s+sj\s+n1\s*,\s*sj\s+n2\s+where\s+"
+     r"n1\.a\s*<>\s*n2\.a\s+and\s+n2\.a\s*=\s*1)"
+     r"\s*;?\s*$",
+     "v1.62: single-page table forces SeqScan over IndexScan"),
+    # v1.64: cost-based hash-vs-nestloop choice — PG19's `cost_hashjoin`
+    # vs `cost_nestloop` (`add_paths_to_joinrel` picks the cheaper;
+    # `STD_FUZZ_FACTOR` 1.01 near-tie fails closed to nestloop). The
+    # choice rule (`pg_hashjoin_cost_order`) picks hash only when
+    # provably cheaper, with the filtered side probing (outer) per PG's
+    # empirical order. USING quals are built per PG19's
+    # `transformJoinUsingClause` (`lvar = rvar`). Narrowly scoped to the
+    # two subselect.sql corpus statements verified byte-exact against
+    # the PG19 oracle; the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+c\.unique1\s*,\s*c\.ten\s+from\s+tenk1\s+c\s+"
+     r"join\s+onek\s+a\s+using\s*\(\s*ten\s*\)\s+where\s+"
+     r"[ac]\.ten\s+in\s*\(\s*values\s*\(\s*1\s*\)\s*,\s*"
+     r"\(\s*2\s*\)\s*\)\s*;?\s*$",
+     "v1.64: hash-vs-nestloop choice with USING quals"),
+    # v1.65: 3-way cross-join reordering — PG19 `standard_join_search`
+    # miniature (the v1.50/v1.54 pullup already flattens q0; `q0.a = 1`
+    # pushes to n2's scan; the reorder builds ((sl⋈n2)⋈n1)) plus PG19
+    # `show_scan_qual` Filter prefixing (`useprefix =
+    # IsA(SubqueryScan) || verbose`, so the pushed-down Filter renders
+    # unqualified). Narrowly scoped to the single join.sql corpus
+    # statement verified byte-exact against the PG19 .out oracle; the
+    # EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+\*\s+from\s*\(\s*select\s+n2\.a\s+from\s+sj\s+n1\s*,\s*sj\s+n2\s+"
+     r"where\s+n1\.a\s*<>\s*n2\.a\s*\)\s*q0\s*,\s*sl\s+"
+     r"where\s+q0\.a\s*=\s*1\s*;?\s*$",
+     "v1.65: 3-way cross-join reorder + unqualified pushed-down Filter"),
+]
 EXPECTED_FAIL_PATTERNS = [
+    # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
+    # override explicitly excludes them so they classify here, not as
+    # REAL-FAIL).
+    # v1.27: the parenthesized-setop-in-LATERAL mask is retired — PG19
+    # `select_with_parens` is now parsed in FROM/LATERAL (parse_from_primary
+    # probes `paren_has_top_level_setop`), so the corpus statement passes.
+    (r"(?is)\bint8_tbl\s+x\s+cross\s+join\s*\(\s*int4_tbl\s+x\b.*\blateral\b",
+     "v1.10: ambiguous table reference in LATERAL not detected"),
+    (r"(?is)\blateral\b\s*\(\s*select\b[^;]*\b(max|min|sum|avg|count)\s*\(",
+     "v1.10: aggregate in LATERAL at own query level not rejected"),
+    # v1.25: the width_bucket float8-precision mask is retired — the
+    # all-float8 overload is supported (see EXPECTED_PASS_OVERRIDES).
+    (r"(?is)\blateral\b\s*\(\s*values\s*\(\s*\w+\.\*\s*\)",
+     "v1.10: row wildcard (n.*) in LATERAL VALUES unsupported"),
+    (r"(?is)\blateral\b\s*\(\s*with\s+recursive\b",
+     "v1.10: WITH RECURSIVE in LATERAL unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?function\b", "CREATE FUNCTION (procedural languages) unsupported"),
+    # v1.02: ALTER FUNCTION was never in the grammar (honest 42601);
+    # previously masked by the cascade guard because CREATE FUNCTION
+    # tattle() itself failed (RAISE unsupported in plpgsql bodies).
+    # Now that the CREATE succeeds, classify the pre-existing gap
+    # honestly instead of as a new REAL-FAIL.
+    # v1.09: ALTER FUNCTION ... {VOLATILE|STABLE|IMMUTABLE} is now
+    # supported (see EXPECTED_PASS_OVERRIDES); this mask remains for
+    # other actions (STRICT, COST, SET, OWNER TO, RENAME).
+    (r"(?is)^\s*alter\s+function\b", "ALTER FUNCTION unsupported"),
     (r"^\s*create\s+(or\s+replace\s+)?procedure\b", "CREATE PROCEDURE unsupported"),
     (r"^\s*create\s+aggregate\b", "CREATE AGGREGATE unsupported"),
     (r"^\s*create\s+operator\b", "CREATE OPERATOR unsupported"),
     (r"^\s*create\s+trigger\b", "CREATE TRIGGER unsupported"),
     (r"^\s*create\s+extension\b", "CREATE EXTENSION unsupported"),
     (r"^\s*create\s+tablespace\b", "CREATE TABLESPACE unsupported"),
-    (r"^\s*create\s+table\b.*\bpartition\s+by\b", "declarative partitioning unsupported"),
-    (r"\battach\s+partition\b", "declarative partitioning unsupported"),
-    (r"\bpartition\s+of\b", "declarative partitioning unsupported"),
-    (r"\bfor\s+values\s+in\b", "declarative partitioning unsupported"),
+    # v1.16: the four "declarative partitioning unsupported" masks are
+    # removed; partitioning is supported (see EXPECTED_PASS_OVERRIDES).
     (r"^\s*do\b", "DO blocks (plpgsql) unsupported"),
     (r"^\s*listen\b|^\s*notify\b|^\s*unlisten\b", "LISTEN/NOTIFY unsupported"),
     (r"^\s*copy\b", "COPY TO/FROM stdout not covered by this harness"),
     (r"^\s*vacuum\s+full\b", "VACUUM FULL unsupported"),
-    (r"^\s*set\b", "SET unsupported"),
-    (r"^\s*show\b", "SHOW unsupported"),
-    (r"^\s*reset\b", "RESET unsupported"),
-    (r"::\s*regclass\b|::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
+    # v1.07: SET/SHOW/RESET are supported (generic validated GUCs,
+    # transaction characteristics, ROLE). The broad masks are removed;
+    # genuinely unsupported parameters surface as 42704 (like PG).
+    # v1.13: ::regclass is supported (tableoid::regclass, 'name'::regclass);
+    # regproc/regtype/regnamespace remain masked.
+    (r"::\s*regproc\b|::\s*regtype\b|::\s*regnamespace\b",
      "reg* pseudotypes unsupported"),
     (r"\bcurrent_setting\s*\(", "current_setting() unsupported"),
-    (r"\btableoid\b", "tableoid system column unsupported"),
+    # v1.13: tableoid system column is supported; mask removed.
+    # Narrow residuals (not tableoid issues):
+    # - pg_relation_size estimate differs from PG's exact page count
+    (r"pg_size_pretty\s*\(\s*pg_relation_size",
+     "pg_relation_size estimate differs from PG"),
+    # - pg_attribute attnum after DROP/ADD COLUMN (catalog fidelity)
+    (r"from\s+pg_attribute\s+where\s+attname",
+     "pg_attribute attnum catalog fidelity"),
+    # - CTE DML with INSERT...RETURNING (parsing, 42601)
+    (r"with\s+\w+\s*\([^)]*\)\s+as\s*\(\s*insert\s+into\s+mlparted",
+     "CTE DML INSERT...RETURNING parsing"),
+    # - toast reltoastrelid::regclass with \gset (psql meta-command)
+    (r"reltoastrelid::regclass",
+     "toast reltoastrelid::regclass \\gset"),
     (r"\bxmin\b|\bxmax\b", "xmin/xmax system columns unsupported"),
     # v0.46: generate_series(int/int8/numeric) is supported as a
     # FROM-clause table function, including implicit LATERAL
@@ -692,9 +1056,13 @@ EXPECTED_FAIL_PATTERNS = [
     # timestamp/timestamptz variants, and empty SELECT lists.
     (r"(?i)\bgenerate_series\s*\([^)]*::\s*(timestamp|timestamptz)\b",
      "generate_series() timestamp variant unsupported"),
+    # v1.12: EXPLAIN of a zero-target-list SELECT stays masked — EXPLAIN
+    # itself is unsupported (the 522-statement EXPLAIN cluster), not the
+    # empty select list. Must precede the generic select-from mask below.
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\b.*\bselect\s+from\b",
+     "v1.12: EXPLAIN of zero-target-list SELECT unsupported"),
     (r"(?i)\bselect\s+from\b", "empty SELECT list unsupported"),
     (r"\bgen_random_uuid\s*\(", "gen_random_uuid() unsupported"),
-    (r"\bquote_ident\s*\(|\bquote_literal\s*\(", "quote_*() unsupported"),
     (r"\bOVER\s*\(", "window functions in this construct unsupported"),
     (r"\bWITH\s+ORDINALITY\b", "WITH ORDINALITY unsupported"),
     (r"\bTABLESAMPLE\b", "TABLESAMPLE unsupported"),
@@ -702,16 +1070,27 @@ EXPECTED_FAIL_PATTERNS = [
     (r"\bIS\s+NOT\s+DISTINCT\s+FROM\b", "IS NOT DISTINCT FROM unsupported"),
     (r"\bNULLS\s+(FIRST|LAST)\b", "NULLS FIRST/LAST unsupported"),
     # --- v0.14: pg_regress conformance gaps (honest EXPECTED-FAILs) ---
-    (r"(?is)^\s*explain\s*\(", "EXPLAIN with (option, ...) syntax unsupported"),
+    # v1.10: also mask EXPLAIN statements with leading -- comments (the
+    # corpus has many; the ^ anchor alone misses them).
+    (r"(?is)^\s*(?:--[^\n]*\n\s*)*explain\s*\(", "EXPLAIN with (option, ...) syntax unsupported"),
     # v0.52: SELECT DISTINCT ON is implemented (PG19 Unique-under-sort
     # semantics); the mask is removed so the corpus statements are
     # exercised. The EXPLAIN variants above stay masked; the
     # ROW()-constructor variants below classify under row().
     (r"(?is)^\s*create\s+rule\b", "CREATE RULE unsupported"),
     (r"(?is)^\s*drop\s+rule\b", "DROP RULE unsupported"),
-    (r"(?i)\b(all|any|some)\s*\(\s*select\b", "= ALL/ANY/SOME (subquery) unsupported"),
-    (r"\(\s*\w+(\s*,\s*\w+)+\s*\)\s*(not\s+)?in\s*\(\s*select\b",
-     "row-wise IN (subquery) unsupported"),
+    # v1.28: the `= ALL/ANY/SOME (subquery)` mask is retired — the
+    # quantified-comparison semantics shipped via `eval_quantified` and the
+    # v1.28 corpus scan found zero failing hits under it (the 14 matches
+    # either pass or classify under earlier masks: EXPLAIN, row()).
+    # v1.27: narrowed — the old `\b(all|any|some)\s*\(\s*select` also
+    # matched `UNION ALL (SELECT ...)` setop shapes (a false positive;
+    # those now parse per PG19 `select_with_parens`). A quantified
+    # comparison always has a comparison operator before ALL/ANY/SOME.
+    # v1.27: the row-wise-IN mask is retired — the remaining corpus
+    # statement (`(f1,f1) IN (SELECT f1, generate_series(...) ... GROUP BY
+    # f1)`) passes now that target-list SRFs fan out over grouped rows
+    # (PG19 ProjectSet above Agg).
     # v0.54: zero-column tables (CREATE TABLE t(); INSERT ... DEFAULT
     # VALUES) are not supported; the following LATERAL test is already
     # masked separately.
@@ -723,14 +1102,15 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)\bshipped_view\b", "depends on CREATE RULE (unsupported)"),
     # v0.54: inheritance (`FROM person*`) is unsupported; the person tables
     # themselves are never created (PG's test_setup.sql builds them via
-    # CREATE TABLE ... INHERITS). sillysrf is an SQL-language SRF whose
-    # CREATE FUNCTION is masked above — its SELECTs fail only because the
-    # function was never created.
+    # CREATE TABLE ... INHERITS).
+    # v1.09: sillysrf is now supported (SQL SRF + targetlist expansion);
+    # the old mask is removed and the override above requires it to pass.
     (r"(?i)\bperson\s*\*", "table inheritance (FROM tbl*) unsupported"),
-    (r"(?i)\bsillysrf\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.55: vol()/volfoo() are plpgsql functions whose CREATE FUNCTION
     # is masked above — their CASE-test SELECTs fail only because the
-    # functions were never created.
+    # functions were never created. (v0.97: bounded single-RETURN
+    # plpgsql bodies are now supported, so these entries are dormant
+    # for vol/volfoo; they remain for richer plpgsql bodies.)
     (r"(?i)\bvol\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     (r"(?i)\bvolfoo\s*\(", "depends on CREATE FUNCTION (unsupported)"),
     # v0.55: no constant-expression folding pass — PG folds `1/0` in a
@@ -748,9 +1128,9 @@ EXPECTED_FAIL_PATTERNS = [
     (r"(?i)^\s*create\s+type\b", "CREATE TYPE unsupported"),
     (r"(?i)^\s*select\s*;\s*$", "empty SELECT list unsupported"),
     (r"(?i)\bselect\s+(union|intersect|except)\s+select\b", "empty SELECT list unsupported"),
-    # v0.45: format() is supported, but VARIADIC array form needs array
-    # literal/coercion support not yet implemented.
-    (r"(?i)\bformat\s*\([^)]*\bvariadic\b", "format() with VARIADIC array unsupported"),
+    # v1.24: the v0.45 format()+VARIADIC mask is removed — VARIADIC
+    # arrays are supported since v0.90, and PG19 text_format() treats a
+    # NULL VARIADIC array as zero arguments (varlena.c).
     (r"(?i)\blateral\b", "LATERAL joins unsupported"),
     (r"(?i)\bunnest\s*\(", "unnest() unsupported"),
     (r"\)\s*\[", "subscript on subquery/expression result unsupported"),
@@ -795,6 +1175,11 @@ def classify_expected_fail(stmt):
     # v0.14: UNION inside WITH RECURSIVE is genuinely supported; only
     # top-level / subquery UNION is an honest EXPECTED-FAIL.
     # v0.14: UPDATE ... FROM is a real grammar gap (not a subquery FROM).
+    # v1.09: statements in EXPECTED_PASS_OVERRIDES are genuinely
+    # supported now; they must NOT be classified as expected-fail.
+    for pat, _reason in EXPECTED_PASS_OVERRIDES:
+        if re.search(pat, stmt, re.IGNORECASE | re.DOTALL):
+            return None
     if re.match(r"(?is)^\s*update\b", stmt) and _top_level_from(stmt):
         return "UPDATE ... FROM unsupported"
     has_recursive = re.search(r"(?is)\bwith\s+recursive\b", stmt) is not None
@@ -808,11 +1193,9 @@ def classify_expected_fail(stmt):
 # conformance data volumes (they wedge the server past STMT_TIMEOUT).
 # EXPECTED-FAIL without executing; the engine gap is real and documented.
 TOO_SLOW_PATTERNS = [
-    (
-        r"\bin\s*\(\s*select\b.*\bfrom\s+tenk1\b",
-        "too slow: IN-subquery over tenk1 re-runs per outer row O(n^2); "
-        "needs a hashed subplan like PostgreSQL",
-    ),
+    # v1.19: IN-subquery hashed path (eval_hashed_in, v0.86/v0.87) now
+    # executes these in O(n); the pre-hashed-path mask is obsolete.
+    # (was: r"\bin\s*\(\s*select\b.*\bfrom\s+tenk1\b")
     (
         r"\bfrom\b[^;]*\btenk1\b[^;]*,\s*tenk1\b",
         "too big: 10k x 10k cartesian product materializes in memory (OOM); "
@@ -869,7 +1252,32 @@ def _tenk_setup(stmts, tables):
         _load_data_table(stmts, tbl, "tenk.data", 10000)
 
 
-def setup_statements(need_tenk, need_onek):
+def _load_road_table(stmts):
+    """Append DDL + chunked INSERTs loading PG's authentic road table.
+
+    PG's test_setup.sql creates road(name text, thepath path) from
+    data/streets.data (5124 rows, 2911 distinct names). rustgres has no
+    geometric path type, so thepath is stored as text — the conformance
+    queries only touch `name`, and the authentic names are what the
+    expected counts (2911) depend on.
+    """
+    stmts.append("CREATE TABLE road (name text, thepath text)")
+    with open(os.path.join(DATA, "streets.data"), encoding="utf-8") as f:
+        rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+    assert len(rows) == 5124, "streets.data row count changed: %d" % len(rows)
+    assert all(len(r) == 2 for r in rows), "streets.data column count changed"
+    for i in range(0, len(rows), 500):
+        chunk = rows[i : i + 500]
+        vals = []
+        for name, thepath in chunk:
+            n = "'" + name.replace("'", "''") + "'"
+            p = "'" + thepath.replace("'", "''") + "'"
+            vals.append("(%s,%s)" % (n, p))
+        stmts.append("INSERT INTO road (name, thepath) VALUES " + ",".join(vals))
+    stmts.append("VACUUM road")
+
+
+def setup_statements(need_tenk, need_onek, need_road):
     stmts = [
         "CREATE TABLE CHAR_TBL(f1 char(4))",
         "INSERT INTO CHAR_TBL (f1) VALUES ('a'), ('ab'), ('abcd'), ('abcd    ')",
@@ -897,6 +1305,19 @@ def setup_statements(need_tenk, need_onek):
         "CREATE TABLE VARCHAR_TBL(f1 varchar(4))",
         "INSERT INTO VARCHAR_TBL (f1) VALUES ('a'), ('ab'), ('abcd'), ('abcd    ')",
         "VACUUM VARCHAR_TBL",
+        # v0.88: join.sql's "proven-dummy append rels" test needs b_star.
+        # PG's create_misc.sql builds it as
+        #   CREATE TABLE a_star (class char, a int4);
+        #   CREATE TABLE b_star (b text) INHERITS (a_star);
+        #   ALTER TABLE b_star RENAME b TO bb;
+        #   ALTER TABLE a_star RENAME a TO aa;
+        # rustgres does not implement table inheritance, so the harness
+        # creates the flattened post-rename shape directly as a plain
+        # table. The test only checks the planner copes with the empty
+        # right side (the predicate `bb < bb AND bb IS NULL` can never
+        # match), so no inheritance semantics are needed.
+        "CREATE TABLE b_star (class char, aa int4, bb text)",
+        "VACUUM b_star",
     ]
     if need_tenk:
         _tenk_setup(stmts, ("tenk1", "tenk2"))
@@ -905,6 +1326,8 @@ def setup_statements(need_tenk, need_onek):
     if need_onek:
         _load_data_table(stmts, "onek", "onek.data", 1000)
         stmts.append("CREATE TABLE onek2 AS SELECT * FROM onek")
+    if need_road:
+        _load_road_table(stmts)
     return stmts
 
 
@@ -918,6 +1341,86 @@ class Verdict:
         self.status = status  # PASS | EXPECTED-FAIL | REAL-FAIL | SKIP
         self.detail = detail
 
+
+def has_top_level_order_by(stmt):
+    """v0.95: detect ORDER BY at the top query level only, ignoring
+    nested parentheses, string literals, comments, and dollar-quoted
+    bodies. The old regex matched ORDER BY inside subqueries, causing
+    false ordered-comparison failures."""
+    i = 0
+    n = len(stmt)
+    depth = 0
+    while i < n:
+        c = stmt[i]
+        # Skip single-quoted strings ('' escapes)
+        if c == "'":
+            i += 1
+            while i < n:
+                if stmt[i] == "'":
+                    if i + 1 < n and stmt[i+1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        # Skip double-quoted identifiers ("" escapes)
+        if c == '"':
+            i += 1
+            while i < n:
+                if stmt[i] == '"':
+                    if i + 1 < n and stmt[i+1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        # Skip line comments
+        if c == '-' and i + 1 < n and stmt[i+1] == '-':
+            i += 2
+            while i < n and stmt[i] != '\n':
+                i += 1
+            continue
+        # Skip block comments
+        if c == '/' and i + 1 < n and stmt[i+1] == '*':
+            i += 2
+            while i + 1 < n and not (stmt[i] == '*' and stmt[i+1] == '/'):
+                i += 1
+            i += 2
+            continue
+        # Skip dollar-quoted strings ($tag$...$tag$)
+        if c == '$':
+            j = i + 1
+            while j < n and (stmt[j].isalnum() or stmt[j] == '_'):
+                j += 1
+            if j < n and stmt[j] == '$':
+                tag = stmt[i:j+1]
+                k = stmt.find(tag, j + 1)
+                if k != -1:
+                    i = k + len(tag)
+                    continue
+            i += 1
+            continue
+        # Track paren depth
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth = max(0, depth - 1)
+        # Check for ORDER BY at depth 0
+        if depth == 0 and (c == 'o' or c == 'O'):
+            # Check if we're at a word boundary and match "order by"
+            if i == 0 or not (stmt[i-1].isalnum() or stmt[i-1] == '_'):
+                j = i + 5
+                if stmt[i:j].lower() == 'order' and j < n and not (stmt[j].isalnum() or stmt[j] == '_'):
+                    # Skip whitespace, check for "by"
+                    k = j
+                    while k < n and stmt[k] in ' \t\n\r':
+                        k += 1
+                    if stmt[k:k+2].lower() == 'by' and (k+2 >= n or not (stmt[k+2].isalnum() or stmt[k+2] == '_')):
+                        return True
+        i += 1
+    return False
 
 def compare(stmt, expected, actual, null_display):
     """Compare expected vs actual wire result. Returns Verdict."""
@@ -1011,7 +1514,7 @@ def compare(stmt, expected, actual, null_display):
                     return False
             return True
 
-        ordered = bool(re.search(r"\border\s+by\b", stmt, re.IGNORECASE))
+        ordered = has_top_level_order_by(stmt)
         if ordered:
             ok = len(exp_rows) == len(act_rows) and all(
                 row_ok(e, a) for e, a in zip(exp_rows, act_rows)
@@ -1041,6 +1544,85 @@ def compare(stmt, expected, actual, null_display):
         )
 
     return Verdict("SKIP", "unknown expected kind")
+
+
+def parse_expected_blocks(lines, pos, null_display):
+    """Parse every result block pg_regress shows for one (possibly
+    multi-statement) Query: repeated table/ERROR blocks, in order. A lone
+    utility statement yields [Expected('noresult')]. Stops at the first
+    parse that finds no block (the next statement's echo or a comment).
+    Returns (blocks, new_pos).
+    """
+    blocks = []
+    while True:
+        exp, new_pos = parse_expected_block(lines, pos, null_display)
+        if exp.kind == "noresult":
+            if not blocks:
+                blocks.append(exp)
+            pos = new_pos
+            break
+        blocks.append(exp)
+        pos = new_pos
+    return blocks, pos
+
+
+def is_quiet_set(s):
+    """A result set pg_regress shows nothing for: a bare command tag
+    with no RowDescription, no rows, and no error. An empty SELECT is
+    NOT quiet — pg_regress shows its table header plus "(0 rows)".
+    v1.12: a zero-column SELECT emits RowDescription with 0 fields
+    (saw_desc), so it is never quiet even with zero rows/columns."""
+    return not s["err_codes"] and not s["rows"] and not s["saw_desc"]
+
+
+def compare_multi(stmt, expected_blocks, sets, null_display):
+    """Compare one (possibly multi-statement) Query's expected blocks
+    against its actual result sets, in order. pg_regress omits command
+    tags, so quiet utility sets are skipped when aligning blocks; any
+    leftover row-producing or erroring set is a mismatch.
+    """
+    si = 0
+    for exp in expected_blocks:
+        if exp.kind == "noresult":
+            # Utility statement: pg_regress expects no output. Consume
+            # its quiet command-tag sets; an erroring set is the
+            # utility's own failure — apply the single-statement rule.
+            while si < len(sets) and is_quiet_set(sets[si]):
+                si += 1
+            if si < len(sets) and sets[si]["err_codes"]:
+                code = sets[si]["err_codes"][0]
+                reason = classify_expected_fail(stmt)
+                if reason:
+                    return Verdict("EXPECTED-FAIL", reason + " [sqlstate %s]" % code)
+                return Verdict("REAL-FAIL", "expected success, got SQLSTATE %s" % code)
+            continue
+        while si < len(sets) and is_quiet_set(sets[si]):
+            si += 1
+        if si >= len(sets):
+            reason = classify_expected_fail(stmt)
+            if reason:
+                return Verdict("EXPECTED-FAIL", reason)
+            return Verdict(
+                "REAL-FAIL",
+                "fewer result sets than expected (%d < %d)"
+                % (len(sets), len(expected_blocks)),
+            )
+        v = compare(stmt, exp, sets[si], null_display)
+        if v.status != "PASS":
+            return v
+        si += 1
+    for s in sets[si:]:
+        if not is_quiet_set(s):
+            reason = classify_expected_fail(stmt)
+            detail = "unexpected extra result set (tag=%r rows=%d%s)" % (
+                s["tag"],
+                len(s["rows"]),
+                (" err=%s" % ",".join(s["err_codes"])) if s["err_codes"] else "",
+            )
+            if reason:
+                return Verdict("EXPECTED-FAIL", reason + " [%s]" % detail)
+            return Verdict("REAL-FAIL", detail)
+    return Verdict("PASS")
 
 
 class ServerWedged(Exception):
@@ -1132,7 +1714,11 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
         pos = idx + len(stmt)
         # convert char pos to the line AFTER the statement echo
         line_pos = out_text.count("\n", 0, pos) + 1
-        expected, new_line_pos = parse_expected_block(out_lines, line_pos, null_display)
+        # v1.04: one Query can carry several statements (psql `\;`);
+        # parse every result block pg_regress shows for it, in order.
+        expected_blocks, new_line_pos = parse_expected_blocks(
+            out_lines, line_pos, null_display
+        )
         pos = sum(len(l) + 1 for l in out_lines[:new_line_pos])
 
         # cascade guard: statement touches an object that failed to create
@@ -1178,28 +1764,41 @@ def run_test(conn, name, need_tenk, verbose=False, skip_stmts=None):
                 exec_stmt += ";"
 
         try:
-            actual = conn.q(exec_stmt)
+            # v1.04: psql sends `\;`-joined statements as ONE Query with
+            # the backslashes removed; unescape to the exact bytes psql
+            # would send (the .out echo keeps the raw `\;`).
+            actual = conn.q(psql_unescape(exec_stmt))
         except socket.timeout as e:
             raise ServerWedged(stmt, "ran past %ds timeout" % STMT_TIMEOUT)
         except (WireError, OSError) as e:
             raise ServerWedged(stmt, "connection died during execution: %r" % e)
 
-        if gset is not None and not actual["err_codes"] and actual["rows"]:
+        if gset is not None and not actual["err_codes"]:
             # psql \gset: first row only; NULL unsets the variable.
-            for cname, cval in zip(actual["colnames"], actual["rows"][0]):
-                vname = gset + cname
-                if cval is None:
-                    psql_vars.pop(vname, None)
-                else:
-                    psql_vars[vname] = cval
+            if actual["rows"]:
+                for cname, cval in zip(actual["colnames"], actual["rows"][0]):
+                    vname = gset + cname
+                    if cval is None:
+                        psql_vars.pop(vname, None)
+                    else:
+                        psql_vars[vname] = cval
+            # v1.42: psql's \gset consumes the query result (it is
+            # stored into variables, not displayed), so drop the result
+            # sets before comparing against the noresult expectation.
+            # Without this, compare_multi reports "unexpected extra
+            # result set" for a correctly-executed \gset.
+            actual["sets"] = []
 
-        if casc and (actual["err_codes"] or expected.kind == "error"):
+        if casc and (
+            actual["err_codes"]
+            or any(b.kind == "error" for b in expected_blocks)
+        ):
             results.append(
                 (stmt, Verdict("EXPECTED-FAIL", "cascade: %s failed earlier" % casc))
             )
             continue
 
-        v = compare(stmt, expected, actual, null_display)
+        v = compare_multi(stmt, expected_blocks, actual["sets"], null_display)
         # track failed CREATEs for the cascade guard
         if v.status in ("REAL-FAIL", "EXPECTED-FAIL") and re.match(
             r"(?is)^\s*create\s+(?:table\s+)?(\w+)", stmt
@@ -1236,15 +1835,16 @@ def main():
         print("missing %s; run `cargo build` first" % BIN)
         return 2
 
-    tests = [(n, t, o) for n, t, o in TESTS if only is None or n in only]
+    tests = [(n, t, o, r) for n, t, o, r in TESTS if only is None or n in only]
     server = Server()
     server.start()
     all_results = {}
-    need_tenk_any = any(t for _, t, _ in tests)
-    need_onek_any = any(o for _, _, o in tests)
+    need_tenk_any = any(t for _, t, _, _ in tests)
+    need_onek_any = any(o for _, _, o, _ in tests)
+    need_road_any = any(r for _, _, _, r in tests)
 
     def run_setup(c):
-        setup = setup_statements(need_tenk_any, need_onek_any)
+        setup = setup_statements(need_tenk_any, need_onek_any, need_road_any)
         print("setup: %d statements ..." % len(setup), flush=True)
         t0 = time.time()
         for s in setup:
@@ -1256,7 +1856,7 @@ def main():
 
     wedged = {}  # stmt -> reason: kills the connection; skip on retry
     try:
-        for name, need_tenk, need_onek in tests:
+        for name, need_tenk, need_onek, need_road in tests:
             # pg_regress runs each file in its own psql session. Use a fresh
             # server+connection per suite so one file's abandoned transaction
             # state (e.g. transactions.sql's last test) cannot poison the next

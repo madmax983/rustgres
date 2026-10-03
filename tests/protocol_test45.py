@@ -125,9 +125,13 @@ def main():
             ("SELECT format('Hello %x', 20);", None, "22023", "bad specifier"),
             ("SELECT format('%0$s', 'a');", None, "22023", "arg 0"),
             ("SELECT format('Hello %', 'a');", None, "22023", "unterminated"),
-            # Bool in format() is true/false (not t/f)
-            ("SELECT format('%s', true);", [["true"]], None, "bool true"),
-            ("SELECT format('%s', false);", [["false"]], None, "bool false"),
+            # v1.24: Bool in format() uses the type output function
+            # (PG19 varlena.c text_format_string_conversion ->
+            # OutputFunctionCall): bool renders t/f, not true/false.
+            # Grounded in PG19's own text.out
+            # (format('%s, %s', variadic array[true, false]) -> 't, f').
+            ("SELECT format('%s', true);", [["t"]], None, "bool true"),
+            ("SELECT format('%s', false);", [["f"]], None, "bool false"),
         ]
 
         for sql, exp_rows, exp_code, desc in cases:

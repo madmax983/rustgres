@@ -2,6 +2,493 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compile_opts` recompiles every regexp pattern from scratch on every row — fix — 2026-10-01
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/regex.rs`: `compile_opts` (and `compile`, which forwards to it) now
+checks a thread-local cache, keyed by `(pattern text, case_insensitive,
+newline_sensitive, expanded)`, before parsing or codegen-ing anything. A
+hit returns an `Rc<Compiled>` clone (one refcount bump) instead of
+re-running the parser and compiler; a miss compiles exactly as before and
+inserts the result into the cache. The cache is bounded at 64 entries
+(matching the size PostgreSQL itself uses for its own regex cache,
+`backend/utils/adt/regexp.c`'s `MAX_CACHED_RES`) and clears itself
+outright rather than evicting LRU-style when that cap is hit, so a
+connection that compiles an unbounded number of distinct patterns (e.g.
+a pattern built per-row from a column value) cannot grow the cache
+without limit — it just stops benefiting from it, falling back to
+recompiling every time exactly as before today. Only successful compiles
+are cached; an invalid pattern still reports the same error on every
+call.
+
+`compile`/`compile_opts` return `Result<Rc<Compiled>, String>` instead of
+`Result<Compiled, String>`. Every one of the 14 call sites across
+`src/exec.rs` calls only `&self` methods on the result (`is_match`,
+`find_at`, `group_count`, …), and the 3 helper functions that take
+`re: &crate::regex::Compiled` as a parameter still compile unchanged —
+`&Rc<Compiled>` coerces to `&Compiled` at the call site via `Deref`. No
+other code needed to change.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_regexp.py --rows 2000 --count 20
+--timeout 600`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, two runs each,
+before and after, to confirm determinism):
+
+| run | Ir |
+|---|---|
+| before, run 1 | 9,465,290,559 |
+| before, run 2 | 9,465,341,834 |
+| after, run 1 | 8,470,038,003 |
+| after, run 2 | 8,470,014,807 |
+
+Before-run pair agrees to within 0.00054%; after-run pair agrees to
+within 0.00027% — both comfortably inside this repo's established
+callgrind-determinism band. Using the two-run averages (9,465,316,196.5
+before, 8,470,026,405 after): **-10.52%**, well past the ≥5%-of-profile
+floor.
+
+DHAT (same workload, one run each before/after — see the baseline entry
+below for how the 37.6%-of-bytes/33.2%-of-blocks share was attributed to
+this exact code path before the fix):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 361,987,577 | 226,830,197 | **-37.34%** |
+| Total blocks | 4,097,966 | 2,857,994 | **-30.26%** |
+
+The byte/block reduction (135,157,380 bytes, 1,239,972 blocks) tracks
+the baseline entry's attributed compile-path cost (136,000,000 bytes,
+1,360,000 blocks) closely — the small gap is the cache's own bookkeeping
+allocations (the `HashMap` entries and the handful of one-time compiles
+that still happen on a cache miss, one per distinct `(pattern, opts)`
+pair instead of once per row). Both the Ir floor (≥5%) and the DHAT
+floor (≥10% bytes or blocks) clear independently and by a wide margin.
+
+`cargo test --all-features`: 686/686 passed, unchanged. `cargo fmt --all
+-- --check`: clean. `cargo clippy --all-targets --all-features -- -D
+warnings`: 501 pre-existing errors on both the pre-change and
+post-change tree (confirmed via `git stash`, compared with a
+line-order-independent sorted diff since raw error counts/order are not
+stable across separate `cargo clippy` invocations on this tree) — the
+same toolchain/lint-version mismatch noted in every prior Bolt round in
+this file; zero new errors/warnings from this diff (a type-complexity
+lint on the cache's `HashMap` key was fixed by factoring it into a
+`type RegexCacheKey` alias, per clippy's own suggestion, before this
+count was taken). Regexp-specific protocol suites
+`tests/protocol_test19.py` (27/27), `tests/protocol_test24.py` (89/89),
+`tests/protocol_test31.py` (22/22), `tests/protocol_test32.py` (27/27),
+`tests/protocol_test34.py` (12/12), `tests/protocol_test38.py` (27/27),
+and `tests/protocol_test_v103_plpgsql_loops.py` (20/20, which exercises
+`regexp_replace` inside a plpgsql loop body) all pass unchanged.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.regexcache-{base,after}-2026-10-01`.
+
+**Reproduce**: apply the diff above to `src/regex.rs`, `cargo build`,
+then repeat the Callgrind/DHAT commands in the baseline entry's
+"Reproduce" section on both the pristine and patched trees.
+
+## Bolt: `compile_opts` recompiles every regexp pattern from scratch on every row — baseline — 2026-10-01
+
+**Why this workload**: v1.26-v1.39 added ten new versions' worth of
+planner/executor generality (LATERAL, SRF fan-out, ordered-set
+aggregates, SQL function bodies, IMMUTABLE constant folding, bit-string
+literals, data-modifying CTEs, …) since the last profiling-focused Bolt
+round (v1.25, 2026-09-29), none of it re-profiled since. `benches/
+profile_regexp.py --rows 2000 --count 20 --timeout 600` (existing
+driver, unchanged) sends 20 exact iterations of `SELECT
+regexp_replace(s, '[0-9]+', '#', 'g'), regexp_like(s, '[0-9]{3,}'),
+regexp_count(s, '[0-9]+') FROM bench_re` — three regexp functions
+(replace/match/count), two distinct literal patterns, over 2,000 text
+rows — over the real wire protocol against a debug build. This re-uses
+the same workload a prior round (`Compiled::find_at` scratch-buffer
+reuse, 2026-09-19) profiled, chosen again because regexp functions are
+common in real text-cleaning/validation queries and the per-row
+evaluation path underneath them (`eval_func` → `eval_func_vals` →
+`eval_str_func`) is exactly the kind of path the v1.26-v1.39 features
+layered more logic onto.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_regexp.py --rows 2000 --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,24p'   # PROGRAM TOTALS Ir
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.39, commit
+`2d2e4ea`): **9,465,290,559** total `Ir`. The flat self-cost list is
+dominated by the regex *matching* VM itself (`Compiled::run` 4.49%,
+`Compiled::find_at` 2.50%, `CharClass::matches` 1.43% + its closure
+0.80%, `backtrack` 0.80%) and by generic `Vec<char>`/UTF-8 machinery
+used both during matching and during compilation (`str::eq` variants,
+`memcpy`, `malloc`/`free`, `Vec<char>::extend_desugared`,
+`chunks_exact`, `split_at_unchecked`) — none of which, by flat self-cost
+alone, points at any single row-independent target: `compile_opts` and
+its `Parser::*`/`Compiler::*` callees sum to only ~2.0% of total `Ir` by
+self-cost, under the 5%-of-profile floor on an instruction-count basis
+by itself.
+
+The DHAT allocation profile tells a different story. Every one of the 14
+`crate::regex::compile_opts`/`compile` call sites in `src/exec.rs`
+compiles its pattern argument from scratch on *every row* — even though
+`'[0-9]+'` and `'[0-9]{3,}'` are `Expr::Literal` string constants that
+never change across all 2,000 rows × 20 iterations × (up to 2 calls
+sharing `'[0-9]+'`) = up to 80,000 full parse+codegen cycles of two
+distinct patterns. Attributing DHAT's per-allocation-site call stacks to
+frames that can only appear on the compile path (`regex::Parser::*`,
+`regex::Compiler::*`, `regex::compile_opts` itself — as opposed to
+`regex::Compiled::{run,find_at,is_match}`, which is pattern-independent
+*matching*, not compilation) shows the compile path responsible for
+**37.57%** of this workload's total bytes allocated (136,000,000 /
+361,987,577) and **33.19%** of total allocation blocks (1,360,000 /
+4,097,966) — comfortably clearing the ≥10%-of-allocations floor on its
+own, independent of the Ir number.
+
+**Hypothesis**: `compile_opts`'s result depends only on its two
+arguments (`pattern`, `opts`) — nothing about the row being evaluated,
+the statement, or the connection's state. A cache keyed on those two
+arguments removes the re-parse + re-codegen for every row after the
+first that uses a given `(pattern, opts)` pair, collapsing up to 80,000
+full compiles in this workload down to 2 (one per distinct pattern) —
+the same "pure function of its own arguments, so memoize it" shape as
+this repo's existing `Q::immutable_fn_cache` (v1.36) and `hashed_in`
+cache (v0.80, fixed 2026-09-29), except global to the connection rather
+than scoped to one statement, since a compiled pattern is reusable
+across statements too and `eval_str_func`/`eval_func_vals` are
+deliberately pure functions with no access to per-statement state like
+`Q`.
+
+`cargo test --all-features`: 686/686 passed (pre-change tree,
+unmodified).
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.regexcache-{base,after}-2026-10-01`.
+
+## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — fix — 2026-09-29
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec.rs`: the `hashed_in` cache (v0.80, extended for JOINs in v1.19)
+keyed its `Vec<(SelectStmt, Rc<HashedIn>)>` lookup by full AST equality
+(`s == sub`), and ran the entire hashability/correlation-safety check
+(`match_hashable_in` → `subplan_inner_is_base_table` per table →
+`subquery_refs_only_inner`) *before* that lookup, unconditionally, on
+every row — even on a cache hit, where the answer can't have changed
+since the statement's snapshot and AST are both fixed for its whole
+execution.
+
+```diff
+-    hashed_in: Rc<RefCell<Vec<(SelectStmt, Rc<HashedIn>)>>>,
++    hashed_in: Rc<RefCell<Vec<(*const SelectStmt, Rc<HashedIn>)>>>,
+```
+
+`eval_hashed_in` now keys the lookup on `sub as *const SelectStmt`
+instead of `sub`'s value, and checks that cache *first*: a hit skips
+straight to `probe_hashed_in`, and only a miss (the first row that
+probes a given `IN (subquery)`) runs the validation chain and, if it
+passes, builds the cache entry. The address is a valid cache key because
+`sub: &SelectStmt` is always the same borrowed node from the statement's
+own WHERE-clause AST — walked by reference on every row, never cloned
+per row — for the entire lifetime of one statement's execution, which is
+the only scope `hashed_in` is ever shared across (`Rc::clone`, never
+persisted past the statement). The one behavioral edge case: two
+syntactically-identical `IN (subquery)` occurrences at different AST
+addresses in the same statement (e.g. the same subquery text appearing
+twice in one WHERE clause) no longer share one cache entry the way
+AST-equality did — each now runs its own one-time subquery build instead
+of one shared build. Results are unaffected either way; this is a
+one-time cost paid at most once more per statement in an already-rare
+shape, not a per-row regression.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_hashedin.py --outer-rows 50000
+--inner-rows 500 --count 20`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, two runs to
+confirm determinism):
+
+| run | Ir |
+|---|---|
+| before (baseline entry below) | 18,506,453,133 |
+| after, run 1 | 10,267,664,305 |
+| after, run 2 | 10,271,643,201 |
+
+The two after-runs agree to within 0.039% (10,271,643,201 vs.
+10,267,664,305), consistent with this repo's established
+callgrind-determinism band. Using run 1: **-44.52%** — a factor of 1.8x,
+far beyond the ≥5%-of-profile floor (this workload's Ir *is* the
+100%-hashed-IN profile from the baseline entry, so there's no separate
+"share of a larger workload" to compute).
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 671,681,124 | 356,635,264 | **-46.90%** |
+| Total blocks | 6,903,297 | 903,277 | **-86.91%** |
+
+The block-count delta matches the hypothesis almost exactly: this
+workload's inner table (`bench_inner`) has 2 columns and the subquery's
+`FROM` has 1 table, so each pre-fix row paid ~6 allocations that the
+fix removes entirely on a cache hit (1 for `collect_hashable_tables`'s
+output `Vec`, 2 for its table-name/alias `String` clones, 1 for
+`subquery_refs_only_inner`'s `cols` `Vec`, 2 for its per-row column-name
+`String` clones) — `6,903,297 - 903,277 = 6,000,020`, against
+1,000,000 probed rows (50,000 rows x 20 iterations) x 6 allocations/row
+= 6,000,000 predicted. Both the Ir floor (≥5%) and the DHAT floor
+(≥10% bytes or blocks) clear independently and by a wide margin.
+
+`cargo test --all-features`: 472/472 passed, unchanged (includes
+`tests/protocol_test_v119_hashed_in.py`'s dedicated hashed-IN suite:
+0 failures). `cargo fmt --all -- --check`: clean. `cargo clippy
+--all-targets --all-features -- -D warnings`: 470 pre-existing errors on
+both the pre-change and post-change tree (confirmed via `git stash`) —
+the same toolchain/lint-version mismatch noted in every prior Bolt round
+in this file; zero new errors/warnings from this diff.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashedin-{base,after}-2026-09-29`.
+
+**Reproduce**: apply the diff above to `src/exec.rs` (see the full
+function bodies in the commit for the reordering of the validation
+chain relative to the cache lookup), `cargo build`, then repeat the
+Callgrind/DHAT commands in the baseline entry's "Reproduce" section on
+both the pristine and patched trees.
+
+## Bolt: `eval_hashed_in`'s per-row cache lookup re-derives hashability from scratch — baseline — 2026-09-29
+
+**Why this workload**: v1.19 (`⚡ v1.19: hashed IN-subquery with JOIN
+support`) added a fast path for uncorrelated `WHERE col IN (SELECT ...)`
+that materializes the subquery's result once per statement instead of
+once per row (`eval_hashed_in`/`HashedIn` in `src/exec.rs`), but no Bolt
+round has profiled it since it shipped. New harness,
+`benches/profile_hashedin.py --outer-rows 50000 --inner-rows 500
+--count 20`: loads a 50,000-row outer table and a 500-row inner table,
+then sends 20 exact iterations of `SELECT count(*) FROM bench_outer
+WHERE k IN (SELECT id FROM bench_inner WHERE tag = 'x')` over the real
+wire protocol against a debug build — an uncorrelated, single-table,
+hash-safe `IN (subquery)` exercising the fast path's per-row code, not a
+synthetic call to one function in isolation.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_hashedin.py --outer-rows 50000 --inner-rows 500 \
+  --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '21,22p'   # PROGRAM TOTALS Ir
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD `dc40d34`):
+**18,506,453,133** total `Ir`. `eval_hashed_in` and its callees —
+the per-row correctness-shape validation this fix targets — account for
+roughly 6% of the total by self-cost alone (`eval_hashed_in` 1.21%,
+`subquery_refs_only_inner` + its closures 2.00%, `SelectStmt::eq` 0.62%,
+`match_hashable_in` 0.42%, `collect_hashable_tables` + `::walk` 0.76%,
+`subplan_inner_is_base_table` 0.28%), but that undercounts its real
+share: every one of those functions clones `String`s or builds `Vec`s on
+every probed row purely to re-derive a fact (is this subquery
+hashable/uncorrelated?) that cannot change within one statement, and
+those allocations drive a large share of this debug build's
+`malloc`/`free`/`memcpy` and UB-check (`is_aligned_to`,
+`precondition_check`) costs elsewhere in the profile — costs that don't
+show up attributed to `eval_hashed_in` in a flat self-cost listing but
+disappear with it, as the after-measurement below shows.
+
+The root cause: `eval_hashed_in` ran `match_hashable_in(sub)` →
+`subplan_inner_is_base_table` (per inner table) →
+`subquery_refs_only_inner(q, sub, &tables)` on *every* row, before ever
+consulting the cache — and `subquery_refs_only_inner` alone clones every
+inner table's column names into a fresh `Vec<String>`
+(`cols.extend(t.columns.iter().map(|(n,_)| n.clone()))`) and walks the
+entire subquery AST (`walk_select`) checking every column reference,
+every single time. The cache lookup itself then re-walked the whole
+subquery AST a second time via `SelectStmt`'s derived `PartialEq`
+(`s == sub`) just to find the entry it was about to use unchanged. None
+of this depends on the probed row's value `v` — it's pure per-row
+overhead on top of the O(1) hash-set probe the caching mechanism was
+built to provide.
+
+**Hypothesis**: `sub: &SelectStmt` is always the same borrowed AST
+node — part of the statement's own immutable WHERE-clause tree, never
+cloned per row — for the entire lifetime of one statement's execution,
+which is the only scope the `hashed_in` cache is ever shared across.
+Keying the cache by `sub`'s address instead of its value, and checking
+that cache *before* re-deriving hashability, lets a cache hit skip the
+entire validation chain (and its allocations) and go straight to the O(1)
+probe — the "once per statement" the mechanism was named for, actually
+enforced for the shape-check too, not just the subquery execution.
+
+See the fix entry above for the change and measurement.
+
+## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — fix — 2026-09-27
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec.rs`, `eval_agg_func`, immediately before the row-accumulation
+loop:
+
+```diff
+-    let mut vals: Vec<Value> = Vec::new();
++    let mut vals: Vec<Value> = Vec::with_capacity(visit.len());
+```
+
+`delims` (the `string_agg`-only delimiter accumulator declared on the
+next line) is untouched — it stays `Vec::new()` because it is never
+pushed to for any other aggregate, so giving it a capacity would add a
+wasted allocation to every `sum`/`avg`/`min`/`max`/etc. call instead of
+removing one. `visit.len()` equals `idxs.len()` (the ORDER-BY-inside-
+aggregate branch above only reorders `visit`, never changes its length)
+and is an exact upper bound on how many times `vals.push` can run in the
+loop below, since NULLs only ever skip a push, never add one. No change
+to accumulation order, NULL handling, DISTINCT dedup, or which values
+reach `sum_vals`/`avg_vals`/etc. — same values, same order, same result.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000 --count
+50`), same machine, same session.
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 3,065,100,754 | 1,913,091,840 | **-37.58%** |
+| Total blocks | 14,102,255 | 12,502,245 | **-11.35%** |
+| Target site bytes (`vals`'s allocation, was exec.rs:19905's `push`, now exec.rs:19872's `with_capacity`) | 1,792,000,000 | 640,000,000 | **-64.29%** |
+| Target site blocks | 2,400,000 | 800,000 | **-66.67%** |
+
+Both the whole-workload total (bytes -37.58%, blocks -11.35%) and the
+target site itself clear the ≥10%-allocation-reduction impact floor by a
+wide margin. The site's post-fix byte count (640,000,000 = 800,000 calls
+x 10 elements/call x 80 bytes/`Value`) matches the hypothesis exactly:
+one exactly-sized allocation per `eval_agg_func` call instead of ~3
+reallocations per call.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`, same workload,
+same build): 49,965,949,921 -> 49,055,480,985, **-1.82%** — below the
+5%-of-profile floor on its own (this workload's cost is dominated by
+parsing, protocol I/O, and hashing well outside this one site, as the
+baseline entry's function-level breakdown showed), but moving in the
+same direction as DHAT, corroborating the allocation-count evidence
+rather than contradicting it. The shipped-or-not decision here rests on
+the DHAT allocation floor, which clears independently.
+
+`cargo test --all-features`: 400/400 passed, unchanged. `cargo fmt --all
+-- --check`: clean. `cargo clippy --all-targets --all-features -- -D
+warnings`: 448 pre-existing errors on both the pre-change and post-change
+tree (confirmed via `git stash`) — the same toolchain/lint-version
+mismatch noted in every prior Bolt round in this file; zero new
+errors/warnings from this diff.
+
+Before/after profiles committed: `benches/profiles/{dhat,callgrind}.out.aggval-{base,after}-2026-09-27`.
+
+**Reproduce**: apply the one-line diff above to `src/exec.rs`, `cargo
+build`, then repeat the DHAT/Callgrind commands in the baseline entry's
+"Reproduce" section on both the pristine and patched trees.
+
+## Bolt: `eval_agg_func`'s per-row accumulator `Vec<Value>` grows unsized — baseline — 2026-09-27
+
+**Why this workload**: `benches/profile_agg.py --rows 40000 --groups 4000
+--count 50` (added in #26) — the same GROUP BY driver used by the two most
+recent Bolt rounds in this file (`exec_agg_one`'s group-key scratch buffer,
+merged as #28; the exec-cell `Vec::with_capacity` negative result, #27).
+Issue #27's own DHAT profile table, taken on the pre-#28 tree, flagged two
+sites bigger than the one it measured and explicitly deferred them for a
+future round: `exec::value_key` (group-key hashing, 45.9% of blocks — fixed
+by #28) and `exec::eval_agg_func` (aggregate accumulator state, 50.4% of
+bytes — untouched until now). This round re-profiles the same workload on
+top of #28 to confirm `eval_agg_func`'s share on the current tree and act on
+it.
+
+**Profile** (DHAT, valgrind 3.22.0, current HEAD `ce7120c` — #28 merged, #29
+not merged; two independent runs to confirm determinism: 3,065,091,798 /
+14,102,245 vs. 3,065,100,754 / 14,102,255 bytes/blocks, agreeing to within
+0.0003%):
+
+- Total: **3,065,100,754** bytes, **14,102,255** allocation blocks.
+- Target site (`eval_agg_func`, `src/exec.rs:19905`, the `vals.push(v)`
+  inside the per-row accumulation loop that every non-`string_agg`,
+  non-count(*) aggregate — `sum`, `avg`, `min`, `max`, `array_agg`, the
+  variance family — funnels its input values through): **1,792,000,000
+  bytes (58.46% of total) / 2,400,000 blocks (17.02% of total)** — by a wide
+  margin the single largest allocation site in the profile, more than 3x
+  the next-largest by bytes.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes`, same workload, same
+build): **49,965,949,921** total `Ir`. `eval_agg_func`'s own self-cost is
+3.17% of `Ir` (function-level `callgrind_annotate`, not call-graph
+inclusive — the malloc/`push_mut`/`grow_one`/memcpy machinery this site
+drives is attributed to those callees, not to `eval_agg_func` itself, so
+this understates the site's true instruction cost; DHAT is the primary
+gate for this finding).
+
+**Hypothesis**: `eval_agg_func`'s row-accumulation loop (`for &i in &visit`)
+declares `let mut vals: Vec<Value> = Vec::new();` (`src/exec.rs:19868`)
+before looping over `visit`, whose length equals `idxs.len()` — the input
+row count for this group, known before the loop starts — and pushes at
+most one value per iteration (`vals.push(v)`, line 19905, or the
+`string_agg`-only branch at line 19898; NULLs are skipped, only ever
+shrinking the final length below `idxs.len()`, never growing it). `Vec`'s
+default growth (capacity 0 -> 4 -> 8 -> 16 -> ...) means a 10-row group (this
+workload's group size) pays 3 reallocations before its capacity covers all
+10 pushes, and `eval_agg_func` is called once per (non-count aggregate,
+group) pair — 4 aggregates (`sum(a)`, `sum(b)`, `max(c)`, `min(d)`) x 4,000
+groups x 50 iterations = 800,000 calls, x 3 reallocations = 2,400,000
+blocks, matching the profile's block count for this site exactly.
+Passing `Vec::with_capacity(idxs.len())` — an upper bound already available
+as a parameter at the point `vals` is declared — should collapse this to
+one allocation per call (800,000 blocks total, a 3x reduction at the site)
+sized to exactly what's needed for a workload with no NULLs in the grouped
+columns (this one), comfortably clearing the ≥10%-of-total allocation-count
+floor on its own, since the site alone is 17% of the whole profile's block
+count.
+
+Fix (measured next commit): `Vec::new()` -> `Vec::with_capacity(idxs.len())`
+for `vals` only. `delims` (the `string_agg`-only second accumulator,
+declared on the next line) stays `Vec::new()` — it is never populated for
+any of this workload's aggregates, and unconditionally sizing it would add
+a wasted allocation to every non-`string_agg` call instead of removing one.
+
+**Artifacts**: `benches/profiles/dhat.out.aggval-base-2026-09-27`,
+`benches/profiles/callgrind.out.aggval-base-2026-09-27`.
+
+**Reproduce**:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+python3 benches/profile_agg.py --rows 40000 --groups 4000 --count 50
+# SIGTERM the server to flush, then sum tb/tbk over dhat.out's `pps` for
+# the total, and filter frames resolving through
+# `rustgres::exec::eval_agg_func` (exec.rs:19905) for the site-specific
+# share.
+```
+
 ## Bolt: `Value::Array` embeds `ArrayVal` (3 Vecs) inline, inflating every `Value` to 80 bytes — fix — 2026-09-25
 
 Fixes the target identified in the baseline entry immediately below this
@@ -238,6 +725,136 @@ compare equal, cast, or serialize identically — see the fix entry's
 "why this is exact" for the call-site-by-call-site argument.
 
 Fix and after-measurement follow in the next entry.
+
+## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — fix — 2026-09-24
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec.rs`, `exec_agg_one`'s row-to-group hashing loop:
+
+```rust
+let mut group_index: HashMap<Vec<u8>, usize> = HashMap::new();
+let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+let mut key_bytes: Vec<u8> = Vec::new();
+for (i, key_vals) in xkeys.iter().enumerate() {
+    key_bytes.clear();
+    for v in key_vals {
+        value_key(v, &mut key_bytes);
+    }
+    match group_index.get(key_bytes.as_slice()) {
+        Some(&gi) => groups[gi].1.push(i),
+        None => {
+            group_index.insert(key_bytes.clone(), groups.len());
+            groups.push((key_vals.clone(), vec![i]));
+        }
+    }
+}
+```
+
+`key_bytes` moves outside the loop and is `.clear()`'d instead of
+re-allocated each iteration; `group_index.get` borrows the scratch
+buffer as `&[u8]` for the lookup (`Vec<u8>: Borrow<[u8]>`), and only
+the "new group" branch pays for an owned allocation, via
+`key_bytes.clone()` (sized exactly to the current key's length, no
+growth). No change to grouping order, key encoding, or which rows
+land in which group — same `value_key` bytes compared the same way,
+same `HashMap<Vec<u8>, usize>` entries, same result.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000
+--count 50`), same machine, same session. DHAT: total blocks
+13,059,899 -> **7,260,049** (**-44.41%**); total bytes 2,135,183,602
+-> **2,021,386,566** (**-5.33%**). The target site (exec.rs:14733,
+the `value_key` call inside the row loop) drops from 6,000,000 blocks
+/ 118,000,000 bytes to **150 blocks / 2,950 bytes** — the residual is
+the reused scratch buffer's own one-time growth (~3 reallocations per
+query execution before its capacity stabilizes, x 50 iterations =
+150, matching exactly). The new "owned on first sight" allocation
+(`key_bytes.clone()` on the `None` branch) shows up as a new
+`Vec<u8>::to_vec` site: exactly 200,000 blocks (4,000 groups x 50
+iterations) / 4,200,000 bytes -- matching the hypothesis precisely
+(one alloc per distinct group instead of three per row).
+
+`cargo test --all-features`: 289/289 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: same pre-existing failures before and after (340
+errors, confirmed via git stash -- all in unrelated code; matches the
+342-line count issue #27 also reported for this same tree).
+
+Reproduce: run `benches/profile_agg.py --rows 40000 --groups 4000
+--count 50` against a `valgrind --tool=dhat`-wrapped debug build on
+both the pre-fix and post-fix tree, then sum `tb`/`tbk` over the
+`pps` array in the resulting `dhat.out.*` JSON for the totals (per
+`benches/profiles/README.md`).
+
+## Bolt: `exec_agg_one`'s per-row GROUP BY key encoding allocates a fresh `Vec<u8>` every row — baseline — 2026-09-24
+
+Workload: `benches/profile_agg.py --rows 40000 --groups 4000 --count 50`
+(added in #26) — a fixed-iteration-count wire-protocol driver. Loads
+`bench_agg(k INT, a INT, b INT, c INT, d INT)` with 40,000 rows across
+4,000 distinct `k` values (10 rows/group), then sends an exact 50
+iterations of `SELECT k, count(*), sum(a), sum(b), max(c), min(d) FROM
+bench_agg GROUP BY k` over the real wire protocol against a debug
+build.
+
+This is the same harness issue #27 used for the (reverted,
+below-floor) `exec_agg_one` output-cell finding. That writeup's
+profile table flagged two bigger, still-unaddressed sites in the same
+workload: `exec::value_key` (exec.rs:14346, group-key hashing, 45.9%
+of blocks) and `exec::eval_agg_func` (accumulator state, 50.4% of
+bytes). This entry follows up on the first one.
+
+### Profile (before fix)
+
+DHAT, valgrind 3.22.0, debug build, this session (reproduced
+independently of issue #27's numbers to confirm determinism — its
+13,059,900 blocks / 2,135,183,906 bytes vs. this run's 13,059,899
+blocks / 2,135,183,602 bytes, both counters within noise of each
+other and safely reproducible):
+
+- Total: **13,059,899** allocation blocks, **2,135,183,602** bytes.
+- Target site (`exec_agg_one`'s row-grouping loop, `src/exec.rs`, the
+  `value_key(v, &mut key_bytes)` calls into a freshly `Vec::new()`'d
+  `key_bytes` buffer, one per input row): **6,000,000** blocks
+  (**45.94%** of total) / **118,000,000** bytes (**5.53%** of total).
+
+### Hypothesis
+
+`exec_agg_one`'s row-to-group hashing loop
+(`for (i, key_vals) in xkeys.iter().enumerate()`) allocates a brand
+new `let mut key_bytes = Vec::new();` on *every input row*, then
+`value_key`-encodes each GROUP BY key column into it purely to look
+the row up in `group_index: HashMap<Vec<u8>, usize>` — and then
+throws the buffer away unless this is the first row of a new group,
+in which case it's moved into the map as the map's key. For this
+workload's single-`INT`-column key, each row's encoding is 21 bytes
+(1 tag byte + 16 bytes of `i128`-widened value + 4 bytes of scale),
+which needs two `Vec<u8>` reallocations to grow from `Vec::new()`'s
+capacity 0 (0→4→8, per the same growth-then-realloc shape as the
+`project_row`/`exec_agg` output-cell findings) — three allocations
+per row, 10 rows per group, but only one row per group actually needs
+an *owned* key.
+
+Since `group_index` only needs to *borrow* the encoded bytes for the
+lookup (`HashMap<Vec<u8>, _>::get` accepts `&[u8]` via `Borrow`), the
+buffer only needs to become an owned allocation on the "new group"
+path — every repeat-lookup row (9 out of every 10, at this workload's
+group size) can reuse one scratch buffer across the whole row loop
+instead of allocating and growing its own. This should collapse the
+per-row alloc-and-grow-3x cost down to one alloc-on-first-sight (a
+`key_bytes.clone()`, sized exactly, no growth) per *distinct group*,
+not per row — roughly a 10x reduction in this site's own allocation
+count at this workload's row/group ratio, well over the ≥10%
+allocation-count impact floor if it holds.
+
+Fix (measured next commit): keep `key_bytes: Vec<u8>` outside the
+per-row loop, `.clear()` it each iteration instead of re-allocating,
+look it up with `group_index.get(key_bytes.as_slice())`, and only
+`.clone()` it into `group_index.insert(...)` on the "new group" path.
 
 ## Bolt: `find_partition_leaf` clones every rejected candidate's metadata before checking it — fix — 2026-09-23
 

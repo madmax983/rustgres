@@ -330,7 +330,8 @@ def main():
         err, _, _, rows = c.do_sql("execute p76_bar")
         check("execute no-arg", err is None and rows == [("42",)])
         err, tag, _, _ = c.do_sql("deallocate all")
-        check("deallocate all", err is None and tag == "DEALLOCATE")
+        # v1.58: PG19 tags it DEALLOCATE ALL (utility.c CMDTAG_DEALLOCATE_ALL).
+        check("deallocate all", err is None and tag == "DEALLOCATE ALL")
 
         c.close()
     finally:

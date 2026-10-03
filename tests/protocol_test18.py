@@ -206,11 +206,17 @@ def main():
         if rows:
             check("special ordering", [r[0] for r in rows] == ["-Infinity", "1", "Infinity", "NaN"],
                   f"got {rows}")
-        # NaN != NaN
+        # v0.94: PG19 NaN equality (numeric.c cmp_numerics: "We consider
+        # all NANs to be equal"; float.h float8_eq): NaN = NaN is TRUE,
+        # NaN <> NaN is FALSE.
         rows, _, _ = c.sql("SELECT 'NaN'::numeric = 'NaN'::numeric")
-        check("NaN != NaN", rows[0][0] == "f", f"got {rows}")
+        check("NaN = NaN", rows[0][0] == "t", f"got {rows}")
         rows, _, _ = c.sql("SELECT 'NaN'::numeric <> 'NaN'::numeric")
-        check("NaN <> NaN", rows[0][0] == "t", f"got {rows}")
+        check("NaN <> NaN false", rows[0][0] == "f", f"got {rows}")
+        rows, _, _ = c.sql("SELECT 'NaN'::float8 = 'NaN'::float8")
+        check("float NaN = NaN", rows[0][0] == "t", f"got {rows}")
+        rows, _, _ = c.sql("SELECT '-0.0'::float8 = '0.0'::float8")
+        check("-0.0 = 0.0", rows[0][0] == "t", f"got {rows}")
         # Comparisons with Inf
         rows, _, _ = c.sql("SELECT 'Infinity'::numeric > 1000000::numeric")
         check("Inf > 1e6", rows[0][0] == "t", f"got {rows}")

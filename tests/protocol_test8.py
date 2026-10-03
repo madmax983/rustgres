@@ -50,6 +50,23 @@ def check(name, cond, detail=""):
         print(f"  FAIL: {name} {detail}")
 
 
+def seed_multi_page(c, table, n, val_fn):
+    """Insert n rows (multi 8KiB heap page) via batched multi-VALUES INSERTs.
+
+    v1.62: PG19's cost model never index-scans a single-page relation,
+    so tests whose purpose is the index-scan path (not the scan choice)
+    seed their tables past one page to keep the IndexScan.
+    """
+    batch, B = [], 50
+    for i in range(1, n + 1):
+        batch.append(val_fn(i))
+        if len(batch) == B:
+            c.q(f"INSERT INTO {table} VALUES " + ",".join(batch))
+            batch = []
+    if batch:
+        c.q(f"INSERT INTO {table} VALUES " + ",".join(batch))
+
+
 def msg(typ, payload):
     return typ + struct.pack("!i", len(payload) + 4) + payload
 
@@ -393,10 +410,13 @@ def t_index_scans():
     try:
         c = Conn(srv.port)
         c.q("CREATE TABLE t(a int, b int, c text)")
-        vals = ",".join(f"({i},{i % 7},'t{i}')" for i in range(1, 101))
+        vals = ",".join(f"({i},{i % 7},'t{i}')" for i in range(1, 401))
         c.q(f"INSERT INTO t VALUES {vals}")
         c.q("CREATE INDEX idx_a ON t(a)")
         c.q("CREATE INDEX idx_ab ON t(a, b)")
+        # v1.62: 400 rows = multi-page, so the index-scan assertions below
+        # exercise the planner's real index path (PG19 never index-scans a
+        # single-page relation).
 
         plan = plan_of(c, "SELECT * FROM t WHERE a = 42")
         check("equality picks index scan",
@@ -523,6 +543,9 @@ def t_explain():
         c.q("INSERT INTO a VALUES (1,10),(2,20)")
         c.q("INSERT INTO b VALUES (1,100),(2,200)")
         c.q("CREATE INDEX idx_a_id ON a(id)")
+        # v1.62: multi-page `a` keeps the IndexScan for the rendering
+        # checks below (PG19 never index-scans a single-page relation).
+        seed_multi_page(c, "a", 400, lambda i: f"({i},{i * 10})")
 
         tags, rows, codes = c.q("EXPLAIN SELECT * FROM a WHERE id = 1")
         check("explain tag is EXPLAIN", tags == ["EXPLAIN"] and codes == [], f"{tags} {codes}")
@@ -545,7 +568,9 @@ def t_explain():
         check("explain sort+limit", "Sort" in plan and "Limit 1" in plan, plan)
 
         plan = plan_of(c, "SELECT * FROM (SELECT id FROM a) s WHERE id = 2")
-        check("explain subquery scan", "Subquery Scan on s" in plan, plan)
+        # v1.54: top-level simple subquery pulls up (PG
+        # `pull_up_simple_subquery`) — flat Index Scan, not Subquery Scan.
+        check("explain subquery scan", "Index Scan using idx_a_id on a" in plan, plan)
 
         _, _, codes = c.q("EXPLAIN ANALYZE SELECT 1")
         check("explain analyze -> 0A000", codes == ["0A000"], f"{codes}")
@@ -590,6 +615,12 @@ def t_analyze():
               rows[0][0] == "{1,2,3}" and "0.4000" in rows[0][1], f"{rows}")
 
         # ANALYZE updates EXPLAIN estimates
+        # v1.62: seed `s` past one heap page (then re-ANALYZE) so the
+        # estimate check still exercises the index path — PG19 never
+        # index-scans a single-page relation. `a = 1` still estimates
+        # 2 rows via the MCV frequency.
+        seed_multi_page(c, "s", 400, lambda i: f"({1000 + i},'q')")
+        c.q("ANALYZE s")
         c.q("CREATE INDEX idx_s_a ON s(a)")
         plan = plan_of(c, "SELECT * FROM s WHERE a = 1")
         check("explain estimate after analyze", "(rows=2)" in plan, plan)
@@ -630,6 +661,9 @@ def t_txn_ddl_mvcc():
         c.q("CREATE TABLE t2(a int)")
         c.q("INSERT INTO t2 VALUES (1),(2)")
         c.q("CREATE INDEX idx_t2 ON t2(a)")
+        # v1.62: multi-page t2 keeps the IndexScan for the visibility
+        # checks (PG19 never index-scans a single-page relation).
+        seed_multi_page(c, "t2", 400, lambda i: f"({100 + i})")
         c.q("BEGIN")
         c.q("DROP INDEX idx_t2")
         c.q("CREATE INDEX idx_tmp ON t2(a)")
@@ -674,6 +708,9 @@ def t_txn_ddl_mvcc():
         # an uncommitted index is invisible to other transactions
         c.q("CREATE TABLE t3(a int)")
         c.q("INSERT INTO t3 VALUES (1)")
+        # v1.62: multi-page t3 keeps the IndexScan for the visibility
+        # check (PG19 never index-scans a single-page relation).
+        seed_multi_page(c, "t3", 400, lambda i: f"({100 + i})")
         c1, c2 = Conn(srv.port), Conn(srv.port)
         c1.q("BEGIN")
         c1.q("CREATE INDEX idx_tmp2 ON t3(a)")
@@ -705,6 +742,9 @@ def t_durability():
         c.q("INSERT INTO t VALUES (1,'one'),(2,'two')")
         c.q("CREATE INDEX idx_a ON t(a)")
         c.q("CREATE UNIQUE INDEX uq_b ON t(b)")
+        # v1.62: multi-page t keeps the IndexScan for the survival check
+        # (PG19 never index-scans a single-page relation).
+        seed_multi_page(c, "t", 400, lambda i: f"({100 + i},'s{i}')")
         c.q("CHECKPOINT")
         c.close()
         srv.kill9()
@@ -746,6 +786,11 @@ def t_vacuum_index():
         c.q("CREATE TABLE t(a int)")
         c.q("INSERT INTO t VALUES (1),(2),(3)")
         c.q("CREATE INDEX idx_a ON t(a)")
+        # v1.62: multi-page t keeps the IndexScan for the post-vacuum
+        # check (PG19 never index-scans a single-page relation). Seeds
+        # are negative so the `a >= 1` row-content check below is
+        # unaffected.
+        seed_multi_page(c, "t", 400, lambda i: f"({-i})")
         c.q("DELETE FROM t WHERE a = 2")
         c.q("VACUUM t")
         _, rows, _ = c.q("SELECT a FROM t WHERE a >= 1 ORDER BY a")
