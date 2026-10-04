@@ -987,6 +987,22 @@ EXPECTED_PASS_OVERRIDES = [
      r"where\s+n1\.a\s*<>\s*n2\.a\s*\)\s*q0\s*,\s*sl\s+"
      r"where\s+q0\.a\s*=\s*1\s*;?\s*$",
      "v1.65: 3-way cross-join reorder + unqualified pushed-down Filter"),
+    # v1.70: contradictory WHERE quals → dummy Result (PG19
+    # `restriction_is_constant_false`, joinrels.c): `p.k = 1 AND p.k = 2`
+    # on the same qualified column is provably false, so the scan plans
+    # as `Result` + `Replaces: Scan on p` + `One-Time Filter: false`,
+    # and an inner join with that dummy input plans as `Result` +
+    # `Replaces: Join on p, x` + `One-Time Filter: false`. Narrowly
+    # scoped to the two join.sql corpus statements verified byte-exact
+    # against the PG19 .out oracle; the EXPLAIN-with-options mask stays
+    # for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+p\.\*\s+from\s+"
+     r"(?:\(\s*parent\s+p\s+left\s+join\s+child\s+c\s+on\s*\(\s*p\.k\s*=\s*c\.k\s*\)\s*\)\s*"
+     r"join\s+parent\s+x\s+on\s+p\.k\s*=\s*x\.k|"
+     r"parent\s+p\s+left\s+join\s+child\s+c\s+on\s*\(\s*p\.k\s*=\s*c\.k\s*\))"
+     r"\s+where\s+p\.k\s*=\s*1\s+and\s+p\.k\s*=\s*2\s*;?\s*$",
+     "v1.70: contradictory WHERE quals plan as dummy Result"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS

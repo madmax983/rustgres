@@ -15738,6 +15738,25 @@ fn plan_from_item(
                 })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             let rel_rows = est_rel_rows(&eng.db, name, snap, own, session);
+            // v1.70: PG19 `restriction_is_constant_false` (joinrels.c): a
+            // scan WHERE with `col = c1 AND col = c2` on the same qualified
+            // column, with provably-different literals, plans as a dummy
+            // `Result` (`One-Time Filter: false`, `Replaces: Scan on
+            // <alias>`). EXPLAIN-path only (`pctx.is_some()`); the
+            // executor never sees `PlanNode`.
+            if pctx.is_some() {
+                if let Some(w) = where_ {
+                    if pg_where_is_contradiction(w) {
+                        return Ok(PlanNode::Result {
+                            rows: 1,
+                            filter: None,
+                            output: Vec::new(),
+                            one_time_filter: true,
+                            replaces: Some(format!("Scan on {}", qual)),
+                        });
+                    }
+                }
+            }
             match plan_access_path(&eng.db, t, name, &qual, where_, snap, own, session) {
                 AccessPath::SeqScan => {
                     // v1.08: PG-text Filter (the whole item slice; index
@@ -16260,6 +16279,36 @@ fn plan_from_item(
             // right side, set it as a Filter on the inner node.
             // v1.63: read the pushdown flag before the `if let` moves it.
             let on_pushed_right = push_on_to_right.is_some();
+            // v1.70: dummy-input propagation (PG19's dummy-rel join: an
+            // inner/cross join with a dummy input is itself dummy). A
+            // `PlanNode::Result { one_time_filter: true, .. }` is only
+            // produced on the EXPLAIN path (v1.60 const-false ON-clause
+            // whole-join early-return above, and the v1.70
+            // scan-contradiction above); the executor never sees it.
+            let dummy_input = matches!(
+                &outer,
+                PlanNode::Result {
+                    one_time_filter: true,
+                    ..
+                }
+            ) || matches!(
+                &inner,
+                PlanNode::Result {
+                    one_time_filter: true,
+                    ..
+                }
+            );
+            if pctx.is_some() && matches!(kind, JoinKind::Inner | JoinKind::Cross) && dummy_input {
+                if let Some(replaces) = pg_result_replaces(std::slice::from_ref(item)) {
+                    return Ok(PlanNode::Result {
+                        rows: 1,
+                        filter: None,
+                        output: Vec::new(),
+                        one_time_filter: true,
+                        replaces: Some(replaces),
+                    });
+                }
+            }
             if let (Some(px), Some(on_expr)) = (pctx, push_on_to_right) {
                 let filter_text = pg_expr_text_or_debug(&on_expr, px, true);
                 inner.set_filter(Some(filter_text));
@@ -17128,6 +17177,50 @@ fn pg_fold_bool_const(e: &Expr, fc: &mut PgConstFold) -> Option<Option<bool>> {
 /// v1.60: takes the fold context (pulled-up function-scan constants).
 fn pg_is_const_false(e: &Expr, fc: &mut PgConstFold) -> bool {
     matches!(pg_fold_bool_const(e, fc), Some(v) if v != Some(true))
+}
+
+/// v1.70: PG19 `restriction_is_constant_false` (joinrels.c): a scan WHERE
+/// containing `col = c1 AND col = c2` on the same qualified column with
+/// provably-different literals plans as a dummy rel. Fail closed:
+/// incomparable literals (`pg_literal_cmp` → `None`, including NULL
+/// constants), OR-nested quals, non-Eq operators, and unqualified columns
+/// (ambiguous) never fire.
+fn pg_where_is_contradiction(w: &Expr) -> bool {
+    let mut pairs: Vec<((Option<String>, String), &Literal)> = Vec::new();
+    for c in split_conjuncts(w) {
+        if let Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } = c
+        {
+            let (col, lit) = match (&**left, &**right) {
+                (Expr::Column { table, name }, Expr::Literal(l)) => {
+                    ((table.clone(), name.clone()), l)
+                }
+                (Expr::Literal(l), Expr::Column { table, name }) => {
+                    ((table.clone(), name.clone()), l)
+                }
+                _ => continue,
+            };
+            // v1.70: unqualified columns are ambiguous (the column could
+            // belong to another RTE); NULL never contradicts.
+            if col.0.is_none() || matches!(lit, Literal::Null) {
+                continue;
+            }
+            pairs.push((col, lit));
+        }
+    }
+    for i in 0..pairs.len() {
+        for j in (i + 1)..pairs.len() {
+            let ((t1, n1), l1) = &pairs[i];
+            let ((t2, n2), l2) = &pairs[j];
+            if t1 == t2 && n1 == n2 && pg_literal_cmp(l1, CmpOp::Eq, l2) == Some(false) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// User-facing RTE names for PG19 `Replaces:` (explain.c
