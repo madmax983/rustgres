@@ -2,6 +2,89 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `to_char`/`to_number` re-parse their format picture from scratch on every row — fix — 2026-10-05
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/numfmt.rs`: `parse_numfmt` is now a thread-local cache lookup keyed
+by the picture text, in front of the parser (renamed
+`parse_numfmt_uncached`, body otherwise untouched). A hit clones an
+`Rc<NumFmt>` (one refcount bump); a miss parses exactly as before and
+inserts the result. Bounded at 64 entries (same cap and same clear-
+outright-on-overflow policy as `regex::compile_opts`'s cache, v1.40): a
+connection that parses an unbounded number of distinct pictures (e.g. one
+built from a column value per row) cannot grow the cache without limit —
+it just stops benefiting, falling back to parsing every time exactly as
+before. Only successful parses are cached; an invalid picture still
+reports the same error on every call.
+
+`parse_numfmt` returns `Result<Rc<NumFmt>, NumFmtError>` instead of
+`Result<NumFmt, NumFmtError>`. 4 of its 5 call sites in `src/exec.rs`
+(`num_to_char`, `float_to_char`, `float4_to_char`, `to_number`) only ever
+read fields through `&desc`, so `&Rc<NumFmt>` coerces to `&NumFmt` via
+`Deref` with no call-site change. `int_to_char` mutates `desc.pre`/
+`desc.multi` on its rare (`V`-picture integer input only) path, so it now
+clones out of the `Rc` (`(*base_desc).clone()`) before mutating — one
+`NumFmt` clone on a path that previously paid a full re-parse anyway, so
+still strictly cheaper, and restructured as an early return to keep the
+common (`multi == 0`) path a zero-cost borrow of the cached value.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_tochar.py --rows 3000 --count 20
+--timeout 600`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 19,283,373,098 | 7,483,384,192 | **-61.19%** |
+
+`numfmt::match_keyword` no longer appears in the post-fix top-cost list at
+all — the keyword-table scan, prefix-check machinery, and the
+`rest: String` allocation it drove are gone from every row after the
+first that uses a given picture. The delta (-61.19%) is over three orders
+of magnitude larger than this repo's established callgrind-determinism
+band (prior rounds' repeat runs agree to within ~0.0005%), so a second
+confirmatory run on each side was not needed to establish significance;
+one run per side is reported.
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 6,031,818 | 3,271,872 | **-45.76%** |
+| Total bytes | 192,865,263 | 132,746,719 | **-31.17%** |
+| Blocks on the `parse_numfmt`/`match_keyword` path | 2,760,000 | 54 | **-100.00%** (3 distinct pictures still parse once each) |
+
+Both the Ir floor (≥5%) and the DHAT floor (≥10% blocks or bytes) clear
+independently and by a wide margin — the whole-workload total alone
+clears the DHAT floor, without even needing the site-specific share.
+
+`cargo test --all-features`: 886/886 passed, unchanged. `cargo fmt --all
+-- --check`: clean. `cargo clippy --all-targets --all-features -- -D
+warnings`: 598 errors on both the pre-change and post-change tree
+(confirmed via `git stash`, compared with a sorted diff since raw
+error counts/order are not stable across separate `cargo clippy`
+invocations on this tree) — the same toolchain/lint-version mismatch
+noted in every prior Bolt round in this file; zero new errors/warnings
+from this diff. `tests/protocol_test26.py` (75/75, the to_char/to_number-
+specific suite) and `tests/protocol_test17.py` (132/132, exercises
+`to_char` on date/timestamp types through the shared `fmt_exec_err` path)
+pass unchanged.
+
+Before/after profiles are not committed (each pair is ~1.9 MB/~230 KB;
+this entry's numbers are reproducible from the commands below against
+this commit and the parent baseline commit).
+
+**Reproduce**: `git show HEAD~1:src/numfmt.rs` (or check out the parent
+baseline commit) for the pre-fix tree, `cargo build`, then repeat the
+Callgrind/DHAT commands in the baseline entry's "Reproduce" section on
+both trees.
+
 ## Bolt: `to_char`/`to_number` re-parse their format picture from scratch on every row — baseline — 2026-10-05
 
 **Why this workload**: v1.40-v1.70 added thirty versions' worth of planner
