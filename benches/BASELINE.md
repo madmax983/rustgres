@@ -2,6 +2,112 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `to_char`/`to_number` re-parse their format picture from scratch on every row — baseline — 2026-10-05
+
+**Why this workload**: v1.40-v1.70 added thirty versions' worth of planner
+generality (cross-join reordering, decorrelation, PG19 cost-model parity,
+PREPARE/EXECUTE, EXPLAIN constant-folding, …) since the last
+profiling-focused Bolt round (`Numeric::hash_key`'s `BigUint` allocation,
+2026-10-03), none of it touching the formatting engine. `src/numfmt.rs` /
+`src/numfmt_tochar.rs` / `src/numfmt_fromchar.rs` (the `to_char`/`to_number`
+numeric-formatting engine, v0.26, ~1,900 lines) have never been profiled by
+any prior Bolt round — every previous round targeted the tokenizer/parser,
+row send/project, join/order-by, aggregate, window, regexp, or TOAST paths.
+
+`benches/profile_tochar.py` (new) is a fixed-iteration-count driver, same
+rationale as `profile_regexp.py`/`profile_join.py`: `bench.py`-style
+workloads are time-boxed, so two profiling runs execute a different amount
+of work whenever wall-clock speed jitters under valgrind, confounding a
+before/after instruction/allocation comparison. It loads a fixed
+3,000-row table (`price NUMERIC`, `qty INT`, `pct NUMERIC`) once, then sends
+20 exact iterations of:
+
+```sql
+SELECT to_char(price, 'FM$999,999,999.00'),
+       to_char(qty, 'FM999,999'),
+       to_char(pct, 'FM990.99')
+FROM bench_tc
+```
+
+three `to_char` calls (one each over a `NUMERIC` and an `INT` column) with
+a literal format picture reused across every one of the 3,000 rows and all
+20 iterations — the same shape as a real invoice/report export query that
+renders `NUMERIC` columns for display, not a synthetic microbenchmark of
+the formatting engine alone: it drives the real
+`run_statement` → `project_row` → `eval_func` → `num_to_char`/`int_to_char`
+call path through the wire protocol, like every other workload in this
+file.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_tochar.py --rows 3000 --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | sed -n '20,24p'   # PROGRAM TOTALS Ir
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.70, this commit —
+engine unchanged): **19,283,373,098** total `Ir`. Top self-cost entries,
+by `callgrind_annotate --auto=no`:
+
+| function | Ir | % of total |
+|---|---|---|
+| `numfmt::match_keyword` | 1,677,660,000 | **8.70%** |
+| `array::iter::iter_inner::PolymorphicIter<[…(&str, Node)…]>::next` (6 call-site variants) + `array::iter::IntoIter<(&str, Node), 20>::next` | 2,784,000,000 | **14.43%** |
+| `str::pattern::is_prefix_of` + `<str>::starts_with::<&str>` + `<[u8]>::starts_with` | 1,425,576,026 | **7.39%** |
+
+`match_keyword` (`src/numfmt.rs`) is called once per character position
+scanned while parsing a format picture. On every call it (a) iterates a
+20-entry `[(&str, Node); 20]` keyword table (`EEEE`, `FM`, `MI`, `PL`,
+`PR`, `RN`, `SG`, `SP`, `S`, `TH` and their lowercase forms) checking
+`rest.starts_with(kw)` against each entry, and (b) builds `rest` itself as
+`let rest: String = s[pos..].iter().collect();` — a fresh heap allocation
+holding *every remaining character of the picture*, not just the ≤4
+characters a keyword match could possibly need, making one parse
+quadratic in picture length on top of being re-run from scratch on every
+row. These three buckets alone — `match_keyword`'s own code, the 20-entry
+array scan, and the prefix-check machinery it calls — already sum to
+**30.53%** of total instructions, comfortably past the 5%-of-profile floor,
+before counting the `malloc`/`free`/`String`-building cost of the `rest`
+allocation itself (also attributable, but not double-counted into the
+30.53% above to keep the figure unambiguous).
+
+**DHAT** (same workload, one run, valgrind 3.22.0): **6,031,818** total
+allocation blocks, **192,865,263** total bytes. Filtering by call stacks
+that pass through `numfmt::parse_numfmt` or `numfmt::match_keyword`:
+
+| counter | value | % of total |
+|---|---|---|
+| Blocks on the `parse_numfmt`/`match_keyword` path | 2,760,000 | **45.76%** |
+| Bytes on the `parse_numfmt`/`match_keyword` path | 60,120,000 | **31.17%** |
+
+Both clear the ≥10%-of-allocations floor by a wide margin, independent of
+the Ir number. Top allocation sites on that path: `match_keyword`'s `rest`
+String (1,860,000 blocks / 17,160,000 bytes), `parse_numfmt`'s
+`chars: Vec<char>` (480,000 blocks / 18,000,000 bytes), and the `NumFmt`'s
+`nodes: Vec<Node>` growth (420,000 blocks / 24,960,000 bytes).
+
+**Hypothesis**: `parse_numfmt`'s result depends only on its `fmt: &str`
+argument — nothing about the row, the statement, or the connection's
+state. Every one of the 5 `numfmt::parse_numfmt` call sites in `src/exec.rs`
+(`num_to_char`, `int_to_char`, `float_to_char`, `float4_to_char`,
+`to_number`) parses its picture argument from scratch on *every row* even
+though it is overwhelmingly an `Expr::Literal` string constant that never
+changes across all 3,000 rows × 20 iterations × 2 distinct pictures (the
+third, `qty`'s `'FM999,999'`, is also fixed) = up to 180,000 full
+parse cycles of 3 distinct pictures in this workload alone. A cache keyed
+on the picture text, the same "pure function of its own arguments, so
+memoize it" shape as this repo's `regex::compile_opts` cache (v1.40, fixed
+2026-10-01) and `Q::immutable_fn_cache` (v1.36), removes the re-parse for
+every row after the first that uses a given picture — collapsing up to
+180,000 parses down to 3 (one per distinct picture).
+
+`cargo test --all-features`: 886/886 passed (pre-change tree, unmodified).
+
 ## Bolt: `Numeric::hash_key` allocates a `BigUint` for every exact-numeric hash key — fix — 2026-10-03
 
 Fixes the target identified in the baseline entry immediately below this
