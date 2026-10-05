@@ -13880,11 +13880,33 @@ fn pg_build_cross_nl(
     inner: PlanNode,
     quals: Vec<Expr>,
     px: &PgPlanCtx,
+    // v1.72: EC-canonical join-filter rendering (PG19 equivclass.c
+    // `generate_join_implied_equalities`) — the 3-way+ DP path's share of
+    // v1.71's 2-way rule. `outer`/`inner` are the build-time sides (the
+    // DP's chosen order IS the build order).
+    ec: &mut PgEc,
+    ec_split: &[(Vec<String>, Vec<String>)],
+    outer_names: &[String],
+    inner_names: &[String],
+    ec_partial_outer: bool,
 ) -> PlanNode {
-    let join_filter = match pg_fold_and(quals) {
+    let mut join_filter = match pg_fold_and(quals.clone()) {
         Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
         None => None,
     };
+    // v1.72: rewrite to PG19 EC-canonical representatives
+    // (first-orientation-outer-member = first-orientation-inner-member).
+    // A partial index on the build-time-outer side flips the orientation
+    // (generalizes v1.71's left-table rule). No-op when the text is
+    // unchanged — zero rendering drift for untouched plans.
+    let (ec_outer, ec_inner) = if ec_partial_outer {
+        (inner_names, outer_names)
+    } else {
+        (outer_names, inner_names)
+    };
+    if let Some(t) = pg_ec_join_filter_text(&quals, ec, ec_outer, ec_inner, ec_split, px) {
+        join_filter = Some(t);
+    }
     let rows = outer.rows().saturating_mul(inner.rows());
     let mut output = outer.output().to_vec();
     output.extend(inner.output().iter().cloned());
@@ -13909,6 +13931,11 @@ fn pg_build_cross_dp(
     rels: &[Option<PgJoinRel166>],
     leaves: &[PgCrossLeaf],
     px: &PgPlanCtx,
+    // v1.72: EC-canonical join-filter rendering state (PG19 equivclass.c).
+    ec: &mut PgEc,
+    ec_split: &[(Vec<String>, Vec<String>)],
+    ec_partial: &[bool],
+    leaf_names: &[Vec<String>],
 ) -> PlanNode {
     let sub_node = if rel.sub.count_ones() == 1 {
         leaves[rel.sub.trailing_zeros() as usize].node.clone()
@@ -13916,13 +13943,57 @@ fn pg_build_cross_dp(
         let sub_rel = rels[rel.sub as usize]
             .as_ref()
             .expect("v1.66: DP subrel exists");
-        pg_build_cross_dp(sub_rel, rels, leaves, px)
+        pg_build_cross_dp(
+            sub_rel, rels, leaves, px, ec, ec_split, ec_partial, leaf_names,
+        )
     };
     let leaf_node = leaves[rel.leaf].node.clone();
-    if rel.sub_outer {
-        pg_build_cross_nl(sub_node, leaf_node, rel.quals.clone(), px)
+    // v1.72: build-time sides for the EC orientation (the DP's chosen
+    // outer/inner IS the build order, unlike the v1.63-swapped 2-way
+    // path). Display-qualifier names per side (NOT pg_item_quals — the
+    // table+alias pair would trip the self-join guard); a partial index
+    // on any build-time-outer leaf flips the orientation.
+    let (outer_mask, inner_mask) = if rel.sub_outer {
+        (rel.sub, 1u32 << rel.leaf)
     } else {
-        pg_build_cross_nl(leaf_node, sub_node, rel.quals.clone(), px)
+        (1u32 << rel.leaf, rel.sub)
+    };
+    let mut outer_names: Vec<String> = Vec::new();
+    let mut inner_names: Vec<String> = Vec::new();
+    let mut ec_partial_outer = false;
+    for i in 0..leaves.len() {
+        if outer_mask & (1u32 << i) != 0 {
+            outer_names.extend(leaf_names[i].iter().cloned());
+            ec_partial_outer |= ec_partial[i];
+        }
+        if inner_mask & (1u32 << i) != 0 {
+            inner_names.extend(leaf_names[i].iter().cloned());
+        }
+    }
+    if rel.sub_outer {
+        pg_build_cross_nl(
+            sub_node,
+            leaf_node,
+            rel.quals.clone(),
+            px,
+            ec,
+            ec_split,
+            &outer_names,
+            &inner_names,
+            ec_partial_outer,
+        )
+    } else {
+        pg_build_cross_nl(
+            leaf_node,
+            sub_node,
+            rel.quals.clone(),
+            px,
+            ec,
+            ec_split,
+            &outer_names,
+            &inner_names,
+            ec_partial_outer,
+        )
     }
 }
 
@@ -13981,6 +14052,37 @@ fn pg_reorder_cross_join(
         Some(w) => pg_split_where(w, &splits).ok()?,
         None => (vec![Vec::new(); n], Vec::new()),
     };
+    // v1.72: EC-canonical join-filter rendering (PG19 equivclass.c
+    // `generate_join_implied_equalities`). One union-find over ALL WHERE
+    // conjuncts in written order — single-leaf conjuncts seed the EC too
+    // (e.g. t1.a = t1.b), exactly like v1.71's 2-way path. Shared by every
+    // DP nestloop node below.
+    let mut join_ec = PgEc::new();
+    if let Some(w) = where_ {
+        for c in pg_conjuncts(w) {
+            pg_ec_union_conjunct(&mut join_ec, c, &splits);
+        }
+    }
+    // v1.72: partial-index flags per leaf (PG19 `check_index_predicates`
+    // early EC orientation; generalizes v1.71's left-table rule to the
+    // DP's multi-leaf build-time sides).
+    let ec_partial: Vec<bool> = items
+        .iter()
+        .map(|it| pg_item_has_partial_index(eng, it, snap, own, session))
+        .collect();
+    // v1.72: display qualifier per leaf (alias-or-table, PG19's RTE
+    // alias) for the EC orientation sides. NOTE: this is NOT
+    // `splits[i].0` (`pg_item_quals` returns table AND alias, which
+    // would trip `pg_ec_join_filter_text`'s self-join guard); the 2-way
+    // path uses `pg_replaces_names` for the same reason.
+    let leaf_names: Vec<Vec<String>> = items
+        .iter()
+        .map(|it| {
+            let mut v = Vec::new();
+            pg_replaces_names(std::slice::from_ref(*it), &mut v);
+            v
+        })
+        .collect();
     // Plan each leaf exactly as the written-order path would; gate on
     // plain SeqScan leaves over resolvable base tables (the v1.63
     // estimability gate, extended to N leaves). A planning error
@@ -14135,7 +14237,16 @@ fn pg_reorder_cross_join(
     // comma products, but never assumed) fails closed to written order.
     let full = (1u32 << n) - 1;
     let top = rels[full as usize].as_ref()?;
-    Some(pg_build_cross_dp(top, &rels, &leaves, px))
+    Some(pg_build_cross_dp(
+        top,
+        &rels,
+        &leaves,
+        px,
+        &mut join_ec,
+        &splits,
+        &ec_partial,
+        &leaf_names,
+    ))
 }
 
 /// v0.78: plan a CTE body for EXPLAIN. `visible` holds the CTEs the body
@@ -76094,6 +76205,57 @@ mod v166_nway_cross_join_reorder_tests {
                 "->  Seq Scan on g5".to_string(),
             ]
         );
+    }
+
+    /// v1.72: 3-way comma join — the reorder DP's nestloop nodes render
+    /// PG19 EC-canonical join-filter representatives (the DP path's share
+    /// of v1.71's 2-way rule). EC in written WHERE order:
+    /// [t1.a, t1.b, t2.b, t2.a, t3.b, t3.a]; inner node (t1,t2) ->
+    /// (t1.a = t2.b), outer node ((t1,t2),t3) -> (t1.a = t3.b).
+    /// Byte-exact vs the join.out oracle.
+    #[test]
+    fn v172_3way_ec_join_filter_canonical() {
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE sj (a int unique, b int, c int unique)").unwrap();
+        run(
+            &mut eng,
+            "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1)",
+        )
+        .unwrap();
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM sj t1, sj t2, sj t3 \
+             WHERE t1.a = t1.b AND t1.b = t2.b AND t2.b = t2.a AND \
+             t1.b = t3.b AND t3.b = t3.a",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop".to_string(),
+                "Join Filter: (t1.a = t3.b)".to_string(),
+                "->  Nested Loop".to_string(),
+                "Join Filter: (t1.a = t2.b)".to_string(),
+                "->  Seq Scan on sj t1".to_string(),
+                "Filter: (a = b)".to_string(),
+                "->  Seq Scan on sj t2".to_string(),
+                "Filter: (b = a)".to_string(),
+                "->  Seq Scan on sj t3".to_string(),
+                "Filter: (b = a)".to_string(),
+            ]
+        );
+    }
+
+    /// v1.72: the EC rewrite is a no-op when the written conjunct is
+    /// already canonical — zero rendering drift for untouched DP plans.
+    #[test]
+    fn v172_dp_ec_noop_when_canonical() {
+        let mut eng = engine();
+        setup_4way(&mut eng);
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM f1, f2, f3, f4 WHERE f1.a = f2.a",
+        );
+        assert!(lines.iter().any(|l| l == "Join Filter: (f1.a = f2.a)"));
     }
 
     /// v1.66: 9-way comma join fails closed to the written order (the
