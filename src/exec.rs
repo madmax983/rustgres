@@ -12227,6 +12227,266 @@ fn pg_split_where(
     Ok((per_item, join))
 }
 
+// ============================================================================
+// v1.71: PG19 EC-canonical join-filter representatives.
+//
+// PG19 reference (`src/backend/optimizer/path/equivclass.c`,
+// `generate_join_implied_equalities`): for an inner join the planner's
+// nestloop Join Filter shows the EC-derived clause built as
+// `best_outer_em = best_inner_em` — the FIRST equivalence-class member (in EC
+// insertion order) from the call's outer side, then the first from the inner
+// side. The scoring prefers simple Vars (+1 per side) and hashjoinable
+// operators (+1), so for all-Var `=` clauses the first pair scores 3 and wins
+// immediately.
+//
+// The clause orientation is fixed by the FIRST EC call per equivalence
+// class and persists regardless of the plan's outer/inner:
+// - `check_index_predicates` (indxpath.c) runs during base-rel path setup —
+//   before join planning — but ONLY when the rel has a partial index. It
+//   calls with outer=otherrels, so the derived clause is
+//   `(first-other-member = first-indexed-member)`; it is saved via
+//   `ec_add_derived_clause` and reused bidirectionally by
+//   `build_joinrel_restrictlist`.
+// - With no partial index, `build_joinrel_restrictlist` calls first with
+//   outer=build-time-left, giving `(first-left-member =
+//   first-right-member)`.
+//
+// ECs are built in jointree post-order: the join's own ON quals are
+// distributed before the top-level WHERE (initsplan.c `deconstruct_recurse`
+// appends each item after its children).
+//
+// Only plain `Column = Column` equalities are admitted to the EC (fail
+// closed) — then every member is a Var and PG's rule provably reduces to
+// first-member-per-side. The rewrite is EXPLAIN-text-only (the join filter
+// is a pre-rendered String on the plan node; the executor never sees
+// PlanNode) and semantics-preserving by EC construction.
+
+/// Union-find over `(qualifier, column)` pairs, preserving insertion order.
+struct PgEc {
+    parent: Vec<usize>,
+    ident: Vec<(String, String)>,
+}
+
+impl PgEc {
+    fn new() -> Self {
+        PgEc {
+            parent: Vec::new(),
+            ident: Vec::new(),
+        }
+    }
+    fn get(&self, m: &(String, String)) -> Option<usize> {
+        self.ident.iter().position(|x| x == m)
+    }
+    fn idx(&mut self, m: (String, String)) -> usize {
+        if let Some(i) = self.get(&m) {
+            return i;
+        }
+        let i = self.ident.len();
+        self.ident.push(m);
+        self.parent.push(i);
+        i
+    }
+    fn find(&mut self, mut i: usize) -> usize {
+        while self.parent[i] != i {
+            self.parent[i] = self.parent[self.parent[i]];
+            i = self.parent[i];
+        }
+        i
+    }
+    fn union(&mut self, a: (String, String), b: (String, String)) {
+        let ia = self.idx(a);
+        let ib = self.idx(b);
+        let ra = self.find(ia);
+        let rb = self.find(ib);
+        if ra != rb {
+            self.parent[rb] = ra;
+        }
+    }
+    /// First member (insertion order) of `root` whose qualifier is in `quals`.
+    fn first_in(&mut self, root: usize, quals: &[String]) -> Option<(String, String)> {
+        for i in 0..self.ident.len() {
+            if self.find(i) == root && quals.iter().any(|q| q == &self.ident[i].0) {
+                return Some(self.ident[i].clone());
+            }
+        }
+        None
+    }
+}
+
+/// Resolve a column reference to an EC member identity. Qualified refs keep
+/// their qualifier (it must name a known side); unqualified refs resolve to
+/// the unique single-qualifier item owning the column. Anything else returns
+/// `None` (fail closed).
+fn pg_ec_member(
+    q: &Option<String>,
+    col: &str,
+    split: &[(Vec<String>, Vec<String>)],
+) -> Option<(String, String)> {
+    match q {
+        Some(qq) => {
+            if split.iter().any(|(qs, _)| qs.iter().any(|x| x == qq)) {
+                Some((qq.clone(), col.to_string()))
+            } else {
+                None
+            }
+        }
+        None => {
+            let mut found = None;
+            for (i, (_, cs)) in split.iter().enumerate() {
+                if cs.iter().any(|x| x == col) {
+                    if found.is_some() {
+                        return None; // ambiguous: no faithful member
+                    }
+                    found = Some(i);
+                }
+            }
+            let i = found?;
+            if split[i].0.len() == 1 {
+                Some((split[i].0[0].clone(), col.to_string()))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Union one equality conjunct's plain-column sides into the EC.
+fn pg_ec_union_conjunct(ec: &mut PgEc, c: &Expr, split: &[(Vec<String>, Vec<String>)]) {
+    if let Expr::Cmp {
+        op: CmpOp::Eq,
+        left,
+        right,
+    } = c
+    {
+        if let (
+            Expr::Column {
+                table: lt,
+                name: ln,
+            },
+            Expr::Column {
+                table: rt,
+                name: rn,
+            },
+        ) = (left.as_ref(), right.as_ref())
+        {
+            if let (Some(a), Some(b)) = (
+                pg_ec_member(lt, ln, split),
+                pg_ec_member(rt, rn, split),
+            ) {
+                ec.union(a, b);
+            }
+        }
+    }
+}
+
+/// v1.71: does this FROM item's base table carry a partial index? PG19's
+/// `check_index_predicates` side effect (early EC-derived clause) fires only
+/// for partial indexes, so only they affect the join-filter orientation.
+fn pg_item_has_partial_index(
+    eng: &Engine,
+    item: &FromItem,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> bool {
+    let tname = match item {
+        FromItem::Table { name, .. } => name,
+        _ => return false,
+    };
+    eng.db
+        .visible_indexes_for(tname, snap, &[own], session)
+        .iter()
+        .any(|ix| ix.def.predicate.is_some())
+}
+
+/// v1.71: rewrite nested-loop join-filter conjuncts to PG19 EC-canonical form
+/// (`first-orientation-outer-member = first-orientation-inner-member`).
+/// Returns the rendered text when at least one conjunct changed, else `None`
+/// (caller keeps the pre-swap text — zero rendering drift for untouched
+/// plans).
+fn pg_ec_join_filter_text(
+    jf: &[Expr],
+    ec: &mut PgEc,
+    outer_names: &[String],
+    inner_names: &[String],
+    split: &[(Vec<String>, Vec<String>)],
+    px: &PgPlanCtx,
+) -> Option<String> {
+    // Self-joins (shared qualifiers across sides): no faithful assignment.
+    if outer_names.iter().any(|q| inner_names.contains(q)) {
+        return None;
+    }
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    for c in jf {
+        for s in pg_conjuncts(c) {
+            conjuncts.push(s.clone());
+        }
+    }
+    let mut changed = false;
+    let rewritten: Vec<Expr> = conjuncts
+        .into_iter()
+        .map(|c| {
+            if let Expr::Cmp {
+                op: CmpOp::Eq,
+                left,
+                right,
+            } = &c
+            {
+                if let (
+                    Expr::Column {
+                        table: lt,
+                        name: ln,
+                    },
+                    Expr::Column {
+                        table: rt,
+                        name: rn,
+                    },
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if let (Some(a), Some(b)) = (
+                        pg_ec_member(lt, ln, split),
+                        pg_ec_member(rt, rn, split),
+                    ) {
+                        if let (Some(ia), Some(ib)) = (ec.get(&a), ec.get(&b)) {
+                            if ec.find(ia) == ec.find(ib) {
+                                let root = ec.find(ia);
+                                if let (Some((oq, oc)), Some((iq, ic))) = (
+                                    ec.first_in(root, outer_names),
+                                    ec.first_in(root, inner_names),
+                                ) {
+                                    // No-op when the canonical members are
+                                    // already the conjunct's members.
+                                    let same =
+                                        oq == a.0 && oc == a.1 && iq == b.0 && ic == b.1;
+                                    if !same {
+                                        changed = true;
+                                        return Expr::Cmp {
+                                            op: CmpOp::Eq,
+                                            left: Box::new(Expr::Column {
+                                                table: Some(oq),
+                                                name: oc,
+                                            }),
+                                            right: Box::new(Expr::Column {
+                                                table: Some(iq),
+                                                name: ic,
+                                            }),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            c
+        })
+        .collect();
+    if !changed {
+        return None;
+    }
+    pg_fold_and(rewritten).map(|e| pg_expr_text_or_debug(&e, px, true))
+}
+
 /// v1.08: an ORDER BY term's effective expression: a bare column naming
 /// a SELECT output alias orders by the aliased expression (PG19 orders
 /// by the targetlist entry, and EXPLAIN deparses that).
@@ -16137,6 +16397,21 @@ fn plan_from_item(
             let mut left_where: Option<Expr> = None;
             let mut right_where: Option<Expr> = None;
             let mut join_filter: Option<String> = None;
+            // v1.71: EC union-find + raw join-filter conjuncts. The text is
+            // rendered post-swap (see the NestedLoop branch below) using the
+            // PG19 first-EC-call orientation.
+            let mut jf_exprs: Vec<Expr> = Vec::new();
+            let mut join_ec = PgEc::new();
+            // v1.71: item qualifier/column split for EC member resolution
+            // (shared by the ON and WHERE EC feeds below).
+            let ec_split: [(Vec<String>, Vec<String>); 2] = [
+                pg_split_item(eng, left, snap, own, session, ctes),
+                pg_split_item(eng, right, snap, own, session, ctes),
+            ];
+            // v1.71: PG19 `check_index_predicates` side effect — a partial
+            // index on the left table fixes the EC-derived orientation to
+            // (right-first, left-second).
+            let ec_partial_left = pg_item_has_partial_index(eng, left, snap, own, session);
             // v1.50: One-sided ON pushdown target (set inside the supported
             // block, used after inner is planned).
             let mut push_on_to_right: Option<Expr> = None;
@@ -16184,6 +16459,11 @@ fn plan_from_item(
                         } else {
                             jf.push(o.clone());
                         }
+                        // v1.71: EC from ON conjuncts (PG19 distributes the
+                        // join's own quals before the top WHERE).
+                        for c in pg_conjuncts(o) {
+                            pg_ec_union_conjunct(&mut join_ec, c, &ec_split);
+                        }
                     }
                     // v1.64: USING quals (PG19 `transformJoinUsingClause`).
                     // Each USING column becomes `left.col = right.col` with
@@ -16227,13 +16507,18 @@ fn plan_from_item(
                     }
                     if using_ok {
                     if let Some(w) = where_ {
-                        let l = pg_split_item(eng, left, snap, own, session, ctes);
-                        let r = pg_split_item(eng, right, snap, own, session, ctes);
-                        let (per_item, mid) = pg_split_where(w, &[l, r])?;
+                        // v1.71: reuse the EC split computed above.
+                        let (per_item, mid) = pg_split_where(w, &ec_split)?;
                         let mut it = per_item.into_iter();
                         left_where = pg_fold_and(it.next().unwrap_or_default());
                         right_where = pg_fold_and(it.next().unwrap_or_default());
                         jf.extend(mid);
+                        // v1.71: EC from WHERE conjuncts, written order
+                        // (after the ON conjuncts, per PG19's post-order
+                        // jointree distribution).
+                        for c in pg_conjuncts(w) {
+                            pg_ec_union_conjunct(&mut join_ec, c, &ec_split);
+                        }
                     }
                     // v1.64: hashable equi clauses for the hash-vs-nestloop
                     // choice (PG19 `hash_inner_and_outer`). Extracted from
@@ -16246,6 +16531,9 @@ fn plan_from_item(
                         pg_replaces_names(std::slice::from_ref(right), &mut rn);
                         hash_clauses = pg_hash_clauses(&jf, &ln, &rn);
                     }
+                    // v1.71: keep the raw conjuncts for the post-swap
+                    // EC-canonical render in the NestedLoop branch.
+                    jf_exprs = jf.clone();
                     join_filter = match pg_fold_and(jf) {
                         Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
                         None => None,
@@ -16544,6 +16832,36 @@ fn plan_from_item(
             } else {
                 (outer, inner)
             };
+            // v1.71: EC-canonical join-filter representatives (PG19
+            // equivclass.c `generate_join_implied_equalities`): the clause
+            // orientation is fixed by PG's first EC call — a partial index
+            // on the left table flips it to (right-first, left-second),
+            // otherwise (left-first, right-first) at build time. The
+            // orientation persists regardless of the plan's outer/inner,
+            // so this uses the build-time sides, not the swapped ones.
+            // EXPLAIN-text only; skipped in legacy (non-PG-text) mode.
+            if let Some(px) = pctx {
+                let mut onm = Vec::new();
+                pg_replaces_names(std::slice::from_ref(left), &mut onm);
+                let mut inm = Vec::new();
+                pg_replaces_names(std::slice::from_ref(right), &mut inm);
+                let (outer_names, inner_names): (&[String], &[String]) =
+                    if ec_partial_left {
+                        (&inm, &onm)
+                    } else {
+                        (&onm, &inm)
+                    };
+                if let Some(t) = pg_ec_join_filter_text(
+                    &jf_exprs,
+                    &mut join_ec,
+                    outer_names,
+                    inner_names,
+                    &ec_split,
+                    px,
+                ) {
+                    join_filter = Some(t);
+                }
+            }
             let rows = outer.rows().saturating_mul(inner.rows());
             // v1.46: VERBOSE `Output:` — a join's tlist starts as the
             // verbatim concatenation of its inputs' tlists (PG19). The
