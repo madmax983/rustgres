@@ -174,12 +174,51 @@ fn match_keyword(s: &[char], pos: usize) -> Option<(Node, usize)> {
     }
 }
 
-/// Parse a numeric format picture into a `NumFmt`.
-///
+/// v1.71: every `to_char`/`to_number` call site re-parses its format
+/// picture from scratch on every row, even though the picture (almost
+/// always an `Expr::Literal` string constant, e.g. `'FM999,999.00'`) is
+/// identical across every row of a statement -- and `match_keyword`
+/// makes a single parse quadratic in picture length on top of that
+/// (`rest: String = s[pos..].iter().collect()` collects the *entire*
+/// remaining picture at every scanned position just to check a 1-4
+/// character keyword prefix). This thread-local cache, keyed by the
+/// picture text, makes a repeat `parse_numfmt` call for a picture this
+/// connection has already parsed a pointer-clone of the first parse
+/// instead of a full re-scan. Same shape and same cap as this repo's
+/// `regex::compile_opts` cache (v1.40): bounded so a picture built from
+/// a column value per row (not a realistic `to_char` usage, but
+/// possible) cannot grow the cache unboundedly -- it just stops
+/// benefiting, falling back to parsing every time exactly as before.
+/// Only successful parses are cached; an invalid picture still reports
+/// the same error on every call.
+const NUMFMT_CACHE_CAP: usize = 64;
+
+thread_local! {
+    static NUMFMT_CACHE: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<NumFmt>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Parse a numeric format picture into a `NumFmt`, memoized per picture
+/// text for the life of the connection thread (see `NUMFMT_CACHE` above).
+pub fn parse_numfmt(fmt: &str) -> Result<std::rc::Rc<NumFmt>, NumFmtError> {
+    if let Some(hit) = NUMFMT_CACHE.with(|c| c.borrow().get(fmt).cloned()) {
+        return Ok(hit);
+    }
+    let parsed = std::rc::Rc::new(parse_numfmt_uncached(fmt)?);
+    NUMFMT_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= NUMFMT_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(fmt.to_string(), parsed.clone());
+    });
+    Ok(parsed)
+}
+
 /// Mirrors `parse_format()` + `NUMDesc_prepare()` in formatting.c,
 /// including the quoted-literal rules (`"..."` with `\"` and `\\`
 /// escapes; an unterminated quote swallows the rest of the picture).
-pub fn parse_numfmt(fmt: &str) -> Result<NumFmt, NumFmtError> {
+fn parse_numfmt_uncached(fmt: &str) -> Result<NumFmt, NumFmtError> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut d = NumFmt::new();
     let mut decimal_seen = false;

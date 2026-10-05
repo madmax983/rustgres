@@ -48806,19 +48806,19 @@ fn num_to_char(n: &crate::storage::Numeric, fmt: &str, _name: &str) -> Result<Va
 /// error, so integers take this checked path whenever `multi > 0` on the
 /// plain (non-roman, non-EEEE) path.
 fn int_to_char(v: i128, bits: u32, fmt: &str) -> Result<Value, ExecError> {
-    let mut desc = match crate::numfmt::parse_numfmt(fmt) {
+    let base_desc = match crate::numfmt::parse_numfmt(fmt) {
         Ok(d) => d,
         Err(e) => return Err(numfmt_exec_err(e)),
     };
-    let n = if desc.multi > 0 && !desc.roman && !desc.eeee {
+    if base_desc.multi > 0 && !base_desc.roman && !base_desc.eeee {
         // dtoi4/dtoi8(10^multi): an out-of-range multiplier errors too;
         // 10^k is exact in float8 for k <= 22, so the int4 (k <= 9) and
         // int8 (k <= 18) multipliers are always exact.
         let max_multi = if bits == 32 { 9 } else { 18 };
-        if desc.multi > max_multi {
+        if base_desc.multi > max_multi {
             return Err(exec_err("22003", "integer out of range"));
         }
-        let shifted = v * 10i128.pow(desc.multi as u32);
+        let shifted = v * 10i128.pow(base_desc.multi as u32);
         let in_range = if bits == 32 {
             shifted >= i128::from(i32::MIN) && shifted <= i128::from(i32::MAX)
         } else {
@@ -48827,13 +48827,19 @@ fn int_to_char(v: i128, bits: u32, fmt: &str) -> Result<Value, ExecError> {
         if !in_range {
             return Err(exec_err("22003", "integer out of range"));
         }
+        // Mutates pre/multi, so this (rare: only `V`-picture integer
+        // input) path clones out of the cached Rc instead of sharing it.
+        let mut desc = (*base_desc).clone();
         desc.pre += desc.multi;
         desc.multi = 0;
-        crate::storage::Numeric::new(shifted, 0)
-    } else {
-        crate::storage::Numeric::new(v, 0)
-    };
-    match crate::numfmt_tochar::numeric_to_char(&n, &desc) {
+        let n = crate::storage::Numeric::new(shifted, 0);
+        return match crate::numfmt_tochar::numeric_to_char(&n, &desc) {
+            Ok(s) => Ok(Value::text(s)),
+            Err(e) => Err(numfmt_exec_err(e)),
+        };
+    }
+    let n = crate::storage::Numeric::new(v, 0);
+    match crate::numfmt_tochar::numeric_to_char(&n, &base_desc) {
         Ok(s) => Ok(Value::text(s)),
         Err(e) => Err(numfmt_exec_err(e)),
     }
