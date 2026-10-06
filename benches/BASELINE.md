@@ -2,6 +2,159 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `row_index`/`leaf_of` hash row-version ids through `SipHash` — fix — 2026-10-06
+
+Fixes the targets identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/storage.rs`: `Table::row_index` (the id -> position map added in v0.5
+so multi-row writes don't degrade to O(rows) per row) changes from
+`HashMap<u64, usize>` to `HashMap<u64, usize, FxBuildHasher>` — the same
+`crate::fxhash` hasher already used for `Database`'s catalog maps (v1.13)
+and the hash-join build table (v0.93), for the same reason: the keys are
+server-assigned row-version ids, not attacker-controlled input, so there
+is nothing to gain from `SipHash`'s hash-flooding resistance and every
+`push_version`/`row_pos`/`swap_remove_version`/`rebuild_row_index` call
+pays for it anyway. The one construction site (`Table::with_def`) changes
+from `HashMap::new()` to `HashMap::default()` (required once the hasher
+is no longer the std default); the field stays private, so no call site
+outside `storage.rs` changes.
+
+`src/exec.rs`: `exec_insert`'s `leaf_of` map (added in v1.40 to resolve
+`RETURNING tableoid`) has the identical shape — keyed by the same
+row-version ids, rebuilt from scratch and fully probed once per `INSERT`
+statement (one entry and one lookup per inserted row). It gets the same
+treatment: `HashMap<u64, &str>` -> `HashMap<u64, &str, FxBuildHasher>`.
+
+Both were missed when `fxhash.rs` was introduced for the catalog maps —
+`row_index` lives on `Table`, not `Database`, and `leaf_of` is a local
+in `exec_insert`, so neither was in scope of that change.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_insert.py --rows 1000 --count 30
+--timeout 600`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 2,776,652,330 | 2,513,038,889 | **-9.49%** |
+
+(`row_index` alone, measured before also fixing `leaf_of`, took the same
+baseline to 2,641,096,051 Ir, **-4.88%** — just under this repo's 5%
+floor on its own. `leaf_of` is the same bug in the same call path this
+harness exercises, found by re-reading the post-fix profile, so both are
+fixed together rather than splitting into a second round.)
+
+Every `core::hash::sip`/`std::hash::random` (`SipHash`/`RandomState`/
+`DefaultHasher`) entry disappears from `callgrind_annotate`'s flat
+profile at the default 100%-of-primary-sort threshold after the fix (it
+was ~5.6% of total `Ir` before, summed across the `d_rounds`/`c_rounds`/
+`write`/`finish`/`hash_one::<&u64>`/... entries parameterized on `u64` or
+`DefaultHasher` — i.e. exactly the keys `row_index` and `leaf_of` use;
+every other hot `HashMap` in this workload was already on `FxHasher`
+before this change, see the flat profile below). This is three orders of
+magnitude larger than this repo's established callgrind-determinism band
+(prior rounds' repeat runs agree to within ~0.0005%), so a second
+confirmatory run on each side was not needed to establish significance.
+
+This is a CPU-instruction fix, not an allocation fix: `FxBuildHasher` is
+`BuildHasherDefault<FxHasher>`, zero-sized, with the same `Default`
+behavior as `RandomState` — no DHAT delta is expected or claimed.
+
+`cargo test --all-features`: 888/888 passed, unchanged. `cargo clippy
+--all-targets --all-features`: 9 errors / 600 warnings on both the
+pre-change and post-change tree (confirmed via `git stash`, compared with
+a sorted diff — the diff is only line-number shifts from the added
+doc comments, no new category) — the same toolchain/lint-version
+mismatch noted in every prior Bolt round in this file. `cargo fmt --all
+-- --check` could not be run this round: it OOMs computing a diff over
+`exec.rs` on this machine, reproducibly, on an unmodified `HEAD` too (not
+caused by this change) — `cargo fmt --all` (no `--check`) was run instead
+on both the pre- and post-change tree and reformats ~1,300 unrelated
+lines across `exec.rs`/`sql.rs`/`regex.rs` on *both*, confirming a
+pre-existing rustfmt/toolchain mismatch (this environment's
+`rustfmt 1.9.0-stable`); that reformat is not included in this change.
+`tests/protocol_test_v100_partitions.py` and
+`tests/protocol_test_v116_partitioning.py` (the suites exercising
+`exec_insert`'s partition-routing path that builds `leaf_of`): 60/60 and
+20/20 passed, unchanged. Manually verified `RETURNING tableoid::regclass`
+on a fresh `RANGE`-partitioned table with out-of-id-order rows still
+resolves each row to its correct leaf.
+
+**Reproduce**: `git show HEAD~1:src/storage.rs src/exec.rs` (or check out
+the parent baseline commit) for the pre-fix tree, `cargo build`, then
+repeat the Callgrind command in the baseline entry's "Reproduce" section
+on both trees.
+
+## Bolt: `row_index`/`leaf_of` hash row-version ids through `SipHash` — baseline — 2026-10-06
+
+**Why this workload**: the last three profiling-focused Bolt rounds
+(`to_char`/`to_number`, `Numeric::hash_key`, `compile_opts`) all targeted
+expression-evaluation/formatting code; v1.70-v1.72 since then added only
+EXPLAIN-text-rendering machinery (`PlanNode` paths explicitly gated on
+`pctx`/EXPLAIN, confirmed by reading `exec.rs`: "EXPLAIN-text only" /
+"`PlanNode` never reaches the executor" comments at the v1.68/v1.71/v1.72
+call sites) — none of it touches the write path. `benches/profile_insert.py`
+(existing, v0.15) is the fixed-iteration-count harness for exactly that
+path: 30 iterations of a 1000-row multi-VALUES `INSERT` into a fresh
+unpartitioned table, over the real wire protocol, same shape as a batch
+load.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_insert.py --rows 1000 --count 30 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no --threshold=100 /tmp/cg.out | grep -i 'sip\|hash_one\|DefaultHasher\|RandomState'
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.72, pre-fix):
+**2,776,652,330** total `Ir`. Every self-cost entry whose symbol
+parameterizes on `u64` or names `std::hash::random`/`core::hash::sip`
+directly (i.e. the default `SipHash`/`RandomState` hasher, as opposed to
+this repo's own `FxHasher`, whose entries are parameterized on `String`/
+`str`/catalog types and are unaffected) sums to:
+
+| bucket (self-cost, `callgrind_annotate --threshold=100`) | Ir | % of total |
+|---|---|---|
+| `Sip13Rounds::d_rounds` (2 inlining sites) | 55,235,290 | 1.99% |
+| `Sip13Rounds::c_rounds` (2 inlining sites) | 38,364,260 | 1.38% |
+| `Hasher<Sip13Rounds>::write`/`::finish`/`::reset` (7 inlining-site variants) | 30,968,824 | 1.12% |
+| `RandomState`/`DefaultHasher`/`u8to64_le`/`<u64 as Hash>` glue (11 inlining-site variants) | 31,430,960 | 1.13% |
+| **Total (24 lines)** | **155,999,334** | **5.62%** |
+
+Comfortably past the 5%-of-profile floor, before counting any inclusive
+cost of the `HashMap::insert`/`get`/`reserve_rehash` frames that call
+into it.
+
+This is the only workload-relevant hashing cost in the profile that is
+*not* already on `FxHasher`: every catalog lookup (`Database::tables`,
+`find_table`, ...) and the hash-join build table show up in the same
+profile already parameterized on `BuildHasherDefault<FxHasher>`.
+
+**Hypothesis**: this workload does nothing but insert rows into a single
+unpartitioned table — the only per-row `u64`-keyed hash map on this path
+is `Table::row_index` (`storage.rs`), probed once per row on every
+`push_version` call (every `INSERT`, `COPY FROM`, WAL replay row, and
+`UPDATE`/DELETE`-triggered move). `fxhash.rs` (introduced for `Database`'s
+catalog maps, v1.13, and reused for the hash-join build table, v0.93)
+exists for exactly this situation — "probed many times per query... keyed
+by [non-adversarial]... identifiers" (its own doc comment) — but
+`row_index` was added in v0.5, before `fxhash.rs` existed, on `Table`
+rather than `Database`, and was never revisited. Swapping its
+`BuildHasherDefault<SipHash>` for `FxBuildHasher` removes 1-3 `SipHash`
+mix rounds per row with no behavior change (`HashMap`'s external API is
+hasher-independent).
+
+`cargo test --all-features`: 888/888 passed (pre-change tree, unmodified).
+
 ## Bolt: `to_char`/`to_number` re-parse their format picture from scratch on every row — fix — 2026-10-05
 
 Fixes the target identified in the baseline entry immediately below this

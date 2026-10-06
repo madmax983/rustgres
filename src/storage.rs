@@ -5016,8 +5016,12 @@ pub struct Table {
     pub domain_elem: Vec<bool>,
     pub rows: Vec<RowVersion>,
     /// Row-version id -> position in `rows`. Keeps id lookups O(1) so
-    /// multi-row writes don't degrade to O(rows) per row.
-    row_index: HashMap<u64, usize>,
+    /// multi-row writes don't degrade to O(rows) per row. Hashed with
+    /// `FxHasher` instead of the default `SipHash`: row-version ids are
+    /// server-assigned counters, not attacker-controlled input, probed
+    /// once per row on every INSERT/UPDATE/DELETE (same rationale as
+    /// `Database`'s catalog maps, see `fxhash.rs`).
+    row_index: HashMap<u64, usize, FxBuildHasher>,
     /// Xid of the CREATE TABLE transaction.
     pub created_xmin: u64,
     /// Xid of the DROP TABLE transaction; 0 = not dropped.
@@ -5096,7 +5100,7 @@ impl Table {
             domain_types: vec![None; n],
             domain_elem: vec![false; n],
             rows: Vec::new(),
-            row_index: HashMap::new(),
+            row_index: HashMap::default(),
             created_xmin,
             dropped_xmax: 0,
             not_null: vec![false; n],

@@ -7162,7 +7162,11 @@ fn exec_insert(
     // v1.40: resolve the partition leaf holding each inserted row for
     // RETURNING system columns (`tableoid` reports the leaf, like PG).
     // Upsert DO UPDATE rows are not routed and keep their planned leaf.
-    let leaf_of: std::collections::HashMap<u64, &str> = routed
+    // Row-version ids are server-assigned counters, not attacker-
+    // controlled input, and this map is rebuilt and fully probed once
+    // per INSERT statement (one entry, one lookup, per row) — same
+    // SipHash-is-overkill rationale as `Table::row_index`.
+    let leaf_of: std::collections::HashMap<u64, &str, crate::fxhash::FxBuildHasher> = routed
         .iter()
         .flat_map(|(leaf, rows)| rows.iter().map(|(id, _)| (*id, leaf.as_str())))
         .collect();
