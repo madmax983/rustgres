@@ -14471,6 +14471,48 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => expr_has_subquery(expr),
         Expr::Row(es) => es.iter().any(expr_has_subquery),
         Expr::ArrayCtor { elems: es, .. } => es.iter().any(expr_has_subquery),
+        // v1.74: the catch-all below historically false-positived on every
+        // pure-expression variant (notably `Arith`), which disabled
+        // self-join elimination for any restriction containing arithmetic
+        // (v1.73's stmt-1 target). Recurse precisely: a subquery can only
+        // hide in a subexpression.
+        Expr::Arith { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::Extract { from, .. } => expr_has_subquery(from),
+        Expr::Subscript { array, indices } => {
+            expr_has_subquery(array) || indices.iter().any(expr_has_subquery)
+        }
+        Expr::Slice { array, bounds } => {
+            expr_has_subquery(array)
+                || bounds.iter().any(|(lo, hi)| {
+                    lo.as_ref().is_some_and(|e| expr_has_subquery(e))
+                        || hi.as_ref().is_some_and(|e| expr_has_subquery(e))
+                })
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_subquery(expr)
+                || expr_has_subquery(pattern)
+                || escape.as_ref().is_some_and(|e| expr_has_subquery(e))
+        }
+        Expr::Regex { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::FieldAccess { expr, .. } | Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
+        Expr::WholeRow { .. } => false,
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            filter,
+            ..
+        } => {
+            args.iter().any(expr_has_subquery)
+                || partition_by.iter().any(expr_has_subquery)
+                || order_by.iter().any(|t| expr_has_subquery(&t.expr))
+                || filter.as_ref().is_some_and(|e| expr_has_subquery(e))
+        }
         _ => true,
     }
 }
@@ -78398,5 +78440,69 @@ mod v169_merge_anti_join_tests {
             "expected 2-key Merge Cond, got: {:?}",
             lines
         );
+    }
+
+    /// v1.74: `expr_has_subquery` must not false-positive on pure-expression
+    /// variants. The `_ => true` catch-all historically reported "has subquery"
+    /// for any `Arith` (and `Extract`, `Subscript`, `Slice`, `Like`, `Regex`,
+    /// `FieldAccess`, `NamedArg`, `WholeRow`, `Window`), disabling self-join
+    /// elimination for restrictions containing arithmetic.
+    #[test]
+    fn v174_expr_has_subquery_arith_no_false_positive() {
+        use crate::sql::{ArithOp, Expr, Literal};
+        let col = || Expr::Column {
+            table: None,
+            name: "a".to_string(),
+        };
+        let lit = || Expr::Literal(Literal::Int(1));
+        // `a + 1`: no subquery.
+        let arith = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(col()),
+            right: Box::new(lit()),
+        };
+        assert!(!expr_has_subquery(&arith));
+        // `a + (SELECT ...)`: subquery inside arithmetic must still be found.
+        let sub = parse_statement("SELECT 1").unwrap();
+        let Stmt::Select(sel) = sub else {
+            panic!("expected SELECT");
+        };
+        let arith_sub = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(col()),
+            right: Box::new(Expr::ScalarSub(Box::new(sel))),
+        };
+        assert!(expr_has_subquery(&arith_sub));
+    }
+
+    #[test]
+    fn v174_expr_has_subquery_other_variants_no_false_positive() {
+        use crate::sql::{Expr, Literal};
+        let col = || Expr::Column {
+            table: None,
+            name: "a".to_string(),
+        };
+        // EXTRACT(DOW FROM a)
+        assert!(!expr_has_subquery(&Expr::Extract {
+            field: "dow".to_string(),
+            from: Box::new(col()),
+        }));
+        // a LIKE 'x%'
+        assert!(!expr_has_subquery(&Expr::Like {
+            expr: Box::new(col()),
+            pattern: Box::new(Expr::Literal(Literal::Text("x%".into()))),
+            not: false,
+            ilike: false,
+            escape: None,
+        }));
+        // a[1]
+        assert!(!expr_has_subquery(&Expr::Subscript {
+            array: Box::new(col()),
+            indices: vec![Expr::Literal(Literal::Int(1))],
+        }));
+        // whole-row ref
+        assert!(!expr_has_subquery(&Expr::WholeRow {
+            qual: "t".to_string(),
+        }));
     }
 }
