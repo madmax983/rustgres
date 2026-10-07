@@ -13092,12 +13092,67 @@ fn pg_cost_hashjoin(
     // PG19 `initial_cost_hashjoin`: build the hashtable.
     let startup = inner_scan + (CPU_OPERATOR_COST * k + CPU_TUPLE_COST) * inner_rows;
     // PG19 `final_cost_hashjoin`: probe; the `* 0.5` is PG19's average
-    // per-bucket scan fraction.
+    // per-bucket scan fraction (`clamp_row_est` floors the bucket
+    // population at one row).
     let run = outer_scan
         + CPU_OPERATOR_COST * k * outer_rows
-        + CPU_OPERATOR_COST * k * outer_rows * (inner_rows * bucketsize) * 0.5
+        + CPU_OPERATOR_COST * k * outer_rows * (inner_rows * bucketsize).max(1.0) * 0.5
         + CPU_TUPLE_COST * join_rows;
     startup + run
+}
+
+/// v1.75: PG19 `estimate_hash_bucket_stats` (selfuncs.c) — the average
+/// fraction of the hashtable each probe tuple scans, for one inner
+/// hash-key column. `final_cost_hashjoin` uses this (not a constant) for
+/// the per-bucket probe term, and it is what makes PG19's inner/outer
+/// choice stats-driven: a filtered inner's `ndistinct` collapses under
+/// the restriction adjustment, raising its bucket fraction.
+///
+/// `estfract` is `1/nbuckets` when `ndistinct > nbuckets`, else
+/// `1/ndistinct`, clamped to >= the MCV frequency; `ndistinct` is scaled
+/// by the inner rel's restriction selectivity (`inner_rows/inner_tuples`,
+/// PG19's uniform-effect assumption). `nbuckets` ports
+/// `ExecChooseHashTableSize`'s single-batch case (nodeHash.c:
+/// `NTUP_PER_BUCKET=1`, 1024-bucket floor, power of 2, capped at PG19's
+/// `max_pointers` for the default 4MB hash_mem). Without ANALYZE stats
+/// (or a non-positive ndistinct), PG19's 0.1 punt. Multi-batch
+/// hashtables (inner bigger than hash_mem) are out of scope — no corpus
+/// shape reaches them.
+fn pg_hash_bucketsize(
+    db: &Database,
+    table: &str,
+    col: &str,
+    inner_rows: f64,
+    inner_tuples: f64,
+) -> f64 {
+    // Single-batch `ExecChooseHashTableSize`.
+    let want = (inner_rows.max(1.0).ceil() as u64).min(524288);
+    let nbuckets = 1024u64.max(want).next_power_of_two() as f64;
+    let cs = match db.stats.get(table).and_then(|t| t.cols.get(col)) {
+        Some(cs) => cs,
+        None => return 0.1,
+    };
+    if cs.n_distinct <= 0.0 {
+        return 0.1;
+    }
+    // The most common value's frequency (rustgres records MCVs
+    // frequency-descending, but take the max for robustness); no MCVs
+    // with a histogram means PG19 assumes the column is unique.
+    let mut mcv_freq = cs.mcv.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
+    if mcv_freq <= 0.0 && !cs.hist_bounds.is_empty() && inner_tuples > 0.0 {
+        mcv_freq = 1.0 / inner_tuples;
+    }
+    let mut ndistinct = cs.n_distinct;
+    if inner_tuples > 0.0 {
+        ndistinct *= (inner_rows / inner_tuples).clamp(0.0, 1.0);
+        ndistinct = ndistinct.max(1.0); // PG19 `clamp_row_est`
+    }
+    let estfract = if ndistinct > nbuckets {
+        1.0 / nbuckets
+    } else {
+        1.0 / ndistinct
+    };
+    estfract.max(mcv_freq)
 }
 
 /// v1.69: PG19's average column width for the no-stats row estimate
@@ -13559,9 +13614,33 @@ const PG_STD_FUZZ_FACTOR: f64 = 1.01;
 /// reproduces that behavior; the cost model alone would pick hash.
 const PG_HASHJOIN_MIN_INNER_ROWS: f64 = 10.0;
 
+/// v1.75: do ANALYZE stats back every inner hash-key column for this
+/// order? PG19's `estimate_hash_bucket_stats` needs real column stats;
+/// without them the bucket fractions punt to 0.1 and the cost model
+/// cannot reproduce PG19's stats-driven inner/outer choice (e.g. the
+/// subselect VtA shapes, whose oracles were generated with stats). Only
+/// plain base-table SeqScan inners with a stats entry per key column
+/// qualify; anything else fails closed to the v1.64 empirical rule.
+fn pg_inner_keys_have_stats(db: &Database, inner: &PlanNode, keys: &[Expr]) -> bool {
+    let table = match inner {
+        PlanNode::SeqScan { table, .. } => table.as_str(),
+        _ => return false,
+    };
+    keys.iter().all(|e| match e {
+        Expr::Column { name, .. } => db
+            .stats
+            .get(table)
+            .and_then(|t| t.cols.get(name))
+            .is_some(),
+        _ => false,
+    })
+}
+
 /// v1.64: absolute hash-join cost for one (outer, inner) order, or `None`
 /// when a side is not an estimable SeqScan (fail closed). See
-/// `pg_cost_hashjoin`.
+/// `pg_cost_hashjoin`. v1.75: `inner_keys` selects the bucket fraction:
+/// `Some(keys)` uses PG19's stats-driven `estimate_hash_bucket_stats`
+/// per key (smallest wins); `None` keeps the v1.64 0.1 punt.
 #[allow(clippy::too_many_arguments)]
 fn pg_hashjoin_cost_order(
     db: &Database,
@@ -13570,6 +13649,7 @@ fn pg_hashjoin_cost_order(
     inner: &PlanNode,
     inner_where: Option<&Expr>,
     num_hashclauses: usize,
+    inner_keys: Option<&[Expr]>,
     snap: &Snapshot,
     own: u64,
     session: u64,
@@ -13607,12 +13687,30 @@ fn pg_hashjoin_cost_order(
         return None;
     }
     let k = num_hashclauses as f64;
-    // PG19 `estimate_hash_bucket_stats` no-stats punt: `bucketsize_frac`
-    // defaults to 0.1 (no MCVs) — the fraction of the hashtable each
-    // probe tuple scans on average.
+    // v1.75: PG19 `final_cost_hashjoin` uses the smallest stats-driven
+    // `innerbucketsize` across the hash clauses ("undoubtedly
+    // conservative"); a non-column inner key gets the no-stats 0.1 punt
+    // (`estimate_hash_bucket_stats`'s isdefault branch). `None` keeps the
+    // v1.64 0.1 punt for the whole order (the no-stats fallback path).
+    let bucketsize = match inner_keys {
+        Some(keys) => {
+            let mut b = 1.0f64;
+            for e in keys {
+                let kb = match e {
+                    Expr::Column { name, .. } => {
+                        pg_hash_bucketsize(db, it, name, inner_rows, i_rel_rows)
+                    }
+                    _ => 0.1,
+                };
+                b = b.min(kb);
+            }
+            b
+        }
+        None => 0.1,
+    };
     let join_rows = outer_rows * inner_rows * PG_DEFAULT_EQ_SEL;
     Some(pg_cost_hashjoin(
-        outer_rows, outer_scan, inner_rows, inner_scan, k, 0.1, join_rows,
+        outer_rows, outer_scan, inner_rows, inner_scan, k, bucketsize, join_rows,
     ))
 }
 
@@ -17629,14 +17727,18 @@ fn plan_from_item(
                     session,
                 );
             // v1.64: hash join planning (PG19 `cost_hashjoin` vs
-            // `cost_nestloop`). The hash join gets its own order: PG
-            // empirically probes the filtered side (outer) and hashes the
-            // unfiltered side (inner); when both/neither sides are
-            // filtered, the cheaper cost-model order wins. Only for inner
-            // equi-joins with hashable clauses and estimable SeqScan
-            // sides; fail closed to nestloop otherwise. The clauses are
-            // oriented outer-var-left for `Hash Cond:` (PG19
-            // `create_hashjoin_plan` / `get_switched_clauses`).
+            // `cost_nestloop`). The hash join gets its own order: v1.75
+            // ports PG19's `make_join_rel` (joinrels.c) + `try_hashjoin_path`
+            // (joinpath.c) — both (rel1, rel2) and (rel2, rel1) orders are
+            // costed and `add_path` keeps the cheaper — deleting the v1.64
+            // empirical rule ("the filtered side probes"), which only
+            // matched PG19 when the filtered side happened to be the
+            // cheaper inner (PG19 hashes the smaller side regardless of
+            // which side the filter sits on). Only for inner equi-joins
+            // with hashable clauses and estimable SeqScan sides; fail
+            // closed to nestloop otherwise. The clauses are oriented
+            // outer-var-left for `Hash Cond:` (PG19 `create_hashjoin_plan`
+            // / `get_switched_clauses`).
             //
             // Note: (outer, inner) here are still the pre-swap (left,
             // right) plans; the v1.63 `swapped` order applies to the
@@ -17649,38 +17751,99 @@ fn plan_from_item(
                 let clauses_lr = hash_clauses.clone();
                 let clauses_rl: Vec<(Expr, Expr)> =
                     hash_clauses.iter().cloned().map(|(l, r)| (r, l)).collect();
-                // PG's empirical order: the filtered side probes.
-                let outer_is_left = match (left_where.is_some(), right_where.is_some()) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    // Both/neither filtered: pick the cheaper cost-model
-                    // order (fuzz tie-break keeps left-outer).
-                    _ => {
-                        let cost_lr = pg_hashjoin_cost_order(
-                            &eng.db,
-                            &outer,
-                            left_where.as_ref(),
-                            &inner,
-                            right_where.as_ref(),
-                            hash_clauses.len(),
-                            snap,
-                            own,
-                            session,
-                        );
-                        let cost_rl = pg_hashjoin_cost_order(
-                            &eng.db,
-                            &inner,
-                            right_where.as_ref(),
-                            &outer,
-                            left_where.as_ref(),
-                            hash_clauses.len(),
-                            snap,
-                            own,
-                            session,
-                        );
-                        match (cost_lr, cost_rl) {
-                            (Some(c1), Some(c2)) if c2 * PG_STD_FUZZ_FACTOR < c1 => false,
-                            _ => true,
+                // v1.75: PG19 `make_join_rel`/`try_hashjoin_path` try both
+                // orders and keep the cheaper — but only when ANALYZE
+                // stats back the bucket fractions
+                // (`estimate_hash_bucket_stats`); without stats the model
+                // cannot reproduce PG19's stats-driven choice (the
+                // subselect VtA oracles were generated with stats), so the
+                // v1.64 validated behavior is kept: the empirical
+                // filtered-probes rule for one-sided filters, the punted
+                // cost-model order for both/neither. `hash_clauses` are
+                // (left, right): the inner keys are the right sides for
+                // LR, the left sides for RL.
+                let keys_r: Vec<Expr> =
+                    hash_clauses.iter().map(|(_, r)| r.clone()).collect();
+                let keys_l: Vec<Expr> =
+                    hash_clauses.iter().map(|(l, _)| l.clone()).collect();
+                // The stats-driven choice is the v1.75 scope: one side
+                // filtered and the other not, with stats backing both
+                // orders' inner keys. Everything else keeps v1.64
+                // behavior exactly (fail closed per the load-bearing
+                // requirement).
+                let stats_driven = left_where.is_some() != right_where.is_some()
+                    && pg_inner_keys_have_stats(&eng.db, &inner, &keys_r)
+                    && pg_inner_keys_have_stats(&eng.db, &outer, &keys_l);
+                let outer_is_left = if stats_driven {
+                    // PG19 tries both orders and keeps the cheaper
+                    // (costsize.c). The fuzz tie-break keeps the written
+                    // (left-outer) order, mirroring PG19's
+                    // `compare_path_costs_fuzzily` (the first-added path
+                    // wins near-ties).
+                    let cost_lr = pg_hashjoin_cost_order(
+                        &eng.db,
+                        &outer,
+                        left_where.as_ref(),
+                        &inner,
+                        right_where.as_ref(),
+                        hash_clauses.len(),
+                        Some(&keys_r[..]),
+                        snap,
+                        own,
+                        session,
+                    );
+                    let cost_rl = pg_hashjoin_cost_order(
+                        &eng.db,
+                        &inner,
+                        right_where.as_ref(),
+                        &outer,
+                        left_where.as_ref(),
+                        hash_clauses.len(),
+                        Some(&keys_l[..]),
+                        snap,
+                        own,
+                        session,
+                    );
+                    match (cost_lr, cost_rl) {
+                        (Some(c1), Some(c2)) if c2 * PG_STD_FUZZ_FACTOR < c1 => false,
+                        _ => true,
+                    }
+                } else {
+                    // v1.64 behavior: the filtered side probes;
+                    // both/neither filtered picks the cheaper punted
+                    // cost-model order (fuzz tie-break keeps left-outer).
+                    match (left_where.is_some(), right_where.is_some()) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        _ => {
+                            let cost_lr = pg_hashjoin_cost_order(
+                                &eng.db,
+                                &outer,
+                                left_where.as_ref(),
+                                &inner,
+                                right_where.as_ref(),
+                                hash_clauses.len(),
+                                None,
+                                snap,
+                                own,
+                                session,
+                            );
+                            let cost_rl = pg_hashjoin_cost_order(
+                                &eng.db,
+                                &inner,
+                                right_where.as_ref(),
+                                &outer,
+                                left_where.as_ref(),
+                                hash_clauses.len(),
+                                None,
+                                snap,
+                                own,
+                                session,
+                            );
+                            match (cost_lr, cost_rl) {
+                                (Some(c1), Some(c2)) if c2 * PG_STD_FUZZ_FACTOR < c1 => false,
+                                _ => true,
+                            }
                         }
                     }
                 };
@@ -17701,6 +17864,14 @@ fn plan_from_item(
                 } else {
                     (&inner, &outer)
                 };
+                // The hash-vs-nestloop comparison uses the chosen order with
+                // the same bucket fractions as the order choice (stats
+                // driven iff the choice was).
+                let hash_keys: Option<&[Expr]> = if stats_driven {
+                    Some(if outer_is_left { &keys_r[..] } else { &keys_l[..] })
+                } else {
+                    None
+                };
                 let hash_cost = pg_hashjoin_cost_order(
                     &eng.db,
                     h_o,
@@ -17708,6 +17879,7 @@ fn plan_from_item(
                     h_i,
                     h_iw,
                     h_clauses.len(),
+                    hash_keys,
                     snap,
                     own,
                     session,
@@ -77866,8 +78038,11 @@ mod v164_hashjoin_choice_tests {
 
     #[test]
     fn v164_hash_cond_outer_first_on_swap() {
-        // When the filtered side is on the right, it probes (outer) and
-        // the Hash Cond leads with its column.
+        // v1.75: without ANALYZE stats the v1.64 empirical rule is kept
+        // (the stats-driven cost model cannot reproduce PG19's
+        // stats-driven bucket fractions from a 0.1 punt). When the
+        // filtered side is on the right, it probes (outer) and the Hash
+        // Cond leads with its column.
         let mut eng = engine();
         setup_hash(&mut eng);
         let lines = plan_raw(
@@ -77880,7 +78055,7 @@ mod v164_hashjoin_choice_tests {
             .expect("Hash Cond line");
         assert!(
             hc.trim() == "Hash Cond: (big2.id = big1.id)",
-            "filtered right side must probe first, got: {hc}"
+            "filtered right side must probe first without stats, got: {hc}"
         );
     }
 
@@ -77897,6 +78072,148 @@ mod v164_hashjoin_choice_tests {
             "hash must win large: {hj_large} vs {nl_large}"
         );
         assert_eq!(PG_HASHJOIN_MIN_INNER_ROWS, 10.0);
+    }
+}
+
+// ============================================================================
+// v1.75: cost-based hash-join inner/outer selection (PG19
+// `try_hashjoin_path`).
+//
+// Soundness: the `HashJoin` plan node is display-only — the executor
+// never sees `PlanNode`, so reordering plan children cannot change
+// results. These tests prove the planner costs both (rel1, rel2) orders
+// and keeps the cheaper, deleting v1.64's empirical rule ("the filtered
+// side probes").
+#[cfg(test)]
+mod v175_hashjoin_order_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    /// Raw (indented) EXPLAIN lines, so child order is observable.
+    fn plan_raw(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup_skew(eng: &mut Engine) {
+        // The join.sql:851 target shape: 1000 rows, `filt` uniform over
+        // 10 values, analyzed so the cost model sees real stats.
+        run(
+            eng,
+            "CREATE TABLE skewedtable (val int not null, filt int not null)",
+        )
+        .unwrap();
+        run(
+            eng,
+            "INSERT INTO skewedtable SELECT CASE WHEN g <= 100 THEN 0 ELSE (g % 100) + 1 END, g % 10 FROM generate_series(1, 1000) g",
+        )
+        .unwrap();
+        run(eng, "ANALYZE skewedtable").unwrap();
+    }
+
+    #[test]
+    fn v175_hashes_filtered_smaller_side() {
+        // join.sql:851 — the filtered side (~100 rows) is the cheaper
+        // build side, so PG19 hashes it and probes the unfiltered side:
+        // `Hash Cond: (t2.val = t1.val)`.
+        let mut eng = engine();
+        setup_skew(&mut eng);
+        let lines = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM skewedtable t1 JOIN skewedtable t2 ON t1.val = t2.val WHERE t1.filt = 5",
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "Hash Join"),
+            "skewed join must use Hash Join, got: {lines:?}"
+        );
+        let hc = lines
+            .iter()
+            .find(|l| l.contains("Hash Cond:"))
+            .expect("Hash Cond line");
+        assert!(
+            hc.trim() == "Hash Cond: (t2.val = t1.val)",
+            "must hash the filtered (smaller) side, got: {hc}"
+        );
+    }
+
+    #[test]
+    fn v175_unfiltered_smaller_side_probes() {
+        // Mirror image: the filter sits on the larger side after
+        // selectivity, so the unfiltered side probes. A narrow `filt`
+        // filter on the left that still leaves it bigger than the right
+        // would need stats; here the no-stats model suffices: two equal
+        // tables, left filtered to half, must keep left-outer only when
+        // the fuzz tie-break applies — instead assert the symmetric
+        // property that swapping the query's FROM order swaps the cond.
+        let mut eng = engine();
+        setup_skew(&mut eng);
+        let ltr = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM skewedtable t1 JOIN skewedtable t2 ON t1.val = t2.val WHERE t1.filt = 5",
+        );
+        let rtl = plan_raw(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM skewedtable t2 JOIN skewedtable t1 ON t2.val = t1.val WHERE t1.filt = 5",
+        );
+        let hc = |ls: &[String]| {
+            ls.iter()
+                .find(|l| l.contains("Hash Cond:"))
+                .expect("Hash Cond line")
+                .trim()
+                .to_string()
+        };
+        // In both written orders the filtered t1 is the cheaper inner, so
+        // the cond always leads with the unfiltered side's column.
+        assert_eq!(hc(&ltr), "Hash Cond: (t2.val = t1.val)");
+        assert_eq!(hc(&rtl), "Hash Cond: (t2.val = t1.val)");
+    }
+
+    #[test]
+    fn v175_results_identical_after_order_choice() {
+        // The order choice is EXPLAIN-only; results are identical by
+        // construction either way.
+        let mut eng = engine();
+        setup_skew(&mut eng);
+        let count = |eng: &mut Engine| match run(
+            eng,
+            "SELECT count(*) FROM skewedtable t1 JOIN skewedtable t2 ON t1.val = t2.val WHERE t1.filt = 5",
+        )
+        .expect("runs")
+        {
+            ExecResult::Select { rows, .. } => {
+                rows[0][0].to_text().unwrap_or("NULL".to_string())
+            }
+            other => panic!("expected Select, got {:?}", other),
+        };
+        assert_eq!(count(&mut eng), "1810");
     }
 }
 

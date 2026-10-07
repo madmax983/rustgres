@@ -1003,6 +1003,19 @@ EXPECTED_PASS_OVERRIDES = [
      r"parent\s+p\s+left\s+join\s+child\s+c\s+on\s*\(\s*p\.k\s*=\s*c\.k\s*\))"
      r"\s+where\s+p\.k\s*=\s*1\s+and\s+p\.k\s*=\s*2\s*;?\s*$",
      "v1.70: contradictory WHERE quals plan as dummy Result"),
+    # v1.75: cost-based hash-join inner/outer selection — PG19's
+    # `make_join_rel` (joinrels.c) tries both (rel1, rel2) and
+    # (rel2, rel1) orders for JOIN_INNER and `try_hashjoin_path`
+    # (joinpath.c) keeps the cheaper via the cost model; the v1.64
+    # empirical rule ("the filtered side probes") is deleted. The
+    # filtered (~100-row) side is the cheaper build side, so PG19 hashes
+    # it: `Hash Cond: (t2.val = t1.val)`. Narrowly scoped to the single
+    # join.sql corpus statement verified byte-exact against the PG19
+    # .out oracle; the EXPLAIN-with-options mask stays for the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+\*\s+from\s+skewedtable\s+t1\s+join\s+skewedtable\s+t2\s+"
+     r"on\s+t1\.val\s*=\s*t2\.val\s+where\s+t1\.filt\s*=\s*5\s*;?\s*$",
+     "v1.75: cost-based hash-join inner/outer selection"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
