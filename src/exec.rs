@@ -11593,11 +11593,26 @@ fn pg_expr_target(
             };
             Some(format!("({l} {op} {r})"))
         }
-        Expr::And(a, b) => Some(format!(
-            "({} AND {})",
-            pg_expr_text(a, pctx, qualify)?,
-            pg_expr_text(b, pctx, qualify)?
-        )),
+        Expr::And(_, _) => {
+            // v1.73: PG renders a BoolExpr AND as a flat `(x AND y AND z)`
+            // (explain.c), not left-nested `((x AND y) AND z)`. Flatten
+            // the binary tree to match PG's output byte-exactly.
+            let mut parts: Vec<String> = Vec::new();
+            let mut stack: Vec<&Expr> = vec![e];
+            while let Some(x) = stack.pop() {
+                match x {
+                    Expr::And(a2, b2) => {
+                        stack.push(a2.as_ref());
+                        stack.push(b2.as_ref());
+                    }
+                    _ => {
+                        parts.push(pg_expr_text(x, pctx, qualify)?);
+                    }
+                }
+            }
+            parts.reverse();
+            Some(format!("({})", parts.join(" AND ")))
+        }
         Expr::Or(a, b) => {
             // v1.56: the parser desugars `x IN (v1, v2, ...)` to a left-deep
             // Or of `=` comparisons; PG19 deparses that shape as
@@ -12373,10 +12388,7 @@ fn pg_ec_union_conjunct(ec: &mut PgEc, c: &Expr, split: &[(Vec<String>, Vec<Stri
             },
         ) = (left.as_ref(), right.as_ref())
         {
-            if let (Some(a), Some(b)) = (
-                pg_ec_member(lt, ln, split),
-                pg_ec_member(rt, rn, split),
-            ) {
+            if let (Some(a), Some(b)) = (pg_ec_member(lt, ln, split), pg_ec_member(rt, rn, split)) {
                 ec.union(a, b);
             }
         }
@@ -12447,10 +12459,9 @@ fn pg_ec_join_filter_text(
                     },
                 ) = (left.as_ref(), right.as_ref())
                 {
-                    if let (Some(a), Some(b)) = (
-                        pg_ec_member(lt, ln, split),
-                        pg_ec_member(rt, rn, split),
-                    ) {
+                    if let (Some(a), Some(b)) =
+                        (pg_ec_member(lt, ln, split), pg_ec_member(rt, rn, split))
+                    {
                         if let (Some(ia), Some(ib)) = (ec.get(&a), ec.get(&b)) {
                             if ec.find(ia) == ec.find(ib) {
                                 let root = ec.find(ia);
@@ -12460,8 +12471,7 @@ fn pg_ec_join_filter_text(
                                 ) {
                                     // No-op when the canonical members are
                                     // already the conjunct's members.
-                                    let same =
-                                        oq == a.0 && oc == a.1 && iq == b.0 && ic == b.1;
+                                    let same = oq == a.0 && oc == a.1 && iq == b.0 && ic == b.1;
                                     if !same {
                                         changed = true;
                                         return Expr::Cmp {
@@ -13217,8 +13227,7 @@ fn pg_cost_mergejoin(
     // `final_cost_mergejoin`: mark/restore is skipped for ANTI joins whose
     // clauses are all merge clauses (our only ANTI shape), so no rescans.
     let skip_mark_restore = matches!(jointype, JoinKind::Anti);
-    let mergejointuples =
-        outer_rows * inner_rows * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
+    let mergejointuples = outer_rows * inner_rows * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
     let rescanned = if skip_mark_restore {
         0.0
     } else {
@@ -13265,11 +13274,7 @@ fn pg_cost_hashjoin_anti(
     let inner_scan_frac = 2.0 / (match_count + 1.0);
     let outer_matched_rows = (outer_rows * outer_match_frac).round();
     let clamp_row_est = |n: f64| {
-        if n <= 1.0 {
-            1.0
-        } else {
-            n.round()
-        }
+        if n <= 1.0 { 1.0 } else { n.round() }
     };
     // Matched outer rows: probe stops after the first match.
     run += CPU_OPERATOR_COST
@@ -13302,7 +13307,9 @@ fn pg_merge_side_ns(
     session: u64,
 ) -> Option<(f64, f64, f64)> {
     let (table, qual, plan_rows) = match node {
-        PlanNode::SeqScan { table, alias, rows, .. } => (
+        PlanNode::SeqScan {
+            table, alias, rows, ..
+        } => (
             table.as_str(),
             alias.as_deref().unwrap_or(table.as_str()),
             *rows as f64,
@@ -13349,8 +13356,18 @@ fn pg_merge_wins_ns(
         None => return false,
     };
     let k = num_clauses as f64;
-    let (_, m_total) =
-        pg_cost_mergejoin(or, ot, os, ir, it, is_, num_clauses, JoinKind::Inner, false, false);
+    let (_, m_total) = pg_cost_mergejoin(
+        or,
+        ot,
+        os,
+        ir,
+        it,
+        is_,
+        num_clauses,
+        JoinKind::Inner,
+        false,
+        false,
+    );
     let join_rows = or * ir * PG_DEFAULT_EQ_SEL.powi(num_clauses as i32);
     let h_total = pg_cost_hashjoin(or, ot, ir, it, k, 0.1, join_rows);
     let n_total = pg_cost_nestloop(or, ot, ir, it, CPU_OPERATOR_COST * k);
@@ -13558,15 +13575,23 @@ fn pg_hashjoin_cost_order(
     session: u64,
 ) -> Option<f64> {
     let (ot, oqual, o_rel_rows) = match outer {
-        PlanNode::SeqScan { table, alias, rows, .. } => {
-            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
-        }
+        PlanNode::SeqScan {
+            table, alias, rows, ..
+        } => (
+            table.as_str(),
+            alias.as_deref().unwrap_or(table.as_str()),
+            *rows as f64,
+        ),
         _ => return None,
     };
     let (it, iqual, i_rel_rows) = match inner {
-        PlanNode::SeqScan { table, alias, rows, .. } => {
-            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
-        }
+        PlanNode::SeqScan {
+            table, alias, rows, ..
+        } => (
+            table.as_str(),
+            alias.as_deref().unwrap_or(table.as_str()),
+            *rows as f64,
+        ),
         _ => return None,
     };
     let otab = db.find_table(ot, snap, &[own], session)?;
@@ -13607,15 +13632,23 @@ fn pg_nestloop_cost_order(
     session: u64,
 ) -> Option<f64> {
     let (ot, oqual, o_rel_rows) = match outer {
-        PlanNode::SeqScan { table, alias, rows, .. } => {
-            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
-        }
+        PlanNode::SeqScan {
+            table, alias, rows, ..
+        } => (
+            table.as_str(),
+            alias.as_deref().unwrap_or(table.as_str()),
+            *rows as f64,
+        ),
         _ => return None,
     };
     let (it, iqual, i_rel_rows) = match inner {
-        PlanNode::SeqScan { table, alias, rows, .. } => {
-            (table.as_str(), alias.as_deref().unwrap_or(table.as_str()), *rows as f64)
-        }
+        PlanNode::SeqScan {
+            table, alias, rows, ..
+        } => (
+            table.as_str(),
+            alias.as_deref().unwrap_or(table.as_str()),
+            *rows as f64,
+        ),
         _ => return None,
     };
     let otab = db.find_table(ot, snap, &[own], session)?;
@@ -13770,11 +13803,7 @@ fn pg_cross_leaf_one<'a>(it: &'a FromItem, out: &mut Vec<&'a FromItem>) -> bool 
             using,
             natural,
             ..
-        } if *kind == JoinKind::Cross
-            && on.is_none()
-            && using.is_empty()
-            && !natural =>
-        {
+        } if *kind == JoinKind::Cross && on.is_none() && using.is_empty() && !natural => {
             pg_cross_leaf_one(left, out) && pg_cross_leaf_one(right, out)
         }
         _ => false,
@@ -14177,8 +14206,7 @@ fn pg_reorder_cross_join(
             if mask.count_ones() as usize != k {
                 continue;
             }
-            let members: Vec<usize> =
-                (0..n).filter(|i| mask & (1u32 << i) != 0).collect();
+            let members: Vec<usize> = (0..n).filter(|i| mask & (1u32 << i) != 0).collect();
             let mut best_key: Option<(f64, f64, f64, f64)> = None;
             let mut best: Option<PgJoinRel166> = None;
             for &r in members.iter().rev() {
@@ -14186,8 +14214,7 @@ fn pg_reorder_cross_join(
                 let Some(sub_rel) = rels[sub as usize].as_ref() else {
                     continue;
                 };
-                let sub_members: Vec<usize> =
-                    (0..n).filter(|i| sub & (1u32 << i) != 0).collect();
+                let sub_members: Vec<usize> = (0..n).filter(|i| sub & (1u32 << i) != 0).collect();
                 if !pg_subset_extensions(&rem, &sub_members, n).contains(&r) {
                     continue;
                 }
@@ -14211,9 +14238,10 @@ fn pg_reorder_cross_join(
                     pg_cost_nestloop(sub_rel.rows, sub_rel.cost, lr.rows, lr.scan, qp);
                 let c_leaf_outer =
                     pg_cost_nestloop(lr.rows, lr.scan, sub_rel.rows, sub_rel.cost, qp);
-                for (cost, sub_outer, inner_rows) in
-                    [(c_sub_outer, true, lr.rows), (c_leaf_outer, false, sub_rel.rows)]
-                {
+                for (cost, sub_outer, inner_rows) in [
+                    (c_sub_outer, true, lr.rows),
+                    (c_leaf_outer, false, sub_rel.rows),
+                ] {
                     let key = (cost, sub_rel.cost, sub_rel.rows, sub_rel.inner_rows);
                     let better = match best_key {
                         None => true,
@@ -14473,9 +14501,11 @@ fn subquery_output_types(
     }
     // Single plain-table FROM?
     let (tbl_name, tbl_cols): (String, Vec<(String, ColType)>) = match sub.from.as_slice() {
-        [FromItem::Table {
-            name, col_aliases, ..
-        }] if col_aliases.is_empty() => match eng.db.find_table(name, snap, &[own], session) {
+        [
+            FromItem::Table {
+                name, col_aliases, ..
+            },
+        ] if col_aliases.is_empty() => match eng.db.find_table(name, snap, &[own], session) {
             Some(t) => (name.clone(), t.columns.clone()),
             None => return out,
         },
@@ -14811,7 +14841,12 @@ fn rewrite_on_in_item(
             alias: jalias.clone(),
             col_aliases: col_aliases.clone(),
         },
-        FromItem::Derived { alias: da, sub, col_aliases, lateral } => {
+        FromItem::Derived {
+            alias: da,
+            sub,
+            col_aliases,
+            lateral,
+        } => {
             let mut new_sub = sub.clone();
             rewrite_stmt_refs(&mut new_sub, alias, items, pulled);
             FromItem::Derived {
@@ -14859,9 +14894,15 @@ fn replace_subquery_refs(
         Expr::Arith { op, left, right } => Expr::Arith {
             op: *op,
             left: Box::new(replace_subquery_refs(left, alias, items, out_names, pulled)),
-            right: Box::new(replace_subquery_refs(right, alias, items, out_names, pulled)),
+            right: Box::new(replace_subquery_refs(
+                right, alias, items, out_names, pulled,
+            )),
         },
-        Expr::Cast { expr: e, to, written } => Expr::Cast {
+        Expr::Cast {
+            expr: e,
+            to,
+            written,
+        } => Expr::Cast {
             expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
             to: *to,
             written: written.clone(),
@@ -14873,7 +14914,9 @@ fn replace_subquery_refs(
         Expr::Cmp { op, left, right } => Expr::Cmp {
             op: *op,
             left: Box::new(replace_subquery_refs(left, alias, items, out_names, pulled)),
-            right: Box::new(replace_subquery_refs(right, alias, items, out_names, pulled)),
+            right: Box::new(replace_subquery_refs(
+                right, alias, items, out_names, pulled,
+            )),
         },
         Expr::And(a, b) => Expr::And(
             Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
@@ -14883,9 +14926,15 @@ fn replace_subquery_refs(
             Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
             Box::new(replace_subquery_refs(b, alias, items, out_names, pulled)),
         ),
-        Expr::Not(e) => Expr::Not(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
-        Expr::Neg(e) => Expr::Neg(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
-        Expr::BitNot(e) => Expr::BitNot(Box::new(replace_subquery_refs(e, alias, items, out_names, pulled))),
+        Expr::Not(e) => Expr::Not(Box::new(replace_subquery_refs(
+            e, alias, items, out_names, pulled,
+        ))),
+        Expr::Neg(e) => Expr::Neg(Box::new(replace_subquery_refs(
+            e, alias, items, out_names, pulled,
+        ))),
+        Expr::BitNot(e) => Expr::BitNot(Box::new(replace_subquery_refs(
+            e, alias, items, out_names, pulled,
+        ))),
         Expr::IsNull { expr: e, neg } => Expr::IsNull {
             expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
             neg: *neg,
@@ -14895,7 +14944,12 @@ fn replace_subquery_refs(
             neg: *neg,
             val: *val,
         },
-        Expr::Between { expr: e, low, high, neg } => Expr::Between {
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            neg,
+        } => Expr::Between {
             expr: Box::new(replace_subquery_refs(e, alias, items, out_names, pulled)),
             low: Box::new(replace_subquery_refs(low, alias, items, out_names, pulled)),
             high: Box::new(replace_subquery_refs(high, alias, items, out_names, pulled)),
@@ -14903,7 +14957,10 @@ fn replace_subquery_refs(
         },
         Expr::Func { name, args } => Expr::Func {
             name: name.clone(),
-            args: args.iter().map(|a| replace_subquery_refs(a, alias, items, out_names, pulled)).collect(),
+            args: args
+                .iter()
+                .map(|a| replace_subquery_refs(a, alias, items, out_names, pulled))
+                .collect(),
         },
         Expr::Concat(a, b) => Expr::Concat(
             Box::new(replace_subquery_refs(a, alias, items, out_names, pulled)),
@@ -15032,10 +15089,7 @@ fn find_pullup_in_item(
                     // - only single-FROM-item subqueries (the splice
                     //   replaces the Derived with exactly one item; a
                     //   multi-item FROM would likewise be kept and loop).
-                    if !lateral
-                        && sub.from.len() == 1
-                        && is_simple_subquery(sub.as_ref())
-                    {
+                    if !lateral && sub.from.len() == 1 && is_simple_subquery(sub.as_ref()) {
                         return Some((
                             alias.clone(),
                             sub.items.clone(),
@@ -15060,21 +15114,13 @@ fn find_pullup_in_item(
 /// The subquery always has exactly one FROM item here (enforced by the
 /// v1.51 scope guards in `find_pullup_in_item`), so it replaces the
 /// Derived directly.
-fn splice_pullup_from(
-    from: &[FromItem],
-    alias: &str,
-    sub_from: &[FromItem],
-) -> Vec<FromItem> {
+fn splice_pullup_from(from: &[FromItem], alias: &str, sub_from: &[FromItem]) -> Vec<FromItem> {
     from.iter()
         .flat_map(|it| splice_pullup_in_item(it, alias, sub_from))
         .collect()
 }
 
-fn splice_pullup_in_item(
-    it: &FromItem,
-    alias: &str,
-    sub_from: &[FromItem],
-) -> Vec<FromItem> {
+fn splice_pullup_in_item(it: &FromItem, alias: &str, sub_from: &[FromItem]) -> Vec<FromItem> {
     match it {
         FromItem::Join {
             left,
@@ -15190,8 +15236,8 @@ fn pull_up_simple_subqueries(
         };
         // v1.54: was the candidate the ONLY top-level FROM item? (For
         // the from-less `SELECT *` expansion below.)
-        let was_single_top = new_stmt.from.len() == 1
-            && matches!(new_stmt.from[0], FromItem::Derived { .. });
+        let was_single_top =
+            new_stmt.from.len() == 1 && matches!(new_stmt.from[0], FromItem::Derived { .. });
         // Splice the subquery's FROM into the parent, replacing the Derived.
         new_stmt.from = splice_pullup_from(&new_stmt.from, &alias, &sub_from);
         dead_rtes += 1;
@@ -15239,9 +15285,7 @@ fn pull_up_simple_subqueries(
 fn count_derived_from_items(from: &[FromItem]) -> usize {
     from.iter()
         .map(|it| match it {
-            FromItem::Derived { sub, .. } => {
-                1 + count_derived_from_items(&sub.from)
-            }
+            FromItem::Derived { sub, .. } => 1 + count_derived_from_items(&sub.from),
             FromItem::Join { left, right, .. } => {
                 count_derived_from_items(std::slice::from_ref(left))
                     + count_derived_from_items(std::slice::from_ref(right))
@@ -15294,7 +15338,11 @@ fn qualify_expr_cols(
             }
         }
         // Recurse for composite exprs (simple cases only).
-        Expr::Cast { expr: e, to, written } => Expr::Cast {
+        Expr::Cast {
+            expr: e,
+            to,
+            written,
+        } => Expr::Cast {
             expr: Box::new(qualify_expr_cols(e, from, eng, snap, own, session)),
             to: *to,
             written: written.clone(),
@@ -15354,13 +15402,17 @@ fn find_col_table(
             }
             FromItem::Join { left, right, .. } => {
                 // Check left then right (simplified: just check both).
-                if let Some(t) = find_col_table(std::slice::from_ref(left), col, eng, snap, own, session) {
+                if let Some(t) =
+                    find_col_table(std::slice::from_ref(left), col, eng, snap, own, session)
+                {
                     if found.is_some() {
                         return None;
                     }
                     found = Some(t);
                 }
-                if let Some(t) = find_col_table(std::slice::from_ref(right), col, eng, snap, own, session) {
+                if let Some(t) =
+                    find_col_table(std::slice::from_ref(right), col, eng, snap, own, session)
+                {
                     if found.is_some() {
                         return None;
                     }
@@ -15648,7 +15700,9 @@ fn join_is_removable(
                 .find_table(name, snap, &[own], session)
                 .map(|t| t.columns.iter().any(|(n, _)| n == col))
                 .unwrap_or(false),
-            FromItem::Join { left: l, right: r, .. } => {
+            FromItem::Join {
+                left: l, right: r, ..
+            } => {
                 left_has_col(l, col, eng, snap, own, session)
                     || left_has_col(r, col, eng, snap, own, session)
             }
@@ -15727,7 +15781,10 @@ fn join_is_removable(
                 },
             ) if t2 == &rqual => (n2.as_str(), other),
             (
-                Expr::Column { table: None, name: n1 },
+                Expr::Column {
+                    table: None,
+                    name: n1,
+                },
                 other,
             ) if inner_has_col(&inner, n1, eng, snap, own, session)
                 && !left_has_col(left, n1, eng, snap, own, session) =>
@@ -15736,7 +15793,10 @@ fn join_is_removable(
             }
             (
                 other,
-                Expr::Column { table: None, name: n2 },
+                Expr::Column {
+                    table: None,
+                    name: n2,
+                },
             ) if inner_has_col(&inner, n2, eng, snap, own, session)
                 && !left_has_col(left, n2, eng, snap, own, session) =>
             {
@@ -15757,7 +15817,10 @@ fn join_is_removable(
                 table: Some(qt),
                 name: qn,
             } => removal_col_type(eng, left, qt, qn, snap, own, session),
-            Expr::Column { table: None, name: qn } => {
+            Expr::Column {
+                table: None,
+                name: qn,
+            } => {
                 // Find the qualifier in left_quals that has this column.
                 left_quals
                     .iter()
@@ -15903,6 +15966,828 @@ fn collect_on_qual_counts(item: &FromItem, counts: &mut HashMap<String, usize>) 
         }
         _ => {}
     }
+}
+// ============================================================================
+// v1.73: PG19's `remove_useless_self_joins`
+// (`src/backend/optimizer/plan/analyzejoins.c`) — self-join elimination
+// for plain-column unique keys.
+//
+// For a top-level cross self-join `FROM t j1, t j2` (exactly two plain
+// table items, same table, distinct qualifiers), when the join is
+// provably a 1:1 row match, the first-listed instance is removed and
+// every reference to its qualifier is rewritten to the kept instance —
+// PG19's `remove_self_join_rel`, which rewrites Vars in the parse tree
+// and targetlist (so `SELECT *` keeps both column sets, valued from the
+// kept instance). A rewritten join clause that becomes `X = X` is
+// replaced by `X IS NOT NULL` (PG19 `replace_relid_callback`); duplicate
+// and commuted-duplicate conjuncts are elided.
+//
+// The 1:1 proof (PG19 `innerrel_is_unique_ext` /
+// `relation_has_unique_index_for` / `match_unique_clauses`):
+// - some unique key (PK / UNIQUE / planner-usable unique index) of `t`
+//   has every column constrained by a mergejoinable `=` clause whose
+//   kept-side operand is the plain column — either a join clause across
+//   the two instances, or a kept-side `col = <column-free expr>`
+//   restriction (the latter are PG19's `uclauses`/`extra_clauses`);
+// - every such kept-side restriction has a side-normalized identical
+//   counterpart among the removed instance's restrictions. This check
+//   is load-bearing for soundness: without it, `j1.b = j2.b AND
+//   2 = j2.a` under unique index (a,b) would wrongly eliminate, since
+//   several j1 rows can share one j2 row.
+//
+// Mergejoinable here means `CmpOp::Eq`, non-volatile
+// (`expr_is_volatile`), and subquery-free — the properties PG19's
+// `mergeopfamilies` test guarantees for this purpose. Expression unique
+// indexes are not considered (deferred to v1.74).
+//
+// Observable output rules (verified against a live PG19beta3; the exact
+// internal pass that commutes `1 = j2.a` to `(a = 1)` was not isolated,
+// so the implementation reproduces the observed text):
+// - synthesized `IS NOT NULL`s render first (PG19's cost-based qual
+//   ordering puts the cheap NullTest first);
+// - surviving `col = <column-free>` equalities render column-left;
+// - structural and commuted duplicates are dropped.
+//
+// Returns `Some(new_stmt)` when the rewrite applied, else `None`.
+// Fail-closed: anything but the exact 2-table cross shape; CTEs, set
+// operations, FOR UPDATE, subqueries anywhere in the statement,
+// unqualified or foreign column references, volatile conjuncts, no
+// covering unique key, and unmatched unique-clause counterparts.
+fn remove_useless_self_joins_from(
+    eng: &Engine,
+    from: &[FromItem],
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<SelectStmt> {
+    // --- Shape gate: a cross self-join of one table. The parser
+    // represents `FROM sj j1, sj j2` as a single `FromItem::Join` with
+    // `JoinKind::Cross`; accept that (or, defensively, two top-level
+    // plain tables with the same name). The first-listed instance (q1)
+    // is removed; the second (q2) is kept, matching PG19's relid order.
+    let Some((tname, q1, q2, kept_item)) = (|| {
+        if from.len() == 1 {
+            if let FromItem::Join {
+                left,
+                kind: JoinKind::Cross,
+                right,
+                on: None,
+                using,
+                natural,
+                ..
+            } = &from[0]
+            {
+                if !using.is_empty() || *natural {
+                    return None;
+                }
+                if let (
+                    FromItem::Table {
+                        name: n1,
+                        alias: a1,
+                        ..
+                    },
+                    FromItem::Table {
+                        name: n2,
+                        alias: a2,
+                        ..
+                    },
+                ) = (&**left, &**right)
+                {
+                    if n1 == n2 {
+                        let q1 = a1.clone().unwrap_or_else(|| n1.clone());
+                        let q2 = a2.clone().unwrap_or_else(|| n2.clone());
+                        if q1 != q2 {
+                            return Some((n1.clone(), q1, q2, (**right).clone()));
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        if from.len() == 2 {
+            if let (
+                FromItem::Table {
+                    name: n1,
+                    alias: a1,
+                    ..
+                },
+                FromItem::Table {
+                    name: n2,
+                    alias: a2,
+                    ..
+                },
+            ) = (&from[0], &from[1])
+            {
+                if n1 == n2 {
+                    let q1 = a1.clone().unwrap_or_else(|| n1.clone());
+                    let q2 = a2.clone().unwrap_or_else(|| n2.clone());
+                    if q1 != q2 {
+                        return Some((n1.clone(), q1, q2, from[1].clone()));
+                    }
+                }
+            }
+        }
+        None
+    })() else {
+        return None;
+    };
+    // --- Fail closed on statement features that complicate rewriting. ---
+    if !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+        || stmt.for_update
+        || !stmt.for_update_of.is_empty()
+    {
+        return None;
+    }
+    if sje_stmt_has_subquery(stmt) {
+        return None;
+    }
+    let where_ = stmt.where_.as_ref()?;
+
+    // --- Classify WHERE conjuncts. ---
+    // Every column reference must carry qualifier q1 or q2; unqualified
+    // or foreign references fail closed.
+    enum SjeClass<'x> {
+        /// `=` with refs on both sides, one side q1-only and the other q2-only.
+        Join { left: &'x Expr, right: &'x Expr },
+        /// `q2.col = <column-free expr>`.
+        Kept { col: String, conj: &'x Expr },
+        /// `q1.col = <column-free expr>`.
+        Removed { conj: &'x Expr },
+        /// Anything else: rewritten and kept, never used in the proof.
+        Other(&'x Expr),
+    }
+    let mut classes: Vec<SjeClass> = Vec::new();
+    // `split_conjuncts` uses a stack and returns conjuncts in reverse
+    // written order; reverse to restore it (PG's output follows written
+    // order for equal-cost clauses).
+    let conjuncts: Vec<&Expr> = split_conjuncts(where_).into_iter().rev().collect();
+    for c in conjuncts {
+        let mut refs: Vec<(Option<String>, String)> = Vec::new();
+        collect_col_refs(c, &mut refs);
+        if refs
+            .iter()
+            .any(|(t, _)| t.as_deref() != Some(q1.as_str()) && t.as_deref() != Some(q2.as_str()))
+        {
+            return None;
+        }
+        let usable = matches!(c, Expr::Cmp { op: CmpOp::Eq, .. })
+            && !expr_is_volatile(&eng.db, c)
+            && !expr_has_subquery(c);
+        if !usable {
+            classes.push(SjeClass::Other(c));
+            continue;
+        }
+        let Expr::Cmp { left, right, .. } = c else {
+            unreachable!("v1.73: guarded by matches! above")
+        };
+        let mut lrefs: Vec<(Option<String>, String)> = Vec::new();
+        let mut rrefs: Vec<(Option<String>, String)> = Vec::new();
+        collect_col_refs(left, &mut lrefs);
+        collect_col_refs(right, &mut rrefs);
+        let lq1 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q1.as_str()));
+        let lq2 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q2.as_str()));
+        let rq1 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q1.as_str()));
+        let rq2 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q2.as_str()));
+        // Cross-instance: one side q1-only, the other q2-only.
+        if (lq1 && !lq2 && rq2 && !rq1) || (lq2 && !lq1 && rq1 && !rq2) {
+            classes.push(SjeClass::Join { left, right });
+            continue;
+        }
+        // Single-side `plain_col = <column-free expr>` (kept or removed).
+        let mut done = false;
+        for (q, kept) in [(&q1, false), (&q2, true)] {
+            for (e_col, r_col, r_free) in [(&**left, &lrefs, &rrefs), (&**right, &rrefs, &lrefs)] {
+                let col_side_ok = !r_col.is_empty()
+                    && r_col.iter().all(|(t, _)| t.as_deref() == Some(q.as_str()));
+                if !col_side_ok || !r_free.is_empty() {
+                    continue;
+                }
+                if let Expr::Column {
+                    table: Some(t),
+                    name,
+                } = e_col
+                {
+                    if t == q {
+                        if kept {
+                            classes.push(SjeClass::Kept {
+                                col: name.clone(),
+                                conj: c,
+                            });
+                        } else {
+                            classes.push(SjeClass::Removed { conj: c });
+                        }
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !done {
+            classes.push(SjeClass::Other(c));
+        }
+    }
+
+    // --- Uniqueness proof (PG19 `relation_has_unique_index_for`). ---
+    let mut constrained: HashSet<String> = HashSet::new();
+    // Kept-side restrictions constraining plain columns = PG19's uclauses.
+    let mut uclauses: Vec<(String, &Expr)> = Vec::new();
+    for cl in &classes {
+        match cl {
+            SjeClass::Join { left, right } => {
+                for side in [*left, *right] {
+                    if let Expr::Column {
+                        table: Some(t),
+                        name,
+                    } = side
+                    {
+                        if t == &q2 {
+                            constrained.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            SjeClass::Kept { col, conj } => {
+                constrained.insert(col.clone());
+                uclauses.push((col.clone(), conj));
+            }
+            SjeClass::Other(_) | SjeClass::Removed { .. } => {}
+        }
+    }
+    if constrained.is_empty() {
+        return None;
+    }
+    // First covering unique key wins; PG19 commits to it without fallback.
+    let key_cols = sje_covering_unique_key(eng, &tname, &constrained, snap, own, session)?;
+    // PG19 `match_unique_clauses`: every uclause on a winning-key column
+    // needs a side-normalized identical counterpart among the removed
+    // instance's restrictions.
+    let removed_conjs: Vec<&Expr> = classes
+        .iter()
+        .filter_map(|cl| match cl {
+            SjeClass::Removed { conj } => Some(*conj),
+            _ => None,
+        })
+        .collect();
+    for (ucol, uconj) in &uclauses {
+        if !key_cols.iter().any(|k| k.eq_ignore_ascii_case(ucol)) {
+            continue;
+        }
+        let mut matched = false;
+        for rconj in &removed_conjs {
+            let rw = sje_rewrite_qual(rconj, &q1, &q2)?;
+            if sje_eq_equal(&rw, uconj) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return None;
+        }
+    }
+
+    // --- Rewrite (PG19 `remove_self_join_rel`). ---
+    // Expand `*` first: PG19 keeps both column sets, re-pointed at the
+    // kept instance (oracle: `a | b | c | a | b | c`).
+    let tcols: Vec<String> = eng
+        .db
+        .find_table(&tname, snap, &[own], session)
+        .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default();
+    if tcols.is_empty() {
+        return None;
+    }
+    let mut new_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
+    for item in &stmt.items {
+        match item {
+            SelectItem::All => {
+                // PG19 keeps both column sets, re-pointed at the kept
+                // instance (oracle: `a | b | c | a | b | c`).
+                for _ in 0..2 {
+                    for cn in &tcols {
+                        new_items.push(SelectItem::Expr {
+                            expr: Expr::Column {
+                                table: Some(q2.clone()),
+                                name: cn.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            SelectItem::AllOf(q) if q == &q1 || q == &q2 => {
+                for cn in &tcols {
+                    new_items.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(q2.clone()),
+                            name: cn.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            SelectItem::Expr { expr, alias } => new_items.push(SelectItem::Expr {
+                expr: sje_rewrite_qual(expr, &q1, &q2)?,
+                alias: alias.clone(),
+            }),
+            // Unreachable (only q1/q2 exist), but fail closed anyway.
+            SelectItem::AllOf(_) => return None,
+        }
+    }
+
+    // New WHERE: synthesized IS NOT NULLs first (PG19's cost-based qual
+    // ordering puts the cheap NullTest first), then the rest in original
+    // relative order. `col = <column-free>` equalities normalize to
+    // column-left (observed PG19 output); structural and commuted
+    // duplicates are dropped.
+    let mut notnulls: Vec<Expr> = Vec::new();
+    let mut rest: Vec<Expr> = Vec::new();
+    for cl in &classes {
+        match cl {
+            SjeClass::Join { left, right } => {
+                let l2 = sje_rewrite_qual(left, &q1, &q2)?;
+                let r2 = sje_rewrite_qual(right, &q1, &q2)?;
+                if l2 == r2 {
+                    // PG19 `replace_relid_callback`: `X = X` -> `X IS NOT NULL`.
+                    let nn = Expr::IsNull {
+                        expr: Box::new(l2),
+                        neg: true,
+                    };
+                    if !notnulls.iter().any(|s| s == &nn) {
+                        notnulls.push(nn);
+                    }
+                } else {
+                    sje_push_dedup(&mut rest, sje_normalize_eq(l2, r2));
+                }
+            }
+            SjeClass::Kept { conj, .. }
+            | SjeClass::Removed { conj, .. }
+            | SjeClass::Other(conj) => {
+                let rw = sje_rewrite_qual(conj, &q1, &q2)?;
+                sje_push_dedup(&mut rest, sje_normalize_eq_expr(rw));
+            }
+        }
+    }
+    notnulls.extend(rest);
+    if notnulls.is_empty() {
+        return None;
+    }
+    let mut it = notnulls.into_iter();
+    let first = it.next().unwrap();
+    let new_where = Some(it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b))));
+
+    // Rewrite remaining Expr positions.
+    let rw_vec = |v: &[Expr]| -> Option<Vec<Expr>> {
+        v.iter().map(|e| sje_rewrite_qual(e, &q1, &q2)).collect()
+    };
+    let mut new_stmt = stmt.clone();
+    new_stmt.items = new_items;
+    new_stmt.from = vec![kept_item];
+    new_stmt.where_ = new_where;
+    new_stmt.distinct_on = rw_vec(&stmt.distinct_on)?;
+    new_stmt.group_by = stmt
+        .group_by
+        .iter()
+        .map(|set| rw_vec(set))
+        .collect::<Option<Vec<_>>>()?;
+    new_stmt.having = match &stmt.having {
+        Some(h) => Some(sje_rewrite_qual(h, &q1, &q2)?),
+        None => None,
+    };
+    new_stmt.order_by = stmt
+        .order_by
+        .iter()
+        .map(|t| {
+            Some(OrderTerm {
+                expr: sje_rewrite_qual(&t.expr, &q1, &q2)?,
+                desc: t.desc,
+                nulls_first: t.nulls_first,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // --- Post-rewrite verification: no reference to the removed
+    // qualifier may survive anywhere. ---
+    let refs_q1 = sje_stmt_refs_qual(&new_stmt, &q1);
+    if refs_q1 {
+        return None;
+    }
+    Some(new_stmt)
+}
+
+/// v1.73: does any expression in the statement contain a subquery?
+/// The self-join rewrite bails on these (different query level).
+fn sje_stmt_has_subquery(stmt: &SelectStmt) -> bool {
+    let mut es: Vec<&Expr> = Vec::new();
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            es.push(expr);
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        es.push(w);
+    }
+    for set in &stmt.group_by {
+        es.extend(set.iter());
+    }
+    if let Some(h) = &stmt.having {
+        es.push(h);
+    }
+    for t in &stmt.order_by {
+        es.push(&t.expr);
+    }
+    es.extend(stmt.distinct_on.iter());
+    es.iter().any(|e| expr_has_subquery(e))
+}
+
+/// v1.73: first unique key (PK, then UNIQUE constraints, then
+/// planner-usable unique indexes in catalog order) whose columns are all
+/// in `constrained`. Mirrors `table_has_unique_for`'s order; PG19 tries
+/// indexes in order and commits to the first covering one.
+fn sje_covering_unique_key(
+    eng: &Engine,
+    table: &str,
+    constrained: &HashSet<String>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<Vec<String>> {
+    let db = &eng.db;
+    let t = db.find_table(table, snap, &[own], session)?;
+    let covers = |cols: &[String]| {
+        !cols.is_empty()
+            && cols
+                .iter()
+                .all(|c| constrained.iter().any(|x| x.eq_ignore_ascii_case(c)))
+    };
+    if let Some(pk) = t.pkey.as_ref() {
+        if covers(&pk.cols) {
+            return Some(pk.cols.clone());
+        }
+    }
+    for u in &t.uniques {
+        if covers(&u.cols) {
+            return Some(u.cols.clone());
+        }
+    }
+    if !db.is_temp_table(session, table) {
+        for ix in db.visible_indexes_for(table, snap, &[own], session) {
+            if ix.def.unique && ix.def.planner_usable && covers(&ix.def.col_names) {
+                return Some(ix.def.col_names.clone());
+            }
+        }
+    }
+    None
+}
+
+/// v1.73: structural equality of two `=` conjuncts up to commutation.
+fn sje_eq_equal(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                left: l1,
+                right: r1,
+            },
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                left: l2,
+                right: r2,
+            },
+        ) => (l1 == l2 && r1 == r2) || (l1 == r2 && r1 == l2),
+        _ => false,
+    }
+}
+
+/// v1.73: push `e` unless a structural or commuted duplicate is present.
+fn sje_push_dedup(v: &mut Vec<Expr>, e: Expr) {
+    if !v.iter().any(|s| s == &e || sje_eq_equal(s, &e)) {
+        v.push(e);
+    }
+}
+
+/// v1.73: normalize `l = r` to column-left when exactly one side is a
+/// plain column and the other side is column-free (observed PG19 output
+/// renders the surviving restriction as `(a = 1)`, never `(1 = a)`).
+fn sje_normalize_eq(l: Expr, r: Expr) -> Expr {
+    fn col_free(e: &Expr) -> bool {
+        let mut refs = Vec::new();
+        collect_col_refs(e, &mut refs);
+        refs.is_empty()
+    }
+    let l_is_col = matches!(l, Expr::Column { .. });
+    let r_is_col = matches!(r, Expr::Column { .. });
+    if l_is_col && !r_is_col && col_free(&r) {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    } else if r_is_col && !l_is_col && col_free(&l) {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(r),
+            right: Box::new(l),
+        }
+    } else {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+}
+
+/// v1.73: apply `sje_normalize_eq` when the expression is an `=` conjunct.
+fn sje_normalize_eq_expr(e: Expr) -> Expr {
+    match e {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } => sje_normalize_eq(*left, *right),
+        other => other,
+    }
+}
+
+/// v1.73: rewrite qualifier `from_q` to `to_q` throughout an expression.
+/// Returns `None` for subquery-bearing variants (the statement gate
+/// already rejected those; this is a backstop).
+fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Expr> {
+    let rq = |t: &Option<String>| -> Option<String> {
+        match t {
+            Some(q) if q == from_q => Some(to_q.to_string()),
+            other => other.clone(),
+        }
+    };
+    let rb =
+        |e: &Box<Expr>| -> Option<Box<Expr>> { sje_rewrite_qual(e, from_q, to_q).map(Box::new) };
+    let rv = |v: &[Expr]| -> Option<Vec<Expr>> {
+        v.iter()
+            .map(|e| sje_rewrite_qual(e, from_q, to_q))
+            .collect()
+    };
+    let ro = |o: &Option<Box<Expr>>| -> Option<Option<Box<Expr>>> {
+        match o {
+            Some(x) => Some(Some(rb(x)?)),
+            None => Some(None),
+        }
+    };
+    let rot = |v: &[OrderTerm]| -> Option<Vec<OrderTerm>> {
+        v.iter()
+            .map(|t| {
+                Some(OrderTerm {
+                    expr: sje_rewrite_qual(&t.expr, from_q, to_q)?,
+                    desc: t.desc,
+                    nulls_first: t.nulls_first,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    Some(match e {
+        Expr::Column { table, name } => Expr::Column {
+            table: rq(table),
+            name: name.clone(),
+        },
+        Expr::WholeRow { qual } => Expr::WholeRow {
+            qual: if qual == from_q {
+                to_q.to_string()
+            } else {
+                qual.clone()
+            },
+        },
+        Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => e.clone(),
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op: *op,
+            left: rb(left)?,
+            right: rb(right)?,
+        },
+        Expr::Cast { expr, to, written } => Expr::Cast {
+            expr: rb(expr)?,
+            to: to.clone(),
+            written: written.clone(),
+        },
+        Expr::CastNamed { expr, name } => Expr::CastNamed {
+            expr: rb(expr)?,
+            name: name.clone(),
+        },
+        Expr::Row(elems) => Expr::Row(rv(elems)?),
+        Expr::FieldAccess { expr, field } => Expr::FieldAccess {
+            expr: rb(expr)?,
+            field: field.clone(),
+        },
+        Expr::Concat(a, b) => Expr::Concat(rb(a)?, rb(b)?),
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+            escape,
+        } => Expr::Like {
+            expr: rb(expr)?,
+            pattern: rb(pattern)?,
+            not: *not,
+            ilike: *ilike,
+            escape: ro(escape)?,
+        },
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => Expr::Regex {
+            expr: rb(expr)?,
+            pattern: rb(pattern)?,
+            not: *not,
+            case_insensitive: *case_insensitive,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => Expr::Between {
+            expr: rb(expr)?,
+            low: rb(low)?,
+            high: rb(high)?,
+            neg: *neg,
+        },
+        Expr::IsBool { expr, neg, val } => Expr::IsBool {
+            expr: rb(expr)?,
+            neg: *neg,
+            val: *val,
+        },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: rv(args)?,
+        },
+        Expr::NamedArg { name, expr } => Expr::NamedArg {
+            name: name.clone(),
+            expr: rb(expr)?,
+        },
+        Expr::Extract { field, from } => Expr::Extract {
+            field: field.clone(),
+            from: rb(from)?,
+        },
+        Expr::Cmp { op, left, right } => Expr::Cmp {
+            op: *op,
+            left: rb(left)?,
+            right: rb(right)?,
+        },
+        Expr::And(a, b) => Expr::And(rb(a)?, rb(b)?),
+        Expr::Or(a, b) => Expr::Or(rb(a)?, rb(b)?),
+        Expr::Not(a) => Expr::Not(rb(a)?),
+        Expr::BitNot(a) => Expr::BitNot(rb(a)?),
+        Expr::Neg(a) => Expr::Neg(rb(a)?),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: ro(operand)?,
+            whens: whens
+                .iter()
+                .map(|(k, r)| Some((rb(k)?, rb(r)?)))
+                .collect::<Option<Vec<_>>>()?,
+            else_: ro(else_)?,
+        },
+        Expr::IsNull { expr, neg } => Expr::IsNull {
+            expr: rb(expr)?,
+            neg: *neg,
+        },
+        Expr::IsDistinctFrom { left, right, neg } => Expr::IsDistinctFrom {
+            left: rb(left)?,
+            right: rb(right)?,
+            neg: *neg,
+        },
+        Expr::Agg {
+            func,
+            arg,
+            distinct,
+            arg2,
+            agg_order_by,
+            filter,
+        } => Expr::Agg {
+            func: func.clone(),
+            arg: ro(arg)?,
+            distinct: *distinct,
+            arg2: ro(arg2)?,
+            agg_order_by: rot(agg_order_by)?,
+            filter: ro(filter)?,
+        },
+        Expr::WithinGroup {
+            func,
+            direct_args,
+            within_order_by,
+            filter,
+        } => Expr::WithinGroup {
+            func: func.clone(),
+            direct_args: rv(direct_args)?,
+            within_order_by: rot(within_order_by)?,
+            filter: ro(filter)?,
+        },
+        Expr::ArrayCtor { elems, nested } => Expr::ArrayCtor {
+            elems: rv(elems)?,
+            nested: *nested,
+        },
+        Expr::Subscript { array, indices } => Expr::Subscript {
+            array: rb(array)?,
+            indices: rv(indices)?,
+        },
+        Expr::Slice { array, bounds } => Expr::Slice {
+            array: rb(array)?,
+            bounds: bounds
+                .iter()
+                .map(|(lo, hi)| Some((ro(lo)?, ro(hi)?)))
+                .collect::<Option<Vec<_>>>()?,
+        },
+        Expr::InSub { .. }
+        | Expr::Quantified { .. }
+        | Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::Exists { .. } => return None,
+        Expr::UserOp { op, left, right } => Expr::UserOp {
+            op: op.clone(),
+            left: rb(left)?,
+            right: rb(right)?,
+        },
+        Expr::Window {
+            func,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            frame,
+            wid,
+            filter,
+            exclusion,
+        } => Expr::Window {
+            func: func.clone(),
+            args: rv(args)?,
+            distinct: *distinct,
+            partition_by: rv(partition_by)?,
+            order_by: rot(order_by)?,
+            frame: frame.clone(),
+            wid: *wid,
+            filter: ro(filter)?,
+            exclusion: exclusion.clone(),
+        },
+    })
+}
+
+/// v1.73: post-rewrite verification helper — does `e` reference `q`?
+fn sje_expr_refs_qual(e: &Expr, q: &str) -> bool {
+    let mut refs = Vec::new();
+    collect_col_refs(e, &mut refs);
+    refs.iter().any(|(t, _)| t.as_deref() == Some(q))
+}
+
+/// v1.73: post-rewrite verification — no reference to the removed
+/// qualifier may survive anywhere in the statement.
+fn sje_stmt_refs_qual(stmt: &SelectStmt, q: &str) -> bool {
+    for item in &stmt.items {
+        match item {
+            SelectItem::AllOf(aq) if aq == q => return true,
+            SelectItem::Expr { expr, .. } => {
+                if sje_expr_refs_qual(expr, q) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        if sje_expr_refs_qual(w, q) {
+            return true;
+        }
+    }
+    for set in &stmt.group_by {
+        for e in set {
+            if sje_expr_refs_qual(e, q) {
+                return true;
+            }
+        }
+    }
+    if let Some(h) = &stmt.having {
+        if sje_expr_refs_qual(h, q) {
+            return true;
+        }
+    }
+    for t in &stmt.order_by {
+        if sje_expr_refs_qual(&t.expr, q) {
+            return true;
+        }
+    }
+    for e in &stmt.distinct_on {
+        if sje_expr_refs_qual(e, q) {
+            return true;
+        }
+    }
+    false
 }
 fn plan_from_item(
     eng: &Engine,
@@ -16149,9 +17034,7 @@ fn plan_from_item(
                     // `verbose` here. A plain multi-table query does NOT
                     // qualify scan Filters in non-verbose mode.
                     let filter = match (pctx, where_) {
-                        (Some(px), Some(w)) => {
-                            Some(pg_expr_text_or_debug(w, px, px.verbose))
-                        }
+                        (Some(px), Some(w)) => Some(pg_expr_text_or_debug(w, px, px.verbose)),
                         _ => None,
                     };
                     // v1.46: VERBOSE `Output:` — the table's columns in
@@ -16216,9 +17099,7 @@ fn plan_from_item(
                                 // (explain.c `show_scan_qual`):
                                 // `useprefix = IsA(SubqueryScan) ||
                                 // verbose` — see the SeqScan site.
-                                Some(e) => {
-                                    Some(pg_expr_text_or_debug(&e, px, px.verbose))
-                                }
+                                Some(e) => Some(pg_expr_text_or_debug(&e, px, px.verbose)),
                                 None => None,
                             }
                         }
@@ -16376,21 +17257,10 @@ fn plan_from_item(
                             }
                             JoinKind::Left => {
                                 let outer = plan_from_item(
-                                    eng,
-                                    left,
-                                    None,
-                                    snap,
-                                    own,
-                                    session,
-                                    ctes,
-                                    pctx,
-                                    stmt,
+                                    eng, left, None, snap, own, session, ctes, pctx, stmt,
                                 )?;
                                 let mut inames = Vec::new();
-                                pg_replaces_names(
-                                    std::slice::from_ref(right),
-                                    &mut inames,
-                                );
+                                pg_replaces_names(std::slice::from_ref(right), &mut inames);
                                 // v1.51: `Replaces:` for the dummy inner names the
                                 // RTEs that survived `remove_useless_joins`
                                 // (PG19 explain.c `show_result_replacement_info`).
@@ -16413,38 +17283,25 @@ fn plan_from_item(
                                 // outer parens (`'constant'::text`, not
                                 // `('constant'::text)`).
                                 let inner_output: Vec<String> = match pctx {
-                                    Some(px) if !px.pulled_exprs.is_empty() => {
-                                        px.pulled_exprs
-                                            .iter()
-                                            .filter_map(|e| {
-                                                match e {
-                                                    Expr::Cast {
-                                                        expr,
-                                                        to,
-                                                        ..
-                                                    } if matches!(
-                                                        &**expr,
-                                                        Expr::Literal(_)
-                                                    ) =>
-                                                    {
-                                                        let label =
-                                                            pg_type_label(*to)?;
-                                                        let inner_s = match &**expr {
-                                                            Expr::Literal(
-                                                                Literal::Text(s),
-                                                            ) => pg_quote_literal(s),
-                                                            _ => return None,
-                                                        };
-                                                        Some(format!(
-                                                            "{}::{label}",
-                                                            inner_s
-                                                        ))
+                                    Some(px) if !px.pulled_exprs.is_empty() => px
+                                        .pulled_exprs
+                                        .iter()
+                                        .filter_map(|e| match e {
+                                            Expr::Cast { expr, to, .. }
+                                                if matches!(&**expr, Expr::Literal(_)) =>
+                                            {
+                                                let label = pg_type_label(*to)?;
+                                                let inner_s = match &**expr {
+                                                    Expr::Literal(Literal::Text(s)) => {
+                                                        pg_quote_literal(s)
                                                     }
-                                                    _ => pg_expr_text(e, px, true),
-                                                }
-                                            })
-                                            .collect()
-                                    }
+                                                    _ => return None,
+                                                };
+                                                Some(format!("{}::{label}", inner_s))
+                                            }
+                                            _ => pg_expr_text(e, px, true),
+                                        })
+                                        .collect(),
                                     _ => Vec::new(),
                                 };
                                 let inner = PlanNode::Result {
@@ -16492,11 +17349,7 @@ fn plan_from_item(
             // the executor), so a reorder changes the plan text, never
             // the result.
             if let Some(px) = pctx {
-                if matches!(kind, JoinKind::Cross)
-                    && on.is_none()
-                    && using.is_empty()
-                    && !natural
-                {
+                if matches!(kind, JoinKind::Cross) && on.is_none() && using.is_empty() && !natural {
                     if let Some(node) = pg_reorder_cross_join(
                         eng, left, right, where_, snap, own, session, ctes, px, stmt,
                     ) {
@@ -16559,10 +17412,8 @@ fn plan_from_item(
                         pg_replaces_names(std::slice::from_ref(right), &mut right_names);
                         let mut on_refs = Vec::new();
                         pg_expr_tables(o, &mut on_refs);
-                        let on_tables: Vec<String> = on_refs
-                            .iter()
-                            .filter_map(|(t, _)| t.clone())
-                            .collect();
+                        let on_tables: Vec<String> =
+                            on_refs.iter().filter_map(|(t, _)| t.clone()).collect();
                         let refs_left = on_tables.iter().any(|t| left_names.contains(t));
                         let refs_right = on_tables.iter().any(|t| right_names.contains(t));
                         // v1.50: push down only if ON refs right (and not left).
@@ -16621,38 +17472,38 @@ fn plan_from_item(
                         }
                     }
                     if using_ok {
-                    if let Some(w) = where_ {
-                        // v1.71: reuse the EC split computed above.
-                        let (per_item, mid) = pg_split_where(w, &ec_split)?;
-                        let mut it = per_item.into_iter();
-                        left_where = pg_fold_and(it.next().unwrap_or_default());
-                        right_where = pg_fold_and(it.next().unwrap_or_default());
-                        jf.extend(mid);
-                        // v1.71: EC from WHERE conjuncts, written order
-                        // (after the ON conjuncts, per PG19's post-order
-                        // jointree distribution).
-                        for c in pg_conjuncts(w) {
-                            pg_ec_union_conjunct(&mut join_ec, c, &ec_split);
+                        if let Some(w) = where_ {
+                            // v1.71: reuse the EC split computed above.
+                            let (per_item, mid) = pg_split_where(w, &ec_split)?;
+                            let mut it = per_item.into_iter();
+                            left_where = pg_fold_and(it.next().unwrap_or_default());
+                            right_where = pg_fold_and(it.next().unwrap_or_default());
+                            jf.extend(mid);
+                            // v1.71: EC from WHERE conjuncts, written order
+                            // (after the ON conjuncts, per PG19's post-order
+                            // jointree distribution).
+                            for c in pg_conjuncts(w) {
+                                pg_ec_union_conjunct(&mut join_ec, c, &ec_split);
+                            }
                         }
-                    }
-                    // v1.64: hashable equi clauses for the hash-vs-nestloop
-                    // choice (PG19 `hash_inner_and_outer`). Extracted from
-                    // the raw conjuncts (ON + USING + WHERE-mid), before
-                    // they are folded into the Join Filter text.
-                    if matches!(kind, JoinKind::Inner) {
-                        let mut ln = Vec::new();
-                        pg_replaces_names(std::slice::from_ref(left), &mut ln);
-                        let mut rn = Vec::new();
-                        pg_replaces_names(std::slice::from_ref(right), &mut rn);
-                        hash_clauses = pg_hash_clauses(&jf, &ln, &rn);
-                    }
-                    // v1.71: keep the raw conjuncts for the post-swap
-                    // EC-canonical render in the NestedLoop branch.
-                    jf_exprs = jf.clone();
-                    join_filter = match pg_fold_and(jf) {
-                        Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
-                        None => None,
-                    };
+                        // v1.64: hashable equi clauses for the hash-vs-nestloop
+                        // choice (PG19 `hash_inner_and_outer`). Extracted from
+                        // the raw conjuncts (ON + USING + WHERE-mid), before
+                        // they are folded into the Join Filter text.
+                        if matches!(kind, JoinKind::Inner) {
+                            let mut ln = Vec::new();
+                            pg_replaces_names(std::slice::from_ref(left), &mut ln);
+                            let mut rn = Vec::new();
+                            pg_replaces_names(std::slice::from_ref(right), &mut rn);
+                            hash_clauses = pg_hash_clauses(&jf, &ln, &rn);
+                        }
+                        // v1.71: keep the raw conjuncts for the post-swap
+                        // EC-canonical render in the NestedLoop branch.
+                        jf_exprs = jf.clone();
+                        join_filter = match pg_fold_and(jf) {
+                            Some(e) => Some(pg_expr_text_or_debug(&e, px, true)),
+                            None => None,
+                        };
                     } // end if using_ok
                 } // end if supported
             }
@@ -16748,19 +17599,14 @@ fn plan_from_item(
             // Note: (outer, inner) here are still the pre-swap (left,
             // right) plans; the v1.63 `swapped` order applies to the
             // nestloop fallback only.
-            let hash_win: Option<(bool, Vec<(Expr, Expr)>)> = if matches!(
-                kind,
-                JoinKind::Inner
-            ) && !on_pushed_right
+            let hash_win: Option<(bool, Vec<(Expr, Expr)>)> = if matches!(kind, JoinKind::Inner)
+                && !on_pushed_right
                 && !hash_clauses.is_empty()
             {
                 // Candidate orders as (outer_is_left, oriented_clauses).
                 let clauses_lr = hash_clauses.clone();
-                let clauses_rl: Vec<(Expr, Expr)> = hash_clauses
-                    .iter()
-                    .cloned()
-                    .map(|(l, r)| (r, l))
-                    .collect();
+                let clauses_rl: Vec<(Expr, Expr)> =
+                    hash_clauses.iter().cloned().map(|(l, r)| (r, l)).collect();
                 // PG's empirical order: the filtered side probes.
                 let outer_is_left = match (left_where.is_some(), right_where.is_some()) {
                     (true, false) => true,
@@ -16769,14 +17615,26 @@ fn plan_from_item(
                     // order (fuzz tie-break keeps left-outer).
                     _ => {
                         let cost_lr = pg_hashjoin_cost_order(
-                            &eng.db, &outer, left_where.as_ref(), &inner,
-                            right_where.as_ref(), hash_clauses.len(),
-                            snap, own, session,
+                            &eng.db,
+                            &outer,
+                            left_where.as_ref(),
+                            &inner,
+                            right_where.as_ref(),
+                            hash_clauses.len(),
+                            snap,
+                            own,
+                            session,
                         );
                         let cost_rl = pg_hashjoin_cost_order(
-                            &eng.db, &inner, right_where.as_ref(), &outer,
-                            left_where.as_ref(), hash_clauses.len(),
-                            snap, own, session,
+                            &eng.db,
+                            &inner,
+                            right_where.as_ref(),
+                            &outer,
+                            left_where.as_ref(),
+                            hash_clauses.len(),
+                            snap,
+                            own,
+                            session,
                         );
                         match (cost_lr, cost_rl) {
                             (Some(c1), Some(c2)) if c2 * PG_STD_FUZZ_FACTOR < c1 => false,
@@ -16802,12 +17660,26 @@ fn plan_from_item(
                     (&inner, &outer)
                 };
                 let hash_cost = pg_hashjoin_cost_order(
-                    &eng.db, h_o, h_ow, h_i, h_iw,
-                    h_clauses.len(), snap, own, session,
+                    &eng.db,
+                    h_o,
+                    h_ow,
+                    h_i,
+                    h_iw,
+                    h_clauses.len(),
+                    snap,
+                    own,
+                    session,
                 );
                 let nl_cost = pg_nestloop_cost_order(
-                    &eng.db, nl_o, nl_ow, nl_i, nl_iw,
-                    h_clauses.len(), snap, own, session,
+                    &eng.db,
+                    nl_o,
+                    nl_ow,
+                    nl_i,
+                    nl_iw,
+                    h_clauses.len(),
+                    snap,
+                    own,
+                    session,
                 );
                 match (hash_cost, nl_cost) {
                     (Some(h), Some(n)) if h * PG_STD_FUZZ_FACTOR < n => {
@@ -16825,26 +17697,28 @@ fn plan_from_item(
             // closed to the v1.64 choice otherwise. Merge takes
             // precedence when it fuzz-wins the no-stats three-way: PG19
             // compares all three on the same (no-stats) estimates.
-            let merge_win: Option<Vec<(Expr, Expr)>> =
-                if matches!(kind, JoinKind::Inner) && !on_pushed_right && !hash_clauses.is_empty() {
-                    if pg_merge_wins_ns(
-                        &eng.db,
-                        &outer,
-                        left_where.as_ref(),
-                        &inner,
-                        right_where.as_ref(),
-                        hash_clauses.len(),
-                        snap,
-                        own,
-                        session,
-                    ) {
-                        Some(hash_clauses.clone())
-                    } else {
-                        None
-                    }
+            let merge_win: Option<Vec<(Expr, Expr)>> = if matches!(kind, JoinKind::Inner)
+                && !on_pushed_right
+                && !hash_clauses.is_empty()
+            {
+                if pg_merge_wins_ns(
+                    &eng.db,
+                    &outer,
+                    left_where.as_ref(),
+                    &inner,
+                    right_where.as_ref(),
+                    hash_clauses.len(),
+                    snap,
+                    own,
+                    session,
+                ) {
+                    Some(hash_clauses.clone())
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
             if let Some(oriented) = merge_win {
                 // v1.69: merge join wins. `Merge Cond:` renders the
                 // oriented clauses PG19-style (`(outer.col = inner.col)`,
@@ -16942,48 +17816,47 @@ fn plan_from_item(
                     output: h_output,
                 })
             } else {
-            let (outer, inner) = if swapped {
-                (inner, outer)
-            } else {
-                (outer, inner)
-            };
-            // v1.71: EC-canonical join-filter representatives (PG19
-            // equivclass.c `generate_join_implied_equalities`): the clause
-            // orientation is fixed by PG's first EC call — a partial index
-            // on the left table flips it to (right-first, left-second),
-            // otherwise (left-first, right-first) at build time. The
-            // orientation persists regardless of the plan's outer/inner,
-            // so this uses the build-time sides, not the swapped ones.
-            // EXPLAIN-text only; skipped in legacy (non-PG-text) mode.
-            if let Some(px) = pctx {
-                let mut onm = Vec::new();
-                pg_replaces_names(std::slice::from_ref(left), &mut onm);
-                let mut inm = Vec::new();
-                pg_replaces_names(std::slice::from_ref(right), &mut inm);
-                let (outer_names, inner_names): (&[String], &[String]) =
-                    if ec_partial_left {
+                let (outer, inner) = if swapped {
+                    (inner, outer)
+                } else {
+                    (outer, inner)
+                };
+                // v1.71: EC-canonical join-filter representatives (PG19
+                // equivclass.c `generate_join_implied_equalities`): the clause
+                // orientation is fixed by PG's first EC call — a partial index
+                // on the left table flips it to (right-first, left-second),
+                // otherwise (left-first, right-first) at build time. The
+                // orientation persists regardless of the plan's outer/inner,
+                // so this uses the build-time sides, not the swapped ones.
+                // EXPLAIN-text only; skipped in legacy (non-PG-text) mode.
+                if let Some(px) = pctx {
+                    let mut onm = Vec::new();
+                    pg_replaces_names(std::slice::from_ref(left), &mut onm);
+                    let mut inm = Vec::new();
+                    pg_replaces_names(std::slice::from_ref(right), &mut inm);
+                    let (outer_names, inner_names): (&[String], &[String]) = if ec_partial_left {
                         (&inm, &onm)
                     } else {
                         (&onm, &inm)
                     };
-                if let Some(t) = pg_ec_join_filter_text(
-                    &jf_exprs,
-                    &mut join_ec,
-                    outer_names,
-                    inner_names,
-                    &ec_split,
-                    px,
-                ) {
-                    join_filter = Some(t);
+                    if let Some(t) = pg_ec_join_filter_text(
+                        &jf_exprs,
+                        &mut join_ec,
+                        outer_names,
+                        inner_names,
+                        &ec_split,
+                        px,
+                    ) {
+                        join_filter = Some(t);
+                    }
                 }
-            }
-            let rows = outer.rows().saturating_mul(inner.rows());
-            // v1.46: VERBOSE `Output:` — a join's tlist starts as the
-            // verbatim concatenation of its inputs' tlists (PG19). The
-            // top-level join's entries are replaced with the query
-            // targetlist at the end of `plan_select`.
-            let mut output = outer.output().to_vec();
-            output.extend(inner.output().iter().cloned());
+                let rows = outer.rows().saturating_mul(inner.rows());
+                // v1.46: VERBOSE `Output:` — a join's tlist starts as the
+                // verbatim concatenation of its inputs' tlists (PG19). The
+                // top-level join's entries are replaced with the query
+                // targetlist at the end of `plan_select`.
+                let mut output = outer.output().to_vec();
+                output.extend(inner.output().iter().cloned());
                 // v1.48: PG19 renders the join kind in the node label
                 // (`Nested Loop Left Join`, ...) and may materialize the
                 // inner side (see `pg_should_materialize`).
@@ -17917,29 +18790,22 @@ fn pg_try_anti_join(
     outer_ctes: &[CteDef],
     verbose: bool,
 ) -> Result<Option<PlanNode>, ExecError> {
-    if let Some(node) =
-        pg_try_anti_join_simple(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    if let Some(node) = pg_try_anti_join_simple(eng, stmt, snap, own, session, outer_ctes, verbose)?
     {
         return Ok(Some(node));
     }
-    if let Some(node) =
-        pg_try_anti_join_multi(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    if let Some(node) = pg_try_anti_join_multi(eng, stmt, snap, own, session, outer_ctes, verbose)?
     {
         return Ok(Some(node));
     }
-    if let Some(node) =
-        pg_try_anti_join_row(eng, stmt, snap, own, session, outer_ctes, verbose)?
+    if let Some(node) = pg_try_anti_join_row(eng, stmt, snap, own, session, outer_ctes, verbose)? {
+        return Ok(Some(node));
+    }
+    if let Some(node) = pg_try_anti_join_outer(eng, stmt, snap, own, session, outer_ctes, verbose)?
     {
         return Ok(Some(node));
     }
-    if let Some(node) =
-        pg_try_anti_join_outer(eng, stmt, snap, own, session, outer_ctes, verbose)?
-    {
-        return Ok(Some(node));
-    }
-    if let Some(node) =
-        pg_try_anti_join_on(eng, stmt, snap, own, session, outer_ctes, verbose)?
-    {
+    if let Some(node) = pg_try_anti_join_on(eng, stmt, snap, own, session, outer_ctes, verbose)? {
         return Ok(Some(node));
     }
     Ok(None)
@@ -17965,14 +18831,9 @@ fn pg_try_anti_join(
 // Every shape fails closed to `None` on anything unrecognized.
 // ============================================================================
 
-
 /// v1.69: a synthetic single-table `SELECT *` for planning an anti-join
 /// side scan (the Filter text deparses PG19-style via `plan_select`).
-fn pg_anti_scan_stmt(
-    table: &str,
-    alias: &Option<String>,
-    where_: Option<Expr>,
-) -> SelectStmt {
+fn pg_anti_scan_stmt(table: &str, alias: &Option<String>, where_: Option<Expr>) -> SelectStmt {
     SelectStmt {
         with: vec![],
         distinct: false,
@@ -18028,15 +18889,24 @@ fn pg_anti_top_choice(
     own: u64,
     session: u64,
 ) -> PlanNode {
-    let (or_, ot, os) = pg_nostats_path_cost(&eng.db, &outer, snap, own, session)
-        .unwrap_or((1.0, 1.0, 0.0));
-    let (ir, it, is_) = pg_nostats_path_cost(&eng.db, &inner, snap, own, session)
-        .unwrap_or((1.0, 1.0, 0.0));
+    let (or_, ot, os) =
+        pg_nostats_path_cost(&eng.db, &outer, snap, own, session).unwrap_or((1.0, 1.0, 0.0));
+    let (ir, it, is_) =
+        pg_nostats_path_cost(&eng.db, &inner, snap, own, session).unwrap_or((1.0, 1.0, 0.0));
     let k = outer_keys.len();
     let o_sorted = outer_keys.iter().all(|kk| pg_plan_sorted_on(&outer, kk));
     let i_sorted = inner_keys.iter().all(|kk| pg_plan_sorted_on(&inner, kk));
     let (_, m_total) = pg_cost_mergejoin(
-        or_, ot, os, ir, it, is_, k, JoinKind::Anti, o_sorted, i_sorted,
+        or_,
+        ot,
+        os,
+        ir,
+        it,
+        is_,
+        k,
+        JoinKind::Anti,
+        o_sorted,
+        i_sorted,
     );
     let h_total = pg_cost_hashjoin_anti(or_, ot, ir, it, k);
     // ANTI preserves the outer cardinality (rows), and the top node's
@@ -18135,7 +19005,7 @@ fn pg_try_anti_join_multi(
             neg: true,
         } => match expr.as_ref() {
             Expr::Column { table: qt, name } => {
-                            let names_outer = match qt {
+                let names_outer = match qt {
                     None => true,
                     Some(_) => pg_anti_qual_is(qt, &outer_table, &outer_alias),
                 };
@@ -18173,15 +19043,17 @@ fn pg_try_anti_join_multi(
     };
     // --- the subquery FROM must be a join ---
     let join = match sub.from.as_slice() {
-        [FromItem::Join {
-            left,
-            kind,
-            right,
-            on,
-            using,
-            natural,
-            ..
-        }] => {
+        [
+            FromItem::Join {
+                left,
+                kind,
+                right,
+                on,
+                using,
+                natural,
+                ..
+            },
+        ] => {
             if !using.is_empty() || *natural {
                 return Ok(None);
             }
@@ -18289,7 +19161,8 @@ fn pg_try_anti_join_multi(
             };
             // Plan t3 scan and materialize it.
             let t3_stmt = pg_anti_scan_stmt(&t3_table, &t3_alias, None);
-            let t3_plan = plan_select(eng, &t3_stmt, snap, own, session, outer_ctes, true, verbose)?;
+            let t3_plan =
+                plan_select(eng, &t3_stmt, snap, own, session, outer_ctes, true, verbose)?;
             let t3_rows = t3_plan.rows();
             let t3_output = t3_plan.output().to_vec();
             let t3_mat = PlanNode::Materialize {
@@ -18367,11 +19240,7 @@ fn pg_try_anti_join_multi(
 /// the output column is constrained by a strict `=` on a non-outerjoined
 /// rel (an INNER join's ON, or the top-level WHERE), so surviving rows
 /// can't have it NULL. Used for T16 (`t1.id = t2.id` on the inner join).
-fn pg_anti_strict_join_proof(
-    sub: &SelectStmt,
-    out_qual: &Option<String>,
-    out_col: &str,
-) -> bool {
+fn pg_anti_strict_join_proof(sub: &SelectStmt, out_qual: &Option<String>, out_col: &str) -> bool {
     // Collect the strict equijoin quals of non-outerjoined rels: INNER
     // join ONs (recursively) plus the top-level WHERE conjuncts. LEFT /
     // RIGHT / FULL ON quals are NOT safe (their rows can be null-extended).
@@ -18457,9 +19326,7 @@ fn pg_anti_plan_join_inner(
         return Ok(None);
     }
     let (l_kcol, r_kcol) = match (&clauses[0].0, &clauses[0].1) {
-        (Expr::Column { name: ln, .. }, Expr::Column { name: rn, .. }) => {
-            (ln.clone(), rn.clone())
-        }
+        (Expr::Column { name: ln, .. }, Expr::Column { name: rn, .. }) => (ln.clone(), rn.clone()),
         _ => return Ok(None),
     };
 
@@ -18707,8 +19574,7 @@ fn pg_try_anti_join_row(
                             if !names_outer {
                                 return Ok(None);
                             }
-                            if !pg_anti_col_not_null(eng, &outer_table, name, snap, own, session)
-                            {
+                            if !pg_anti_col_not_null(eng, &outer_table, name, snap, own, session) {
                                 return Ok(None);
                             }
                             cols.push(name.clone());
@@ -18858,16 +19724,18 @@ fn pg_try_anti_join_outer(
         None => return Ok(None),
     };
     let (l_table, l_alias, r_table, r_alias, on) = match stmt.from.as_slice() {
-        [FromItem::Join {
-            left,
-            kind: JoinKind::Left,
-            right,
-            on,
-            using,
-            natural,
-            ..
-        }] => {
-                    if !using.is_empty() || *natural {
+        [
+            FromItem::Join {
+                left,
+                kind: JoinKind::Left,
+                right,
+                on,
+                using,
+                natural,
+                ..
+            },
+        ] => {
+            if !using.is_empty() || *natural {
                 return Ok(None);
             }
             let (lt, la) = match left.as_ref() {
@@ -18974,8 +19842,7 @@ fn pg_try_anti_join_outer(
         true,
         verbose,
     )?;
-    let anti_inner_plan =
-        plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
+    let anti_inner_plan = plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
     let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
     let uniq = pg_anti_unique_names(&[l_name.clone(), inner_name.clone()]);
     let (l_ref, i_ref) = (uniq[0].clone(), uniq[1].clone());
@@ -19041,8 +19908,7 @@ fn pg_try_anti_join_outer(
         Some(t) => t,
         None => return Ok(None),
     };
-    let (_, m_total) =
-        pg_cost_mergejoin(lr, lt, ls, rr, rt, rs, 1, JoinKind::Left, false, false);
+    let (_, m_total) = pg_cost_mergejoin(lr, lt, ls, rr, rt, rs, 1, JoinKind::Left, false, false);
     let join_rows = lr * rr * PG_DEFAULT_EQ_SEL;
     let h_total = pg_cost_hashjoin(lr, lt, rr, rt, 1.0, 0.1, join_rows);
     let n_total = pg_cost_nestloop(lr, lt, rr, rt, CPU_OPERATOR_COST);
@@ -19092,15 +19958,17 @@ fn pg_try_anti_join_on(
 ) -> Result<Option<PlanNode>, ExecError> {
     // --- gates: FROM is a single LEFT JOIN; plain SELECT (ORDER BY ok) ---
     let (l_table, l_alias, r_table, r_alias, on) = match stmt.from.as_slice() {
-        [FromItem::Join {
-            left,
-            kind: JoinKind::Left,
-            right,
-            on: Some(on),
-            using,
-            natural,
-            ..
-        }] => {
+        [
+            FromItem::Join {
+                left,
+                kind: JoinKind::Left,
+                right,
+                on: Some(on),
+                using,
+                natural,
+                ..
+            },
+        ] => {
             if !using.is_empty() || *natural {
                 return Ok(None);
             }
@@ -19192,8 +20060,7 @@ fn pg_try_anti_join_on(
         true,
         verbose,
     )?;
-    let anti_inner_plan =
-        plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
+    let anti_inner_plan = plan_select(eng, &sub, snap, own, session, outer_ctes, true, verbose)?;
     let inner_name = inner_alias.clone().unwrap_or_else(|| inner_table.clone());
     let uniq = pg_anti_unique_names(&[r_name.clone(), inner_name.clone()]);
     let (r_ref, i_ref) = (uniq[0].clone(), uniq[1].clone());
@@ -19257,11 +20124,7 @@ fn pg_try_anti_join_on(
                 Expr::Column {
                     table: Some(q),
                     name,
-                } => keys.push(format!(
-                    "{}.{}",
-                    pg_quote_ident(q),
-                    pg_quote_ident(name)
-                )),
+                } => keys.push(format!("{}.{}", pg_quote_ident(q), pg_quote_ident(name))),
                 _ => return Ok(None),
             }
             // (DESC / NULLS FIRST would render key suffixes; T18 is
@@ -19541,10 +20404,11 @@ fn plan_select(
     // (planner() order: pull_up_subqueries → reduce_outer_joins →
     // remove_useless_joins). Returns the rewritten statement and the
     // non-Column tlist exprs substituted (for PG-text paren marking).
-    let (pullup_stmt_owned, pulled_exprs) = match pull_up_simple_subqueries(stmt, eng, snap, own, session) {
-        Some((new_stmt, pulled)) => (Some(new_stmt), pulled),
-        None => (None, Vec::new()),
-    };
+    let (pullup_stmt_owned, pulled_exprs) =
+        match pull_up_simple_subqueries(stmt, eng, snap, own, session) {
+            Some((new_stmt, pulled)) => (Some(new_stmt), pulled),
+            None => (None, Vec::new()),
+        };
     let stmt_after_pullup: &SelectStmt = pullup_stmt_owned.as_ref().unwrap_or(stmt);
     // remove_useless_joins, flipping JOIN_RIGHT to JOIN_LEFT with swapped
     // inputs (ON clause unmodified). `orig_from` is the pre-flip tree, kept
@@ -19566,6 +20430,18 @@ fn plan_select(
             &stmt_owned
         }
     };
+    // v1.73: PG19 `remove_useless_self_joins` (analyzejoins.c) — self-join
+    // elimination for plain-column unique keys. Runs after
+    // `remove_useless_joins_from`, mirroring PG19 planmain.c order.
+    let stmt_owned_sje;
+    let stmt: &SelectStmt =
+        match remove_useless_self_joins_from(eng, &stmt.from, stmt, snap, own, session) {
+            Some(rewritten) => {
+                stmt_owned_sje = rewritten;
+                &stmt_owned_sje
+            }
+            None => stmt,
+        };
     // v1.08: PG-text name/type context for this query level, plus the
     // WHERE clause distributed over the FROM items (per-item slices and
     // the join-level remainder).
@@ -50424,7 +51300,8 @@ fn describe_cte_dml(
     }
 }
 
-fn describe_cte(    eng: &Engine,
+fn describe_cte(
+    eng: &Engine,
     snap: &Snapshot,
     own: u64,
     session: u64,
@@ -51546,7 +52423,9 @@ fn within_group_result_type(
     };
     match func {
         OrderedSetAgg::PercentileCont => {
-            let a = direct_args.first().expect("percentile_cont takes one direct arg");
+            let a = direct_args
+                .first()
+                .expect("percentile_cont takes one direct arg");
             let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
             // PG19 coerces the fraction to float8 implicitly
             // (numeric/int literals work); the sort column must be
@@ -51576,7 +52455,9 @@ fn within_group_result_type(
             }
         }
         OrderedSetAgg::PercentileDisc => {
-            let a = direct_args.first().expect("percentile_disc takes one direct arg");
+            let a = direct_args
+                .first()
+                .expect("percentile_disc takes one direct arg");
             let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
             let elem = sort_ty(0)?;
             // PG19: an untyped NULL literal coerces to float8 and
@@ -51585,9 +52466,7 @@ fn within_group_result_type(
             let null_lit = matches!(a, Expr::Literal(Literal::Null));
             match t {
                 _ if within_group_numeric(&t) || null_lit => Ok(elem),
-                ColType::Array(_) => {
-                    Ok(ColType::Array(crate::storage::ArrayElem::of(&elem)))
-                }
+                ColType::Array(_) => Ok(ColType::Array(crate::storage::ArrayElem::of(&elem))),
                 _ => Err(exec_err(
                     "42883",
                     format!("function percentile_disc({}) does not exist", t.sql_name()),
@@ -53276,11 +54155,7 @@ mod tests {
         // (the row-sharing assertion is about the executor, not the
         // planner's scan choice).
         for i in 4..=500 {
-            run(
-                &mut eng,
-                &format!("INSERT INTO users VALUES ({i}, 'n{i}')"),
-            )
-            .unwrap();
+            run(&mut eng, &format!("INSERT INTO users VALUES ({i}, 'n{i}')")).unwrap();
         }
         let plan = rows_of(run(&mut eng, "EXPLAIN SELECT * FROM users WHERE id = 2").unwrap());
         let plan = plan.concat().join(" ");
@@ -57450,10 +58325,7 @@ mod tests {
             .map(|r| r[0].clone())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            plan3.contains("Result"),
-            "plan was:\n{plan3}"
-        );
+        assert!(plan3.contains("Result"), "plan was:\n{plan3}");
         // Recursive CTE: nominal estimate, no infinite recursion.
         let r4 = run(
             &mut eng,
@@ -66866,8 +67738,7 @@ mod v126_lateral_validation_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -67003,7 +67874,11 @@ mod v126_lateral_validation_tests {
         // Top-level aggregate: no marker live, unaffected.
         run(&mut eng, "select max(q1) from int8_tbl").unwrap();
         // Scalar subquery (not LATERAL): no marker, unaffected.
-        run(&mut eng, "select (select max(q1) from int8_tbl) from int4_tbl").unwrap();
+        run(
+            &mut eng,
+            "select (select max(q1) from int8_tbl) from int4_tbl",
+        )
+        .unwrap();
     }
 }
 
@@ -67611,8 +68486,7 @@ mod v127_projectset_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -67914,8 +68788,7 @@ mod v128_projectset_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -68035,10 +68908,7 @@ mod v128_projectset_tests {
     fn nested_srf_plain_col_repeats() {
         let mut eng = engine();
         let r = run(&mut eng, "select 'a' as c, generate_series(1,2)+1").unwrap();
-        assert_eq!(
-            rows_of(r),
-            vec![vec![s("a"), s("2")], vec![s("a"), s("3")]]
-        );
+        assert_eq!(rows_of(r), vec![vec![s("a"), s("2")], vec![s("a"), s("3")]]);
     }
 
     /// The SRF args see the input row: fan-out is per input row.
@@ -68090,10 +68960,7 @@ mod v128_projectset_tests {
             "select generate_series(1,3)+1 order by generate_series(1,3)+1 desc",
         )
         .unwrap();
-        assert_eq!(
-            rows_of(r),
-            vec![vec![s("4")], vec![s("3")], vec![s("2")]]
-        );
+        assert_eq!(rows_of(r), vec![vec![s("4")], vec![s("3")], vec![s("2")]]);
     }
 
     /// Ordinal ORDER BY over a nested-SRF item sorts the fanned rows.
@@ -68101,10 +68968,7 @@ mod v128_projectset_tests {
     fn nested_srf_order_by_ordinal() {
         let mut eng = engine();
         let r = run(&mut eng, "select generate_series(1,3)+1 order by 1 desc").unwrap();
-        assert_eq!(
-            rows_of(r),
-            vec![vec![s("4")], vec![s("3")], vec![s("2")]]
-        );
+        assert_eq!(rows_of(r), vec![vec![s("4")], vec![s("3")], vec![s("2")]]);
     }
 
     /// DISTINCT ON defers the expansion until after the first-row-per-group
@@ -68192,11 +69056,12 @@ mod v128_projectset_tests {
         let mut eng = engine();
         let r = run(&mut eng, "select generate_series(1,2)").unwrap();
         assert_eq!(rows_of(r), vec![vec![s("1")], vec![s("2")]]);
-        let r = run(&mut eng, "select generate_series(1,2), generate_series(5,6)").unwrap();
-        assert_eq!(
-            rows_of(r),
-            vec![vec![s("1"), s("5")], vec![s("2"), s("6")]]
-        );
+        let r = run(
+            &mut eng,
+            "select generate_series(1,2), generate_series(5,6)",
+        )
+        .unwrap();
+        assert_eq!(rows_of(r), vec![vec![s("1"), s("5")], vec![s("2"), s("6")]]);
     }
 }
 
@@ -68218,8 +69083,7 @@ mod v129_filter_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -68509,17 +69373,17 @@ mod v129_filter_tests {
             "select sum(x) filter (where grouping(a) = 0) from (values (1,1)) as t(a,x) group by a",
         );
         assert_eq!(err.code, "42803");
-        assert_eq!(
-            err.message,
-            "grouping operations are not allowed in FILTER"
-        );
+        assert_eq!(err.message, "grouping operations are not allowed in FILTER");
     }
 
     /// Non-boolean FILTER: 42804, PG-verbatim construct name.
     #[test]
     fn filter_non_boolean() {
         let mut eng = engine();
-        let err = err_of(&mut eng, "select sum(x) filter (where 'a') from (values (1)) as t(x)");
+        let err = err_of(
+            &mut eng,
+            "select sum(x) filter (where 'a') from (values (1)) as t(x)",
+        );
         assert_eq!(err.code, "42804");
         assert_eq!(
             err.message,
@@ -68542,8 +69406,7 @@ mod v130_ordered_set_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -68590,9 +69453,7 @@ mod v130_ordered_set_tests {
 
     fn cols_of(eng: &mut Engine, sql: &str) -> Vec<String> {
         match run(eng, sql).unwrap() {
-            ExecResult::Select { columns, .. } => {
-                columns.into_iter().map(|c| c.0).collect()
-            }
+            ExecResult::Select { columns, .. } => columns.into_iter().map(|c| c.0).collect(),
             other => panic!("expected SELECT, got {other:?}"),
         }
     }
@@ -69095,7 +69956,11 @@ mod v130_ordered_set_tests {
             "select rank('a') within group (order by x) from (values (1)) as t(x)",
         );
         assert_eq!(err.code, "42804");
-        assert!(err.message.contains("WITHIN GROUP types"), "{}", err.message);
+        assert!(
+            err.message.contains("WITHIN GROUP types"),
+            "{}",
+            err.message
+        );
     }
 
     /// Numerics unify across int/float (PG19 implicit coercion).
@@ -69150,7 +70015,11 @@ mod v130_ordered_set_tests {
             "select percentile_cont(0.5) from (values (1)) as t(x)",
         );
         assert_eq!(err.code, "42809");
-        assert!(err.message.contains("WITHIN GROUP is required"), "{}", err.message);
+        assert!(
+            err.message.contains("WITHIN GROUP is required"),
+            "{}",
+            err.message
+        );
         let err = err_of(&mut eng, "select mode() from (values (1)) as t(x)");
         assert_eq!(err.code, "42809");
     }
@@ -69178,7 +70047,11 @@ mod v130_ordered_set_tests {
             "select sum(x) within group (order by x) from (values (1)) as t(x)",
         );
         assert_eq!(err.code, "42809");
-        assert!(err.message.contains("not an ordered-set aggregate"), "{}", err.message);
+        assert!(
+            err.message.contains("not an ordered-set aggregate"),
+            "{}",
+            err.message
+        );
     }
 
     /// A non-aggregate cannot take WITHIN GROUP (42809, PG19
@@ -69202,7 +70075,8 @@ mod v130_ordered_set_tests {
         );
         assert_eq!(err.code, "42809");
         assert!(
-            err.message.contains("window function row_number cannot have WITHIN GROUP"),
+            err.message
+                .contains("window function row_number cannot have WITHIN GROUP"),
             "{}",
             err.message
         );
@@ -69315,8 +70189,7 @@ mod v131_groups_exclusion_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -69369,13 +70242,7 @@ mod v131_groups_exclusion_tests {
     }
 
     fn groups_q(eng: &mut Engine, sel: &str) -> Vec<Vec<String>> {
-        rows_of(
-            run(
-                eng,
-                &format!("SELECT v, {sel} FROM gvals ORDER BY v"),
-            )
-            .unwrap(),
-        )
+        rows_of(run(eng, &format!("SELECT v, {sel} FROM gvals ORDER BY v")).unwrap())
     }
 
     fn vv(pairs: &[(i32, &str)]) -> Vec<Vec<String>> {
@@ -69393,7 +70260,13 @@ mod v131_groups_exclusion_tests {
                 &mut eng,
                 "sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND CURRENT ROW)"
             ),
-            vv(&[(10, "30"), (20, "30"), (30, "120"), (40, "120"), (50, "120")])
+            vv(&[
+                (10, "30"),
+                (20, "30"),
+                (30, "120"),
+                (40, "120"),
+                (50, "120")
+            ])
         );
         // 0 PRECEDING .. 0 FOLLOWING hits the same single group.
         assert_eq!(
@@ -69401,7 +70274,13 @@ mod v131_groups_exclusion_tests {
                 &mut eng,
                 "sum(v) OVER (ORDER BY g GROUPS BETWEEN 0 PRECEDING AND 0 FOLLOWING)"
             ),
-            vv(&[(10, "30"), (20, "30"), (30, "120"), (40, "120"), (50, "120")])
+            vv(&[
+                (10, "30"),
+                (20, "30"),
+                (30, "120"),
+                (40, "120"),
+                (50, "120")
+            ])
         );
     }
 
@@ -69429,7 +70308,13 @@ mod v131_groups_exclusion_tests {
                 &mut eng,
                 "sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)"
             ),
-            vv(&[(10, "30"), (20, "30"), (30, "150"), (40, "150"), (50, "150")])
+            vv(&[
+                (10, "30"),
+                (20, "30"),
+                (30, "150"),
+                (40, "150"),
+                (50, "150")
+            ])
         );
     }
 
@@ -69606,13 +70491,7 @@ mod v131_groups_exclusion_tests {
                 "lead(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING \
                  AND 1 FOLLOWING EXCLUDE TIES)"
             ),
-            vv(&[
-                (10, "20"),
-                (20, "30"),
-                (30, "40"),
-                (40, "50"),
-                (50, "NULL")
-            ])
+            vv(&[(10, "20"), (20, "30"), (30, "40"), (40, "50"), (50, "NULL")])
         );
     }
 
@@ -69731,8 +70610,7 @@ mod v132_sql_function_tests {
     fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -69787,7 +70665,10 @@ mod v132_sql_function_tests {
             "CREATE FUNCTION g() RETURNS int LANGUAGE SQL AS 'SELECT 1';",
         )
         .expect("LANGUAGE SQL should resolve");
-        assert_eq!(rows_of(run(&mut eng, "SELECT g();").unwrap()), vec![vec!["1"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT g();").unwrap()),
+            vec![vec!["1"]]
+        );
     }
 
     #[test]
@@ -69798,7 +70679,10 @@ mod v132_sql_function_tests {
             "CREATE FUNCTION m() RETURNS int LANGUAGE sql AS 'SELECT 1; SELECT 2; SELECT 3';",
         )
         .expect("multi-statement body should create");
-        assert_eq!(rows_of(run(&mut eng, "SELECT m();").unwrap()), vec![vec!["3"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT m();").unwrap()),
+            vec![vec!["3"]]
+        );
     }
 
     #[test]
@@ -69851,7 +70735,10 @@ mod v132_sql_function_tests {
         let mut eng = engine();
         // PG19 check_sql_fn_retval: an empty body is "the last query
         // rewrote to nothing" -> return type mismatch.
-        let e = err_of(&mut eng, "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS '';");
+        let e = err_of(
+            &mut eng,
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS '';",
+        );
         assert_eq!(e.code, "42P13");
         let e = err_of(
             &mut eng,
@@ -69932,7 +70819,10 @@ mod v132_sql_function_tests {
             "CREATE OR REPLACE FUNCTION d() RETURNS int LANGUAGE sql AS 'SELECT 2;';",
         )
         .unwrap();
-        assert_eq!(rows_of(run(&mut eng, "SELECT d();").unwrap()), vec![vec!["2"]]);
+        assert_eq!(
+            rows_of(run(&mut eng, "SELECT d();").unwrap()),
+            vec![vec!["2"]]
+        );
     }
 
     #[test]
@@ -70020,8 +70910,7 @@ mod v133_dml_function_bodies {
     fn run_with(eng: &mut Engine, sql: &str, read_only: bool) -> Result<ExecResult, ExecError> {
         // Preserve the parser's SQLSTATE (e.g. 42601), like the main
         // test harness does.
-        let stmt =
-            crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
         let snap = eng.take_snapshot();
         let mut writes = Vec::new();
         let mut ctx = StmtCtx {
@@ -70909,7 +71798,6 @@ mod v135_select_final_coercion {
     }
 }
 
-
 #[cfg(test)]
 mod v136_immutable_fold_tests {
     use super::*;
@@ -70968,7 +71856,8 @@ mod v136_immutable_fold_tests {
              AS 'SELECT $1 + 1'",
         )
         .unwrap();
-        let rows = rows_of(run(&mut eng, "SELECT add1(41) FROM generate_series(1, 1000) g").unwrap());
+        let rows =
+            rows_of(run(&mut eng, "SELECT add1(41) FROM generate_series(1, 1000) g").unwrap());
         assert_eq!(rows.len(), 1000);
         assert!(rows.iter().all(|r| r == &vec!["42".to_string()]));
     }
@@ -70993,7 +71882,13 @@ mod v136_immutable_fold_tests {
         );
         assert_eq!(
             col0(rows),
-            vec!["2".to_string(), "2".to_string(), "3".to_string(), "3".to_string(), "4".to_string()]
+            vec![
+                "2".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "3".to_string(),
+                "4".to_string()
+            ]
         );
     }
 
@@ -71011,7 +71906,10 @@ mod v136_immutable_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT add1(a) FROM t136 ORDER BY a").unwrap());
-        assert_eq!(col0(rows), vec!["2".to_string(), "3".to_string(), "4".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["2".to_string(), "3".to_string(), "4".to_string()]
+        );
     }
 
     /// v1.36: VOLATILE-marked functions never fold (PG19
@@ -71030,7 +71928,13 @@ mod v136_immutable_fold_tests {
         let rows = rows_of(run(&mut eng, "SELECT sv136() FROM generate_series(1, 5) g").unwrap());
         assert_eq!(
             col0(rows),
-            vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()]
+            vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+                "5".to_string()
+            ]
         );
     }
 
@@ -71047,7 +71951,10 @@ mod v136_immutable_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT ss136() FROM generate_series(1, 3) g").unwrap());
-        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
     }
 
     /// v1.36: a body calling a volatile builtin never folds, even when
@@ -71089,7 +71996,10 @@ mod v136_immutable_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT ic136() FROM generate_series(1, 3) g").unwrap());
-        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
     }
 
     /// v1.36: a STABLE callee is fine (statement-constant by contract)
@@ -71455,7 +72365,10 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT cte137() FROM generate_series(1, 3) g").unwrap());
-        assert_eq!(col0(rows), vec!["42".to_string(), "42".to_string(), "42".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["42".to_string(), "42".to_string(), "42".to_string()]
+        );
     }
 
     /// v1.37: a body reading a plain catalog table (no CTE anywhere)
@@ -71472,7 +72385,10 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT cat137() FROM generate_series(1, 3) g").unwrap());
-        assert_eq!(col0(rows), vec!["5".to_string(), "5".to_string(), "5".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["5".to_string(), "5".to_string(), "5".to_string()]
+        );
     }
 
     /// v1.37: a caller CTE shadowing a name the body reads through a
@@ -71513,7 +72429,11 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(
-            run(&mut eng, "SELECT sv137(), sv137() FROM generate_series(1, 3) g").unwrap(),
+            run(
+                &mut eng,
+                "SELECT sv137(), sv137() FROM generate_series(1, 3) g",
+            )
+            .unwrap(),
         );
         assert_eq!(rows.len(), 3);
         let flat: Vec<String> = rows.into_iter().flatten().collect();
@@ -71534,7 +72454,10 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(run(&mut eng, "SELECT ss137() FROM generate_series(1, 3) g").unwrap());
-        assert_eq!(col0(rows), vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
     }
 
     /// v1.37: errors are never memoized — the first row raises exactly
@@ -71563,10 +72486,17 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(
-            run(&mut eng, "SELECT z137(), z137() FROM generate_series(1, 3) g").unwrap(),
+            run(
+                &mut eng,
+                "SELECT z137(), z137() FROM generate_series(1, 3) g",
+            )
+            .unwrap(),
         );
         assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|r| r == &vec!["99".to_string(), "99".to_string()]));
+        assert!(
+            rows.iter()
+                .all(|r| r == &vec!["99".to_string(), "99".to_string()])
+        );
     }
 
     /// v1.37: named-argument calls fold — the memo key is the call-site
@@ -71581,9 +72511,16 @@ mod v137_plan_fold_tests {
         )
         .unwrap();
         let rows = rows_of(
-            run(&mut eng, "SELECT add137(y => 2, x => 40) FROM generate_series(1, 3) g").unwrap(),
+            run(
+                &mut eng,
+                "SELECT add137(y => 2, x => 40) FROM generate_series(1, 3) g",
+            )
+            .unwrap(),
         );
-        assert_eq!(col0(rows), vec!["42".to_string(), "42".to_string(), "42".to_string()]);
+        assert_eq!(
+            col0(rows),
+            vec!["42".to_string(), "42".to_string(), "42".to_string()]
+        );
     }
 
     /// v1.37: a fold-eligible call nested inside a subquery (whose own
@@ -71626,9 +72563,8 @@ mod v137_plan_fold_tests {
              AS 'SELECT sum(inner137(v)) FROM (VALUES (1),(2),(3)) t(v)'",
         )
         .unwrap();
-        let rows = rows_of(
-            run(&mut eng, "SELECT outer137() FROM generate_series(1, 5) g").unwrap(),
-        );
+        let rows =
+            rows_of(run(&mut eng, "SELECT outer137() FROM generate_series(1, 5) g").unwrap());
         assert_eq!(
             col0(rows),
             vec![
@@ -71760,16 +72696,17 @@ mod v138_cast_tests {
         assert_eq!(col0(r), vec!["16".to_string()]);
         let r = rows_of(run(&mut eng, "SELECT i4in138('-2147483648')").unwrap());
         assert_eq!(col0(r), vec!["-2147483648".to_string()]);
-        let r = rows_of(
-            run(&mut eng, "SELECT i8in138('9223372036854775807')").unwrap(),
-        );
+        let r = rows_of(run(&mut eng, "SELECT i8in138('9223372036854775807')").unwrap());
         assert_eq!(col0(r), vec!["9223372036854775807".to_string()]);
         // NULL in (STRICT) -> NULL out, no error.
         let r = rows_of(run(&mut eng, "SELECT i4in138(NULL)").unwrap());
         assert_eq!(col0(r), vec!["NULL".to_string()]);
         // PG19 error codes.
         assert_eq!(err_code(&mut eng, "SELECT i4in138('2147483648')"), "22003");
-        assert_eq!(err_code(&mut eng, "SELECT i8in138('-9223372036854775809')"), "22003");
+        assert_eq!(
+            err_code(&mut eng, "SELECT i8in138('-9223372036854775809')"),
+            "22003"
+        );
         assert_eq!(err_code(&mut eng, "SELECT i4in138('abc')"), "22P02");
         assert_eq!(err_code(&mut eng, "SELECT i4in138('12.5')"), "22P02");
     }
@@ -71825,17 +72762,26 @@ mod v138_cast_tests {
         run(&mut eng, "CREATE TYPE c138").unwrap();
         // Unknown source type -> 42704.
         assert_eq!(
-            err_code(&mut eng, "CREATE CAST (nosuch138 AS integer) WITHOUT FUNCTION"),
+            err_code(
+                &mut eng,
+                "CREATE CAST (nosuch138 AS integer) WITHOUT FUNCTION"
+            ),
             "42704"
         );
         // Unknown target type -> 42704.
         assert_eq!(
-            err_code(&mut eng, "CREATE CAST (integer AS nosuch138) WITHOUT FUNCTION"),
+            err_code(
+                &mut eng,
+                "CREATE CAST (integer AS nosuch138) WITHOUT FUNCTION"
+            ),
             "42704"
         );
         // Same type -> 42P17.
         assert_eq!(
-            err_code(&mut eng, "CREATE CAST (integer AS integer) WITHOUT FUNCTION"),
+            err_code(
+                &mut eng,
+                "CREATE CAST (integer AS integer) WITHOUT FUNCTION"
+            ),
             "42P17"
         );
         // Physically incompatible (different typlen) -> 42P17.
@@ -71866,7 +72812,10 @@ mod v138_cast_tests {
         // WITH FUNCTION is out of scope -> 0A000, like PG19's
         // "not yet implemented".
         assert_eq!(
-            err_code(&mut eng, "CREATE CAST (integer AS bigint) WITH FUNCTION int4larger"),
+            err_code(
+                &mut eng,
+                "CREATE CAST (integer AS bigint) WITH FUNCTION int4larger"
+            ),
             "0A000"
         );
     }
@@ -71992,7 +72941,9 @@ mod v139_bit_cte_tests {
     fn bit_literal_bad_hex_digit() {
         let mut eng = engine();
         assert_eq!(err_code(&mut eng, "select x'2G';"), "22P02");
-        assert!(err_msg(&mut eng, "select x'2G';").contains("\"G\" is not a valid hexadecimal digit"));
+        assert!(
+            err_msg(&mut eng, "select x'2G';").contains("\"G\" is not a valid hexadecimal digit")
+        );
     }
 
     #[test]
@@ -72311,7 +73262,11 @@ mod v140_syscols_returning_tests {
         match run(&mut eng, "select ctid, cmin, cmax from t140;").unwrap() {
             ExecResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                let cells: Vec<String> = rows.into_iter().next().unwrap().into_iter()
+                let cells: Vec<String> = rows
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .into_iter()
                     .map(|v| v.to_text().unwrap_or("NULL".to_string()))
                     .collect();
                 assert_eq!(cells, vec!["(0,0)", "0", "0"]);
@@ -72805,7 +73760,6 @@ mod v140_syscols_returning_tests {
     }
 }
 
-
 #[cfg(test)]
 mod v145_join_removal_tests {
     use super::*;
@@ -72837,10 +73791,9 @@ mod v145_join_removal_tests {
 
     fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
         match run(eng, sql).unwrap() {
-            ExecResult::Explain { rows, .. } => rows
-                .into_iter()
-                .map(|r| r[0].to_text().unwrap())
-                .collect(),
+            ExecResult::Explain { rows, .. } => {
+                rows.into_iter().map(|r| r[0].to_text().unwrap()).collect()
+            }
             other => panic!("expected Explain, got {other:?}"),
         }
     }
@@ -72886,7 +73839,10 @@ mod v145_join_removal_tests {
         let mut eng = engine();
         setup(&mut eng);
         // SELECT * needs b's columns.
-        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM a LEFT JOIN b ON a.b_id = b.id");
+        let lines = plan_lines(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM a LEFT JOIN b ON a.b_id = b.id",
+        );
         assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
         // WHERE references the inner range.
         let lines = plan_lines(
@@ -72914,7 +73870,10 @@ mod v145_join_removal_tests {
             &mut eng,
             "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE b_id > 0",
         );
-        assert!(!lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("Nested Loop")),
+            "{lines:?}"
+        );
         // Ambiguous unqualified reference: conservative keep.
         let lines = plan_lines(
             &mut eng,
@@ -72940,7 +73899,10 @@ mod v145_join_removal_tests {
         );
         assert_eq!(
             lines,
-            vec!["Seq Scan on a".to_string(), "  Filter: (b_id > 0)".to_string()],
+            vec![
+                "Seq Scan on a".to_string(),
+                "  Filter: (b_id > 0)".to_string()
+            ],
             "{lines:?}"
         );
     }
@@ -72991,10 +73953,9 @@ mod v147_join_removal_tests {
 
     fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
         match run(eng, sql).unwrap() {
-            ExecResult::Explain { rows, .. } => rows
-                .into_iter()
-                .map(|r| r[0].to_text().unwrap())
-                .collect(),
+            ExecResult::Explain { rows, .. } => {
+                rows.into_iter().map(|r| r[0].to_text().unwrap()).collect()
+            }
             other => panic!("expected EXPLAIN, got {other:?}"),
         }
     }
@@ -73143,7 +74104,9 @@ mod v147_join_removal_tests {
         ] {
             let lines = plan_lines(&mut eng, sql);
             assert!(
-                lines.iter().any(|l| l.contains("Nested Loop") || l.contains("Hash")),
+                lines
+                    .iter()
+                    .any(|l| l.contains("Nested Loop") || l.contains("Hash")),
                 "should keep the join: {sql} -> {lines:?}"
             );
         }
@@ -73182,7 +74145,6 @@ mod v147_join_removal_tests {
     }
 }
 
-
 #[cfg(test)]
 mod v148_join_label_materialize_tests {
     use super::*;
@@ -73214,10 +74176,9 @@ mod v148_join_label_materialize_tests {
 
     fn plan_lines(eng: &mut Engine, sql: &str) -> Vec<String> {
         match run(eng, sql).unwrap() {
-            ExecResult::Explain { rows, .. } => rows
-                .into_iter()
-                .map(|r| r[0].to_text().unwrap())
-                .collect(),
+            ExecResult::Explain { rows, .. } => {
+                rows.into_iter().map(|r| r[0].to_text().unwrap()).collect()
+            }
             other => panic!("expected EXPLAIN, got {other:?}"),
         }
     }
@@ -75817,10 +76778,7 @@ mod v161_distinct_limit_tests {
     fn v161_explain_keeps_unique_otherwise() {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1(four int)").unwrap();
-        let lines = plan_lines(
-            &mut eng,
-            "EXPLAIN (COSTS OFF) SELECT DISTINCT four FROM t1",
-        );
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT DISTINCT four FROM t1");
         assert_eq!(lines[0], "Unique");
     }
 
@@ -75831,11 +76789,7 @@ mod v161_distinct_limit_tests {
         let mut eng = engine();
         run(&mut eng, "CREATE TABLE t1(four int)").unwrap();
         run(&mut eng, "INSERT INTO t1 VALUES (0), (0), (1)").unwrap();
-        let out = match run(
-            &mut eng,
-            "SELECT DISTINCT four FROM t1 WHERE four = 0",
-        )
-        .expect("runs")
+        let out = match run(&mut eng, "SELECT DISTINCT four FROM t1 WHERE four = 0").expect("runs")
         {
             ExecResult::Select { rows, .. } => rows,
             other => panic!("expected Select, got {:?}", other),
@@ -75889,7 +76843,11 @@ mod v165_cross_join_reorder_tests {
     }
 
     fn setup_t5(eng: &mut Engine) {
-        run(&mut *eng, "CREATE TABLE sj (a int unique, b int, c int unique)").unwrap();
+        run(
+            &mut *eng,
+            "CREATE TABLE sj (a int unique, b int, c int unique)",
+        )
+        .unwrap();
         run(
             &mut *eng,
             "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1), (3, 1, 3)",
@@ -75962,10 +76920,7 @@ mod v165_cross_join_reorder_tests {
         run(&mut eng, "INSERT INTO w1 VALUES (1), (2)").unwrap();
         run(&mut eng, "INSERT INTO w2 VALUES (1), (2)").unwrap();
         run(&mut eng, "INSERT INTO w3 VALUES (1), (2)").unwrap();
-        let lines = plan_lines(
-            &mut eng,
-            "EXPLAIN (COSTS OFF) SELECT * FROM w1, w2, w3",
-        );
+        let lines = plan_lines(&mut eng, "EXPLAIN (COSTS OFF) SELECT * FROM w1, w2, w3");
         // All three tables are the same size with no quals: every
         // order ties, so the written left-deep order stands (the
         // Materialize nodes are the pre-existing `pg_maybe_materialize`
@@ -76025,8 +76980,7 @@ mod v165_cross_join_reorder_tests {
         };
         assert_eq!(out.len(), 2);
         for row in &out {
-            let vals: Vec<String> =
-                row.iter().map(|v| v.to_text().unwrap()).collect();
+            let vals: Vec<String> = row.iter().map(|v| v.to_text().unwrap()).collect();
             assert_eq!(vals, vec!["1", "9", "9", "9"]);
         }
     }
@@ -76096,14 +77050,22 @@ mod v166_nway_cross_join_reorder_tests {
     fn setup_4way(eng: &mut Engine) {
         for t in ["f1", "f2", "f3", "f4"] {
             run(&mut *eng, &format!("CREATE TABLE {t} (a int)")).unwrap();
-            run(&mut *eng, &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)")).unwrap();
+            run(
+                &mut *eng,
+                &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)"),
+            )
+            .unwrap();
         }
     }
 
     fn setup_5way(eng: &mut Engine) {
         for t in ["g1", "g2", "g3", "g4", "g5"] {
             run(&mut *eng, &format!("CREATE TABLE {t} (a int)")).unwrap();
-            run(&mut *eng, &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)")).unwrap();
+            run(
+                &mut *eng,
+                &format!("INSERT INTO {t} VALUES (1),(2),(3),(4)"),
+            )
+            .unwrap();
         }
     }
 
@@ -76220,7 +77182,11 @@ mod v166_nway_cross_join_reorder_tests {
     #[test]
     fn v172_3way_ec_join_filter_canonical() {
         let mut eng = engine();
-        run(&mut eng, "CREATE TABLE sj (a int unique, b int, c int unique)").unwrap();
+        run(
+            &mut eng,
+            "CREATE TABLE sj (a int unique, b int, c int unique)",
+        )
+        .unwrap();
         run(
             &mut eng,
             "INSERT INTO sj VALUES (1, null, 2), (null, 2, null), (2, 1, 1)",
@@ -76276,10 +77242,7 @@ mod v166_nway_cross_join_reorder_tests {
             "EXPLAIN (COSTS OFF) SELECT * FROM h1, h2, h3, h4, h5, h6, h7, h8, h9",
         );
         // Written left-deep order, h1..h9 — the DP did not fire.
-        let scans: Vec<&String> = lines
-            .iter()
-            .filter(|l| l.contains("Seq Scan on"))
-            .collect();
+        let scans: Vec<&String> = lines.iter().filter(|l| l.contains("Seq Scan on")).collect();
         assert_eq!(scans.len(), 9, "nine scans expected, got: {lines:?}");
         for (i, s) in scans.iter().enumerate() {
             assert!(s.ends_with(&format!("Seq Scan on h{}", i + 1)), "got: {s}");
@@ -76298,8 +77261,11 @@ mod v166_nway_cross_join_reorder_tests {
     fn v166_reorder_result_identity() {
         let mut eng = engine();
         setup_4way(&mut eng);
-        match run(&mut eng, "SELECT count(*) FROM f1, f2, f3, f4 WHERE f1.a = 1")
-            .expect("runs")
+        match run(
+            &mut eng,
+            "SELECT count(*) FROM f1, f2, f3, f4 WHERE f1.a = 1",
+        )
+        .expect("runs")
         {
             ExecResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1);
@@ -76309,8 +77275,11 @@ mod v166_nway_cross_join_reorder_tests {
         }
         let mut eng = engine();
         setup_5way(&mut eng);
-        match run(&mut eng, "SELECT count(*) FROM g1, g2, g3, g4, g5 WHERE g3.a = 2")
-            .expect("runs")
+        match run(
+            &mut eng,
+            "SELECT count(*) FROM g1, g2, g3, g4, g5 WHERE g3.a = 2",
+        )
+        .expect("runs")
         {
             ExecResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1);
@@ -76659,7 +77628,6 @@ mod v163_nestloop_side_selection_tests {
     }
 }
 
-
 // ============================================================================
 // v1.64: cost-based hash-vs-nestloop choice (PG19 `cost_hashjoin` vs
 // `cost_nestloop` parity) + Hash Join EXPLAIN rendering + USING quals.
@@ -76760,7 +77728,10 @@ mod v164_hashjoin_choice_tests {
         // loop would: NULL keys never match, duplicate keys fan out.
         let mut eng = engine();
         setup_hash(&mut eng);
-        let hash_rows = query_sorted(&mut eng, "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2");
+        let hash_rows = query_sorted(
+            &mut eng,
+            "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2",
+        );
         // Expected by hand: (1,a)x(1,q); (2,b)x(2,x),(2,y); (2,b2)x(2,x),(2,y).
         // NULLs never match; 3 and 4 have no partner.
         assert_eq!(
@@ -76775,8 +77746,14 @@ mod v164_hashjoin_choice_tests {
         // USING is an inner equi-join; result identity vs the ON form.
         let mut eng = engine();
         setup_hash(&mut eng);
-        let using_rows = query_sorted(&mut eng, "SELECT v, w FROM h1 JOIN h2 USING (id) ORDER BY 1, 2");
-        let on_rows = query_sorted(&mut eng, "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2");
+        let using_rows = query_sorted(
+            &mut eng,
+            "SELECT v, w FROM h1 JOIN h2 USING (id) ORDER BY 1, 2",
+        );
+        let on_rows = query_sorted(
+            &mut eng,
+            "SELECT h1.v, h2.w FROM h1 JOIN h2 ON h1.id = h2.id ORDER BY 1, 2",
+        );
         assert_eq!(using_rows, on_rows, "USING must match ON results");
     }
 
@@ -76794,7 +77771,9 @@ mod v164_hashjoin_choice_tests {
             "large join must use Hash Join, got: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
+            lines
+                .iter()
+                .any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
             "Hash Cond must be outer-first, got: {lines:?}"
         );
         assert!(
@@ -76836,7 +77815,9 @@ mod v164_hashjoin_choice_tests {
             "large USING join must use Hash Join, got: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
+            lines
+                .iter()
+                .any(|l| l.trim() == "Hash Cond: (big1.id = big2.id)"),
             "USING Hash Cond must be outer-first, got: {lines:?}"
         );
     }
@@ -76876,7 +77857,6 @@ mod v164_hashjoin_choice_tests {
         assert_eq!(PG_HASHJOIN_MIN_INNER_ROWS, 10.0);
     }
 }
-
 
 // ============================================================================
 // v1.62: tiny-table SeqScan choice (PG19 cost-model parity).
@@ -77355,9 +78335,21 @@ mod v169_merge_anti_join_tests {
 
     fn setup(eng: &mut Engine) {
         run(eng, "CREATE TABLE null_tab (id int, val int)").unwrap();
-        run(eng, "CREATE TABLE not_null_tab (id int NOT NULL, val int NOT NULL)").unwrap();
-        run(eng, "INSERT INTO null_tab VALUES (1, 10), (2, 20), (NULL, 30)").unwrap();
-        run(eng, "INSERT INTO not_null_tab VALUES (1, 100), (2, 200), (3, 300)").unwrap();
+        run(
+            eng,
+            "CREATE TABLE not_null_tab (id int NOT NULL, val int NOT NULL)",
+        )
+        .unwrap();
+        run(
+            eng,
+            "INSERT INTO null_tab VALUES (1, 10), (2, 20), (NULL, 30)",
+        )
+        .unwrap();
+        run(
+            eng,
+            "INSERT INTO not_null_tab VALUES (1, 100), (2, 200), (3, 300)",
+        )
+        .unwrap();
     }
 
     #[test]

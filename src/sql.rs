@@ -132,7 +132,7 @@ enum Token {
     // String is the raw digit content (validated by the parser with
     // `bit_in` semantics, not the lexer).
     BitStr(char, String),
-    Param(u32),     // $N parameter placeholder, 1-based
+    Param(u32), // $N parameter placeholder, 1-based
     LParen,
     RParen,
     LBracket, // v0.79: `[` array constructor / subscript / type suffix
@@ -6176,13 +6176,9 @@ impl Parser {
                             // a quoted "TEXT" is still rejected.
                             opts.serialize = match opt_val.as_deref() {
                                 None => ExplainSerialize::Text,
-                                Some(v) if v == "off" || v == "none" => {
-                                    ExplainSerialize::None
-                                }
+                                Some(v) if v == "off" || v == "none" => ExplainSerialize::None,
                                 Some(v) if v == "text" => ExplainSerialize::Text,
-                                Some(v) if v == "binary" => {
-                                    ExplainSerialize::Binary
-                                }
+                                Some(v) if v == "binary" => ExplainSerialize::Binary,
                                 Some(v) => {
                                     return Err(err_invalid_param(format!(
                                         "unrecognized value for EXPLAIN option \"serialize\": \"{v}\""
@@ -6212,9 +6208,7 @@ impl Parser {
                             };
                         } else {
                             // v1.08: PG19 rejects unknown EXPLAIN options with 42601.
-                            return Err(err(format!(
-                                "unrecognized EXPLAIN option \"{opt_name}\""
-                            )));
+                            return Err(err(format!("unrecognized EXPLAIN option \"{opt_name}\"")));
                         }
                         match self.next() {
                             Token::Comma => continue,
@@ -11397,8 +11391,7 @@ impl Parser {
                 self.expect_keyword("where")?;
                 let _ = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
-                let followed_by_over =
-                    matches!(self.peek(), Token::Ident(s) if s == "over");
+                let followed_by_over = matches!(self.peek(), Token::Ident(s) if s == "over");
                 let is_window_fn = matches!(
                     name.as_str(),
                     "row_number"
@@ -13632,78 +13625,78 @@ impl Parser {
                     extra += 1;
                 }
                 let mut item = if matches!(self.peek(), Token::Ident(s) if s == "values") {
-                self.next();
-                let rows = self.parse_values_rows()?;
-                FromItem::Values {
-                    rows,
-                    alias: String::new(),
-                    col_aliases: Vec::new(),
-                    lateral,
-                }
-            } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
-                // v0.76: `(WITH ... SELECT ...)` derived tables are now
-                // supported (PG19). Parse via parse_select_query_not_consumed
-                // which handles the leading WITH.
-                let sub = self.parse_select_query_not_consumed()?;
-                FromItem::Derived {
-                    sub: Box::new(sub),
-                    alias: String::new(),
-                    col_aliases: Vec::new(),
-                    lateral,
-                }
-            } else {
-                // v0.23: parenthesized joined table (or bare table):
-                // `(a JOIN b ...)`, `(tbl)`.
-                self.parse_join_chain()?
-            };
-            // v0.75: `((query) [AS] alias [JOIN ...])` — a parenthesized
-            // derived table that is the left operand of a join, e.g.
-            // `((select ...) s LEFT JOIN t ...)`. If we consumed extra '('
-            // and the derived table's ')' is not followed by another ')',
-            // the extra '(' was the derived table's own paren, not a
-            // redundant one. (`inner_aliased` is declared above so the
-            // v1.27 setop branch shares the alias code below.)
-            if extra > 0 && matches!(item, FromItem::Derived { .. } | FromItem::Values { .. }) {
-                // Consume the derived table's ')'.
-                self.expect(Token::RParen, "')'")?;
-                extra -= 1;
-                if *self.peek() != Token::RParen {
-                    // An alias follows: `((query) alias ...)`.
-                    let inner_alias = self.parse_alias_opt()?.unwrap_or_default();
-                    let inner_cols = self.parse_col_alias_list()?;
-                    match &mut item {
-                        FromItem::Values {
-                            alias: a,
-                            col_aliases: c,
-                            ..
-                        } => {
-                            *a = inner_alias;
-                            *c = inner_cols;
-                        }
-                        FromItem::Derived {
-                            alias: a,
-                            col_aliases: c,
-                            ..
-                        } => {
-                            *a = inner_alias;
-                            *c = inner_cols;
-                        }
-                        _ => {}
+                    self.next();
+                    let rows = self.parse_values_rows()?;
+                    FromItem::Values {
+                        rows,
+                        alias: String::new(),
+                        col_aliases: Vec::new(),
+                        lateral,
                     }
-                    inner_aliased = true;
-                    // A join may follow the aliased derived table.
-                    item = self.parse_join_rest(item)?;
+                } else if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with") {
+                    // v0.76: `(WITH ... SELECT ...)` derived tables are now
+                    // supported (PG19). Parse via parse_select_query_not_consumed
+                    // which handles the leading WITH.
+                    let sub = self.parse_select_query_not_consumed()?;
+                    FromItem::Derived {
+                        sub: Box::new(sub),
+                        alias: String::new(),
+                        col_aliases: Vec::new(),
+                        lateral,
+                    }
+                } else {
+                    // v0.23: parenthesized joined table (or bare table):
+                    // `(a JOIN b ...)`, `(tbl)`.
+                    self.parse_join_chain()?
+                };
+                // v0.75: `((query) [AS] alias [JOIN ...])` — a parenthesized
+                // derived table that is the left operand of a join, e.g.
+                // `((select ...) s LEFT JOIN t ...)`. If we consumed extra '('
+                // and the derived table's ')' is not followed by another ')',
+                // the extra '(' was the derived table's own paren, not a
+                // redundant one. (`inner_aliased` is declared above so the
+                // v1.27 setop branch shares the alias code below.)
+                if extra > 0 && matches!(item, FromItem::Derived { .. } | FromItem::Values { .. }) {
+                    // Consume the derived table's ')'.
+                    self.expect(Token::RParen, "')'")?;
+                    extra -= 1;
+                    if *self.peek() != Token::RParen {
+                        // An alias follows: `((query) alias ...)`.
+                        let inner_alias = self.parse_alias_opt()?.unwrap_or_default();
+                        let inner_cols = self.parse_col_alias_list()?;
+                        match &mut item {
+                            FromItem::Values {
+                                alias: a,
+                                col_aliases: c,
+                                ..
+                            } => {
+                                *a = inner_alias;
+                                *c = inner_cols;
+                            }
+                            FromItem::Derived {
+                                alias: a,
+                                col_aliases: c,
+                                ..
+                            } => {
+                                *a = inner_alias;
+                                *c = inner_cols;
+                            }
+                            _ => {}
+                        }
+                        inner_aliased = true;
+                        // A join may follow the aliased derived table.
+                        item = self.parse_join_rest(item)?;
+                    }
+                    // Else: redundant parens `((query))`; the outer alias is
+                    // parsed below.
                 }
-                // Else: redundant parens `((query))`; the outer alias is
-                // parsed below.
-            }
-            for _ in 0..=extra {
-                self.expect(Token::RParen, "')'")?;
-            }
+                for _ in 0..=extra {
+                    self.expect(Token::RParen, "')'")?;
+                }
                 item
             }; // end of the non-setop `else` branch; the v1.27 setop branch
-               // rejoins here with `item` already built and `inner_aliased`
-               // false.
+            // rejoins here with `item` already built and `inner_aliased`
+            // false.
             // The alias follows the closing parens: FROM ((SELECT 1 AS x)) ss.
             // v0.21: `AS t(x, y)` column aliases for VALUES/derived tables.
             // v0.23: `(a JOIN b ...) [AS] x [(cols)]` — the alias is
@@ -16804,7 +16797,11 @@ mod v145_explain_options_tests {
         ] {
             let err = parse_err(sql);
             assert_eq!(err.code, "22023", "{sql}");
-            assert_eq!(err.message, format!("EXPLAIN option {opt} requires ANALYZE"), "{sql}");
+            assert_eq!(
+                err.message,
+                format!("EXPLAIN option {opt} requires ANALYZE"),
+                "{sql}"
+            );
         }
         // False/off variants do NOT require ANALYZE.
         for sql in [
@@ -16819,7 +16816,8 @@ mod v145_explain_options_tests {
             explain_opts(sql);
         }
         // With ANALYZE, all are fine.
-        let (_, _, opts) = explain_opts("EXPLAIN (ANALYZE, WAL, TIMING, IO, SERIALIZE BINARY) SELECT 1");
+        let (_, _, opts) =
+            explain_opts("EXPLAIN (ANALYZE, WAL, TIMING, IO, SERIALIZE BINARY) SELECT 1");
         assert!(opts.wal && opts.timing && opts.io);
         assert_eq!(opts.serialize, ExplainSerialize::Binary);
     }
@@ -16904,7 +16902,8 @@ mod v145_explain_options_tests {
     fn duplicate_last_wins_new_options() {
         let (_, _, opts) = explain_opts("EXPLAIN (WAL, ANALYZE, WAL OFF) SELECT 1");
         assert!(!opts.wal);
-        let (_, _, opts) = explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE, SERIALIZE TEXT) SELECT 1");
+        let (_, _, opts) =
+            explain_opts("EXPLAIN (SERIALIZE NONE, ANALYZE, SERIALIZE TEXT) SELECT 1");
         assert_eq!(opts.serialize, ExplainSerialize::Text);
     }
 }

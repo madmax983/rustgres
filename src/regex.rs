@@ -113,10 +113,7 @@ thread_local! {
 }
 
 /// v0.24: compile with explicit flag options.
-pub fn compile_opts(
-    pattern: &str,
-    opts: RegexOptions,
-) -> Result<std::rc::Rc<Compiled>, String> {
+pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<std::rc::Rc<Compiled>, String> {
     let key = (
         pattern.to_string(),
         opts.case_insensitive,

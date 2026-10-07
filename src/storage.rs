@@ -933,7 +933,12 @@ impl Numeric {
                 mag = q;
                 scale -= 1;
             }
-            return (NumericSpecial::Finite as u8, neg, NumKeyMag::Small(mag), scale);
+            return (
+                NumericSpecial::Finite as u8,
+                neg,
+                NumKeyMag::Small(mag),
+                scale,
+            );
         }
         let mut mag = self.mag();
         while scale > 0 {
@@ -4522,7 +4527,7 @@ impl Value {
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
             Value::Bytea(_) => Cow::Borrowed("bytea"),
             Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
-            Value::Tid(_, _) => Cow::Borrowed("tid"), // v1.40
+            Value::Tid(_, _) => Cow::Borrowed("tid"),    // v1.40
             Value::Uuid(_) => Cow::Borrowed("uuid"),
             Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
             Value::Record(_) => Cow::Borrowed("record"), // v0.73
@@ -4552,7 +4557,7 @@ impl Value {
             Value::Timestamptz(_) => ColType::Timestamptz,
             Value::Bytea(_) => ColType::Bytea,
             Value::BitString(_) => ColType::Bit, // v1.39
-            Value::Tid(_, _) => ColType::Tid, // v1.40
+            Value::Tid(_, _) => ColType::Tid,    // v1.40
             Value::Uuid(_) => ColType::Uuid,
             Value::PgLsn(_) => ColType::PgLsn, // v0.64
             // v0.73: a whole-row value has composite (record) type.
