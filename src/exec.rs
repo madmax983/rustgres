@@ -16168,6 +16168,290 @@ fn collect_on_qual_counts(item: &FromItem, counts: &mut HashMap<String, usize>) 
     }
 }
 // ============================================================================
+// v1.77: shared self-join-elimination conjunct classifier (v1.73
+// top-level cross shape; v1.77 nested inner joins). Hoisted from
+// `remove_useless_self_joins_from` so both shapes share the proof.
+enum SjeClass<'x> {
+    /// `=` with refs on both sides, one side q1-only and the other q2-only.
+    Join { left: &'x Expr, right: &'x Expr },
+    /// `q2.col = <column-free expr>`.
+    Kept { col: String, conj: &'x Expr },
+    /// `q1.col = <column-free expr>`.
+    Removed { conj: &'x Expr },
+    /// Anything else: rewritten and kept, never used in the proof.
+    Other(&'x Expr),
+}
+
+/// v1.77: classify conjuncts for the SJE 1:1 proof. Every column
+/// reference must carry qualifier q1 (removed instance) or q2 (kept
+/// instance); unqualified or foreign references fail closed. Returns
+/// the classes in written order.
+fn sje_classify_conjuncts<'x>(
+    eng: &Engine,
+    conjuncts: Vec<&'x Expr>,
+    q1: &str,
+    q2: &str,
+) -> Option<Vec<SjeClass<'x>>> {
+    let mut classes: Vec<SjeClass> = Vec::new();
+    for c in conjuncts {
+        let mut refs: Vec<(Option<String>, String)> = Vec::new();
+        collect_col_refs(c, &mut refs);
+        if refs
+            .iter()
+            .any(|(t, _)| t.as_deref() != Some(q1) && t.as_deref() != Some(q2))
+        {
+            return None;
+        }
+        let usable = matches!(c, Expr::Cmp { op: CmpOp::Eq, .. })
+            && !expr_is_volatile(&eng.db, c)
+            && !expr_has_subquery(c);
+        if !usable {
+            classes.push(SjeClass::Other(c));
+            continue;
+        }
+        let Expr::Cmp { left, right, .. } = c else {
+            unreachable!("v1.77: guarded by matches! above")
+        };
+        let mut lrefs: Vec<(Option<String>, String)> = Vec::new();
+        let mut rrefs: Vec<(Option<String>, String)> = Vec::new();
+        collect_col_refs(left, &mut lrefs);
+        collect_col_refs(right, &mut rrefs);
+        let lq1 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q1));
+        let lq2 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q2));
+        let rq1 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q1));
+        let rq2 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q2));
+        // Cross-instance: one side q1-only, the other q2-only.
+        if (lq1 && !lq2 && rq2 && !rq1) || (lq2 && !lq1 && rq1 && !rq2) {
+            classes.push(SjeClass::Join { left, right });
+            continue;
+        }
+        // Single-side `plain_col = <column-free expr>` (kept or removed).
+        let mut done = false;
+        for (q, kept) in [(q1, false), (q2, true)] {
+            for (e_col, r_col, r_free) in [(&**left, &lrefs, &rrefs), (&**right, &rrefs, &lrefs)] {
+                let col_side_ok = !r_col.is_empty()
+                    && r_col.iter().all(|(t, _)| t.as_deref() == Some(q));
+                if !col_side_ok || !r_free.is_empty() {
+                    continue;
+                }
+                if let Expr::Column {
+                    table: Some(t),
+                    name,
+                } = e_col
+                {
+                    if t == q {
+                        if kept {
+                            classes.push(SjeClass::Kept {
+                                col: name.clone(),
+                                conj: c,
+                            });
+                        } else {
+                            classes.push(SjeClass::Removed { conj: c });
+                        }
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !done {
+            classes.push(SjeClass::Other(c));
+        }
+    }
+    Some(classes)
+}
+
+/// v1.77: the 1:1 uniqueness proof shared by v1.73/v1.77 (PG19
+/// `innerrel_is_unique_ext` / `relation_has_unique_index_for` /
+/// `match_unique_clauses`). Some unique key (PK / UNIQUE /
+/// planner-usable unique index) of `tname` must have every column
+/// constrained by a mergejoinable `=` whose kept-side operand is the
+/// plain column — either a join clause across the two instances, or a
+/// kept-side `col = <column-free expr>` restriction (PG19's
+/// uclauses/extra_clauses). Every uclause on a winning-key column
+/// needs a side-normalized identical counterpart among the removed
+/// instance's restrictions.
+fn sje_prove_unique(
+    eng: &Engine,
+    tname: &str,
+    classes: &[SjeClass],
+    q1: &str,
+    q2: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<()> {
+    let mut constrained: HashSet<String> = HashSet::new();
+    // Kept-side restrictions constraining plain columns = PG19's uclauses.
+    let mut uclauses: Vec<(String, &Expr)> = Vec::new();
+    for cl in classes {
+        match cl {
+            SjeClass::Join { left, right } => {
+                for side in [*left, *right] {
+                    if let Expr::Column {
+                        table: Some(t),
+                        name,
+                    } = side
+                    {
+                        if t == q2 {
+                            constrained.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            SjeClass::Kept { col, conj } => {
+                constrained.insert(col.clone());
+                uclauses.push((col.clone(), conj));
+            }
+            SjeClass::Other(_) | SjeClass::Removed { .. } => {}
+        }
+    }
+    if constrained.is_empty() {
+        return None;
+    }
+    // First covering unique key wins; PG19 commits to it without fallback.
+    let key_cols = sje_covering_unique_key(eng, tname, &constrained, snap, own, session)?;
+    // PG19 `match_unique_clauses`.
+    let removed_conjs: Vec<&Expr> = classes
+        .iter()
+        .filter_map(|cl| match cl {
+            SjeClass::Removed { conj } => Some(*conj),
+            _ => None,
+        })
+        .collect();
+    for (ucol, uconj) in &uclauses {
+        if !key_cols.iter().any(|k| k.eq_ignore_ascii_case(ucol)) {
+            continue;
+        }
+        let mut matched = false;
+        for rconj in &removed_conjs {
+            let rw = sje_rewrite_qual(rconj, q1, q2)?;
+            if sje_eq_equal(&rw, uconj) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// v1.77: rewritten survivors for an eliminated join's clauses (PG19
+/// `remove_self_join_rel` + `replace_relid_callback`). A rewritten
+/// clause that becomes `X = X` turns into `X IS NOT NULL`;
+/// synthesized NullTests render first (PG19's cost-based qual
+/// ordering puts the cheap NullTest first), then the rest in written
+/// order with structural and commuted duplicates dropped. Returns
+/// None when nothing survives (v1.73's commit gate).
+fn sje_survivor_exprs(classes: &[SjeClass], q1: &str, q2: &str) -> Option<Vec<Expr>> {
+    let mut notnulls: Vec<Expr> = Vec::new();
+    let mut rest: Vec<Expr> = Vec::new();
+    for cl in classes {
+        match cl {
+            SjeClass::Join { left, right } => {
+                let l2 = sje_rewrite_qual(left, q1, q2)?;
+                let r2 = sje_rewrite_qual(right, q1, q2)?;
+                if l2 == r2 {
+                    // PG19 `replace_relid_callback`: `X = X` -> `X IS NOT NULL`.
+                    let nn = Expr::IsNull {
+                        expr: Box::new(l2),
+                        neg: true,
+                    };
+                    if !notnulls.iter().any(|s| s == &nn) {
+                        notnulls.push(nn);
+                    }
+                } else {
+                    sje_push_dedup(&mut rest, sje_normalize_eq(l2, r2));
+                }
+            }
+            SjeClass::Kept { conj, .. }
+            | SjeClass::Removed { conj, .. }
+            | SjeClass::Other(conj) => {
+                let rw = sje_rewrite_qual(conj, q1, q2)?;
+                sje_push_dedup(&mut rest, sje_normalize_eq_expr(rw));
+            }
+        }
+    }
+    notnulls.extend(rest);
+    if notnulls.is_empty() {
+        return None;
+    }
+    Some(notnulls)
+}
+
+/// v1.77: rewrite the SELECT items for a self-join elimination (PG19
+/// `remove_self_join_rel` keeps both column sets, re-pointed at the
+/// kept instance). Bare `*` fails closed in the nested case (it spans
+/// tables beyond the pair); `q1.*`/`q2.*` expand to the kept
+/// instance's columns; anything else is qualifier-rewritten.
+fn sje_rewrite_items(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    tname: &str,
+    q1: &str,
+    q2: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    nested: bool,
+) -> Option<Vec<SelectItem>> {
+    let tcols: Vec<String> = eng
+        .db
+        .find_table(tname, snap, &[own], session)
+        .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default();
+    if tcols.is_empty() {
+        return None;
+    }
+    let mut new_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
+    for item in &stmt.items {
+        match item {
+            SelectItem::All if !nested => {
+                // PG19 keeps both column sets, re-pointed at the kept
+                // instance (oracle: `a | b | c | a | b | c`). Only
+                // sound when q1/q2 are the whole FROM (v1.73 shape).
+                for _ in 0..2 {
+                    for cn in &tcols {
+                        new_items.push(SelectItem::Expr {
+                            expr: Expr::Column {
+                                table: Some(q2.to_string()),
+                                name: cn.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            SelectItem::All => return None,
+            SelectItem::AllOf(q) if q == q1 || q == q2 => {
+                for cn in &tcols {
+                    new_items.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(q2.to_string()),
+                            name: cn.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            // A different table's `t.*` survives untouched (nested only;
+            // unreachable in the v1.73 shape, which fails closed anyway).
+            SelectItem::AllOf(_) if nested => new_items.push(item.clone()),
+            SelectItem::AllOf(_) => return None,
+            SelectItem::Expr { expr, alias } => new_items.push(SelectItem::Expr {
+                expr: sje_rewrite_qual(expr, q1, q2)?,
+                alias: alias.clone(),
+            }),
+        }
+    }
+    Some(new_items)
+}
+
 // v1.73: PG19's `remove_useless_self_joins`
 // (`src/backend/optimizer/plan/analyzejoins.c`) — self-join elimination
 // for plain-column unique keys.
@@ -16305,238 +16589,25 @@ fn remove_useless_self_joins_from(
     }
     let where_ = stmt.where_.as_ref()?;
 
-    // --- Classify WHERE conjuncts. ---
-    // Every column reference must carry qualifier q1 or q2; unqualified
-    // or foreign references fail closed.
-    enum SjeClass<'x> {
-        /// `=` with refs on both sides, one side q1-only and the other q2-only.
-        Join { left: &'x Expr, right: &'x Expr },
-        /// `q2.col = <column-free expr>`.
-        Kept { col: String, conj: &'x Expr },
-        /// `q1.col = <column-free expr>`.
-        Removed { conj: &'x Expr },
-        /// Anything else: rewritten and kept, never used in the proof.
-        Other(&'x Expr),
-    }
-    let mut classes: Vec<SjeClass> = Vec::new();
+    // --- Classify WHERE conjuncts (shared v1.77 helper). ---
     // `split_conjuncts` uses a stack and returns conjuncts in reverse
     // written order; reverse to restore it (PG's output follows written
     // order for equal-cost clauses).
     let conjuncts: Vec<&Expr> = split_conjuncts(where_).into_iter().rev().collect();
-    for c in conjuncts {
-        let mut refs: Vec<(Option<String>, String)> = Vec::new();
-        collect_col_refs(c, &mut refs);
-        if refs
-            .iter()
-            .any(|(t, _)| t.as_deref() != Some(q1.as_str()) && t.as_deref() != Some(q2.as_str()))
-        {
-            return None;
-        }
-        let usable = matches!(c, Expr::Cmp { op: CmpOp::Eq, .. })
-            && !expr_is_volatile(&eng.db, c)
-            && !expr_has_subquery(c);
-        if !usable {
-            classes.push(SjeClass::Other(c));
-            continue;
-        }
-        let Expr::Cmp { left, right, .. } = c else {
-            unreachable!("v1.73: guarded by matches! above")
-        };
-        let mut lrefs: Vec<(Option<String>, String)> = Vec::new();
-        let mut rrefs: Vec<(Option<String>, String)> = Vec::new();
-        collect_col_refs(left, &mut lrefs);
-        collect_col_refs(right, &mut rrefs);
-        let lq1 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q1.as_str()));
-        let lq2 = lrefs.iter().any(|(t, _)| t.as_deref() == Some(q2.as_str()));
-        let rq1 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q1.as_str()));
-        let rq2 = rrefs.iter().any(|(t, _)| t.as_deref() == Some(q2.as_str()));
-        // Cross-instance: one side q1-only, the other q2-only.
-        if (lq1 && !lq2 && rq2 && !rq1) || (lq2 && !lq1 && rq1 && !rq2) {
-            classes.push(SjeClass::Join { left, right });
-            continue;
-        }
-        // Single-side `plain_col = <column-free expr>` (kept or removed).
-        let mut done = false;
-        for (q, kept) in [(&q1, false), (&q2, true)] {
-            for (e_col, r_col, r_free) in [(&**left, &lrefs, &rrefs), (&**right, &rrefs, &lrefs)] {
-                let col_side_ok = !r_col.is_empty()
-                    && r_col.iter().all(|(t, _)| t.as_deref() == Some(q.as_str()));
-                if !col_side_ok || !r_free.is_empty() {
-                    continue;
-                }
-                if let Expr::Column {
-                    table: Some(t),
-                    name,
-                } = e_col
-                {
-                    if t == q {
-                        if kept {
-                            classes.push(SjeClass::Kept {
-                                col: name.clone(),
-                                conj: c,
-                            });
-                        } else {
-                            classes.push(SjeClass::Removed { conj: c });
-                        }
-                        done = true;
-                        break;
-                    }
-                }
-            }
-            if done {
-                break;
-            }
-        }
-        if !done {
-            classes.push(SjeClass::Other(c));
-        }
-    }
+    let classes = sje_classify_conjuncts(eng, conjuncts, &q1, &q2)?;
 
-    // --- Uniqueness proof (PG19 `relation_has_unique_index_for`). ---
-    let mut constrained: HashSet<String> = HashSet::new();
-    // Kept-side restrictions constraining plain columns = PG19's uclauses.
-    let mut uclauses: Vec<(String, &Expr)> = Vec::new();
-    for cl in &classes {
-        match cl {
-            SjeClass::Join { left, right } => {
-                for side in [*left, *right] {
-                    if let Expr::Column {
-                        table: Some(t),
-                        name,
-                    } = side
-                    {
-                        if t == &q2 {
-                            constrained.insert(name.clone());
-                        }
-                    }
-                }
-            }
-            SjeClass::Kept { col, conj } => {
-                constrained.insert(col.clone());
-                uclauses.push((col.clone(), conj));
-            }
-            SjeClass::Other(_) | SjeClass::Removed { .. } => {}
-        }
-    }
-    if constrained.is_empty() {
-        return None;
-    }
-    // First covering unique key wins; PG19 commits to it without fallback.
-    let key_cols = sje_covering_unique_key(eng, &tname, &constrained, snap, own, session)?;
-    // PG19 `match_unique_clauses`: every uclause on a winning-key column
-    // needs a side-normalized identical counterpart among the removed
-    // instance's restrictions.
-    let removed_conjs: Vec<&Expr> = classes
-        .iter()
-        .filter_map(|cl| match cl {
-            SjeClass::Removed { conj } => Some(*conj),
-            _ => None,
-        })
-        .collect();
-    for (ucol, uconj) in &uclauses {
-        if !key_cols.iter().any(|k| k.eq_ignore_ascii_case(ucol)) {
-            continue;
-        }
-        let mut matched = false;
-        for rconj in &removed_conjs {
-            let rw = sje_rewrite_qual(rconj, &q1, &q2)?;
-            if sje_eq_equal(&rw, uconj) {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            return None;
-        }
-    }
+    // --- Uniqueness proof (shared v1.77 helper). ---
+    sje_prove_unique(eng, &tname, &classes, &q1, &q2, snap, own, session)?;
 
     // --- Rewrite (PG19 `remove_self_join_rel`). ---
-    // Expand `*` first: PG19 keeps both column sets, re-pointed at the
-    // kept instance (oracle: `a | b | c | a | b | c`).
-    let tcols: Vec<String> = eng
-        .db
-        .find_table(&tname, snap, &[own], session)
-        .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
-        .unwrap_or_default();
-    if tcols.is_empty() {
-        return None;
-    }
-    let mut new_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
-    for item in &stmt.items {
-        match item {
-            SelectItem::All => {
-                // PG19 keeps both column sets, re-pointed at the kept
-                // instance (oracle: `a | b | c | a | b | c`).
-                for _ in 0..2 {
-                    for cn in &tcols {
-                        new_items.push(SelectItem::Expr {
-                            expr: Expr::Column {
-                                table: Some(q2.clone()),
-                                name: cn.clone(),
-                            },
-                            alias: None,
-                        });
-                    }
-                }
-            }
-            SelectItem::AllOf(q) if q == &q1 || q == &q2 => {
-                for cn in &tcols {
-                    new_items.push(SelectItem::Expr {
-                        expr: Expr::Column {
-                            table: Some(q2.clone()),
-                            name: cn.clone(),
-                        },
-                        alias: None,
-                    });
-                }
-            }
-            SelectItem::Expr { expr, alias } => new_items.push(SelectItem::Expr {
-                expr: sje_rewrite_qual(expr, &q1, &q2)?,
-                alias: alias.clone(),
-            }),
-            // Unreachable (only q1/q2 exist), but fail closed anyway.
-            SelectItem::AllOf(_) => return None,
-        }
-    }
-
+    let new_items = sje_rewrite_items(eng, stmt, &tname, &q1, &q2, snap, own, session, false)?;
     // New WHERE: synthesized IS NOT NULLs first (PG19's cost-based qual
     // ordering puts the cheap NullTest first), then the rest in original
     // relative order. `col = <column-free>` equalities normalize to
     // column-left (observed PG19 output); structural and commuted
-    // duplicates are dropped.
-    let mut notnulls: Vec<Expr> = Vec::new();
-    let mut rest: Vec<Expr> = Vec::new();
-    for cl in &classes {
-        match cl {
-            SjeClass::Join { left, right } => {
-                let l2 = sje_rewrite_qual(left, &q1, &q2)?;
-                let r2 = sje_rewrite_qual(right, &q1, &q2)?;
-                if l2 == r2 {
-                    // PG19 `replace_relid_callback`: `X = X` -> `X IS NOT NULL`.
-                    let nn = Expr::IsNull {
-                        expr: Box::new(l2),
-                        neg: true,
-                    };
-                    if !notnulls.iter().any(|s| s == &nn) {
-                        notnulls.push(nn);
-                    }
-                } else {
-                    sje_push_dedup(&mut rest, sje_normalize_eq(l2, r2));
-                }
-            }
-            SjeClass::Kept { conj, .. }
-            | SjeClass::Removed { conj, .. }
-            | SjeClass::Other(conj) => {
-                let rw = sje_rewrite_qual(conj, &q1, &q2)?;
-                sje_push_dedup(&mut rest, sje_normalize_eq_expr(rw));
-            }
-        }
-    }
-    notnulls.extend(rest);
-    if notnulls.is_empty() {
-        return None;
-    }
-    let mut it = notnulls.into_iter();
+    // duplicates are dropped (shared v1.77 helper).
+    let survivors = sje_survivor_exprs(&classes, &q1, &q2)?;
+    let mut it = survivors.into_iter();
     let first = it.next().unwrap();
     let new_where = Some(it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b))));
 
@@ -16577,6 +16648,327 @@ fn remove_useless_self_joins_from(
         return None;
     }
     Some(new_stmt)
+}
+
+// v1.77: PG19 `remove_useless_self_joins` for nested inner joins
+// (analyzejoins.c `remove_self_joins_recurse` descending into
+// sub-joinlists). v1.73 handled only the top-level 2-table cross
+// shape; this applies the same 1:1 proof to an inner `Join` node
+// nested anywhere in the FROM tree whose left/right are plain scans
+// of one table with distinct qualifiers, with the proof clauses in
+// the node's ON clause (PG19 `generate_join_implied_equalities`
+// over the pair's joinrelids).
+//
+// Grounded in PG19 source (postgresql-19beta3):
+// - `pull_up_simple_subquery` (prep/prepjointree.c) pulls the
+//   non-lateral simple subquery up despite the FULL JOIN above (only
+//   lateral refs are blocked by an enclosing outer join), so the
+//   target's FROM is flat: emp1, t1, t2, t3.
+// - `remove_self_joins_recurse` (plan/analyzejoins.c) descends into
+//   sub-joinlists; for the group {t1,t2,t3} (same relid) the pair
+//   (t2,t3) yields `t2.id=t3.id` from
+//   `generate_join_implied_equalities`, `split_selfjoin_quals`
+//   classifies it as a self-join qual, and `innerrel_is_unique_ext`
+//   proves t2 unique via the PK on id. The jinfo_check passes: both
+//   are on the same side of the FULL JOIN. t2 (lower relid) is
+//   removed, t3 kept; `replace_relid_callback` turns the rewritten
+//   `t3.id=t3.id` into `t3.id IS NOT NULL`, re-attached to the kept
+//   rel's baserestrictinfo.
+// - `make_one_row_result` (plan/createplan.c) sets the dummy Result's
+//   relids to the final join rel {emp1,t1,t3}, RESULT_TYPE_JOIN.
+// - `show_result_replacement_info` (commands/explain.c) iterates
+//   relids ascending, skips RTE_JOIN entries, names from
+//   rtable_names — the oracle's `Replaces: Join on emp1, t1, t3`.
+//
+// Fail-closed: only INNER join nodes (a pair is always on one side of
+// any enclosing outer join, matching PG19's jinfo_check); the node's
+// ON must be Some (PG19's no-qual degenerate case needs
+// baserestrictinfo matching, not implemented); USING/NATURAL and
+// join aliases fail closed; the v1.73 statement gates apply
+// unchanged. One pair per milestone (first in tree order).
+fn remove_useless_self_joins_nested_from(
+    eng: &Engine,
+    from: &[FromItem],
+    stmt: &SelectStmt,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<SelectStmt> {
+    // --- Statement gates (same as v1.73). ---
+    if !stmt.with.is_empty()
+        || stmt.set_op.is_some()
+        || stmt.for_update
+        || !stmt.for_update_of.is_empty()
+    {
+        return None;
+    }
+    if sje_stmt_has_subquery(stmt) {
+        return None;
+    }
+    // Find the first removable pair in tree order.
+    let mut target: Option<(String, String, String, Expr)> = None;
+    for item in from {
+        if let Some(t) = sje_nested_find(item) {
+            target = Some(t);
+            break;
+        }
+    }
+    let (tname, q1, q2, on) = target?;
+    // Proof over the node's ON conjuncts (PG19's joinrelid quals for
+    // the pair).
+    // `split_conjuncts` returns conjuncts in reverse written order;
+    // restore it.
+    let conjuncts: Vec<&Expr> = split_conjuncts(&on).into_iter().rev().collect();
+    let classes = sje_classify_conjuncts(eng, conjuncts, &q1, &q2)?;
+    sje_prove_unique(eng, &tname, &classes, &q1, &q2, snap, own, session)?;
+    let survivors = sje_survivor_exprs(&classes, &q1, &q2)?;
+    // v1.77: PG19's `match_unique_clauses` gate — if the WHERE clause
+    // references the removed qualifier, fail closed. Rewriting WHERE
+    // quals (q1→q2) is only sound when the kept instance carries the
+    // same baserestrictinfo; the conservative fail-closed is to not
+    // eliminate at all. (The target's WHERE is const-false, unaffected.)
+    if let Some(w) = &stmt.where_ {
+        if sje_expr_refs_qual(w, &q1) {
+            return None;
+        }
+    }
+    // Surgery: replace the pair's Join node with the kept Table, and
+    // rewrite q1→q2 qualifiers in every surviving ON clause.
+    let mut done = false;
+    let mut new_from: Vec<FromItem> = Vec::with_capacity(from.len());
+    for item in from {
+        new_from.push(sje_nested_surgery(
+            item, &tname, &q1, &q2, &on, &mut done,
+        ));
+    }
+    if !done {
+        return None;
+    }
+    // Verify the removed table is truly gone from the FROM tree.
+    if sje_from_refs_qual(&new_from, &q1) {
+        return None;
+    }
+    let mut new_stmt = stmt.clone();
+    new_stmt.items = sje_rewrite_items(eng, stmt, &tname, &q1, &q2, snap, own, session, true)?;
+    new_stmt.from = new_from;
+    // New WHERE: the existing WHERE (qualifier-rewritten) AND the
+    // surviving ON-clause quals. PG19 attaches these to the kept
+    // rel's baserestrictinfo, which rustgres's WHERE distribution
+    // models as scan Filters.
+    let mut surv_it = survivors.into_iter();
+    let first = surv_it.next().unwrap();
+    let surv_expr = surv_it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b)));
+    new_stmt.where_ = Some(match &stmt.where_ {
+        Some(w) => Expr::And(
+            Box::new(sje_rewrite_qual(w, &q1, &q2)?),
+            Box::new(surv_expr),
+        ),
+        None => surv_expr,
+    });
+    // Rewrite remaining Expr positions.
+    let rw_vec = |v: &[Expr]| -> Option<Vec<Expr>> {
+        v.iter().map(|e| sje_rewrite_qual(e, &q1, &q2)).collect()
+    };
+    new_stmt.distinct_on = rw_vec(&stmt.distinct_on)?;
+    new_stmt.group_by = stmt
+        .group_by
+        .iter()
+        .map(|set| rw_vec(set))
+        .collect::<Option<Vec<_>>>()?;
+    new_stmt.having = match &stmt.having {
+        Some(h) => Some(sje_rewrite_qual(h, &q1, &q2)?),
+        None => None,
+    };
+    new_stmt.order_by = stmt
+        .order_by
+        .iter()
+        .map(|t| {
+            Some(OrderTerm {
+                expr: sje_rewrite_qual(&t.expr, &q1, &q2)?,
+                desc: t.desc,
+                nulls_first: t.nulls_first,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // --- Post-rewrite verification: no reference to the removed
+    // qualifier may survive anywhere. ---
+    if sje_stmt_refs_qual(&new_stmt, &q1) {
+        return None;
+    }
+    Some(new_stmt)
+}
+
+/// v1.77: find the first inner Join node in tree order whose left and
+/// right are plain scans of one table with distinct qualifiers.
+/// Returns (table, q_remove, q_keep, on_expr). The search descends
+/// through joins of any kind (a pair inside one subtree is always on
+/// one side of every enclosing outer join, matching PG19's
+/// jinfo_check); only INNER nodes are candidates.
+fn sje_nested_find(item: &FromItem) -> Option<(String, String, String, Expr)> {
+    if let FromItem::Join {
+        left,
+        kind: JoinKind::Inner,
+        right,
+        on: Some(o),
+        using,
+        natural,
+        using_alias,
+        alias,
+        col_aliases,
+    } = item
+    {
+        if using.is_empty()
+            && !*natural
+            && using_alias.is_none()
+            && alias.is_none()
+            && col_aliases.is_empty()
+        {
+            if let (
+                FromItem::Table {
+                    name: n1, alias: a1, ..
+                },
+                FromItem::Table {
+                    name: n2, alias: a2, ..
+                },
+            ) = (&**left, &**right)
+            {
+                if n1 == n2 {
+                    let q1 = a1.clone().unwrap_or_else(|| n1.clone());
+                    let q2 = a2.clone().unwrap_or_else(|| n2.clone());
+                    if q1 != q2 {
+                        return Some((n1.clone(), q1, q2, o.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if let FromItem::Join { left, right, .. } = item {
+        if let Some(t) = sje_nested_find(left) {
+            return Some(t);
+        }
+        if let Some(t) = sje_nested_find(right) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// v1.77: tree surgery for a proven nested pair. The first inner Join
+/// node structurally matching (tname, q1, q2, on) is replaced by its
+/// kept (right) Table child; every other Join node's ON clause gets
+/// q1→q2 qualifier rewriting (PG19 `remove_self_join_rel`
+/// re-pointing the surviving rel's quals).
+fn sje_nested_surgery(
+    item: &FromItem,
+    tname: &str,
+    q1: &str,
+    q2: &str,
+    on: &Expr,
+    done: &mut bool,
+) -> FromItem {
+    if !*done {
+        if let FromItem::Join {
+            left,
+            kind: JoinKind::Inner,
+            right,
+            on: jon,
+            using,
+            natural,
+            using_alias,
+            alias,
+            col_aliases,
+        } = item
+        {
+            if using.is_empty()
+                && !*natural
+                && using_alias.is_none()
+                && alias.is_none()
+                && col_aliases.is_empty()
+            {
+                if let (
+                    FromItem::Table {
+                        name: n1, alias: a1, ..
+                    },
+                    FromItem::Table {
+                        name: n2, alias: a2, ..
+                    },
+                ) = (&**left, &**right)
+                {
+                    let qq1 = a1.clone().unwrap_or_else(|| n1.clone());
+                    let qq2 = a2.clone().unwrap_or_else(|| n2.clone());
+                    if n1 == tname && n2 == tname && qq1 == q1 && qq2 == q2 {
+                        if let Some(o) = jon {
+                            if o == on {
+                                *done = true;
+                                return (**right).clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match item {
+        FromItem::Join {
+            left,
+            kind,
+            right,
+            on: jon,
+            using,
+            natural,
+            using_alias,
+            alias,
+            col_aliases,
+        } => {
+            let nl = Box::new(sje_nested_surgery(left, tname, q1, q2, on, done));
+            let nr = Box::new(sje_nested_surgery(right, tname, q1, q2, on, done));
+            let non = match jon {
+                Some(e) => Some(sje_rewrite_qual(e, q1, q2).unwrap_or_else(|| e.clone())),
+                None => None,
+            };
+            FromItem::Join {
+                left: nl,
+                kind: *kind,
+                right: nr,
+                on: non,
+                using: using.clone(),
+                natural: *natural,
+                using_alias: using_alias.clone(),
+                alias: alias.clone(),
+                col_aliases: col_aliases.clone(),
+            }
+        }
+        _ => item.clone(),
+    }
+}
+
+/// v1.77: does any Table item in the FROM tree still carry qualifier
+/// `q`, or does any Join ON clause still reference it?
+fn sje_from_refs_qual(from: &[FromItem], q: &str) -> bool {
+    for item in from {
+        match item {
+            FromItem::Table { name, alias, .. } => {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                if qual == q {
+                    return true;
+                }
+            }
+            FromItem::Join { left, right, on, .. } => {
+                if let Some(e) = on {
+                    if sje_expr_refs_qual(e, q) {
+                        return true;
+                    }
+                }
+                if sje_from_refs_qual(std::slice::from_ref(left), q)
+                    || sje_from_refs_qual(std::slice::from_ref(right), q)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// v1.73: does any expression in the statement contain a subquery?
@@ -18722,16 +19114,20 @@ fn pg_fold_bool_const(e: &Expr, fc: &mut PgConstFold) -> Option<Option<bool>> {
             None => None,
         },
         Expr::And(l, r) => match (pg_fold_bool_const(l, fc), pg_fold_bool_const(r, fc)) {
+            // v1.77: PG19 `eval_const_expressions` simplifies `FALSE AND x`
+            // to FALSE without needing x to fold (likewise `TRUE OR x` to
+            // TRUE). Sound: FALSE AND anything is FALSE in three-valued
+            // logic.
+            (Some(Some(false)), _) | (_, Some(Some(false))) => Some(Some(false)),
             (Some(a), Some(b)) => Some(match (a, b) {
-                (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             }),
             _ => None,
         },
         Expr::Or(l, r) => match (pg_fold_bool_const(l, fc), pg_fold_bool_const(r, fc)) {
+            (Some(Some(true)), _) | (_, Some(Some(true))) => Some(Some(true)),
             (Some(a), Some(b)) => Some(match (a, b) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
             }),
@@ -20713,15 +21109,22 @@ fn plan_select(
     // v1.73: PG19 `remove_useless_self_joins` (analyzejoins.c) — self-join
     // elimination for plain-column unique keys. Runs after
     // `remove_useless_joins_from`, mirroring PG19 planmain.c order.
+    // v1.77: the nested-inner-join extension runs when the top-level
+    // shape does not apply (disjoint shapes; one pair per milestone).
     let stmt_owned_sje;
-    let stmt: &SelectStmt =
-        match remove_useless_self_joins_from(eng, &stmt.from, stmt, snap, own, session) {
+    let stmt: &SelectStmt = match remove_useless_self_joins_from(eng, &stmt.from, stmt, snap, own, session) {
+        Some(rewritten) => {
+            stmt_owned_sje = rewritten;
+            &stmt_owned_sje
+        }
+        None => match remove_useless_self_joins_nested_from(eng, &stmt.from, stmt, snap, own, session) {
             Some(rewritten) => {
                 stmt_owned_sje = rewritten;
                 &stmt_owned_sje
             }
             None => stmt,
-        };
+        },
+    };
     // v1.08: PG-text name/type context for this query level, plus the
     // WHERE clause distributed over the FROM items (per-item slices and
     // the join-level remainder).
@@ -74945,9 +75348,11 @@ mod v149b_const_false_tests {
             pg_fold_bool_const(&parse_expr("1 = 0"), &mut PgConstFold::pure()),
             Some(Some(false))
         );
+        // v1.77: PG19 `eval_const_expressions` simplifies `FALSE AND x`
+        // to FALSE without needing x to fold (likewise `TRUE OR x`).
         assert_eq!(
             pg_fold_bool_const(&parse_expr("false AND a = 1"), &mut PgConstFold::pure()),
-            None
+            Some(Some(false))
         );
     }
 
@@ -78419,6 +78824,142 @@ mod v176_filter_order_tests {
             ),
             "Filter: (b AND (a = 1))"
         );
+    }
+}
+
+// ============================================================================
+// v1.77: nested inner-join self-join elimination (PG19
+// `remove_useless_self_joins` descending into sub-joinlists).
+// ============================================================================
+#[cfg(test)]
+mod v177_nested_sje_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_text(eng: &mut Engine, sql: &str) -> String {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn setup_emp(eng: &mut Engine) {
+        run(eng, "CREATE TABLE emp177 (id SERIAL PRIMARY KEY NOT NULL, code int)").unwrap();
+        run(eng, "INSERT INTO emp177 VALUES (1, 1), (2, 2)").unwrap();
+    }
+
+    fn parse_expr(sql: &str) -> Expr {
+        // Parse via a WHERE clause: `SELECT 1 WHERE <expr>`.
+        match parse_statement(&format!("SELECT 1 WHERE {sql}")).unwrap() {
+            crate::sql::Stmt::Select(s) => s.where_.unwrap(),
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn v177_nested_pair_removed_from_replaces() {
+        // join.out bug-#18187 shape: the (t2,t3) inner pair is proven
+        // 1:1 via the PK, t2 removed, Replaces drops it.
+        let mut eng = engine();
+        setup_emp(&mut eng);
+        let plan = plan_text(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT 1 FROM emp177 FULL JOIN \
+             (SELECT * FROM emp177 t1 JOIN emp177 t2 JOIN emp177 t3 \
+              ON t2.id = t3.id ON TRUE WHERE FALSE) s ON TRUE WHERE FALSE",
+        );
+        assert!(plan.contains("Replaces: Join on emp177, t1, t3"), "plan:\n{}", plan);
+        assert!(plan.contains("One-Time Filter: false"), "plan:\n{}", plan);
+    }
+
+    #[test]
+    fn v177_nested_pair_keeps_null_rejection() {
+        // The surviving `t3.id IS NOT NULL` lands as a scan Filter
+        // (PG19's baserestrictinfo placement via WHERE distribution).
+        let mut eng = engine();
+        setup_emp(&mut eng);
+        let plan = plan_text(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT t1.id, t3.id FROM emp177 t1 \
+             JOIN emp177 t2 JOIN emp177 t3 ON t2.id = t3.id ON TRUE",
+        );
+        assert!(!plan.contains("t2"), "t2 must be gone:\n{}", plan);
+        assert!(plan.contains("IS NOT NULL"), "plan:\n{}", plan);
+    }
+
+    #[test]
+    fn v177_nested_non_unique_pair_kept() {
+        // `code` is not unique: fail closed, all three scans survive.
+        let mut eng = engine();
+        setup_emp(&mut eng);
+        let plan = plan_text(
+            &mut eng,
+            "EXPLAIN (COSTS OFF) SELECT * FROM emp177 a \
+             JOIN emp177 b JOIN emp177 c ON b.code = c.code ON TRUE",
+        );
+        assert!(plan.contains("Seq Scan on emp177 b"), "plan:\n{}", plan);
+        assert!(plan.contains("Join Filter: (b.code = c.code)"), "plan:\n{}", plan);
+    }
+
+    #[test]
+    fn v177_nested_sje_preserves_rows() {
+        // Execution sees the rewritten statement: same rows as the
+        // unoptimized join.
+        let mut eng = engine();
+        setup_emp(&mut eng);
+        let n = match run(
+            &mut eng,
+            "SELECT t1.id, t3.id FROM emp177 t1 JOIN emp177 t2 \
+             JOIN emp177 t3 ON t2.id = t3.id ON TRUE",
+        )
+        .unwrap()
+        {
+            ExecResult::Select { rows, .. } => rows.len(),
+            other => panic!("expected Select, got {:?}", other),
+        };
+        assert_eq!(n, 4); // 2 t1 rows x 2 t3 rows, t2 provably 1:1
+    }
+
+    #[test]
+    fn v177_fold_false_and_nonconst() {
+        // PG19 `eval_const_expressions`: `FALSE AND x` folds to FALSE
+        // without needing x to fold.
+        let e = parse_expr("false AND (1 = 1)");
+        let mut fc = PgConstFold::pure();
+        assert_eq!(pg_fold_bool_const(&e, &mut fc), Some(Some(false)));
+        assert!(pg_is_const_false(&e, &mut fc));
+        let e2 = parse_expr("true OR (1 = 2)");
+        assert_eq!(pg_fold_bool_const(&e2, &mut PgConstFold::pure()), Some(Some(true)));
+        // `TRUE AND x` still needs x.
+        let e3 = parse_expr("true AND (1 = 1)");
+        assert_eq!(pg_fold_bool_const(&e3, &mut PgConstFold::pure()), Some(Some(true)));
     }
 }
 
