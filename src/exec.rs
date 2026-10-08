@@ -12135,6 +12135,66 @@ fn pg_conjuncts(e: &Expr) -> Vec<&Expr> {
     out
 }
 
+/// v1.76: is this scan-Filter conjunct EC-deferred by PG19?
+///
+/// PG19's `distribute_qual_to_rels` (initsplan.c) routes binary `=`
+/// quals through `process_equivalence` (equivclass.c), which absorbs them
+/// into EquivalenceClasses instead of appending them to baserestrictinfo;
+/// the originals are pushed back only later by
+/// `generate_base_implied_equalities_const` — after all non-`=` quals.
+/// Observable (11 live PG19-beta3 probes): non-`=` conjuncts render first
+/// in written order, then `=` conjuncts in written order.
+/// The predicate is just "binary `=` with syntactically different sides":
+/// volatile `=` and array `=` are deferred too (probed); `X = X` is
+/// excluded because PG rewrites it to `X IS NOT NULL` (not deferred).
+fn pg_filter_conjunct_ec_deferred(c: &Expr) -> bool {
+    match c {
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            left,
+            right,
+        } => left.as_ref() != right.as_ref(),
+        _ => false,
+    }
+}
+
+/// v1.76: PG19 scan-Filter qual ordering (EC deferral; EXPLAIN-deparse
+/// only, the executor's qual list is untouched).
+///
+/// Reorders the top-level AND conjuncts of a scan WHERE into PG19's
+/// render order: non-`=` conjuncts first (written order), then
+/// EC-deferred `=` conjuncts (written order). Returns the original tree
+/// unchanged unless the conjuncts are genuinely mixed (fail-closed:
+/// single-conjunct, all-`=` and no-`=` Filters render exactly as before).
+/// The re-fold is a manual left fold that preserves every conjunct
+/// verbatim (`pg_fold_and` would drop `Literal::Bool(true)` conjuncts,
+/// which PG renders, e.g. `(nt2.b1 AND true)`).
+/// `order_qual_clauses`' stable cost sort is deliberately not implemented:
+/// the only conjunct-order oracles in the corpus are the two v1.76
+/// targets, whose quals have equal per_tuple cost.
+fn pg_order_scan_filter(w: &Expr) -> Expr {
+    let cs = pg_conjuncts(w);
+    if cs.len() < 2 {
+        return w.clone();
+    }
+    let mut immediate: Vec<Expr> = Vec::new();
+    let mut deferred: Vec<Expr> = Vec::new();
+    for c in cs {
+        if pg_filter_conjunct_ec_deferred(c) {
+            deferred.push((*c).clone());
+        } else {
+            immediate.push((*c).clone());
+        }
+    }
+    if deferred.is_empty() || immediate.is_empty() {
+        return w.clone();
+    }
+    immediate.extend(deferred);
+    let mut it = immediate.into_iter();
+    let first = it.next().expect("v1.76: mixed conjuncts are non-empty");
+    it.fold(first, |a, b| Expr::And(Box::new(a), Box::new(b)))
+}
+
 /// v1.08: per top-level FROM item, the qualifier names and known
 /// column names (joins flatten to their inputs' qualifiers/columns).
 /// Used to distribute WHERE conjuncts over the FROM list.
@@ -17174,7 +17234,13 @@ fn plan_from_item(
                     // `verbose` here. A plain multi-table query does NOT
                     // qualify scan Filters in non-verbose mode.
                     let filter = match (pctx, where_) {
-                        (Some(px), Some(w)) => Some(pg_expr_text_or_debug(w, px, px.verbose)),
+                        (Some(px), Some(w)) => {
+                            // v1.76: PG19 scan-Filter qual ordering (EC
+                            // deferral): `=` conjuncts render after non-`=`
+                            // conjuncts. EXPLAIN-deparse only.
+                            let ordered = pg_order_scan_filter(w);
+                            Some(pg_expr_text_or_debug(&ordered, px, px.verbose))
+                        }
                         _ => None,
                     };
                     // v1.46: VERBOSE `Output:` — the table's columns in
@@ -78214,6 +78280,145 @@ mod v175_hashjoin_order_tests {
             other => panic!("expected Select, got {:?}", other),
         };
         assert_eq!(count(&mut eng), "1810");
+    }
+}
+
+// ============================================================================
+// v1.76: PG19 EC-deferral ordering for scan Filter quals.
+// ============================================================================
+#[cfg(test)]
+mod v176_filter_order_tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new()
+    }
+
+    fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
+        let stmt = parse_statement(sql).map_err(|e| exec_err(e.code, e.message))?;
+        let snap = eng.take_snapshot();
+        let mut writes = Vec::new();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: 9,
+            write_xid: 9,
+            all_xids: vec![9],
+            level: IsolationLevel::ReadCommitted,
+            writes: &mut writes,
+            session: 0,
+            role: "postgres",
+            read_only: false,
+            default_toast_compression: crate::storage::ToastCompression::Pglz,
+            notices: Vec::new(),
+        };
+        execute(eng, &mut ctx, &stmt)
+    }
+
+    fn plan_raw(eng: &mut Engine, sql: &str) -> Vec<String> {
+        match run(eng, sql).expect("runs") {
+            ExecResult::Explain { rows, .. } => rows
+                .into_iter()
+                .map(|row| row[0].to_text().unwrap_or("NULL".to_string()))
+                .collect(),
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    fn filter_line(eng: &mut Engine, sql: &str) -> String {
+        plan_raw(eng, sql)
+            .into_iter()
+            .find(|l| l.trim_start().starts_with("Filter:"))
+            .expect("Filter line")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn v176_eq_deferred_after_non_eq() {
+        // select.sql target shape: `unique2 = 11 AND stringu1 < 'C'` —
+        // PG19 defers the `=` conjunct after the non-`=` one.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176 (a int, s name)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176 WHERE a = 11 AND s < 'C'"
+            ),
+            "Filter: ((s < 'C'::name) AND (a = 11))"
+        );
+    }
+
+    #[test]
+    fn v176_ne_before_eq() {
+        // select_distinct.sql target shape: `four = 0 AND two <> 0` —
+        // PG19 renders `((two <> 0) AND (four = 0))`.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176b (a int, b int)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176b WHERE a = 0 AND b <> 0"
+            ),
+            "Filter: ((b <> 0) AND (a = 0))"
+        );
+    }
+
+    #[test]
+    fn v176_all_eq_keeps_written_order() {
+        // No mixing: all-`=` Filters are untouched (fail-closed no-op).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176c (a int, b int)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176c WHERE a = 0 AND b = 1"
+            ),
+            "Filter: ((a = 0) AND (b = 1))"
+        );
+    }
+
+    #[test]
+    fn v176_no_eq_keeps_written_order() {
+        // No mixing: no-`=` Filters are untouched.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176d (a int, b int)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176d WHERE a > 0 AND b < 1"
+            ),
+            "Filter: ((a > 0) AND (b < 1))"
+        );
+    }
+
+    #[test]
+    fn v176_self_eq_not_deferred() {
+        // `X = X` becomes `X IS NOT NULL` in PG19 (not deferred as `=`).
+        // rustgres renders the comparison itself; the ordering rule must
+        // not move it.
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176e (a int, b int)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176e WHERE a = a AND b <> 0"
+            ),
+            "Filter: ((a = a) AND (b <> 0))"
+        );
+    }
+
+    #[test]
+    fn v176_true_conjunct_preserved() {
+        // The re-fold must not drop `true` conjuncts (pg_fold_and would).
+        let mut eng = engine();
+        run(&mut eng, "CREATE TABLE t176f (a int, b boolean)").unwrap();
+        assert_eq!(
+            filter_line(
+                &mut eng,
+                "EXPLAIN (COSTS OFF) SELECT * FROM t176f WHERE b AND a = 1"
+            ),
+            "Filter: (b AND (a = 1))"
+        );
     }
 }
 

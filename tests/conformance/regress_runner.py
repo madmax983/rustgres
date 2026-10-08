@@ -1016,6 +1016,25 @@ EXPECTED_PASS_OVERRIDES = [
      r"select\s+\*\s+from\s+skewedtable\s+t1\s+join\s+skewedtable\s+t2\s+"
      r"on\s+t1\.val\s*=\s*t2\.val\s+where\s+t1\.filt\s*=\s*5\s*;?\s*$",
      "v1.75: cost-based hash-join inner/outer selection"),
+    # v1.76: PG19 EC-deferral ordering for scan Filter quals —
+    # `distribute_qual_to_rels` (initsplan.c) routes binary `=` quals
+    # through `process_equivalence` (equivclass.c), which absorbs them
+    # into EquivalenceClasses instead of appending them to
+    # baserestrictinfo; the originals are pushed back only later by
+    # `generate_base_implied_equalities_const` — after all non-`=`
+    # quals (verified by live PG19-beta3 probes + an oracle-wide check:
+    # zero violations in 28 multi-conjunct oracle Filters). Narrowly
+    # scoped to the two corpus statements verified byte-exact against
+    # the PG19 .out oracle; the EXPLAIN-with-options mask stays for
+    # the rest.
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+unique2\s+from\s+onek2\s+where\s+unique2\s*=\s*11\s+"
+     r"and\s+stringu1\s*<\s*'C'\s*;?\s*$",
+     "v1.76: EC-deferral Filter ordering (non-= before =)"),
+    (r"(?is)^\s*(?:--[^\\n]*\\n\s*)*explain\s*\(\s*costs\s+off\s*\)\s*"
+     r"select\s+distinct\s+four\s+from\s+tenk1\s+where\s+four\s*=\s*0\s+"
+     r"and\s+two\s*<>\s*0\s*;?\s*$",
+     "v1.76: EC-deferral Filter ordering (non-= before =)"),
 ]
 EXPECTED_FAIL_PATTERNS = [
     # v1.10: LATERAL shapes that remain unsupported (the v1.10 PASS
