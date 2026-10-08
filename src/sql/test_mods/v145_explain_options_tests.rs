@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn explain_opts(sql: &str) -> (bool, bool, ExplainOpts) {

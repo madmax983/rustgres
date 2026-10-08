@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn explain_costs(sql: &str) -> (bool, bool) {
