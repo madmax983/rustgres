@@ -6396,4 +6396,117 @@ mod tests {
             .expect_err("unique index must survive recovery");
         assert_eq!(err.code, "23505");
     }
+
+    // --- v1.80: DROP COLUMN on partitioned tables -------------------------
+
+    fn v180_session(tag: &str) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        (
+            Arc::new(Mutex::new(Engine::new())),
+            scratch_wal(&format!("rg180-{tag}")),
+            session_no_txn(),
+        )
+    }
+
+    fn v180_exec(
+        engine: &Arc<Mutex<Engine>>,
+        wal: &Arc<Mutex<Wal>>,
+        session: &mut Session,
+        stmts: &[&str],
+    ) {
+        for sql in stmts {
+            v158_run(engine, wal, session, sql)
+                .unwrap_or_else(|e| panic!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+
+    #[test]
+    fn v180_drop_partition_key_column_is_rejected() {
+        // PG19 ATExecDropColumn: 42P16 "cannot drop column ... because it
+        // is part of the partition key of relation ...". v1.79 accepted it.
+        let (engine, wal, mut session) = v180_session("pkey-reject");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE q (a int, b int) PARTITION BY RANGE ((a + 1))",
+            ],
+        );
+        let err = v158_run(&engine, &wal, &mut session, "ALTER TABLE p DROP a")
+            .expect_err("dropping a key column must fail");
+        assert_eq!(err.code, "42P16");
+        assert!(err.message.contains("partition key"), "{}", err.message);
+        let err = v158_run(&engine, &wal, &mut session, "ALTER TABLE q DROP a")
+            .expect_err("dropping a column used by a key expression must fail");
+        assert_eq!(err.code, "42P16");
+        // Non-key columns still drop.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["ALTER TABLE p DROP x", "ALTER TABLE q DROP b"],
+        );
+    }
+
+    #[test]
+    fn v180_drop_column_before_list_key_keeps_routing() {
+        // v1.79: the key position went stale, and the next CREATE TABLE
+        // ... PARTITION OF panicked (partition.rs, index out of bounds).
+        let (engine, wal, mut session) = v180_session("pkey-list");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "ALTER TABLE p DROP x",
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES IN (2)",
+                "INSERT INTO p VALUES (1), (2)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1", "p2|2"]);
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO p VALUES (3)")
+            .expect_err("no partition for 3");
+        assert_eq!(err.code, "23514");
+    }
+
+    #[test]
+    fn v180_drop_column_before_range_key_keeps_routing() {
+        // v1.79: routing read the stale key position and panicked
+        // (partition.rs eval_table_part_key, index out of bounds).
+        let (engine, wal, mut session) = v180_session("pkey-range");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (a int, b int, c int) PARTITION BY RANGE (c)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10)",
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20)",
+                "ALTER TABLE p DROP a",
+                "INSERT INTO p VALUES (1, 5), (2, 15)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, b, c FROM p ORDER BY c",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1|5", "p2|2|15"]);
+    }
 }

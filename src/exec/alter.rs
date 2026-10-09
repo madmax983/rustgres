@@ -1034,6 +1034,29 @@ pub(crate) fn alter_drop_column(
             format!("column \"{}\" of relation \"{}\" does not exist", col, name),
         )
     })?;
+    // v1.80: a partitioned table's key column cannot be dropped (PG19
+    // ATExecDropColumn), whether the key names it directly or through an
+    // expression. v1.79 accepted it and left the key pointing at a column
+    // that no longer existed.
+    if let Some(p) = t.partition.as_ref().filter(|p| p.is_partitioned) {
+        let in_key = p.key.iter().any(|k| match &k.expr {
+            None => k.col == ci,
+            Some(e) => {
+                let mut refs = Vec::new();
+                collect_col_refs(e, &mut refs);
+                refs.iter().any(|(_, r)| r == col)
+            }
+        });
+        if in_key {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "cannot drop column \"{}\" because it is part of the partition key of relation \"{}\"",
+                    col, name
+                ),
+            ));
+        }
+    }
     // v0.77: temp tables have no global indexes, no views can depend on
     // them, and no other catalog table's FKs reference them — a
     // same-named permanent table's catalog objects must not be touched
@@ -1254,6 +1277,28 @@ pub(crate) fn alter_drop_column(
     // v0.41: keep the per-column COMPRESSION metadata parallel too.
     if next.col_compression.len() > ci {
         next.col_compression.remove(ci);
+    }
+    // v1.80: shift partition key positions like the index positions.
+    // A partitioned table's own key is in its own column space. A leaf's
+    // key is a copy of its parent's (parent column space, never consulted
+    // for routing): DROP COLUMN propagation alters the parent first, so
+    // re-copy the parent's now-shifted key. v1.79 shifted neither, and
+    // the next routed INSERT or PARTITION OF read past the row.
+    if let Some(p) = next.partition.as_mut() {
+        if p.is_partitioned {
+            for k in &mut p.key {
+                if k.expr.is_none() && k.col > ci {
+                    k.col -= 1;
+                }
+            }
+        } else if let Some(parent_key) = p.parent.as_ref().and_then(|pn| {
+            eng.db
+                .find_table(pn, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|pt| pt.partition.as_ref())
+                .map(|pp| pp.key.clone())
+        }) {
+            p.key = parent_key;
+        }
     }
     // CHECK expressions reference columns by name; nothing to shift.
     // Rewrite rows without the column. v0.42: mint fresh row ids (see
