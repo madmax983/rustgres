@@ -484,6 +484,24 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         );
                         continue;
                     }
+                    // v1.80: live execution never stores a row whose width
+                    // differs from its version's columns. In replay such a
+                    // row can only be a v1.79 mis-logged intermediate
+                    // rewrite of a multi-action ALTER, whose AlterTable
+                    // record carried the final shape. A later AlterTable in
+                    // the same batch supersedes that version and re-inserts
+                    // the rows at the right width, so skip it rather than
+                    // build a version no checkpoint could load back.
+                    if row.values.len() != t.columns.len() {
+                        eprintln!(
+                            "WAL replay: skipping row id {} in table \"{}\": {} values for {} columns",
+                            row.id,
+                            table,
+                            row.values.len(),
+                            t.columns.len()
+                        );
+                        continue;
+                    }
                     // v0.39: restore the per-cell toast flags (they were
                     // WAL-logged per row) and rebuild the table's
                     // toast_info provenance from the record's metadata.
@@ -918,6 +936,16 @@ pub fn records_for_commit(
     session: u64,
 ) -> Result<Vec<WalRecord>, String> {
     let mut out: Vec<WalRecord> = Vec::new();
+    // v1.80: CreateTable/AlterTable ops and the table versions they push
+    // pair up one-to-one, in order: op N on a table made that table's Nth
+    // version owned by this transaction. Each record must describe ITS
+    // version. v1.79 logged the latest one for every AlterTable, so a
+    // multi-action ALTER (two DROP COLUMNs) logged the final shape for the
+    // intermediate version, whose rewritten rows were wider. Replay built
+    // an inconsistent version, and the next checkpoint made the data
+    // directory unopenable.
+    let mut own_versions: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut i = 0;
     while i < writes.len() {
         let op = &writes[i];
@@ -1107,11 +1135,14 @@ pub fn records_for_commit(
                 }
             }
             WriteOp::CreateTable { name } => {
+                let nth = own_versions.entry(name.clone()).or_insert(0);
+                let idx = *nth;
+                *nth += 1;
                 let Some(versions) = eng.db.tables.get(name) else {
                     i += 1;
                     continue;
                 };
-                let Some(ours) = versions.iter().find(|t| t.created_xmin == own) else {
+                let Some(ours) = versions.iter().filter(|t| t.created_xmin == own).nth(idx) else {
                     i += 1;
                     continue;
                 };
@@ -1183,13 +1214,25 @@ pub fn records_for_commit(
             // v0.9: ALTER TABLE swaps the table version; log the latest
             // version this transaction created.
             WriteOp::AlterTable {
-                name, rewrite_rows, ..
+                name,
+                rewrite_rows,
+                renamed_to,
+                ..
             } => {
+                let nth = own_versions.entry(name.clone()).or_insert(0);
+                let idx = *nth;
+                *nth += 1;
+                // A rename moves the table's versions (and their count)
+                // under the new name; later ops address it by that name.
+                if let Some(target) = renamed_to {
+                    let moved = own_versions.remove(name).unwrap_or(0);
+                    own_versions.insert(target.clone(), moved);
+                }
                 let Some(ours) = eng
                     .db
                     .tables
                     .get(name)
-                    .and_then(|vs| vs.iter().filter(|t| t.created_xmin == own).last())
+                    .and_then(|vs| vs.iter().filter(|t| t.created_xmin == own).nth(idx))
                 else {
                     i += 1;
                     continue;

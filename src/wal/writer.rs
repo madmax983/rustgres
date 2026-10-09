@@ -1011,9 +1011,6 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             for _ in 0..n_vals {
                 values.push(d.value().map_err(|e| bad(&e))?);
             }
-            if values.len() != columns.len() {
-                return Err(bad("row/column count mismatch"));
-            }
             // v0.37: per-cell toast flags.
             let mut toast = Vec::with_capacity(n_vals);
             for _ in 0..n_vals {
@@ -1021,6 +1018,24 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             }
             if id >= eng.txns.next_row_id {
                 eng.txns.next_row_id = id + 1;
+            }
+            if values.len() != columns.len() {
+                // v1.80: v1.79 could checkpoint a SUPERSEDED version holding
+                // a mis-logged multi-action ALTER's wider rows (replayed
+                // from WAL). No snapshot can see a dropped version, so drop
+                // those rows and start. In a live version the mismatch is
+                // real corruption: refuse.
+                if dropped_xmax != 0 {
+                    eprintln!(
+                        "checkpoint load: skipping row id {} of superseded \"{}\" version: {} values for {} columns",
+                        id,
+                        name,
+                        values.len(),
+                        columns.len()
+                    );
+                    continue;
+                }
+                return Err(bad("row/column count mismatch"));
             }
             let mut __rv = RowVersion::plain(id, Row::new(values), xmin);
             __rv.xmax = xmax;

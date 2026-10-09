@@ -6770,4 +6770,57 @@ mod tests {
         .expect_err("CHECK still enforced after recovery");
         assert_eq!(err.code, "23514");
     }
+
+    #[test]
+    fn v180_multi_action_alter_survives_checkpoint() {
+        // Two DROP COLUMNs in one statement version the table twice in one
+        // transaction. v1.79 logged BOTH AlterTable records with the final
+        // (3-column) shape while the first rewrite's rows were 4 wide. Replay
+        // built an inconsistent intermediate version, the next CHECKPOINT
+        // wrote it, and the data directory refused to open ("checkpoint.dat
+        // is corrupt (row/column count mismatch)"). Hit by PG19
+        // insert_conflict (dropcol) once later suites checkpointed.
+        let dir = std::env::temp_dir().join("rg180-multi-alter");
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = || {
+            let (eng, wal) = crate::wal::Wal::open(&dir).expect("data dir must open");
+            (
+                Arc::new(Mutex::new(eng)),
+                Arc::new(Mutex::new(wal)),
+                session_no_txn(),
+            )
+        };
+        {
+            let (engine, wal, mut session) = open();
+            v180_exec(
+                &engine,
+                &wal,
+                &mut session,
+                &[
+                    "CREATE TABLE t (k int PRIMARY KEY, d1 int, keep1 text, d2 numeric, keep2 float)",
+                    "INSERT INTO t VALUES (1, 1, 'one', 1, 1.5)",
+                    "ALTER TABLE t DROP COLUMN d1, DROP COLUMN d2",
+                    "INSERT INTO t VALUES (2, 'two', 2.5)",
+                ],
+            );
+        }
+        {
+            // Replay the WAL, then checkpoint the replayed state.
+            let (engine, wal, mut session) = open();
+            v180_exec(&engine, &wal, &mut session, &["CHECKPOINT"]);
+        }
+        let (engine, wal, mut session) = open();
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT * FROM t ORDER BY k").expect("select"),
+        );
+        assert_eq!(rows, vec!["1|one|1.5", "2|two|2.5"]);
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO t VALUES (1, 'dup', 0)",
+        )
+        .expect_err("primary key survives");
+        assert_eq!(err.code, "23505");
+    }
 }
