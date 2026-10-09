@@ -6561,13 +6561,6 @@ pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
     // v1.21: `owns` is every xid owned by the reading transaction (top +
     // sub-xids). A transaction sees its own sub-xid rows even when the
     // snapshot predates the sub-xid allocation (RepeatableRead).
-    if owns.len() == 1 && v.xmin == 2 {
-        let bt = std::backtrace::Backtrace::capture();
-        let s = format!("{}", bt);
-        for line in s.lines().take(25) {
-            eprintln!("BT: {}", line);
-        }
-    }
     let xmin_ok =
         owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
     if !xmin_ok {

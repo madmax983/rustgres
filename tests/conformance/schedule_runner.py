@@ -662,6 +662,7 @@ def main():
     server.start()
     failed_objects = {}
     per_suite = {}
+    recovery_failures = []
     t_all = time.time()
     try:
         for name in tests:
@@ -678,8 +679,24 @@ def main():
             try:
                 results = run_suite(session, name, failed_objects, verbose=verbose)
             except ServerUnrecoverable as e:
-                print("FATAL during %s: %s" % (name, e), flush=True)
-                break
+                # The data dir no longer opens (a crash-recovery bug). Keep
+                # it for diagnosis, start a fresh cluster, rebuild the
+                # baseline objects (unscored), and carry on: later suites
+                # lose earlier suites' objects, which shows up as cascades.
+                print("    ! %s: %s; continuing on a fresh data dir" % (name, e),
+                      flush=True)
+                recovery_failures.append({"suite": name, "error": str(e),
+                                          "data_dir": server.data_dir,
+                                          "log": server.log_path})
+                server.stop()
+                server = SharedServer()
+                server.start()
+                failed_objects.clear()
+                setup = Session(server)
+                run_suite(setup, "test_setup", failed_objects)
+                setup.conn.close()
+                results = [(name, rr.Verdict(
+                    "REAL-FAIL", "server: unrecoverable after crash"), str(e))]
             try:
                 session.conn.close()
             except Exception:
@@ -704,9 +721,13 @@ def main():
               scored, totals["PASS"], rate, totals["EXPECTED-FAIL"],
               totals["REAL-FAIL"], totals["CASCADE"], totals["SKIP"]))
 
+    for rf in recovery_failures:
+        print("recovery failure during %s: %s\n  data dir kept: %s"
+              % (rf["suite"], rf["error"], rf["data_dir"]))
     if report_json:
         data = {
             "upstream": open(os.path.join(PG19, "UPSTREAM")).read(),
+            "recovery_failures": recovery_failures,
             "excluded": EXCLUDED,
             "totals": dict(totals),
             "suites": {
@@ -730,6 +751,9 @@ def main():
                     "(cascade %d), unscored %d\n\n" % (
                         scored, totals["PASS"], rate, totals["EXPECTED-FAIL"],
                         totals["REAL-FAIL"], totals["CASCADE"], totals["SKIP"]))
+            for rf in recovery_failures:
+                f.write("**Server unrecoverable during `%s`:** %s. The run "
+                        "continued on a fresh data dir.\n\n" % (rf["suite"], rf["error"]))
             f.write("| suite | PASS | EXPECTED-FAIL | REAL-FAIL | cascade | pass % |\n")
             f.write("|---|---:|---:|---:|---:|---:|\n")
             for name, res in per_suite.items():
