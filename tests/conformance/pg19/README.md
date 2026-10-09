@@ -53,3 +53,10 @@ knock-on failures.
 
 Not run: `psql`, `psql_crosstab` and `psql_pipeline`. They test the
 psql client itself, not the server.
+
+## Baseline
+
+The first full run, with a feature-gap ranking and the crash and
+durability bugs it found, is in
+[`docs/conformance/pg19-baseline.md`](../../../docs/conformance/pg19-baseline.md).
+Re-run the schedule and update that file when a change moves the numbers.

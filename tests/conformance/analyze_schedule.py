@@ -71,6 +71,13 @@ def categorize(f):
     if "SQLSTATE 42P01" in detail:
         return ("knock-on: relation missing (probable cascade)",
                 (re.search(r'"([^"]+)"', err) or re.match("(.*)", "?")).group(1))
+    if ("syntax error" in err or "42601" in detail) and re.search(
+            r"(found|unexpected) Colon|at or near \":\"", err) and re.search(
+            r"(?<!:):['\"]?[A-Za-z_]", stmt):
+        # A psql :variable left verbatim: the \gset that should have set
+        # it failed earlier.
+        return ("knock-on: psql variable never set (earlier \\gset failed)",
+                first_words(stmt, 1))
     if "syntax error" in err or "42601" in detail:
         return ("unsupported syntax", syntax_key(stmt, err))
     if "0A000" in detail:
