@@ -1,6 +1,8 @@
 # ADR 0001 — Embedded Rust API
 
-- **Status:** Proposed (design only — nothing in this ADR is implemented yet)
+- **Status:** Proposed (design only — nothing in this ADR is implemented yet).
+  Amended 2026-10-09: async is `std`-only and works with any executor, and
+  the project stays zero-dependency (Decision 2).
 - **Date:** 2026-10-09
 - **Deciders:** @madmax983
 
@@ -46,7 +48,7 @@ Facts that shape this design:
 | Nothing stops two processes opening the same data dir | (no lockfile) | Embedding makes this much easier to hit by accident, so it needs a guard. |
 | Process-global state: `DATESTYLE_POSTGRES` (`datetime.rs:21`), `SESSION_COUNTS` (`server.rs:503`), `RANDOM_SEED` (`exec/arith.rs:160`) | — | Two `Database`s in one process (every test suite) would leak settings into each other. These must move to the session or the database. |
 | Thread-locals (`NOTICE_SINK`, `LATERAL_NS`, format caches) are scoped to one statement or are pure caches | `exec/core.rs:118` | Moving a `Connection` to another thread *between* statements is safe. A statement never yields partway through, so a sync API is fine. |
-| Zero external crates | `Cargo.toml` | No `thiserror` and no `tokio` in the core crate (see Decision 2). |
+| Zero external crates | `Cargo.toml` | A project rule, not just a core-crate rule: no `thiserror`, no `tokio`, no adapter crates (see Decision 2). |
 
 ## Decision
 
@@ -72,17 +74,43 @@ The conformance suite (4,753 PASS) then checks the code path that
 embedded callers use as well. Without this, the embedded API would be a
 second, untested copy of the transaction logic.
 
-### 2. Sync core, zero dependencies; async lives in a separate crate
+### 2. Zero dependencies throughout; async uses only `std` and works with any executor
 
-The engine runs each statement under one mutex and never yields partway
-through. An `async fn query` in the core would only be `spawn_blocking`
-in disguise, and would break the zero-crate rule. So:
+The whole project stays zero-dependency, including async. Rust's async
+model needs no runtime: `Future`, `Poll`, `Context` and `Waker` are all in
+`std`. Tokio, smol and async-std are executors that drive futures. A
+library can hand out futures without depending on any of them.
 
-- `rustgres` (core crate): a sync API, `Database: Send + Sync + Clone`,
-  `Connection: Send` (not `Sync`).
-- `rustgres-tokio` (a later workspace member, optional): `AsyncConnection`
-  wraps `Connection` with `tokio::task::spawn_blocking`. This keeps the
-  "Tokio for async" standard without making the core depend on it.
+The engine never waits on I/O partway through a statement, and row-lock
+conflicts fail with `40001` instead of waiting. A caller can be stuck in
+only two places: the global engine mutex (another connection's statement
+is running) and the WAL fsync at commit. Async only has to get those two
+off the caller's executor thread:
+
+- `Connection` (sync): `Database: Send + Sync + Clone`, `Connection: Send`
+  (not `Sync`).
+- `AsyncConnection` (async, `std` only, in the same crate):
+  - Each method sends its job to a small worker-thread pool owned by the
+    `Database`. The pool is sized to the configured number of
+    connections, since statements run one at a time anyway.
+  - Each method returns a hand-written future, `Pending<T>`: an
+    `Arc<Mutex<Slot<T>>>` holding `Option<Result<T>>` and the most recent
+    `Waker`. The worker runs the statement through the same `session`
+    code as `Connection`, fills the slot, and calls `wake()`.
+  - Dropping a `Pending` does not cancel a statement that is already
+    running. The statement finishes, and its transaction effects follow
+    the `Connection` rules (an open transaction is rolled back when the
+    `AsyncConnection` is dropped).
+  - It runs unchanged under tokio, smol, async-std, or the `block_on`
+    used in our own tests. That `block_on` is about 15 lines: park the
+    thread, and unpark it from the waker.
+- Possible later optimization: an `std`-only async mutex for the engine
+  lock (a FIFO of wakers). Short read-only statements could then run
+  directly on the caller's task with no thread hop. Not needed for v0.
+- The wire server stays thread-per-connection. An async *network* server
+  would need a reactor (epoll/kqueue), and `std` does not provide one.
+  Raw `extern "C"` epoll bindings are possible without crates, but they
+  buy nothing while the engine runs statements one at a time.
 
 ### 3. Proposed public surface
 
@@ -169,8 +197,9 @@ handle.shutdown();
   (`rustgres::types::{Date, Timestamp, Timestamptz, Numeric}`).
   They wrap the internal representation and provide accessors
   (`Date::from_ymd`, `Timestamp::as_micros_since_epoch`,
-  `Numeric::to_string` / `FromStr`). `chrono`/`time`/`rust_decimal` impls
-  can come later in an optional adapter crate.
+  `Numeric::to_string` / `FromStr`). There are no `chrono`/`time`/
+  `rust_decimal` impls (zero-dependency rule). Callers convert through
+  the accessors, which are designed for exactly that.
 - **`ToSql` / `FromSql`** are implemented for `bool`, `i16`, `i32`, `i64`,
   `f32`, `f64`, `&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; 16]` (uuid),
   `Option<T>`, `Vec<T>` (arrays), and the newtypes above. `FromSql`
@@ -253,7 +282,7 @@ I1–I3 is a local-machine task in Phase 1.
 | **2. Public API v0** | `Database`, `Connection`, `Transaction`, `Savepoint`, `Rows`, `Row`, `Value`, `Type`, `ToSql`/`FromSql`, `Error`, `params!`. `open_in_memory` via a do-nothing `WalSink`. Data-dir lockfile. | Rust integration tests in `tests/embedded_*.rs`: happy path, every `FromSql` boundary (overflow, NULL into a non-`Option`), drop-rollback, `25P02` after an error, savepoint rollback, crash-recovery round-trip (open → write → drop without close → reopen), two `Database`s in one process with different DateStyles. Doc comments on every public item. |
 | **3. COPY + notices + prepared** | `copy_in`/`copy_out`, notice handler, `prepare` with param-type inference (reuses `resolve_param_types`). | Tests for each. |
 | **4. `db.serve()`** | Embedded wire server sharing the `Database`. | A `psql`-equivalent Python client and an embedded `Connection` see each other's committed writes. |
-| **5. `rustgres-tokio`** | Separate crate in the workspace; `spawn_blocking` adapter. | Its own tests; the core stays zero-dep. |
+| **5. `AsyncConnection`** | `std`-only `AsyncConnection` with the worker pool and `Pending<T>` future; a test-only `block_on`. | The same behavioural tests as `Connection`, driven through `block_on`; a test that a `Pending` polled from several threads wakes exactly once; `cargo tree` shows no dependencies. |
 
 ## Alternatives considered
 
@@ -266,7 +295,12 @@ I1–I3 is a local-machine task in Phase 1.
   conversion on every value, and loses typed binding. Rejected; `serve()`
   gives the "also reachable from psql" benefit without it.
 - **An async-first core.** Rejected (Decision 2): the engine cannot yield
-  partway through a statement, and it would break the zero-crate build.
+  partway through a statement, so async gains nothing inside it. Async is
+  a thin `std` layer on top instead.
+- **A `rustgres-tokio` adapter crate (`spawn_blocking`).** This was the
+  original Decision 2. Rejected in the amendment: the `std`-only
+  `AsyncConnection` serves tokio users equally well, works on every other
+  executor, and adds no dependency.
 - **Reuse `storage::Value` as the public value type.** Rejected: its
   representation is tuned for the executor (`Int(i64)` for INT4,
   `Arc<str>`), and freezing it would block storage refactors.
@@ -278,8 +312,8 @@ I1–I3 is a local-machine task in Phase 1.
    embedded callers own the process anyway.
 2. **Crate name for the public API:** keep `rustgres` (lib + bin in one
    package) or split into a `rustgres` lib and a `rustgres-server` bin?
-   Proposed: a single package for now; split if `rustgres-tokio` makes a
-   workspace worthwhile.
+   Proposed: a single package for now. With no adapter crates there is
+   no workspace to justify.
 3. **Synchronous commit default for embedded:** keep fsync-per-commit,
    which is safe and matches the server, or offer group commit? Proposed:
    keep it; expose `synchronous_commit(false)` as an opt-in later.
