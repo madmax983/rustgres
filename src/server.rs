@@ -6300,8 +6300,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{sql}: {} {}", e.code, e.message));
             }
         }
-        let (eng, wal) =
-            crate::wal::Wal::open(&dir).expect("data dir must reopen after DROP COLUMN");
+        let (eng, wal) = crate::wal::Wal::open(&dir).expect("data dir must reopen after a restart");
         (
             Arc::new(Mutex::new(eng)),
             Arc::new(Mutex::new(wal)),
@@ -6711,5 +6710,64 @@ mod tests {
         )
         .expect_err("overlaps fk_partitioned_fk_1");
         assert!(err.message.contains("would overlap"), "{}", err.message);
+    }
+
+    #[test]
+    fn v180_casts_in_defaults_and_checks_survive_restart() {
+        // v1.79 wrote cast types into the WAL's constraint encoding as bare
+        // multi-word names, and recovery refused the data directory ("bad
+        // constraints for table ..."). Hit by PG19 triggers' log_table.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "cast-defaults",
+            &[
+                "CREATE TABLE log_table (tstamp timestamp DEFAULT timeofday()::timestamp)",
+                "CREATE TABLE d (
+                    a timestamptz DEFAULT '2020-01-02 03:04:05+00'::timestamptz,
+                    b float8 DEFAULT '1.5'::double precision,
+                    c text DEFAULT 'abcdefgh'::varchar(5),
+                    e text DEFAULT 'x'::char(3),
+                    f numeric DEFAULT 1.005::numeric(10,2),
+                    g int DEFAULT ('{7,8}'::int[])[2],
+                    h text CHECK (h::\"char\"::text <> 'z')
+                )",
+            ],
+        );
+        // (timeofday() itself is not implemented yet; the table surviving
+        // recovery is what v1.79 broke.)
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT count(*) FROM log_table",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["0"]);
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["INSERT INTO d DEFAULT VALUES"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT b, c, length(e), f, g FROM d",
+            )
+            .expect("select"),
+        );
+        // char(3) -> text drops the blank padding (PG bpchar-to-text), so length 1.
+        assert_eq!(rows, vec!["1.5|abcde|1|1.01|8"]);
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO d (h) VALUES ('zz')",
+        )
+        .expect_err("CHECK still enforced after recovery");
+        assert_eq!(err.code, "23514");
     }
 }
