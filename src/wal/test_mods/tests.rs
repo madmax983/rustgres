@@ -709,3 +709,55 @@ fn v088_create_index_metadata_roundtrip() {
     }
     d.end().unwrap();
 }
+
+/// Copy the v1.79 DROP COLUMN fixture into a fresh scratch directory.
+fn v180_fixture_dir(tag: &str) -> std::path::PathBuf {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wal_v179_drop_column");
+    let dir = std::env::temp_dir().join(format!("rg180-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    for f in ["wal.log", "system.id"] {
+        std::fs::copy(src.join(f), dir.join(f)).expect("copy fixture");
+    }
+    dir
+}
+
+#[test]
+fn v180_replays_v179_drop_column_wal() {
+    // Regression: v1.79 and earlier logged DROP COLUMN as AlterTable -> InsertRows ->
+    // DropIndex -> CreateIndex. Replaying InsertRows indexed the rewritten
+    // one-column rows through the stale index (position 1) and panicked,
+    // so the data directory could never be opened again.
+    let dir = v180_fixture_dir("replay");
+    let (eng, _wal) = Wal::open(&dir).expect("v1.79 WAL must replay");
+    let t = eng
+        .db
+        .tables
+        .get("t")
+        .and_then(|vs| vs.iter().find(|t| t.dropped_xmax == 0))
+        .expect("table t survives recovery");
+    let cols: Vec<&str> = t.columns.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(cols, vec!["a"]);
+    let mut live: Vec<i64> = t
+        .rows
+        .iter()
+        .filter(|r| r.xmax == 0)
+        .map(|r| match r.values[0] {
+            Value::Int(v) => v,
+            ref other => panic!("unexpected value {:?}", other),
+        })
+        .collect();
+    live.sort_unstable();
+    assert_eq!(live, vec![3, 4]);
+    // The unique index is rebuilt on the shifted position and covers
+    // every surviving row exactly once.
+    let ix = eng
+        .db
+        .indexes
+        .get("t_a_key")
+        .expect("unique index survives recovery");
+    assert_eq!(ix.def.cols, vec![0]);
+    assert_eq!(ix.def.dropped_xmax, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

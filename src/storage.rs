@@ -5212,16 +5212,6 @@ impl Table {
     }
 }
 
-/// The whole database: table name -> versions of that table (usually one).
-/// Multiple live versions of one name can only arise from concurrent
-/// uncommitted CREATEs; the commit-time check in server.rs rejects the
-/// second committer with 40001.
-/// v0.22: session id meaning "no session". Real session ids come from an
-/// incrementing counter starting at 1 (`NEXT_SID` in server.rs), so this
-/// never collides. Pass it to session-aware helpers from paths that only
-/// ever touch permanent tables (WAL replay, vacuum).
-pub const NO_SESSION: u64 = u64::MAX;
-
 /// v0.22: bounded shell-type registry entry. PostgreSQL's
 /// `CREATE TYPE name;` creates an undefined "shell" type that a later
 /// `CREATE TYPE name (... LIKE = base)` completes. rustgres supports
@@ -5314,6 +5304,10 @@ pub struct OperDef {
     pub merges: bool,
 }
 
+/// The whole database: table name -> versions of that table (usually one).
+/// Multiple live versions of one name can only arise from concurrent
+/// uncommitted CREATEs; the commit-time check in server.rs rejects the
+/// second committer with 40001.
 #[derive(Clone, Debug)]
 pub struct Database {
     /// Keyed by table name — a short, trusted identifier (whoever is
@@ -5689,9 +5683,6 @@ impl Database {
     }
 
     /// v0.22: does `session` hold a temp table called `name`?
-    ///
-    /// Pass [`NO_SESSION`] for paths that only ever touch permanent
-    /// tables (WAL replay, vacuum): it is never a real session id.
     pub fn is_temp_table(&self, session: u64, name: &str) -> bool {
         self.temp_tables
             .get(&session)
@@ -5872,6 +5863,35 @@ impl Database {
             // v0.88: expression / partial indexes are catalog-only (never
             // built or maintained).
             .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
+            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .collect();
+        for (name, cols) in targets {
+            let key = IndexKey(cols.iter().map(|&c| values[c].clone()).collect());
+            if let Some(ix) = self.indexes.get_mut(&name) {
+                ix.insert(key, row_id);
+            }
+        }
+    }
+
+    /// WAL-replay variant of [`Self::index_insert_row`]. It skips any index
+    /// definition whose column positions do not fit the replayed row.
+    ///
+    /// Such a definition can only be stale. Logs written by v1.79 and
+    /// earlier record a DROP COLUMN as AlterTable -> InsertRows (rewritten,
+    /// shorter rows) -> DropIndex -> CreateIndex (shifted positions). While
+    /// the InsertRows record replays, the pre-drop index is still live.
+    /// Indexing through it would read past the end of the row (the panic
+    /// that left those data directories unopenable). Skipping it loses
+    /// nothing: the same batch's CreateIndex rebuilds the index from the
+    /// table's rows. Live execution keeps definitions in step with the
+    /// table shape, so it keeps the strict variant, where a mismatch is a
+    /// bug that should surface.
+    pub fn index_insert_row_replay(&mut self, table: &str, row_id: u64, values: &[Value]) {
+        let targets: Vec<(String, Vec<usize>)> = self
+            .indexes
+            .values()
+            .filter(|ix| ix.def.table == table && ix.def.dropped_xmax == 0 && ix.def.planner_usable)
+            .filter(|ix| ix.def.cols.iter().all(|&c| c < values.len()))
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect();
         for (name, cols) in targets {

@@ -6278,4 +6278,122 @@ mod tests {
         v158_run(&engine, &wal, &mut session_b, "DEALLOCATE ALL").expect("deallocate all");
         v158_rows(v158_run(&engine, &wal, &mut session_a, "EXECUTE q").expect("execute"));
     }
+
+    // --- v1.80: DROP COLUMN must survive a restart ---------------------
+
+    /// Run each statement in autocommit against a fresh data dir, drop
+    /// the server state, then reopen the directory (crash recovery) and
+    /// return a live engine + WAL over the recovered state.
+    fn v180_run_then_reopen(
+        tag: &str,
+        stmts: &[&str],
+    ) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        let dir = std::env::temp_dir().join(format!("rg180-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let (eng, wal) = crate::wal::Wal::open(&dir).expect("fresh open");
+            let engine = Arc::new(Mutex::new(eng));
+            let wal = Arc::new(Mutex::new(wal));
+            let mut session = session_no_txn();
+            for sql in stmts {
+                v158_run(&engine, &wal, &mut session, sql)
+                    .unwrap_or_else(|e| panic!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+        let (eng, wal) =
+            crate::wal::Wal::open(&dir).expect("data dir must reopen after DROP COLUMN");
+        (
+            Arc::new(Mutex::new(eng)),
+            Arc::new(Mutex::new(wal)),
+            session_no_txn(),
+        )
+    }
+
+    #[test]
+    fn v180_drop_column_before_indexed_column_survives_restart() {
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "plain",
+            &[
+                "CREATE TABLE t (b char, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 3)",
+                "ALTER TABLE t DROP b",
+                "INSERT INTO t VALUES (4)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT * FROM t ORDER BY a").expect("select"),
+        );
+        assert_eq!(rows, vec!["3", "4"]);
+        // The unique index still enforces on the shifted position.
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (3)")
+            .expect_err("duplicate must be rejected after recovery");
+        assert_eq!(err.code, "23505");
+        // And the recovered state keeps accepting writes and restarts.
+        v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (5)").expect("insert");
+    }
+
+    #[test]
+    fn v180_drop_column_without_later_writes_survives_restart() {
+        // The rewrite alone (no later INSERT) was enough to brick v1.79.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "norewrite",
+            &[
+                "CREATE TABLE t (b char, c text, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 'y', 3), ('z', 'w', 7)",
+                "ALTER TABLE t DROP b",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT c, a FROM t ORDER BY a").expect("select"),
+        );
+        assert_eq!(rows, vec!["y|3", "w|7"]);
+    }
+
+    #[test]
+    fn v180_drop_column_propagated_to_partition_survives_restart() {
+        // The shape the PG19 insert_conflict suite hit: the partition's
+        // own column order differs from the parent's, so the parent's
+        // DROP COLUMN shifts the partition's unique index.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "partition",
+            &[
+                "CREATE TABLE p (a int UNIQUE, b char) PARTITION BY LIST (a)",
+                "CREATE TABLE p3 (b char, a int UNIQUE)",
+                "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES IN (3)",
+                "INSERT INTO p VALUES (3, 'x')",
+                "ALTER TABLE p DROP b",
+                "INSERT INTO p VALUES (3) ON CONFLICT DO NOTHING",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a FROM p3").expect("select"));
+        assert_eq!(rows, vec!["3"]);
+    }
+
+    #[test]
+    fn v180_recreate_table_with_same_index_name_in_one_txn_survives_restart() {
+        // DROP TABLE + CREATE TABLE under the same name in one transaction
+        // (PG allows it). v1.79 rejected the COMMIT with 40001 "relation
+        // already exists": the commit-time rival check counted the version
+        // this very transaction had dropped. The re-created same-named
+        // unique index (shorter rows) must also survive recovery.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "recreate",
+            &[
+                "CREATE TABLE t (b char, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 3)",
+                "BEGIN",
+                "DROP TABLE t",
+                "CREATE TABLE t (a int UNIQUE)",
+                "INSERT INTO t VALUES (9)",
+                "COMMIT",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a FROM t").expect("select"));
+        assert_eq!(rows, vec!["9"]);
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (9)")
+            .expect_err("unique index must survive recovery");
+        assert_eq!(err.code, "23505");
+    }
 }

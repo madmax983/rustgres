@@ -1278,15 +1278,42 @@ pub(crate) fn alter_drop_column(
         rv.toast = flags;
         new_rows.push(rv);
     }
-    alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
-    // Shift index positions: drop and re-create each surviving index with
-    // positions adjusted, so undo (DropIndex+CreateIndex pair) and WAL
-    // (new def logged) stay correct.
+    // Shift index positions: drop each surviving index, rewrite the rows,
+    // then re-create the index with positions adjusted, so undo (the
+    // DropIndex+CreateIndex pair) and WAL (new def logged) stay correct.
+    // v1.80: the drops must be logged BEFORE the row rewrite. The WAL
+    // batch then reads DropIndex -> AlterTable/InsertRows -> CreateIndex,
+    // and replay never indexes the rewritten, shorter rows through a stale
+    // definition. v1.79 dropped after the rewrite; recovery panicked in
+    // index_insert_row and the data directory never reopened.
+    struct ShiftedIndex {
+        name: String,
+        cols: Vec<usize>,
+        col_names: Vec<String>,
+        unique: bool,
+        internal: bool,
+    }
+    let mut shifted: Vec<ShiftedIndex> = Vec::with_capacity(index_defs.len());
     for (ix_name, cols, col_names) in index_defs {
         let snapshot = eng.db.indexes.get(&ix_name).cloned().expect("found above");
-        let unique = snapshot.def.unique;
-        let internal = snapshot.def.internal;
         drop_index_internal(eng, ctx, &ix_name)?;
+        shifted.push(ShiftedIndex {
+            name: ix_name,
+            cols,
+            col_names,
+            unique: snapshot.def.unique,
+            internal: snapshot.def.internal,
+        });
+    }
+    alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    for ShiftedIndex {
+        name: ix_name,
+        cols,
+        col_names,
+        unique,
+        internal,
+    } in shifted
+    {
         let new_cols: Vec<usize> = cols
             .into_iter()
             .map(|p| if p > ci { p - 1 } else { p })

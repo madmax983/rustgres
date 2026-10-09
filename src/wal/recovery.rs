@@ -471,7 +471,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             };
             for (id, values) in &inserted {
                 eng.db
-                    .index_insert_row(table, *id, values, crate::storage::NO_SESSION);
+                    .index_insert_row_replay(table, *id, values);
             }
         }
         WalRecord::DropTable { name, xmax } => match live_table(eng, name) {
@@ -551,13 +551,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 t.push_version(rv);
             }
             // Index the new versions, like live execution's
-            // index_insert_row: recovery rebuilds indexes only for the
+            // index_insert_row (replay variant): recovery rebuilds indexes only for the
             // checkpoint image; replayed rows need their entries.
             let indexed: Vec<(u64, Row)> = new.iter().map(|r| (r.id, r.values.clone())).collect();
             // `t`'s borrow ends at its last use above; eng.db is free again.
             for (id, values) in indexed {
                 eng.db
-                    .index_insert_row(table, id, &values, crate::storage::NO_SESSION);
+                    .index_insert_row_replay(table, id, &values);
             }
         }
         // v0.13: replication slot metadata is applied by the match
@@ -1075,11 +1075,15 @@ pub fn records_for_commit(
                     continue;
                 };
                 // First-committer-wins: a rival committed live version
-                // means our CREATE lost the race.
+                // means our CREATE lost the race. v1.80: a version WE
+                // dropped earlier in this transaction is not a rival
+                // (DROP TABLE t; CREATE TABLE t in one transaction, which
+                // PG allows), like the CREATE VIEW check below.
                 let rival = versions.iter().any(|t| {
                     t.created_xmin != own
                         && eng.xid_committed(t.created_xmin)
                         && (t.dropped_xmax == 0 || !eng.xid_committed(t.dropped_xmax))
+                        && t.dropped_xmax != own
                 });
                 if rival {
                     return Err(format!("relation \"{}\" already exists", name));
@@ -1561,11 +1565,17 @@ pub fn records_for_commit(
                 continue;
             }
             WriteOp::DropIndex { name, .. } => {
+                // v1.80: the drop is ours if the entry under this name was
+                // dropped by us, OR was created by us: that means we dropped
+                // the old index and re-created it under the same name (ALTER
+                // TABLE ... DROP COLUMN shifts positions this way). That drop
+                // must reach the WAL ahead of the row rewrite, or replay
+                // indexes the rewritten rows through the stale definition.
                 let won = eng
                     .db
                     .indexes
                     .get(name)
-                    .is_some_and(|ix| ix.def.dropped_xmax == own);
+                    .is_some_and(|ix| ix.def.dropped_xmax == own || ix.def.created_xmin == own);
                 if !won {
                     i += 1;
                     continue; // overwritten by a concurrent drop; theirs wins
