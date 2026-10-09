@@ -380,6 +380,25 @@ def load_data_file(path):
         return f.read().split("\n")[:-1]
 
 
+def parse_blocks(lines, pos, null_display, max_blocks):
+    """rr.parse_expected_blocks, but never more blocks than the query has
+    statements: after a result table, a following statement echo plus a
+    `-----` comment banner otherwise reads as one more table header."""
+    blocks = []
+    while len(blocks) < max_blocks:
+        exp, new_pos = rr.parse_expected_block(lines, pos, null_display)
+        if exp.kind == "noresult":
+            if not blocks:
+                blocks.append(exp)
+            pos = new_pos
+            break
+        blocks.append(exp)
+        pos = new_pos
+    return blocks, pos
+
+
+COPY_TO_STDOUT = re.compile(r"(?is)^\s*copy\b.*\bto\s+stdout\b")
+
 COPY_FROM_FILE = re.compile(
     r"(?is)^\s*copy\s+(\S+?)(\s*\([^)]*\))?\s+from\s+'(/__pg19__/src/[^']+)'(.*)$")
 
@@ -413,8 +432,8 @@ def run_suite(session, name, failed_objects, verbose=False):
             return None
         pos = idx + len(stmt)
         line_pos = out_text.count("\n", 0, pos) + 1
-        blocks, new_line_pos = rr.parse_expected_blocks(
-            out_lines, line_pos, session.null_display)
+        blocks, new_line_pos = parse_blocks(
+            out_lines, line_pos, session.null_display, 1 + stmt.count("\\;"))
         pos = sum(len(l) + 1 for l in out_lines[:new_line_pos])
         return blocks
 
@@ -428,7 +447,36 @@ def run_suite(session, name, failed_objects, verbose=False):
         session.recover()
         return None, reason
 
-    for kind, text in items:
+    def same_line_group(start):
+        """psql echoes a whole input line, then prints the results of every
+        statement on it in order (`BEGIN; DELETE ...; ROLLBACK;`). Return
+        the run of sql items sharing the echo line(s) that begin with
+        items[start], or None when the statement stands alone."""
+        first = items[start][1]
+        i = out_text.find(first, pos)
+        if i == -1:
+            return None
+        cursor = i + len(first)
+        group = [first]
+        j = start + 1
+        while True:
+            eol = out_text.find("\n", cursor)
+            eol = len(out_text) if eol == -1 else eol
+            rest = out_text[cursor:eol].strip()
+            if not rest or rest.startswith("--") or j >= len(items) or items[j][0] != "sql":
+                break
+            k = out_text.find(items[j][1], cursor)
+            if k == -1 or out_text[cursor:k].strip():
+                break
+            group.append(items[j][1])
+            cursor = k + len(items[j][1])
+            j += 1
+        return (group, cursor) if len(group) > 1 else None
+
+    resume_at = 0
+    for idx_item, (kind, text) in enumerate(items):
+        if idx_item < resume_at:
+            continue
         if kind == "skip":
             continue
         if kind == "meta":
@@ -527,6 +575,53 @@ def run_suite(session, name, failed_objects, verbose=False):
 
         stmt = text
         exec_stmt = interpolate(stmt, session.pvars)
+        grp = same_line_group(idx_item)
+        if grp:
+            group, cursor = grp
+            resume_at = idx_item + len(group)
+            sets, err_msg, wedge = [], "", None
+            for g in group:
+                actual, wedge = execute(lambda: session.conn.q(
+                    rr.psql_unescape(interpolate(g, session.pvars))), g)
+                if wedge:
+                    break
+                sets.extend(actual["sets"])
+                err_msg = err_msg or (actual.get("err_msgs") or [""])[0]
+            pos = cursor
+            line_pos = out_text.count("\n", 0, pos) + 1
+            blocks, new_line_pos = parse_blocks(
+                out_lines, line_pos, session.null_display, len(group))
+            pos = sum(len(l) + 1 for l in out_lines[:new_line_pos])
+            gtext = " ".join(group)
+            if wedge:
+                v = rr.Verdict("REAL-FAIL", "server: " + wedge)
+            else:
+                v = rr.compare_multi(gtext, blocks, sets, session.null_display)
+            results.append((gtext, v, err_msg))
+            continue
+        if COPY_TO_STDOUT.match(exec_stmt) and "\\;" not in stmt:
+            # Its output is raw COPY data, not a table: compare error vs
+            # success only; a clean success is unscored (the harness does
+            # not capture CopyOut data).
+            idx = out_text.find(stmt, pos)
+            if idx != -1:
+                pos = idx + len(stmt)
+                nl = out_text.find("\n", pos)
+                nxt = out_text[nl + 1: nl + 200] if nl != -1 else ""
+                exp_err = nxt.startswith("ERROR:")
+                actual, wedge = execute(lambda: session.conn.q(exec_stmt), stmt)
+                if wedge:
+                    v = rr.Verdict("REAL-FAIL", "server: " + wedge)
+                elif bool(actual["err_codes"]) != exp_err:
+                    v = rr.Verdict("REAL-FAIL", "expected %s, got %s" % (
+                        "ERROR" if exp_err else "success",
+                        "SQLSTATE %s" % actual["err_codes"][0] if actual["err_codes"] else "success"))
+                elif exp_err:
+                    v = rr.Verdict("PASS")
+                else:
+                    v = rr.Verdict("SKIP", "COPY TO STDOUT data not compared")
+                results.append((stmt, v, ((actual or {}).get("err_msgs") or [""])[0]))
+                continue
         blocks = expected_after_echo(stmt)
         if blocks is None:
             # Echo not found (psql-only syntax the splitter cannot model,
