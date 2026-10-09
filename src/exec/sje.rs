@@ -224,6 +224,31 @@ pub(crate) fn sje_survivor_exprs(classes: &[SjeClass], q1: &str, q2: &str) -> Op
 /// kept instance). Bare `*` fails closed in the nested case (it spans
 /// tables beyond the pair); `q1.*`/`q2.*` expand to the kept
 /// instance's columns; anything else is qualifier-rewritten.
+/// v1.79: collect (qualifier, table_name) for plain tables in a FROM
+/// tree, in left-to-right order. Returns None if any item is not a
+/// plain table (fail closed; subqueries/functions need catalog
+/// metadata we don't want to guess).
+fn sje_star_tables(from: &[FromItem]) -> Option<Vec<(String, String)>> {
+    fn walk(item: &FromItem, out: &mut Vec<(String, String)>) -> bool {
+        match item {
+            FromItem::Table { name, alias, .. } => {
+                let q = alias.clone().unwrap_or_else(|| name.clone());
+                out.push((q, name.clone()));
+                true
+            }
+            FromItem::Join { left, right, .. } => walk(left, out) && walk(right, out),
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    for item in from {
+        if !walk(item, &mut out) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn sje_rewrite_items(
     eng: &Engine,
     stmt: &SelectStmt,
@@ -256,6 +281,36 @@ pub(crate) fn sje_rewrite_items(
                             expr: Expr::Column {
                                 table: Some(q2.to_string()),
                                 name: cn.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            SelectItem::All if nested => {
+                // v1.79: expand the star over the original FROM tree in
+                // order; the removed qualifier's columns are re-pointed
+                // at the kept instance. PG19's `remove_self_join_rel`
+                // (analyzejoins.c) rewrites Vars after parse-time star
+                // expansion, so `SELECT *` keeps both column sets with
+                // q1's Vars re-pointed at q2.
+                let tables = sje_star_tables(&stmt.from)?;
+                for (q, tn) in tables {
+                    let cols: Vec<String> = eng
+                        .db
+                        .find_table(&tn, snap, &[own], session)
+                        .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                        .unwrap_or_default();
+                    if cols.is_empty() {
+                        return None;
+                    }
+                    // Re-point the removed qualifier at the kept table.
+                    let use_q = if q == q1 { q2 } else { q.as_str() };
+                    for cn in cols {
+                        new_items.push(SelectItem::Expr {
+                            expr: Expr::Column {
+                                table: Some(use_q.to_string()),
+                                name: cn,
                             },
                             alias: None,
                         });
@@ -1828,9 +1883,10 @@ pub(crate) fn plan_from_item(
             // hash-vs-nestloop choice (set inside the supported block).
             let mut hash_clauses: Vec<(Expr, Expr)> = Vec::new();
             if let Some(px) = pctx {
-                // Only inner/cross joins get the full PG-text treatment;
-                // others render without a Join Filter (wrong, masked).
-                let supported = matches!(kind, JoinKind::Inner | JoinKind::Cross)
+                // v1.79: left joins get the full PG-text treatment (Join
+                // Filter from ON, WHERE distribution); right/full remain
+                // unsupported (wrong, masked).
+                let supported = matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left)
                     && !*natural
                     && !(matches!(kind, JoinKind::Cross) && on.is_some())
                     // v1.64: USING is supported for inner joins — PG19's

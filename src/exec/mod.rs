@@ -231,6 +231,9 @@ mod v176_filter_order_tests;
 #[path = "test_mods/v177_nested_sje_tests.rs"]
 mod v177_nested_sje_tests;
 #[cfg(test)]
+#[path = "test_mods/v179_sje_star_tests.rs"]
+mod v179_sje_star_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
