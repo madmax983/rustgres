@@ -2,6 +2,153 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `to_date`/`to_timestamp`/`to_char` re-tokenize their date/timestamp format picture from scratch on every row — fix — 2026-10-09
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/datetime.rs`: `tokenize_format` is now a thread-local cache
+lookup keyed by the picture text, in front of the tokenizer (renamed
+`tokenize_format_uncached`, body otherwise untouched). A hit clones an
+`Rc<Vec<FmtTok>>` (one refcount bump); a miss tokenizes exactly as
+before and inserts the result. Bounded at 64 entries, same cap and
+same clear-outright-on-overflow policy as `numfmt::parse_numfmt`'s
+cache (v1.73) and `regex::compile_opts`'s cache (v1.40). Only
+successful tokenizations are cached; an invalid picture still reports
+the same error on every call.
+
+`tokenize_format`'s two call sites (`parse_with_format`,
+`format_with_pattern`) only ever iterate the token list, so the only
+other source change is `for tok in &toks` -> `for tok in toks.iter()`
+(iterating `&Rc<Vec<FmtTok>>` directly isn't `IntoIterator`; `.iter()`
+auto-derefs through the `Rc` and yields the same `&FmtTok` items as
+before).
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_datefmt.py --rows 3000 --count 20
+--timeout 600`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 9,280,572,682 | 7,642,099,356 | **-17.65%** |
+
+`tokenize_format`'s self-cost (6.23% of the baseline total) collapses
+to 0.08% post-fix; `tokenize_format_uncached` (the renamed original
+parser, now only reached on a cache miss) totals 9,644 Ir across the
+entire 240,000-call workload -- 3 distinct pictures tokenized once
+each per connection, the same shape as the `numfmt::parse_numfmt`
+fix's "3 distinct pictures still parse once each" note. This
+-17.65% is three orders of magnitude larger than this repo's
+established callgrind-determinism band (prior rounds' repeat runs
+agree to within ~0.0005%), so a second confirmatory run on each side
+was not needed to establish significance.
+
+DHAT:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes | 148,164,950 | 128,965,952 | **-12.96%** |
+| Total blocks | 3,229,148 | 2,629,169 | **-18.58%** |
+| Blocks on the `tokenize_format` allocation site | 600,000 | 21 | **-99.997%** |
+| Bytes on the `tokenize_format` allocation site | 19,200,000 | 1,002 | **-99.99%** |
+
+Both the Ir floor (>=5%) and the DHAT floor (>=10% blocks or bytes)
+clear independently and by a wide margin -- the whole-workload totals
+alone clear both floors, without even needing the site-specific
+share.
+
+`cargo test --all-features`: 904/904 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 634 errors on both the pre-change and post-change
+tree (confirmed via `git stash`, compared by count) -- the same
+toolchain/lint-version mismatch noted in every prior Bolt round in
+this file; zero new errors from this diff. `tests/protocol_test17.py`
+(132/132, the date/time function suite covering
+`to_date`/`to_char`/`to_timestamp`/`make_date`/`make_timestamp`) and
+`tests/protocol_test_v090_text.py` (9/9, exercises `to_char`-on-date
+through string concatenation) pass unchanged.
+
+Before/after profiles are not committed (each pair is ~2MB/~230KB on
+this workload; this entry's numbers are reproducible from the parent
+baseline commit and this commit).
+
+**Reproduce**: `git show HEAD~1:src/datetime.rs` (or check out the
+parent baseline commit) for the pre-fix tree, `cargo build`, then
+repeat the Callgrind/DHAT commands in the baseline entry's "Reproduce"
+section on both trees.
+
+## Bolt: `to_date`/`to_timestamp`/`to_char` re-tokenize their date/timestamp format picture from scratch on every row — baseline — 2026-10-09
+
+**Why this workload**: the last profiling-focused Bolt round
+(`row_index`/`leaf_of` hash row-version ids, 2026-10-06) targeted the
+write path; the four rounds before that targeted numeric `to_char`/
+`to_number` formatting (`src/numfmt.rs`), `Numeric::hash_key`, regexp
+compilation, and `eval_hashed_in`'s cache. None of them touched
+`src/datetime.rs`'s format-picture machinery, which is a separate
+engine from `src/numfmt.rs` (added independently, v0.17 vs v0.26) --
+every `to_date`/`to_timestamp`/`to_char` call on a date/timestamp/text
+value goes through `tokenize_format`, and no prior round profiled it.
+`benches/profile_datefmt.py` (new, this round) is the fixed-iteration-
+count harness for exactly that path: 20 iterations of a 4-call
+format/parse SELECT (two `to_char` pictures on a `TIMESTAMP`, one
+`to_char` on a `DATE`, one `to_date` parse) over 3000 rows, the same
+shape as a real invoice/report export that renders and parses date
+columns with a literal format picture reused across every row.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_datefmt.py --rows 3000 --count 20 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no --threshold=100 /tmp/cg.out | grep -i tokenize_format
+
+# DHAT, same workload, fresh server:
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out ./target/debug/rustgres &
+python3 benches/profile_datefmt.py --rows 3000 --count 20 --timeout 600
+# SIGTERM the server to flush, then load /tmp/dhat.out into dh_view.html
+# or sum "tb"/"tbk" over "pps" entries whose resolved frames include
+# "tokenize_format".
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, pre-fix): **9,280,572,682**
+total `Ir`.
+
+| symbol (self cost, `callgrind_annotate --threshold=100`) | Ir | % of total |
+|---|---|---|
+| `datetime::tokenize_format` | 578,640,000 | 6.23% |
+| `core::slice::index.rs` inlined into `tokenize_format` | 77,760,000 | 0.84% |
+| **combined** | **656,400,000** | **7.07%** |
+
+Comfortably past the 5%-of-profile floor on self-cost alone, before
+counting any inclusive cost of the `Vec<FmtTok>` allocation/drop it
+drives or the `HashMap`/`Vec` traffic in its two callers.
+
+DHAT (pre-fix): **148,164,950** total bytes, **3,229,148** total
+blocks. Every allocation stack passing through `tokenize_format`
+sums to 19,200,000 bytes (12.96%) and 600,000 blocks (18.58%) of the
+*whole workload's* heap traffic -- the per-call `Vec<FmtTok>` token
+buffer, one alloc/free pair per `to_date`/`to_timestamp`/`to_char`
+call on every row of every iteration.
+
+**Hypothesis**: the picture text passed to `to_char`/`to_date`/
+`to_timestamp` is a SQL literal, identical across every row of a
+statement -- an export query doesn't build a different picture per
+row. Caching the tokenize result per picture text, the same mechanism
+already proven for `numfmt::parse_numfmt` (-61.19% Ir, -45.76% dhat
+blocks on its own workload, 2026-10-05) and `regex::compile_opts`
+(v1.40), turns every row after the first that uses a given picture
+into a pointer-clone of a cached `Rc<Vec<FmtTok>>` instead of a full
+re-scan and a fresh allocation.
+
 ## Bolt: `row_index`/`leaf_of` hash row-version ids through `SipHash` — fix — 2026-10-06
 
 Fixes the targets identified in the baseline entry immediately below this

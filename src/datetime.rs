@@ -456,9 +456,46 @@ enum FmtTok {
     Lit(char),
 }
 
-/// Split a format string into pattern/literal tokens. Matching is
-/// case-insensitive; the longest pattern wins ("HH24" before "HH").
-fn tokenize_format(fmt: &str) -> Result<Vec<FmtTok>, FmtErr> {
+/// `to_date`/`to_timestamp`/`to_char` on date/timestamp/text input all
+/// reuse the same literal format picture across every row of a
+/// statement (an invoice export rendering `placed_at` with
+/// `'YYYY-MM-DD HH24:MI:SS'` on every row, say) -- caching the tokenize
+/// result per picture text turns a repeat call into a pointer-clone of
+/// the first parse instead of a full re-scan. Same shape and same cap
+/// as `numfmt::parse_numfmt`'s cache (v1.73) and `regex::compile_opts`'s
+/// cache (v1.40): bounded so a picture built from a column value per
+/// row (not a realistic usage, but possible) cannot grow the cache
+/// unboundedly -- it just stops benefiting, falling back to parsing
+/// every time exactly as before. Only successful parses are cached; an
+/// invalid picture still reports the same error on every call.
+const FMT_TOKEN_CACHE_CAP: usize = 64;
+
+thread_local! {
+    static FMT_TOKEN_CACHE: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<Vec<FmtTok>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Split a format string into pattern/literal tokens, memoized per
+/// picture text for the life of the connection thread (see
+/// `FMT_TOKEN_CACHE` above).
+fn tokenize_format(fmt: &str) -> Result<std::rc::Rc<Vec<FmtTok>>, FmtErr> {
+    if let Some(hit) = FMT_TOKEN_CACHE.with(|c| c.borrow().get(fmt).cloned()) {
+        return Ok(hit);
+    }
+    let toks = std::rc::Rc::new(tokenize_format_uncached(fmt)?);
+    FMT_TOKEN_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= FMT_TOKEN_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(fmt.to_string(), toks.clone());
+    });
+    Ok(toks)
+}
+
+/// Matching is case-insensitive; the longest pattern wins ("HH24"
+/// before "HH").
+fn tokenize_format_uncached(fmt: &str) -> Result<Vec<FmtTok>, FmtErr> {
     // Longest-first so "HH24" is not read as "HH" + literal "24".
     const PATS: &[(&str, FmtTok)] = &[
         ("YYYY", FmtTok::Year4),
@@ -571,7 +608,7 @@ pub fn parse_with_format(input: &str, fmt: &str) -> Result<ParsedDt, FmtErr> {
     let toks = tokenize_format(fmt)?;
     let mut p = ParsedDt::default();
     let mut s = input.trim();
-    for tok in &toks {
+    for tok in toks.iter() {
         match tok {
             FmtTok::Lit(c) => match s.chars().next() {
                 Some(ch) if ch.eq_ignore_ascii_case(c) => {
@@ -782,7 +819,7 @@ pub fn format_with_pattern(days: i64, tod_micros: i64, fmt: &str) -> Result<Stri
     let ss = (tod_micros / 1_000_000) % 60;
     let us = tod_micros % 1_000_000;
     let mut out = String::new();
-    for tok in &toks {
+    for tok in toks.iter() {
         match tok {
             FmtTok::Lit(c) => out.push(*c),
             FmtTok::Year4 => out.push_str(&format!("{y:04}")),
@@ -867,7 +904,7 @@ mod tests {
             Err(FmtErr::Unsupported(_))
         ));
         // Longest match wins: HH24, not HH + "24".
-        assert_eq!(tokenize_format("HH24").unwrap(), vec![FmtTok::Hour24]);
+        assert_eq!(*tokenize_format("HH24").unwrap(), vec![FmtTok::Hour24]);
         // Case-insensitive patterns.
         assert_eq!(tokenize_format("yyyy/mm/dd").unwrap()[0], FmtTok::Year4);
     }
