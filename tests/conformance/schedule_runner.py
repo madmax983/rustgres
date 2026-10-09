@@ -302,19 +302,43 @@ class SharedServer(rr.Server):
     """A server whose data dir survives restarts (WAL recovery brings the
     committed state back), like a pg_regress cluster that crashed."""
 
+    restarts = 0
+
+    @property
+    def log_path(self):
+        return self.data_dir + ".server.log"
+
     def start(self):
         env = dict(os.environ, RUSTGRES_DATA_DIR=self.data_dir,
                    PGDATESTYLE="Postgres,MDY")
+        # Server stderr (panics, recovery errors) goes to a log beside the
+        # data dir; it is the first place to look after a restart.
+        log = open(self.log_path, "ab")
         self.proc = subprocess.Popen(
             [rr.BIN], env=env, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, preexec_fn=limit_server_memory)
-        if not rr.wait_for_port(timeout=120.0):
-            raise RuntimeError("server did not open 127.0.0.1:%d" % rr.PORT)
-        time.sleep(0.2)
+            stderr=log, preexec_fn=limit_server_memory)
+        log.close()
+        end = time.time() + 120.0
+        while time.time() < end:
+            if self.proc.poll() is not None:
+                raise ServerUnrecoverable(
+                    "server exited with %s on startup (see %s)"
+                    % (self.proc.returncode, self.log_path))
+            if rr.wait_for_port(timeout=1.0):
+                time.sleep(0.2)
+                return
+        raise ServerUnrecoverable("server did not open 127.0.0.1:%d" % rr.PORT)
 
     def restart(self):
+        self.restarts += 1
+        print("    ! server restart #%d (log: %s)" % (self.restarts, self.log_path),
+              flush=True)
         self.stop()
         self.start()
+
+
+class ServerUnrecoverable(Exception):
+    """The server cannot be brought back (e.g. WAL recovery fails)."""
 
 
 class Session:
@@ -651,7 +675,11 @@ def main():
             except (rr.WireError, OSError):
                 server.restart()
                 session = Session(server)
-            results = run_suite(session, name, failed_objects, verbose=verbose)
+            try:
+                results = run_suite(session, name, failed_objects, verbose=verbose)
+            except ServerUnrecoverable as e:
+                print("FATAL during %s: %s" % (name, e), flush=True)
+                break
             try:
                 session.conn.close()
             except Exception:
