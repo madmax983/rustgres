@@ -193,8 +193,14 @@ handle.shutdown();
   engine mutex, exactly as on the wire today. MVCC snapshots, row locks,
   `40001` serialization failures, and `SELECT ... FOR UPDATE` behave the
   same as over the wire, because it is the same code.
-- A blocked row lock (`FOR UPDATE` waiting on another connection) blocks
-  the calling thread, as it blocks a backend today.
+- Row-lock conflicts never wait. A `FOR UPDATE` or `UPDATE` that hits a
+  row locked by another open transaction fails at once with `40001`
+  (`exec/dml.rs` `check_row_lock`, which works like NOWAIT). Embedded
+  callers must handle this with a retry loop. If real lock waiting is
+  added later, it needs a wait queue *outside* the engine mutex and a
+  deadlock detector, and that is engine work, not API work.
+- `SERIALIZABLE` currently behaves like `REPEATABLE READ` (no SSI). The
+  API docs must say so, so callers don't assume write-skew protection.
 - Dropping a `Connection` with an open transaction rolls it back. Dropping
   the last `Database` handle does not checkpoint, because the WAL is
   already durable. `db.close()` checkpoints and releases the data-dir
