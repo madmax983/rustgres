@@ -6609,4 +6609,107 @@ mod tests {
         );
         assert_eq!(rows, vec!["p1|1", "p2|2"]);
     }
+
+    // --- v1.80: triggers on temp tables ----------------------------------
+
+    #[test]
+    fn v180_trigger_on_temp_table() {
+        // v1.79: CREATE TRIGGER / DROP TRIGGER versioned the table through
+        // the permanent-table catalog, which never holds temp tables, and
+        // panicked ("table still visible"), killing the connection. Hit by
+        // PG19 copy2, rangefuncs and with.
+        let (engine, wal, mut session) = v180_session("temp-trigger");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TEMP TABLE x (a int, b text)",
+                "CREATE FUNCTION fill_b() RETURNS trigger AS $$ BEGIN NEW.b := 'set'; RETURN NEW; END $$ LANGUAGE plpgsql",
+                "CREATE TRIGGER trg BEFORE INSERT ON x FOR EACH ROW EXECUTE PROCEDURE fill_b()",
+                "INSERT INTO x (a) VALUES (1)",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a, b FROM x").expect("select"));
+        assert_eq!(rows, vec!["1|set"], "the trigger fired");
+        // DROP TRIGGER is transactional on temp tables too.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "BEGIN",
+                "DROP TRIGGER trg ON x",
+                "ROLLBACK",
+                "INSERT INTO x (a) VALUES (2)",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["DROP TRIGGER trg ON x", "INSERT INTO x (a) VALUES (3)"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a, coalesce(b, '-') FROM x ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["1|set", "2|set", "3|-"]);
+    }
+
+    #[test]
+    fn v180_attach_partition_after_dropped_columns() {
+        // PG19 foreign_key's "irregular definitions" hierarchy: a two-column
+        // range key on a parent with a dropped column, and a child with
+        // three dropped columns. v1.79 crashed on the ATTACH (stale key
+        // position) and corrupted the cluster on restart.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "fk-irregular",
+            &[
+                "CREATE TABLE fk_partitioned_fk (b int, fdrop1 int, a int) PARTITION BY RANGE (a, b)",
+                "ALTER TABLE fk_partitioned_fk DROP COLUMN fdrop1",
+                "CREATE TABLE fk_partitioned_fk_1 (fdrop1 int, fdrop2 int, a int, fdrop3 int, b int)",
+                "ALTER TABLE fk_partitioned_fk_1 DROP COLUMN fdrop1, DROP COLUMN fdrop2, DROP COLUMN fdrop3",
+                "ALTER TABLE fk_partitioned_fk ATTACH PARTITION fk_partitioned_fk_1 FOR VALUES FROM (0,0) TO (1000,1000)",
+                "CREATE TABLE fk_partitioned_fk_2 PARTITION OF fk_partitioned_fk FOR VALUES FROM (1000,1000) TO (2000,2000)",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["INSERT INTO fk_partitioned_fk (a, b) VALUES (500, 501), (1500, 1501)"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a, b FROM fk_partitioned_fk ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "fk_partitioned_fk_1|500|501",
+                "fk_partitioned_fk_2|1500|1501"
+            ]
+        );
+        // Overlap is still detected against the reattached children.
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "CREATE TABLE fk_partitioned_fk_x PARTITION OF fk_partitioned_fk FOR VALUES FROM (10,10) TO (20,20)",
+        )
+        .expect_err("overlaps fk_partitioned_fk_1");
+        assert!(err.message.contains("would overlap"), "{}", err.message);
+    }
 }

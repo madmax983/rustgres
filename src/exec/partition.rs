@@ -349,12 +349,18 @@ pub(crate) fn check_bound_no_overlap(
     new_name: &str,
 ) -> Result<(), ExecError> {
     for child_name in &pinfo.children {
-        let child = eng
+        // v1.80: skip a stale link (child gone, or no longer a bounded
+        // partition) like routing does, instead of panicking. v1.79's
+        // expect()s killed the connection on state left by the WAL losing
+        // partition metadata (fixed in v1.80, RGSWAL21).
+        let Some(cbound) = eng
             .db
             .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
-            .expect("child still visible");
-        let cinfo = child.partition.as_ref().expect("child is partitioned");
-        let cbound = cinfo.bound.as_ref().expect("child has bound");
+            .and_then(|child| child.partition.as_ref())
+            .and_then(|cinfo| cinfo.bound.as_ref())
+        else {
+            continue;
+        };
         if bounds_overlap(&pinfo.method, bound, cbound) {
             return Err(exec_err(
                 "23514",
@@ -555,6 +561,16 @@ pub(crate) fn commit_table_version(
     prev: Table,
     mut next: Table,
 ) {
+    // v1.80: temp tables live in the session's temp map, not in
+    // `eng.db.tables`. Version them the temp way, so every caller (CREATE
+    // and DROP TRIGGER included) is safe on temp tables. v1.79 looked
+    // only in the permanent map and panicked "table still visible".
+    if eng.db.is_temp_table(ctx.session, name) {
+        let _ = prev; // alter_swap_temp snapshots the undo image itself
+        alter_swap_temp(eng, ctx, name, None, next, None)
+            .expect("is_temp_table just found the temp table");
+        return;
+    }
     next.created_xmin = ctx.own;
     next.dropped_xmax = 0;
     let versions = eng.db.tables.get_mut(name).expect("table still visible");
