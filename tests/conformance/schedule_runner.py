@@ -390,7 +390,7 @@ def run_suite(session, name, failed_objects, verbose=False):
     out_text = open(os.path.join(PG19, "expected", name + ".out"),
                     encoding="utf-8", errors="replace").read()
     out_lines = out_text.split("\n")
-    items = rr.split_statements(sql_text)
+    items = rr.split_statements(sql_text, keep_inner_comments=True)
     results = []  # (stmt, Verdict, err_msg)
     pos = 0
     # \if stack: each entry [branch_active, any_branch_taken, parent_active]
@@ -529,8 +529,14 @@ def run_suite(session, name, failed_objects, verbose=False):
         exec_stmt = interpolate(stmt, session.pvars)
         blocks = expected_after_echo(stmt)
         if blocks is None:
-            # Echo not found: psql-only syntax the splitter cannot model
-            # (\bind ... \g, \gx). Execute nothing; unscored.
+            # Echo not found (psql-only syntax the splitter cannot model,
+            # e.g. \bind ... \g or \gx). Still execute it -- later
+            # statements may depend on its side effects -- but leave it
+            # unscored, and count it so the report shows the blind spot.
+            actual, wedge = execute(
+                lambda: session.conn.q(rr.psql_unescape(exec_stmt)), stmt)
+            results.append((stmt, rr.Verdict(
+                "SKIP", "echo not found in .out (executed, unscored)"), ""))
             continue
 
         slow = rr.classify_too_slow(exec_stmt)

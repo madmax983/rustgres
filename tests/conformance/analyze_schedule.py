@@ -21,6 +21,24 @@ def first_words(stmt, n=2):
     return " ".join(s.split()[:n]).upper()
 
 
+def syntax_key(stmt, err):
+    """Statement kind plus the token the parser choked on, e.g.
+    `CREATE … unlogged` or `SELECT … jsonb`."""
+    m = (re.search(r'at or near "([^"]+)"', err)
+         or re.search(r'found (?:Ident|Keyword)\("?([^")]+)"?\)', err)
+         or re.search(r"found (\w+)", err)
+         or re.search(r"unexpected (?:Ident\(\")?([\w]+)", err))
+    if m:
+        return "%s … %s" % (first_words(stmt, 1), m.group(1).lower())
+    # No offending token in the message ("expected TABLE, ... after
+    # ALTER"): key on the object type, plus the action for ALTER TABLE.
+    words = re.sub(r"(?s)^\s*(--[^\n]*\n\s*)*", "", stmt).upper().split()
+    words = [w for w in words if w not in ("ONLY", "IF", "EXISTS", "OR", "REPLACE")]
+    if len(words) >= 4 and words[:2] == ["ALTER", "TABLE"]:
+        return "ALTER TABLE … %s" % " ".join(words[3:5])
+    return " ".join(words[:2])
+
+
 def categorize(f):
     """Return (bucket, key) for one failure record."""
     stmt, detail, err = f["stmt"], f["detail"], f.get("error") or ""
@@ -48,8 +66,13 @@ def categorize(f):
     m = re.search(r'unrecognized configuration parameter "([^"]+)"', err)
     if m:
         return ("missing GUC", m.group(1))
+    if "SQLSTATE 25P02" in detail:
+        return ("knock-on: statement in aborted transaction", first_words(stmt, 1))
+    if "SQLSTATE 42P01" in detail:
+        return ("knock-on: relation missing (probable cascade)",
+                (re.search(r'"([^"]+)"', err) or re.match("(.*)", "?")).group(1))
     if "syntax error" in err or "42601" in detail:
-        return ("unsupported syntax", first_words(stmt))
+        return ("unsupported syntax", syntax_key(stmt, err))
     if "0A000" in detail:
         return ("feature not supported (0A000)", first_words(stmt))
     if detail.startswith("expected ERROR") or detail.startswith("fewer result sets"):
@@ -91,7 +114,7 @@ def main():
     for b, c in buckets.most_common():
         lines.append("| %s | %d |" % (b, c))
     for b, _ in buckets.most_common():
-        if b in ("cascade",):
+        if b == "cascade" or b.startswith("knock-on"):
             continue
         lines.append("\n### %s (top 25)\n" % b)
         lines.append("| key | count | suites |")

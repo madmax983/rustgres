@@ -310,8 +310,14 @@ class Server:
 # ---------------------------------------------------------------------------
 
 
-def split_statements(text):
+def split_statements(text, keep_inner_comments=False):
     """Split .sql text into items: ('sql', text) | ('meta', text) | ('skip', reason).
+
+    keep_inner_comments: keep `--` and `/* */` comments that occur INSIDE a
+    statement (after its first token) in the item text, so the text matches
+    psql's echo in the .out file byte-for-byte. Default False preserves the
+    historical behaviour (comments dropped; such statements miss their echo
+    and are SKIPped) that the curated 22-suite baseline was measured with.
 
     Handles -- and /* */ comments, single/double-quoted strings, dollar
     quoting, psql backslash commands, and COPY ... FROM stdin/stdout data.
@@ -351,6 +357,7 @@ def split_statements(text):
             items.append(("sql", s))
 
     state = "normal"  # normal | linecomment | blockcomment | squote | dquote | dollar
+    keep_comment = False  # current comment is inside a statement (kept)
     dollar_tag = ""
     line_start = True  # at start of a line (for backslash commands)
     pending = None
@@ -415,10 +422,16 @@ def split_statements(text):
                 continue
             if c == "-" and nxt == "-":
                 state = "linecomment"
+                keep_comment = keep_inner_comments and "".join(buf).strip() != ""
+                if keep_comment:
+                    buf.append("--")
                 i += 2
                 continue
             if c == "/" and nxt == "*":
                 state = "blockcomment"
+                keep_comment = keep_inner_comments and "".join(buf).strip() != ""
+                if keep_comment:
+                    buf.append("/*")
                 i += 2
                 continue
             if c == "'":
@@ -458,6 +471,8 @@ def split_statements(text):
             continue
 
         if state == "linecomment":
+            if keep_comment:
+                buf.append(c)
             if c == "\n":
                 state = "normal"
                 line_start = True
@@ -466,9 +481,13 @@ def split_statements(text):
 
         if state == "blockcomment":
             if c == "*" and nxt == "/":
+                if keep_comment:
+                    buf.append("*/")
                 state = "normal"
                 i += 2
             else:
+                if keep_comment:
+                    buf.append(c)
                 i += 1
             continue
 
