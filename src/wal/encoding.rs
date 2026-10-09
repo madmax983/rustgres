@@ -718,6 +718,7 @@ impl Enc {
                 attnums,
                 next_attnum,
                 fillfactor,
+                partition,
                 xmin,
             } => {
                 self.u8(1);
@@ -748,6 +749,9 @@ impl Enc {
                 self.i16(*next_attnum);
                 self.u8(*fillfactor);
                 self.u64(*xmin);
+                // v1.80 (RGSWAL21): partition metadata, last so an
+                // RGSWAL20 record is an exact prefix of this layout.
+                self.partition(partition);
             }
             WalRecord::InsertRows { table, rows } => {
                 self.u8(2);
@@ -873,6 +877,7 @@ impl Enc {
                 fillfactor,
                 next_value_id,
                 toast_info,
+                partition,
                 xmin,
             } => {
                 self.u8(7);
@@ -916,6 +921,8 @@ impl Enc {
                     self.u8(*c);
                 }
                 self.u64(*xmin);
+                // v1.80 (RGSWAL21): partition metadata, last (see CreateTable).
+                self.partition(partition);
             }
             WalRecord::CreateView {
                 name,
@@ -1226,6 +1233,83 @@ impl Enc {
     }
 
     /// v0.96: encode a `Vec<String>` (inheritance parent links).
+    /// v1.80: partition metadata, shared by checkpoint table entries and
+    /// the WAL `CreateTable`/`AlterTable` records (one codec, one format).
+    /// Layout: presence byte, method, key (col + optional expression),
+    /// optional bound, default flag, optional parent, children, and the
+    /// v0.72 `is_partitioned` flag.
+    pub(crate) fn partition(&mut self, part: &Option<crate::storage::PartitionInfo>) {
+        let Some(p) = part else {
+            self.u8(0);
+            return;
+        };
+        self.u8(1);
+        self.u8(match p.method {
+            crate::storage::PartMethod::Range => 0,
+            crate::storage::PartMethod::List => 1,
+            crate::storage::PartMethod::Hash => 2,
+        });
+        self.u32(p.key.len() as u32);
+        for k in &p.key {
+            self.u64(k.col as u64);
+            if let Some(e) = &k.expr {
+                self.u8(1);
+                // v0.69: serialize the key expression as
+                // debug string; parsed back on load for the
+                // common cases (column, arith, func).
+                // FULL support is a gap (see decode below).
+                self.str(&format!("{:?}", e));
+            } else {
+                self.u8(0);
+            }
+        }
+        if let Some(b) = &p.bound {
+            self.u8(1);
+            match b {
+                crate::storage::PartBound::List { values, has_null } => {
+                    self.u8(0);
+                    self.u32(values.len() as u32);
+                    for v in values {
+                        self.value(v);
+                    }
+                    self.u8(if *has_null { 1 } else { 0 });
+                }
+                crate::storage::PartBound::Range { lower, upper } => {
+                    self.u8(1);
+                    self.u32(lower.len() as u32);
+                    for rb in lower {
+                        encode_range_bound(self, rb);
+                    }
+                    self.u32(upper.len() as u32);
+                    for rb in upper {
+                        encode_range_bound(self, rb);
+                    }
+                }
+                crate::storage::PartBound::Hash { modulus, remainder } => {
+                    self.u8(2);
+                    self.u32(*modulus);
+                    self.u32(*remainder);
+                }
+            }
+        } else {
+            self.u8(0);
+        }
+        self.u8(if p.is_default { 1 } else { 0 });
+        if let Some(par) = &p.parent {
+            self.u8(1);
+            self.str(par);
+        } else {
+            self.u8(0);
+        }
+        self.u32(p.children.len() as u32);
+        for c in &p.children {
+            self.str(c);
+        }
+        // v0.72: whether this table is itself partitioned
+        // (a childless partitioned table is not a leaf).
+        self.u8(if p.is_partitioned { 1 } else { 0 });
+    }
+
     pub(crate) fn str_list(&mut self, v: &[String]) {
         self.u32(v.len() as u32);
         for s in v {
@@ -1317,11 +1401,29 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     pub(crate) buf: &'a [u8],
     pub(crate) pos: usize,
+    /// v1.80: WAL format version of the frames being decoded (the number
+    /// in the `RGSWALnn` magic). Records gain trailing fields across
+    /// versions; decoders read them only when the log is new enough.
+    /// Checkpoints and in-memory round trips use the current version.
+    pub(crate) wal_version: u32,
 }
 
 impl<'a> Dec<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Dec { buf, pos: 0 }
+        Dec {
+            buf,
+            pos: 0,
+            wal_version: crate::wal::writer::WAL_VERSION,
+        }
+    }
+
+    /// v1.80: decode frames written under an older WAL format version.
+    pub(crate) fn with_wal_version(buf: &'a [u8], wal_version: u32) -> Self {
+        Dec {
+            buf,
+            pos: 0,
+            wal_version,
+        }
     }
 
     pub(crate) fn err(&self, what: &str) -> String {
@@ -1680,6 +1782,12 @@ impl<'a> Dec<'a> {
                 let next_attnum = self.i16()?;
                 let fillfactor = self.u8()?;
                 let xmin = self.u64()?;
+                // v1.80 (RGSWAL21): trailing partition metadata.
+                let partition = if self.wal_version >= 21 {
+                    self.partition()?
+                } else {
+                    None
+                };
                 Ok(WalRecord::CreateTable {
                     name,
                     columns,
@@ -1697,6 +1805,7 @@ impl<'a> Dec<'a> {
                     attnums,
                     next_attnum,
                     fillfactor,
+                    partition,
                     xmin,
                 })
             }
@@ -1839,6 +1948,12 @@ impl<'a> Dec<'a> {
                     toast_info.push((self.u32()?, self.u8()?));
                 }
                 let xmin = self.u64()?;
+                // v1.80 (RGSWAL21): trailing partition metadata.
+                let partition = if self.wal_version >= 21 {
+                    self.partition()?
+                } else {
+                    None
+                };
                 Ok(WalRecord::AlterTable {
                     name,
                     columns,
@@ -1861,6 +1976,7 @@ impl<'a> Dec<'a> {
                     fillfactor,
                     next_value_id,
                     toast_info,
+                    partition,
                     xmin,
                 })
             }
@@ -2244,6 +2360,94 @@ impl<'a> Dec<'a> {
     }
 
     /// v0.96: decode a `Vec<String>` (inheritance parent links).
+    /// v1.80: decode [`Enc::partition`].
+    pub(crate) fn partition(&mut self) -> Result<Option<crate::storage::PartitionInfo>, String> {
+        let has_partition = self.u8()? != 0;
+        if !has_partition {
+            return Ok(None);
+        }
+        {
+            let method_tag = self.u8()?;
+            let method = match method_tag {
+                0 => crate::storage::PartMethod::Range,
+                1 => crate::storage::PartMethod::List,
+                2 => crate::storage::PartMethod::Hash,
+                _ => return Err(self.err("bad partition method tag")),
+            };
+            let n_keys = self.u32()? as usize;
+            let mut key = Vec::with_capacity(n_keys);
+            for _ in 0..n_keys {
+                let col = self.u64()? as usize;
+                let has_expr = self.u8()? != 0;
+                let expr = if has_expr {
+                    let s = self.str()?;
+                    // v0.69: parse the debug-format expression back.
+                    // Only the common cases are supported; others become
+                    // None (routing will fail — documented gap).
+                    parse_partition_expr(&s)
+                } else {
+                    None
+                };
+                key.push(crate::storage::PartKey { col, expr });
+            }
+            let has_bound = self.u8()? != 0;
+            let bound = if has_bound {
+                let bound_tag = self.u8()?;
+                match bound_tag {
+                    0 => {
+                        let n_vals = self.u32()? as usize;
+                        let mut values = Vec::with_capacity(n_vals);
+                        for _ in 0..n_vals {
+                            values.push(self.value()?);
+                        }
+                        let has_null = self.u8()? != 0;
+                        Some(crate::storage::PartBound::List { values, has_null })
+                    }
+                    1 => {
+                        let n_lo = self.u32()? as usize;
+                        let mut lower = Vec::with_capacity(n_lo);
+                        for _ in 0..n_lo {
+                            lower.push(decode_range_bound(self)?);
+                        }
+                        let n_hi = self.u32()? as usize;
+                        let mut upper = Vec::with_capacity(n_hi);
+                        for _ in 0..n_hi {
+                            upper.push(decode_range_bound(self)?);
+                        }
+                        Some(crate::storage::PartBound::Range { lower, upper })
+                    }
+                    2 => {
+                        let modulus = self.u32()?;
+                        let remainder = self.u32()?;
+                        Some(crate::storage::PartBound::Hash { modulus, remainder })
+                    }
+                    _ => return Err(self.err("bad partition bound tag")),
+                }
+            } else {
+                None
+            };
+            let is_default = self.u8()? != 0;
+            let has_parent = self.u8()? != 0;
+            let parent = if has_parent { Some(self.str()?) } else { None };
+            let n_children = self.u32()? as usize;
+            let mut children = Vec::with_capacity(n_children);
+            for _ in 0..n_children {
+                children.push(self.str()?);
+            }
+            // v0.72: the is_partitioned flag (format version 11).
+            let is_partitioned = self.u8()? != 0;
+            Ok(Some(crate::storage::PartitionInfo {
+                method,
+                key,
+                bound,
+                is_default,
+                parent,
+                children,
+                is_partitioned,
+            }))
+        }
+    }
+
     pub(crate) fn str_list_d(&mut self) -> Result<Vec<String>, String> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n);

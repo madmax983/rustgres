@@ -6509,4 +6509,104 @@ mod tests {
         );
         assert_eq!(rows, vec!["p1|1|5", "p2|2|15"]);
     }
+
+    // --- v1.80: partitioning must survive a restart -------------------------
+
+    #[test]
+    fn v180_partitioning_survives_restart() {
+        // v1.79 never WAL-logged partition metadata (only checkpoints held
+        // it). After a crash, the parent was a plain table: its existing
+        // rows vanished from `SELECT ... FROM p`, new rows landed in the
+        // parent itself, and unroutable rows were accepted.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "partitions",
+            &[
+                "CREATE TABLE p (a int, b text) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "CREATE TABLE c3 (b text, a int)",
+                "ALTER TABLE p ATTACH PARTITION c3 FOR VALUES IN (3)",
+                "CREATE TABLE r (a int, k int) PARTITION BY RANGE (k)",
+                "CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10) PARTITION BY LIST (a)",
+                "CREATE TABLE r1a PARTITION OF r1 FOR VALUES IN (7)",
+                "INSERT INTO p VALUES (1, 'one'), (3, 'three')",
+                "INSERT INTO r VALUES (7, 5)",
+            ],
+        );
+        // Rows written before the crash are still reachable via the parent.
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a, b FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1|one", "c3|3|three"]);
+        // New rows still route, including into the attached partition.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "INSERT INTO p VALUES (1, 'uno'), (3, 'tres')",
+                "INSERT INTO r VALUES (7, 6)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT count(*) FROM c3").expect("count"),
+        );
+        assert_eq!(rows, vec!["2"]);
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, k FROM r ORDER BY k",
+            )
+            .expect("sub-partitioned select"),
+        );
+        assert_eq!(rows, vec!["r1a|5", "r1a|6"]);
+        // Unroutable rows are still rejected.
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO p VALUES (5, 'five')",
+        )
+        .expect_err("no partition for 5");
+        assert_eq!(err.code, "23514");
+    }
+
+    #[test]
+    fn v180_partition_key_shift_survives_restart() {
+        // The DROP COLUMN key shift (v1.80) must be durable too.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "pkey-shift",
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "ALTER TABLE p DROP x",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES IN (2)",
+                "INSERT INTO p VALUES (1), (2)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1", "p2|2"]);
+    }
 }

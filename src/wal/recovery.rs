@@ -19,6 +19,38 @@ pub(crate) fn live_table<'e>(eng: &'e mut Engine, name: &str) -> Option<&'e mut 
         .and_then(|vs| vs.iter_mut().find(|t| t.dropped_xmax == 0))
 }
 
+/// v1.80: adapt a record from an `RGSWAL20` log to current semantics.
+/// Those logs never carried partition metadata, so an `AlterTable` on a
+/// partitioned table (ATTACH, a link from PARTITION OF, any ALTER) decodes
+/// with `partition: None`. Applied as-is it would de-partition the table.
+/// Carry the live version's metadata forward instead. That metadata came
+/// from the checkpoint image, or from an earlier record in the same log.
+/// `CreateTable` cannot be repaired this way: v1.79 lost that metadata at
+/// write time.
+pub(crate) fn legacy_fill_partition(eng: &Engine, r: &WalRecord) -> Option<WalRecord> {
+    let WalRecord::AlterTable {
+        name,
+        partition: None,
+        ..
+    } = r
+    else {
+        return None;
+    };
+    let live = eng
+        .db
+        .tables
+        .get(name)?
+        .iter()
+        .find(|v| v.dropped_xmax == 0)?
+        .partition
+        .clone()?;
+    let mut out = r.clone();
+    if let WalRecord::AlterTable { partition, .. } = &mut out {
+        *partition = Some(live);
+    }
+    Some(out)
+}
+
 /// Apply one record during recovery. Records replay in commit order, so
 /// the version chains — and therefore visibility — are rebuilt exactly.
 pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
@@ -366,9 +398,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             attnums,
             next_attnum,
             fillfactor,
+            partition,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.80: partition metadata (None on RGSWAL20 logs).
+            t.partition = partition.clone();
             // v1.41: restore attnums, the next-attnum counter, and
             // fillfactor.
             t.attnums = attnums.clone();
@@ -661,6 +696,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             fillfactor,
             next_value_id,
             toast_info,
+            partition,
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
@@ -669,6 +705,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 prev.dropped_xmax = *xmin;
             }
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.80: partition metadata (ATTACH, PARTITION OF, DROP COLUMN
+            // key shifts). RGSWAL20 records never carried it; open() fills
+            // it in from the live version before replay (see
+            // `legacy_fill_partition`), so here None means "not partitioned".
+            t.partition = partition.clone();
             // v1.41: restore attnums, the next-attnum counter, and
             // fillfactor.
             t.attnums = attnums.clone();
@@ -1113,6 +1154,8 @@ pub fn records_for_commit(
                     attnums: ours.attnums.clone(),
                     next_attnum: ours.next_attnum,
                     fillfactor: ours.fillfactor,
+                    // v1.80: partition metadata (RGSWAL21).
+                    partition: ours.partition.clone(),
                     xmin: own,
                 });
             }
@@ -1186,6 +1229,8 @@ pub fn records_for_commit(
                         .iter()
                         .map(|(k, v)| (*k, if v.compressed { v.method.code() } else { 0 }))
                         .collect(),
+                    // v1.80: partition metadata (RGSWAL21).
+                    partition: ours.partition.clone(),
                     xmin: own,
                 });
             }

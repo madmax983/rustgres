@@ -64,7 +64,16 @@ pub(crate) const CHKPT_VERSION: u32 = 17;
 /// v1.41: `RGSWAL20` — `CreateTable`/`AlterTable` carry `attnums`,
 /// `next_attnum`, and `fillfactor`. Old `RGSWAL19` files are refused
 /// loudly.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL20";
+/// v1.80: `RGSWAL21` — `CreateTable`/`AlterTable` carry partition
+/// metadata (before, only checkpoints did, so a crash between checkpoints
+/// lost partitioning). `RGSWAL20` logs are still READ (the field decodes
+/// as absent); opening one replays it and immediately checkpoints, so the
+/// live generation is always current-format before anything is appended.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL21";
+/// v1.80: the format version number in [`WAL_MAGIC`].
+pub(crate) const WAL_VERSION: u32 = 21;
+/// v1.80: oldest WAL format this build can replay.
+pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
 
 /// Encode a WAL file header for a generation starting at `base_lsn`.
@@ -79,7 +88,9 @@ pub(crate) fn encode_wal_header(base_lsn: u64) -> [u8; 16] {
 /// header is torn (short file) — both mean "start a fresh generation";
 /// see the module docs for why that is safe. A complete header with the
 /// wrong magic is an error (incompatible format, e.g. v0.4 data).
-pub(crate) fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
+/// v1.80: returns `(base_lsn, format_version)`; any version from
+/// [`MIN_READABLE_WAL_VERSION`] to [`WAL_VERSION`] is accepted.
+pub(crate) fn read_wal_header(file: &mut File) -> std::io::Result<Option<(u64, u32)>> {
     let mut hdr = [0u8; 16];
     file.seek(SeekFrom::Start(0))?;
     let mut got = 0;
@@ -99,12 +110,24 @@ pub(crate) fn read_wal_header(file: &mut File) -> std::io::Result<Option<u64>> {
     // A full 16-byte header with the wrong magic (e.g. an older
     // `RGSWAL05` file, whose record format is incompatible) is a loud
     // error: silently treating it as empty would lose data.
-    if &hdr[..8] != WAL_MAGIC {
+    let version = wal_magic_version(&hdr[..8])
+        .filter(|v| (MIN_READABLE_WAL_VERSION..=WAL_VERSION).contains(v));
+    let Some(version) = version else {
         return Err(io_err(
             "wal.log has an unrecognized magic; this rustgres cannot read older data - remove the data directory".to_string(),
         ));
+    };
+    let base = u64::from_be_bytes(hdr[8..].try_into().expect("16-byte header"));
+    Ok(Some((base, version)))
+}
+
+/// v1.80: the format version of an `RGSWALnn` magic, if it is one.
+fn wal_magic_version(magic: &[u8]) -> Option<u32> {
+    let digits = magic.strip_prefix(b"RGSWAL")?;
+    if digits.len() != 2 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
     }
-    Ok(Some(u64::from_be_bytes(hdr[8..].try_into().unwrap())))
+    Some(u32::from(digits[0] - b'0') * 10 + u32::from(digits[1] - b'0'))
 }
 
 // ---------------------------------------------------------------------------
@@ -203,14 +226,14 @@ impl Wal {
         // data dir) or a torn header (crash during the WAL reset inside
         // checkpoint()) starts a new generation at the checkpoint's
         // logical end — safe per the module docs.
-        let base_lsn = match read_wal_header(&mut file)? {
+        let (base_lsn, wal_version) = match read_wal_header(&mut file)? {
             Some(b) => b,
             None => {
                 file.set_len(0)?;
                 file.write_all(&encode_wal_header(wal_end))?;
                 file.sync_all()?;
                 file_len = WAL_HEADER_LEN;
-                wal_end
+                (wal_end, WAL_VERSION)
             }
         };
 
@@ -223,7 +246,7 @@ impl Wal {
         file.seek(SeekFrom::Start(WAL_HEADER_LEN))?;
         loop {
             let phys = file.stream_position()?;
-            let frame = match read_frame(&mut file)? {
+            let frame = match read_frame(&mut file, wal_version)? {
                 None => break, // clean EOF or torn tail
                 Some(f) => f,
             };
@@ -233,7 +256,13 @@ impl Wal {
             }
             max_txn = max_txn.max(frame.txn_id);
             for r in &frame.records {
-                apply_record(&mut eng, r).map_err(io_err)?;
+                // v1.80: older logs lack fields current records carry.
+                let legacy = if wal_version < WAL_VERSION {
+                    crate::wal::recovery::legacy_fill_partition(&eng, r)
+                } else {
+                    None
+                };
+                apply_record(&mut eng, legacy.as_ref().unwrap_or(r)).map_err(io_err)?;
                 records += 1;
             }
             batches += 1;
@@ -251,17 +280,27 @@ impl Wal {
             records,
             dir.display()
         );
-        Ok((
-            eng,
-            Wal {
-                dir: dir.to_path_buf(),
-                file,
-                len: file_len,
-                base_lsn,
-                next_txn: max_txn + 1,
-                system_id,
-            },
-        ))
+        let mut wal = Wal {
+            dir: dir.to_path_buf(),
+            file,
+            len: file_len,
+            base_lsn,
+            next_txn: max_txn + 1,
+            system_id,
+        };
+        // v1.80: an older-format generation was replayed. Snapshot it and
+        // start a fresh current-format generation before anything can be
+        // appended, so new-format frames never land behind an old header.
+        if wal_version < WAL_VERSION {
+            wal.checkpoint(&eng)?;
+            println!(
+                "rustgres v{} recovery: upgraded wal.log from RGSWAL{} to RGSWAL{}",
+                crate::server::SERVER_VERSION,
+                wal_version,
+                WAL_VERSION
+            );
+        }
+        Ok((eng, wal))
     }
 
     /// v0.13: the cluster's stable random identifier (IDENTIFY_SYSTEM).
@@ -286,7 +325,9 @@ impl Wal {
         self.file.seek(SeekFrom::Start(WAL_HEADER_LEN))?;
         loop {
             let phys = self.file.stream_position()?;
-            let frame = match read_frame(&mut self.file)? {
+            // The live generation is always current-format (open()
+            // upgrades older logs before anything is appended).
+            let frame = match read_frame(&mut self.file, WAL_VERSION)? {
                 None => break, // clean EOF or torn tail
                 Some(f) => f,
             };
@@ -440,76 +481,9 @@ impl Wal {
                         body.u32(*f);
                     }
                 }
-                // v0.69: partition metadata.
-                if let Some(p) = &t.partition {
-                    body.u8(1);
-                    body.u8(match p.method {
-                        crate::storage::PartMethod::Range => 0,
-                        crate::storage::PartMethod::List => 1,
-                        crate::storage::PartMethod::Hash => 2,
-                    });
-                    body.u32(p.key.len() as u32);
-                    for k in &p.key {
-                        body.u64(k.col as u64);
-                        if let Some(e) = &k.expr {
-                            body.u8(1);
-                            // v0.69: serialize the key expression as
-                            // debug string; parsed back on load for the
-                            // common cases (column, arith, func).
-                            // FULL support is a gap (see decode below).
-                            body.str(&format!("{:?}", e));
-                        } else {
-                            body.u8(0);
-                        }
-                    }
-                    if let Some(b) = &p.bound {
-                        body.u8(1);
-                        match b {
-                            crate::storage::PartBound::List { values, has_null } => {
-                                body.u8(0);
-                                body.u32(values.len() as u32);
-                                for v in values {
-                                    body.value(v);
-                                }
-                                body.u8(if *has_null { 1 } else { 0 });
-                            }
-                            crate::storage::PartBound::Range { lower, upper } => {
-                                body.u8(1);
-                                body.u32(lower.len() as u32);
-                                for rb in lower {
-                                    encode_range_bound(&mut body, rb);
-                                }
-                                body.u32(upper.len() as u32);
-                                for rb in upper {
-                                    encode_range_bound(&mut body, rb);
-                                }
-                            }
-                            crate::storage::PartBound::Hash { modulus, remainder } => {
-                                body.u8(2);
-                                body.u32(*modulus);
-                                body.u32(*remainder);
-                            }
-                        }
-                    } else {
-                        body.u8(0);
-                    }
-                    body.u8(if p.is_default { 1 } else { 0 });
-                    if let Some(par) = &p.parent {
-                        body.u8(1);
-                        body.str(par);
-                    } else {
-                        body.u8(0);
-                    }
-                    body.u32(p.children.len() as u32);
-                    for c in &p.children {
-                        body.str(c);
-                    }
-                    // v0.72: whether this table is itself partitioned
-                    // (a childless partitioned table is not a leaf).
-                    body.u8(if p.is_partitioned { 1 } else { 0 });
-                } else {
-                    body.u8(0);
-                }
+                // v0.69: partition metadata (v1.80: shared with the WAL
+                // CreateTable/AlterTable records, see Enc::partition).
+                body.partition(&t.partition);
                 // v0.96: inheritance parent links.
                 body.str_list(&t.inherits);
                 n_versions += 1;
@@ -863,7 +837,9 @@ pub(crate) struct Frame {
 
 /// Read one WAL frame. `Ok(None)` = clean EOF (no bytes) or a torn tail
 /// (short read / bad CRC): recovery stops, the partial batch is dropped.
-pub(crate) fn read_frame(file: &mut File) -> std::io::Result<Option<Frame>> {
+/// v1.80: `wal_version` is the format of the generation being read (see
+/// [`read_wal_header`]); records decode their version-gated fields by it.
+pub(crate) fn read_frame(file: &mut File, wal_version: u32) -> std::io::Result<Option<Frame>> {
     let mut len_buf = [0u8; 4];
     match file.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -889,7 +865,7 @@ pub(crate) fn read_frame(file: &mut File) -> std::io::Result<Option<Frame>> {
     if crc32(body) != want {
         return Ok(None); // torn tail
     }
-    let mut d = Dec::new(body);
+    let mut d = Dec::with_wal_version(body, wal_version);
     let txn_id = d.u64().map_err(io_err)?;
     let n = d.u32().map_err(io_err)? as usize;
     let mut records = Vec::with_capacity(n);
@@ -1092,92 +1068,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         for __rv in rows {
             __t.push_version(__rv);
         }
-        // v0.69: partition metadata.
-        let has_partition = d.u8().map_err(|e| bad(&e))? != 0;
-        if has_partition {
-            let method_tag = d.u8().map_err(|e| bad(&e))?;
-            let method = match method_tag {
-                0 => crate::storage::PartMethod::Range,
-                1 => crate::storage::PartMethod::List,
-                2 => crate::storage::PartMethod::Hash,
-                _ => return Err(bad("bad partition method tag")),
-            };
-            let n_keys = d.u32().map_err(|e| bad(&e))? as usize;
-            let mut key = Vec::with_capacity(n_keys);
-            for _ in 0..n_keys {
-                let col = d.u64().map_err(|e| bad(&e))? as usize;
-                let has_expr = d.u8().map_err(|e| bad(&e))? != 0;
-                let expr = if has_expr {
-                    let s = d.str().map_err(|e| bad(&e))?;
-                    // v0.69: parse the debug-format expression back.
-                    // Only the common cases are supported; others become
-                    // None (routing will fail — documented gap).
-                    parse_partition_expr(&s)
-                } else {
-                    None
-                };
-                key.push(crate::storage::PartKey { col, expr });
-            }
-            let has_bound = d.u8().map_err(|e| bad(&e))? != 0;
-            let bound = if has_bound {
-                let bound_tag = d.u8().map_err(|e| bad(&e))?;
-                match bound_tag {
-                    0 => {
-                        let n_vals = d.u32().map_err(|e| bad(&e))? as usize;
-                        let mut values = Vec::with_capacity(n_vals);
-                        for _ in 0..n_vals {
-                            values.push(d.value().map_err(|e| bad(&e))?);
-                        }
-                        let has_null = d.u8().map_err(|e| bad(&e))? != 0;
-                        Some(crate::storage::PartBound::List { values, has_null })
-                    }
-                    1 => {
-                        let n_lo = d.u32().map_err(|e| bad(&e))? as usize;
-                        let mut lower = Vec::with_capacity(n_lo);
-                        for _ in 0..n_lo {
-                            lower.push(decode_range_bound(&mut d).map_err(|e| bad(&e))?);
-                        }
-                        let n_hi = d.u32().map_err(|e| bad(&e))? as usize;
-                        let mut upper = Vec::with_capacity(n_hi);
-                        for _ in 0..n_hi {
-                            upper.push(decode_range_bound(&mut d).map_err(|e| bad(&e))?);
-                        }
-                        Some(crate::storage::PartBound::Range { lower, upper })
-                    }
-                    2 => {
-                        let modulus = d.u32().map_err(|e| bad(&e))?;
-                        let remainder = d.u32().map_err(|e| bad(&e))?;
-                        Some(crate::storage::PartBound::Hash { modulus, remainder })
-                    }
-                    _ => return Err(bad("bad partition bound tag")),
-                }
-            } else {
-                None
-            };
-            let is_default = d.u8().map_err(|e| bad(&e))? != 0;
-            let has_parent = d.u8().map_err(|e| bad(&e))? != 0;
-            let parent = if has_parent {
-                Some(d.str().map_err(|e| bad(&e))?)
-            } else {
-                None
-            };
-            let n_children = d.u32().map_err(|e| bad(&e))? as usize;
-            let mut children = Vec::with_capacity(n_children);
-            for _ in 0..n_children {
-                children.push(d.str().map_err(|e| bad(&e))?);
-            }
-            // v0.72: the is_partitioned flag (format version 11).
-            let is_partitioned = d.u8().map_err(|e| bad(&e))? != 0;
-            __t.partition = Some(crate::storage::PartitionInfo {
-                method,
-                key,
-                bound,
-                is_default,
-                parent,
-                children,
-                is_partitioned,
-            });
-        }
+        // v0.69: partition metadata (v1.80: shared codec, Dec::partition).
+        __t.partition = d.partition().map_err(|e| bad(&e))?;
         // v0.96: inheritance parent links (format version 16).
         __t.inherits = d.str_list_d().map_err(|e| bad(&e))?;
         eng.db.tables.entry(name).or_default().push(__t);

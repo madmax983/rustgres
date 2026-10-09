@@ -123,6 +123,7 @@ fn record_roundtrip_all_kinds() {
             attnums: vec![1],
             next_attnum: 2,
             fillfactor: 100,
+            partition: Some(v180_sample_partition()),
             xmin: 3,
         },
         WalRecord::InsertRows {
@@ -244,6 +245,7 @@ fn v96_create_table_inherits_roundtrip() {
         attnums: vec![1],
         next_attnum: 2,
         fillfactor: 100,
+        partition: None,
         xmin: 3,
     };
     assert_eq!(&roundtrip(&create), &create);
@@ -268,6 +270,7 @@ fn v96_create_table_inherits_roundtrip() {
         attnums: vec![1],
         next_attnum: 2,
         fillfactor: 100,
+        partition: None,
         next_value_id: 1,
         toast_info: vec![],
         xmin: 4,
@@ -404,6 +407,7 @@ fn apply_record_rebuilds_versions_and_counters() {
             attnums: vec![1],
             next_attnum: 2,
             fillfactor: 100,
+            partition: None,
             xmin: 4,
         },
     )
@@ -759,5 +763,154 @@ fn v180_replays_v179_drop_column_wal() {
         .expect("unique index survives recovery");
     assert_eq!(ix.def.cols, vec![0]);
     assert_eq!(ix.def.dropped_xmax, 0);
+    // Opening an older-format log upgrades the data directory before any
+    // new frame is appended: the live WAL generation carries the current
+    // magic, so new-format records never land in an old-format file.
+    let mut hdr = [0u8; 8];
+    use std::io::Read;
+    std::fs::File::open(dir.join("wal.log"))
+        .and_then(|mut f| f.read_exact(&mut hdr))
+        .expect("read header");
+    assert_eq!(&hdr, WAL_MAGIC);
+    drop(eng);
+    // And the upgraded directory reopens with the same contents.
+    let (eng, _wal) = Wal::open(&dir).expect("upgraded dir reopens");
+    assert!(eng.db.indexes.contains_key("t_a_key"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A partition descriptor exercising every encoded field: a range bound
+/// with an unbounded side, an expression key, a parent link and children.
+fn v180_sample_partition() -> crate::storage::PartitionInfo {
+    use crate::storage::{PartBound, PartKey, PartMethod, PartitionInfo, RangeBound};
+    PartitionInfo {
+        method: PartMethod::Range,
+        key: vec![PartKey { col: 1, expr: None }],
+        bound: Some(PartBound::Range {
+            lower: vec![RangeBound::Val(Value::Int(0))],
+            upper: vec![RangeBound::Max],
+        }),
+        is_default: false,
+        parent: Some("root".into()),
+        children: vec!["leaf_a".into(), "leaf_b".into()],
+        is_partitioned: true,
+    }
+}
+
+#[test]
+fn v180_rgswal20_records_decode_without_partition() {
+    // An RGSWAL20 frame ends at xmin; decoding it as version 20 must not
+    // read past the record (no trailing partition field).
+    let rec = WalRecord::CreateTable {
+        name: "t".into(),
+        columns: vec![("a".into(), ColType::Int)],
+        constraints: "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".into(),
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        col_compression: vec![0],
+        composite_types: vec![None],
+        domain_types: vec![None],
+        domain_elem: vec![false],
+        inherits: vec![],
+        attnums: vec![1],
+        next_attnum: 2,
+        fillfactor: 100,
+        partition: Some(v180_sample_partition()),
+        xmin: 3,
+    };
+    let mut e = Enc::new();
+    e.record(&rec);
+    // Strip the trailing v21 partition bytes to get the v20 layout.
+    let mut tail = Enc::new();
+    tail.partition(&Some(v180_sample_partition()));
+    let v20 = &e.buf[..e.buf.len() - tail.buf.len()];
+    let mut d = Dec::with_wal_version(v20, 20);
+    match d.record().unwrap() {
+        WalRecord::CreateTable {
+            partition, xmin, ..
+        } => {
+            assert_eq!(partition, None);
+            assert_eq!(xmin, 3);
+        }
+        other => panic!("expected CreateTable, got {:?}", other),
+    }
+    d.end().unwrap();
+    // And the full v21 bytes round-trip the partition.
+    let mut d = Dec::new(&e.buf);
+    assert_eq!(d.record().unwrap(), rec);
+    d.end().unwrap();
+}
+
+#[test]
+fn v180_legacy_fill_partition_keeps_live_metadata() {
+    // An RGSWAL20 AlterTable on a partitioned table decodes with no
+    // partition metadata. open() must carry the live version's metadata
+    // forward instead of de-partitioning the table.
+    let empty_constraints =
+        "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+    let mut eng = Engine::new();
+    apply_record(
+        &mut eng,
+        &WalRecord::CreateTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints.clone(),
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec![],
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            partition: Some(v180_sample_partition()),
+            xmin: 3,
+        },
+    )
+    .unwrap();
+    let legacy_alter = WalRecord::AlterTable {
+        name: "c".into(),
+        columns: vec![("a".into(), ColType::Int)],
+        constraints: empty_constraints,
+        copy_rows: true,
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        toast_target: 0,
+        col_storage: vec![0],
+        col_compression: vec![0],
+        composite_types: vec![None],
+        domain_types: vec![None],
+        domain_elem: vec![false],
+        inherits: vec![],
+        attnums: vec![1],
+        next_attnum: 2,
+        fillfactor: 100,
+        partition: None,
+        next_value_id: 1,
+        toast_info: vec![],
+        xmin: 4,
+    };
+    let filled = legacy_fill_partition(&eng, &legacy_alter).expect("filled");
+    apply_record(&mut eng, &filled).unwrap();
+    let live = eng.db.tables["c"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    assert_eq!(live.partition, Some(v180_sample_partition()));
+    // A current-format record is applied exactly as written: None means
+    // "not partitioned", and an unpartitioned table needs no fill.
+    let mut plain = Engine::new();
+    assert!(legacy_fill_partition(&plain, &legacy_alter).is_none());
+    apply_record(&mut plain, &legacy_alter).unwrap();
 }
