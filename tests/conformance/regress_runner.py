@@ -99,9 +99,9 @@ class WireError(Exception):
 
 
 class Conn:
-    def __init__(self):
+    def __init__(self, user="postgres"):
         self.s = socket.create_connection((HOST, PORT), timeout=STMT_TIMEOUT)
-        body = struct.pack("!i", 196608) + b"user\x00postgres\x00\x00"
+        body = struct.pack("!i", 196608) + b"user\x00" + user.encode() + b"\x00\x00"
         self.s.sendall(struct.pack("!i", len(body) + 4) + body)
         self._drain_until_ready()
 
@@ -145,6 +145,10 @@ class Conn:
                # apart from a utility that emits no RowDescription at all.
                "saw_desc": False}
         all_oids, all_names, all_rows, all_codes = [], [], [], []
+        # Error message text ('M' field), parallel to all_codes. Not used
+        # for verdicts (wording is ours by design); reports use it to
+        # categorize failures.
+        all_msgs = []
         all_tag = ""
         while True:
             t, p = self._read_msg()
@@ -182,6 +186,7 @@ class Conn:
                     fields[chr(p[pos])] = p[pos + 1 : e].decode()
                     pos = e + 1
                 all_codes.append(fields.get("C", "?"))
+                all_msgs.append(fields.get("M", ""))
                 cur["err_codes"].append(fields.get("C", "?"))
             elif t == b"C":
                 all_tag = p[:-1].decode()
@@ -201,6 +206,7 @@ class Conn:
                     "colnames": all_names,
                     "rows": all_rows,
                     "err_codes": all_codes,
+                    "err_msgs": all_msgs,
                     "tag": all_tag,
                     "sets": sets,
                 }
@@ -213,7 +219,7 @@ class Conn:
         CommandComplete -> ReadyForQuery.
         """
         self.s.sendall(msg(b"Q", cstr(sql)))
-        codes, tag = [], ""
+        codes, msgs, tag = [], [], ""
         # Expect CopyInResponse ('G').
         t, p = self._read_msg()
         if t == b"E":
@@ -224,7 +230,8 @@ class Conn:
                 pos = e + 1
             codes.append(fields.get("C", "?"))
             self._drain_until_ready()
-            return {"err_codes": codes, "tag": tag, "rows": []}
+            return {"err_codes": codes, "err_msgs": [fields.get("M", "")],
+                    "tag": tag, "rows": []}
         if t != b"G":
             raise WireError("expected CopyInResponse, got %r" % t)
         for line in data_lines:
@@ -239,10 +246,11 @@ class Conn:
                     fields[chr(p[pos])] = p[pos + 1 : e].decode()
                     pos = e + 1
                 codes.append(fields.get("C", "?"))
+                msgs.append(fields.get("M", ""))
             elif t == b"C":
                 tag = p[:-1].decode()
             elif t == b"Z":
-                return {"err_codes": codes, "tag": tag, "rows": []}
+                return {"err_codes": codes, "err_msgs": msgs, "tag": tag, "rows": []}
 
     def close(self):
         try:

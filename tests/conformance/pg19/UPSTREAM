@@ -1,0 +1,4 @@
+source: https://github.com/postgres/postgres (src/test/regress)
+branch: REL_19_STABLE
+commit: 1ecc48b9bcc377df867de3957d3abfbe5c14c2f9
+vendored: 2026-10-09
