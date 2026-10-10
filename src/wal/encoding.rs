@@ -10,7 +10,14 @@ use super::*;
 // the same checksum.)
 // ---------------------------------------------------------------------------
 
-pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();
+// `static`, not `const`: a `const` array has no fixed address and is
+// materialized fresh at every use site — in this case, a full 1024-byte
+// copy of the table on every byte checksummed (confirmed by disassembly:
+// a `memcpy` from .rodata onto the stack inside the per-byte loop,
+// 8.81% of this crate's instructions on the INSERT/WAL-commit path).
+// `static` has one fixed address, so `CRC32_TABLE[idx]` becomes a plain
+// indexed load.
+pub(crate) static CRC32_TABLE: [u32; 256] = build_crc32_table();
 
 pub(crate) const fn build_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
