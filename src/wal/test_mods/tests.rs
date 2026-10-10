@@ -123,6 +123,7 @@ fn record_roundtrip_all_kinds() {
             attnums: vec![1],
             next_attnum: 2,
             fillfactor: 100,
+            partition: Some(v180_sample_partition()),
             xmin: 3,
         },
         WalRecord::InsertRows {
@@ -244,6 +245,7 @@ fn v96_create_table_inherits_roundtrip() {
         attnums: vec![1],
         next_attnum: 2,
         fillfactor: 100,
+        partition: None,
         xmin: 3,
     };
     assert_eq!(&roundtrip(&create), &create);
@@ -268,6 +270,7 @@ fn v96_create_table_inherits_roundtrip() {
         attnums: vec![1],
         next_attnum: 2,
         fillfactor: 100,
+        partition: None,
         next_value_id: 1,
         toast_info: vec![],
         xmin: 4,
@@ -404,6 +407,7 @@ fn apply_record_rebuilds_versions_and_counters() {
             attnums: vec![1],
             next_attnum: 2,
             fillfactor: 100,
+            partition: None,
             xmin: 4,
         },
     )
@@ -708,4 +712,343 @@ fn v088_create_index_metadata_roundtrip() {
         other => panic!("expected CreateIndex, got {:?}", other),
     }
     d.end().unwrap();
+}
+
+/// Copy the v1.79 DROP COLUMN fixture into a fresh scratch directory.
+fn v180_fixture_dir(tag: &str) -> std::path::PathBuf {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wal_v179_drop_column");
+    let dir = std::env::temp_dir().join(format!("rg180-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    for f in ["wal.log", "system.id"] {
+        std::fs::copy(src.join(f), dir.join(f)).expect("copy fixture");
+    }
+    dir
+}
+
+#[test]
+fn v180_replays_v179_drop_column_wal() {
+    // Regression: v1.79 and earlier logged DROP COLUMN as AlterTable -> InsertRows ->
+    // DropIndex -> CreateIndex. Replaying InsertRows indexed the rewritten
+    // one-column rows through the stale index (position 1) and panicked,
+    // so the data directory could never be opened again.
+    let dir = v180_fixture_dir("replay");
+    let (eng, _wal) = Wal::open(&dir).expect("v1.79 WAL must replay");
+    let t = eng
+        .db
+        .tables
+        .get("t")
+        .and_then(|vs| vs.iter().find(|t| t.dropped_xmax == 0))
+        .expect("table t survives recovery");
+    let cols: Vec<&str> = t.columns.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(cols, vec!["a"]);
+    let mut live: Vec<i64> = t
+        .rows
+        .iter()
+        .filter(|r| r.xmax == 0)
+        .map(|r| match r.values[0] {
+            Value::Int(v) => v,
+            ref other => panic!("unexpected value {:?}", other),
+        })
+        .collect();
+    live.sort_unstable();
+    assert_eq!(live, vec![3, 4]);
+    // The unique index is rebuilt on the shifted position and covers
+    // every surviving row exactly once.
+    let ix = eng
+        .db
+        .indexes
+        .get("t_a_key")
+        .expect("unique index survives recovery");
+    assert_eq!(ix.def.cols, vec![0]);
+    assert_eq!(ix.def.dropped_xmax, 0);
+    // Opening an older-format log upgrades the data directory before any
+    // new frame is appended: the live WAL generation carries the current
+    // magic, so new-format records never land in an old-format file.
+    let mut hdr = [0u8; 8];
+    use std::io::Read;
+    std::fs::File::open(dir.join("wal.log"))
+        .and_then(|mut f| f.read_exact(&mut hdr))
+        .expect("read header");
+    assert_eq!(&hdr, WAL_MAGIC);
+    drop(eng);
+    // And the upgraded directory reopens with the same contents.
+    let (eng, _wal) = Wal::open(&dir).expect("upgraded dir reopens");
+    assert!(eng.db.indexes.contains_key("t_a_key"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A partition descriptor exercising every encoded field: a range bound
+/// with an unbounded side, an expression key, a parent link and children.
+fn v180_sample_partition() -> crate::storage::PartitionInfo {
+    use crate::storage::{PartBound, PartKey, PartMethod, PartitionInfo, RangeBound};
+    PartitionInfo {
+        method: PartMethod::Range,
+        key: vec![PartKey { col: 1, expr: None }],
+        bound: Some(PartBound::Range {
+            lower: vec![RangeBound::Val(Value::Int(0))],
+            upper: vec![RangeBound::Max],
+        }),
+        is_default: false,
+        parent: Some("root".into()),
+        children: vec!["leaf_a".into(), "leaf_b".into()],
+        is_partitioned: true,
+    }
+}
+
+#[test]
+fn v180_rgswal20_records_decode_without_partition() {
+    // An RGSWAL20 frame ends at xmin; decoding it as version 20 must not
+    // read past the record (no trailing partition field).
+    let rec = WalRecord::CreateTable {
+        name: "t".into(),
+        columns: vec![("a".into(), ColType::Int)],
+        constraints: "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".into(),
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        col_compression: vec![0],
+        composite_types: vec![None],
+        domain_types: vec![None],
+        domain_elem: vec![false],
+        inherits: vec![],
+        attnums: vec![1],
+        next_attnum: 2,
+        fillfactor: 100,
+        partition: Some(v180_sample_partition()),
+        xmin: 3,
+    };
+    let mut e = Enc::new();
+    e.record(&rec);
+    // Strip the trailing v21 partition bytes to get the v20 layout.
+    let mut tail = Enc::new();
+    tail.partition(&Some(v180_sample_partition()));
+    let v20 = &e.buf[..e.buf.len() - tail.buf.len()];
+    let mut d = Dec::with_wal_version(v20, 20);
+    match d.record().unwrap() {
+        WalRecord::CreateTable {
+            partition, xmin, ..
+        } => {
+            assert_eq!(partition, None);
+            assert_eq!(xmin, 3);
+        }
+        other => panic!("expected CreateTable, got {:?}", other),
+    }
+    d.end().unwrap();
+    // And the full v21 bytes round-trip the partition.
+    let mut d = Dec::new(&e.buf);
+    assert_eq!(d.record().unwrap(), rec);
+    d.end().unwrap();
+}
+
+#[test]
+fn v180_legacy_fill_partition_keeps_live_metadata() {
+    // An RGSWAL20 AlterTable on a partitioned table decodes with no
+    // partition metadata. open() must carry the live version's metadata
+    // forward instead of de-partitioning the table.
+    let empty_constraints =
+        "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+    let mut eng = Engine::new();
+    apply_record(
+        &mut eng,
+        &WalRecord::CreateTable {
+            name: "c".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints.clone(),
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec![],
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            partition: Some(v180_sample_partition()),
+            xmin: 3,
+        },
+    )
+    .unwrap();
+    let legacy_alter = WalRecord::AlterTable {
+        name: "c".into(),
+        columns: vec![("a".into(), ColType::Int)],
+        constraints: empty_constraints,
+        copy_rows: true,
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        toast_target: 0,
+        col_storage: vec![0],
+        col_compression: vec![0],
+        composite_types: vec![None],
+        domain_types: vec![None],
+        domain_elem: vec![false],
+        inherits: vec![],
+        attnums: vec![1],
+        next_attnum: 2,
+        fillfactor: 100,
+        partition: None,
+        next_value_id: 1,
+        toast_info: vec![],
+        xmin: 4,
+    };
+    let filled = legacy_fill_partition(&eng, &legacy_alter).expect("filled");
+    apply_record(&mut eng, &filled).unwrap();
+    let live = eng.db.tables["c"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    assert_eq!(live.partition, Some(v180_sample_partition()));
+    // A current-format record is applied exactly as written: None means
+    // "not partitioned", and an unpartitioned table needs no fill.
+    let mut plain = Engine::new();
+    assert!(legacy_fill_partition(&plain, &legacy_alter).is_none());
+    apply_record(&mut plain, &legacy_alter).unwrap();
+}
+
+fn v180_alter(cols: &[&str], xmin: u64) -> WalRecord {
+    let n = cols.len();
+    WalRecord::AlterTable {
+        name: "t".into(),
+        columns: cols
+            .iter()
+            .map(|c| ((*c).to_string(), ColType::Int))
+            .collect(),
+        constraints: "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))"
+            .to_string(),
+        copy_rows: false,
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        toast_target: 0,
+        col_storage: vec![0; n],
+        col_compression: vec![0; n],
+        composite_types: vec![None; n],
+        domain_types: vec![None; n],
+        domain_elem: vec![false; n],
+        inherits: vec![],
+        attnums: (1..=n as i16).collect(),
+        next_attnum: n as i16 + 1,
+        fillfactor: 100,
+        partition: None,
+        next_value_id: 1,
+        toast_info: vec![],
+        xmin,
+    }
+}
+
+fn v180_insert(id: u64, width: usize, xmin: u64) -> WalRecord {
+    WalRecord::InsertRows {
+        table: "t".into(),
+        rows: vec![WalRow {
+            id,
+            xmin,
+            values: Row::new((0..width as i64).map(Value::Int).collect()),
+            toast: vec![0; width],
+            toast_meta: vec![],
+        }],
+    }
+}
+
+#[test]
+fn v180_replay_skips_rows_wider_than_their_version() {
+    // v1.79 logged every AlterTable of a multi-action ALTER with the final
+    // shape, so the first rewrite's (wider) rows land in a version with
+    // fewer columns. Replay must not build that inconsistent version, or
+    // the next checkpoint (including the RGSWAL20 upgrade checkpoint) is
+    // unloadable.
+    let mut eng = engine_with_committed_table();
+    for r in [
+        v180_alter(&["k", "keep1", "keep2"], 20),
+        v180_insert(100, 4, 20), // the mis-logged intermediate rewrite
+        v180_alter(&["k", "keep1", "keep2"], 20),
+        v180_insert(101, 3, 20),
+    ] {
+        apply_record(&mut eng, &r).unwrap();
+    }
+    for v in &eng.db.tables["t"] {
+        for row in &v.rows {
+            assert_eq!(row.values.len(), v.columns.len(), "version {:?}", v.columns);
+        }
+    }
+    let live = eng.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .unwrap();
+    assert_eq!(
+        live.rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![101]
+    );
+}
+
+#[test]
+fn v180_checkpoint_load_tolerates_bad_rows_in_superseded_versions() {
+    // Data directories checkpointed by v1.79 after replaying a mis-logged
+    // multi-action ALTER hold a superseded table version with rows wider
+    // than its columns. That version is invisible to every snapshot, so
+    // loading drops those rows instead of refusing to start. A LIVE
+    // version with such rows is still rejected as corruption.
+    let dir = std::env::temp_dir().join("rg180-ckpt-superseded");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cols = |names: &[&str]| -> Vec<(String, ColType)> {
+        names
+            .iter()
+            .map(|c| ((*c).to_string(), ColType::Int))
+            .collect()
+    };
+    let row = |id: u64, width: usize| {
+        RowVersion::plain(id, Row::new((0..width as i64).map(Value::Int).collect()), 2)
+    };
+    let mut eng = Engine::new();
+    let mut superseded = Table::new(cols(&["k", "a", "b"]), 2);
+    superseded.dropped_xmax = 2;
+    superseded.push_version(row(10, 4));
+    let mut live = Table::new(cols(&["k", "a", "b"]), 2);
+    live.push_version(row(11, 3));
+    eng.db.tables.insert("t".into(), vec![superseded, live]);
+    eng.txns.next_xid = 3;
+    eng.txns.next_row_id = 12;
+    {
+        let (_e, mut wal) = Wal::open(&dir).expect("open");
+        wal.checkpoint(&eng).expect("checkpoint");
+    }
+    let (loaded, _wal) = Wal::open(&dir).expect("superseded junk must not block startup");
+    let vs = &loaded.db.tables["t"];
+    let live = vs
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    assert_eq!(live.rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![11]);
+    for v in vs {
+        assert!(v.rows.iter().all(|r| r.values.len() == v.columns.len()));
+    }
+
+    // The same bad row in the LIVE version is real corruption: refuse.
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = Engine::new();
+    let mut live = Table::new(cols(&["k", "a", "b"]), 2);
+    live.push_version(row(11, 4));
+    eng.db.tables.insert("t".into(), vec![live]);
+    eng.txns.next_xid = 3;
+    eng.txns.next_row_id = 12;
+    {
+        let (_e, mut wal) = Wal::open(&dir).expect("open");
+        wal.checkpoint(&eng).expect("checkpoint");
+    }
+    assert!(
+        Wal::open(&dir).is_err(),
+        "a live mismatch must still be rejected"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -58,6 +58,9 @@ mod v109_function_tests;
 #[path = "test_mods/v145_explain_options_tests.rs"]
 mod v145_explain_options_tests;
 #[cfg(test)]
+#[path = "test_mods/v180_cast_encoding_tests.rs"]
+mod v180_cast_encoding_tests;
+#[cfg(test)]
 #[path = "test_mods/v72_ddl_tests.rs"]
 mod v72_ddl_tests;
 

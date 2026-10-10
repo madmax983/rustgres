@@ -32,24 +32,33 @@ EXPLAIN plan-text diffs, which were 88% of the curated gate's
 EXPECTED-FAILs, are only **11%** of root-cause failures here (1,754). Most of
 what is missing is whole features, not edge cases.
 
-## Crash and durability bugs found
+## Crash and durability bugs found (all fixed in v1.80)
 
-These come first: they take the server down, and in one case the data
-directory with it.
+These came first: they took the server down, and several took the data
+directory with it. The original triggers are below; root causes and tests
+are in the v1.80 commits. Re-running the schedule on v1.80 gives **zero
+recovery failures and zero panics** across all 236 suites. **23,138 PASS**
+(44.5%), up 582 from this baseline. Most of the gain comes from `triggers`,
+which used to brick the data directory partway through.
 
-| # | Site | Trigger (first seen) | Effect |
+| # | Symptom (as first seen) | Root cause | Fix |
 |---|---|---|---|
-| 1 | `src/storage.rs` `Database::index_insert_row` during `wal::recovery::apply_record` | Restart after crash #2 below, during `triggers` | **WAL recovery panics (index out of bounds), so the data directory never opens again.** The runner keeps the directory and continues on a fresh one. |
-| 2 | `src/exec/partition.rs:193` (index out of bounds) | Multi-column / hash partition bounds: `CREATE TABLE … PARTITION OF … FOR VALUES FROM (0,0) TO (10,100)`, `… WITH (MODULUS 5, REMAINDER 0)`, `ATTACH PARTITION` (`alter_table`, `foreign_key`, `indexing`, `triggers`) | The connection thread panics |
-| 3 | `src/exec/partition.rs:560` (`table still visible`) | `CREATE TRIGGER … EXECUTE PROCEDURE` on partitioned/inherited tables (`copy2`, `rangefuncs`, `with`) | The connection thread panics |
-| 4 | `src/exec/partition.rs:356` (`child is partitioned`) | Sub-partitioned trees (`foreign_key`) | The connection thread panics |
+| 1 | WAL recovery panic in `Database::index_insert_row`; **data directory unopenable** (`triggers`) | `DROP COLUMN` before an indexed column. The same-name index re-create hid the `DropIndex` from the WAL, so replay indexed rewritten rows through the stale definition. | Log the drop, order it before the rewrite, make replay tolerant of v1.79 logs |
+| 2 | `partition.rs:193` / `:1464` index out of bounds (`alter_table`, `foreign_key`, `indexing`) | `DROP COLUMN` before the partition key left the key position stale | Shift key positions; dropping a key column now raises 42P16 |
+| 3 | `partition.rs:560` "table still visible" (`copy2`, `rangefuncs`, `with`) | `CREATE`/`DROP TRIGGER` on a **temp** table looked only in the permanent catalog | `commit_table_version` versions temp tables too |
+| 4 | `partition.rs:356` "child is partitioned" (`foreign_key`) | Fallout of #5 after a crash and restart | Overlap check skips stale links; #5 fixed |
+| 5 | *(found while fixing #2)* After a crash, partitioned tables replayed as plain tables | Partition metadata was never WAL-logged (only checkpointed) | WAL format `RGSWAL21`; `RGSWAL20` logs still readable and upgraded on open |
+| 6 | Recovery refused: "bad constraints for table `log_table`" (`triggers`) | Casts in `DEFAULT`/`CHECK` were encoded with bare multi-word type names (`timestamp without time zone`) | Quoted, typmod-preserving cast encoding; v1.79 form still decodes |
+| 7 | "checkpoint.dat is corrupt (row/column count mismatch)" (`insert_conflict`, via a later checkpoint) | A multi-action `ALTER` logged every version with the final shape | Pair each op with its own version; replay and checkpoint load tolerate v1.79 debris |
 
-There were also 10 statement timeouts (30 s). Nine are slow plans:
-correlated `LATERAL`/sub-select queries over `tenk1` (`memoize` ×4,
-`join` ×2, `subselect`, `aggregates`, `partition_join`). The tenth is a
-harness limitation: `COPY … FROM STDIN` inside a `\;` multi-statement query
-(`copyselect`). Separately, `infinite_recurse` kills the connection
-instead of raising `54001` (stack depth limit exceeded).
+Still open:
+- 11 statement timeouts (30 s). They are slow plans: correlated
+  `LATERAL`/sub-select queries over `tenk1` (`memoize` ×4, `join` ×2,
+  `subselect`, `aggregates`, `create_index`, `partition_join`). There is
+  also one harness limitation: `COPY … FROM STDIN` inside a `\;`
+  multi-statement query (`copyselect`).
+- `infinite_recurse` overflows the stack and aborts the process, instead
+  of raising `54001` (stack depth limit exceeded).
 
 ## Biggest functional gaps (root causes, by statements affected)
 

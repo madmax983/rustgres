@@ -19,6 +19,38 @@ pub(crate) fn live_table<'e>(eng: &'e mut Engine, name: &str) -> Option<&'e mut 
         .and_then(|vs| vs.iter_mut().find(|t| t.dropped_xmax == 0))
 }
 
+/// v1.80: adapt a record from an `RGSWAL20` log to current semantics.
+/// Those logs never carried partition metadata, so an `AlterTable` on a
+/// partitioned table (ATTACH, a link from PARTITION OF, any ALTER) decodes
+/// with `partition: None`. Applied as-is it would de-partition the table.
+/// Carry the live version's metadata forward instead. That metadata came
+/// from the checkpoint image, or from an earlier record in the same log.
+/// `CreateTable` cannot be repaired this way: v1.79 lost that metadata at
+/// write time.
+pub(crate) fn legacy_fill_partition(eng: &Engine, r: &WalRecord) -> Option<WalRecord> {
+    let WalRecord::AlterTable {
+        name,
+        partition: None,
+        ..
+    } = r
+    else {
+        return None;
+    };
+    let live = eng
+        .db
+        .tables
+        .get(name)?
+        .iter()
+        .find(|v| v.dropped_xmax == 0)?
+        .partition
+        .clone()?;
+    let mut out = r.clone();
+    if let WalRecord::AlterTable { partition, .. } = &mut out {
+        *partition = Some(live);
+    }
+    Some(out)
+}
+
 /// Apply one record during recovery. Records replay in commit order, so
 /// the version chains — and therefore visibility — are rebuilt exactly.
 pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
@@ -366,9 +398,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             attnums,
             next_attnum,
             fillfactor,
+            partition,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.80: partition metadata (None on RGSWAL20 logs).
+            t.partition = partition.clone();
             // v1.41: restore attnums, the next-attnum counter, and
             // fillfactor.
             t.attnums = attnums.clone();
@@ -449,6 +484,24 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         );
                         continue;
                     }
+                    // v1.80: live execution never stores a row whose width
+                    // differs from its version's columns. In replay such a
+                    // row can only be a v1.79 mis-logged intermediate
+                    // rewrite of a multi-action ALTER, whose AlterTable
+                    // record carried the final shape. A later AlterTable in
+                    // the same batch supersedes that version and re-inserts
+                    // the rows at the right width, so skip it rather than
+                    // build a version no checkpoint could load back.
+                    if row.values.len() != t.columns.len() {
+                        eprintln!(
+                            "WAL replay: skipping row id {} in table \"{}\": {} values for {} columns",
+                            row.id,
+                            table,
+                            row.values.len(),
+                            t.columns.len()
+                        );
+                        continue;
+                    }
                     // v0.39: restore the per-cell toast flags (they were
                     // WAL-logged per row) and rebuild the table's
                     // toast_info provenance from the record's metadata.
@@ -471,7 +524,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             };
             for (id, values) in &inserted {
                 eng.db
-                    .index_insert_row(table, *id, values, crate::storage::NO_SESSION);
+                    .index_insert_row_replay(table, *id, values);
             }
         }
         WalRecord::DropTable { name, xmax } => match live_table(eng, name) {
@@ -551,13 +604,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 t.push_version(rv);
             }
             // Index the new versions, like live execution's
-            // index_insert_row: recovery rebuilds indexes only for the
+            // index_insert_row (replay variant): recovery rebuilds indexes only for the
             // checkpoint image; replayed rows need their entries.
             let indexed: Vec<(u64, Row)> = new.iter().map(|r| (r.id, r.values.clone())).collect();
             // `t`'s borrow ends at its last use above; eng.db is free again.
             for (id, values) in indexed {
                 eng.db
-                    .index_insert_row(table, id, &values, crate::storage::NO_SESSION);
+                    .index_insert_row_replay(table, id, &values);
             }
         }
         // v0.13: replication slot metadata is applied by the match
@@ -661,6 +714,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             fillfactor,
             next_value_id,
             toast_info,
+            partition,
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
@@ -669,6 +723,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 prev.dropped_xmax = *xmin;
             }
             let mut t = Table::new(columns.clone(), *xmin);
+            // v1.80: partition metadata (ATTACH, PARTITION OF, DROP COLUMN
+            // key shifts). RGSWAL20 records never carried it; open() fills
+            // it in from the live version before replay (see
+            // `legacy_fill_partition`), so here None means "not partitioned".
+            t.partition = partition.clone();
             // v1.41: restore attnums, the next-attnum counter, and
             // fillfactor.
             t.attnums = attnums.clone();
@@ -877,6 +936,16 @@ pub fn records_for_commit(
     session: u64,
 ) -> Result<Vec<WalRecord>, String> {
     let mut out: Vec<WalRecord> = Vec::new();
+    // v1.80: CreateTable/AlterTable ops and the table versions they push
+    // pair up one-to-one, in order: op N on a table made that table's Nth
+    // version owned by this transaction. Each record must describe ITS
+    // version. v1.79 logged the latest one for every AlterTable, so a
+    // multi-action ALTER (two DROP COLUMNs) logged the final shape for the
+    // intermediate version, whose rewritten rows were wider. Replay built
+    // an inconsistent version, and the next checkpoint made the data
+    // directory unopenable.
+    let mut own_versions: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut i = 0;
     while i < writes.len() {
         let op = &writes[i];
@@ -1066,20 +1135,27 @@ pub fn records_for_commit(
                 }
             }
             WriteOp::CreateTable { name } => {
+                let nth = own_versions.entry(name.clone()).or_insert(0);
+                let idx = *nth;
+                *nth += 1;
                 let Some(versions) = eng.db.tables.get(name) else {
                     i += 1;
                     continue;
                 };
-                let Some(ours) = versions.iter().find(|t| t.created_xmin == own) else {
+                let Some(ours) = versions.iter().filter(|t| t.created_xmin == own).nth(idx) else {
                     i += 1;
                     continue;
                 };
                 // First-committer-wins: a rival committed live version
-                // means our CREATE lost the race.
+                // means our CREATE lost the race. v1.80: a version WE
+                // dropped earlier in this transaction is not a rival
+                // (DROP TABLE t; CREATE TABLE t in one transaction, which
+                // PG allows), like the CREATE VIEW check below.
                 let rival = versions.iter().any(|t| {
                     t.created_xmin != own
                         && eng.xid_committed(t.created_xmin)
                         && (t.dropped_xmax == 0 || !eng.xid_committed(t.dropped_xmax))
+                        && t.dropped_xmax != own
                 });
                 if rival {
                     return Err(format!("relation \"{}\" already exists", name));
@@ -1109,6 +1185,8 @@ pub fn records_for_commit(
                     attnums: ours.attnums.clone(),
                     next_attnum: ours.next_attnum,
                     fillfactor: ours.fillfactor,
+                    // v1.80: partition metadata (RGSWAL21).
+                    partition: ours.partition.clone(),
                     xmin: own,
                 });
             }
@@ -1136,13 +1214,25 @@ pub fn records_for_commit(
             // v0.9: ALTER TABLE swaps the table version; log the latest
             // version this transaction created.
             WriteOp::AlterTable {
-                name, rewrite_rows, ..
+                name,
+                rewrite_rows,
+                renamed_to,
+                ..
             } => {
+                let nth = own_versions.entry(name.clone()).or_insert(0);
+                let idx = *nth;
+                *nth += 1;
+                // A rename moves the table's versions (and their count)
+                // under the new name; later ops address it by that name.
+                if let Some(target) = renamed_to {
+                    let moved = own_versions.remove(name).unwrap_or(0);
+                    own_versions.insert(target.clone(), moved);
+                }
                 let Some(ours) = eng
                     .db
                     .tables
                     .get(name)
-                    .and_then(|vs| vs.iter().filter(|t| t.created_xmin == own).last())
+                    .and_then(|vs| vs.iter().filter(|t| t.created_xmin == own).nth(idx))
                 else {
                     i += 1;
                     continue;
@@ -1182,6 +1272,8 @@ pub fn records_for_commit(
                         .iter()
                         .map(|(k, v)| (*k, if v.compressed { v.method.code() } else { 0 }))
                         .collect(),
+                    // v1.80: partition metadata (RGSWAL21).
+                    partition: ours.partition.clone(),
                     xmin: own,
                 });
             }
@@ -1561,11 +1653,17 @@ pub fn records_for_commit(
                 continue;
             }
             WriteOp::DropIndex { name, .. } => {
+                // v1.80: the drop is ours if the entry under this name was
+                // dropped by us, OR was created by us: that means we dropped
+                // the old index and re-created it under the same name (ALTER
+                // TABLE ... DROP COLUMN shifts positions this way). That drop
+                // must reach the WAL ahead of the row rewrite, or replay
+                // indexes the rewritten rows through the stale definition.
                 let won = eng
                     .db
                     .indexes
                     .get(name)
-                    .is_some_and(|ix| ix.def.dropped_xmax == own);
+                    .is_some_and(|ix| ix.def.dropped_xmax == own || ix.def.created_xmin == own);
                 if !won {
                     i += 1;
                     continue; // overwritten by a concurrent drop; theirs wins

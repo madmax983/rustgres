@@ -9507,7 +9507,15 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
             out.push(')');
         }
         Expr::Cast { expr, to, .. } => {
-            out.push_str(&format!("(cast {} ", to.sql_name()));
+            // v1.80: the type is one quoted atom holding its SQL spelling
+            // with typmod (`"timestamp without time zone"`,
+            // `"numeric(10,2)"`), decoded by the SQL type parser. v1.79
+            // wrote a bare `sql_name()`; multi-word names and types
+            // `coltype_by_name` did not know then failed to decode, and
+            // WAL recovery rejected the table's constraints.
+            out.push_str("(cast ");
+            sexpr_escape(&to.typmod_display(), out);
+            out.push(' ');
             encode_expr_inner(expr, out);
             out.push(')');
         }
@@ -9810,6 +9818,35 @@ impl<'a> SexprParser<'a> {
         let s: String = self.chars.clone().take(prefix.len()).collect();
         s == prefix
     }
+    /// v1.80: the target type of an encoded `(cast <type> <expr>)`. The
+    /// current form is one quoted atom (see `encode_expr_inner`). v1.79
+    /// wrote the bare `sql_name()`, which may span several words, so a
+    /// bare name runs up to the operand, and every encoded operand starts
+    /// with `(`. Either spelling resolves through the SQL type parser.
+    pub(crate) fn cast_type(&mut self) -> Result<ColType, String> {
+        self.ws();
+        let quoted = self.chars.peek() == Some(&'"');
+        let mut name = self.atom()?;
+        if !quoted {
+            loop {
+                self.ws();
+                match self.chars.peek() {
+                    Some('(') | Some(')') | None => break,
+                    _ => {
+                        name.push(' ');
+                        name.push_str(&self.atom()?);
+                    }
+                }
+            }
+        } else if name == "char" {
+            // v1.79 wrote the one-byte "char" type as `"char"`, which reads
+            // back as `char`. The current encoder never emits that spelling
+            // (character types render as `character...`).
+            return Ok(ColType::SingleChar);
+        }
+        coltype_from_sql_spelling(&name)
+    }
+
     pub(crate) fn atom(&mut self) -> Result<String, String> {
         self.ws();
         let mut s = String::new();
@@ -9900,7 +9937,7 @@ impl<'a> SexprParser<'a> {
                 }
             }
             "cast" => {
-                let to = coltype_by_name(&self.atom()?)?;
+                let to = self.cast_type()?;
                 let x = self.expr()?;
                 Expr::Cast {
                     expr: Box::new(x),
@@ -10249,6 +10286,27 @@ pub(crate) fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
         i += 2;
     }
     Ok(out)
+}
+
+/// v1.80: resolve a type's SQL spelling (`timestamp without time zone`,
+/// `character varying(5)`, `"char"`, `integer[]`, ...) with the same type
+/// parser `CAST`/`::` use, so every builtin `typmod_display()` produces
+/// round-trips.
+pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
+    let tokens = tokenize(name).map_err(|e| format!("bad cast type {name:?}: {}", e.message))?;
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        unnamed_seq: 0,
+        allow_similar_to: true,
+    };
+    let (ty, named) = p
+        .parse_type_name()
+        .map_err(|e| format!("bad cast type {name:?}: {}", e.message))?;
+    if named.is_some() || p.next() != Token::EOF {
+        return Err(format!("bad cast type {name:?}"));
+    }
+    Ok(ty)
 }
 
 pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {

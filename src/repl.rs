@@ -1012,6 +1012,7 @@ mod tests {
                 attnums: vec![],
                 next_attnum: 1,
                 fillfactor: 100,
+                partition: None,
             },
             WalRecord::InsertRows {
                 table: "t".into(),

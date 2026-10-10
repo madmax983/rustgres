@@ -6278,4 +6278,549 @@ mod tests {
         v158_run(&engine, &wal, &mut session_b, "DEALLOCATE ALL").expect("deallocate all");
         v158_rows(v158_run(&engine, &wal, &mut session_a, "EXECUTE q").expect("execute"));
     }
+
+    // --- v1.80: DROP COLUMN must survive a restart ---------------------
+
+    /// Run each statement in autocommit against a fresh data dir, drop
+    /// the server state, then reopen the directory (crash recovery) and
+    /// return a live engine + WAL over the recovered state.
+    fn v180_run_then_reopen(
+        tag: &str,
+        stmts: &[&str],
+    ) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        let dir = std::env::temp_dir().join(format!("rg180-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let (eng, wal) = crate::wal::Wal::open(&dir).expect("fresh open");
+            let engine = Arc::new(Mutex::new(eng));
+            let wal = Arc::new(Mutex::new(wal));
+            let mut session = session_no_txn();
+            for sql in stmts {
+                v158_run(&engine, &wal, &mut session, sql)
+                    .unwrap_or_else(|e| panic!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+        let (eng, wal) = crate::wal::Wal::open(&dir).expect("data dir must reopen after a restart");
+        (
+            Arc::new(Mutex::new(eng)),
+            Arc::new(Mutex::new(wal)),
+            session_no_txn(),
+        )
+    }
+
+    #[test]
+    fn v180_drop_column_before_indexed_column_survives_restart() {
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "plain",
+            &[
+                "CREATE TABLE t (b char, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 3)",
+                "ALTER TABLE t DROP b",
+                "INSERT INTO t VALUES (4)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT * FROM t ORDER BY a").expect("select"),
+        );
+        assert_eq!(rows, vec!["3", "4"]);
+        // The unique index still enforces on the shifted position.
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (3)")
+            .expect_err("duplicate must be rejected after recovery");
+        assert_eq!(err.code, "23505");
+        // And the recovered state keeps accepting writes and restarts.
+        v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (5)").expect("insert");
+    }
+
+    #[test]
+    fn v180_drop_column_without_later_writes_survives_restart() {
+        // The rewrite alone (no later INSERT) was enough to brick v1.79.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "norewrite",
+            &[
+                "CREATE TABLE t (b char, c text, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 'y', 3), ('z', 'w', 7)",
+                "ALTER TABLE t DROP b",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT c, a FROM t ORDER BY a").expect("select"),
+        );
+        assert_eq!(rows, vec!["y|3", "w|7"]);
+    }
+
+    #[test]
+    fn v180_drop_column_propagated_to_partition_survives_restart() {
+        // The shape the PG19 insert_conflict suite hit: the partition's
+        // own column order differs from the parent's, so the parent's
+        // DROP COLUMN shifts the partition's unique index.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "partition",
+            &[
+                "CREATE TABLE p (a int UNIQUE, b char) PARTITION BY LIST (a)",
+                "CREATE TABLE p3 (b char, a int UNIQUE)",
+                "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES IN (3)",
+                "INSERT INTO p VALUES (3, 'x')",
+                "ALTER TABLE p DROP b",
+                "INSERT INTO p VALUES (3) ON CONFLICT DO NOTHING",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a FROM p3").expect("select"));
+        assert_eq!(rows, vec!["3"]);
+    }
+
+    #[test]
+    fn v180_recreate_table_with_same_index_name_in_one_txn_survives_restart() {
+        // DROP TABLE + CREATE TABLE under the same name in one transaction
+        // (PG allows it). v1.79 rejected the COMMIT with 40001 "relation
+        // already exists": the commit-time rival check counted the version
+        // this very transaction had dropped. The re-created same-named
+        // unique index (shorter rows) must also survive recovery.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "recreate",
+            &[
+                "CREATE TABLE t (b char, a int UNIQUE)",
+                "INSERT INTO t VALUES ('x', 3)",
+                "BEGIN",
+                "DROP TABLE t",
+                "CREATE TABLE t (a int UNIQUE)",
+                "INSERT INTO t VALUES (9)",
+                "COMMIT",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a FROM t").expect("select"));
+        assert_eq!(rows, vec!["9"]);
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO t VALUES (9)")
+            .expect_err("unique index must survive recovery");
+        assert_eq!(err.code, "23505");
+    }
+
+    // --- v1.80: DROP COLUMN on partitioned tables -------------------------
+
+    fn v180_session(tag: &str) -> (Arc<Mutex<Engine>>, Arc<Mutex<Wal>>, Session) {
+        (
+            Arc::new(Mutex::new(Engine::new())),
+            scratch_wal(&format!("rg180-{tag}")),
+            session_no_txn(),
+        )
+    }
+
+    fn v180_exec(
+        engine: &Arc<Mutex<Engine>>,
+        wal: &Arc<Mutex<Wal>>,
+        session: &mut Session,
+        stmts: &[&str],
+    ) {
+        for sql in stmts {
+            v158_run(engine, wal, session, sql)
+                .unwrap_or_else(|e| panic!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+
+    #[test]
+    fn v180_drop_partition_key_column_is_rejected() {
+        // PG19 ATExecDropColumn: 42P16 "cannot drop column ... because it
+        // is part of the partition key of relation ...". v1.79 accepted it.
+        let (engine, wal, mut session) = v180_session("pkey-reject");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE q (a int, b int) PARTITION BY RANGE ((a + 1))",
+            ],
+        );
+        let err = v158_run(&engine, &wal, &mut session, "ALTER TABLE p DROP a")
+            .expect_err("dropping a key column must fail");
+        assert_eq!(err.code, "42P16");
+        assert!(err.message.contains("partition key"), "{}", err.message);
+        let err = v158_run(&engine, &wal, &mut session, "ALTER TABLE q DROP a")
+            .expect_err("dropping a column used by a key expression must fail");
+        assert_eq!(err.code, "42P16");
+        // Non-key columns still drop.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["ALTER TABLE p DROP x", "ALTER TABLE q DROP b"],
+        );
+    }
+
+    #[test]
+    fn v180_drop_column_before_list_key_keeps_routing() {
+        // v1.79: the key position went stale, and the next CREATE TABLE
+        // ... PARTITION OF panicked (partition.rs, index out of bounds).
+        let (engine, wal, mut session) = v180_session("pkey-list");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "ALTER TABLE p DROP x",
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES IN (2)",
+                "INSERT INTO p VALUES (1), (2)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1", "p2|2"]);
+        let err = v158_run(&engine, &wal, &mut session, "INSERT INTO p VALUES (3)")
+            .expect_err("no partition for 3");
+        assert_eq!(err.code, "23514");
+    }
+
+    #[test]
+    fn v180_drop_column_before_range_key_keeps_routing() {
+        // v1.79: routing read the stale key position and panicked
+        // (partition.rs eval_table_part_key, index out of bounds).
+        let (engine, wal, mut session) = v180_session("pkey-range");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p (a int, b int, c int) PARTITION BY RANGE (c)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10)",
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20)",
+                "ALTER TABLE p DROP a",
+                "INSERT INTO p VALUES (1, 5), (2, 15)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, b, c FROM p ORDER BY c",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1|5", "p2|2|15"]);
+    }
+
+    // --- v1.80: partitioning must survive a restart -------------------------
+
+    #[test]
+    fn v180_partitioning_survives_restart() {
+        // v1.79 never WAL-logged partition metadata (only checkpoints held
+        // it). After a crash, the parent was a plain table: its existing
+        // rows vanished from `SELECT ... FROM p`, new rows landed in the
+        // parent itself, and unroutable rows were accepted.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "partitions",
+            &[
+                "CREATE TABLE p (a int, b text) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "CREATE TABLE c3 (b text, a int)",
+                "ALTER TABLE p ATTACH PARTITION c3 FOR VALUES IN (3)",
+                "CREATE TABLE r (a int, k int) PARTITION BY RANGE (k)",
+                "CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10) PARTITION BY LIST (a)",
+                "CREATE TABLE r1a PARTITION OF r1 FOR VALUES IN (7)",
+                "INSERT INTO p VALUES (1, 'one'), (3, 'three')",
+                "INSERT INTO r VALUES (7, 5)",
+            ],
+        );
+        // Rows written before the crash are still reachable via the parent.
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a, b FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1|one", "c3|3|three"]);
+        // New rows still route, including into the attached partition.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "INSERT INTO p VALUES (1, 'uno'), (3, 'tres')",
+                "INSERT INTO r VALUES (7, 6)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT count(*) FROM c3").expect("count"),
+        );
+        assert_eq!(rows, vec!["2"]);
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, k FROM r ORDER BY k",
+            )
+            .expect("sub-partitioned select"),
+        );
+        assert_eq!(rows, vec!["r1a|5", "r1a|6"]);
+        // Unroutable rows are still rejected.
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO p VALUES (5, 'five')",
+        )
+        .expect_err("no partition for 5");
+        assert_eq!(err.code, "23514");
+    }
+
+    #[test]
+    fn v180_partition_key_shift_survives_restart() {
+        // The DROP COLUMN key shift (v1.80) must be durable too.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "pkey-shift",
+            &[
+                "CREATE TABLE p (x int, a int) PARTITION BY LIST (a)",
+                "CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1)",
+                "ALTER TABLE p DROP x",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TABLE p2 PARTITION OF p FOR VALUES IN (2)",
+                "INSERT INTO p VALUES (1), (2)",
+            ],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a FROM p ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["p1|1", "p2|2"]);
+    }
+
+    // --- v1.80: triggers on temp tables ----------------------------------
+
+    #[test]
+    fn v180_trigger_on_temp_table() {
+        // v1.79: CREATE TRIGGER / DROP TRIGGER versioned the table through
+        // the permanent-table catalog, which never holds temp tables, and
+        // panicked ("table still visible"), killing the connection. Hit by
+        // PG19 copy2, rangefuncs and with.
+        let (engine, wal, mut session) = v180_session("temp-trigger");
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "CREATE TEMP TABLE x (a int, b text)",
+                "CREATE FUNCTION fill_b() RETURNS trigger AS $$ BEGIN NEW.b := 'set'; RETURN NEW; END $$ LANGUAGE plpgsql",
+                "CREATE TRIGGER trg BEFORE INSERT ON x FOR EACH ROW EXECUTE PROCEDURE fill_b()",
+                "INSERT INTO x (a) VALUES (1)",
+            ],
+        );
+        let rows =
+            v158_rows(v158_run(&engine, &wal, &mut session, "SELECT a, b FROM x").expect("select"));
+        assert_eq!(rows, vec!["1|set"], "the trigger fired");
+        // DROP TRIGGER is transactional on temp tables too.
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &[
+                "BEGIN",
+                "DROP TRIGGER trg ON x",
+                "ROLLBACK",
+                "INSERT INTO x (a) VALUES (2)",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["DROP TRIGGER trg ON x", "INSERT INTO x (a) VALUES (3)"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT a, coalesce(b, '-') FROM x ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["1|set", "2|set", "3|-"]);
+    }
+
+    #[test]
+    fn v180_attach_partition_after_dropped_columns() {
+        // PG19 foreign_key's "irregular definitions" hierarchy: a two-column
+        // range key on a parent with a dropped column, and a child with
+        // three dropped columns. v1.79 crashed on the ATTACH (stale key
+        // position) and corrupted the cluster on restart.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "fk-irregular",
+            &[
+                "CREATE TABLE fk_partitioned_fk (b int, fdrop1 int, a int) PARTITION BY RANGE (a, b)",
+                "ALTER TABLE fk_partitioned_fk DROP COLUMN fdrop1",
+                "CREATE TABLE fk_partitioned_fk_1 (fdrop1 int, fdrop2 int, a int, fdrop3 int, b int)",
+                "ALTER TABLE fk_partitioned_fk_1 DROP COLUMN fdrop1, DROP COLUMN fdrop2, DROP COLUMN fdrop3",
+                "ALTER TABLE fk_partitioned_fk ATTACH PARTITION fk_partitioned_fk_1 FOR VALUES FROM (0,0) TO (1000,1000)",
+                "CREATE TABLE fk_partitioned_fk_2 PARTITION OF fk_partitioned_fk FOR VALUES FROM (1000,1000) TO (2000,2000)",
+            ],
+        );
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["INSERT INTO fk_partitioned_fk (a, b) VALUES (500, 501), (1500, 1501)"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT tableoid::regclass, a, b FROM fk_partitioned_fk ORDER BY a",
+            )
+            .expect("select"),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "fk_partitioned_fk_1|500|501",
+                "fk_partitioned_fk_2|1500|1501"
+            ]
+        );
+        // Overlap is still detected against the reattached children.
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "CREATE TABLE fk_partitioned_fk_x PARTITION OF fk_partitioned_fk FOR VALUES FROM (10,10) TO (20,20)",
+        )
+        .expect_err("overlaps fk_partitioned_fk_1");
+        assert!(err.message.contains("would overlap"), "{}", err.message);
+    }
+
+    #[test]
+    fn v180_casts_in_defaults_and_checks_survive_restart() {
+        // v1.79 wrote cast types into the WAL's constraint encoding as bare
+        // multi-word names, and recovery refused the data directory ("bad
+        // constraints for table ..."). Hit by PG19 triggers' log_table.
+        let (engine, wal, mut session) = v180_run_then_reopen(
+            "cast-defaults",
+            &[
+                "CREATE TABLE log_table (tstamp timestamp DEFAULT timeofday()::timestamp)",
+                "CREATE TABLE d (
+                    a timestamptz DEFAULT '2020-01-02 03:04:05+00'::timestamptz,
+                    b float8 DEFAULT '1.5'::double precision,
+                    c text DEFAULT 'abcdefgh'::varchar(5),
+                    e text DEFAULT 'x'::char(3),
+                    f numeric DEFAULT 1.005::numeric(10,2),
+                    g int DEFAULT ('{7,8}'::int[])[2],
+                    h text CHECK (h::\"char\"::text <> 'z')
+                )",
+            ],
+        );
+        // (timeofday() itself is not implemented yet; the table surviving
+        // recovery is what v1.79 broke.)
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT count(*) FROM log_table",
+            )
+            .expect("select"),
+        );
+        assert_eq!(rows, vec!["0"]);
+        v180_exec(
+            &engine,
+            &wal,
+            &mut session,
+            &["INSERT INTO d DEFAULT VALUES"],
+        );
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT b, c, length(e), f, g FROM d",
+            )
+            .expect("select"),
+        );
+        // char(3) -> text drops the blank padding (PG bpchar-to-text), so length 1.
+        assert_eq!(rows, vec!["1.5|abcde|1|1.01|8"]);
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO d (h) VALUES ('zz')",
+        )
+        .expect_err("CHECK still enforced after recovery");
+        assert_eq!(err.code, "23514");
+    }
+
+    #[test]
+    fn v180_multi_action_alter_survives_checkpoint() {
+        // Two DROP COLUMNs in one statement version the table twice in one
+        // transaction. v1.79 logged BOTH AlterTable records with the final
+        // (3-column) shape while the first rewrite's rows were 4 wide. Replay
+        // built an inconsistent intermediate version, the next CHECKPOINT
+        // wrote it, and the data directory refused to open ("checkpoint.dat
+        // is corrupt (row/column count mismatch)"). Hit by PG19
+        // insert_conflict (dropcol) once later suites checkpointed.
+        let dir = std::env::temp_dir().join("rg180-multi-alter");
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = || {
+            let (eng, wal) = crate::wal::Wal::open(&dir).expect("data dir must open");
+            (
+                Arc::new(Mutex::new(eng)),
+                Arc::new(Mutex::new(wal)),
+                session_no_txn(),
+            )
+        };
+        {
+            let (engine, wal, mut session) = open();
+            v180_exec(
+                &engine,
+                &wal,
+                &mut session,
+                &[
+                    "CREATE TABLE t (k int PRIMARY KEY, d1 int, keep1 text, d2 numeric, keep2 float)",
+                    "INSERT INTO t VALUES (1, 1, 'one', 1, 1.5)",
+                    "ALTER TABLE t DROP COLUMN d1, DROP COLUMN d2",
+                    "INSERT INTO t VALUES (2, 'two', 2.5)",
+                ],
+            );
+        }
+        {
+            // Replay the WAL, then checkpoint the replayed state.
+            let (engine, wal, mut session) = open();
+            v180_exec(&engine, &wal, &mut session, &["CHECKPOINT"]);
+        }
+        let (engine, wal, mut session) = open();
+        let rows = v158_rows(
+            v158_run(&engine, &wal, &mut session, "SELECT * FROM t ORDER BY k").expect("select"),
+        );
+        assert_eq!(rows, vec!["1|one|1.5", "2|two|2.5"]);
+        let err = v158_run(
+            &engine,
+            &wal,
+            &mut session,
+            "INSERT INTO t VALUES (1, 'dup', 0)",
+        )
+        .expect_err("primary key survives");
+        assert_eq!(err.code, "23505");
+    }
 }

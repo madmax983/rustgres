@@ -62,6 +62,10 @@ pub enum WalRecord {
         next_attnum: i16,
         /// v1.41: `fillfactor` storage parameter (10–100).
         fillfactor: u8,
+        /// v1.80 (`RGSWAL21`): partition metadata. Before v1.80 only
+        /// checkpoints carried it, so a crash between checkpoints turned
+        /// partitioned tables into plain ones. `None` on `RGSWAL20` logs.
+        partition: Option<crate::storage::PartitionInfo>,
         xmin: u64,
     },
     InsertRows {
@@ -161,6 +165,10 @@ pub enum WalRecord {
         next_value_id: u32,
         /// (value_id, compression-method-code) pairs.
         toast_info: Vec<(u32, u8)>,
+        /// v1.80 (`RGSWAL21`): partition metadata (ATTACH, PARTITION OF,
+        /// and DROP COLUMN key shifts all version the table through this
+        /// record). `None` on `RGSWAL20` logs.
+        partition: Option<crate::storage::PartitionInfo>,
         xmin: u64,
     },
     CreateView {
