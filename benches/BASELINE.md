@@ -2,6 +2,70 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `wal::encoding::crc32` copies its 1024-byte lookup table onto the stack on every byte it checksums — baseline — 2026-10-10
+
+**Why this workload**: `benches/profile_insert.py` (existing harness, same
+shape as bench.py's `insert` workload and the 2026-09-15 `WriteOp` round)
+drives 20 iterations of a 1000-row multi-VALUES `INSERT` over the real wire
+protocol. Every `INSERT` commits a WAL record, and every WAL record is
+checksummed by `wal::encoding::crc32` — this is the real, unavoidable
+write-path cost of durability, not a synthetic microbenchmark of `crc32`
+alone.
+
+Reproduce:
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  ./target/debug/rustgres &
+python3 benches/profile_insert.py --count 20 --rows 1000 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --tree=caller --auto=no /tmp/cg.out \
+  | grep -B2 '__memcpy_avx_unaligned_erms \[/usr/lib'
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, pre-fix, `Ir` only): **1,671,749,585**
+total instructions.
+
+| symbol (caller-tree breakdown of `__memcpy_avx_unaligned_erms`) | Ir | % of total |
+|---|---|---|
+| called from `wal::encoding::crc32` (1,178,861 calls) | 147,357,625 | 8.81% |
+| `crc32`'s own self cost (table lookup + XOR loop) | 41,260,576 | 2.47% |
+| **combined inclusive cost of `crc32`** | **188,618,201** | **11.28%** |
+
+Comfortably past the 5%-of-profile floor from the `memcpy` share alone,
+before even counting `crc32`'s own arithmetic.
+
+**Mechanism** (confirmed by disassembly, not guessed): `CRC32_TABLE` is
+declared `pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();`
+in `src/wal/encoding.rs`. A Rust `const` is not a memory location — every
+place that reads from it gets its own freshly materialized copy of the
+value. `objdump -d` on the compiled `crc32` function shows exactly this:
+inside the per-byte loop, every single iteration does
+
+```
+lea    0x30(%rsp),%rdi
+lea    <CRC32_TABLE rodata>,%rsi
+mov    $0x400,%edx          ; 0x400 == 1024 == size_of::<[u32; 256]>()
+call   memcpy@plt
+```
+
+i.e. the full 1024-byte table is `memcpy`'d from `.rodata` onto the stack
+*on every byte checksummed*, before the single `u32` needed for that byte
+is read back out of the copy. This is not an algorithmic issue (the
+table-driven CRC itself is correct and already the right algorithm per the
+v0.4 baseline) — it is a storage-class bug: `const` was used where `static`
+was needed. A `static [u32; 256]` has one fixed address; every access
+becomes a plain indexed load with no copy.
+
+**Hypothesis**: changing `const` to `static` for `CRC32_TABLE` (the
+`build_crc32_table()` const-fn initializer is unchanged and already valid
+in a `static` initializer) removes the per-byte 1024-byte copy entirely,
+turning `CRC32_TABLE[idx]` into a single indexed load against the fixed
+`.rodata` address. Expected to remove essentially all of the 8.81%
+`memcpy` share with no change to the CRC32 output (byte-for-byte identical
+table contents, same algorithm, same call sites).
+
 ## Bolt: `to_date`/`to_timestamp`/`to_char` re-tokenize their date/timestamp format picture from scratch on every row — fix — 2026-10-09
 
 Fixes the target identified in the baseline entry immediately below
