@@ -2,6 +2,155 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `apply_record`'s `InsertRows` replay does a linear duplicate-id scan per row, making crash/restart recovery O(n²) in table size — fix — 2026-10-11
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/wal/recovery.rs`, `apply_record`'s `InsertRows` arm: the
+duplicate-id guard changes from a linear scan to the table's existing
+O(1) id→position index, the same mechanism `DeleteRows`/`UpdateRows`
+replay already use two call sites down:
+
+```rust
+-                    if t.rows.iter().any(|r| r.id == row.id) {
++                    if t.row_pos(row.id).is_some() {
+```
+
+Nothing else in the arm changes: a hit still emits the same
+"skipping duplicate row id" warning and `continue`s; a miss still
+builds and pushes the `RowVersion` exactly as before. `row_pos`
+reads `row_index`, which `push_version` (called a few lines below,
+on the non-duplicate path) keeps in sync — no new invariant, just the
+lookup `Table` already maintains.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_recovery.py`), same three sizes, same
+machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| `--txns` | before | after | delta |
+|---|---|---|---|
+| 1,000 | 71,492,260 | 53,649,164 | **-24.96%** |
+| 5,000 | 730,797,149 | 271,630,740 | **-62.82%** |
+| 10,000 | 2,387,587,550 | 544,362,695 | **-77.19%** |
+
+All three clear the ≥5%-instruction-reduction floor by a wide margin,
+and — the point of an asymptotic fix — the *size* of the win grows
+with `n`, the opposite of noise. Post-fix scaling is linear: 1,000→
+5,000 (5x size) moves Ir 5.06x; 5,000→10,000 (2x size) moves it
+2.00x, both a clean match for O(n) where pre-fix the same two steps
+gave 10.22x and 3.27x respectively (the quadratic signature from the
+baseline entry). The duplicate-id check itself (`apply_record::
+{closure#10}` and its inlining sites, 63.29% of the 5,000-row profile
+pre-fix) no longer appears above `callgrind_annotate`'s default
+threshold post-fix.
+
+`cargo test --all-features`: 927/927 passed, unchanged (includes
+`wal::tests::apply_record_rebuilds_versions_and_counters` and
+`wal::tests::apply_record_tolerates_missing_targets`, which exercise
+`InsertRows` replay directly). `cargo fmt --all -- --check`: clean.
+`cargo clippy --all-targets --all-features -- -D warnings`: 633
+errors on both the pre-change and post-change tree (confirmed via
+`git stash`, compared by count) — the same toolchain/lint-version
+mismatch noted in every prior Bolt entry in this file; zero new
+errors from this diff.
+
+Before/after profiles are not committed (6 callgrind runs for this
+round, ~0.3-20MB each; every number here is reproducible from the
+parent baseline commit and this commit, per the reproduce steps
+below).
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section at `--txns 1000`, `5000`, and `10000` for the before numbers;
+check out this commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: `apply_record`'s `InsertRows` replay does a linear duplicate-id scan per row, making crash/restart recovery O(n²) in table size — baseline — 2026-10-11
+
+**Why this workload**: every prior Bolt round profiled a live-query hot
+path (SELECT/INSERT/JOIN/aggregate/format functions). None has profiled
+`wal::writer::Wal::open` — the one path that runs on *every* server
+restart, planned shutdown or crash, before a single connection is
+accepted. `benches/profile_recovery.py` (new, this round) builds a
+realistic pre-restart WAL: `--txns` separate autocommit single-row
+`INSERT`s (no `CHECKPOINT`), the shape the module's own docs call out —
+"Autocommit statements are their own implicit transactions" — matching a
+server that has been handling row-at-a-time OLTP traffic and then
+restarts (or crashes) between checkpoints, not a bulk load.
+
+Reproduce (one size; the asymptotic claim below repeats this at three
+sizes):
+```bash
+cargo build
+python3 benches/profile_recovery.py --data-dir /tmp/rgrecov --txns 5000 --port 5450
+RUSTGRES_DATA_DIR=/tmp/rgrecov RUSTGRES_PORT=5451 \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+# wait for "rustgres vX.Y.Z recovery: ... record(s)" on stdout, then:
+kill %1   # SIGTERM flushes callgrind's output
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, pre-fix, `--txns 5000`):
+**730,797,149** total `Ir`.
+
+| symbol (self cost) | Ir | % of total |
+|---|---|---|
+| `<slice::Iter<RowVersion> as Iterator>::any::<apply_record::{closure#10}>` (3 inlining sites: `iter/macros.rs`, `ptr/non_null.rs`, `main.rs`) | 362,542,500 | 49.61% |
+| `wal::recovery::apply_record::{closure#10}` itself (the `|r| r.id == row.id` body) | 99,980,000 | 13.68% |
+| **combined (the duplicate-id scan)** | **462,522,500** | **63.29%** |
+
+Comfortably past the 5%-of-profile floor — this single linear scan is
+nearly two-thirds of total recovery instructions at this workload size.
+
+**Hypothesis**: `apply_record`'s `InsertRows` arm (`src/wal/recovery.rs:480`)
+guards against replaying a row id already present in the table with
+```rust
+if t.rows.iter().any(|r| r.id == row.id) {
+```
+— an O(table size) scan run once per row replayed, making the whole
+`InsertRows` replay loop O(n²) in the table's row count. `Table` already
+carries an O(1) id→position index (`row_index` / `row_pos`, added in
+v0.22) for exactly this lookup — `DeleteRows` and `UpdateRows` replay
+already use it (`t.row_pos(*id)`, with the comment "O(1) via row_index —
+the old linear scan made crash recovery quadratic in version count ...
+now ~1s"). `InsertRows` was missed by that v0.22 fix: it still has the
+original linear scan. Swapping it for `t.row_pos(row.id).is_some()` is
+the same mechanism already proven correct for the other two record
+types, mechanically removing the quadratic term.
+
+**Asymptotic confirmation** (3 input sizes, same harness, same machine,
+fresh WAL per size, `--port` varied to avoid clashing with the
+callgrind-wrapped server):
+
+| `--txns` (table rows at end of replay) | total `Ir` (pre-fix) |
+|---|---|
+| 1,000 | 71,492,260 |
+| 5,000 | 730,797,149 |
+| 10,000 | 2,387,587,550 |
+
+Doubling n (5,000→10,000) grows Ir by **3.27x** — well past the 2x a
+linear cost would give, consistent with a quadratic term that's
+overtaking a smaller linear one. Fitting `Ir(n) = a*n + b*n²` to the
+1,000/10,000 endpoints (`a≈52,907`, `b≈18.585`) predicts the 5,000-row
+midpoint within **0.22%** (729,161,300 predicted vs. 730,797,149
+measured) — the data is explained almost exactly by a linear (per-row
+decode/apply) term plus a quadratic (the duplicate-id scan, which does
+`i` comparisons for the `i`-th row inserted, `sum_{i=1}^{n} i ≈ n²/2`)
+term, not by linear cost alone.
+
+`cargo test --all-features`: 907/907 passed (pre-fix tree, unchanged
+from the last baseline). `cargo fmt --all -- --check`: clean.
+
+**Reproduce the 3-size table**: repeat the single-size reproduce command
+above with `--txns 1000`, `--txns 5000`, `--txns 10000` against fresh
+data directories, each on a distinct `--port`.
+
 ## Bolt: `to_date`/`to_timestamp`/`to_char` re-tokenize their date/timestamp format picture from scratch on every row — fix — 2026-10-09
 
 Fixes the target identified in the baseline entry immediately below

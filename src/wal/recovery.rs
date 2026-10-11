@@ -477,7 +477,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 };
                 let mut out = Vec::new();
                 for row in rows {
-                    if t.rows.iter().any(|r| r.id == row.id) {
+                    // v1.81: O(1) via row_index — the old linear scan made
+                    // crash recovery quadratic in table size, the same bug
+                    // v0.22 fixed for DeleteRows/UpdateRows below but missed
+                    // here (see benches/BASELINE.md, 2026-10-11).
+                    if t.row_pos(row.id).is_some() {
                         eprintln!(
                             "WAL replay: skipping duplicate row id {} in table \"{}\"",
                             row.id, table
