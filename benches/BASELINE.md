@@ -2,7 +2,161 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
-## Bolt: `apply_record`'s `InsertRows` replay does a linear duplicate-id scan per row, making crash/restart recovery O(n²) in table size — fix — 2026-10-11
+## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — fix — 2026-10-12
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/agg.rs`, `value_key_numeric`: the `NumKeyMag::Small(u128)`
+arm no longer renders through `v.to_string()` (a heap-allocating
+`u128`-to-`String` conversion whose result was copied into `out` and
+then dropped). It instead writes the decimal digits into a fixed
+`[u8; 39]` stack buffer (`u128::MAX` is 39 digits) and extends `out`
+from the resulting slice directly:
+
+```diff
+-    let digits = match &mag {
+-        crate::storage::NumKeyMag::Small(v) => v.to_string(),
+-        crate::storage::NumKeyMag::Big(b) => b.to_decimal_string(),
+-    };
+-    out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
+-    out.extend_from_slice(digits.as_bytes());
++    match &mag {
++        crate::storage::NumKeyMag::Small(v) => {
++            let mut buf = [0u8; 39];
++            let mut end = buf.len();
++            let mut rem = *v;
++            loop {
++                end -= 1;
++                buf[end] = b'0' + (rem % 10) as u8;
++                rem /= 10;
++                if rem == 0 {
++                    break;
++                }
++            }
++            let digits = &buf[end..];
++            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
++            out.extend_from_slice(digits);
++        }
++        crate::storage::NumKeyMag::Big(b) => {
++            let digits = b.to_decimal_string();
++            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
++            out.extend_from_slice(digits.as_bytes());
++        }
++    }
+```
+
+The rare `NumKeyMag::Big` (genuine big-mantissa numerics) arm is
+untouched — same `to_decimal_string()` allocation as before; only the
+overwhelmingly common `Small(u128)` path (every int2/int4/int8, and
+every numeric that fits a `u128` magnitude) changes. Output bytes are
+identical: same big-endian length prefix, same digit bytes, no leading
+zeros, "0" for zero — the stack rendering produces the exact same
+string `v.to_string()` would have, just without the heap round-trip.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000
+--count 50`), same workload, same machine, same session, DHAT
+(valgrind 3.22.0):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 10,025,435 | 8,025,435 | **-19.95%** |
+| Total allocation bytes | 1,678,727,507 | 1,671,282,529 | **-0.44%** |
+| Target site blocks (`value_key_numeric`'s `to_string()`/stack-buffer arm) | 2,000,000 | 0 (site no longer appears in the top-15 by blocks or bytes) | -100% |
+
+The block-count delta (-2,000,000) lands exactly on the target site's
+pre-fix count — this is a clean 1:1 removal, not a shift to some other
+site. -19.95% clears the ≥10%-reduction allocation-count impact floor
+by roughly 2x. The byte-count delta is small (-0.44%, matching the
+target's tiny pre-fix byte share) and isn't the claim being made here;
+allocation *count* is, and DHAT's block counter backs it directly.
+
+`cargo test --all-features`: 927/927 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 633 errors on both the pre-change and post-change
+tree (confirmed via `git stash`/`git stash pop` around the clippy run,
+compared by count) — the same toolchain/lint-version mismatch noted in
+every prior Bolt entry in this file; zero new errors from this diff.
+
+Before/after `dhat.out` files are not committed (each run is several
+hundred MB under debug-build DHAT instrumentation); every number above
+is reproducible from the parent baseline commit and this commit, per
+the reproduce steps below.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the DHAT command in the baseline entry's "Reproduce" section
+for the before numbers; check out this commit, `cargo build`, repeat
+for the after numbers.
+
+## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — baseline — 2026-10-12
+
+**Why this workload**: `benches/profile_agg.py` (already committed, from the
+`exec_agg` per-group `cells` round, 2026-09-24/#27) drives a realistic
+`GROUP BY` aggregation — `bench_agg(k INT, a INT, b INT, c INT, d INT)`
+loaded with 40,000 rows across 4,000 distinct `k` values, then 50
+iterations of
+`SELECT k, count(*), sum(a), sum(b), max(c), min(d) FROM bench_agg GROUP BY k`
+over the real wire protocol. That round's own negative-result writeup
+(GitHub issue #27) explicitly flagged `value_key`'s per-row group-key
+hashing — 45.9% of that session's allocation blocks, at the old
+pre-modularization `exec.rs:14346` — as unexplored and likely to
+dominate the workload's real allocation cost more than the per-group
+output buffer it was measuring. This round picks up that flag.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) RUSTGRES_PORT=5433 \
+  valgrind --tool=dhat --dhat-out-file=/tmp/dhat.out \
+  ./target/debug/rustgres &
+# wait for "... listening on 127.0.0.1:5433", then:
+python3 benches/profile_agg.py --rows 40000 --groups 4000 --count 50
+kill -TERM %1   # flushes dhat's output on exit
+# sum `tb`/`tbk` over dhat.out's `pps`, grouped by the innermost
+# frame in `ftbl` containing "rustgres::", for the breakdown below.
+```
+
+**Profile** (DHAT, valgrind 3.22.0, `main` @ current head, debug build):
+**10,025,435** total allocation blocks, **1,678,727,507** total bytes,
+over 50 iterations of the 40,000-row/4,000-group workload. Top sites by
+innermost `rustgres::` frame:
+
+| site | blocks | % of blocks | bytes | % of bytes |
+|---|---|---|---|---|
+| `Vec<Value>` `with_capacity_in`/`grow_one`/`reserve` (row storage, unrelated) | ~4,400,000 | ~43.9% | ~825,600,000 | ~49.2% |
+| **`exec::agg::value_key_numeric` (agg.rs:25, target — group-key digit encoding)** | **2,000,000** | **19.95%** | **7,445,000** | **0.44%** |
+| `exec::agg::exec_agg_one` (agg.rs:598-599, group bucket bookkeeping, unrelated) | 1,000,000 | 9.97% | 50,144,500 | 2.99% |
+| `exec::agg::eval_agg_func` (agg.rs:2602, aggregate accumulator state, unrelated) | 800,000 | 7.98% | 64,000,000 | 3.81% |
+
+The target (`value_key_numeric`'s `v.to_string()` call, one per exact-
+numeric value hashed into any GROUP BY/DISTINCT/ORDER BY/hash-join key —
+here, once per row for the single-column `k` key) is the single
+largest *named* `rustgres::` allocation site in the profile: 19.95% of
+all allocation blocks, comfortably clearing the ≥5%-of-profile
+relevance bar. Its byte share is tiny (0.44%) because each allocation
+is a short digit string (1-4 bytes for `k` in `0..4000`) plus heap
+bookkeeping overhead — the *count*, not the size, is the cost here.
+
+**Hypothesis**: `value_key_numeric` (`src/exec/agg.rs:16-31`) renders
+the group-key magnitude's decimal digits via `NumKeyMag::Small(v) =>
+v.to_string()` — a `u128`-to-`String` conversion that heap-allocates,
+even though the caller immediately copies the string's bytes into the
+pre-existing `out: &mut Vec<u8>` scratch buffer (via
+`extend_from_slice`) and then drops the `String`. The digits never
+need to live on the heap at all: `u128::MAX` is 39 decimal digits, so
+formatting into a fixed `[u8; 39]` stack buffer and extending `out`
+from the computed slice removes the allocation entirely, for every
+call, with byte-for-byte identical output (same length-prefix, same
+digit bytes, no leading zeros, "0" for zero — matching the existing
+doc comment's stated invariant).
+
+**Next**: implement the stack-buffer rendering, re-run this exact
+harness under DHAT, and confirm the delta clears the ≥10%-reduction
+allocation-count floor before shipping as a fix.
 
 Fixes the target identified in the baseline entry immediately below
 this one.
