@@ -1119,12 +1119,26 @@ pub(crate) fn send_warning(stream: &mut Writer, message: &str) -> io::Result<()>
 /// statement (PG sends notices before the completion tag).
 /// v1.04: warnings queued by `queue_warning` go first, with WARNING
 /// severity (a statement never produces both at once).
+/// v1.81: PG19 `client_min_messages` filtering — messages below the
+/// configured level are not sent to the client (default `notice`, so
+/// default behavior is unchanged).
 fn drain_notices(stream: &mut Writer, session: &mut Session) -> io::Result<()> {
+    let min_level = message_level_rank(
+        &session
+            .gucs
+            .get("client_min_messages")
+            .cloned()
+            .unwrap_or_else(|| "notice".to_string()),
+    );
     for warning in std::mem::take(&mut session.pending_warnings) {
-        send_warning(stream, &warning)?;
+        if message_level_rank("warning") >= min_level {
+            send_warning(stream, &warning)?;
+        }
     }
     for notice in std::mem::take(&mut session.pending_notices) {
-        send_notice(stream, &notice)?;
+        if message_level_rank("notice") >= min_level {
+            send_notice(stream, &notice)?;
+        }
     }
     Ok(())
 }
@@ -2650,6 +2664,32 @@ fn is_generic_guc(name: &str) -> bool {
             | "plan_cache_mode"
             | "lc_numeric"
             | "standard_conforming_strings"
+            // v1.81: top missing PG19 GUCs (full-schedule burn-down).
+            | "client_min_messages"
+            | "log_min_messages"
+            | "icu_validation_level"
+            | "constraint_exclusion"
+            | "debug_parallel_query"
+            | "intervalstyle"
+            | "session_replication_role"
+            | "stats_fetch_consistency"
+            | "password_encryption"
+            | "datestyle"
+            | "client_encoding"
+            | "row_security"
+            | "check_function_bodies"
+            | "enable_material"
+            | "enable_partitionwise_aggregate"
+            | "enable_partition_pruning"
+            | "enable_incremental_sort"
+            | "vacuum_cost_delay"
+            | "hash_mem_multiplier"
+            | "maintenance_work_mem"
+            | "max_parallel_maintenance_workers"
+            | "max_stack_depth"
+            | "timezone"
+            | "search_path"
+            | "default_table_access_method"
     )
 }
 
@@ -2671,6 +2711,32 @@ fn guc_default(name: &str) -> &'static str {
         "plan_cache_mode" => "auto",
         "lc_numeric" => "C",
         "standard_conforming_strings" => "on",
+        // v1.81: PG19 `boot_val`s (guc_parameters.dat).
+        "client_min_messages" => "notice",
+        "log_min_messages" => "warning",
+        "icu_validation_level" => "warning",
+        "constraint_exclusion" => "partition",
+        "debug_parallel_query" => "off",
+        "intervalstyle" => "postgres",
+        "session_replication_role" => "origin",
+        "stats_fetch_consistency" => "cache",
+        "password_encryption" => "scram-sha-256",
+        "datestyle" => "ISO, MDY",
+        "client_encoding" => "UTF8",
+        "row_security" => "on",
+        "check_function_bodies" => "on",
+        "enable_material" => "on",
+        "enable_partitionwise_aggregate" => "off",
+        "enable_partition_pruning" => "on",
+        "enable_incremental_sort" => "on",
+        "vacuum_cost_delay" => "0",
+        "hash_mem_multiplier" => "2.0",
+        "maintenance_work_mem" => "64MB",
+        "max_parallel_maintenance_workers" => "2",
+        "max_stack_depth" => "100kB",
+        "timezone" => "GMT",
+        "search_path" => "\"$user\", public",
+        "default_table_access_method" => "heap",
         _ => "on",
     }
 }
@@ -2692,6 +2758,148 @@ fn parse_memory_kb(s: &str) -> Option<i64> {
         (t, 1)
     };
     num.trim().parse::<i64>().ok()?.checked_mul(mult)
+}
+
+/// v1.81: validate a PG19 enum GUC value (case-insensitive) against
+/// `(accepted_spelling, canonical_form)` pairs, returning the canonical
+/// form. 22023 when nothing matches, like PG19's `config_enum` check.
+fn validate_enum_guc(
+    name: &str,
+    value: &str,
+    options: &[(&str, &str)],
+) -> Result<String, ExecError> {
+    let lower = value.trim().to_ascii_lowercase();
+    for (spell, canon) in options {
+        if lower == *spell {
+            return Ok(canon.to_string());
+        }
+    }
+    Err(ExecError {
+        detail: None,
+        code: "22023",
+        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+    })
+}
+
+/// v1.81: PG19 `check_datestyle` (src/backend/commands/variable.c):
+/// comma-separated tokens, each a style (ISO, SQL, Postgres, German)
+/// or an order (YMD, DMY/Euro, MDY/US), at most one of each, no
+/// conflicts, no unknown tokens. Returns the canonical form
+/// ("ISO, MDY") PG19 stores.
+fn validate_datestyle(value: &str) -> Result<String, ExecError> {
+    let invalid = || ExecError {
+        detail: None,
+        code: "22023",
+        message: format!("invalid value for parameter \"datestyle\": \"{}\"", value),
+    };
+    let mut style: Option<&str> = None;
+    let mut order: Option<&str> = None;
+    let mut any = false;
+    for tok in value.split(',') {
+        let t = tok.trim().to_ascii_uppercase();
+        if t.is_empty() {
+            return Err(invalid());
+        }
+        any = true;
+        let (is_style, canon) = match t.as_str() {
+            "ISO" => (true, "ISO"),
+            "SQL" => (true, "SQL"),
+            "POSTGRES" => (true, "Postgres"),
+            "GERMAN" => (true, "German"),
+            "YMD" => (false, "YMD"),
+            "DMY" | "EURO" => (false, "DMY"),
+            "MDY" | "US" => (false, "MDY"),
+            "DEFAULT" => continue,
+            _ => return Err(invalid()),
+        };
+        if is_style {
+            match style {
+                Some(prev) if prev != canon => return Err(invalid()),
+                _ => style = Some(canon),
+            }
+        } else {
+            match order {
+                Some(prev) if prev != canon => return Err(invalid()),
+                _ => order = Some(canon),
+            }
+        }
+    }
+    if !any {
+        return Err(invalid());
+    }
+    Ok(format!(
+        "{}, {}",
+        style.unwrap_or("ISO"),
+        order.unwrap_or("MDY")
+    ))
+}
+
+/// v1.81: PG19 client-encoding names (`pg_valid_client_encoding`,
+/// src/common/encnames.c), canonical spellings. Case-insensitive like PG.
+fn validate_client_encoding(value: &str) -> Result<String, ExecError> {
+    const ENCODINGS: &[(&str, &str)] = &[
+        ("sql_ascii", "SQL_ASCII"),
+        ("mule_internal", "MULE_INTERNAL"),
+        ("latin1", "LATIN1"),
+        ("latin2", "LATIN2"),
+        ("latin3", "LATIN3"),
+        ("latin4", "LATIN4"),
+        ("latin5", "LATIN5"),
+        ("latin6", "LATIN6"),
+        ("latin7", "LATIN7"),
+        ("latin8", "LATIN8"),
+        ("latin9", "LATIN9"),
+        ("latin10", "LATIN10"),
+        ("iso_8859_5", "ISO_8859_5"),
+        ("iso_8859_6", "ISO_8859_6"),
+        ("iso_8859_7", "ISO_8859_7"),
+        ("iso_8859_8", "ISO_8859_8"),
+        ("koi8r", "KOI8R"),
+        ("koi8u", "KOI8U"),
+        ("win866", "WIN866"),
+        ("win874", "WIN874"),
+        ("win1250", "WIN1250"),
+        ("win1251", "WIN1251"),
+        ("win1252", "WIN1252"),
+        ("win1253", "WIN1253"),
+        ("win1254", "WIN1254"),
+        ("win1255", "WIN1255"),
+        ("win1256", "WIN1256"),
+        ("win1257", "WIN1257"),
+        ("win1258", "WIN1258"),
+        ("euc_jp", "EUC_JP"),
+        ("euc_cn", "EUC_CN"),
+        ("euc_kr", "EUC_KR"),
+        ("euc_tw", "EUC_TW"),
+        ("big5", "BIG5"),
+        ("gb18030", "GB18030"),
+        ("uhc", "UHC"),
+        ("sjis", "SJIS"),
+        ("shift_jis_2004", "SHIFT_JIS_2004"),
+        ("euc_jis_2004", "EUC_JIS_2004"),
+        ("utf8", "UTF8"),
+    ];
+    validate_enum_guc("client_encoding", value, ENCODINGS)
+}
+
+/// v1.81: rank of a PG19 message level for `client_min_messages`
+/// filtering (e.g. `warning` suppresses `notice`). Canonical spellings.
+fn message_level_rank(level: &str) -> i32 {
+    match level {
+        "debug5" => 10,
+        "debug4" => 11,
+        "debug3" => 12,
+        "debug2" => 13,
+        "debug1" => 14,
+        "log" => 15,
+        "info" => 16,
+        "notice" => 17,
+        "warning" => 18,
+        "error" => 19,
+        "fatal" => 20,
+        "panic" => 21,
+        _ => 17,
+    }
 }
 
 /// v1.07: validate a value for a generic GUC like PG19, returning the
@@ -2829,6 +3037,223 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             }
             Ok("on".to_string())
         }
+        // v1.81: PG19 message-level enums
+        // (src/backend/utils/misc/guc_tables.c:
+        // client_message_level_options / server_message_level_options).
+        "client_min_messages" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("debug5", "debug5"),
+                ("debug4", "debug4"),
+                ("debug3", "debug3"),
+                ("debug2", "debug2"),
+                ("debug1", "debug1"),
+                ("debug", "debug2"),
+                ("log", "log"),
+                ("info", "info"),
+                ("notice", "notice"),
+                ("warning", "warning"),
+                ("error", "error"),
+            ],
+        ),
+        "log_min_messages" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("debug5", "debug5"),
+                ("debug4", "debug4"),
+                ("debug3", "debug3"),
+                ("debug2", "debug2"),
+                ("debug1", "debug1"),
+                ("debug", "debug2"),
+                ("info", "info"),
+                ("notice", "notice"),
+                ("warning", "warning"),
+                ("error", "error"),
+                ("log", "log"),
+                ("fatal", "fatal"),
+                ("panic", "panic"),
+            ],
+        ),
+        "icu_validation_level" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("disabled", "disabled"),
+                ("debug5", "debug5"),
+                ("debug4", "debug4"),
+                ("debug3", "debug3"),
+                ("debug2", "debug2"),
+                ("debug1", "debug1"),
+                ("warning", "warning"),
+                ("error", "error"),
+                ("fatal", "fatal"),
+            ],
+        ),
+        // v1.81: PG19 enum GUCs (guc_tables.c).
+        "constraint_exclusion" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("partition", "partition"),
+                ("on", "on"),
+                ("off", "off"),
+                ("true", "on"),
+                ("yes", "on"),
+                ("1", "on"),
+                ("false", "off"),
+                ("no", "off"),
+                ("0", "off"),
+            ],
+        ),
+        "debug_parallel_query" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("off", "off"),
+                ("on", "on"),
+                ("regress", "regress"),
+                ("true", "on"),
+                ("yes", "on"),
+                ("1", "on"),
+                ("false", "off"),
+                ("no", "off"),
+                ("0", "off"),
+            ],
+        ),
+        "intervalstyle" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("postgres", "postgres"),
+                ("postgres_verbose", "postgres_verbose"),
+                ("sql_standard", "sql_standard"),
+                ("iso_8601", "iso_8601"),
+            ],
+        ),
+        "session_replication_role" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("origin", "origin"),
+                ("replica", "replica"),
+                ("local", "local"),
+            ],
+        ),
+        "stats_fetch_consistency" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("none", "none"),
+                ("cache", "cache"),
+                ("snapshot", "snapshot"),
+            ],
+        ),
+        "password_encryption" => validate_enum_guc(
+            name,
+            value,
+            &[("md5", "md5"), ("scram-sha-256", "scram-sha-256")],
+        ),
+        // v1.81: PG19 check_datestyle (src/backend/commands/variable.c).
+        "datestyle" => validate_datestyle(value),
+        // v1.81: PG19 client-encoding names (pg_valid_client_encoding).
+        "client_encoding" => validate_client_encoding(value),
+        // v1.81: PG19 bool GUCs.
+        "row_security"
+        | "check_function_bodies"
+        | "enable_material"
+        | "enable_partitionwise_aggregate"
+        | "enable_partition_pruning"
+        | "enable_incremental_sort" => parse_bool_guc(value)
+            .map(|b| (if b { "on" } else { "off" }).to_string())
+            .ok_or_else(invalid),
+        // v1.81: PG19 real GUCs (vacuum_cost_delay: 0..100ms;
+        // hash_mem_multiplier: 1.0..1000.0).
+        "vacuum_cost_delay" | "hash_mem_multiplier" => {
+            let f: f64 = value.trim().parse().map_err(|_| invalid())?;
+            let (lo, hi) = if name == "vacuum_cost_delay" {
+                (0.0, 100.0)
+            } else {
+                (1.0, 1000.0)
+            };
+            if !(lo..=hi).contains(&f) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(value.trim().to_string())
+        }
+        // v1.81: PG19 int-memory GUCs (maintenance_work_mem: >=64kB;
+        // max_stack_depth: >=100kB).
+        "maintenance_work_mem" | "max_stack_depth" => {
+            let kb = parse_memory_kb(value).ok_or_else(invalid)?;
+            let min_kb = if name == "maintenance_work_mem" {
+                64
+            } else {
+                100
+            };
+            if kb < min_kb {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "\"{}\" is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(format!("{}kB", kb))
+        }
+        // v1.81: PG19 int GUC (0..1024).
+        "max_parallel_maintenance_workers" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(0..=1024).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"{}\" (0 .. 1024)",
+                        value, name
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        // v1.81: PG19 string GUCs; accepted without catalog validation
+        // (like v1.07 `lc_numeric`).
+        "timezone" | "search_path" => Ok(value.to_string()),
+        // v1.81: PG19 validates `default_table_access_method` against
+        // registered TABLE AMs at SET time (empty / unknown rejected;
+        // the only table AM here is `heap`).
+        "default_table_access_method" => {
+            if value.is_empty() {
+                return Err(ExecError {
+                    detail: Some("\"default_table_access_method\" cannot be empty.".to_string()),
+                    code: "22023",
+                    message: format!(
+                        "invalid value for parameter \"default_table_access_method\": \"{}\"",
+                        value
+                    ),
+                });
+            }
+            if !value.eq_ignore_ascii_case("heap") {
+                return Err(ExecError {
+                    detail: Some(format!("Table access method \"{}\" does not exist.", value)),
+                    code: "22023",
+                    message: format!(
+                        "invalid value for parameter \"default_table_access_method\": \"{}\"",
+                        value
+                    ),
+                });
+            }
+            Ok("heap".to_string())
+        }
         _ => Err(ExecError {
             detail: None,
             code: "42704",
@@ -2869,6 +3294,32 @@ fn name_to_static(name: &str) -> &'static str {
         "plan_cache_mode" => "plan_cache_mode",
         "lc_numeric" => "lc_numeric",
         "standard_conforming_strings" => "standard_conforming_strings",
+        // v1.81: top missing PG19 GUCs.
+        "client_min_messages" => "client_min_messages",
+        "log_min_messages" => "log_min_messages",
+        "icu_validation_level" => "icu_validation_level",
+        "constraint_exclusion" => "constraint_exclusion",
+        "debug_parallel_query" => "debug_parallel_query",
+        "intervalstyle" => "intervalstyle",
+        "session_replication_role" => "session_replication_role",
+        "stats_fetch_consistency" => "stats_fetch_consistency",
+        "password_encryption" => "password_encryption",
+        "datestyle" => "datestyle",
+        "client_encoding" => "client_encoding",
+        "row_security" => "row_security",
+        "check_function_bodies" => "check_function_bodies",
+        "enable_material" => "enable_material",
+        "enable_partitionwise_aggregate" => "enable_partitionwise_aggregate",
+        "enable_partition_pruning" => "enable_partition_pruning",
+        "enable_incremental_sort" => "enable_incremental_sort",
+        "vacuum_cost_delay" => "vacuum_cost_delay",
+        "hash_mem_multiplier" => "hash_mem_multiplier",
+        "maintenance_work_mem" => "maintenance_work_mem",
+        "max_parallel_maintenance_workers" => "max_parallel_maintenance_workers",
+        "max_stack_depth" => "max_stack_depth",
+        "timezone" => "timezone",
+        "search_path" => "search_path",
+        "default_table_access_method" => "default_table_access_method",
         _ => "unrecognized",
     }
 }
@@ -3067,12 +3518,23 @@ fn stmt_set_guc(
     }
 }
 
+/// v1.81: PG19's canonical GUC display names (`SHOW` column header).
+/// Most GUCs are already lowercase; these three are not.
+fn guc_display_name(name: &str) -> &str {
+    match name {
+        "datestyle" => "DateStyle",
+        "intervalstyle" => "IntervalStyle",
+        "timezone" => "TimeZone",
+        _ => name,
+    }
+}
+
 /// v0.17: `SHOW name` — one row, one text column named for the
 /// parameter, like PG.
 fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError> {
     match guc_value(session, name) {
         Some(v) => Ok(ExecResult::Select {
-            columns: vec![(name.to_string(), ColType::Text)],
+            columns: vec![(guc_display_name(name).to_string(), ColType::Text)],
             rows: vec![Row::new(vec![Value::text(v)])],
         }),
         None => Err(ExecError {
@@ -5832,6 +6294,130 @@ mod tests {
         // standard_conforming_strings = off is 0A000.
         let e = validate_generic_guc("standard_conforming_strings", "off").unwrap_err();
         assert_eq!(e.code, "0A000");
+    }
+
+    // v1.81: top missing PG19 GUCs (full-schedule burn-down).
+    #[test]
+    fn v181_new_guc_validation() {
+        // client_min_messages enum (+ hidden aliases).
+        assert_eq!(
+            validate_generic_guc("client_min_messages", "warning").unwrap(),
+            "warning"
+        );
+        assert_eq!(
+            validate_generic_guc("client_min_messages", "DEBUG1").unwrap(),
+            "debug1"
+        );
+        assert_eq!(
+            validate_generic_guc("client_min_messages", "debug").unwrap(),
+            "debug2"
+        );
+        let e = validate_generic_guc("client_min_messages", "fatal").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // log_min_messages accepts the server levels.
+        assert_eq!(
+            validate_generic_guc("log_min_messages", "panic").unwrap(),
+            "panic"
+        );
+        // datestyle: PG19 check_datestyle, canonical form.
+        assert_eq!(
+            validate_generic_guc("datestyle", "Postgres, DMY").unwrap(),
+            "Postgres, DMY"
+        );
+        assert_eq!(
+            validate_generic_guc("datestyle", "iso").unwrap(),
+            "ISO, MDY"
+        );
+        assert_eq!(
+            validate_generic_guc("datestyle", "ymd").unwrap(),
+            "ISO, YMD"
+        );
+        let e = validate_generic_guc("datestyle", "nonsense").unwrap_err();
+        assert_eq!(e.code, "22023");
+        let e = validate_generic_guc("datestyle", "ISO, MDY, YMD").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // intervalstyle enum.
+        assert_eq!(
+            validate_generic_guc("intervalstyle", "sql_standard").unwrap(),
+            "sql_standard"
+        );
+        let e = validate_generic_guc("intervalstyle", "unix").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // constraint_exclusion enum (+ bool aliases).
+        assert_eq!(
+            validate_generic_guc("constraint_exclusion", "partition").unwrap(),
+            "partition"
+        );
+        assert_eq!(
+            validate_generic_guc("constraint_exclusion", "true").unwrap(),
+            "on"
+        );
+        // bool GUCs.
+        assert_eq!(validate_generic_guc("row_security", "off").unwrap(), "off");
+        assert_eq!(validate_generic_guc("enable_material", "1").unwrap(), "on");
+        // real GUCs with ranges.
+        assert_eq!(
+            validate_generic_guc("vacuum_cost_delay", "10").unwrap(),
+            "10"
+        );
+        let e = validate_generic_guc("vacuum_cost_delay", "-1").unwrap_err();
+        assert_eq!(e.code, "22023");
+        let e = validate_generic_guc("hash_mem_multiplier", "0.5").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // int-memory GUCs.
+        assert_eq!(
+            validate_generic_guc("maintenance_work_mem", "64MB").unwrap(),
+            "65536kB"
+        );
+        let e = validate_generic_guc("maintenance_work_mem", "32kB").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // client_encoding names.
+        assert_eq!(
+            validate_generic_guc("client_encoding", "LATIN1").unwrap(),
+            "LATIN1"
+        );
+        let e = validate_generic_guc("client_encoding", "BOGUS99").unwrap_err();
+        assert_eq!(e.code, "22023");
+        // string GUCs.
+        assert_eq!(
+            validate_generic_guc("search_path", "myschema, public").unwrap(),
+            "myschema, public"
+        );
+        // compiled defaults (PG19 boot_vals).
+        assert_eq!(guc_default("client_min_messages"), "notice");
+        assert_eq!(guc_default("datestyle"), "ISO, MDY");
+        assert_eq!(guc_default("intervalstyle"), "postgres");
+        assert_eq!(guc_default("row_security"), "on");
+        assert_eq!(guc_default("enable_partitionwise_aggregate"), "off");
+        assert_eq!(guc_default("maintenance_work_mem"), "64MB");
+        assert_eq!(guc_default("max_stack_depth"), "100kB");
+        assert_eq!(guc_default("search_path"), "\"$user\", public");
+        assert_eq!(guc_default("password_encryption"), "scram-sha-256");
+        // message-level ranking for client_min_messages filtering.
+        assert!(message_level_rank("error") > message_level_rank("warning"));
+        assert!(message_level_rank("warning") > message_level_rank("notice"));
+        assert!(message_level_rank("notice") > message_level_rank("log"));
+        // default_table_access_method: only heap exists here.
+        assert_eq!(
+            validate_generic_guc("default_table_access_method", "heap").unwrap(),
+            "heap"
+        );
+        assert_eq!(
+            validate_generic_guc("default_table_access_method", "HEAP").unwrap(),
+            "heap"
+        );
+        let e = validate_generic_guc("default_table_access_method", "").unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert!(
+            e.message.contains("cannot be empty")
+                || e.detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("cannot be empty")
+        );
+        let e = validate_generic_guc("default_table_access_method", "btree").unwrap_err();
+        assert_eq!(e.code, "22023");
+        assert!(e.detail.as_deref().unwrap_or("").contains("does not exist"));
     }
 
     // v1.07: generic GUC SET/SHOW/RESET round-trip.
