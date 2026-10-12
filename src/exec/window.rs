@@ -192,6 +192,7 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
+        | Expr::JsonOp { left, right, .. }
         | Expr::Concat(left, right) => {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)

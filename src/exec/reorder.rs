@@ -727,6 +727,7 @@ pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
             left: a, right: b, ..
         }
         | Expr::Concat(a, b) => expr_has_subquery(a) || expr_has_subquery(b),
+        Expr::JsonOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
         Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) => expr_has_subquery(x),
         Expr::Func { args, .. } => args.iter().any(expr_has_subquery),
         Expr::Agg { arg, arg2, .. } => {
@@ -1071,6 +1072,7 @@ pub(crate) fn expr_has_agg(e: &Expr) -> bool {
             left: a, right: b, ..
         }
         | Expr::Concat(a, b) => expr_has_agg(a) || expr_has_agg(b),
+        Expr::JsonOp { left, right, .. } => expr_has_agg(left) || expr_has_agg(right),
         Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::Cast { expr: x, .. } => {
             expr_has_agg(x)
         }

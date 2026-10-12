@@ -186,6 +186,11 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             expr_is_volatile(db, a) || expr_is_volatile(db, b)
         }
+        // v1.82: JSON operators are immutable (PG19 jsonfuncs.c funcs
+        // are provolatile 'i'); volatility comes from the operands.
+        Expr::JsonOp { left, right, .. } => {
+            expr_is_volatile(db, left) || expr_is_volatile(db, right)
+        }
         Expr::Cast { expr, .. }
         | Expr::CastNamed { expr, .. }
         | Expr::FieldAccess { expr, .. }
@@ -398,6 +403,10 @@ pub(crate) fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, Strin
         Expr::Concat(a, b) => {
             collect_column_refs(a, out);
             collect_column_refs(b, out);
+        }
+        Expr::JsonOp { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
         }
         // v0.79: array constructors/subscripts/slices depend on their
         // operands' columns.

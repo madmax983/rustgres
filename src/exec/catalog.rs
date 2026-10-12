@@ -844,6 +844,7 @@ pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::JsonOp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Like {
                 expr,
                 pattern,
@@ -960,6 +961,7 @@ pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::JsonOp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Like {
                 expr,
                 pattern,
@@ -1074,6 +1076,7 @@ pub(crate) fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
+            Expr::JsonOp { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Like {
                 expr,
                 pattern,
@@ -1383,6 +1386,12 @@ pub(crate) fn resolve_predicate_columns_in(
             right: Box::new(r(right)?),
         }),
         Expr::Concat(a, b) => Ok(Expr::Concat(Box::new(r(a)?), Box::new(r(b)?))),
+        // v1.82: JSON operators — resolve columns in both operands.
+        Expr::JsonOp { op, left, right } => Ok(Expr::JsonOp {
+            op: *op,
+            left: Box::new(r(left)?),
+            right: Box::new(r(right)?),
+        }),
         // v0.79: array expressions rebuild with resolved operands.
         Expr::ArrayCtor { elems, nested } => Ok(Expr::ArrayCtor {
             elems: elems.iter().map(r).collect::<Result<Vec<_>, _>>()?,

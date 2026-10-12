@@ -996,7 +996,8 @@ pub(crate) fn contains_agg(e: &Expr) -> bool {
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
-        | Expr::Concat(left, right) => contains_agg(left) || contains_agg(right),
+        | Expr::Concat(left, right)
+        | Expr::JsonOp { left, right, .. } => contains_agg(left) || contains_agg(right),
         // v0.79: array operands can hide aggregates — recurse.
         Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_agg),
         // v0.81: composite operands can hide aggregates — recurse.
@@ -1081,6 +1082,10 @@ pub(crate) fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 stack.push(right);
             }
             Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::JsonOp { left, right, .. } => {
                 stack.push(left);
                 stack.push(right);
             }
@@ -1386,7 +1391,8 @@ pub(crate) fn contains_window(e: &Expr) -> bool {
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
-        | Expr::Concat(left, right) => contains_window(left) || contains_window(right),
+        | Expr::Concat(left, right)
+        | Expr::JsonOp { left, right, .. } => contains_window(left) || contains_window(right),
         // v0.79: array operands can hide window functions — recurse.
         Expr::ArrayCtor { elems, .. } => elems.iter().any(contains_window),
         // v0.81: composite operands can hide window functions — recurse.

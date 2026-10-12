@@ -1472,9 +1472,22 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // v0.73: no composite input function — nothing casts TO record.
         ColType::Record => Err(cast_err(v, "record")),
         // v0.73: PG19 has record->json and text->json casts.
+        // v1.82: text input is validated like PG19's `json_in`
+        // (utils/adt/json.c over common/jsonapi.c): malformed JSON is
+        // 22P02 `invalid input syntax for type json`. Before v1.82 the
+        // `json` type name was unregistered, so these casts never got
+        // here (they failed 42704 at resolution).
         ColType::Json => match v {
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
-            Value::Text(_) | Value::BpChar(_) => Ok(text_value_of(&[v])),
+            Value::Text(s) | Value::BpChar(s) => {
+                if parse_json(&s).is_err() {
+                    return Err(exec_err(
+                        "22P02",
+                        "invalid input syntax for type json".to_string(),
+                    ));
+                }
+                Ok(text_value_of(&[v]))
+            }
             other => Err(cast_err(other, "json")),
         },
         // v0.79: real array casts (PG19 array_in/array_out semantics).

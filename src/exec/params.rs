@@ -70,6 +70,12 @@ pub(crate) fn hint_type(
         )
         .ok(),
         Expr::Concat(..) => Some(ColType::Text),
+        // v1.82: JSON operator result types, like expr_type.
+        Expr::JsonOp { op, .. } => Some(if op.returns_json() {
+            ColType::Json
+        } else {
+            ColType::Text
+        }),
         Expr::Extract { .. } => Some(ColType::Numeric(None)),
         Expr::Func { name, args } => {
             func_result_type(name, args, eng, snap, own, session, schemas, &[], &[]).ok()
@@ -1177,6 +1183,7 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
+        | Expr::JsonOp { left, right, .. }
         | Expr::Concat(left, right) => {
             subst_expr(left, params)?;
             subst_expr(right, params)?;

@@ -41,11 +41,11 @@ pub(crate) use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound,
     FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
-    IsolationLevel, JoinKind, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind, QuantOp,
-    RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
-    Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc,
-    collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body, trig_event,
-    validate_constraint_expr,
+    IsolationLevel, JoinKind, JsonOp, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind,
+    QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot,
+    SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame,
+    WindowFunc, collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body,
+    trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
@@ -83,6 +83,7 @@ mod funcs;
 mod indexes;
 mod info_schema;
 mod join;
+mod json;
 mod orderby;
 mod params;
 mod partition;
@@ -261,6 +262,7 @@ pub(crate) use funcs::*;
 pub(crate) use indexes::*;
 pub(crate) use info_schema::*;
 pub(crate) use join::*;
+pub(crate) use json::*;
 pub(crate) use orderby::*;
 pub(crate) use params::*;
 pub(crate) use partition::*;

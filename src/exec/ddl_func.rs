@@ -590,6 +590,10 @@ pub(crate) fn substitute_func_params(
             substitute_func_params(left, args, eng, snap, own, session)
                 && substitute_func_params(right, args, eng, snap, own, session)
         }
+        Expr::JsonOp { left, right, .. } => {
+            substitute_func_params(left, args, eng, snap, own, session)
+                && substitute_func_params(right, args, eng, snap, own, session)
+        }
         Expr::Not(inner) | Expr::Neg(inner) | Expr::BitNot(inner) => {
             substitute_func_params(inner, args, eng, snap, own, session)
         }
@@ -1339,6 +1343,10 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
             rewrite_func_arg_expr(right, arg_names);
         }
         Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
+            rewrite_func_arg_expr(left, arg_names);
+            rewrite_func_arg_expr(right, arg_names);
+        }
+        Expr::JsonOp { left, right, .. } => {
             rewrite_func_arg_expr(left, arg_names);
             rewrite_func_arg_expr(right, arg_names);
         }

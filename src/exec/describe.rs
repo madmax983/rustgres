@@ -1156,6 +1156,13 @@ pub(crate) fn expr_type(
             case_result_type(eng, snap, own, session, schemas, ctes, whens, else_)
         }
         Expr::Concat(..) => Ok(ColType::Text),
+        // v1.82: PG19 operator return types — `->`/`#>` are json,
+        // `->>`/`#>>` are text.
+        Expr::JsonOp { op, .. } => Ok(if op.returns_json() {
+            ColType::Json
+        } else {
+            ColType::Text
+        }),
         Expr::Cmp { .. }
         | Expr::And(_, _)
         | Expr::Or(_, _)
@@ -1457,6 +1464,12 @@ pub(crate) fn arith_operand_type(
             eng, snap, own, session, schemas, outer, ctes, e,
         )?)),
         Expr::Concat(..) => Ok(Some(ColType::Text)),
+        // v1.82: same return-type rule as expr_type.
+        Expr::JsonOp { op, .. } => Ok(Some(if op.returns_json() {
+            ColType::Json
+        } else {
+            ColType::Text
+        })),
         // v0.25: `~x` result type via the shared expr_type rule.
         Expr::BitNot(_) => Ok(Some(expr_type(
             eng, snap, own, session, schemas, outer, ctes, e,

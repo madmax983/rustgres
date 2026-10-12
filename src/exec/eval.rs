@@ -1576,6 +1576,13 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             let vb = eval_expr(q, scopes, b)?;
             eval_concat(&va, &vb)
         }
+        // v1.82: JSON extraction operators `->`, `->>`, `#>`, `#>>`
+        // (PG19 jsonfuncs.c).
+        Expr::JsonOp { op, left, right } => {
+            let va = eval_expr(q, scopes, left)?;
+            let vb = eval_expr(q, scopes, right)?;
+            eval_json_op(*op, &va, &vb)
+        }
         // v0.79: real array expressions.
         Expr::ArrayCtor { elems, nested } => eval_array_ctor(q, scopes, elems, *nested),
         Expr::Subscript { array, indices } => {
@@ -2077,6 +2084,7 @@ pub(crate) fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | Expr::WholeRow { .. } => {}
         Expr::Arith { left, right, .. }
         | Expr::Concat(left, right)
+        | Expr::JsonOp { left, right, .. }
         | Expr::Cmp { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)

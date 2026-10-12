@@ -365,6 +365,9 @@ pub(crate) fn pg_expr_tables(e: &Expr, out: &mut Vec<(Option<String>, String)>) 
             left: a, right: b, ..
         }
         | Expr::Concat(a, b)
+        | Expr::JsonOp {
+            left: a, right: b, ..
+        }
         | Expr::IsDistinctFrom {
             left: a, right: b, ..
         } => {
@@ -1569,6 +1572,13 @@ pub(crate) fn pg_expr_target(
             "({} || {})",
             pg_expr_text(a, pctx, qualify)?,
             pg_expr_text(b, pctx, qualify)?
+        )),
+        // v1.82: PG19 deparses the JSON operators like any OpExpr.
+        Expr::JsonOp { op, left, right } => Some(format!(
+            "({} {} {})",
+            pg_expr_text(left, pctx, qualify)?,
+            op.sql(),
+            pg_expr_text(right, pctx, qualify)?
         )),
         Expr::Cast { expr, to, written } => {
             let label = pg_type_label(*to)?;

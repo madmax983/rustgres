@@ -61,6 +61,9 @@ mod v145_explain_options_tests;
 #[path = "test_mods/v180_cast_encoding_tests.rs"]
 mod v180_cast_encoding_tests;
 #[cfg(test)]
+#[path = "test_mods/v182_jsonop_encoding_tests.rs"]
+mod v182_jsonop_encoding_tests;
+#[cfg(test)]
 #[path = "test_mods/v72_ddl_tests.rs"]
 mod v72_ddl_tests;
 

@@ -929,6 +929,7 @@ pub(crate) fn collect_target_srfs(
         | Expr::WholeRow { .. } => {}
         Expr::Arith { left, right, .. }
         | Expr::Concat(left, right)
+        | Expr::JsonOp { left, right, .. }
         | Expr::Cmp { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
@@ -1441,6 +1442,16 @@ pub(crate) fn eval_grouped(
             let va = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
             let vb = eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, b)?;
             eval_concat(&va, &vb)
+        }
+        // v1.82: JSON extraction operators (PG19 jsonfuncs.c).
+        Expr::JsonOp { op, left, right } => {
+            let va = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, left,
+            )?;
+            let vb = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, right,
+            )?;
+            eval_json_op(*op, &va, &vb)
         }
         // v0.79: real array expressions (operands evaluate in the
         // grouped scope, like every other scalar expression here).

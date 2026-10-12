@@ -479,7 +479,12 @@ pub(crate) fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
                 rename_col_in_expr(e, old, new);
             }
         }
-        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::Concat(a, b)
+        | Expr::JsonOp {
+            left: a, right: b, ..
+        }
+        | Expr::And(a, b)
+        | Expr::Or(a, b) => {
             rename_col_in_expr(a, old, new);
             rename_col_in_expr(b, old, new);
         }

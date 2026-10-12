@@ -728,6 +728,12 @@ impl Parser {
             // is its own type now: values truncate at 63 bytes on input
             // (PG19 namein) instead of behaving like text.
             "name" => Ok(ColType::Name),
+            // v1.82: the `json` type (ColType::Json, OID 114, since
+            // v0.73) was never registered by name — `'...'::json` fell
+            // through to the Composite fallback and failed 42704 at
+            // resolution. PG19 registers it in the bootstrap catalog
+            // (pg_type.dat, oid 114).
+            "json" => Ok(ColType::Json),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".
@@ -4700,13 +4706,37 @@ impl Parser {
         Ok(left)
     }
 
-    /// concat := add (`||` add)*
+    /// concat := add ((`||` | `->` | `->>` | `#>` | `#>>`) add)*
+    /// v1.82: PG19 gives `||`, `->`, `->>`, `#>`, `#>>` the same `Op`
+    /// precedence, all left-associative (gram.y `%left Op OPERATOR
+    /// RIGHT_ARROW '|'`), so they share one loop.
     pub(crate) fn parse_concat(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_add()?;
-        while *self.peek() == Token::PipePipe {
-            self.next();
-            let right = self.parse_add()?;
-            left = Expr::Concat(Box::new(left), Box::new(right));
+        loop {
+            // v1.82: JSON extraction operators at Op precedence with `||`.
+            if let Some(jop) = match self.peek() {
+                Token::Arrow => Some(JsonOp::Arrow),
+                Token::ArrowText => Some(JsonOp::ArrowText),
+                Token::HashArrow => Some(JsonOp::HashArrow),
+                Token::HashArrowText => Some(JsonOp::HashArrowText),
+                _ => None,
+            } {
+                self.next();
+                let right = self.parse_add()?;
+                left = Expr::JsonOp {
+                    op: jop,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+                continue;
+            }
+            if *self.peek() == Token::PipePipe {
+                self.next();
+                let right = self.parse_add()?;
+                left = Expr::Concat(Box::new(left), Box::new(right));
+                continue;
+            }
+            break;
         }
         Ok(left)
     }
@@ -9327,6 +9357,12 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             validate_constraint_expr(a, what)?;
             validate_constraint_expr(b, what)
         }
+        // v1.82: JSON operators are immutable scalar ops (PG19 allows
+        // them in CHECK/DEFAULT); validate both operands.
+        Expr::JsonOp { left, right, .. } => {
+            validate_constraint_expr(left, what)?;
+            validate_constraint_expr(right, what)
+        }
         Expr::Not(a) => validate_constraint_expr(a, what),
         Expr::BitNot(a) => validate_constraint_expr(a, what),
         Expr::Neg(a) => validate_constraint_expr(a, what),
@@ -9547,6 +9583,16 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
             encode_expr_inner(a, out);
             out.push(' ');
             encode_expr_inner(b, out);
+            out.push(')');
+        }
+        // v1.82: JSON extraction operators.
+        Expr::JsonOp { op, left, right } => {
+            out.push_str("(jsonop ");
+            out.push_str(op.sexpr_name());
+            out.push(' ');
+            encode_expr_inner(left, out);
+            out.push(' ');
+            encode_expr_inner(right, out);
             out.push(')');
         }
         // v0.79: array constructors/subscripts/slices.
@@ -9949,6 +9995,19 @@ impl<'a> SexprParser<'a> {
                 let a = self.expr()?;
                 let b = self.expr()?;
                 Expr::Concat(Box::new(a), Box::new(b))
+            }
+            // v1.82: JSON extraction operators (see JsonOp::sexpr_name).
+            "jsonop" => {
+                let name = self.atom()?;
+                let op = JsonOp::from_sexpr_name(&name)
+                    .ok_or_else(|| format!("bad json op {}", name))?;
+                let l = self.expr()?;
+                let r = self.expr()?;
+                Expr::JsonOp {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }
             }
             "like" => {
                 let not = self.atom()? == "1";

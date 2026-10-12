@@ -112,29 +112,35 @@ pub(crate) enum Token {
     Slash,   // v0.7: `/`
     Percent, // v0.7: `%`
     Eq,
-    FatArrow,      // v0.95: `=>` named-argument operator (PG19)
-    Dot,           // v0.6: qualified refs (t.col)
-    Lt,            // v0.6: <
-    Gt,            // v0.6: >
-    LtEq,          // v0.6: <=
-    GtEq,          // v0.6: >=
-    Neq,           // v0.6: <> and !=
-    ColonColon,    // v0.7: `::` cast
-    PipePipe,      // v0.7: `||` concat
-    Pipe,          // v0.25: `|` bitwise OR
-    Amp,           // v0.25: `&` bitwise AND
-    Hash,          // v0.25: `#` bitwise XOR
-    Tilde,         // v0.25: `~` bitwise NOT (unary)
-    TildeStar,     // v0.68: `~*` POSIX regex match, case-insensitive
-    BangTilde,     // v0.68: `!~` POSIX regex non-match
+    FatArrow,   // v0.95: `=>` named-argument operator (PG19)
+    Dot,        // v0.6: qualified refs (t.col)
+    Lt,         // v0.6: <
+    Gt,         // v0.6: >
+    LtEq,       // v0.6: <=
+    GtEq,       // v0.6: >=
+    Neq,        // v0.6: <> and !=
+    ColonColon, // v0.7: `::` cast
+    PipePipe,   // v0.7: `||` concat
+    Pipe,       // v0.25: `|` bitwise OR
+    Amp,        // v0.25: `&` bitwise AND
+    Hash,       // v0.25: `#` bitwise XOR
+    /// v1.82: JSON operators (PG19 scan.l `right_arrow`, gram.y `Op`):
+    /// `->`, `->>`, `#>`, `#>>`. Lexed longest-match-first, like PG.
+    Arrow, // `->`
+    ArrowText,  // `->>`
+    HashArrow,  // `#>`
+    HashArrowText, // `#>>`
+    Tilde,      // v0.25: `~` bitwise NOT (unary)
+    TildeStar,  // v0.68: `~*` POSIX regex match, case-insensitive
+    BangTilde,  // v0.68: `!~` POSIX regex non-match
     BangTildeStar, // v0.68: `!~*` POSIX regex non-match, case-insensitive
-    Shl,           // v0.25: `<<` shift left
-    Shr,           // v0.25: `>>` shift right
-    At,            // v0.21: `@` prefix abs operator
-    PipeSlash,     // v0.21: `|/` prefix sqrt operator
+    Shl,        // v0.25: `<<` shift left
+    Shr,        // v0.25: `>>` shift right
+    At,         // v0.21: `@` prefix abs operator
+    PipeSlash,  // v0.21: `|/` prefix sqrt operator
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
-    Caret,         // v0.7: `^` exponentiation
-    StarEq,        // v0.81: `*=` PG19 record-image equality (record_image_eq)
+    Caret,      // v0.7: `^` exponentiation
+    StarEq,     // v0.81: `*=` PG19 record-image equality (record_image_eq)
     /// v0.86: user-defined operator name starting with `?` (e.g. `?=`).
     /// Only `?`-led sequences lex here; every other operator character
     /// already has its own token. Used in `CREATE OPERATOR`'s name
@@ -356,9 +362,22 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         // `-` (minus) when not starting a `--` comment.
+        // v1.82: `->` / `->>` lex as single tokens (PG19 scan.l
+        // `right_arrow`); longest match first. A `-` followed by `>`
+        // with no space between is always the arrow, never minus.
         if c == '-' {
-            toks.push(Token::Minus);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '>' {
+                if i + 2 < chars.len() && chars[i + 2] == '>' {
+                    toks.push(Token::ArrowText);
+                    i += 3;
+                } else {
+                    toks.push(Token::Arrow);
+                    i += 2;
+                }
+            } else {
+                toks.push(Token::Minus);
+                i += 1;
+            }
             continue;
         }
         // `::` cast operator; a lone `:` is the array-slice bound
@@ -409,9 +428,21 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             i += 1;
             continue;
         }
+        // v1.82: `#>` / `#>>` lex as single tokens (PG19 gram.y `Op`);
+        // longest match first, like the `|` family above.
         if c == '#' {
-            toks.push(Token::Hash);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '>' {
+                if i + 2 < chars.len() && chars[i + 2] == '>' {
+                    toks.push(Token::HashArrowText);
+                    i += 3;
+                } else {
+                    toks.push(Token::HashArrow);
+                    i += 2;
+                }
+            } else {
+                toks.push(Token::Hash);
+                i += 1;
+            }
             continue;
         }
         if c == '~' {
@@ -1130,6 +1161,60 @@ impl ArithOp {
     }
 }
 
+/// v1.82: JSON extraction operators (PG19 gram.y `Op` / `RIGHT_ARROW`,
+/// implemented in `src/backend/utils/adt/jsonfuncs.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonOp {
+    /// `->`: field/element as json.
+    Arrow,
+    /// `->>`: field/element as text.
+    ArrowText,
+    /// `#>`: path as json.
+    HashArrow,
+    /// `#>>`: path as text.
+    HashArrowText,
+}
+
+impl JsonOp {
+    pub fn sql(&self) -> &'static str {
+        match self {
+            JsonOp::Arrow => "->",
+            JsonOp::ArrowText => "->>",
+            JsonOp::HashArrow => "#>",
+            JsonOp::HashArrowText => "#>>",
+        }
+    }
+
+    /// PG19 operator return types: `->`/`#>` return json, `->>`/`#>>`
+    /// return text.
+    pub fn returns_json(&self) -> bool {
+        matches!(self, JsonOp::Arrow | JsonOp::HashArrow)
+    }
+
+    /// v1.82: name used in the constraint-expression s-encoding
+    /// (`encode_expr_inner` / `SexprParser`), like the `arith` op names.
+    /// The WAL recovery path decodes stored CHECK/domain expressions,
+    /// so every encoded head must decode — v1.80's lesson.
+    pub fn sexpr_name(&self) -> &'static str {
+        match self {
+            JsonOp::Arrow => "arrow",
+            JsonOp::ArrowText => "arrowtext",
+            JsonOp::HashArrow => "hasharrow",
+            JsonOp::HashArrowText => "hasharrowtext",
+        }
+    }
+
+    pub fn from_sexpr_name(s: &str) -> Option<JsonOp> {
+        match s {
+            "arrow" => Some(JsonOp::Arrow),
+            "arrowtext" => Some(JsonOp::ArrowText),
+            "hasharrow" => Some(JsonOp::HashArrow),
+            "hasharrowtext" => Some(JsonOp::HashArrowText),
+            _ => None,
+        }
+    }
+}
+
 /// A SELECT-list / WHERE / ON / HAVING expression (v0.6: full predicates,
 /// qualified refs, aggregates, subqueries).
 #[derive(Clone, Debug, PartialEq)]
@@ -1182,6 +1267,14 @@ pub enum Expr {
     },
     /// v0.7: `||` string concatenation.
     Concat(Box<Expr>, Box<Expr>),
+    /// v1.82: JSON extraction operators `->`, `->>`, `#>`, `#>>`
+    /// (PG19 gram.y `Op`/`RIGHT_ARROW`, jsonfuncs.c). Same precedence
+    /// and left-associativity as `||`, like PG.
+    JsonOp {
+        op: JsonOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// v0.7: `[NOT] LIKE` / `[NOT] ILIKE`.
     Like {
         expr: Box<Expr>,
@@ -2622,6 +2715,10 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
             collect_col_refs(a, out);
             collect_col_refs(b, out);
+        }
+        Expr::JsonOp { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
         }
         Expr::Not(a) => collect_col_refs(a, out),
         Expr::BitNot(a) => collect_col_refs(a, out),
@@ -5364,6 +5461,7 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
             max_param_expr(left).max(max_param_expr(right))
         }
         Expr::Concat(a, b) => max_param_expr(a).max(max_param_expr(b)),
+        Expr::JsonOp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         // v0.81: composite expressions recurse into their operands.
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => max_param_expr(expr),
@@ -5607,6 +5705,11 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::Percent => "%".to_string(),
             Token::Eq => "=".to_string(),
             Token::FatArrow => "=>".to_string(),
+            // v1.82: JSON operators render back to their source text.
+            Token::Arrow => "->".to_string(),
+            Token::ArrowText => "->>".to_string(),
+            Token::HashArrow => "#>".to_string(),
+            Token::HashArrowText => "#>>".to_string(),
             Token::Dot => ".".to_string(),
             Token::Lt => "<".to_string(),
             Token::Gt => ">".to_string(),

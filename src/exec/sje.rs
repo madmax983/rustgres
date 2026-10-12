@@ -1071,6 +1071,12 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             field: field.clone(),
         },
         Expr::Concat(a, b) => Expr::Concat(rb(a)?, rb(b)?),
+        // v1.82: JSON operators rebuild with remapped operands.
+        Expr::JsonOp { op, left, right } => Expr::JsonOp {
+            op: *op,
+            left: rb(left)?,
+            right: rb(right)?,
+        },
         Expr::Like {
             expr,
             pattern,
