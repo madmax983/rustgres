@@ -21,12 +21,35 @@ pub(crate) fn value_key_numeric(out: &mut Vec<u8>, n: &crate::storage::Numeric) 
     // (see `Numeric::hash_key`/`NumKeyMag`); both arms render the exact
     // same digit string for equal magnitudes (no leading zeros, "0" for
     // zero), so the encoded bytes are unchanged either way.
-    let digits = match &mag {
-        crate::storage::NumKeyMag::Small(v) => v.to_string(),
-        crate::storage::NumKeyMag::Big(b) => b.to_decimal_string(),
-    };
-    out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
-    out.extend_from_slice(digits.as_bytes());
+    match &mag {
+        crate::storage::NumKeyMag::Small(v) => {
+            // Render into a stack buffer instead of `v.to_string()`:
+            // this runs once per exact-numeric value hashed into a
+            // GROUP BY/DISTINCT/ORDER BY/hash-join key, so the heap
+            // allocation `to_string()` costs here was a per-row tax
+            // on every such key, not a one-off. u128::MAX is 39
+            // decimal digits.
+            let mut buf = [0u8; 39];
+            let mut end = buf.len();
+            let mut rem = *v;
+            loop {
+                end -= 1;
+                buf[end] = b'0' + (rem % 10) as u8;
+                rem /= 10;
+                if rem == 0 {
+                    break;
+                }
+            }
+            let digits = &buf[end..];
+            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
+            out.extend_from_slice(digits);
+        }
+        crate::storage::NumKeyMag::Big(b) => {
+            let digits = b.to_decimal_string();
+            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
+            out.extend_from_slice(digits.as_bytes());
+        }
+    }
     out.extend_from_slice(&scale.to_be_bytes());
 }
 

@@ -2,6 +2,96 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — fix — 2026-10-12
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/agg.rs`, `value_key_numeric`: the `NumKeyMag::Small(u128)`
+arm no longer renders through `v.to_string()` (a heap-allocating
+`u128`-to-`String` conversion whose result was copied into `out` and
+then dropped). It instead writes the decimal digits into a fixed
+`[u8; 39]` stack buffer (`u128::MAX` is 39 digits) and extends `out`
+from the resulting slice directly:
+
+```diff
+-    let digits = match &mag {
+-        crate::storage::NumKeyMag::Small(v) => v.to_string(),
+-        crate::storage::NumKeyMag::Big(b) => b.to_decimal_string(),
+-    };
+-    out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
+-    out.extend_from_slice(digits.as_bytes());
++    match &mag {
++        crate::storage::NumKeyMag::Small(v) => {
++            let mut buf = [0u8; 39];
++            let mut end = buf.len();
++            let mut rem = *v;
++            loop {
++                end -= 1;
++                buf[end] = b'0' + (rem % 10) as u8;
++                rem /= 10;
++                if rem == 0 {
++                    break;
++                }
++            }
++            let digits = &buf[end..];
++            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
++            out.extend_from_slice(digits);
++        }
++        crate::storage::NumKeyMag::Big(b) => {
++            let digits = b.to_decimal_string();
++            out.extend_from_slice(&(digits.len() as u64).to_be_bytes());
++            out.extend_from_slice(digits.as_bytes());
++        }
++    }
+```
+
+The rare `NumKeyMag::Big` (genuine big-mantissa numerics) arm is
+untouched — same `to_decimal_string()` allocation as before; only the
+overwhelmingly common `Small(u128)` path (every int2/int4/int8, and
+every numeric that fits a `u128` magnitude) changes. Output bytes are
+identical: same big-endian length prefix, same digit bytes, no leading
+zeros, "0" for zero — the stack rendering produces the exact same
+string `v.to_string()` would have, just without the heap round-trip.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_agg.py --rows 40000 --groups 4000
+--count 50`), same workload, same machine, same session, DHAT
+(valgrind 3.22.0):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 10,025,435 | 8,025,435 | **-19.95%** |
+| Total allocation bytes | 1,678,727,507 | 1,671,282,529 | **-0.44%** |
+| Target site blocks (`value_key_numeric`'s `to_string()`/stack-buffer arm) | 2,000,000 | 0 (site no longer appears in the top-15 by blocks or bytes) | -100% |
+
+The block-count delta (-2,000,000) lands exactly on the target site's
+pre-fix count — this is a clean 1:1 removal, not a shift to some other
+site. -19.95% clears the ≥10%-reduction allocation-count impact floor
+by roughly 2x. The byte-count delta is small (-0.44%, matching the
+target's tiny pre-fix byte share) and isn't the claim being made here;
+allocation *count* is, and DHAT's block counter backs it directly.
+
+`cargo test --all-features`: 927/927 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 633 errors on both the pre-change and post-change
+tree (confirmed via `git stash`/`git stash pop` around the clippy run,
+compared by count) — the same toolchain/lint-version mismatch noted in
+every prior Bolt entry in this file; zero new errors from this diff.
+
+Before/after `dhat.out` files are not committed (each run is several
+hundred MB under debug-build DHAT instrumentation); every number above
+is reproducible from the parent baseline commit and this commit, per
+the reproduce steps below.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the DHAT command in the baseline entry's "Reproduce" section
+for the before numbers; check out this commit, `cargo build`, repeat
+for the after numbers.
+
 ## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — baseline — 2026-10-12
 
 **Why this workload**: `benches/profile_agg.py` (already committed, from the
