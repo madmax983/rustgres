@@ -1479,6 +1479,9 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // here (they failed 42704 at resolution).
         ColType::Json => match v {
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
+            // v1.83: PG's jsonb -> json cast renders the canonical
+            // jsonb text as json.
+            Value::Jsonb(s) => Ok(Value::Text(s.clone())),
             Value::Text(s) | Value::BpChar(s) => {
                 if parse_json(&s).is_err() {
                     return Err(exec_err(
@@ -1489,6 +1492,23 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 Ok(text_value_of(&[v]))
             }
             other => Err(cast_err(other, "json")),
+        },
+        // v1.83: PG19's jsonb input (utils/adt/jsonb.c `jsonb_in`):
+        // validate like json, then canonicalize (keys sorted by
+        // (length, bytewise) and deduplicated last-wins, numbers
+        // through numeric_in). Sources: text/bpchar (which is also how
+        // a `json` value arrives, since json rides as Value::Text —
+        // PG's json -> jsonb cast), jsonb (identity; handled by the
+        // col_type short-circuit above, kept here for direct calls),
+        // and record via row_to_json text (PG's record -> jsonb).
+        ColType::Jsonb => match v {
+            Value::Jsonb(_) => Ok(v.clone()),
+            Value::Record(fields) => {
+                let t = row_to_json_text(fields);
+                Ok(Value::jsonb(jsonb_canonical(&t)?))
+            }
+            Value::Text(s) | Value::BpChar(s) => Ok(Value::jsonb(jsonb_canonical(s)?)),
+            other => Err(cast_err(other, "jsonb")),
         },
         // v0.79: real array casts (PG19 array_in/array_out semantics).
         // Text (or bpchar) input parses as a `{...}` literal through

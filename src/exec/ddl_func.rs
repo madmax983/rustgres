@@ -200,6 +200,8 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Numeric(_) => Value::Numeric(crate::storage::Numeric::new(1, 0)),
         ColType::Char(_) => Value::BpChar("x".into()),
         ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Json => Value::text("x"),
+        // v1.83: a valid canonical jsonb dummy.
+        ColType::Jsonb => Value::jsonb("{}"),
         ColType::SingleChar => Value::SingleChar(b'x'),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(1),

@@ -149,6 +149,20 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&b.to_be_bytes());
             out.extend_from_slice(&o.to_be_bytes());
         }
+        // v1.83: jsonb groups by its semantic value (PG's jsonb hash
+        // is over the canonical structure with numeric-value hashing),
+        // so 1.0 and 1.00 land in the same group. A stored value that
+        // fails to parse (unreachable via casts) keys by its text.
+        Value::Jsonb(s) => {
+            out.push(20);
+            match parse_jsonb(s) {
+                Ok(v) => jsonb_semantic_key(&v, out),
+                Err(_) => {
+                    out.push(0);
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
         // v0.36: the one-byte "char" value groups by its byte.
         Value::SingleChar(b) => {
             out.push(14);

@@ -67,6 +67,15 @@ pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
     if a == &Value::Null || b == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.83: jsonb || jsonb is PG's jsonb_concat (jsonfuncs.c), not
+    // text concatenation. A jsonb beside a non-jsonb falls through to
+    // the text path, matching PG's resolution via the implicit
+    // jsonb -> text I/O cast (`'{}'::jsonb || ''` is text concat).
+    if let (Value::Jsonb(x), Value::Jsonb(y)) = (a, b) {
+        let va = parse_jsonb(x)?;
+        let vb = parse_jsonb(y)?;
+        return Ok(Value::jsonb(jsonb_concat(&va, &vb).render()));
+    }
     match (a, b) {
         (Value::Bytea(x), Value::Bytea(y)) => {
             let mut r = Vec::with_capacity(x.len() + y.len());
@@ -1704,6 +1713,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Bytea => (-1, 4),      // bytea: -1/'i'
         ColType::Bit => (-1, 4),        // varbit: -1/'i'
         ColType::Json => (-1, 4),       // json: -1/'i'
+        ColType::Jsonb => (-1, 4),      // jsonb: -1/'i' (v1.83)
         ColType::Array(_) => (-1, 4),   // array types: 'i'
         ColType::Date => (4, 4),        // date: 4/'i'
         ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
@@ -8014,6 +8024,13 @@ pub(crate) fn compare_values(
             pg_float_ord(float_val(x), exact_to_f64(y))
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v1.83: jsonb's total order (jsonb_util.c
+        // compareJsonbContainers). Stored values are canonical, so
+        // the parse cannot fail; a failure degrades to text order.
+        (Value::Jsonb(x), Value::Jsonb(y)) => match (parse_jsonb(x), parse_jsonb(y)) {
+            (Ok(va), Ok(vb)) => jsonb_cmp(&va, &vb),
+            _ => x.cmp(y),
+        },
         // v0.35: bpchar ordering ignores trailing spaces (like
         // cmp_ordering above).
         (Value::BpChar(x), Value::BpChar(y)) => {
@@ -8147,6 +8164,7 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Float(_) => Cow::Borrowed("float"),
         Value::Numeric(_) => Cow::Borrowed("numeric"),
         Value::Text(_) => Cow::Borrowed("text"),
+        Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
         Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
         Value::SingleChar(_) => Cow::Borrowed("\"char\""), // v0.36
         Value::Bool(_) => Cow::Borrowed("boolean"),

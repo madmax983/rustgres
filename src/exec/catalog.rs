@@ -1743,6 +1743,9 @@ pub(crate) enum FnKeyVal {
         big: Option<Box<crate::storage::BigUint>>,
     },
     Text(String),
+    // v1.83: jsonb keys distinctly from text (a jsonb argument must
+    // not alias a text argument's cache key).
+    Jsonb(String),
     BpChar(String),
     SingleChar(u8),
     Bool(bool),
@@ -1789,6 +1792,7 @@ pub(crate) fn fn_key_val(v: &Value) -> FnKeyVal {
             big: n.big.clone(),
         },
         Value::Text(s) => FnKeyVal::Text(s.to_string()),
+        Value::Jsonb(s) => FnKeyVal::Jsonb(s.to_string()), // v1.83
         Value::BpChar(s) => FnKeyVal::BpChar(s.to_string()),
         Value::SingleChar(c) => FnKeyVal::SingleChar(*c),
         Value::Bool(b) => FnKeyVal::Bool(*b),

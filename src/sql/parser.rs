@@ -734,6 +734,8 @@ impl Parser {
             // resolution. PG19 registers it in the bootstrap catalog
             // (pg_type.dat, oid 114).
             "json" => Ok(ColType::Json),
+            // v1.83: PG's `jsonb` type (pg_type.dat, oid 3802).
+            "jsonb" => Ok(ColType::Jsonb),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".
@@ -4710,6 +4712,8 @@ impl Parser {
     /// v1.82: PG19 gives `||`, `->`, `->>`, `#>`, `#>>` the same `Op`
     /// precedence, all left-associative (gram.y `%left Op OPERATOR
     /// RIGHT_ARROW '|'`), so they share one loop.
+    /// v1.83: the jsonb containment/existence operators (`@>`, `<@`,
+    /// `?`, `?|`, `?&`) are gram.y `Op` too — same loop.
     pub(crate) fn parse_concat(&mut self) -> Result<Expr, SqlError> {
         let mut left = self.parse_add()?;
         loop {
@@ -4719,6 +4723,11 @@ impl Parser {
                 Token::ArrowText => Some(JsonOp::ArrowText),
                 Token::HashArrow => Some(JsonOp::HashArrow),
                 Token::HashArrowText => Some(JsonOp::HashArrowText),
+                Token::AtGt => Some(JsonOp::Contains),
+                Token::LtAt => Some(JsonOp::ContainedBy),
+                Token::Question => Some(JsonOp::Exists),
+                Token::QuestionPipe => Some(JsonOp::ExistsAny),
+                Token::QuestionAmp => Some(JsonOp::ExistsAll),
                 _ => None,
             } {
                 self.next();

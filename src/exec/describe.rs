@@ -1158,8 +1158,15 @@ pub(crate) fn expr_type(
         Expr::Concat(..) => Ok(ColType::Text),
         // v1.82: PG19 operator return types — `->`/`#>` are json,
         // `->>`/`#>>` are text.
-        Expr::JsonOp { op, .. } => Ok(if op.returns_json() {
-            ColType::Json
+        // v1.83: on a jsonb operand `->`/`#>` return jsonb, and the
+        // containment/existence family returns boolean.
+        Expr::JsonOp { op, left, .. } => Ok(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, left) {
+                Ok(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         }),
@@ -1465,8 +1472,14 @@ pub(crate) fn arith_operand_type(
         )?)),
         Expr::Concat(..) => Ok(Some(ColType::Text)),
         // v1.82: same return-type rule as expr_type.
-        Expr::JsonOp { op, .. } => Ok(Some(if op.returns_json() {
-            ColType::Json
+        // v1.83: bool family + jsonb operand propagation, as expr_type.
+        Expr::JsonOp { op, left, .. } => Ok(Some(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, left) {
+                Ok(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         })),

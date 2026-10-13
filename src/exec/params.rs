@@ -71,8 +71,14 @@ pub(crate) fn hint_type(
         .ok(),
         Expr::Concat(..) => Some(ColType::Text),
         // v1.82: JSON operator result types, like expr_type.
-        Expr::JsonOp { op, .. } => Some(if op.returns_json() {
-            ColType::Json
+        // v1.83: bool family + jsonb operand propagation.
+        Expr::JsonOp { op, left, .. } => Some(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match hint_type(eng, snap, own, session, schemas, left) {
+                Some(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         }),
@@ -900,6 +906,13 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::text(s))
         }
+        // v1.83: jsonb parameters arrive as text and canonicalize,
+        // like the cast path.
+        ColType::Jsonb => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            Ok(Value::jsonb(jsonb_canonical(s)?))
+        }
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -1143,6 +1156,9 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::Float(f)) => Literal::Float(*f),
         Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
         Some(Value::Text(s)) => Literal::Text(s.clone()),
+        // v1.83: a jsonb parameter substitutes as its canonical text;
+        // downstream coercion re-canonicalizes for a jsonb target.
+        Some(Value::Jsonb(s)) => Literal::Text(s.clone()),
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
@@ -1372,6 +1388,8 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         // types; the empty record is the honest dummy here too.
         ColType::Composite => Value::Record(Vec::new()),
         ColType::Json => Value::text(""),
+        // v1.83: the empty jsonb dummy.
+        ColType::Jsonb => Value::jsonb("null"),
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
         ColType::Array(_) => Value::text("{}"),

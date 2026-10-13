@@ -100,6 +100,11 @@ pub enum ColType {
     // `row_to_json`. Values are carried as `Value::Text` holding the
     // JSON document text.
     Json, // OID 114
+    // v1.83: PG's `jsonb` type (OID 3802). Values are carried as
+    // `Value::Jsonb` holding the canonical jsonb text (exactly what
+    // PG's `jsonb_out` renders: keys sorted by (length, bytewise) and
+    // deduplicated last-wins, numbers as PG numerics).
+    Jsonb, // OID 3802
     // v0.78: PG's array type — carries the element type. Arrays only
     // flow through expression evaluation (like Record/Json); table
     // columns cannot be arrays (no DDL support). Values are carried as
@@ -170,6 +175,9 @@ impl ArrayElem {
             ColType::Uuid => ArrayElem::Uuid,
             ColType::Regclass => ArrayElem::Regclass,
             ColType::Json => ArrayElem::Json,
+            // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
+            // array-of-jsonb degrades to the json element kind.
+            ColType::Jsonb => ArrayElem::Json,
             ColType::Record => ArrayElem::Record,
             // v0.81: named composites are not arrayable yet.
             ColType::Composite => ArrayElem::Record,
@@ -386,7 +394,8 @@ impl ColType {
             ColType::Record => 2249,      // RECORD (v0.73)
             // v0.81: named composite; PG uses the rowtype OID, we use record's.
             ColType::Composite => 2249,
-            ColType::Json => 114, // JSON (v0.73)
+            ColType::Json => 114,   // JSON (v0.73)
+            ColType::Jsonb => 3802, // JSONB (v1.83)
             // v0.78: PG's _<elem> array OIDs (pg_type.dat).
             ColType::Array(e) => e.array_oid() as i32,
         }
@@ -427,7 +436,8 @@ impl ColType {
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
             ColType::Composite => "record",
-            ColType::Json => "json", // v0.73
+            ColType::Json => "json",   // v0.73
+            ColType::Jsonb => "jsonb", // v1.83
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -470,7 +480,8 @@ impl ColType {
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
             ColType::Composite => "record",
-            ColType::Json => "json", // v0.73
+            ColType::Json => "json",   // v0.73
+            ColType::Jsonb => "jsonb", // v1.83
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -4247,6 +4258,13 @@ pub enum Value {
     // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
     // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
     PgLsn(u64),
+    // v1.83: a jsonb value — the canonical jsonb text (what PG's
+    // `jsonb_out` renders), in its own variant so casts, operators,
+    // comparisons, and type inference can distinguish jsonb from both
+    // `json` and plain `text` (both of which ride in `Value::Text`).
+    // Operations parse the canonical text on demand, like v1.82's
+    // json operators parse their document text.
+    Jsonb(Arc<str>),
     // v0.73: a whole-row (composite) value — PG19's whole-row Var
     // (varattno = 0). Field names travel with the value so `row_to_json`
     // can label its object keys; the text format `(f1,f2,...)` ignores
@@ -4404,6 +4422,12 @@ impl Value {
         Value::BpChar(s.into())
     }
 
+    /// Make a jsonb value from canonical jsonb text (v1.83). The caller
+    /// must have canonicalized (see `exec::json::jsonb_canonical`).
+    pub fn jsonb(s: impl Into<Arc<str>>) -> Value {
+        Value::Jsonb(s.into())
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -4416,6 +4440,8 @@ impl Value {
             Value::Float(f) => Some(float_text(*f)),
             Value::Numeric(n) => Some(n.to_text()),
             Value::Text(s) => Some(s.to_string()),
+            // v1.83: jsonb_out — the stored text is already canonical.
+            Value::Jsonb(s) => Some(s.to_string()),
             // v0.35: bpchar is stored blank-padded; the wire shows the
             // padded bytes, like Postgres.
             Value::BpChar(s) => Some(s.to_string()),
@@ -4518,6 +4544,7 @@ impl Value {
             Value::Float(_) => Cow::Borrowed("double precision"),
             Value::Numeric(_) => Cow::Borrowed("numeric"),
             Value::Text(_) => Cow::Borrowed("text"),
+            Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
             Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
             // v0.36: PG's format_type(18) renders `"char"` (quoted).
             Value::SingleChar(_) => Cow::Borrowed("\"char\""),
@@ -4547,6 +4574,7 @@ impl Value {
             Value::Float(_) => ColType::Float,
             Value::Numeric(_) => ColType::Numeric(None),
             Value::Text(_) => ColType::Text,
+            Value::Jsonb(_) => ColType::Jsonb, // v1.83
             // v0.35: the value alone doesn't record the typmod; Char(None)
             // is the honest fallback (bare `character`).
             Value::BpChar(_) => ColType::Char(None),

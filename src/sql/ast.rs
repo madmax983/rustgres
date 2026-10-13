@@ -130,6 +130,14 @@ pub(crate) enum Token {
     ArrowText,  // `->>`
     HashArrow,  // `#>`
     HashArrowText, // `#>>`
+    /// v1.83: jsonb operators (PG19 gram.y `Op`): `@>`, `<@`, `?`,
+    /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
+    /// below (exact matches only; `?=` etc. stay `Op`).
+    AtGt, // `@>`
+    LtAt,       // `<@`
+    Question,   // `?`
+    QuestionPipe, // `?|`
+    QuestionAmp, // `?&`
     Tilde,      // v0.25: `~` bitwise NOT (unary)
     TildeStar,  // v0.68: `~*` POSIX regex match, case-insensitive
     BangTilde,  // v0.68: `!~` POSIX regex non-match
@@ -459,9 +467,15 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         // v0.21: `@` prefix absolute-value operator.
+        // v1.83: `@>` (jsonb containment) lexes as one token, like PG.
         if c == '@' {
-            toks.push(Token::At);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '>' {
+                toks.push(Token::AtGt);
+                i += 2;
+            } else {
+                toks.push(Token::At);
+                i += 1;
+            }
             continue;
         }
         // `/* ... */` block comment
@@ -596,6 +610,10 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '<' {
                     toks.push(Token::Shl);
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    // v1.83: `<@` jsonb contained-by.
+                    toks.push(Token::LtAt);
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Token::LtEq);
@@ -869,7 +887,15 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                     i += 1;
                 }
                 let op: String = chars[start..i].iter().collect();
-                toks.push(Token::Op(op));
+                // v1.83: the jsonb existence operators get dedicated
+                // tokens; every other `?`-led sequence stays a generic
+                // Op (CREATE OPERATOR names).
+                match op.as_str() {
+                    "?" => toks.push(Token::Question),
+                    "?|" => toks.push(Token::QuestionPipe),
+                    "?&" => toks.push(Token::QuestionAmp),
+                    _ => toks.push(Token::Op(op)),
+                }
             }
             _ => return Err(err(format!("unexpected character '{}'", c))),
         }
@@ -1173,6 +1199,16 @@ pub enum JsonOp {
     HashArrow,
     /// `#>>`: path as text.
     HashArrowText,
+    /// v1.83: `@>`: jsonb containment (bool).
+    Contains,
+    /// v1.83: `<@`: jsonb contained-by (bool).
+    ContainedBy,
+    /// v1.83: `?`: jsonb key/element existence (bool).
+    Exists,
+    /// v1.83: `?|`: jsonb existence, any (bool).
+    ExistsAny,
+    /// v1.83: `?&`: jsonb existence, all (bool).
+    ExistsAll,
 }
 
 impl JsonOp {
@@ -1182,6 +1218,11 @@ impl JsonOp {
             JsonOp::ArrowText => "->>",
             JsonOp::HashArrow => "#>",
             JsonOp::HashArrowText => "#>>",
+            JsonOp::Contains => "@>",
+            JsonOp::ContainedBy => "<@",
+            JsonOp::Exists => "?",
+            JsonOp::ExistsAny => "?|",
+            JsonOp::ExistsAll => "?&",
         }
     }
 
@@ -1189,6 +1230,18 @@ impl JsonOp {
     /// return text.
     pub fn returns_json(&self) -> bool {
         matches!(self, JsonOp::Arrow | JsonOp::HashArrow)
+    }
+
+    /// v1.83: the jsonb containment/existence family returns boolean.
+    pub fn returns_bool(&self) -> bool {
+        matches!(
+            self,
+            JsonOp::Contains
+                | JsonOp::ContainedBy
+                | JsonOp::Exists
+                | JsonOp::ExistsAny
+                | JsonOp::ExistsAll
+        )
     }
 
     /// v1.82: name used in the constraint-expression s-encoding
@@ -1201,6 +1254,11 @@ impl JsonOp {
             JsonOp::ArrowText => "arrowtext",
             JsonOp::HashArrow => "hasharrow",
             JsonOp::HashArrowText => "hasharrowtext",
+            JsonOp::Contains => "contains",
+            JsonOp::ContainedBy => "containedby",
+            JsonOp::Exists => "exists",
+            JsonOp::ExistsAny => "existsany",
+            JsonOp::ExistsAll => "existsall",
         }
     }
 
@@ -1210,6 +1268,11 @@ impl JsonOp {
             "arrowtext" => Some(JsonOp::ArrowText),
             "hasharrow" => Some(JsonOp::HashArrow),
             "hasharrowtext" => Some(JsonOp::HashArrowText),
+            "contains" => Some(JsonOp::Contains),
+            "containedby" => Some(JsonOp::ContainedBy),
+            "exists" => Some(JsonOp::Exists),
+            "existsany" => Some(JsonOp::ExistsAny),
+            "existsall" => Some(JsonOp::ExistsAll),
             _ => None,
         }
     }
@@ -5710,6 +5773,12 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::ArrowText => "->>".to_string(),
             Token::HashArrow => "#>".to_string(),
             Token::HashArrowText => "#>>".to_string(),
+            // v1.83: jsonb operators render back to their source text.
+            Token::AtGt => "@>".to_string(),
+            Token::LtAt => "<@".to_string(),
+            Token::Question => "?".to_string(),
+            Token::QuestionPipe => "?|".to_string(),
+            Token::QuestionAmp => "?&".to_string(),
             Token::Dot => ".".to_string(),
             Token::Lt => "<".to_string(),
             Token::Gt => ">".to_string(),

@@ -3856,6 +3856,14 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
             Ok(Some(pg_float_ord(float_val(x), exact_to_f64(y))))
         }
         (Value::Text(x), Value::Text(y)) => Ok(Some(x.cmp(y))),
+        // v1.83: jsonb comparison operators use PG's total order
+        // (jsonb_util.c compareJsonbContainers); equality under it is
+        // semantic (key order and numeric scale irrelevant).
+        (Value::Jsonb(x), Value::Jsonb(y)) => {
+            let va = parse_jsonb(x)?;
+            let vb = parse_jsonb(y)?;
+            Ok(Some(jsonb_cmp(&va, &vb)))
+        }
         // v0.35: PG's bpcharcmp ignores trailing spaces (bcTruelen):
         // when either side is a blank-padded char, compare the
         // significant (rtrimmed) contents.
