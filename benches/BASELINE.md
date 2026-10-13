@@ -2,6 +2,81 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — fix — 2026-10-13
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/json.rs`: `parse_string`'s regular-character arm no longer
+calls `std::str::from_utf8(&self.chars[self.pos..])` (an unbounded
+slice running to the end of the whole document) to decode the next
+character:
+
+```diff
+-                    // Copy the full UTF-8 sequence for this char.
+-                    let s = std::str::from_utf8(&self.chars[self.pos..])
+-                        .map_err(|_| "invalid utf-8".to_string())?;
+-                    let ch = s.chars().next().unwrap();
++                    // Decode just the one leading char (see doc comment).
++                    let ch = text[self.pos..].chars().next().unwrap();
+                     out.push(ch);
+                     self.pos += ch.len_utf8();
+```
+
+`parse_string` now takes the document's `text: &str` (the same
+`&str` `parse_value`/`parse_value_inner` already thread through
+every recursive call, previously unused past a no-op boundary check)
+and decodes through it instead of re-deriving a `&str` from the raw
+byte buffer each call. Indexing an already-valid `&str` by
+`self.pos..` is O(1) -- `str`'s `Index` impl only checks the
+boundary lands on a char (it always does here: `self.pos` only ever
+advances by whole-char lengths) -- and `Chars::next()` decodes just
+the one leading code point, bounded by at most 4 bytes, never
+touching the rest of the buffer. Both call sites (`parse_value_inner`
+for string values, the object-field loop for keys) now pass `text`
+through, the same parameter they already receive.
+
+The removed `.map_err(|_| "invalid utf-8"...)` branch was dead code:
+the parser's input is always a `&str`, already guaranteed valid
+UTF-8 by Rust's type system, so that branch could never be taken.
+No test exercised it (confirmed: no reference to `"invalid utf-8"`
+outside this line before the fix).
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_json.py --rows 1500 --count 15
+--timeout 1800`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 17,660,693,562 | 15,406,345,198 | **-12.76%** |
+| `core::str::converts::from_utf8` (self) | 2,306,780,740 (13.06%) | 322 (0.00%) | **-99.99999%** |
+| `json::Parser::parse_string` (self) | 1,754,213,460 (9.93%) | 1,405,786,620 (9.12%) | -19.86% |
+
+`from_utf8` drops out of the profile entirely (not in the
+`--threshold=100` top-cost listing at all; the 322 Ir that remain are
+calls elsewhere in the binary, e.g. protocol/UTF-8-validation code
+unrelated to this fix). The -12.76% total-Ir drop is more than 2x
+the 5% impact floor on its own, before counting the asymptotic
+improvement: parsing all the strings/keys in one document is no
+longer O(n^2) in document size, it is O(n).
+
+`cargo test --all-features`: 935/935 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 635 errors on both the pre-change and post-change
+tree (confirmed via `git stash`, compared by count) -- the same
+pre-existing toolchain/lint-version mismatch noted in every prior
+Bolt round in this file; zero new errors from this diff.
+
+Reproduce: `git show HEAD~1:src/exec/json.rs` (or check out the
+parent baseline commit) for the pre-fix tree, `cargo build`, then
+repeat the Callgrind command from the baseline entry's "Reproduce"
+section on both trees.
+
 ## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — baseline — 2026-10-13
 
 `benches/profile_json.py` (new, this commit) loads a table of 1500
