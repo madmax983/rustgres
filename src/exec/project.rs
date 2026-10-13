@@ -120,7 +120,7 @@ pub(crate) fn project_item_values(
                             vals.push(eval_expr(q, scopes, a)?);
                         }
                         if is_builtin_srf(name) {
-                            return eval_srf_vals(name, &vals);
+                            return eval_srf_vals(q, name, &vals, args);
                         }
                         // v1.09: user-defined RETURNS SETOF function.
                         return eval_user_srf_vals(q, scopes, name, &vals);
@@ -235,7 +235,7 @@ pub(crate) fn project_row_expanded(
             avals.push(eval_expr(q, &scopes, a)?);
         }
         fans.push(if is_builtin_srf(&slot.name) {
-            eval_srf_vals(&slot.name, &avals)?
+            eval_srf_vals(q, &slot.name, &avals, &slot.args)?
         } else {
             eval_user_srf_vals(q, &scopes, &slot.name, &avals)?
         });

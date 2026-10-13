@@ -5535,6 +5535,10 @@ impl Parser {
             "stddev" | "stddev_samp" => Some(AggFunc::StddevSamp),
             "stddev_pop" => Some(AggFunc::StddevPop),
             "array_agg" => Some(AggFunc::ArrayAgg),
+            "json_agg" => Some(AggFunc::JsonAgg),
+            "jsonb_agg" => Some(AggFunc::JsonbAgg),
+            "json_object_agg" => Some(AggFunc::JsonObjectAgg),
+            "jsonb_object_agg" => Some(AggFunc::JsonbObjectAgg),
             _ => None,
         };
         if let Some(func) = agg {
@@ -5549,7 +5553,10 @@ impl Parser {
             } else {
                 Some(Box::new(self.parse_or()?))
             };
-            let arg2 = if matches!(func, AggFunc::StringAgg) {
+            let arg2 = if matches!(
+                func,
+                AggFunc::StringAgg | AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg
+            ) {
                 self.expect(Token::Comma, "','")?;
                 Some(Box::new(self.parse_or()?))
             } else {
@@ -8212,13 +8219,27 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RParen, "')'")?;
-                let alias = self.parse_alias_opt()?;
-                let col_aliases = self.parse_col_alias_list()?;
+                // v1.84: `func(...) AS (a int, b text)` — a column
+                // definition list with no table alias (PG19
+                // func_table); parse_alias_opt would choke on the
+                // paren, so detect AS + '(' first.
+                let save_as = self.pos;
+                let alias = if self.eat_keyword("as") && *self.peek() == Token::LParen {
+                    None
+                } else {
+                    self.pos = save_as;
+                    self.parse_alias_opt()?
+                };
+                // v1.84: the parenthesized list after the alias is
+                // either plain column aliases or a typed column
+                // definition list (record-returning functions).
+                let (col_aliases, col_defs) = self.parse_col_defs_or_aliases()?;
                 return Ok(FromItem::Function {
                     name,
                     args,
                     alias,
                     col_aliases,
+                    col_defs,
                     lateral,
                 });
             }
@@ -8240,6 +8261,44 @@ impl Parser {
 
     /// `(a, b, c)` column alias list after a table alias, or empty when
     /// the next token is not `(`.
+    /// v1.84: parse the parenthesized list after a table-function
+    /// alias as either plain column aliases `(a, b)` or a typed
+    /// column definition list `(a int, b text)`. The typed reading is
+    /// speculative: any parse failure restores the position and the
+    /// plain-alias reading runs instead (so `(a, int)` still reads
+    /// as two aliases, and `(a int, b)` degrades the same way).
+    pub(crate) fn parse_col_defs_or_aliases(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<(String, ColType, Option<String>)>), SqlError> {
+        if *self.peek() == Token::LParen {
+            let save = self.pos;
+            if let Ok(defs) = self.try_parse_col_defs() {
+                if !defs.is_empty() {
+                    return Ok((Vec::new(), defs));
+                }
+            }
+            self.pos = save;
+        }
+        Ok((self.parse_col_alias_list()?, Vec::new()))
+    }
+
+    fn try_parse_col_defs(&mut self) -> Result<Vec<(String, ColType, Option<String>)>, SqlError> {
+        self.next(); // '('
+        let mut defs = Vec::new();
+        loop {
+            let cname = self.expect_ident()?;
+            let (ty, written) = self.parse_type_name()?;
+            defs.push((cname, ty, written));
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(defs)
+    }
+
     pub(crate) fn parse_col_alias_list(&mut self) -> Result<Vec<String>, SqlError> {
         if *self.peek() == Token::LParen {
             self.next();

@@ -785,10 +785,38 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
             .iter()
             .map(|s| s.to_string())
             .collect()),
+        // v1.84: json/jsonb expansion SRFs.
+        "json_each" | "json_each_text" | "jsonb_each" | "jsonb_each_text" => {
+            Ok(vec!["key".to_string(), "value".to_string()])
+        }
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text" => Ok(vec!["value".to_string()]),
+        "json_object_keys" | "jsonb_object_keys" => Ok(vec![name.to_string()]),
         _ => Err(exec_err(
             "42883",
             format!("function {name}() does not exist"),
         )),
+    }
+}
+
+/// v1.84: static column types of the json expansion SRFs (the value
+/// column mirrors the document type; _text variants are text).
+pub(crate) fn json_srf_col_types(name: &str) -> Vec<ColType> {
+    let value_ty = if name.ends_with("_text") {
+        ColType::Text
+    } else if name.starts_with("jsonb") {
+        ColType::Jsonb
+    } else {
+        ColType::Json
+    };
+    if name.contains("each") {
+        vec![ColType::Text, value_ty]
+    } else if name.contains("object_keys") {
+        vec![ColType::Text]
+    } else {
+        vec![value_ty]
     }
 }
 
@@ -803,6 +831,17 @@ pub(crate) fn table_function_col_types(
     match name {
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
+        // v1.84: json/jsonb expansion SRFs.
+        "json_each"
+        | "json_each_text"
+        | "jsonb_each"
+        | "jsonb_each_text"
+        | "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text"
+        | "json_object_keys"
+        | "jsonb_object_keys" => Ok(json_srf_col_types(name)),
         // v0.99: parse_ident returns text[] (see eval_str_func).
         "parse_ident" => Ok(vec![ColType::Array(crate::storage::ArrayElem::Text)]),
         "generate_series" => {
@@ -880,10 +919,26 @@ pub(crate) fn eval_function_item(
     args: &[Expr],
     alias: &Option<String>,
     col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     let mut arg_vals = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);
+    }
+    // v1.84: record-returning json functions resolve their row type
+    // from the call site (base argument shape or column definitions),
+    // before generic table-function dispatch.
+    if is_json_record_function(name) {
+        return eval_json_record_table_function(
+            q,
+            scopes,
+            name,
+            args,
+            &arg_vals,
+            alias,
+            col_aliases,
+            col_defs,
+        );
     }
     // v0.86: user-defined functions in FROM (scalar composite-returning
     // functions expand to their fields; SETOF returns rows).
@@ -945,6 +1000,184 @@ pub(crate) fn eval_function_item(
         })
         .collect();
     Ok((schema, rows))
+}
+
+/// v1.84: evaluate a record-returning json function FROM item
+/// (json(b)_populate_record(set), json(b)_to_record(set)). The row
+/// type resolves from the call site: a column definition list when
+/// present, else the populate base argument's named type or record
+/// value; to_record* without definitions is PG's 42601. A NULL
+/// document yields one base/NULL row for the scalar forms and no
+/// rows for the set forms.
+pub(crate) fn eval_json_record_table_function(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+    arg_vals: &[Value],
+    alias: &Option<String>,
+    col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    let is_set = name.ends_with("recordset");
+    let is_populate = name.contains("populate");
+    let want_args = if is_populate { 2 } else { 1 };
+    if args.len() != want_args || arg_vals.len() != want_args {
+        return Err(exec_err(
+            "42883",
+            format!("function {name}() does not exist"),
+        ));
+    }
+    let (fields, base_val): (Vec<PopField>, Option<Value>) = if is_populate {
+        let base_val = arg_vals[0].clone();
+        // PG19 validates a query-specified column definition list
+        // against the function's intrinsic return row (the base
+        // argument's static type) when that type is determinable:
+        // count and field types must match exactly (42804).
+        if !col_defs.is_empty() {
+            if let Some(intrinsic) = static_base_field_types(q, scopes, &args[0]) {
+                let mismatch = intrinsic.len() != col_defs.len()
+                    || intrinsic
+                        .iter()
+                        .zip(col_defs.iter())
+                        .any(|(t, (_, ct, _))| t != ct);
+                if mismatch {
+                    return Err(exec_err(
+                        "42804",
+                        "function return row and query-specified return row do not match",
+                    ));
+                }
+            }
+        }
+        let fields = resolve_populate_fields(q, &args[0], &base_val, col_defs)?;
+        (fields, Some(base_val))
+    } else {
+        if col_defs.is_empty() {
+            return Err(exec_err(
+                "42601",
+                "a column definition list is required for functions returning \"record\"",
+            ));
+        }
+        (
+            resolve_populate_fields(q, &args[0], &Value::Null, col_defs)?,
+            None,
+        )
+    };
+    let col_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+    let col_types: Vec<ColType> = fields.iter().map(|f| f.ty.clone()).collect();
+    let base_fields: Option<Vec<(String, Value)>> = match &base_val {
+        Some(Value::Record(fs)) => Some(fs.clone()),
+        _ => None,
+    };
+    let doc_val = if is_populate {
+        &arg_vals[1]
+    } else {
+        &arg_vals[0]
+    };
+    // Domain-typed base: PG coerces each result row to the domain.
+    let domain = if is_populate {
+        populate_domain_name(q, &args[0])
+    } else {
+        None
+    };
+    let check_row = |q: &mut Q, cells: &[Value]| -> Result<(), ExecError> {
+        if let Some(dn) = &domain {
+            let rec = Value::Record(
+                col_names
+                    .iter()
+                    .cloned()
+                    .zip(cells.iter().cloned())
+                    .collect(),
+            );
+            check_domain_value(q, dn, &rec, false)?;
+        }
+        Ok(())
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    if *doc_val == Value::Null {
+        if !is_set {
+            let cells = fields
+                .iter()
+                .map(|f| {
+                    base_fields
+                        .as_ref()
+                        .and_then(|b| b.iter().find(|(n, _)| n == &f.name).map(|(_, v)| v.clone()))
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            rows.push(Row::new(cells));
+        }
+        return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
+    }
+    let tree = populate_doc_tree(name, doc_val)?
+        .ok_or_else(|| exec_err("22023", "cannot call populate_composite on a scalar"))?;
+    if is_set {
+        let JsonbVal::Array(elems) = &tree else {
+            return Err(exec_err(
+                "22023",
+                format!("cannot call {name} on a non-array"),
+            ));
+        };
+        for el in elems {
+            if !matches!(el, JsonbVal::Object(_)) {
+                return Err(exec_err(
+                    "22023",
+                    format!("argument of {name} must be an array of objects"),
+                ));
+            }
+            let vals = populate_fields(q, &fields, base_fields.as_ref(), el)?;
+            check_row(q, &vals)?;
+            rows.push(Row::new(vals));
+        }
+    } else {
+        match &tree {
+            JsonbVal::Object(_) => {
+                let vals = populate_fields(q, &fields, base_fields.as_ref(), &tree)?;
+                check_row(q, &vals)?;
+                rows.push(Row::new(vals));
+            }
+            JsonbVal::Array(_) => {
+                return Err(exec_err(
+                    "22023",
+                    "cannot call populate_composite on an array",
+                ));
+            }
+            _ => {
+                return Err(exec_err(
+                    "22023",
+                    "cannot call populate_composite on a scalar",
+                ));
+            }
+        }
+    }
+    finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows)
+}
+
+/// v1.84: the statically determinable field types of a populate
+/// base argument — a named composite cast's fields, or a ROW(...)
+/// constructor's element types. None when no intrinsic row type is
+/// determinable (PG then lets the column definition list rule).
+pub(crate) fn static_base_field_types(
+    q: &mut Q,
+    scopes: &[Scope],
+    base_expr: &Expr,
+) -> Option<Vec<ColType>> {
+    match base_expr {
+        Expr::CastNamed { name, .. } => pop_fields_for_type(q, name)
+            .ok()
+            .map(|fs| fs.iter().map(|f| f.ty.clone()).collect()),
+        Expr::Row(elems) => {
+            let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                out.push(
+                    expr_type(&mut *q.eng, q.snap, q.own, q.session, &schemas, &[], &[], e).ok()?,
+                );
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// v0.86: finish a user-defined function FROM item: build the output
@@ -1076,6 +1309,8 @@ pub(crate) enum LateralRight<'a> {
         args: &'a [Expr],
         alias: &'a Option<String>,
         col_aliases: &'a [String],
+        /// v1.84: typed column definitions (record functions).
+        col_defs: &'a [(String, ColType, Option<String>)],
     },
     Derived {
         sub: &'a SelectStmt,
@@ -1112,6 +1347,7 @@ pub(crate) fn lateral_right_schema(
             args,
             alias,
             col_aliases,
+            col_defs,
         } => lateral_function_schema(
             eng,
             snap,
@@ -1121,6 +1357,7 @@ pub(crate) fn lateral_right_schema(
             args,
             alias,
             col_aliases,
+            col_defs,
             // v1.10: arg type inference sees the innermost scope (the
             // immediate left input), as before.
             scope_schemas.last().copied().unwrap_or(&[]),
@@ -1551,8 +1788,10 @@ pub(crate) fn eval_lateral_right(
             args,
             alias,
             col_aliases,
+            col_defs,
         } => {
-            let (_, frows) = eval_function_item(q, scopes, name, args, alias, col_aliases)?;
+            let (_, frows) =
+                eval_function_item(q, scopes, name, args, alias, col_aliases, col_defs)?;
             Ok(frows)
         }
         LateralRight::Derived { sub, .. } => {
@@ -1650,8 +1889,40 @@ pub(crate) fn lateral_function_schema(
     args: &[Expr],
     alias: &Option<String>,
     col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
     left: &[QCol],
 ) -> Result<Vec<QCol>, ExecError> {
+    // v1.84: record-returning json functions: static schema from the
+    // column definition list or the populate base's named type.
+    if is_json_record_function(name) {
+        let fields: Vec<(String, ColType)> = if !col_defs.is_empty() {
+            col_defs
+                .iter()
+                .map(|(n, t, _)| (n.clone(), t.clone()))
+                .collect()
+        } else if name.contains("populate") {
+            match args.first() {
+                Some(Expr::CastNamed {
+                    name: type_name, ..
+                }) => pop_fields_static(eng, snap, own, session, type_name).ok_or_else(|| {
+                    exec_err("42704", format!("type \"{type_name}\" does not exist"))
+                })?,
+                _ => {
+                    return Err(exec_err(
+                        "42601",
+                        "a column definition list is required for functions returning \"record\"",
+                    ));
+                }
+            }
+        } else {
+            return Err(exec_err(
+                "42601",
+                "a column definition list is required for functions returning \"record\"",
+            ));
+        };
+        let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
+        return function_item_schema(name, &names, &types, alias, col_aliases);
+    }
     // v0.86: user-defined functions in FROM (Describe path). A scalar
     // function returning a table rowtype expands to the table's columns.
     // v0.87: resolve overload by arity for the describe path.
@@ -1718,6 +1989,8 @@ pub(crate) fn lateral_function_schema(
             }
         };
         vec![ty]
+    } else if is_json_expansion_srf(name) {
+        json_srf_col_types(name)
     } else {
         vec![ColType::Text; out_names.len()]
     };
@@ -2326,8 +2599,9 @@ pub(crate) fn build_source(
             args,
             alias,
             col_aliases,
+            col_defs,
             ..
-        } => eval_function_item(q, outer, name, args, alias, col_aliases),
+        } => eval_function_item(q, outer, name, args, alias, col_aliases, col_defs),
         FromItem::Derived {
             sub,
             alias,
@@ -2510,6 +2784,7 @@ pub(crate) fn build_source(
                     args,
                     alias: falias,
                     col_aliases,
+                    col_defs,
                     lateral,
                 } if *lateral || (is_comma && function_args_lateral(args, &lschema0)) => {
                     Some(LateralRight::Func {
@@ -2517,6 +2792,7 @@ pub(crate) fn build_source(
                         args: args.as_slice(),
                         alias: falias,
                         col_aliases: col_aliases.as_slice(),
+                        col_defs: col_defs.as_slice(),
                     })
                 }
                 FromItem::Derived {

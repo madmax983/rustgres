@@ -347,6 +347,7 @@ pub(crate) fn from_schema_item(
             args,
             alias,
             col_aliases,
+            col_defs,
             ..
         } => {
             let left: Vec<QCol> = out.iter().flatten().cloned().collect();
@@ -359,6 +360,7 @@ pub(crate) fn from_schema_item(
                 args,
                 alias,
                 col_aliases,
+                col_defs,
                 &left,
             )?;
             out.push(cols);
@@ -447,6 +449,7 @@ pub(crate) fn from_schema_item(
                     args,
                     alias: falias,
                     col_aliases: fca,
+                    col_defs,
                     lateral,
                 } if *lateral || (is_comma && function_args_lateral(args, &lflat)) => {
                     Some(LateralRight::Func {
@@ -454,6 +457,7 @@ pub(crate) fn from_schema_item(
                         args: args.as_slice(),
                         alias: falias,
                         col_aliases: fca.as_slice(),
+                        col_defs: col_defs.as_slice(),
                     })
                 }
                 FromItem::Derived {
@@ -1754,6 +1758,9 @@ pub(crate) fn agg_result_type(
                 )),
             }
         }
+        // v1.84: JSON aggregates return json/jsonb (pg_proc).
+        AggFunc::JsonAgg | AggFunc::JsonObjectAgg => Ok(ColType::Json),
+        AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => Ok(ColType::Jsonb),
     }
 }
 

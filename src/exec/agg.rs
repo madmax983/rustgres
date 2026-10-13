@@ -263,7 +263,7 @@ pub(crate) fn eval_group_key_expanded(
             for a in args {
                 vals.push(eval_expr(q, scopes, a)?);
             }
-            return eval_srf_vals(name, &vals);
+            return eval_srf_vals(q, name, &vals, args);
         }
     }
     Ok(vec![eval_expr(q, scopes, key)?])
@@ -1089,7 +1089,7 @@ pub(crate) fn project_group_expanded(
             )?);
         }
         fans.push(if is_builtin_srf(&slot.name) {
-            eval_srf_vals(&slot.name, &avals)?
+            eval_srf_vals(q, &slot.name, &avals, &slot.args)?
         } else {
             let mut chained: Vec<Scope> = outer.to_vec();
             chained.push(gscope);
@@ -2732,11 +2732,28 @@ pub(crate) fn eval_agg_func(
             }
             vals.push(v);
             delims.push(d);
+        // v1.84: json_object_agg/jsonb_object_agg evaluate the value
+        // argument per row into `delims` (StringAgg's channel) and
+        // keep every row: a NULL key errors at finalize, a NULL value
+        // becomes a JSON null (PG19 json_objectagg_transfn).
+        } else if matches!(func, AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg) {
+            let d = eval_expr(
+                q,
+                scopes,
+                arg2.expect("json_object_agg takes a value argument"),
+            )?;
+            vals.push(v);
+            delims.push(d);
         // v0.73: a whole-row value counts as null iff every field is
         // null (PG19: `count(t.*)` skips null-extended outer-join rows).
         // v0.92: array_agg keeps NULL inputs — PG19 "Collects all the
         // input values, including nulls, into an array".
-        } else if func == AggFunc::ArrayAgg || !crate::storage::value_is_null(&v) {
+        // v1.84: json_agg/jsonb_agg also keep NULL inputs (rendered as
+        // JSON null per row).
+        } else if func == AggFunc::ArrayAgg
+            || matches!(func, AggFunc::JsonAgg | AggFunc::JsonbAgg)
+            || !crate::storage::value_is_null(&v)
+        {
             vals.push(v);
         }
     }
@@ -2753,7 +2770,10 @@ pub(crate) fn eval_agg_func(
         for (i, v) in vals.iter().enumerate() {
             let mut k = Vec::new();
             value_key(v, &mut k);
-            if func == AggFunc::StringAgg {
+            if matches!(
+                func,
+                AggFunc::StringAgg | AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg
+            ) {
                 if let Some(d) = delims.get(i) {
                     value_key(d, &mut k);
                 }
@@ -2847,5 +2867,73 @@ pub(crate) fn eval_agg_func(
         // array_agg(anyarray) statically); the query schema lets
         // column references resolve to array types.
         AggFunc::ArrayAgg => array_agg_final(vals, expr_is_statically_array(a, Some(schema))),
+        // v1.84: json_agg — json.c's AccumJsonArray: elements joined
+        // ", ", with an extra "\n " before non-first elements whose
+        // category is array or composite; NULLs render as null; zero
+        // rows yield NULL (no transition ever ran).
+        AggFunc::JsonAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::from("[");
+            for (i, v) in vals.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                    if matches!(v, Value::Array(_) | Value::Record(_)) {
+                        out.push_str("\n ");
+                    }
+                }
+                datum_to_json_text(v, &mut out);
+            }
+            out.push(']');
+            Ok(Value::text(out))
+        }
+        AggFunc::JsonbAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut elems = Vec::with_capacity(vals.len());
+            for v in &vals {
+                elems.push(datum_to_jsonb(v)?);
+            }
+            Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+        }
+        // v1.84: json_object_agg — "{ " + `"key" : value` pairs joined
+        // ", " + "}"; a NULL key is 22004 (PG raises it in the
+        // transition function; finalize is observationally equal).
+        AggFunc::JsonObjectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::from("{ ");
+            for (i, (k, v)) in vals.iter().zip(delims.iter()).enumerate() {
+                if *k == Value::Null {
+                    return Err(exec_err("22004", "null value not allowed for object key"));
+                }
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let kt = json_key_text(k)?;
+                out.push('"');
+                escape_json_into(&kt, &mut out);
+                out.push_str("\" : ");
+                datum_to_json_text(v, &mut out);
+            }
+            out.push('}');
+            Ok(Value::text(out))
+        }
+        AggFunc::JsonbObjectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut pairs = Vec::with_capacity(vals.len());
+            for (k, v) in vals.iter().zip(delims.iter()) {
+                if *k == Value::Null {
+                    return Err(exec_err("22004", "null value not allowed for object key"));
+                }
+                pairs.push((json_key_text(k)?, datum_to_jsonb(v)?));
+            }
+            Ok(Value::jsonb(jsonb_canon(JsonbVal::Object(pairs)).render()))
+        }
     }
 }

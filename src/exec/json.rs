@@ -1321,12 +1321,929 @@ fn jsonb_extract_result(op: JsonOp, node: Option<&JsonbVal>) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v1.84: the json/jsonb FUNCTION families (PG19 jsonfuncs.c, json.c,
+// jsonb.c). Scalar dispatch lives in funcs.rs (`eval_json_func`); the
+// tree machinery lives here next to the v1.82/v1.83 value model.
+// ---------------------------------------------------------------------------
+
+/// PG's `json_typeof` result for a document root (jsonfuncs.c: the
+/// lexer token class of the root value).
+pub(crate) fn json_node_typeof(node: &JsonNode) -> &'static str {
+    match node.kind {
+        JsonKind::Null => "null",
+        JsonKind::Bool => "boolean",
+        JsonKind::Number => "number",
+        JsonKind::Str(_) => "string",
+        JsonKind::Array(_) => "array",
+        JsonKind::Object(_) => "object",
+    }
+}
+
+/// PG's `jsonb_typeof` result for a value root.
+pub(crate) fn jsonb_typeof_str(v: &JsonbVal) -> &'static str {
+    match v {
+        JsonbVal::Null => "null",
+        JsonbVal::Bool(_) => "boolean",
+        JsonbVal::Number(_) => "number",
+        JsonbVal::Str(_) => "string",
+        JsonbVal::Array(_) => "array",
+        JsonbVal::Object(_) => "object",
+    }
+}
+
+/// A `json` function argument as a parsed document. PG validates the
+/// argument with `json_in` when the value is produced, so a Text value
+/// that fails to parse here surfaces the input error (22P02). A
+/// `Value::Jsonb` argument is accepted via its canonical text (the
+/// eval-time type blindness documented at `eval_json_op`).
+pub(crate) fn json_doc_arg(fname: &str, v: &Value) -> Result<Option<JsonDoc>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Text(s) | Value::BpChar(s) => match parse_json(s) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) => Err(exec_err(
+                "22P02",
+                format!("invalid input syntax for type json: {e}"),
+            )),
+        },
+        Value::Jsonb(s) => match parse_json(s) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) => Err(exec_err(
+                "22P02",
+                format!("invalid input syntax for type json: {e}"),
+            )),
+        },
+        other => Err(func_arg_err(fname, other)),
+    }
+}
+
+/// A `jsonb` function argument as a value tree (PG's `jsonb_in`
+/// validation + canonicalization; errors carry PG's codes already).
+pub(crate) fn jsonb_val_arg(fname: &str, v: &Value) -> Result<Option<JsonbVal>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Jsonb(s) => Ok(Some(parse_jsonb(s)?)),
+        Value::Text(s) | Value::BpChar(s) => Ok(Some(parse_jsonb(s)?)),
+        other => Err(func_arg_err(fname, other)),
+    }
+}
+
+/// A `text[]` path argument (jsonb_set / jsonb_insert /
+/// jsonb_delete_path / extract_path's variadic list is handled by the
+/// caller). Returns the elements with NULLs preserved, plus the array's
+/// dimension count (the set-family functions reject ndims > 1 with
+/// 2202E, like PG). A bare text literal coerces via the array-literal
+/// parser, mirroring `json_path_elems`.
+pub(crate) fn json_path_list_arg(
+    fname: &str,
+    v: &Value,
+) -> Result<Option<(usize, Vec<Option<String>>)>, ExecError> {
+    let arr = match v {
+        Value::Null => return Ok(None),
+        Value::Array(a) => (**a).clone(),
+        Value::Text(s) | Value::BpChar(s) => match parse_array_literal(s, ArrayElem::Text) {
+            Ok(a) => a,
+            Err(_) => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {fname}(text[]) does not exist"),
+                ));
+            }
+        },
+        other => return Err(func_arg_err(fname, other)),
+    };
+    let mut out = Vec::with_capacity(arr.elems.len());
+    for e in &arr.elems {
+        match e {
+            Value::Null => out.push(None),
+            Value::Text(s) | Value::BpChar(s) => out.push(Some(s.to_string())),
+            other => return Err(func_arg_err(fname, other)),
+        }
+    }
+    Ok(Some((arr.dims.len(), out)))
+}
+
+/// Render a parsed `json` document tree compactly (no whitespace):
+/// object/array punctuation tight, strings re-escaped from their
+/// decoded form, number/bool/null tokens verbatim from the source.
+/// This is the output shape of PG's token-stream functions over `json`
+/// (json_strip_nulls' semantic actions append exactly these tokens).
+pub(crate) fn render_json_compact(doc: &JsonDoc, node: &JsonNode, out: &mut String) {
+    match &node.kind {
+        JsonKind::Null | JsonKind::Bool | JsonKind::Number => {
+            out.push_str(node_text(doc, node));
+        }
+        JsonKind::Str(s) => jsonb_escape_string(s, out),
+        JsonKind::Array(elems) => {
+            out.push('[');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_json_compact(doc, e, out);
+            }
+            out.push(']');
+        }
+        JsonKind::Object(fields) => {
+            out.push('{');
+            for (i, (k, v)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                jsonb_escape_string(k, out);
+                out.push(':');
+                render_json_compact(doc, v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// `json_strip_nulls` on a parsed tree: drop object fields whose value
+/// is JSON null; with `in_arrays`, also drop null array elements
+/// (PG19's optional second argument). Returns a new tree (spans still
+/// point into the same document).
+pub(crate) fn json_strip_nulls_node(node: &JsonNode, in_arrays: bool) -> JsonNode {
+    let kind = match &node.kind {
+        JsonKind::Object(fields) => JsonKind::Object(
+            fields
+                .iter()
+                .filter(|(_, v)| !matches!(v.kind, JsonKind::Null))
+                .map(|(k, v)| (k.clone(), json_strip_nulls_node(v, in_arrays)))
+                .collect(),
+        ),
+        JsonKind::Array(elems) => JsonKind::Array(
+            elems
+                .iter()
+                .filter(|e| !(in_arrays && matches!(e.kind, JsonKind::Null)))
+                .map(|e| json_strip_nulls_node(e, in_arrays))
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    JsonNode {
+        kind,
+        span: node.span,
+    }
+}
+
+/// `jsonb_strip_nulls`: the tree form of PG's iterator filter — object
+/// fields with null values are skipped (recursively), array nulls are
+/// kept unless `in_arrays`. A scalar root is returned unchanged.
+pub(crate) fn jsonb_strip_nulls(v: &JsonbVal, in_arrays: bool) -> JsonbVal {
+    match v {
+        JsonbVal::Object(pairs) => JsonbVal::Object(
+            pairs
+                .iter()
+                .filter(|(_, val)| !matches!(val, JsonbVal::Null))
+                .map(|(k, val)| (k.clone(), jsonb_strip_nulls(val, in_arrays)))
+                .collect(),
+        ),
+        JsonbVal::Array(elems) => JsonbVal::Array(
+            elems
+                .iter()
+                .filter(|e| !(in_arrays && matches!(e, JsonbVal::Null)))
+                .map(|e| jsonb_strip_nulls(e, in_arrays))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// `jsonb_pretty` (jsonb.c JsonbToCStringWorker with indent=true):
+/// containers open on the current line, each element/key on its own
+/// line indented 4 spaces per level, the closer on its own line at the
+/// container's level. Separators are bare commas (ispaces=1).
+pub(crate) fn jsonb_pretty(v: &JsonbVal) -> String {
+    let mut out = String::new();
+    jsonb_pretty_rec(v, 0, &mut out);
+    out
+}
+
+fn jsonb_pretty_indent(level: usize, out: &mut String) {
+    out.push('\n');
+    for _ in 0..level * 4 {
+        out.push(' ');
+    }
+}
+
+fn jsonb_pretty_rec(v: &JsonbVal, level: usize, out: &mut String) {
+    match v {
+        JsonbVal::Array(elems) => {
+            out.push('[');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                jsonb_pretty_indent(level + 1, out);
+                jsonb_pretty_rec(e, level + 1, out);
+            }
+            jsonb_pretty_indent(level, out);
+            out.push(']');
+        }
+        JsonbVal::Object(pairs) => {
+            out.push('{');
+            for (i, (k, val)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                jsonb_pretty_indent(level + 1, out);
+                jsonb_escape_string(k, out);
+                out.push_str(": ");
+                jsonb_pretty_rec(val, level + 1, out);
+            }
+            jsonb_pretty_indent(level, out);
+            out.push('}');
+        }
+        other => jsonb_render(other, out),
+    }
+}
+
+/// Re-establish the canonical jsonb object invariant (keys sorted by
+/// (length, bytewise), duplicates removed last-wins) over a whole tree.
+/// Used after mutations and value construction, mirroring what
+/// JsonbValueToJsonb does to iterator output in PG.
+pub(crate) fn jsonb_canon(v: JsonbVal) -> JsonbVal {
+    match v {
+        JsonbVal::Array(elems) => JsonbVal::Array(elems.into_iter().map(jsonb_canon).collect()),
+        JsonbVal::Object(pairs) => {
+            let mut pairs: Vec<(String, JsonbVal)> = pairs
+                .into_iter()
+                .map(|(k, val)| (k, jsonb_canon(val)))
+                .collect();
+            // Stable sort: among equal keys the later original stays
+            // later, and the dedupe keeps the last of each run.
+            pairs.sort_by(|a, b| jsonb_key_cmp(&a.0, &b.0));
+            let mut out: Vec<(String, JsonbVal)> = Vec::with_capacity(pairs.len());
+            for (k, val) in pairs {
+                if out.last().is_some_and(|(pk, _)| *pk == k) {
+                    out.pop();
+                }
+                out.push((k, val));
+            }
+            JsonbVal::Object(out)
+        }
+        other => other,
+    }
+}
+
+/// PG json.c `datum_to_json`: render one value as JSON text.
+/// Numbers render bare when their output text is a valid JSON number
+/// prefix (digit, or `-` + digit) and are quoted otherwise (float
+/// Infinity/NaN); text-like values are quoted and escaped; dates and
+/// timestamps are quoted ISO text (JsonEncodeDateTime forces XSD/ISO
+/// format regardless of DateStyle); arrays nest by dimension with
+/// bare commas; records become objects with tight `,`/`:` separators.
+pub(crate) fn datum_to_json_text(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::SmallInt(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Float4(_)
+        | Value::Float(_)
+        | Value::Numeric(_) => {
+            let t = v.to_text().unwrap_or_default();
+            push_json_number(&t, out);
+        }
+        // A jsonb value embeds raw (its canonical text IS JSON text).
+        Value::Jsonb(s) => out.push_str(s),
+        Value::Text(s) => {
+            out.push('"');
+            escape_json_into(s, out);
+            out.push('"');
+        }
+        // PG's bpchar output function strips trailing blanks.
+        Value::BpChar(s) => {
+            out.push('"');
+            escape_json_into(crate::storage::rtrim_spaces(s), out);
+            out.push('"');
+        }
+        Value::Array(a) => {
+            if a.dims.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            let mut cur = 0usize;
+            datum_array_json_text(a, 0, &mut cur, out);
+        }
+        Value::Record(fields) => {
+            out.push('{');
+            for (i, (k, val)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                escape_json_into(k, out);
+                out.push_str("\":");
+                datum_to_json_text(val, out);
+            }
+            out.push('}');
+        }
+        // json.c forces USE_XSD_DATES for date/timestamp/timestamptz
+        // output inside JSON (the 'T' separator, colon zone offset).
+        Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_) => {
+            let t = json_xsd_datetime_text(v);
+            out.push('"');
+            escape_json_into(&t, out);
+            out.push('"');
+        }
+        // Dates, timestamps, uuid, bytea, intervals, and every other
+        // type: the type's output text, quoted (json.c's default arm).
+        other => {
+            let t = other.to_text().unwrap_or_default();
+            out.push('"');
+            escape_json_into(&t, out);
+            out.push('"');
+        }
+    }
+}
+
+/// The XSD rendering of a date/timestamp value for JSON output:
+/// the plain display text with the date/time separator swapped to
+/// 'T' and a bare `+HH`/`-HH` zone offset widened to `+HH:00`
+/// (PG's EncodeDateTime with USE_XSD_DATES).
+pub(crate) fn json_xsd_datetime_text(v: &Value) -> String {
+    let t = v.to_text().unwrap_or_default();
+    if matches!(v, Value::Date(_)) {
+        return t;
+    }
+    let mut t = t;
+    if t.len() > 10 && t.as_bytes()[10] == b' ' {
+        t.replace_range(10..11, "T");
+    }
+    // Timestamptz zone suffix: +HH or -HH at the very end widens.
+    if matches!(v, Value::Timestamptz(_)) {
+        let b = t.as_bytes();
+        if b.len() >= 3 {
+            let tail = &t[t.len() - 3..];
+            if (tail.starts_with('+') || tail.starts_with('-'))
+                && tail[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                t.push_str(":00");
+            }
+        }
+    }
+    t
+}
+
+fn datum_array_json_text(a: &ArrayVal, dim: usize, cur: &mut usize, out: &mut String) {
+    out.push('[');
+    let n = a.dims[dim].max(0) as usize;
+    for i in 0..n {
+        if i > 0 {
+            out.push(',');
+        }
+        if dim + 1 == a.dims.len() {
+            datum_to_json_text(&a.elems[*cur], out);
+            *cur += 1;
+        } else {
+            datum_array_json_text(a, dim + 1, cur, out);
+        }
+    }
+    out.push(']');
+}
+
+/// json.c's number rule: bare when the output text starts with a
+/// digit or `-`+digit (then it is a valid JSON number), else quoted.
+fn push_json_number(t: &str, out: &mut String) {
+    let b = t.as_bytes();
+    let bare = match b.first() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some(b'-') => b.get(1).is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    };
+    if bare {
+        out.push_str(t);
+    } else {
+        out.push('"');
+        escape_json_into(t, out);
+        out.push('"');
+    }
+}
+
+/// Escape a string's contents (no surrounding quotes) per json.c
+/// `escape_json_char` — the same set `jsonb_escape_string` applies.
+pub(crate) fn escape_json_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// PG jsonb.c `datum_to_jsonb`: convert one value to a jsonb tree.
+/// Text becomes a JSON string (a decoded NUL is 22P02, as in
+/// jsonb_from_node); numbers go through PG numeric input; floats via
+/// their output text (Infinity overflows like PG's float->numeric
+/// conversion); arrays nest by dimension; records become objects
+/// (canonicalized: sorted keys, last duplicate wins).
+pub(crate) fn datum_to_jsonb(v: &Value) -> Result<JsonbVal, ExecError> {
+    match v {
+        Value::Null => Ok(JsonbVal::Null),
+        Value::Bool(b) => Ok(JsonbVal::Bool(*b)),
+        Value::SmallInt(i) => Ok(JsonbVal::Number(Numeric::parse(&i.to_string()).unwrap())),
+        Value::Int(i) | Value::BigInt(i) => {
+            Ok(JsonbVal::Number(Numeric::parse(&i.to_string()).unwrap()))
+        }
+        Value::Numeric(n) => Ok(JsonbVal::Number(n.clone())),
+        Value::Float4(f) => datum_float_to_jsonb(*f as f64),
+        Value::Float(f) => datum_float_to_jsonb(*f),
+        Value::Jsonb(s) => parse_jsonb(s),
+        Value::Text(s) => jsonb_string_value(s),
+        Value::BpChar(s) => jsonb_string_value(crate::storage::rtrim_spaces(s)),
+        Value::Array(a) => {
+            if a.dims.is_empty() {
+                return Ok(JsonbVal::Array(Vec::new()));
+            }
+            let mut cur = 0usize;
+            datum_array_jsonb(a, 0, &mut cur)
+        }
+        Value::Record(fields) => {
+            let mut pairs = Vec::with_capacity(fields.len());
+            for (k, val) in fields {
+                if k.contains('\0') {
+                    return Err(exec_err("22P02", "\\u0000 cannot be converted to text."));
+                }
+                pairs.push((k.clone(), datum_to_jsonb(val)?));
+            }
+            Ok(jsonb_canon(JsonbVal::Object(pairs)))
+        }
+        // jsonb.c converts dates/timestamps with the same XSD
+        // rendering json.c uses.
+        Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_) => {
+            jsonb_string_value(&json_xsd_datetime_text(v))
+        }
+        other => {
+            let t = other.to_text().unwrap_or_default();
+            jsonb_string_value(&t)
+        }
+    }
+}
+
+fn jsonb_string_value(s: &str) -> Result<JsonbVal, ExecError> {
+    if s.contains('\0') {
+        return Err(exec_err("22P02", "\\u0000 cannot be converted to text."));
+    }
+    Ok(JsonbVal::Str(s.to_string()))
+}
+
+fn datum_float_to_jsonb(f: f64) -> Result<JsonbVal, ExecError> {
+    // PG converts float8 to numeric (float8_numeric): NaN stays NaN;
+    // +/-Infinity cannot be represented and errors.
+    if f.is_nan() {
+        return match Numeric::parse("NaN") {
+            Ok(n) => Ok(JsonbVal::Number(n)),
+            Err(_) => Err(exec_err(
+                "22P02",
+                "invalid input syntax for type numeric: \"NaN\"",
+            )),
+        };
+    }
+    if f.is_infinite() {
+        return Err(exec_err("22003", "value overflows numeric format"));
+    }
+    let t = Value::Float(f).to_text().unwrap_or_default();
+    match Numeric::parse(&t) {
+        Ok(n) => Ok(JsonbVal::Number(n)),
+        Err(_) => Err(exec_err("22003", "value overflows numeric format")),
+    }
+}
+
+fn datum_array_jsonb(a: &ArrayVal, dim: usize, cur: &mut usize) -> Result<JsonbVal, ExecError> {
+    let n = a.dims[dim].max(0) as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if dim + 1 == a.dims.len() {
+            out.push(datum_to_jsonb(&a.elems[*cur])?);
+            *cur += 1;
+        } else {
+            out.push(datum_array_jsonb(a, dim + 1, cur)?);
+        }
+    }
+    Ok(JsonbVal::Array(out))
+}
+
+/// The `json_build_object` key conversion (json.c's add_json with
+/// key_scalar=true): scalars become their JSON rendering AS a key —
+/// bool/number keys are quoted, text keys are the raw string; arrays,
+/// records, and json/jsonb values are 22023.
+pub(crate) fn json_key_text(v: &Value) -> Result<String, ExecError> {
+    match v {
+        Value::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
+        Value::SmallInt(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Float4(_)
+        | Value::Float(_)
+        | Value::Numeric(_) => Ok(v.to_text().unwrap_or_default()),
+        Value::Text(s) => Ok(s.to_string()),
+        Value::BpChar(s) => Ok(crate::storage::rtrim_spaces(s).to_string()),
+        Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_) => {
+            Ok(v.to_text().unwrap_or_default())
+        }
+        _ => Err(exec_err(
+            "22023",
+            "key value must be scalar, not array, composite, or json",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.84: jsonb path mutation — a tree form of jsonfuncs.c's setPath
+// walker, shared by jsonb_set / jsonb_set_lax / jsonb_insert /
+// jsonb_delete_path. PG walks the document with an iterator and
+// copies untouched subtrees verbatim; the observable result is the
+// same as this recursive rebuild (containers are re-canonicalized on
+// output, which JsonbValueToJsonb does in PG too).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JsonbPathOp {
+    /// jsonb_set with create_missing=false (JB_PATH_REPLACE).
+    Replace,
+    /// jsonb_set with create_missing=true (JB_PATH_CREATE).
+    Create,
+    /// jsonb_insert with after=false (JB_PATH_INSERT_BEFORE).
+    InsertBefore,
+    /// jsonb_insert with after=true (JB_PATH_INSERT_AFTER).
+    InsertAfter,
+    /// jsonb_delete_path (JB_PATH_DELETE).
+    Delete,
+}
+
+impl JsonbPathOp {
+    fn creates(self) -> bool {
+        matches!(
+            self,
+            JsonbPathOp::Create | JsonbPathOp::InsertBefore | JsonbPathOp::InsertAfter
+        )
+    }
+}
+
+/// PG's `strtoint` for array path elements (setPathArray): leading
+/// whitespace and a sign are accepted, trailing junk and int32
+/// overflow are 22P02.
+fn parse_path_index(s: &str, level: usize) -> Result<i64, ExecError> {
+    let err = || {
+        exec_err(
+            "22P02",
+            format!(
+                "path element at position {} is not an integer: {:?}",
+                level + 1,
+                s
+            ),
+        )
+    };
+    let t = s.trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    let parsed: i64 = t.parse().map_err(|_| err())?;
+    if parsed < i32::MIN as i64 || parsed > i32::MAX as i64 {
+        return Err(err());
+    }
+    Ok(parsed)
+}
+
+/// Apply one setPath operation. `path` elements are checked for NULL
+/// lazily, exactly where PG's walker reaches them: entering a node at
+/// `level` with a NULL element is 22004. The caller performs the
+/// root-scalar and empty-path checks (their order differs per SQL
+/// function in PG).
+pub(crate) fn jsonb_set_path(
+    root: JsonbVal,
+    path: &[Option<String>],
+    newval: Option<&JsonbVal>,
+    op: JsonbPathOp,
+) -> Result<JsonbVal, ExecError> {
+    set_path_rec(root, path, 0, newval, op)
+}
+
+fn set_path_rec(
+    node: JsonbVal,
+    path: &[Option<String>],
+    level: usize,
+    newval: Option<&JsonbVal>,
+    op: JsonbPathOp,
+) -> Result<JsonbVal, ExecError> {
+    let elem = match &path[level] {
+        None => {
+            return Err(exec_err(
+                "22004",
+                format!("path element at position {} is null", level + 1),
+            ));
+        }
+        Some(s) => s.clone(),
+    };
+    let last = level + 1 == path.len();
+    match node {
+        JsonbVal::Object(pairs) => {
+            let mut pairs = pairs;
+            match pairs.iter().position(|(k, _)| *k == elem) {
+                Some(pos) => {
+                    if last {
+                        match op {
+                            JsonbPathOp::InsertBefore | JsonbPathOp::InsertAfter => {
+                                return Err(exec_err("22023", "cannot replace existing key"));
+                            }
+                            JsonbPathOp::Delete => {
+                                pairs.remove(pos);
+                            }
+                            _ => {
+                                pairs[pos].1 = newval.expect("set/insert value").clone();
+                            }
+                        }
+                    } else {
+                        let v = std::mem::replace(&mut pairs[pos].1, JsonbVal::Null);
+                        pairs[pos].1 = set_path_rec(v, path, level + 1, newval, op)?;
+                    }
+                }
+                None => {
+                    if last && op.creates() {
+                        pairs.push((elem, newval.expect("set/insert value").clone()));
+                        pairs.sort_by(|a, b| jsonb_key_cmp(&a.0, &b.0));
+                    }
+                }
+            }
+            Ok(JsonbVal::Object(pairs))
+        }
+        JsonbVal::Array(elems) => {
+            let mut elems = elems;
+            // PG parses the index whenever the walker reaches an
+            // array — even an empty one, and even mid-path.
+            let raw = parse_path_index(&elem, level)?;
+            let len = elems.len() as i64;
+            if len == 0 {
+                if last && op.creates() {
+                    elems.push(newval.expect("set/insert value").clone());
+                }
+                return Ok(JsonbVal::Array(elems));
+            }
+            let idx = if raw < 0 {
+                if raw.checked_abs().expect("i32 range") > len {
+                    // Out-of-range negative: PG's INT_MIN sentinel —
+                    // only a creating op at the last element acts
+                    // (prepend); anything else is a no-op.
+                    if last && op.creates() {
+                        elems.insert(0, newval.expect("set/insert value").clone());
+                    }
+                    return Ok(JsonbVal::Array(elems));
+                }
+                len + raw
+            } else if raw > len {
+                len
+            } else {
+                raw
+            };
+            if idx == len {
+                if last && op.creates() {
+                    elems.push(newval.expect("set/insert value").clone());
+                }
+                return Ok(JsonbVal::Array(elems));
+            }
+            let i = idx as usize;
+            if last {
+                match op {
+                    JsonbPathOp::Replace | JsonbPathOp::Create => {
+                        elems[i] = newval.expect("set/insert value").clone();
+                    }
+                    JsonbPathOp::InsertBefore => {
+                        elems.insert(i, newval.expect("set/insert value").clone());
+                    }
+                    JsonbPathOp::InsertAfter => {
+                        elems.insert(i + 1, newval.expect("set/insert value").clone());
+                    }
+                    JsonbPathOp::Delete => {
+                        elems.remove(i);
+                    }
+                }
+            } else {
+                let v = std::mem::replace(&mut elems[i], JsonbVal::Null);
+                elems[i] = set_path_rec(v, path, level + 1, newval, op)?;
+            }
+            Ok(JsonbVal::Array(elems))
+        }
+        // A scalar mid-path is copied through untouched (PG's iterator
+        // pushes it verbatim; the path simply does not resolve).
+        scalar => Ok(scalar),
+    }
+}
+
+/// `jsonb_delete(jsonb, text)`: object key removal; on an array,
+/// removal of every string element equal to the key. A scalar root
+/// is 22023.
+pub(crate) fn jsonb_delete_key(root: &JsonbVal, key: &str) -> Result<JsonbVal, ExecError> {
+    match root {
+        JsonbVal::Object(pairs) => Ok(JsonbVal::Object(
+            pairs
+                .iter()
+                .filter(|(k, _)| k != key)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )),
+        JsonbVal::Array(elems) => Ok(JsonbVal::Array(
+            elems
+                .iter()
+                .filter(|e| !matches!(e, JsonbVal::Str(s) if s == key))
+                .cloned()
+                .collect(),
+        )),
+        _ => Err(exec_err("22023", "cannot delete from scalar")),
+    }
+}
+
+/// `jsonb_delete(jsonb, text[])`: every key in the array is deleted
+/// (object keys and matching array string elements), like applying
+/// the single-key form once per key.
+pub(crate) fn jsonb_delete_keys(
+    root: &JsonbVal,
+    keys: &[Option<String>],
+) -> Result<JsonbVal, ExecError> {
+    match root {
+        JsonbVal::Object(_) | JsonbVal::Array(_) => {
+            let mut out = root.clone();
+            for k in keys.iter().flatten() {
+                out = jsonb_delete_key(&out, k)?;
+            }
+            Ok(out)
+        }
+        _ => Err(exec_err("22023", "cannot delete from scalar")),
+    }
+}
+
+/// `jsonb_delete(jsonb, int)`: array element removal (negative counts
+/// from the end; out of range is a no-op). An object root is 22023.
+pub(crate) fn jsonb_delete_idx(root: &JsonbVal, idx: i64) -> Result<JsonbVal, ExecError> {
+    match root {
+        JsonbVal::Object(_) => Err(exec_err(
+            "22023",
+            "cannot delete from object using integer index",
+        )),
+        JsonbVal::Array(elems) => {
+            let n = elems.len() as i64;
+            let i = if idx < 0 {
+                if idx.checked_abs().expect("i32 range") > n {
+                    return Ok(root.clone());
+                }
+                n + idx
+            } else {
+                idx
+            };
+            if i >= n {
+                return Ok(root.clone());
+            }
+            let mut elems = elems.clone();
+            elems.remove(i as usize);
+            Ok(JsonbVal::Array(elems))
+        }
+        _ => Err(exec_err("22023", "cannot delete from scalar")),
+    }
+}
+
 #[cfg(test)]
 mod jsonb_tests {
     use super::*;
 
     fn canon(s: &str) -> String {
         jsonb_canonical(s).unwrap()
+    }
+
+    fn jb(s: &str) -> JsonbVal {
+        parse_jsonb(s).unwrap()
+    }
+
+    fn path(vs: &[Option<&str>]) -> Vec<Option<String>> {
+        vs.iter().map(|o| o.map(|s| s.to_string())).collect()
+    }
+
+    // v1.84: jsonb_set_path walker semantics (jsonfuncs.c setPath).
+    #[test]
+    fn set_path_ops() {
+        // Replace into an object, create a missing last-level key.
+        let out = jsonb_set_path(
+            jb(r#"{"a": 1}"#),
+            &path(&[Some("b")]),
+            Some(&jb("2")),
+            JsonbPathOp::Create,
+        )
+        .unwrap();
+        assert_eq!(out.render(), r#"{"a": 1, "b": 2}"#);
+        // Replace-only on a missing key is a no-op.
+        let out = jsonb_set_path(
+            jb(r#"{"a": 1}"#),
+            &path(&[Some("b")]),
+            Some(&jb("2")),
+            JsonbPathOp::Replace,
+        )
+        .unwrap();
+        assert_eq!(out.render(), r#"{"a": 1}"#);
+        // Insert-before on an existing key errors 22023.
+        let err = jsonb_set_path(
+            jb(r#"{"a": 1}"#),
+            &path(&[Some("a")]),
+            Some(&jb("2")),
+            JsonbPathOp::InsertBefore,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "22023");
+        // Array index arithmetic: negative clamps, overflow appends.
+        let out = jsonb_set_path(
+            jb("[1, 2]"),
+            &path(&[Some("-5")]),
+            Some(&jb("9")),
+            JsonbPathOp::Create,
+        )
+        .unwrap();
+        assert_eq!(out.render(), "[9, 1, 2]");
+        // REPLACE never appends: idx clamps to len and no element is
+        // hit (PG's append case requires JB_PATH_CREATE_OR_INSERT).
+        let out = jsonb_set_path(
+            jb("[1, 2]"),
+            &path(&[Some("7")]),
+            Some(&jb("9")),
+            JsonbPathOp::Replace,
+        )
+        .unwrap();
+        assert_eq!(out.render(), "[1, 2]");
+        // Bad index on a live array errors 22P02.
+        let err = jsonb_set_path(
+            jb("[1, 2]"),
+            &path(&[Some("x")]),
+            Some(&jb("9")),
+            JsonbPathOp::Create,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "22P02");
+        // Null path element reached mid-walk errors 22004.
+        let err = jsonb_set_path(
+            jb(r#"{"a": {"b": 1}}"#),
+            &path(&[Some("a"), None]),
+            Some(&jb("9")),
+            JsonbPathOp::Create,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "22004");
+        // Mid-path missing key: no-op even when creating.
+        let out = jsonb_set_path(
+            jb(r#"{"a": {}}"#),
+            &path(&[Some("a"), Some("x"), Some("y")]),
+            Some(&jb("9")),
+            JsonbPathOp::Create,
+        )
+        .unwrap();
+        assert_eq!(out.render(), r#"{"a": {}}"#);
+        // Delete removes the leaf.
+        let out = jsonb_set_path(
+            jb(r#"{"a": {"b": 1, "c": 2}}"#),
+            &path(&[Some("a"), Some("b")]),
+            None,
+            JsonbPathOp::Delete,
+        )
+        .unwrap();
+        assert_eq!(out.render(), r#"{"a": {"c": 2}}"#);
+    }
+
+    #[test]
+    fn strip_and_pretty() {
+        let v = jb(r#"{"a": null, "b": {"c": null, "d": [null, 1]}}"#);
+        assert_eq!(
+            jsonb_strip_nulls(&v, false).render(),
+            r#"{"b": {"d": [null, 1]}}"#
+        );
+        assert_eq!(jsonb_strip_nulls(&v, true).render(), r#"{"b": {"d": [1]}}"#);
+        // The pretty worker: empty containers still split lines.
+        assert_eq!(
+            jsonb_pretty(&jb(r#"{"a": [1], "c": {}}"#)),
+            "{\n    \"a\": [\n        1\n    ],\n    \"c\": {\n    }\n}"
+        );
+        assert_eq!(jsonb_pretty(&jb("[]")), "[\n]");
+        assert_eq!(jsonb_pretty(&jb("5")), "5");
+    }
+
+    #[test]
+    fn delete_variants() {
+        // Array delete removes ALL equal string elements.
+        let out = jsonb_delete_key(&jb(r#"["a", "b", "a"]"#), "a").unwrap();
+        assert_eq!(out.render(), r#"["b"]"#);
+        // Integer delete from an object is 22023.
+        assert_eq!(
+            jsonb_delete_idx(&jb(r#"{"a": 1}"#), 0).unwrap_err().code,
+            "22023"
+        );
+        // Multi-key delete skips NULL keys.
+        let out =
+            jsonb_delete_keys(&jb(r#"{"a": 1, "b": 2}"#), &[Some("a".to_string()), None]).unwrap();
+        assert_eq!(out.render(), r#"{"b": 2}"#);
     }
 
     #[test]

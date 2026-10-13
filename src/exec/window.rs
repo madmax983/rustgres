@@ -344,6 +344,11 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         | AggFunc::StddevPop
         | AggFunc::ArrayAgg => n == 1,
         AggFunc::StringAgg => false,
+        // v1.84: json_agg/jsonb_agg are window-capable in PG19;
+        // the object aggregates need a second value stream the
+        // window machinery does not carry (StringAgg precedent).
+        AggFunc::JsonAgg | AggFunc::JsonbAgg => n == 1,
+        AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => false,
     }
 }
 
@@ -1647,7 +1652,10 @@ pub(crate) fn compute_partition(
                             // counterparts. (PG19 rejects ORDER BY
                             // inside windowed aggregates with 0A000, so
                             // no sort key applies here.)
-                            if *f == AggFunc::ArrayAgg || !matches!(v, Value::Null) {
+                            if *f == AggFunc::ArrayAgg
+                                || matches!(f, AggFunc::JsonAgg | AggFunc::JsonbAgg)
+                                || !matches!(v, Value::Null)
+                            {
                                 vals.push(v);
                             }
                         }
@@ -1709,6 +1717,40 @@ pub(crate) fn eval_window_agg(
         // type picks the overload (schema-free probe: array ctors and
         // casts; the windowed path has no query schema handy).
         AggFunc::ArrayAgg => array_agg_final(vals.to_vec(), array_input),
+        // v1.84: windowed json_agg/jsonb_agg render the frame values
+        // exactly like the grouped finalize (NULLs kept by the
+        // caller for these two, as for array_agg).
+        AggFunc::JsonAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::from("[");
+            for (i, v) in vals.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                    if matches!(v, Value::Array(_) | Value::Record(_)) {
+                        out.push_str("\n ");
+                    }
+                }
+                datum_to_json_text(v, &mut out);
+            }
+            out.push(']');
+            Ok(Value::text(out))
+        }
+        AggFunc::JsonbAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut elems = Vec::with_capacity(vals.len());
+            for v in vals {
+                elems.push(datum_to_jsonb(v)?);
+            }
+            Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+        }
+        AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => Err(exec_err(
+            "0A000",
+            "json_object_agg is not supported as a window function",
+        )),
     }
 }
 

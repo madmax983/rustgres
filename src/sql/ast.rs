@@ -1074,6 +1074,12 @@ pub enum AggFunc {
     // v0.91: `array_agg(x)` — collect non-null inputs into a 1-D array
     // (multidimensional when the input is itself an array, like PG).
     ArrayAgg,
+    // v1.84: JSON aggregates (json.c/jsonb.c). JsonObjectAgg and
+    // JsonbObjectAgg take (key, value) — arg2 carries the value.
+    JsonAgg,
+    JsonbAgg,
+    JsonObjectAgg,
+    JsonbObjectAgg,
 }
 
 impl AggFunc {
@@ -1091,6 +1097,10 @@ impl AggFunc {
             AggFunc::StddevSamp => "stddev",
             AggFunc::StddevPop => "stddev_pop",
             AggFunc::ArrayAgg => "array_agg",
+            AggFunc::JsonAgg => "json_agg",
+            AggFunc::JsonbAgg => "jsonb_agg",
+            AggFunc::JsonObjectAgg => "json_object_agg",
+            AggFunc::JsonbObjectAgg => "jsonb_object_agg",
         }
     }
 }
@@ -1663,6 +1673,12 @@ pub enum FromItem {
         args: Vec<Expr>,
         alias: Option<String>,
         col_aliases: Vec<String>,
+        /// v1.84: typed column definition list (`f(...) AS t (a int,
+        /// b text)`) for record-returning functions; mutually
+        /// exclusive with `col_aliases` (the parser commits to one
+        /// reading of the parenthesized list). Entries are
+        /// (column name, type, written type name when composite).
+        col_defs: Vec<(String, ColType, Option<String>)>,
         lateral: bool,
     },
     Join {
