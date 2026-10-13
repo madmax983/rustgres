@@ -2,6 +2,84 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — baseline — 2026-10-13
+
+`benches/profile_json.py` (new, this commit) loads a table of 1500
+nested JSON order-event documents (object with a nested `customer`
+object, a nested `items` array of objects, and several scalar
+fields — ~250-350 bytes each, shaped like a real request/event-log
+JSON payload, not a toy `{"a":1}`) and runs 15 iterations of a
+5-extraction report query (`doc->>'status'`,
+`doc->'customer'->>'region'`, `doc#>>ARRAY['customer','name']`,
+`doc#>ARRAY['items','0','sku']`, `doc->'items'->0->>'price'`) over
+the real wire protocol — the v1.82 JSON extraction operators
+(`->`/`->>`/`#>`/`#>>`), never profiled by a prior Bolt round.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes`, debug build),
+`benches/profiles/callgrind.out.jsonstr-base-2026-10-13`, total `Ir`
+**17,660,693,562**:
+
+| symbol (self cost) | Ir | % of total |
+|---|---|---|
+| `core::str::converts::from_utf8` | 2,306,780,740 | **13.06%** |
+| `json::Parser::parse_string` (self) | 1,754,213,460 | **9.93%** |
+| **combined** | **4,060,994,200** | **23.00%** |
+
+`callgrind_annotate --tree=caller` shows `from_utf8`'s only two call
+edges both route through `parse_string` (via `parse_value_inner` /
+`parse_value_inner'2`, its inlined/non-inlined variants); grepping
+`src/exec/json.rs` confirms there is exactly one call site for
+`std::str::from_utf8` in the whole module — `parse_string`'s
+regular-character arm (line 366-368):
+
+```rust
+let s = std::str::from_utf8(&self.chars[self.pos..])
+    .map_err(|_| "invalid utf-8".to_string())?;
+let ch = s.chars().next().unwrap();
+```
+
+**Bug**: `self.chars` is the whole document's byte buffer, and the
+slice `&self.chars[self.pos..]` has no *upper* bound — it runs from
+the current character to the *end of the entire document*, not just
+to the end of the current string value. `std::str::from_utf8`
+validates every byte of whatever slice it is given, so this call
+re-validates the UTF-8 well-formedness of the entire rest of the
+document, from scratch, once per character copied into every string
+(and every object key — keys are parsed with the same `parse_string`)
+in the document. That is O(remaining-document-length) work per
+character, i.e. O(n²) in document size for parsing all the strings in
+one document, not O(n).
+
+**Mechanism for the fix**: the parser's input is always a `&str`
+(guaranteed-valid UTF-8 by Rust's type system), and `self.pos` is
+always at a char boundary (the loop only ever advances by whole-char
+lengths). `parse_value`/`parse_value_inner` already thread the
+original `text: &str` through recursive calls (currently unused
+inside them beyond a no-op boundary check); threading it one level
+further into `parse_string` and decoding via `text[self.pos..]
+.chars().next()` gets the same character with zero re-validation:
+indexing an already-valid `&str` by a byte range is O(1) (pointer
+arithmetic only, `str`'s `Index` impl does not re-check UTF-8
+validity), and `Chars::next()` decodes only the one leading code
+point (bounded by at most 4 bytes), never touching the rest of the
+buffer. The `.map_err(|_| "invalid utf-8"...)` branch this removes is
+already dead code — the input can never fail that check, since it
+comes from a `&str`.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_json.py --rows 1500 --count 15 --timeout 1800
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+callgrind_annotate --auto=no --tree=caller /tmp/cg.out | grep -A5 'converts::from_utf8$'
+```
+
+Fix follows in the next commit.
+
 ## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — fix — 2026-10-12
 
 Fixes the target identified in the baseline entry immediately below
