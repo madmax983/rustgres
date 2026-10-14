@@ -753,16 +753,51 @@ pub(crate) fn jsonb_from_node(doc: &JsonDoc, node: &JsonNode) -> Result<JsonbVal
     }
 }
 
+/// `jsonb_val_arg` (every `jsonb_path_*`/`->`/`#>`/... call site, 15 of
+/// them) re-parses its jsonb/text argument's *entire* text into a fresh
+/// `JsonbVal` tree on every call, even though a single row routinely
+/// passes the same column value to several functions in one SELECT
+/// (e.g. `jsonb_path_exists(doc, ...), jsonb_path_match(doc, ...),
+/// jsonb_path_query_array(doc, ...)` all reading the same `doc`). This
+/// thread-local cache, keyed by the input text, makes a repeat
+/// `parse_jsonb` call for text this connection has already parsed a
+/// clone of the cached tree instead of a full re-tokenize +
+/// re-validate + re-sort-keys. Bounded like this repo's existing regex
+/// cache (`src/regex.rs`'s `REGEX_CACHE_CAP`, 64 entries) since distinct
+/// rows almost never share identical jsonb text, so this cache's hit
+/// rate lives entirely in the "same row, multiple calls" pattern above
+/// — unbounded growth would just be dead weight. Only successful parses
+/// are cached; invalid input re-reports the same error on every call,
+/// exactly as before.
+const JSONB_PARSE_CACHE_CAP: usize = 64;
+
+thread_local! {
+    static JSONB_PARSE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<JsonbVal>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Validate + canonicalize JSON text into a jsonb value tree
 /// (PG's `jsonb_in`). Malformed input is 22P02.
 pub(crate) fn parse_jsonb(text: &str) -> Result<JsonbVal, ExecError> {
+    if let Some(hit) = JSONB_PARSE_CACHE.with(|c| c.borrow().get(text).cloned()) {
+        return Ok((*hit).clone());
+    }
     let doc = parse_json(text).map_err(|_| {
         exec_err(
             "22P02",
             format!("invalid input syntax for type jsonb: {:?}", text),
         )
     })?;
-    jsonb_from_node(&doc, &doc.root)
+    let val = jsonb_from_node(&doc, &doc.root)?;
+    JSONB_PARSE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= JSONB_PARSE_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(text.to_string(), std::rc::Rc::new(val.clone()));
+    });
+    Ok(val)
 }
 
 /// The canonical text of a jsonb value (PG's `jsonb_in` result).
