@@ -960,7 +960,13 @@ pub(crate) fn eval_function_item(
         let (col_names, col_types, rows) = call_table_function(q, scopes, &fdef, &arg_vals)?;
         return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
     }
-    let (col_names, row_vals) = eval_table_function(name, &arg_vals)?;
+    // v1.87: pg_input_error_info resolves user-defined types against
+    // the live catalog (domains, composites, aclitem, reg*).
+    let (col_names, row_vals) = if name == "pg_input_error_info" && arg_vals.len() == 2 {
+        pg_input_error_info_catalog(q, &arg_vals)?
+    } else {
+        eval_table_function(name, &arg_vals)?
+    };
     // v0.46: PG's real output types (generate_series is int4/int8/
     // numeric, so the wire RowDescription carries the right OIDs and
     // the harness canonicalizes numerics by value, not by text).

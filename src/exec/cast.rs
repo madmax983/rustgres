@@ -665,6 +665,125 @@ pub(crate) fn pg_input_validate_numeric_typmod(input: &str, t: &str) -> Result<(
     Ok(())
 }
 
+/// v1.87: map a crate datetime parser error onto PG's `pg_input`
+/// error for the type (PG19 datetime_in / DecodeDateTime error
+/// selection). `pgname` is the display name used in PG messages
+/// ("date", "timestamp", "timestamp with time zone", "time",
+/// "time with time zone", "interval").
+fn pg_input_datetime_err(input: &str, pgname: &str, e: String) -> PgInputFailure {
+    let soft = |code: &'static str, message: String| {
+        PgInputFailure::Soft(PgInputError::soft(code, message))
+    };
+    // Zone recognition failures: PG lowercases the zone name in the
+    // message and uses 22023 (ERRCODE_INVALID_PARAMETER_VALUE via
+    // SelectTimeZone / check_timezone).
+    if e.contains("not recognized") {
+        if let Some(z) = e.split('"').nth(1) {
+            return soft(
+                "22023",
+                format!("time zone \"{}\" not recognized", z.to_ascii_lowercase()),
+            );
+        }
+    }
+    if let Some(rest) = e.strip_prefix("date/time field value out of range:") {
+        let _ = rest;
+        // PG distinguishes a structurally valid ISO date whose year is
+        // beyond the type's range: `<type> out of range: "<input>"`.
+        if let Some(msg) = datetime_year_out_of_range(input, pgname) {
+            return soft("22008", msg);
+        }
+        return soft("22008", e);
+    }
+    if e == "timestamp out of range" || e == "timestamp with time zone out of range" {
+        return soft("22008", format!("{pgname} out of range: \"{input}\""));
+    }
+    if e == "interval out of range" {
+        return soft("22008", e);
+    }
+    if e.starts_with("invalid input syntax for type") {
+        return soft("22007", e);
+    }
+    if e.contains("out of range") || e.contains("overflow") {
+        return soft("22008", e);
+    }
+    soft(
+        "22007",
+        format!("invalid input syntax for type {pgname}: \"{input}\""),
+    )
+}
+
+/// If `input` begins with an ISO date (YYYY-MM-DD) whose fields are
+/// individually valid but whose year is outside the PG range for the
+/// type, produce PG's `<type> out of range: "<input>"` message.
+fn datetime_year_out_of_range(input: &str, pgname: &str) -> Option<String> {
+    let s = input.trim();
+    let bytes = s.as_bytes();
+    let neg = bytes.first() == Some(&b'-');
+    let start = if neg { 1 } else { 0 };
+    let dash = s[start..].find('-')? + start;
+    let year_txt = &s[start..dash];
+    if year_txt.is_empty() || !year_txt.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_txt.parse().ok()?;
+    let year = if neg { -year } else { year };
+    let rest = &s[dash + 1..];
+    let rb = rest.as_bytes();
+    if rb.len() < 5
+        || !rb[0].is_ascii_digit()
+        || !rb[1].is_ascii_digit()
+        || rb[2] != b'-'
+        || !rb[3].is_ascii_digit()
+        || !rb[4].is_ascii_digit()
+    {
+        return None;
+    }
+    let month: i64 = rest[0..2].parse().ok()?;
+    let day: i64 = rest[3..5].parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(month - 1) as usize];
+    if day < 1 || day > dim {
+        return None;
+    }
+    let max_year = if pgname == "date" { 5874897 } else { 294276 };
+    if year > max_year || year < -4713 {
+        return Some(format!("{pgname} out of range: \"{input}\""));
+    }
+    None
+}
+
+/// v1.87: `bit(n)` / `bit varying(n)` arm: parse the typmod (a malformed
+/// one is a hard 22023 from the type parser, like the char family).
+fn pg_input_bit_typmod(input: &str, t: &str, varying: bool) -> Result<(), PgInputFailure> {
+    let bad = || PgInputFailure::Hard(exec_err("22023", "invalid type modifier"));
+    let open = t.find('(').ok_or_else(bad)?;
+    let close = t.rfind(')').ok_or_else(bad)?;
+    if close < open || !t[close + 1..].trim().is_empty() {
+        return Err(bad());
+    }
+    let n: i64 = t[open + 1..close].trim().parse().map_err(|_| bad())?;
+    if n < 0 {
+        return Err(bad());
+    }
+    super::pg_input::pg_input_validate_bit(input, Some(n as i32), varying)
+}
+
 /// v0.43: shared input-validation core for `pg_input_is_valid` and
 /// `pg_input_error_info` (PG19 misc.c `pg_input_is_valid_common`). Runs the
 /// type's input function against `input`; `Ok(())` = valid input. The type
@@ -710,6 +829,26 @@ pub(crate) fn pg_input_validate(
             }
         })
     };
+    // v1.87: array types — parse the suffix structure once and validate
+    // element-wise through the shared array parser in pg_input.rs.
+    {
+        let parts = super::pg_input::parse_type_name(typ);
+        if parts.array_depth > 0 {
+            let mut elem = parts.base.clone();
+            if let Some(tm) = &parts.typmod {
+                elem.push('(');
+                elem.push_str(tm);
+                elem.push(')');
+            }
+            for _ in 1..parts.array_depth {
+                elem.push_str("[]");
+            }
+            if parts.base_quoted && parts.base == "char" {
+                elem = "\"char\"".to_string();
+            }
+            return super::pg_input::pg_input_validate_array(fn_name, input, &elem);
+        }
+    }
     match typ.to_ascii_lowercase().as_str() {
         "bytea" => crate::storage::parse_bytea(input).map(|_| ()).map_err(|e| {
             use crate::storage::ByteaParseError;
@@ -756,79 +895,121 @@ pub(crate) fn pg_input_validate(
         t if t.starts_with("numeric(") || t.starts_with("decimal(") => {
             pg_input_validate_numeric_typmod(input, t)
         }
-        // v1.86: the datetime family validates through the same
-        // parsers as the casts. PG reports 22008 for range failures
-        // and 22P02 for syntax; the message text rides along.
-        "date" => crate::datetime::parse_date(input).map(|_| ()).map_err(|e| {
-            PgInputFailure::Soft(PgInputError::soft(
-                if e.contains("out of range") {
-                    "22008"
-                } else {
-                    "22P02"
-                },
-                e,
-            ))
-        }),
+        // v1.86/v1.87: the datetime family validates through the same
+        // parsers as the casts; pg_input_datetime_err maps the crate
+        // error onto PG's message/code choice (22007 syntax, 22008
+        // range, 22023 unknown zone, `<type> out of range`).
+        "date" => crate::datetime::parse_date(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "date", e)),
         "timestamp" | "timestamp without time zone" => crate::datetime::parse_timestamp(input)
             .map(|_| ())
-            .map_err(|e| {
-                PgInputFailure::Soft(PgInputError::soft(
-                    if e.contains("out of range") {
-                        "22008"
-                    } else {
-                        "22P02"
-                    },
-                    e,
-                ))
-            }),
+            .map_err(|e| pg_input_datetime_err(input, "timestamp", e)),
         "timestamptz" | "timestamp with time zone" => crate::datetime::parse_timestamptz(input)
             .map(|_| ())
-            .map_err(|e| {
-                PgInputFailure::Soft(PgInputError::soft(
-                    if e.contains("out of range") {
-                        "22008"
-                    } else {
-                        "22P02"
-                    },
-                    e,
-                ))
-            }),
-        "time" | "time without time zone" => {
-            crate::datetime::parse_time(input).map(|_| ()).map_err(|e| {
-                PgInputFailure::Soft(PgInputError::soft(
-                    if e.contains("out of range") || e.contains("overflow") {
-                        "22008"
-                    } else {
-                        "22P02"
-                    },
-                    e,
-                ))
-            })
-        }
+            .map_err(|e| pg_input_datetime_err(input, "timestamp with time zone", e)),
+        "time" | "time without time zone" => crate::datetime::parse_time(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "time", e)),
         "timetz" | "time with time zone" => crate::datetime::parse_timetz(input)
             .map(|_| ())
-            .map_err(|e| {
-                PgInputFailure::Soft(PgInputError::soft(
-                    if e.contains("out of range") || e.contains("overflow") {
-                        "22008"
-                    } else {
-                        "22P02"
-                    },
-                    e,
-                ))
-            }),
+            .map_err(|e| pg_input_datetime_err(input, "time with time zone", e)),
         "interval" => crate::datetime::parse_interval(input)
             .map(|_| ())
-            .map_err(|e| {
-                PgInputFailure::Soft(PgInputError::soft(
-                    if e.contains("overflow") {
-                        "22008"
-                    } else {
-                        "22P02"
-                    },
-                    e,
-                ))
-            }),
+            .map_err(|e| pg_input_datetime_err(input, "interval", e)),
+        // v1.87: the remaining builtin families, validated by the
+        // dedicated ports in pg_input.rs.
+        "text" | "name" => Ok(()),
+        "oid" => super::pg_input::pg_input_validate_uint(input, 32, "oid"),
+        "oid8" => super::pg_input::pg_input_validate_uint(input, 64, "oid8"),
+        "xid" => super::pg_input::pg_input_validate_uint(input, 32, "xid"),
+        "xid8" => super::pg_input::pg_input_validate_uint(input, 64, "xid8"),
+        "oidvector" => super::pg_input::pg_input_validate_oidvector(input),
+        "bit" => super::pg_input::pg_input_validate_bit(input, None, false),
+        "bit varying" | "varbit" => super::pg_input::pg_input_validate_bit(input, None, true),
+        t if t.starts_with("bit(") => pg_input_bit_typmod(input, t, false),
+        t if t.starts_with("bit varying(") || t.starts_with("varbit(") => {
+            pg_input_bit_typmod(input, t, true)
+        }
+        "point" | "box" | "circle" | "line" | "lseg" | "path" | "polygon" => {
+            let name = typ.to_ascii_lowercase();
+            super::pg_input::pg_input_validate_geometry(input, name.trim())
+        }
+        "inet" => super::pg_input::pg_input_validate_network(input, false),
+        "cidr" => super::pg_input::pg_input_validate_network(input, true),
+        "macaddr" => super::pg_input::pg_input_validate_macaddr(input, false),
+        "macaddr8" => super::pg_input::pg_input_validate_macaddr(input, true),
+        "money" => super::pg_input::pg_input_validate_money(input),
+        "uuid" => super::pg_input::pg_input_validate_uuid(input),
+        "tid" => super::pg_input::pg_input_validate_tid(input),
+        "pg_lsn" => super::pg_input::pg_input_validate_pg_lsn(input),
+        "pg_snapshot" | "txid_snapshot" => super::pg_input::pg_input_validate_pg_snapshot(input),
+        "json" => super::pg_input::pg_input_validate_json(input, false),
+        "jsonb" => super::pg_input::pg_input_validate_json(input, true),
+        "jsonpath" => super::pg_input::pg_input_validate_jsonpath(input),
+        "xml" => super::pg_input::pg_input_validate_xml(input),
+        "tsvector" => super::pg_input::pg_input_validate_tsvector(input),
+        "tsquery" => super::pg_input::pg_input_validate_tsquery(input),
+        "pg_ndistinct" => super::pg_input::pg_input_validate_ndistinct(input),
+        "pg_dependencies" => super::pg_input::pg_input_validate_dependencies(input),
+        "int4range" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int4,
+        ),
+        "int8range" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int8,
+        ),
+        "daterange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Date,
+        ),
+        "numrange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Num,
+        ),
+        "tsrange" => {
+            super::pg_input::pg_input_validate_range(fn_name, input, super::pg_input::RangeKind::Ts)
+        }
+        "tstzrange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Tstz,
+        ),
+        "int4multirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int4,
+        ),
+        "int8multirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int8,
+        ),
+        "datemultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Date,
+        ),
+        "nummultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Num,
+        ),
+        "tsmultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Ts,
+        ),
+        "tstzmultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Tstz,
+        ),
         // v0.35: character types with typmod, via the same blank-tolerant
         // input coercion as INSERT. A malformed typmod is 22023, like PG's
         // type parser (hard error, via `?`).

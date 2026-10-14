@@ -1685,6 +1685,27 @@ pub(crate) fn eval_func(
         let v = eval_expr(q, scopes, &args[0])?;
         return Ok(Value::text(v.type_name()));
     }
+    // v1.87: pg_input_is_valid needs the live catalog for user-defined
+    // types (domains, composites, aclitem, the reg* family), so it is
+    // intercepted here where `q` is available. Other evaluation
+    // contexts (grouped/aggregate) keep the pure path in eval_func_vals.
+    if name == "pg_input_is_valid" && args.len() == 2 {
+        let v0 = eval_expr(q, scopes, &args[0])?;
+        let v1 = eval_expr(q, scopes, &args[1])?;
+        let input = match str_arg(name, &v0)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        let typ = match str_arg(name, &v1)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        return match pg_input_validate_catalog(q, "pg_input_is_valid", &input, &typ) {
+            Ok(()) => Ok(Value::Bool(true)),
+            Err(PgInputFailure::Soft(_)) => Ok(Value::Bool(false)),
+            Err(PgInputFailure::Hard(e)) => Err(e),
+        };
+    }
     // v1.85: SQL/JSON DEFAULT expressions are restricted by PG at
     // analysis time (transformJsonFuncExpr): no subqueries,
     // aggregates, window functions, or set-returning functions
