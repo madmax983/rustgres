@@ -1175,6 +1175,21 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.85: cast to jsonpath validates + normalizes through the
+        // jsonpath parser (PG's jsonpathin), error 22P02.
+        ColType::Jsonpath => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                let p = crate::exec::jsonpath::parse_jsonpath(t)?;
+                Ok(Value::jsonpath(crate::exec::jsonpath::render_jsonpath(&p)))
+            }
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to jsonpath",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
         // v1.40: cast to tid (from text `(b,o)`, like PG's tidin).
         ColType::Tid => {
             // Identity: already a tid.

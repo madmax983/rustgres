@@ -736,6 +736,8 @@ impl Parser {
             "json" => Ok(ColType::Json),
             // v1.83: PG's `jsonb` type (pg_type.dat, oid 3802).
             "jsonb" => Ok(ColType::Jsonb),
+            // v1.85: PG's `jsonpath` type (pg_type.dat, oid 4072).
+            "jsonpath" => Ok(ColType::Jsonpath),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".
@@ -4724,6 +4726,8 @@ impl Parser {
                 Token::HashArrow => Some(JsonOp::HashArrow),
                 Token::HashArrowText => Some(JsonOp::HashArrowText),
                 Token::AtGt => Some(JsonOp::Contains),
+                Token::AtQuestion => Some(JsonOp::PathExists),
+                Token::AtAt => Some(JsonOp::PathMatch),
                 Token::LtAt => Some(JsonOp::ContainedBy),
                 Token::Question => Some(JsonOp::Exists),
                 Token::QuestionPipe => Some(JsonOp::ExistsAny),
@@ -5496,6 +5500,11 @@ impl Parser {
             self.pos = save;
         }
         match name.as_str() {
+            // v1.85: SQL/JSON query functions desugar onto the
+            // jsonpath engine (see parse_sqljson_fn).
+            "json_value" => return self.parse_sqljson_fn(0),
+            "json_query" => return self.parse_sqljson_fn(1),
+            "json_exists" => return self.parse_sqljson_fn(2),
             "extract" => return self.parse_extract(),
             "trim" => return self.parse_trim(),
             "position" => return self.parse_position(),
@@ -6154,6 +6163,220 @@ impl Parser {
             field,
             from: Box::new(from),
         })
+    }
+
+    /// v1.85: SQL/JSON query functions (PG19 gram.y JsonValueExpr /
+    /// JsonQueryExpr / JsonExistsExpr). Desugared onto internal
+    /// builtins over the jsonpath engine:
+    ///   JSON_VALUE  -> __sqljson_value(doc, path, vars, oe_k, oe_x,
+    ///                  or_k, or_x) [wrapped in a Cast when RETURNING]
+    ///   JSON_QUERY  -> __sqljson_query(doc, path, vars, oe_k, oe_x,
+    ///                  or_k, or_x, wrapper, keep_quotes) [+ Cast]
+    ///   JSON_EXISTS -> __sqljson_exists(doc, path, vars, or_k)
+    /// Behavior kinds (exec/json.rs): 0 ERROR, 1 NULL, 2 DEFAULT-expr,
+    /// 3 EMPTY, 4 EMPTY ARRAY, 5 EMPTY OBJECT, 6 TRUE, 7 FALSE.
+    /// PASSING pairs fold into a jsonb_build_object() vars argument.
+    /// `kind`: 0 = VALUE, 1 = QUERY, 2 = EXISTS.
+    pub(crate) fn parse_sqljson_fn(&mut self, kind: u8) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let doc = self.parse_or()?;
+        self.expect(Token::Comma, "','")?;
+        let path = self.parse_or()?;
+        // PASSING expr AS name [, ...]
+        let mut vars = Expr::Literal(Literal::Null);
+        if self.eat_keyword("passing") {
+            let mut kv: Vec<Expr> = Vec::new();
+            loop {
+                let v = self.parse_or()?;
+                self.expect_keyword("as")?;
+                let nm = match self.next() {
+                    Token::Ident(s) => s,
+                    t => {
+                        return Err(err(&format!(
+                            "syntax error: expected PASSING variable name, found {:?}",
+                            t
+                        )));
+                    }
+                };
+                kv.push(Expr::Literal(Literal::Text(nm.into())));
+                kv.push(v);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            vars = Expr::Func {
+                name: "jsonb_build_object".to_string(),
+                args: kv,
+            };
+        }
+        // RETURNING type (VALUE and QUERY).
+        let mut returning: Option<ColType> = None;
+        if kind != 2 && self.eat_keyword("returning") {
+            let tname = match self.next() {
+                Token::Ident(s) => s,
+                t => {
+                    return Err(err(&format!(
+                        "syntax error: expected type name, found {:?}",
+                        t
+                    )));
+                }
+            };
+            let (ty, _) = self.parse_type_name_rest(tname)?;
+            returning = Some(ty);
+        }
+        // JSON_QUERY wrapper / quotes clauses.
+        let mut wrapper: i64 = 0; // 0 without, 1 unconditional, 2 conditional
+        let mut keep_quotes = false;
+        if kind == 1 {
+            loop {
+                if self.eat_keyword("without") {
+                    self.expect_keyword("wrapper")?;
+                    wrapper = 0;
+                } else if self.eat_keyword("with") {
+                    if self.eat_keyword("conditional") {
+                        wrapper = 2;
+                    } else if self.eat_keyword("unconditional") {
+                        wrapper = 1;
+                    } else {
+                        wrapper = 1;
+                    }
+                    self.expect_keyword("wrapper")?;
+                } else if self.eat_keyword("keep") {
+                    self.expect_keyword("quotes")?;
+                    keep_quotes = true;
+                } else if self.eat_keyword("omit") {
+                    self.expect_keyword("quotes")?;
+                    keep_quotes = false;
+                } else {
+                    break;
+                }
+            }
+        }
+        // Behavior clauses: `<behavior> ON EMPTY|ON ERROR` in either
+        // order, each at most once (defaults: ERROR / ERROR; for
+        // JSON_EXISTS ON ERROR defaults to ERROR too).
+        let (mut oe_kind, mut oe_expr) = (0i64, Expr::Literal(Literal::Null));
+        let (mut or_kind, mut or_expr) = (0i64, Expr::Literal(Literal::Null));
+        for _ in 0..2 {
+            let save = self.pos;
+            let (bk, bx) = match self.parse_sqljson_behavior() {
+                Ok(x) => x,
+                Err(_) => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            if self.eat_keyword("on") {
+                if self.eat_keyword("empty") {
+                    oe_kind = bk;
+                    oe_expr = bx;
+                } else if self.eat_keyword("error") {
+                    or_kind = bk;
+                    or_expr = bx;
+                } else {
+                    return Err(err("syntax error: expected EMPTY or ERROR after ON"));
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        let int_lit = |v: i64| Expr::Literal(Literal::Int(v));
+        // JSON_VALUE's RETURNING conversion is NOT a plain cast in
+        // PG (it uses the target type's input semantics — "1.234"
+        // to int errors), so the type name rides as an argument and
+        // __sqljson_value converts strictly. JSON_QUERY keeps the
+        // plain Cast wrap.
+        let ret_name = match (kind, &returning) {
+            (0, Some(ty)) => Expr::Literal(Literal::Text(ty.sql_name().into())),
+            _ => Expr::Literal(Literal::Null),
+        };
+        let call = match kind {
+            2 => Expr::Func {
+                name: "__sqljson_exists".to_string(),
+                args: vec![doc, path, vars, int_lit(or_kind)],
+            },
+            1 => Expr::Func {
+                name: "__sqljson_query".to_string(),
+                args: vec![
+                    doc,
+                    path,
+                    vars,
+                    int_lit(oe_kind),
+                    oe_expr,
+                    int_lit(or_kind),
+                    or_expr,
+                    int_lit(wrapper),
+                    Expr::Literal(Literal::Bool(keep_quotes)),
+                ],
+            },
+            _ => Expr::Func {
+                name: "__sqljson_value".to_string(),
+                args: vec![
+                    doc,
+                    path,
+                    vars,
+                    int_lit(oe_kind),
+                    oe_expr,
+                    int_lit(or_kind),
+                    or_expr,
+                    ret_name,
+                ],
+            },
+        };
+        Ok(match returning {
+            Some(to) if kind == 1 => Expr::Cast {
+                expr: Box::new(call),
+                to,
+                written: None,
+            },
+            _ => call,
+        })
+    }
+
+    /// One SQL/JSON behavior: ERROR | NULL | TRUE | FALSE | EMPTY
+    /// [ARRAY|OBJECT] | DEFAULT expr. Returns (kind, expr).
+    fn parse_sqljson_behavior(&mut self) -> Result<(i64, Expr), SqlError> {
+        match self.peek().clone() {
+            Token::Ident(s) if s == "error" => {
+                self.next();
+                Ok((0, Expr::Literal(Literal::Null)))
+            }
+            Token::Ident(s) if s == "null" => {
+                self.next();
+                Ok((1, Expr::Literal(Literal::Null)))
+            }
+            Token::Ident(s) if s == "true" => {
+                self.next();
+                Ok((6, Expr::Literal(Literal::Null)))
+            }
+            Token::Ident(s) if s == "false" => {
+                self.next();
+                Ok((7, Expr::Literal(Literal::Null)))
+            }
+            Token::Ident(s) if s == "empty" => {
+                self.next();
+                if self.eat_keyword("array") {
+                    Ok((4, Expr::Literal(Literal::Null)))
+                } else if self.eat_keyword("object") {
+                    Ok((5, Expr::Literal(Literal::Null)))
+                } else {
+                    Ok((3, Expr::Literal(Literal::Null)))
+                }
+            }
+            Token::Ident(s) if s == "default" => {
+                self.next();
+                let e = self.parse_or()?;
+                Ok((2, e))
+            }
+            t => Err(err(&format!(
+                "syntax error: unexpected {:?} in SQL/JSON behavior clause",
+                t
+            ))),
+        }
     }
 
     /// `trim([ [leading|trailing|both] [chars] from ] str)`.
@@ -8210,7 +8433,21 @@ impl Parser {
                 let mut args = Vec::new();
                 if *self.peek() != Token::RParen {
                     loop {
-                        args.push(self.parse_or()?);
+                        // v1.85: named-argument syntax in FROM-clause
+                        // function items, like generic calls.
+                        if matches!(self.peek(), Token::Ident(_))
+                            && matches!(self.peek2(), Token::FatArrow)
+                        {
+                            let arg_name = self.expect_ident()?;
+                            self.next(); // consume '=>'
+                            let val = self.parse_or()?;
+                            args.push(Expr::NamedArg {
+                                name: arg_name,
+                                expr: Box::new(val),
+                            });
+                        } else {
+                            args.push(self.parse_or()?);
+                        }
                         if *self.peek() == Token::Comma {
                             self.next();
                         } else {

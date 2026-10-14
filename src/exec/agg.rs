@@ -153,6 +153,11 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
         // is over the canonical structure with numeric-value hashing),
         // so 1.0 and 1.00 land in the same group. A stored value that
         // fails to parse (unreachable via casts) keys by its text.
+        // v1.85: jsonpath groups by its rendered text.
+        Value::Jsonpath(s) => {
+            out.push(21);
+            out.extend_from_slice(s.as_bytes());
+        }
         Value::Jsonb(s) => {
             out.push(20);
             match parse_jsonb(s) {
@@ -259,6 +264,8 @@ pub(crate) fn eval_group_key_expanded(
 ) -> Result<Vec<Value>, ExecError> {
     if let Expr::Func { name, args } = key {
         if is_builtin_srf(name) {
+            let resolved = resolve_named_args_if_any(q.eng, name, args)?;
+            let args: &[Expr] = &resolved;
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 vals.push(eval_expr(q, scopes, a)?);

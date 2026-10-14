@@ -134,6 +134,10 @@ pub(crate) enum Token {
     /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
     /// below (exact matches only; `?=` etc. stay `Op`).
     AtGt, // `@>`
+    /// v1.85: `@?` (jsonpath exists) and `@@` (jsonpath match) —
+    /// PG19 gram.y `Op` for (jsonb, jsonpath).
+    AtQuestion, // `@?`
+    AtAt,       // `@@`
     LtAt,       // `<@`
     Question,   // `?`
     QuestionPipe, // `?|`
@@ -471,6 +475,14 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
         if c == '@' {
             if i + 1 < chars.len() && chars[i + 1] == '>' {
                 toks.push(Token::AtGt);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '?' {
+                // v1.85: `@?` jsonpath exists operator.
+                toks.push(Token::AtQuestion);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '@' {
+                // v1.85: `@@` jsonpath match operator.
+                toks.push(Token::AtAt);
                 i += 2;
             } else {
                 toks.push(Token::At);
@@ -1219,6 +1231,10 @@ pub enum JsonOp {
     ExistsAny,
     /// v1.83: `?&`: jsonb existence, all (bool).
     ExistsAll,
+    /// v1.85: `@?`: jsonb @? jsonpath — path exists (bool).
+    PathExists,
+    /// v1.85: `@@`: jsonb @@ jsonpath — path predicate matches (bool).
+    PathMatch,
 }
 
 impl JsonOp {
@@ -1233,6 +1249,8 @@ impl JsonOp {
             JsonOp::Exists => "?",
             JsonOp::ExistsAny => "?|",
             JsonOp::ExistsAll => "?&",
+            JsonOp::PathExists => "@?",
+            JsonOp::PathMatch => "@@",
         }
     }
 
@@ -1251,6 +1269,8 @@ impl JsonOp {
                 | JsonOp::Exists
                 | JsonOp::ExistsAny
                 | JsonOp::ExistsAll
+                | JsonOp::PathExists
+                | JsonOp::PathMatch
         )
     }
 
@@ -1269,6 +1289,8 @@ impl JsonOp {
             JsonOp::Exists => "exists",
             JsonOp::ExistsAny => "existsany",
             JsonOp::ExistsAll => "existsall",
+            JsonOp::PathExists => "pathexists",
+            JsonOp::PathMatch => "pathmatch",
         }
     }
 
@@ -1283,6 +1305,8 @@ impl JsonOp {
             "exists" => Some(JsonOp::Exists),
             "existsany" => Some(JsonOp::ExistsAny),
             "existsall" => Some(JsonOp::ExistsAll),
+            "pathexists" => Some(JsonOp::PathExists),
+            "pathmatch" => Some(JsonOp::PathMatch),
             _ => None,
         }
     }
@@ -5791,6 +5815,8 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::HashArrowText => "#>>".to_string(),
             // v1.83: jsonb operators render back to their source text.
             Token::AtGt => "@>".to_string(),
+            Token::AtQuestion => "@?".to_string(),
+            Token::AtAt => "@@".to_string(),
             Token::LtAt => "<@".to_string(),
             Token::Question => "?".to_string(),
             Token::QuestionPipe => "?|".to_string(),

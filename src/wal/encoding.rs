@@ -548,6 +548,11 @@ impl Enc {
                 self.u8(27);
                 return;
             }
+            // v1.85: jsonpath; tag appends after v1.83's.
+            ColType::Jsonpath => {
+                self.u8(28);
+                return;
+            }
             // v1.17: xid; tag appends after v0.81's.
             ColType::Xid => {
                 self.u8(24);
@@ -697,6 +702,11 @@ impl Enc {
             // canonical text is the whole payload.
             Value::Jsonb(s) => {
                 self.u8(21);
+                self.str(s);
+            }
+            // v1.85: jsonpath values; tag appends after v1.83's.
+            Value::Jsonpath(s) => {
+                self.u8(22);
                 self.str(s);
             }
         }
@@ -1559,6 +1569,8 @@ impl<'a> Dec<'a> {
             21 => Ok(ColType::Json),
             // v1.83: jsonb.
             27 => Ok(ColType::Jsonb),
+            // v1.85: jsonpath.
+            28 => Ok(ColType::Jsonpath),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -1640,6 +1652,8 @@ impl<'a> Dec<'a> {
             20 => Ok(Value::Tid(self.u32()?, self.u32()?)),
             // v1.83: jsonb (canonical text payload).
             21 => Ok(Value::Jsonb(self.str_arc()?)),
+            // v1.85: jsonpath (rendered text payload).
+            22 => Ok(Value::Jsonpath(self.str_arc()?)),
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;

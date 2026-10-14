@@ -74,6 +74,14 @@ pub(crate) fn execute_inner(
             returning,
         ),
         Stmt::Select(sel) => {
+            // v1.85: SQL/JSON DEFAULT analysis-time restrictions
+            // (PG transformJsonFuncExpr) — checked once here so they
+            // fire even when the query yields zero rows.
+            for item in &sel.items {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    analyze_sqljson_defaults(eng, expr)?;
+                }
+            }
             // FOR UPDATE locks (from every query level that asked for
             // them) are collected during the scan and acquired here, while
             // the engine lock is still held — so they are atomic with the

@@ -591,6 +591,11 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
     };
     let as_text = !op.returns_json();
     let node = match op {
+        // v1.85: @? / @@ on a json/text document go through the
+        // jsonpath engine on the jsonb tree.
+        JsonOp::PathExists | JsonOp::PathMatch => {
+            return eval_jsonb_op(op, doc_text, right);
+        }
         // v1.83: the containment/existence family is jsonb-only;
         // eval_json_op rejects it for text/json operands before this
         // point, so this arm is defensive.
@@ -1303,6 +1308,34 @@ fn eval_jsonb_op(op: JsonOp, doc_text: &str, right: &Value) -> Result<Value, Exe
                     } else {
                         Ok(Value::Bool(true))
                     }
+                }
+            }
+        }
+        // v1.85: @? / @@ — the jsonpath predicate operators. The
+        // right operand is a jsonpath value or jsonpath text; a
+        // malformed literal raises the jsonpath input error (22P02).
+        JsonOp::PathExists | JsonOp::PathMatch => {
+            let path_text: &str = match right {
+                Value::Jsonpath(p) => p.as_ref(),
+                Value::Text(t) | Value::BpChar(t) => t.as_ref(),
+                other => {
+                    return Err(exec_err(
+                        "42883",
+                        format!(
+                            "operator does not exist: jsonb {} {}",
+                            op.sql(),
+                            value_type_name(other)
+                        ),
+                    ));
+                }
+            };
+            let path = super::jsonpath::parse_jsonpath(path_text)?;
+            if op == JsonOp::PathExists {
+                Ok(Value::Bool(super::jsonpath::jp_exists(&doc, &path, None)?))
+            } else {
+                match super::jsonpath::jp_match(&doc, &path, None)? {
+                    Some(b) => Ok(Value::Bool(b)),
+                    None => Ok(Value::Null),
                 }
             }
         }
@@ -2377,5 +2410,512 @@ mod jsonb_tests {
         // Missing key -> SQL NULL.
         let r = eval_json_op(JsonOp::Arrow, &d, &Value::text("zz")).unwrap();
         assert_eq!(r, Value::Null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.85: jsonpath function family + SQL/JSON query-function internals
+// (PG19 jsonfuncs.c jsonb_path_* wrappers over exec/jsonpath.rs).
+// ---------------------------------------------------------------------------
+
+/// A jsonpath argument value: a typed jsonpath value or bare text
+/// (coerced through the jsonpath input function, 22P02 on error).
+pub(crate) fn jsonpath_arg(
+    fname: &str,
+    v: &Value,
+) -> Result<Option<super::jsonpath::JpPath>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Jsonpath(p) => Ok(Some(super::jsonpath::parse_jsonpath(p)?)),
+        Value::Text(t) | Value::BpChar(t) => Ok(Some(super::jsonpath::parse_jsonpath(t)?)),
+        other => Err(func_arg_err(fname, other)),
+    }
+}
+
+fn jsonpath_vars_arg(
+    fname: &str,
+    vals: &[Value],
+    idx: usize,
+) -> Result<Option<JsonbVal>, ExecError> {
+    if vals.len() <= idx {
+        return Ok(Some(JsonbVal::Object(Vec::new())));
+    }
+    jsonb_val_arg(fname, &vals[idx])
+}
+
+fn jsonpath_silent_arg(vals: &[Value], idx: usize) -> bool {
+    matches!(vals.get(idx), Some(Value::Bool(true)))
+}
+
+/// Scalar jsonb_path_* functions (exists/match/query_array/
+/// query_first + _tz aliases). All are STRICT: any NULL argument
+/// yields NULL (the SRF/empty cases are handled by the caller).
+pub(crate) fn eval_jsonpath_scalar(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    let base = name.strip_suffix("_tz").unwrap_or(name);
+    if vals[0] == Value::Null || vals[1] == Value::Null {
+        return Ok(Value::Null);
+    }
+    if let Some(v) = vals.get(2) {
+        if *v == Value::Null {
+            return Ok(Value::Null);
+        }
+    }
+    if let Some(v) = vals.get(3) {
+        if *v == Value::Null {
+            return Ok(Value::Null);
+        }
+    }
+    let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
+    let path = jsonpath_arg(name, &vals[1])?.unwrap();
+    let vars = jsonpath_vars_arg(name, vals, 2)?;
+    let silent = jsonpath_silent_arg(vals, 3);
+    let vars_ref = vars.as_ref();
+    match base {
+        "jsonb_path_exists" => match super::jsonpath::jp_exists(&doc, &path, vars_ref) {
+            Ok(b) => Ok(Value::Bool(b)),
+            Err(e) => {
+                if silent {
+                    Ok(Value::Bool(false))
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        "jsonb_path_match" => match super::jsonpath::jp_match(&doc, &path, vars_ref) {
+            Ok(Some(b)) => Ok(Value::Bool(b)),
+            Ok(None) => Ok(Value::Null),
+            Err(e) => {
+                if silent {
+                    Ok(Value::Null)
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        "jsonb_path_query_array" => match super::jsonpath::jp_query_seq(&doc, &path, vars_ref) {
+            Ok(seq) => Ok(Value::jsonb(JsonbVal::Array(seq).render())),
+            Err(e) => {
+                if silent {
+                    Ok(Value::jsonb("[]"))
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        "jsonb_path_query_first" => match super::jsonpath::jp_query_seq(&doc, &path, vars_ref) {
+            Ok(seq) => match seq.into_iter().next() {
+                Some(v) => Ok(Value::jsonb(v.render())),
+                None => Ok(Value::Null),
+            },
+            Err(e) => {
+                if silent {
+                    Ok(Value::Null)
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        _ => unreachable!(),
+    }
+}
+
+/// jsonb_path_query (SRF form): the result rows as jsonb values.
+/// NULL target/path yields zero rows (PG's strict SRF).
+pub(crate) fn jsonpath_query_rows(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    if vals[0] == Value::Null || vals[1] == Value::Null {
+        return Ok(Vec::new());
+    }
+    if let Some(v) = vals.get(2) {
+        if *v == Value::Null {
+            return Ok(Vec::new());
+        }
+    }
+    let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
+    let path = jsonpath_arg(name, &vals[1])?.unwrap();
+    let vars = jsonpath_vars_arg(name, vals, 2)?;
+    let silent = jsonpath_silent_arg(vals, 3);
+    match super::jsonpath::jp_query_seq(&doc, &path, vars.as_ref()) {
+        Ok(seq) => Ok(seq.iter().map(|v| Value::jsonb(v.render())).collect()),
+        Err(e) => {
+            if silent {
+                Ok(Vec::new())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+// SQL/JSON behavior-clause kinds (parser desugar encoding):
+//   0 = ERROR, 1 = NULL, 2 = DEFAULT expr (value in the paired slot),
+//   3 = EMPTY, 4 = EMPTY ARRAY, 5 = EMPTY OBJECT, 6 = TRUE, 7 = FALSE.
+pub(crate) const SJ_NULL: i64 = 1;
+pub(crate) const SJ_EXPR: i64 = 2;
+pub(crate) const SJ_EMPTY: i64 = 3;
+pub(crate) const SJ_EMPTY_ARRAY: i64 = 4;
+pub(crate) const SJ_EMPTY_OBJECT: i64 = 5;
+pub(crate) const SJ_TRUE: i64 = 6;
+pub(crate) const SJ_FALSE: i64 = 7;
+
+fn sj_kind(v: &Value) -> i64 {
+    match v {
+        Value::Int(i) => *i,
+        Value::BigInt(i) => *i,
+        Value::SmallInt(i) => *i as i64,
+        _ => 0,
+    }
+}
+
+/// Run a SQL/JSON path for the query functions; apply the ON ERROR
+/// behavior to engine errors. Returns the item sequence.
+#[allow(clippy::too_many_arguments)]
+fn sqljson_run(
+    name: &str,
+    vals: &[Value],
+    or_kind: i64,
+    or_expr: &Value,
+) -> Result<Option<Vec<JsonbVal>>, ExecError> {
+    let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
+    let path_text = match &vals[1] {
+        Value::Text(t) | Value::BpChar(t) => t.as_ref(),
+        Value::Jsonpath(p) => p.as_ref(),
+        other => return Err(func_arg_err(name, other)),
+    };
+    let vars = if vals[2] == Value::Null {
+        None
+    } else {
+        jsonb_val_arg(name, &vals[2])?
+    };
+    let path = match super::jsonpath::parse_jsonpath(path_text) {
+        Ok(p) => p,
+        Err(e) => {
+            return match or_kind {
+                SJ_NULL => Ok(None),
+                SJ_EXPR => Ok(Some(vec![jsonbval_of_sql_value(or_expr)])),
+                SJ_TRUE => Ok(Some(vec![JsonbVal::Bool(true)])),
+                SJ_FALSE => Ok(Some(vec![JsonbVal::Bool(false)])),
+                SJ_EMPTY => Ok(Some(Vec::new())),
+                SJ_EMPTY_ARRAY => Ok(Some(vec![JsonbVal::Array(Vec::new())])),
+                SJ_EMPTY_OBJECT => Ok(Some(vec![JsonbVal::Object(Vec::new())])),
+                _ => Err(e),
+            };
+        }
+    };
+    match super::jsonpath::jp_query_seq(&doc, &path, vars.as_ref()) {
+        Ok(seq) => Ok(Some(seq)),
+        Err(e) => match or_kind {
+            SJ_NULL => Ok(None),
+            SJ_EXPR => Ok(Some(vec![jsonbval_of_sql_value(or_expr)])),
+            SJ_TRUE => Ok(Some(vec![JsonbVal::Bool(true)])),
+            SJ_FALSE => Ok(Some(vec![JsonbVal::Bool(false)])),
+            SJ_EMPTY => Ok(Some(Vec::new())),
+            SJ_EMPTY_ARRAY => Ok(Some(vec![JsonbVal::Array(Vec::new())])),
+            SJ_EMPTY_OBJECT => Ok(Some(vec![JsonbVal::Object(Vec::new())])),
+            _ => Err(e),
+        },
+    }
+}
+
+/// Convert an evaluated DEFAULT-expression value to a jsonb item
+/// (used for ON ERROR/ON EMPTY DEFAULT in the query functions).
+fn jsonbval_of_sql_value(v: &Value) -> JsonbVal {
+    match v {
+        Value::Jsonb(s) => parse_jsonb(s).unwrap_or(JsonbVal::Null),
+        Value::Text(t) | Value::BpChar(t) => JsonbVal::Str(t.to_string()),
+        Value::Bool(b) => JsonbVal::Bool(*b),
+        Value::SmallInt(i) => JsonbVal::Number(Numeric::from_i64(*i as i64)),
+        Value::Int(i) => JsonbVal::Number(Numeric::from_i64(*i)),
+        Value::BigInt(i) => JsonbVal::Number(Numeric::from_i64(*i)),
+        Value::Numeric(n) => JsonbVal::Number(n.clone()),
+        Value::Float(f) => JsonbVal::Number(Numeric::from_f64(*f).unwrap_or(Numeric::zero())),
+        Value::Float4(f) => {
+            JsonbVal::Number(Numeric::from_f64(*f as f64).unwrap_or(Numeric::zero()))
+        }
+        _ => JsonbVal::Null,
+    }
+}
+
+/// The __sqljson_* internal builtins the parser desugars
+/// JSON_VALUE / JSON_QUERY / JSON_EXISTS into.
+pub(crate) fn eval_sqljson_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    if vals[0] == Value::Null {
+        return Ok(Value::Null);
+    }
+    match name {
+        "__sqljson_exists" => {
+            // [doc, path, vars, on_error_kind]
+            let or_kind = sj_kind(&vals[3]);
+            let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
+            let path_text = match &vals[1] {
+                Value::Text(t) | Value::BpChar(t) => t.as_ref(),
+                Value::Jsonpath(p) => p.as_ref(),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let vars = if vals[2] == Value::Null {
+                None
+            } else {
+                jsonb_val_arg(name, &vals[2])?
+            };
+            let path = match super::jsonpath::parse_jsonpath(path_text) {
+                Ok(p) => p,
+                Err(e) => {
+                    return match or_kind {
+                        SJ_TRUE => Ok(Value::Bool(true)),
+                        SJ_FALSE => Ok(Value::Bool(false)),
+                        _ => Err(e),
+                    };
+                }
+            };
+            match super::jsonpath::jp_exists(&doc, &path, vars.as_ref()) {
+                Ok(b) => Ok(Value::Bool(b)),
+                Err(e) => match or_kind {
+                    SJ_TRUE => Ok(Value::Bool(true)),
+                    SJ_FALSE => Ok(Value::Bool(false)),
+                    _ => Err(e),
+                },
+            }
+        }
+        "__sqljson_value" => {
+            // [doc, path, vars, oe_kind, oe_expr, or_kind, or_expr]
+            let oe_kind = sj_kind(&vals[3]);
+            let or_kind = sj_kind(&vals[5]);
+            let seq = sqljson_run(name, vals, or_kind, &vals[6])?;
+            let seq = match seq {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let item = if seq.is_empty() {
+                match oe_kind {
+                    SJ_NULL => return Ok(Value::Null),
+                    SJ_EXPR => return Ok(vals[4].clone()),
+                    _ => return Err(exec_err("22035", "no SQL/JSON item".to_string())),
+                }
+            } else if seq.len() > 1 {
+                match or_kind {
+                    SJ_NULL => return Ok(Value::Null),
+                    SJ_EXPR => return Ok(vals[6].clone()),
+                    _ => {
+                        return Err(exec_err(
+                            "22038",
+                            "singleton SQL/JSON item required".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                seq.into_iter().next().unwrap()
+            };
+            match item {
+                JsonbVal::Null => Ok(Value::Null),
+                JsonbVal::Array(_) | JsonbVal::Object(_) => match or_kind {
+                    SJ_NULL => Ok(Value::Null),
+                    SJ_EXPR => Ok(vals[6].clone()),
+                    _ => Err(exec_err("2203F", "SQL/JSON scalar required".to_string())),
+                },
+                scalar => {
+                    // RETURNING type: PG converts via the target
+                    // type's input function (strict — "1.234" to
+                    // int is 22P02), not via a cast.
+                    if let Value::Text(tname) = &vals[7] {
+                        sqljson_convert_return(&scalar, tname)
+                    } else {
+                        Ok(match scalar {
+                            JsonbVal::Bool(b) => Value::Bool(b),
+                            JsonbVal::Number(n) => Value::Numeric(n),
+                            JsonbVal::Str(s) => Value::text(s),
+                            _ => unreachable!(),
+                        })
+                    }
+                }
+            }
+        }
+        "__sqljson_query" => {
+            // [doc, path, vars, oe_kind, oe_expr, or_kind, or_expr,
+            //  wrapper_kind, keep_quotes]
+            let oe_kind = sj_kind(&vals[3]);
+            let or_kind = sj_kind(&vals[5]);
+            let wrapper = sj_kind(&vals[7]);
+            let keep_quotes = matches!(vals[8], Value::Bool(true));
+            let _ = keep_quotes;
+            let seq = sqljson_run(name, vals, or_kind, &vals[6])?;
+            let seq = match seq {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            if seq.is_empty() {
+                return match oe_kind {
+                    SJ_NULL => Ok(Value::Null),
+                    SJ_EXPR => Ok(vals[4].clone()),
+                    SJ_EMPTY => Ok(Value::jsonb("[]")),
+                    SJ_EMPTY_ARRAY => Ok(Value::jsonb("[]")),
+                    SJ_EMPTY_OBJECT => Ok(Value::jsonb("{}")),
+                    _ => Err(exec_err("22035", "no SQL/JSON item".to_string())),
+                };
+            }
+            match wrapper {
+                // WITHOUT WRAPPER: exactly one item, and it must be
+                // an array or object.
+                0 => {
+                    if seq.len() > 1 {
+                        return match or_kind {
+                            SJ_NULL => Ok(Value::Null),
+                            SJ_EXPR => Ok(vals[6].clone()),
+                            _ => Err(exec_err(
+                                "22038",
+                                "singleton SQL/JSON item required".to_string(),
+                            )),
+                        };
+                    }
+                    let item = seq.into_iter().next().unwrap();
+                    match item {
+                        JsonbVal::Array(_) | JsonbVal::Object(_) => Ok(Value::jsonb(item.render())),
+                        _ => match or_kind {
+                            SJ_NULL => Ok(Value::Null),
+                            SJ_EXPR => Ok(vals[6].clone()),
+                            _ => Err(exec_err(
+                                "2203C",
+                                "SQL/JSON array or object required".to_string(),
+                            )),
+                        },
+                    }
+                }
+                // UNCONDITIONAL WRAPPER: always wrap in an array.
+                1 => Ok(Value::jsonb(JsonbVal::Array(seq).render())),
+                // CONDITIONAL WRAPPER: a single array item is used
+                // as-is; anything else wraps.
+                _ => {
+                    if seq.len() == 1 {
+                        if let JsonbVal::Array(_) = &seq[0] {
+                            return Ok(Value::jsonb(seq[0].render()));
+                        }
+                    }
+                    Ok(Value::jsonb(JsonbVal::Array(seq).render()))
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// v1.85: JSON_VALUE RETURNING conversion — PG applies the target
+/// type's *input* semantics to the item's text (strict integer
+/// syntax, boolean spellings, datetime input), unlike a cast, which
+/// would round numerics. Unmapped types fall back to a cast of the
+/// item's natural value.
+pub(crate) fn sqljson_convert_return(item: &JsonbVal, type_name: &str) -> Result<Value, ExecError> {
+    let base = type_name.split('(').next().unwrap_or(type_name).trim();
+    let text = match item {
+        JsonbVal::Str(s) => s.clone(),
+        JsonbVal::Number(n) => n.to_text(),
+        JsonbVal::Bool(b) => b.to_string(),
+        _ => item.render(),
+    };
+    let invalid = |ty: &str| {
+        exec_err(
+            "22P02",
+            format!("invalid input syntax for type {}: {:?}", ty, text),
+        )
+    };
+    match base {
+        "smallint" | "integer" | "bigint" => {
+            let t = text.trim();
+            let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid(base));
+            }
+            let v: i64 = t.parse().map_err(|_| invalid(base))?;
+            match base {
+                "smallint" => {
+                    if v < i16::MIN as i64 || v > i16::MAX as i64 {
+                        return Err(exec_err(
+                            "22003",
+                            format!("value \"{}\" is out of range for type smallint", t),
+                        ));
+                    }
+                    Ok(Value::SmallInt(v as i16))
+                }
+                "integer" => {
+                    if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                        return Err(exec_err(
+                            "22003",
+                            format!("value \"{}\" is out of range for type integer", t),
+                        ));
+                    }
+                    Ok(Value::Int(v))
+                }
+                _ => Ok(Value::BigInt(v)),
+            }
+        }
+        "numeric" | "decimal" => match Numeric::parse(text.trim()) {
+            Ok(n) => Ok(Value::Numeric(n)),
+            Err(_) => Err(invalid("numeric")),
+        },
+        "double precision" => match text.trim().parse::<f64>() {
+            Ok(f) => Ok(Value::Float(f)),
+            Err(_) => Err(invalid("double precision")),
+        },
+        "real" => match text.trim().parse::<f32>() {
+            Ok(f) => Ok(Value::Float4(f)),
+            Err(_) => Err(invalid("real")),
+        },
+        "boolean" => {
+            let t = text.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Value::Bool(true)),
+                "f" | "false" | "n" | "no" | "off" | "0" => Ok(Value::Bool(false)),
+                _ => Err(invalid("boolean")),
+            }
+        }
+        "date" => match dt_safe(|| crate::datetime::parse_date(text.trim())) {
+            Ok(d) => Ok(Value::Date(d)),
+            Err(_) => Err(exec_err(
+                "22007",
+                format!("invalid input syntax for type date: {:?}", text),
+            )),
+        },
+        "timestamp without time zone" => {
+            match dt_safe(|| crate::datetime::parse_timestamp(text.trim())) {
+                Ok(t) => Ok(Value::Timestamp(t)),
+                Err(_) => Err(exec_err(
+                    "22007",
+                    format!(
+                        "invalid input syntax for type timestamp without time zone: {:?}",
+                        text
+                    ),
+                )),
+            }
+        }
+        "timestamp with time zone" => {
+            match dt_safe(|| crate::datetime::parse_timestamp(text.trim())) {
+                Ok(t) => Ok(Value::Timestamptz(t)),
+                Err(_) => Err(exec_err(
+                    "22007",
+                    format!(
+                        "invalid input syntax for type timestamp with time zone: {:?}",
+                        text
+                    ),
+                )),
+            }
+        }
+        "text" => Ok(Value::text(text)),
+        "json" => Ok(Value::text(item.render())),
+        "jsonb" => Ok(Value::jsonb(item.render())),
+        _ => {
+            // Fall back to a cast of the natural value when the type
+            // has a registered ColType by name.
+            let v = match item {
+                JsonbVal::Bool(b) => Value::Bool(*b),
+                JsonbVal::Number(n) => Value::Numeric(n.clone()),
+                JsonbVal::Str(s) => Value::text(s.clone()),
+                _ => Value::text(item.render()),
+            };
+            Ok(v)
+        }
+    }
+}
+
+fn dt_safe<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err("datetime value out of range".to_string()),
     }
 }

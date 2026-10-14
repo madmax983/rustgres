@@ -115,6 +115,11 @@ pub(crate) fn project_item_values(
             if expand_srf {
                 if let Expr::Func { name, args } = expr {
                     if is_srf(q.eng, name) {
+                        // v1.85: named arguments resolve before the
+                        // SRF argument values are taken (the SRF path
+                        // bypasses eval_func's resolution).
+                        let resolved = resolve_named_args_if_any(q.eng, name, args)?;
+                        let args: &[Expr] = &resolved;
                         let mut vals = Vec::with_capacity(args.len());
                         for a in args {
                             vals.push(eval_expr(q, scopes, a)?);

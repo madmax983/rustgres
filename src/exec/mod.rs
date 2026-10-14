@@ -84,6 +84,7 @@ mod indexes;
 mod info_schema;
 mod join;
 mod json;
+mod jsonpath;
 mod orderby;
 mod params;
 mod partition;

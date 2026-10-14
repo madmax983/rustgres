@@ -892,6 +892,16 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             }
         }
         // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
+        // v1.85: SQL/JSON desugars present under their public names.
+        Expr::Func { name, .. } if name.starts_with("__sqljson_") => (
+            match name.as_str() {
+                "__sqljson_value" => "json_value",
+                "__sqljson_query" => "json_query",
+                _ => "json_exists",
+            }
+            .to_string(),
+            2,
+        ),
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
@@ -1198,6 +1208,16 @@ pub(crate) fn expr_type(
             resolve_func_type_name(eng, snap, own, session, &fdef.ret_type)
         }
         Expr::Func { name, args } => {
+            // v1.85: SQL/JSON DEFAULT restrictions are analysis-time
+            // in PG — enforce them here too so they fire even when
+            // the query returns zero rows (see eval_func).
+            if name == "__sqljson_value" || name == "__sqljson_query" {
+                for slot in [4usize, 6usize] {
+                    if let Some(e) = args.get(slot) {
+                        check_sqljson_default(eng, e)?;
+                    }
+                }
+            }
             func_result_type(name, args, eng, snap, own, session, schemas, outer, ctes)
         }
         Expr::Extract { .. } => Ok(ColType::Numeric(None)),

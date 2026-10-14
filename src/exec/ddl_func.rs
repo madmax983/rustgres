@@ -202,6 +202,8 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Json => Value::text("x"),
         // v1.83: a valid canonical jsonb dummy.
         ColType::Jsonb => Value::jsonb("{}"),
+        // v1.85: the root path is the honest jsonpath dummy.
+        ColType::Jsonpath => Value::jsonpath("$"),
         ColType::SingleChar => Value::SingleChar(b'x'),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(1),

@@ -164,6 +164,8 @@ fn type_tag(v: &Value) -> u8 {
         Value::Tid(_, _) => 19,
         // v1.83: jsonb (append-only).
         Value::Jsonb(_) => 20,
+        // v1.85: jsonpath (append-only).
+        Value::Jsonpath(_) => 21,
     }
 }
 

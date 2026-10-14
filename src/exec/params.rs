@@ -913,6 +913,14 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::jsonb(jsonb_canonical(s)?))
         }
+        // v1.85: jsonpath parameters validate + normalize like the
+        // cast path.
+        ColType::Jsonpath => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            let p = super::jsonpath::parse_jsonpath(s)?;
+            Ok(Value::jsonpath(super::jsonpath::render_jsonpath(&p)))
+        }
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -1159,6 +1167,7 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         // v1.83: a jsonb parameter substitutes as its canonical text;
         // downstream coercion re-canonicalizes for a jsonb target.
         Some(Value::Jsonb(s)) => Literal::Text(s.clone()),
+        Some(Value::Jsonpath(s)) => Literal::Text(s.clone()), // v1.85
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
@@ -1390,6 +1399,7 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Json => Value::text(""),
         // v1.83: the empty jsonb dummy.
         ColType::Jsonb => Value::jsonb("null"),
+        ColType::Jsonpath => Value::jsonpath("$"), // v1.85
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
         ColType::Array(_) => Value::text("{}"),

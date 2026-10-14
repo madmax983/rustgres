@@ -785,6 +785,8 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
             .iter()
             .map(|s| s.to_string())
             .collect()),
+        // v1.85: jsonb_path_query's single column is named after it.
+        "jsonb_path_query" | "jsonb_path_query_tz" => Ok(vec![name.to_string()]),
         // v1.84: json/jsonb expansion SRFs.
         "json_each" | "json_each_text" | "jsonb_each" | "jsonb_each_text" => {
             Ok(vec!["key".to_string(), "value".to_string()])
@@ -831,6 +833,8 @@ pub(crate) fn table_function_col_types(
     match name {
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
+        // v1.85: jsonb_path_query returns jsonb rows.
+        "jsonb_path_query" | "jsonb_path_query_tz" => Ok(vec![ColType::Jsonb]),
         // v1.84: json/jsonb expansion SRFs.
         "json_each"
         | "json_each_text"
@@ -921,6 +925,15 @@ pub(crate) fn eval_function_item(
     col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    // v1.85: named arguments in FROM-clause function items resolve
+    // like everywhere else.
+    let resolved_args;
+    let args: &[Expr] = if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        resolved_args = resolve_named_args(q.eng, name, args)?;
+        &resolved_args
+    } else {
+        args
+    };
     let mut arg_vals = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);

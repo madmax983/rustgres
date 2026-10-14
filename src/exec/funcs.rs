@@ -1311,8 +1311,49 @@ pub(crate) fn builtin_param_names(name: &str) -> Option<&'static [&'static str]>
     Some(match name {
         // `parse_ident(qualname text, strict boolean DEFAULT true)`.
         "parse_ident" => &["qualname", "strict"],
+        // v1.84: `jsonb_set_lax(target, path, new_value,
+        // create_missing, null_value_treatment)` (pg_proc proargnames).
+        "jsonb_set_lax" => &[
+            "target",
+            "path",
+            "new_value",
+            "create_missing",
+            "null_value_treatment",
+        ],
+        // v1.85: `jsonb_path_*(target, path, vars, silent)`
+        // (pg_proc proargnames; the _tz variants share the shape).
+        "jsonb_path_query"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first"
+        | "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_tz"
+        | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => &["target", "path", "vars", "silent"],
         _ => return None,
     })
+}
+
+/// v1.85: default argument expressions for builtins whose trailing
+/// parameters carry PG defaults (used by named-argument resolution).
+pub(crate) fn builtin_arg_default(name: &str, param: &str) -> Option<Expr> {
+    use crate::sql::Literal;
+    match (name, param) {
+        ("parse_ident", "strict") => Some(Expr::Literal(Literal::Bool(true))),
+        (_, "vars") if name.starts_with("jsonb_path_") => {
+            Some(Expr::Literal(Literal::Text("{}".into())))
+        }
+        (_, "silent") if name.starts_with("jsonb_path_") => {
+            Some(Expr::Literal(Literal::Bool(false)))
+        }
+        ("jsonb_set_lax", "create_missing") => Some(Expr::Literal(Literal::Bool(true))),
+        ("jsonb_set_lax", "null_value_treatment") => {
+            Some(Expr::Literal(Literal::Text("use_json_null".into())))
+        }
+        _ => None,
+    }
 }
 
 /// v0.95: resolve `name => expr` named arguments to positional order
@@ -1390,28 +1431,203 @@ pub(crate) fn resolve_named_args(
             }
         }
     }
-    // Every parameter must be supplied, except `parse_ident.strict`,
-    // which defaults to true (PG19).
+    // Every parameter must be supplied unless it has a registered
+    // default (`parse_ident.strict`, the jsonb_path_* `vars`/`silent`,
+    // jsonb_set_lax's trailing pair — PG19 pg_proc defaults).
     for (i, slot) in out.iter().enumerate() {
-        if slot.is_none() {
-            let is_strict_default = name == "parse_ident" && params[i].as_deref() == Some("strict");
-            if !is_strict_default {
-                return Err(exec_err(
-                    "42883",
-                    format!("function {}() does not exist", name),
-                ));
-            }
+        if slot.is_none() && builtin_arg_default(name, params[i].as_deref().unwrap_or("")).is_none()
+        {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
         }
     }
     let mut result = Vec::with_capacity(n);
-    for slot in out {
+    for (i, slot) in out.into_iter().enumerate() {
         match slot {
             Some(e) => result.push(e.clone()),
-            // `parse_ident.strict` default.
-            None => result.push(Expr::Literal(crate::sql::Literal::Bool(true))),
+            None => result.push(
+                builtin_arg_default(name, params[i].as_deref().unwrap_or(""))
+                    .expect("default existence checked above"),
+            ),
         }
     }
     Ok(result)
+}
+
+/// v1.85: resolve `name => expr` arguments to positional order when
+/// a call site evaluates arguments itself (the SRF paths bypass
+/// eval_func's resolution). Returns a Cow so the common no-named-arg
+/// case costs nothing.
+pub(crate) fn resolve_named_args_if_any<'a>(
+    eng: &Engine,
+    name: &str,
+    args: &'a [Expr],
+) -> Result<std::borrow::Cow<'a, [Expr]>, ExecError> {
+    if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        Ok(std::borrow::Cow::Owned(resolve_named_args(
+            eng, name, args,
+        )?))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(args))
+    }
+}
+
+/// v1.85: PG's analysis-time restrictions on SQL/JSON behavior
+/// DEFAULT expressions (see the __sqljson_* call site in eval_func).
+pub(crate) fn check_sqljson_default(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+    fn walk(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+        match e {
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::Agg { .. }
+            | Expr::WithinGroup { .. }
+            | Expr::Window { .. }
+            | Expr::InSub { .. }
+            | Expr::Exists { .. } => Err(exec_err(
+                "42601",
+                "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+            )),
+            Expr::Func { name, args } => {
+                if is_srf(eng, name) {
+                    return Err(exec_err(
+                        "42601",
+                        "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+                    ));
+                }
+                for a in args {
+                    walk(eng, a)?;
+                }
+                Ok(())
+            }
+            Expr::Arith { left, right, .. }
+            | Expr::Concat(left, right)
+            | Expr::Cmp { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right)
+            | Expr::IsDistinctFrom { left, right, .. } => {
+                walk(eng, left)?;
+                walk(eng, right)
+            }
+            Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => walk(eng, expr),
+            Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+                walk(eng, x)
+            }
+            Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+                for x in elems {
+                    walk(eng, x)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                if let Some(o) = operand {
+                    walk(eng, o)?;
+                }
+                for (a, b) in whens {
+                    walk(eng, a)?;
+                    walk(eng, b)?;
+                }
+                if let Some(x) = else_ {
+                    walk(eng, x)?;
+                }
+                Ok(())
+            }
+            Expr::JsonOp { left, right, .. } => {
+                walk(eng, left)?;
+                walk(eng, right)
+            }
+            Expr::NamedArg { expr, .. } => walk(eng, expr),
+            Expr::FieldAccess { expr, .. } => walk(eng, expr),
+            Expr::Column { .. } | Expr::ResolvedCol { .. } => Err(exec_err(
+                "42601",
+                "DEFAULT expression must not contain column references",
+            )),
+            _ => Ok(()),
+        }
+    }
+    walk(eng, e)?;
+    let mut cols = Vec::new();
+    crate::sql::collect_col_refs(e, &mut cols);
+    if !cols.is_empty() {
+        return Err(exec_err(
+            "42601",
+            "DEFAULT expression must not contain column references",
+        ));
+    }
+    Ok(())
+}
+
+/// v1.85: statement-level SQL/JSON DEFAULT analysis: find every
+/// __sqljson_* call in an expression tree (through the wrappers a
+/// target list realistically carries) and validate its DEFAULT
+/// slots. Runs once per SELECT in dispatch, so the PG analysis-time
+/// errors fire even for zero-row results.
+pub(crate) fn analyze_sqljson_defaults(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+    match e {
+        Expr::Func { name, args } => {
+            if name == "__sqljson_value" || name == "__sqljson_query" {
+                for slot in [4usize, 6usize] {
+                    if let Some(d) = args.get(slot) {
+                        check_sqljson_default(eng, d)?;
+                    }
+                }
+            }
+            for a in args {
+                analyze_sqljson_defaults(eng, a)?;
+            }
+            Ok(())
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            analyze_sqljson_defaults(eng, expr)
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::IsDistinctFrom { left, right, .. } => {
+            analyze_sqljson_defaults(eng, left)?;
+            analyze_sqljson_defaults(eng, right)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+            analyze_sqljson_defaults(eng, x)
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                analyze_sqljson_defaults(eng, x)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                analyze_sqljson_defaults(eng, o)?;
+            }
+            for (a, b) in whens {
+                analyze_sqljson_defaults(eng, a)?;
+                analyze_sqljson_defaults(eng, b)?;
+            }
+            if let Some(x) = else_ {
+                analyze_sqljson_defaults(eng, x)?;
+            }
+            Ok(())
+        }
+        Expr::JsonOp { left, right, .. } => {
+            analyze_sqljson_defaults(eng, left)?;
+            analyze_sqljson_defaults(eng, right)
+        }
+        Expr::NamedArg { expr, .. } => analyze_sqljson_defaults(eng, expr),
+        Expr::FieldAccess { expr, .. } => analyze_sqljson_defaults(eng, expr),
+        _ => Ok(()),
+    }
 }
 
 /// v1.37: `node` is the call-site `Expr::Func` node's address, keying
@@ -1448,6 +1664,19 @@ pub(crate) fn eval_func(
         }
         let v = eval_expr(q, scopes, &args[0])?;
         return Ok(Value::text(v.type_name()));
+    }
+    // v1.85: SQL/JSON DEFAULT expressions are restricted by PG at
+    // analysis time (transformJsonFuncExpr): no subqueries,
+    // aggregates, window functions, or set-returning functions
+    // ("can only specify a constant, non-aggregate function, or
+    // operator expression for DEFAULT"), and no column references
+    // ("DEFAULT expression must not contain column references").
+    if name == "__sqljson_value" || name == "__sqljson_query" {
+        for slot in [4usize, 6usize] {
+            if let Some(e) = args.get(slot) {
+                check_sqljson_default(q.eng, e)?;
+            }
+        }
     }
     // v0.80: `GROUPING(...)` is only meaningful at group level (handled
     // by `eval_grouped`). Reaching scalar evaluation means it sits in a
@@ -1771,6 +2000,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Bit => (-1, 4),        // varbit: -1/'i'
         ColType::Json => (-1, 4),       // json: -1/'i'
         ColType::Jsonb => (-1, 4),      // jsonb: -1/'i' (v1.83)
+        ColType::Jsonpath => (-1, 4),   // jsonpath: -1/'i' (v1.85)
         ColType::Array(_) => (-1, 4),   // array types: 'i'
         ColType::Date => (4, 4),        // date: 4/'i'
         ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
@@ -2109,6 +2339,21 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "regexp_split_to_array" => (2..=3).contains(&n),
         // v0.95: `parse_ident(qualname text, strict boolean DEFAULT true)`.
         "parse_ident" => (1..=2).contains(&n),
+        // v1.85: jsonb_path_*(target, path [, vars [, silent]]).
+        "jsonb_path_query"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first"
+        | "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_tz"
+        | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => (2..=4).contains(&n),
+        // v1.85: SQL/JSON desugar internals (fixed shapes).
+        "__sqljson_value" => n == 8,
+        "__sqljson_query" => n == 9,
+        "__sqljson_exists" => n == 4,
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
         "regexp_split_to_table" => (2..=3).contains(&n),
@@ -2510,6 +2755,15 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path"
         | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
         | "jsonb_delete" | "jsonb_delete_path" => eval_json_func(name, vals),
+        // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
+        "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_query_array"
+        | "jsonb_path_query_first" | "jsonb_path_exists_tz" | "jsonb_path_match_tz"
+        | "jsonb_path_query_array_tz" | "jsonb_path_query_first_tz" => {
+            eval_jsonpath_scalar(name, vals)
+        }
+        "__sqljson_value" | "__sqljson_query" | "__sqljson_exists" => {
+            eval_sqljson_func(name, vals)
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -4086,6 +4340,14 @@ pub(crate) fn eval_table_function(
     check_builtin_arity(name, vals)?;
     // v1.84: json/jsonb expansion SRFs share their core with the
     // target-list SRF path; Record rows flatten to cells.
+    // v1.85: jsonb_path_query as a FROM-clause table function.
+    if name == "jsonb_path_query" || name == "jsonb_path_query_tz" {
+        let rows = jsonpath_query_rows(name, vals)?
+            .into_iter()
+            .map(|v| vec![v])
+            .collect();
+        return Ok((vec![name.to_string()], rows));
+    }
     if is_json_expansion_srf(name) {
         let (names, values) = eval_json_srf_core(name, &vals[0])?;
         let rows = values
@@ -4271,6 +4533,9 @@ pub(crate) fn is_builtin_srf(name: &str) -> bool {
             | "jsonb_populate_recordset"
             | "json_to_recordset"
             | "jsonb_to_recordset"
+            // v1.85: the jsonpath row source.
+            | "jsonb_path_query"
+            | "jsonb_path_query_tz"
     )
 }
 
@@ -4338,6 +4603,8 @@ pub(crate) fn eval_srf_vals(
         | "jsonb_populate_recordset"
         | "json_to_recordset"
         | "jsonb_to_recordset" => eval_json_recordset_srf(q, name, vals, arg_exprs),
+        // v1.85: jsonb_path_query in target-list position.
+        "jsonb_path_query" | "jsonb_path_query_tz" => jsonpath_query_rows(name, vals),
         _ => Err(exec_err(
             "42883",
             format!("function {name} is not a set-returning function"),
@@ -9337,6 +9604,13 @@ pub(crate) fn func_result_type(
         | "jsonb_delete" | "jsonb_delete_path" => Ok(ColType::Jsonb),
         "json_extract_path_text" | "jsonb_extract_path_text" => Ok(ColType::Text),
         "jsonb_populate_record_valid" => Ok(ColType::Bool),
+        // v1.85: jsonpath family + SQL/JSON desugar result types.
+        "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" | "__sqljson_exists" => Ok(ColType::Bool),
+        "jsonb_path_query_array" | "jsonb_path_query_first" | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz" | "__sqljson_query" => Ok(ColType::Jsonb),
+        "jsonb_path_query" | "jsonb_path_query_tz" => Ok(ColType::Jsonb),
+        "__sqljson_value" => Ok(ColType::Text),
         // v0.91: hidden quantified-array-comparison desugar; boolean.
         "__any_all_array" => Ok(ColType::Bool),
         "random" => Ok(ColType::Float),
@@ -9641,6 +9915,7 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Numeric(_) => Cow::Borrowed("numeric"),
         Value::Text(_) => Cow::Borrowed("text"),
         Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
+        Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
         Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
         Value::SingleChar(_) => Cow::Borrowed("\"char\""), // v0.36
         Value::Bool(_) => Cow::Borrowed("boolean"),
