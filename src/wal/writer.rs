@@ -27,7 +27,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v0.98: version 17 adds the sequence CACHE size to sequence
 /// images. v16 checkpoints are refused; remove the data directory
 /// to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 17;
+pub(crate) const CHKPT_VERSION: u32 = 18;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -69,9 +69,9 @@ pub(crate) const CHKPT_VERSION: u32 = 17;
 /// lost partitioning). `RGSWAL20` logs are still READ (the field decodes
 /// as absent); opening one replays it and immediately checkpoints, so the
 /// live generation is always current-format before anything is appended.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL21";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL22";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 21;
+pub(crate) const WAL_VERSION: u32 = 22;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -696,6 +696,15 @@ impl Wal {
                     img.u8(if d.not_null { 1 } else { 0 });
                     img.str(&crate::sql::encode_domain_checks(&d.checks));
                     img.str(&crate::sql::encode_domain_default(&d.default));
+                }
+                None => img.u8(0),
+            }
+            // v1.88 (RGSCHK18): range definition.
+            match &st.range {
+                Some((e, multi)) => {
+                    img.u8(1);
+                    img.u8(e.code());
+                    img.u8(*multi as u8);
                 }
                 None => img.u8(0),
             }
@@ -1334,12 +1343,21 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         } else {
             None
         };
+        // v1.88 (RGSCHK18): range definition.
+        let range = if d.u8().map_err(|e| bad(&e))? != 0 {
+            let code = d.u8().map_err(|e| bad(&e))?;
+            let multi = d.u8().map_err(|e| bad(&e))? != 0;
+            crate::storage::RangeElem::from_code(code).map(|e| (e, multi))
+        } else {
+            None
+        };
         eng.db.types.insert(
             name,
             crate::storage::ShellType {
                 like_base,
                 composite,
                 domain,
+                range,
             },
         );
     }

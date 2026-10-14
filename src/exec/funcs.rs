@@ -1706,6 +1706,20 @@ pub(crate) fn eval_func(
             Err(PgInputFailure::Hard(e)) => Err(e),
         };
     }
+    // v1.88: constructors of user-defined range types
+    // (CREATE TYPE ... AS RANGE) resolve through the type catalog.
+    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        let tname = Some(name.to_string());
+        return if multi {
+            super::ranges::multirange_constructor(elem, tname, &vals)
+        } else {
+            super::ranges::range_constructor(elem, tname, &vals)
+        };
+    }
     // v1.85: SQL/JSON DEFAULT expressions are restricted by PG at
     // analysis time (transformJsonFuncExpr): no subqueries,
     // aggregates, window functions, or set-returning functions
@@ -2055,6 +2069,15 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Xid => (4, 4),         // xid: 4/'i'
         ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
         ColType::Tid => (6, 2),         // tid: 6/'s'
+        // v1.88: ranges are varlena; int/num/date align 'i',
+        // ts/tstz/int8 align 'd' (pg_type.dat).
+        ColType::Range(e) | ColType::Multirange(e) => match e {
+            crate::storage::RangeElem::Ts
+            | crate::storage::RangeElem::Tstz
+            | crate::storage::RangeElem::Int8
+            | crate::storage::RangeElem::Float8 => (-1, 8),
+            _ => (-1, 4),
+        },
         // Pseudo/composite types never persist in table columns; map
         // them to varlena so the layout code stays total.
         ColType::Record | ColType::Composite => (-1, 8), // record: -1/'d'
@@ -2627,6 +2650,12 @@ pub(crate) fn parse_ident_parts(qualname: &str, strict: bool) -> Result<Vec<Stri
 }
 
 pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // v1.88: range / multirange constructors and functions dispatch
+    // before the generic machinery (lower/upper are also text
+    // functions; the rangeish-operand check inside decides).
+    if let Some(r) = super::ranges::try_eval_range_func(name, vals) {
+        return r;
+    }
     check_builtin_arity(name, vals)?;
     // v0.16: `substr` is a true alias of `substring` (same semantics).
     let name = if name == "substr" { "substring" } else { name };
@@ -10003,6 +10032,46 @@ pub(crate) fn func_result_type(
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
     let arg0 = || expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0]);
+    // v1.88: range constructors and bound functions (static types).
+    if let Some(e) = super::ranges::builtin_range_elem(name) {
+        return Ok(ColType::Range(e));
+    }
+    if let Some(e) = super::ranges::builtin_multirange_elem(name) {
+        return Ok(ColType::Multirange(e));
+    }
+    if !args.is_empty() {
+        match name {
+            "lower" | "upper" => {
+                if let Ok(t) = arg0() {
+                    match t {
+                        ColType::Range(e) | ColType::Multirange(e) => {
+                            return Ok(super::ranges::elem_coltype(e));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => {
+                if let Ok(ColType::Range(_)) | Ok(ColType::Multirange(_)) = arg0() {
+                    return Ok(ColType::Bool);
+                }
+            }
+            "range_merge" => {
+                if let Ok(t @ (ColType::Range(_) | ColType::Multirange(_))) = arg0() {
+                    return Ok(match t {
+                        ColType::Multirange(e) => ColType::Range(e),
+                        _ => t,
+                    });
+                }
+            }
+            "range_union" | "range_intersect" | "range_minus" => {
+                if let Ok(t @ ColType::Range(_)) = arg0() {
+                    return Ok(t);
+                }
+            }
+            _ => {}
+        }
+    }
     // v0.33: bytea-returning string functions dispatch on input type.
     let bytea_if_arg0_bytea = || match arg0() {
         Ok(ColType::Bytea) => Ok(ColType::Bytea),
@@ -10271,6 +10340,15 @@ pub(crate) fn func_result_type(
         // v0.86: user-defined functions resolve their declared return
         // type here (Describe runs before eval_func).
         _ => {
+            // v1.88: user-defined range type constructors type as
+            // their range / multirange type.
+            if let Some((elem, multi)) = eng.db.types.get(name).and_then(|st| st.range) {
+                return Ok(if multi {
+                    ColType::Multirange(elem)
+                } else {
+                    ColType::Range(elem)
+                });
+            }
             // v0.87: resolve overload by arity for type inference.
             if let Some(fdef) = eng
                 .db
@@ -10351,6 +10429,14 @@ pub(crate) fn compare_values(
             (Ok(va), Ok(vb)) => jsonb_cmp(&va, &vb),
             _ => x.cmp(y),
         },
+        // v1.88: range / multirange ordering for ORDER BY / DISTINCT
+        // (PG range_cmp / multirange_cmp).
+        (Value::Range(x), Value::Range(y)) if x.elem == y.elem => {
+            crate::exec::ranges::range_cmp(x, y)
+        }
+        (Value::Multirange(x), Value::Multirange(y)) if x.elem == y.elem => {
+            crate::exec::ranges::multirange_cmp(x, y)
+        }
         // v0.35: bpchar ordering ignores trailing spaces (like
         // cmp_ordering above).
         (Value::BpChar(x), Value::BpChar(y)) => {
@@ -10499,6 +10585,17 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Text(_) => Cow::Borrowed("text"),
         Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
         Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
+        // v1.88: range type names for operator error messages.
+        Value::Range(r) => Cow::Owned(
+            r.name
+                .clone()
+                .unwrap_or_else(|| r.elem.range_name().unwrap_or("range").to_string()),
+        ),
+        Value::Multirange(m) => Cow::Owned(
+            m.name
+                .clone()
+                .unwrap_or_else(|| m.elem.multirange_name().unwrap_or("multirange").to_string()),
+        ),
         Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
         Value::SingleChar(_) => Cow::Borrowed("\"char\""), // v0.36
         Value::Bool(_) => Cow::Borrowed("boolean"),

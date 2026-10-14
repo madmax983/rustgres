@@ -123,6 +123,7 @@ pub(crate) enum Token {
     PipePipe,   // v0.7: `||` concat
     Pipe,       // v0.25: `|` bitwise OR
     Amp,        // v0.25: `&` bitwise AND
+    AmpAmp,     // v1.88: `&&` overlap operator (PG19 gram.y Op)
     Hash,       // v0.25: `#` bitwise XOR
     /// v1.82: JSON operators (PG19 scan.l `right_arrow`, gram.y `Op`):
     /// `->`, `->>`, `#>`, `#>>`. Lexed longest-match-first, like PG.
@@ -435,9 +436,15 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         // v0.25: `&` bitwise AND, `#` bitwise XOR, `~` bitwise NOT.
+        // v1.88: `&&` (overlap) lexes as one token, like PG.
         if c == '&' {
-            toks.push(Token::Amp);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '&' {
+                toks.push(Token::AmpAmp);
+                i += 2;
+            } else {
+                toks.push(Token::Amp);
+                i += 1;
+            }
             continue;
         }
         // v1.82: `#>` / `#>>` lex as single tokens (PG19 gram.y `Op`);
@@ -1105,6 +1112,11 @@ pub enum AggFunc {
     JsonbAgg,
     JsonObjectAgg,
     JsonbObjectAgg,
+    // v1.88: range aggregates (rangetypes.c): range_agg(anyrange) ->
+    // anymultirange (also the multirange-input form), and
+    // range_intersect_agg(anyrange) -> anyrange.
+    RangeAgg,
+    RangeIntersectAgg,
 }
 
 impl AggFunc {
@@ -1126,6 +1138,8 @@ impl AggFunc {
             AggFunc::JsonbAgg => "jsonb_agg",
             AggFunc::JsonObjectAgg => "json_object_agg",
             AggFunc::JsonbObjectAgg => "jsonb_object_agg",
+            AggFunc::RangeAgg => "range_agg",
+            AggFunc::RangeIntersectAgg => "range_intersect_agg",
         }
     }
 }
@@ -1248,6 +1262,11 @@ pub enum JsonOp {
     PathExists,
     /// v1.85: `@@`: jsonb @@ jsonpath — path predicate matches (bool).
     PathMatch,
+    /// v1.88: `&&`: range/multirange overlap (bool). Shares the JsonOp
+    /// expression node because it sits at the same gram.y Op precedence
+    /// and has the same binary shape; evaluation dispatches on the
+    /// operand values (ranges here, jsonb for the ops above).
+    Overlaps,
 }
 
 impl JsonOp {
@@ -1264,6 +1283,7 @@ impl JsonOp {
             JsonOp::ExistsAll => "?&",
             JsonOp::PathExists => "@?",
             JsonOp::PathMatch => "@@",
+            JsonOp::Overlaps => "&&",
         }
     }
 
@@ -1284,6 +1304,7 @@ impl JsonOp {
                 | JsonOp::ExistsAll
                 | JsonOp::PathExists
                 | JsonOp::PathMatch
+                | JsonOp::Overlaps
         )
     }
 
@@ -1304,6 +1325,7 @@ impl JsonOp {
             JsonOp::ExistsAll => "existsall",
             JsonOp::PathExists => "pathexists",
             JsonOp::PathMatch => "pathmatch",
+            JsonOp::Overlaps => "overlaps",
         }
     }
 
@@ -1320,6 +1342,7 @@ impl JsonOp {
             "existsall" => Some(JsonOp::ExistsAll),
             "pathexists" => Some(JsonOp::PathExists),
             "pathmatch" => Some(JsonOp::PathMatch),
+            "overlaps" => Some(JsonOp::Overlaps),
             _ => None,
         }
     }
@@ -4907,6 +4930,10 @@ pub enum Stmt {
         /// definition: `(field_name, ColType, composite_type_name)`.
         /// None for the shell and LIKE forms.
         composite: Option<Vec<(String, ColType, Option<String>)>>,
+        /// v1.88: `CREATE TYPE name AS RANGE (subtype = T, ...)`:
+        /// `(subtype, subtype_named, multirange_type_name)`. None for
+        /// the other forms.
+        range: Option<(ColType, Option<String>, Option<String>)>,
     },
     DropType {
         names: Vec<String>,
@@ -5862,6 +5889,7 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::PipePipe => "||".to_string(),
             Token::Pipe => "|".to_string(),
             Token::Amp => "&".to_string(),
+            Token::AmpAmp => "&&".to_string(),
             Token::Hash => "#".to_string(),
             Token::Tilde => "~".to_string(),
             Token::TildeStar => "~*".to_string(),

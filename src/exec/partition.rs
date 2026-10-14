@@ -1890,6 +1890,18 @@ pub(crate) fn create_table_from_def(
             let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
             match st {
                 Some(st) if st.composite.is_some() => {}
+                // v1.88: a user-defined range type column stores as the
+                // range/multirange ColType; the type name stays in
+                // composite_types (like composites) so casts and
+                // typeof can find it.
+                Some(st) if st.range.is_some() => {
+                    let (elem, multi) = st.range.expect("range branch has a def");
+                    like_def.columns[i].1 = if multi {
+                        ColType::Multirange(elem)
+                    } else {
+                        ColType::Range(elem)
+                    };
+                }
                 Some(st) if st.domain.is_some() => {
                     let dom = st.domain.clone().expect("domain branch has a def");
                     like_def.columns[i].1 = dom.base.clone();

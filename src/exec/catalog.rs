@@ -1765,6 +1765,10 @@ pub(crate) enum FnKeyVal {
     Jsonb(String),
     // v1.85: jsonpath cache keys (rendered text).
     Jsonpath(String),
+    // v1.88: range / multirange cache keys (canonical text; distinct
+    // variants so a range never aliases a multirange or text key).
+    Range(String),
+    Multirange(String),
     BpChar(String),
     SingleChar(u8),
     Bool(bool),
@@ -1821,6 +1825,8 @@ pub(crate) fn fn_key_val(v: &Value) -> FnKeyVal {
         Value::Text(s) => FnKeyVal::Text(s.to_string()),
         Value::Jsonb(s) => FnKeyVal::Jsonb(s.to_string()), // v1.83
         Value::Jsonpath(s) => FnKeyVal::Jsonpath(s.to_string()), // v1.85
+        Value::Range(r) => FnKeyVal::Range(super::ranges::range_to_text(r)), // v1.88
+        Value::Multirange(m) => FnKeyVal::Multirange(super::ranges::multirange_to_text(m)),
         Value::BpChar(s) => FnKeyVal::BpChar(s.to_string()),
         Value::SingleChar(c) => FnKeyVal::SingleChar(*c),
         Value::Bool(b) => FnKeyVal::Bool(*b),

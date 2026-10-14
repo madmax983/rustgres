@@ -1339,6 +1339,42 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     if v == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.88: cast to a user-defined range / multirange type
+    // (CREATE TYPE ... AS RANGE registration in the type catalog).
+    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+        let tname = Some(name.to_string());
+        return match (multi, v) {
+            (false, Value::Text(t)) | (false, Value::BpChar(t)) => {
+                super::ranges::parse_range(elem, tname, t).map(Value::range)
+            }
+            (true, Value::Text(t)) | (true, Value::BpChar(t)) => {
+                super::ranges::parse_multirange(elem, tname, t).map(Value::multirange)
+            }
+            (false, Value::Range(r)) if r.elem == elem => {
+                let mut r = (**r).clone();
+                r.name = tname;
+                Ok(Value::range(r))
+            }
+            (true, Value::Range(r)) if r.elem == elem => {
+                let mut m = super::ranges::multi_from_range((**r).clone());
+                m.name = tname;
+                Ok(Value::multirange(m))
+            }
+            (true, Value::Multirange(m)) if m.elem == elem => {
+                let mut m = (**m).clone();
+                m.name = tname;
+                Ok(Value::multirange(m))
+            }
+            _ => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    v.type_name().to_lowercase(),
+                    name
+                ),
+            )),
+        };
+    }
     // v1.38: user-defined binary casts take precedence over the
     // composite path (a LIKE-defined target is not a composite).
     if let Some(casted) = apply_binary_cast(q, v, name)? {
@@ -1429,6 +1465,41 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.88: cast to a range type (PG range_in on text; a range of
+        // the same elem passes through; anything else is 42804).
+        ColType::Range(elem) => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::ranges::parse_range(elem, None, t).map(Value::range)
+            }
+            Value::Range(r) if r.elem == elem => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    other.type_name().to_lowercase(),
+                    super::ranges::range_type_name(elem, &None)
+                ),
+            )),
+        },
+        // v1.88: cast to a multirange type (PG multirange_in on text;
+        // a single range wraps; same-elem multirange passes through).
+        ColType::Multirange(elem) => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::ranges::parse_multirange(elem, None, t).map(Value::multirange)
+            }
+            Value::Range(r) if r.elem == elem => Ok(Value::multirange(
+                super::ranges::multi_from_range((**r).clone()),
+            )),
+            Value::Multirange(m) if m.elem == elem => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    other.type_name().to_lowercase(),
+                    super::ranges::multirange_type_name(elem, &None)
+                ),
+            )),
+        },
         // v1.85: cast to jsonpath validates + normalizes through the
         // jsonpath parser (PG's jsonpathin), error 22P02.
         ColType::Jsonpath => match v {

@@ -49,9 +49,9 @@ pub(crate) use crate::sql::{
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
-    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, Numeric,
-    NumericSpecial, OperDef, Row, RowVersion, Sequence, ShellType, Snapshot, Table, TableStats,
-    Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
+    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, MultiVal, Numeric,
+    NumericSpecial, OperDef, RangeElem, RangeVal, Row, RowVersion, Sequence, ShellType, Snapshot,
+    Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
@@ -91,6 +91,7 @@ mod partition;
 mod pg_input;
 mod privilege;
 mod project;
+pub(crate) mod ranges;
 mod reorder;
 mod roles;
 mod seq;
@@ -236,6 +237,9 @@ mod v177_nested_sje_tests;
 #[cfg(test)]
 #[path = "test_mods/v179_sje_star_tests.rs"]
 mod v179_sje_star_tests;
+#[cfg(test)]
+#[path = "test_mods/v188_range_tests.rs"]
+mod v188_range_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

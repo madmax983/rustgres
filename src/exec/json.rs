@@ -546,6 +546,11 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
     if left == &Value::Null || right == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.88: range / multirange operands take the @> / <@ / && family
+    // (and element containment) before any jsonb interpretation.
+    if super::ranges::is_rangeish(left) || super::ranges::is_rangeish(right) {
+        return super::ranges::eval_range_op(op, left, right);
+    }
     if let Value::Jsonb(s) = left {
         return eval_jsonb_op(op, s, right);
     }
@@ -603,7 +608,8 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
         | JsonOp::ContainedBy
         | JsonOp::Exists
         | JsonOp::ExistsAny
-        | JsonOp::ExistsAll => {
+        | JsonOp::ExistsAll
+        | JsonOp::Overlaps => {
             return Err(exec_err(
                 "42883",
                 format!(
@@ -1311,6 +1317,14 @@ fn eval_jsonb_op(op: JsonOp, doc_text: &str, right: &Value) -> Result<Value, Exe
                 }
             }
         }
+        // v1.88: && is ranges-only; jsonb has no overlap operator.
+        JsonOp::Overlaps => Err(exec_err(
+            "42883",
+            format!(
+                "operator does not exist: jsonb && {}",
+                value_type_name(right)
+            ),
+        )),
         // v1.85: @? / @@ — the jsonpath predicate operators. The
         // right operand is a jsonpath value or jsonpath text; a
         // malformed literal raises the jsonpath input error (22P02).

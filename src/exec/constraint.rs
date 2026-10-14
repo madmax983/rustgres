@@ -242,6 +242,21 @@ pub(crate) fn coerce_assign_composite(
 ) -> Result<Value, ExecError> {
     match (v, comp) {
         (Value::Record(rec), Some(tname)) => coerce_record_to_composite(eng, &rec, tname),
+        // v1.88: stamp the user range type's name onto values stored
+        // in a column of that type (so pg_typeof / output naming
+        // matches PG).
+        (Value::Range(mut r), Some(tname)) => {
+            if eng.db.types.get(tname).and_then(|st| st.range) == Some((r.elem, false)) {
+                r.name = Some(tname.to_string());
+            }
+            Ok(Value::Range(r))
+        }
+        (Value::Multirange(mut m), Some(tname)) => {
+            if eng.db.types.get(tname).and_then(|st| st.range) == Some((m.elem, true)) {
+                m.name = Some(tname.to_string());
+            }
+            Ok(Value::Multirange(m))
+        }
         (v, _) => Ok(v),
     }
 }

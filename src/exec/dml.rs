@@ -2056,6 +2056,16 @@ pub(crate) fn exec_insert(
                         }
                     }
                 }
+                // v1.88: stamp user range type names (INSERT...SELECT
+                // path; the VALUES path stamps via
+                // coerce_assign_composite).
+                let mut values = values;
+                for ci in 0..values.len() {
+                    if let Some(tname) = meta.composite_types.get(ci).and_then(|o| o.as_deref()) {
+                        let v = std::mem::replace(&mut values[ci], Value::Null);
+                        values[ci] = coerce_assign_composite(eng, v, Some(tname))?;
+                    }
+                }
                 check_row_constraints(
                     eng,
                     ctx.snap,

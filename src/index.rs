@@ -170,6 +170,9 @@ fn type_tag(v: &Value) -> u8 {
         Value::Time(_) => 22,
         Value::TimeTz(_, _) => 23,
         Value::Interval(_) => 24,
+        // v1.88: ranges (append-only).
+        Value::Range(_) => 25,
+        Value::Multirange(_) => 26,
     }
 }
 

@@ -4035,8 +4035,39 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         }
         _ => {}
     }
+    // v1.88: unknown-literal coercion for ranges — a text operand
+    // against a range/multirange parses as that type (PG resolves the
+    // unknown literal to the peer type).
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), Value::Range(r)) => {
+            let parsed = crate::exec::ranges::parse_range(r.elem, r.name.clone(), t)?;
+            return cmp_ordering(&Value::range(parsed), b, op);
+        }
+        (Value::Range(r), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::ranges::parse_range(r.elem, r.name.clone(), t)?;
+            return cmp_ordering(a, &Value::range(parsed), op);
+        }
+        (Value::Text(t) | Value::BpChar(t), Value::Multirange(m)) => {
+            let parsed = crate::exec::ranges::parse_multirange(m.elem, m.name.clone(), t)?;
+            return cmp_ordering(&Value::multirange(parsed), b, op);
+        }
+        (Value::Multirange(m), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::ranges::parse_multirange(m.elem, m.name.clone(), t)?;
+            return cmp_ordering(a, &Value::multirange(parsed), op);
+        }
+        _ => {}
+    }
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // v1.88: range / multirange comparisons (PG range_cmp /
+        // multirange_cmp; range vs multirange of the same elem compare
+        // by wrapping the range — PG forbids mixing range types).
+        (Value::Range(x), Value::Range(y)) if x.elem == y.elem => {
+            Ok(Some(crate::exec::ranges::range_cmp(x, y)))
+        }
+        (Value::Multirange(x), Value::Multirange(y)) if x.elem == y.elem => {
+            Ok(Some(crate::exec::ranges::multirange_cmp(x, y)))
+        }
         (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
             Ok(Some(match (exact_as_i64(x), exact_as_i64(y)) {
                 (Some(a), Some(b)) => a.cmp(&b),

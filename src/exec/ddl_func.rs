@@ -204,6 +204,13 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Jsonb => Value::jsonb("{}"),
         // v1.85: the root path is the honest jsonpath dummy.
         ColType::Jsonpath => Value::jsonpath("$"),
+        // v1.88: empty range / multirange dummies.
+        ColType::Range(e) => Value::range(super::ranges::empty_range(*e, None)),
+        ColType::Multirange(e) => Value::multirange(crate::storage::MultiVal {
+            elem: *e,
+            name: None,
+            ranges: Vec::new(),
+        }),
         ColType::SingleChar => Value::SingleChar(b'x'),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(1),

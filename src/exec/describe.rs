@@ -1089,6 +1089,15 @@ pub(crate) fn expr_type(
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
             match eng.db.types.get(name) {
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
+                // v1.88: casts to user-defined range types.
+                Some(st) if st.range.is_some() => {
+                    let (elem, multi) = st.range.expect("range branch");
+                    Ok(if multi {
+                        ColType::Multirange(elem)
+                    } else {
+                        ColType::Range(elem)
+                    })
+                }
                 Some(st) => match st.domain.as_ref() {
                     Some(dom) => Ok(dom.base.clone()),
                     // v1.38: LIKE types carry their base's physical
@@ -1643,6 +1652,25 @@ pub(crate) fn combine_arith_types(
             let is_int_kind =
                 |t: &ColType| matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt);
             match (&x, &y) {
+                // v1.88: range/multirange `+` (union), `*`
+                // (intersection), `-` (difference). Any multirange
+                // operand makes a multirange result; range - range and
+                // range * range stay ranges.
+                (ColType::Range(e), ColType::Range(_))
+                | (ColType::Range(e), ColType::Multirange(_))
+                | (ColType::Multirange(e), ColType::Range(_))
+                    if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
+                {
+                    match (&x, &y) {
+                        (ColType::Range(_), ColType::Range(_)) => Ok(ColType::Range(*e)),
+                        _ => Ok(ColType::Multirange(*e)),
+                    }
+                }
+                (ColType::Multirange(e), ColType::Multirange(_))
+                    if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
+                {
+                    Ok(ColType::Multirange(*e))
+                }
                 (ColType::Date, y) if is_int_kind(y) => match op {
                     ArithOp::Add | ArithOp::Sub => Ok(ColType::Date),
                     _ => Err(op_err(&x, &y)),
@@ -1894,6 +1922,31 @@ pub(crate) fn agg_result_type(
         // v1.84: JSON aggregates return json/jsonb (pg_proc).
         AggFunc::JsonAgg | AggFunc::JsonObjectAgg => Ok(ColType::Json),
         AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => Ok(ColType::Jsonb),
+        // v1.88: range aggregates — range_agg(anyrange) -> the
+        // multirange; range_intersect_agg mirrors its input kind.
+        AggFunc::RangeAgg => {
+            let a = arg.expect("range_agg always takes an argument");
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
+                ColType::Range(e) | ColType::Multirange(e) => Ok(ColType::Multirange(e)),
+                t => Err(exec_err(
+                    "42883",
+                    format!("function range_agg({}) does not exist", t.sql_name()),
+                )),
+            }
+        }
+        AggFunc::RangeIntersectAgg => {
+            let a = arg.expect("range_intersect_agg always takes an argument");
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
+                t @ (ColType::Range(_) | ColType::Multirange(_)) => Ok(t),
+                t => Err(exec_err(
+                    "42883",
+                    format!(
+                        "function range_intersect_agg({}) does not exist",
+                        t.sql_name()
+                    ),
+                )),
+            }
+        }
     }
 }
 

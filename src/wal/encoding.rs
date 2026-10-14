@@ -595,6 +595,18 @@ impl Enc {
                 self.u8(31);
                 return;
             }
+            // v1.88: range / multirange; tags append after v1.86's,
+            // then the RangeElem code.
+            ColType::Range(e) => {
+                self.u8(32);
+                self.u8(e.code());
+                return;
+            }
+            ColType::Multirange(e) => {
+                self.u8(33);
+                self.u8(e.code());
+                return;
+            }
             // v1.17: xid; tag appends after v0.81's.
             ColType::Xid => {
                 self.u8(24);
@@ -768,6 +780,22 @@ impl Enc {
                 self.i32(iv.months);
                 self.i32(iv.days);
                 self.i64(iv.micros);
+            }
+            // v1.88: range values (tag 26) — elem code, user type name
+            // (empty = builtin), then the canonical text; the decoder
+            // re-parses it (canonical text always parses).
+            Value::Range(r) => {
+                self.u8(26);
+                self.u8(r.elem.code());
+                self.str(r.name.as_deref().unwrap_or(""));
+                self.str(&crate::exec::ranges::range_to_text(r));
+            }
+            // v1.88: multirange values (tag 27), same layout.
+            Value::Multirange(m) => {
+                self.u8(27);
+                self.u8(m.elem.code());
+                self.str(m.name.as_deref().unwrap_or(""));
+                self.str(&crate::exec::ranges::multirange_to_text(m));
             }
         }
     }
@@ -1114,6 +1142,7 @@ impl Enc {
                 like_base,
                 composite,
                 domain,
+                range,
                 xmin,
             } => {
                 self.u8(22);
@@ -1169,6 +1198,15 @@ impl Enc {
                     None => self.u8(0),
                 }
                 self.u64(*xmin);
+                // v1.88 (RGSWAL22): trailing range definition.
+                match range {
+                    Some((code, multi)) => {
+                        self.u8(1);
+                        self.u8(*code);
+                        self.u8(*multi as u8);
+                    }
+                    None => self.u8(0),
+                }
             }
             WalRecord::DropType { name, xmax } => {
                 self.u8(23);
@@ -1635,6 +1673,19 @@ impl<'a> Dec<'a> {
             29 => Ok(ColType::Time),
             30 => Ok(ColType::TimeTz),
             31 => Ok(ColType::Interval),
+            // v1.88: range / multirange, then the RangeElem code.
+            32 => {
+                let c = self.u8()?;
+                crate::storage::RangeElem::from_code(c)
+                    .map(ColType::Range)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))
+            }
+            33 => {
+                let c = self.u8()?;
+                crate::storage::RangeElem::from_code(c)
+                    .map(ColType::Multirange)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))
+            }
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -1730,6 +1781,29 @@ impl<'a> Dec<'a> {
                 days: self.i32()?,
                 micros: self.i64()?,
             })),
+            // v1.88: range / multirange (tags 26/27; mirrors encoder).
+            26 => {
+                let c = self.u8()?;
+                let elem = crate::storage::RangeElem::from_code(c)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))?;
+                let name = self.str()?;
+                let name = if name.is_empty() { None } else { Some(name) };
+                let text = self.str()?;
+                let r = crate::exec::ranges::parse_range(elem, name, &text)
+                    .map_err(|e| self.err(&format!("bad range in WAL: {}", e.message)))?;
+                Ok(Value::Range(Box::new(r)))
+            }
+            27 => {
+                let c = self.u8()?;
+                let elem = crate::storage::RangeElem::from_code(c)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))?;
+                let name = self.str()?;
+                let name = if name.is_empty() { None } else { Some(name) };
+                let text = self.str()?;
+                let m = crate::exec::ranges::parse_multirange(elem, name, &text)
+                    .map_err(|e| self.err(&format!("bad multirange in WAL: {}", e.message)))?;
+                Ok(Value::Multirange(Box::new(m)))
+            }
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -2259,11 +2333,18 @@ impl<'a> Dec<'a> {
                     None
                 };
                 let xmin = self.u64()?;
+                // v1.88 (RGSWAL22): trailing range definition.
+                let range = if self.wal_version >= 22 && self.u8()? != 0 {
+                    Some((self.u8()?, self.u8()? != 0))
+                } else {
+                    None
+                };
                 Ok(WalRecord::CreateType {
                     name,
                     like_base,
                     composite,
                     domain,
+                    range,
                     xmin,
                 })
             }

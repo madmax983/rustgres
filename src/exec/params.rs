@@ -941,6 +941,17 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
             let p = super::jsonpath::parse_jsonpath(s)?;
             Ok(Value::jsonpath(super::jsonpath::render_jsonpath(&p)))
         }
+        // v1.88: range / multirange parameters parse like the cast path.
+        ColType::Range(elem) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::ranges::parse_range(*elem, None, s).map(Value::range)
+        }
+        ColType::Multirange(elem) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::ranges::parse_multirange(*elem, None, s).map(Value::multirange)
+        }
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -1188,6 +1199,10 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         // downstream coercion re-canonicalizes for a jsonb target.
         Some(Value::Jsonb(s)) => Literal::Text(s.clone()),
         Some(Value::Jsonpath(s)) => Literal::Text(s.clone()), // v1.85
+        // v1.88: range parameters substitute as their canonical text;
+        // downstream coercion re-parses for a range target.
+        Some(Value::Range(r)) => Literal::Text(super::ranges::range_to_text(r).into()),
+        Some(Value::Multirange(m)) => Literal::Text(super::ranges::multirange_to_text(m).into()),
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
@@ -1435,6 +1450,13 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         // v1.83: the empty jsonb dummy.
         ColType::Jsonb => Value::jsonb("null"),
         ColType::Jsonpath => Value::jsonpath("$"), // v1.85
+        // v1.88: the empty range / empty multirange dummies.
+        ColType::Range(e) => Value::range(super::ranges::empty_range(*e, None)),
+        ColType::Multirange(e) => Value::multirange(crate::storage::MultiVal {
+            elem: *e,
+            name: None,
+            ranges: Vec::new(),
+        }),
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
         ColType::Array(_) => Value::text("{}"),

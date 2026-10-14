@@ -357,6 +357,9 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         // window machinery does not carry (StringAgg precedent).
         AggFunc::JsonAgg | AggFunc::JsonbAgg => n == 1,
         AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => false,
+        // v1.88: PG19 allows range_agg / range_intersect_agg as window
+        // aggregates.
+        AggFunc::RangeAgg | AggFunc::RangeIntersectAgg => n == 1,
     }
 }
 
@@ -1759,6 +1762,74 @@ pub(crate) fn eval_window_agg(
             "0A000",
             "json_object_agg is not supported as a window function",
         )),
+        // v1.88: windowed range aggregates share the grouped logic.
+        AggFunc::RangeAgg => {
+            let mut ranges: Vec<RangeVal> = Vec::new();
+            let mut elem_name: Option<(RangeElem, Option<String>)> = None;
+            for v in vals {
+                match v {
+                    Value::Range(r) => {
+                        elem_name = Some((r.elem, r.name.clone()));
+                        ranges.push((**r).clone());
+                    }
+                    Value::Multirange(m) => {
+                        elem_name = Some((m.elem, m.name.clone()));
+                        ranges.extend(m.ranges.iter().cloned());
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                }
+            }
+            let (elem, mname) = elem_name.unwrap_or((RangeElem::Int4, None));
+            Ok(Value::multirange(super::ranges::normalize_multi(
+                elem, mname, ranges,
+            )))
+        }
+        AggFunc::RangeIntersectAgg => {
+            let mut acc: Option<MultiVal> = None;
+            let mut single = true;
+            for v in vals {
+                let m = match v {
+                    Value::Range(r) => super::ranges::multi_from_range((**r).clone()),
+                    Value::Multirange(m) => {
+                        single = false;
+                        (**m).clone()
+                    }
+                    Value::Null => continue,
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_intersect_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                };
+                acc = Some(match acc {
+                    None => m,
+                    Some(a) => super::ranges::multi_intersect(&a, &m),
+                });
+            }
+            match acc {
+                None => Ok(Value::Null),
+                Some(acc) if single && acc.ranges.len() == 1 => {
+                    Ok(Value::range(acc.ranges[0].clone()))
+                }
+                Some(acc) if single && acc.ranges.is_empty() => Ok(Value::range(
+                    super::ranges::empty_range(acc.elem, acc.name.clone()),
+                )),
+                Some(acc) => Ok(Value::multirange(acc)),
+            }
+        }
     }
 }
 

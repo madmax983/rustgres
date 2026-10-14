@@ -388,9 +388,11 @@ pub(crate) fn value_coltype(v: &Value) -> ColType {
         Value::Float(_) => ColType::Float,
         Value::Numeric(_) => ColType::Numeric(None),
         Value::Text(_) => ColType::Text,
-        Value::Jsonb(_) => ColType::Jsonb,           // v1.83
-        Value::Jsonpath(_) => ColType::Jsonpath,     // v1.85
-        Value::BpChar(_) => ColType::Char(None),     // v0.35
+        Value::Jsonb(_) => ColType::Jsonb,         // v1.83
+        Value::Jsonpath(_) => ColType::Jsonpath,   // v1.85
+        Value::Range(r) => ColType::Range(r.elem), // v1.88
+        Value::Multirange(m) => ColType::Multirange(m.elem), // v1.88
+        Value::BpChar(_) => ColType::Char(None),   // v0.35
         Value::SingleChar(_) => ColType::SingleChar, // v0.36
         Value::Bool(_) => ColType::Bool,
         Value::Date(_) => ColType::Date,

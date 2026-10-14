@@ -784,6 +784,20 @@ impl Parser {
             "jsonb" => Ok(ColType::Jsonb),
             // v1.85: PG's `jsonpath` type (pg_type.dat, oid 4072).
             "jsonpath" => Ok(ColType::Jsonpath),
+            // v1.88: PG's builtin range types (pg_type.dat).
+            "int4range" => Ok(ColType::Range(crate::storage::RangeElem::Int4)),
+            "int8range" => Ok(ColType::Range(crate::storage::RangeElem::Int8)),
+            "numrange" => Ok(ColType::Range(crate::storage::RangeElem::Num)),
+            "daterange" => Ok(ColType::Range(crate::storage::RangeElem::Date)),
+            "tsrange" => Ok(ColType::Range(crate::storage::RangeElem::Ts)),
+            "tstzrange" => Ok(ColType::Range(crate::storage::RangeElem::Tstz)),
+            // v1.88: PG's builtin multirange types (pg_type.dat).
+            "int4multirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Int4)),
+            "int8multirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Int8)),
+            "nummultirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Num)),
+            "datemultirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Date)),
+            "tsmultirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Ts)),
+            "tstzmultirange" => Ok(ColType::Multirange(crate::storage::RangeElem::Tstz)),
             "real" | "float4" => Ok(ColType::Float4),
             "float8" => Ok(ColType::Float),
             // v0.1-v0.6 spelled the float8 column type "float"/"double".
@@ -1009,6 +1023,18 @@ impl Parser {
                 | "regclass"
                 | "pg_lsn" // v0.64
                 | "xid" // v1.17
+                | "int4range" // v1.88
+                | "int8range"
+                | "numrange"
+                | "daterange"
+                | "tsrange"
+                | "tstzrange"
+                | "int4multirange"
+                | "int8multirange"
+                | "nummultirange"
+                | "datemultirange"
+                | "tsmultirange"
+                | "tstzmultirange"
         )
     }
 
@@ -2285,6 +2311,99 @@ impl Parser {
         // composite type. The fields are parsed like table columns
         // (type names may themselves be composites).
         if self.eat_keyword("as") {
+            // v1.88: `CREATE TYPE name AS RANGE (subtype = T, ...)`.
+            if matches!(self.peek(), Token::Ident(s) if s == "range") {
+                self.next(); // 'range'
+                self.expect(Token::LParen, "'('")?;
+                let mut subtype: Option<(ColType, Option<String>)> = None;
+                let mut multi_name: Option<String> = None;
+                loop {
+                    if *self.peek() == Token::RParen {
+                        self.next();
+                        break;
+                    }
+                    let key = self.expect_ident()?;
+                    self.expect(Token::Eq, "'='")?;
+                    if key == "subtype" {
+                        subtype = Some(self.parse_type_name()?);
+                    } else if key == "multirange_type_name" {
+                        multi_name = Some(self.expect_ident()?);
+                    } else {
+                        // canonical / subtype_diff / collation / etc.:
+                        // skip the value token(s) up to ',' or ')'.
+                        match self.next() {
+                            tok if tok == Token::RParen => {
+                                return Ok(Stmt::CreateType {
+                                    name,
+                                    like_base: None,
+                                    composite: None,
+                                    range: Some((
+                                        subtype.clone().map(|(t, _)| t).unwrap_or(ColType::Text),
+                                        subtype.clone().and_then(|(_, n)| n),
+                                        multi_name,
+                                    )),
+                                });
+                            }
+                            Token::EOF => {
+                                return Err(err(
+                                    "syntax error: unterminated CREATE TYPE".to_string()
+                                ));
+                            }
+                            _ => {
+                                // A qualified name (a.b) or typmod (n):
+                                // consume trailing Dot/Ident/LParen groups.
+                                loop {
+                                    match self.peek() {
+                                        Token::Dot => {
+                                            self.next();
+                                            let _ = self.expect_ident()?;
+                                        }
+                                        Token::LParen => {
+                                            let mut depth = 0;
+                                            loop {
+                                                match self.next() {
+                                                    Token::LParen => depth += 1,
+                                                    Token::RParen => {
+                                                        depth -= 1;
+                                                        if depth == 0 {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Token::EOF => {
+                                                        return Err(err(
+                                                            "syntax error: unterminated CREATE TYPE"
+                                                                .to_string(),
+                                                        ));
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+                let (sty, sname) = subtype.unwrap_or((ColType::Text, None));
+                return Ok(Stmt::CreateType {
+                    name,
+                    like_base: None,
+                    composite: None,
+                    range: Some((sty, sname, multi_name)),
+                });
+            }
             self.expect(Token::LParen, "'('")?;
             let mut fields = Vec::new();
             loop {
@@ -2310,6 +2429,7 @@ impl Parser {
                 name,
                 like_base: None,
                 composite: Some(fields),
+                range: None,
             });
         }
         let like_base = if *self.peek() == Token::LParen {
@@ -2341,6 +2461,7 @@ impl Parser {
             name,
             like_base,
             composite: None,
+            range: None,
         })
     }
 
@@ -4848,6 +4969,7 @@ impl Parser {
                 Token::ArrowText => Some(JsonOp::ArrowText),
                 Token::HashArrow => Some(JsonOp::HashArrow),
                 Token::HashArrowText => Some(JsonOp::HashArrowText),
+                Token::AmpAmp => Some(JsonOp::Overlaps),
                 Token::AtGt => Some(JsonOp::Contains),
                 Token::AtQuestion => Some(JsonOp::PathExists),
                 Token::AtAt => Some(JsonOp::PathMatch),
@@ -5735,6 +5857,8 @@ impl Parser {
             "jsonb_agg" => Some(AggFunc::JsonbAgg),
             "json_object_agg" => Some(AggFunc::JsonObjectAgg),
             "jsonb_object_agg" => Some(AggFunc::JsonbObjectAgg),
+            "range_agg" => Some(AggFunc::RangeAgg),
+            "range_intersect_agg" => Some(AggFunc::RangeIntersectAgg),
             _ => None,
         };
         if let Some(func) = agg {

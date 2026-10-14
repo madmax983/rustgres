@@ -3868,6 +3868,8 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Json => "json".into(),
         ColType::Jsonb => "jsonb".into(),
         ColType::Jsonpath => "jsonpath".into(),
+        // v1.88: range / multirange type names.
+        ColType::Range(_) | ColType::Multirange(_) => ct.sql_name(),
         ColType::Array(e) => format!("{}[]", coltype_typ_string(&elem_coltype(e))),
         ColType::Composite | ColType::Record => "record".into(),
     }

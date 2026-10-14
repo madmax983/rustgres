@@ -204,6 +204,32 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
         // v0.79: arrays group by element type, dims and element keys
         // (PG's hash_array mixes the same inputs). NULL elements hash
         // distinctly from the string "NULL", like every other type.
+        // v1.88: ranges group by (elem, name, bounds) via value keys.
+        Value::Range(r) => {
+            out.push(26);
+            out.push(r.elem.code());
+            out.extend_from_slice(r.name.as_deref().unwrap_or("").as_bytes());
+            out.push(r.empty as u8);
+            out.push(r.lo_inc as u8);
+            out.push(r.hi_inc as u8);
+            match &r.lo {
+                Some(v) => value_key(v, out),
+                None => out.push(0),
+            }
+            match &r.hi {
+                Some(v) => value_key(v, out),
+                None => out.push(0),
+            }
+        }
+        Value::Multirange(m) => {
+            out.push(27);
+            out.push(m.elem.code());
+            out.extend_from_slice(m.name.as_deref().unwrap_or("").as_bytes());
+            out.extend_from_slice(&(m.ranges.len() as u64).to_be_bytes());
+            for r in &m.ranges {
+                value_key(&Value::Range(Box::new(r.clone())), out);
+            }
+        }
         Value::Array(a) => {
             out.push(17);
             out.push(a.elem as u8);
@@ -2984,6 +3010,101 @@ pub(crate) fn eval_agg_func(
             }
             out.push('}');
             Ok(Value::text(out))
+        }
+        // v1.88: range_agg — the union of all input ranges as a
+        // multirange. vals holds only non-NULL inputs (the collector
+        // filters them, matching PG's strict transition); zero rows
+        // yield the empty multirange of the statically-known elem
+        // (PG's agginitval '{}'), falling back to int4 when the type
+        // cannot be determined.
+        AggFunc::RangeAgg => {
+            let mut ranges: Vec<RangeVal> = Vec::new();
+            let mut elem_name: Option<(RangeElem, Option<String>)> = None;
+            for v in &vals {
+                match v {
+                    Value::Range(r) => {
+                        elem_name = Some((r.elem, r.name.clone()));
+                        ranges.push((**r).clone());
+                    }
+                    Value::Multirange(m) => {
+                        elem_name = Some((m.elem, m.name.clone()));
+                        ranges.extend(m.ranges.iter().cloned());
+                    }
+                    Value::Text(t) | Value::BpChar(t) => {
+                        // Unknown literal against a statically range
+                        // column cannot reach here (bind coerces), but
+                        // a bare range_agg('[1,2)') parses as int4.
+                        let r = super::ranges::parse_range(RangeElem::Int4, None, t)?;
+                        elem_name = Some((RangeElem::Int4, None));
+                        ranges.push(r);
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                }
+            }
+            let (elem, mname) = elem_name.unwrap_or((RangeElem::Int4, None));
+            Ok(Value::multirange(super::ranges::normalize_multi(
+                elem, mname, ranges,
+            )))
+        }
+        // v1.88: range_intersect_agg — the intersection of all input
+        // ranges (or of all ranges in all input multiranges). Zero
+        // rows yield NULL (PG has no initcond for it).
+        AggFunc::RangeIntersectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut acc: Option<MultiVal> = None;
+            let mut single = true;
+            for v in &vals {
+                let m = match v {
+                    Value::Range(r) => super::ranges::multi_from_range((**r).clone()),
+                    Value::Multirange(m) => {
+                        single = false;
+                        (**m).clone()
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_intersect_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                };
+                acc = Some(match acc {
+                    None => m,
+                    Some(a) => super::ranges::multi_intersect(&a, &m),
+                });
+            }
+            let acc = acc.unwrap();
+            if single {
+                // anyrange form: the result is a range (empty when the
+                // intersection is empty).
+                if acc.ranges.is_empty() {
+                    // The elem survives in acc even with no ranges.
+                    Ok(Value::range(super::ranges::empty_range(
+                        acc.elem,
+                        acc.name.clone(),
+                    )))
+                } else if acc.ranges.len() == 1 {
+                    Ok(Value::range(acc.ranges[0].clone()))
+                } else {
+                    // Disjoint intersection pieces cannot arise from
+                    // intersecting single ranges.
+                    Ok(Value::multirange(acc))
+                }
+            } else {
+                Ok(Value::multirange(acc))
+            }
         }
         AggFunc::JsonbObjectAgg => {
             if vals.is_empty() {

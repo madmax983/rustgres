@@ -194,6 +194,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             like_base,
             composite,
             domain,
+            range,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
@@ -221,6 +222,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     like_base: like_base.clone(),
                     composite: composite.clone(),
                     domain,
+                    // v1.88: range definition (elem code + multi flag).
+                    range: range.and_then(|(c, m)| {
+                        crate::storage::RangeElem::from_code(c).map(|e| (e, m))
+                    }),
                 },
             );
         }
@@ -1517,6 +1522,8 @@ pub fn records_for_commit(
                             not_null: d.not_null,
                             default: crate::sql::encode_domain_default(&d.default),
                         }),
+                        // v1.88: range definition.
+                        range: st.range.map(|(e, m)| (e.code(), m)),
                         xmin: own,
                     });
                 }

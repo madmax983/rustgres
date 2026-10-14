@@ -592,6 +592,11 @@ pub(crate) fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, Exe
     if a == &Value::Null || b == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.88: range / multirange `+` (union), `*` (intersection),
+    // `-` (difference).
+    if let Some(r) = super::ranges::eval_range_arith(op, a, b) {
+        return r;
+    }
     // v0.21: text-vs-numeric coercion (unknown-literal resolution)
     // before anything else, so '1.5' + 1 works like Postgres.
     let coerced = coerce_text_numeric(a, b)?;

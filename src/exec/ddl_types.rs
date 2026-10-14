@@ -54,6 +54,7 @@ pub(crate) fn exec_create_type(
                 like_base: None,
                 composite: Some(fields.to_vec()),
                 domain: None,
+                range: None,
             },
         );
         ctx.writes.push(WriteOp::CreateType {
@@ -79,6 +80,7 @@ pub(crate) fn exec_create_type(
                     like_base: None,
                     composite: None,
                     domain: None,
+                    range: None,
                 },
             );
         }
@@ -108,6 +110,7 @@ pub(crate) fn exec_create_type(
                     like_base: Some(base.to_string()),
                     composite: None,
                     domain: None,
+                    range: None,
                 },
             );
         }
@@ -115,6 +118,97 @@ pub(crate) fn exec_create_type(
     ctx.writes.push(WriteOp::CreateType {
         name: name.to_string(),
         prev,
+    });
+    Ok(ExecResult::Command {
+        tag: "CREATE TYPE".to_string(),
+    })
+}
+
+/// v1.88: PG's multirange companion name for a range type
+/// (GetMultirangeTypeName): a trailing "range" is replaced by
+/// "multirange"; otherwise "multirange" is appended.
+pub(crate) fn multirange_name_for(range_name: &str) -> String {
+    match range_name.strip_suffix("range") {
+        Some(stem) => format!("{stem}multirange"),
+        None => format!("{range_name}multirange"),
+    }
+}
+
+/// v1.88: `CREATE TYPE name AS RANGE (subtype = T, ...)`. Registers the
+/// range type and its multirange companion in the type catalog
+/// (ShellType.range). The subtype must resolve to a RangeElem family —
+/// directly, or through a domain over one; composite/array/varbit
+/// subtypes are 0A000 (documented hold-back).
+pub(crate) fn exec_create_range_type(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    subty: ColType,
+    sub_named: Option<&str>,
+    multi_name: Option<&str>,
+) -> Result<ExecResult, ExecError> {
+    if eng.db.types.contains_key(name) {
+        return Err(exec_err(
+            "42710",
+            format!("type \"{}\" already exists", name),
+        ));
+    }
+    // Resolve the subtype to a range elem.
+    let mut elem = RangeElem::of_coltype(&subty);
+    if elem.is_none() {
+        if let Some(sn) = sub_named {
+            if let Some(st) = eng.db.types.get(sn) {
+                if let Some(dom) = &st.domain {
+                    elem = RangeElem::of_coltype(&dom.base);
+                }
+            }
+        }
+    }
+    let elem = match elem {
+        Some(e) => e,
+        None => {
+            return Err(exec_err(
+                "0A000",
+                "range types over this subtype are not supported".to_string(),
+            ));
+        }
+    };
+    let mname = multi_name
+        .map(str::to_string)
+        .unwrap_or_else(|| multirange_name_for(name));
+    if eng.db.types.contains_key(&mname) {
+        return Err(exec_err(
+            "42710",
+            format!("type \"{}\" already exists", mname),
+        ));
+    }
+    let prev = eng.db.types.get(name).cloned();
+    eng.db.types.insert(
+        name.to_string(),
+        ShellType {
+            like_base: None,
+            composite: None,
+            domain: None,
+            range: Some((elem, false)),
+        },
+    );
+    ctx.writes.push(WriteOp::CreateType {
+        name: name.to_string(),
+        prev,
+    });
+    let prev_m = eng.db.types.get(&mname).cloned();
+    eng.db.types.insert(
+        mname.clone(),
+        ShellType {
+            like_base: None,
+            composite: None,
+            domain: None,
+            range: Some((elem, true)),
+        },
+    );
+    ctx.writes.push(WriteOp::CreateType {
+        name: mname,
+        prev: prev_m,
     });
     Ok(ExecResult::Command {
         tag: "CREATE TYPE".to_string(),
@@ -137,10 +231,39 @@ pub(crate) fn exec_drop_type(
                 format!("type \"{}\" does not exist", name),
             ));
         }
+        // v1.88: dropping a range type also drops its multirange
+        // companion (PG dependency semantics).
+        let is_range = matches!(
+            prev,
+            Some(ShellType {
+                range: Some((_, false)),
+                ..
+            })
+        );
         ctx.writes.push(WriteOp::DropType {
             name: name.clone(),
             prev,
         });
+        if is_range {
+            let mname = multirange_name_for(name);
+            if let Some(prev_m) = eng.db.types.remove(&mname) {
+                if matches!(
+                    prev_m,
+                    ShellType {
+                        range: Some((_, true)),
+                        ..
+                    }
+                ) {
+                    ctx.writes.push(WriteOp::DropType {
+                        name: mname,
+                        prev: Some(prev_m),
+                    });
+                } else {
+                    // Not our companion after all; restore it.
+                    eng.db.types.insert(mname, prev_m);
+                }
+            }
+        }
     }
     Ok(ExecResult::Command {
         tag: "DROP TYPE".to_string(),
@@ -416,6 +539,7 @@ pub(crate) fn exec_create_domain(
         ShellType {
             like_base: None,
             composite: None,
+            range: None,
             domain: Some(crate::storage::DomainDef {
                 base: base_ty,
                 base_named: resolved_named,
@@ -584,6 +708,7 @@ pub(crate) fn exec_alter_domain(
             like_base: old.like_base,
             composite: old.composite,
             domain: Some(dom),
+            range: old.range,
         },
     );
     // Transactional: undo restores `prev`; the WAL encoder reads the
