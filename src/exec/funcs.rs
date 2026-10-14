@@ -1926,6 +1926,57 @@ pub(crate) fn eval_func(
         for v in raw_vals {
             vals.push(normalize_func_arg(name, v));
         }
+        // v1.89: JSON_VALUE needs the catalog for its RETURNING
+        // conversion (domain checks, typmod assignment semantics).
+        if name == "__sqljson_value" {
+            return super::json::eval_sqljson_value_q(q, &vals);
+        }
+        // v1.89: json_build_object / jsonb_build_object keys whose
+        // static type is json/jsonb/array/composite are 22023 in PG
+        // (json.c add_json key_scalar) — json values ride as plain
+        // text at the value level, so the check inspects the arg
+        // expressions' cast targets.
+        if name == "json_build_object" || name == "jsonb_build_object" {
+            for a in args.iter().step_by(2) {
+                let mut e = a;
+                while let Expr::NamedArg { expr, .. } = e {
+                    e = expr;
+                }
+                let bad = match e {
+                    Expr::Cast { to, .. } => matches!(
+                        to,
+                        crate::storage::ColType::Json
+                            | crate::storage::ColType::Jsonb
+                            | crate::storage::ColType::Array(_)
+                            | crate::storage::ColType::Composite
+                            | crate::storage::ColType::Record
+                    ),
+                    Expr::CastNamed { name: n, .. } => match q.eng.db.types.get(n.as_str()) {
+                        // A composite type name, or a domain over a
+                        // composite / json / array base. A domain over
+                        // a scalar base is a legal key.
+                        Some(st) => match &st.domain {
+                            None => true,
+                            Some(d) => matches!(
+                                d.base,
+                                crate::storage::ColType::Composite
+                                    | crate::storage::ColType::Json
+                                    | crate::storage::ColType::Jsonb
+                                    | crate::storage::ColType::Array(_)
+                            ),
+                        },
+                        None => false,
+                    },
+                    _ => false,
+                };
+                if bad {
+                    return Err(exec_err(
+                        "22023",
+                        "key value must be scalar, not array, composite, or json",
+                    ));
+                }
+            }
+        }
         return eval_func_vals(name, &vals);
     }
 }
@@ -3080,7 +3131,7 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
                         None => Ok(Value::Null),
                         Some(n) => {
                             if as_text {
-                                match json_scalar_text(&doc, n) {
+                                match json_scalar_text(&doc, n)? {
                                     Some(s) => Ok(Value::text(s)),
                                     None => Ok(Value::Null),
                                 }
@@ -3667,8 +3718,9 @@ pub(crate) fn populate_fields(
 }
 
 /// Convert one JSON value into a typed field value (PG's
-/// populate_record_field recursion).
-fn populate_typed(
+/// populate_record_field recursion). v1.89: pub(crate) — JSON_TABLE
+/// column conversion is the same coercion (jsonfuncs.c shares it).
+pub(crate) fn populate_typed(
     q: &mut Q,
     f: &PopField,
     base: Option<&Value>,
@@ -4856,15 +4908,15 @@ fn json_srf_rows(
                     .iter()
                     .map(|e| {
                         if as_text {
-                            match json_scalar_text(doc, e) {
-                                Some(s) => Value::text(s),
-                                None => Value::Null,
+                            match json_scalar_text(doc, e)? {
+                                Some(s) => Ok(Value::text(s)),
+                                None => Ok(Value::Null),
                             }
                         } else {
-                            Value::text(node_text(doc, e))
+                            Ok(Value::text(node_text(doc, e)))
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<Value>, ExecError>>()?;
                 Ok((json_srf_col_names(name), rows))
             }
             JsonKind::Object(_) => Err(exec_err("22023", "cannot extract elements from an object")),
@@ -4877,19 +4929,19 @@ fn json_srf_rows(
                     .iter()
                     .map(|(k, val)| {
                         let vv = if as_text {
-                            match json_scalar_text(doc, val) {
+                            match json_scalar_text(doc, val)? {
                                 Some(s) => Value::text(s),
                                 None => Value::Null,
                             }
                         } else {
                             Value::text(node_text(doc, val))
                         };
-                        Value::Record(vec![
+                        Ok(Value::Record(vec![
                             ("key".to_string(), Value::text(k.clone())),
                             ("value".to_string(), vv),
-                        ])
+                        ]))
                     })
-                    .collect();
+                    .collect::<Result<Vec<Value>, ExecError>>()?;
                 Ok((vec!["key".to_string(), "value".to_string()], rows))
             }
             _ => Err(exec_err(

@@ -1690,6 +1690,103 @@ pub enum SelectItem {
     },
 }
 
+/// v1.89: one SQL/JSON behavior clause (`<behavior> ON EMPTY|ON ERROR`)
+/// in a JSON_TABLE column or at JSON_TABLE level. The kind encoding
+/// matches the __sqljson_* desugar in exec/json.rs (0 ERROR, 1 NULL,
+/// 2 DEFAULT expr, 3 EMPTY, 4 EMPTY ARRAY, 5 EMPTY OBJECT, 6 TRUE,
+/// 7 FALSE) plus 8 UNKNOWN (JSON_TABLE / JSON_EXISTS only in PG19).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JtBehavior {
+    pub kind: i64,
+    pub expr: Expr,
+}
+
+/// v1.89: a parsed `JSON_TABLE(...)` COLUMNS tree plus the table-level
+/// ON ERROR behavior (PG19 gram.y JsonTable). Column and nested-path
+/// names share one namespace with the root path name (kept in
+/// `FromItem::Function` args as the path string; the optional root
+/// path name is `path_name`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonTableSpec {
+    pub path_name: Option<String>,
+    pub columns: Vec<JtColumn>,
+    /// Table-level ON ERROR: kinds 0 (ERROR), 3 (EMPTY), 4 (EMPTY
+    /// ARRAY), 5 (EMPTY OBJECT) only; applies to the root path
+    /// evaluation alone (PG does not propagate it to columns).
+    pub on_error: JtBehavior,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum JtColumn {
+    /// `name FOR ORDINALITY` — 1-based position within the owning
+    /// path's sequence; at most one per COLUMNS list (parser-enforced
+    /// per PG's "only one FOR ORDINALITY column is allowed").
+    Ordinality { name: String },
+    /// `name type [FORMAT JSON] [PATH '...'] [wrapper] [quotes]
+    /// [behavior ON EMPTY] [behavior ON ERROR]`. An omitted PATH is
+    /// the implicit `$."<name>"` (PG19).
+    Regular {
+        name: String,
+        ty: ColType,
+        /// Written type name when `ty` is a named (composite/domain/
+        /// user-range) type.
+        named: Option<String>,
+        /// Typmod for bit(n)/varbit(n) columns (ColType::Bit carries
+        /// no typmod, so the length rides here).
+        bit_len: Option<i32>,
+        format_json: bool,
+        path: String,
+        /// 0 = WITHOUT (default), 1 = WITH UNCONDITIONAL,
+        /// 2 = WITH CONDITIONAL.
+        wrapper: i64,
+        /// None = unspecified, Some(true) = KEEP QUOTES,
+        /// Some(false) = OMIT QUOTES.
+        quotes: Option<bool>,
+        on_empty: JtBehavior,
+        on_error: JtBehavior,
+    },
+    /// `name type EXISTS [PATH '...'] [behavior ON ERROR]` — the
+    /// jsonpath EXISTS result converted from boolean to the column
+    /// type (PG19 JsonExpr coercion rules).
+    Exists {
+        name: String,
+        ty: ColType,
+        named: Option<String>,
+        bit_len: Option<i32>,
+        path: String,
+        on_error: JtBehavior,
+    },
+    /// `NESTED PATH '...' [AS name] COLUMNS (...)`.
+    Nested {
+        path: String,
+        path_name: Option<String>,
+        columns: Vec<JtColumn>,
+    },
+}
+
+impl JsonTableSpec {
+    /// The leaf (output) columns in PG output order: within each
+    /// COLUMNS list, all plain columns (in written order) come before
+    /// the nested subtrees' leaves (in written order), recursively.
+    /// PG19 transforms a JsonTable node's columns exactly this way
+    /// (the "parent columns appear before NESTED ones" regress case).
+    pub fn flat_columns<'a>(&'a self, out: &mut Vec<&'a JtColumn>) {
+        fn walk<'a>(cols: &'a [JtColumn], out: &mut Vec<&'a JtColumn>) {
+            for c in cols {
+                if !matches!(c, JtColumn::Nested { .. }) {
+                    out.push(c);
+                }
+            }
+            for c in cols {
+                if let JtColumn::Nested { columns, .. } = c {
+                    walk(columns, out);
+                }
+            }
+        }
+        walk(&self.columns, out);
+    }
+}
+
 /// A FROM source (v0.6).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromItem {
@@ -1746,6 +1843,11 @@ pub enum FromItem {
         /// (column name, type, written type name when composite).
         col_defs: Vec<(String, ColType, Option<String>)>,
         lateral: bool,
+        /// v1.89: the parsed COLUMNS tree when this item is a
+        /// JSON_TABLE table function (name == "json_table"); `args`
+        /// then holds [doc, path-text, vars]. None for every other
+        /// table function.
+        json_table: Option<Box<JsonTableSpec>>,
     },
     Join {
         left: Box<FromItem>,
@@ -5585,7 +5687,33 @@ pub(crate) fn max_param_from(f: &FromItem) -> usize {
         FromItem::Table { .. } => 0,
         FromItem::Derived { sub, .. } => max_param_select(sub),
         // v0.32: table-function args may hold $n parameters.
-        FromItem::Function { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
+        // v1.89: JSON_TABLE DEFAULT-behavior expressions may too.
+        FromItem::Function {
+            args, json_table, ..
+        } => {
+            let mut m = args.iter().map(max_param_expr).max().unwrap_or(0);
+            if let Some(spec) = json_table {
+                fn cols_max(cols: &[JtColumn], m: &mut usize) {
+                    for c in cols {
+                        match c {
+                            JtColumn::Regular {
+                                on_empty, on_error, ..
+                            } => {
+                                *m = (*m).max(max_param_expr(&on_empty.expr));
+                                *m = (*m).max(max_param_expr(&on_error.expr));
+                            }
+                            JtColumn::Exists { on_error, .. } => {
+                                *m = (*m).max(max_param_expr(&on_error.expr));
+                            }
+                            JtColumn::Nested { columns, .. } => cols_max(columns, m),
+                            JtColumn::Ordinality { .. } => {}
+                        }
+                    }
+                }
+                cols_max(&spec.columns, &mut m);
+            }
+            m
+        }
         FromItem::Values { rows, .. } => rows
             .iter()
             .flat_map(|r| r.iter())

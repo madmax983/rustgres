@@ -916,6 +916,7 @@ pub(crate) fn function_item_schema(
 /// caller chooses the scope chain — the outer query's scopes for the
 /// uncorrelated case, one accumulated input row per call for implicit
 /// LATERAL.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_function_item(
     q: &mut Q,
     scopes: &[Scope],
@@ -924,6 +925,7 @@ pub(crate) fn eval_function_item(
     alias: &Option<String>,
     col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
+    json_table: Option<&JsonTableSpec>,
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
     // v1.85: named arguments in FROM-clause function items resolve
     // like everywhere else.
@@ -937,6 +939,24 @@ pub(crate) fn eval_function_item(
     let mut arg_vals = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);
+    }
+    // v1.89: JSON_TABLE — its own evaluator over the jsonpath engine.
+    if name == "json_table" {
+        let spec = json_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "json_table FROM item without a COLUMNS tree".to_string(),
+            )
+        })?;
+        return super::jsontable::eval_json_table(
+            q,
+            scopes,
+            spec,
+            args,
+            &arg_vals,
+            alias,
+            col_aliases,
+        );
     }
     // v1.84: record-returning json functions resolve their row type
     // from the call site (base argument shape or column definitions),
@@ -1330,6 +1350,8 @@ pub(crate) enum LateralRight<'a> {
         col_aliases: &'a [String],
         /// v1.84: typed column definitions (record functions).
         col_defs: &'a [(String, ColType, Option<String>)],
+        /// v1.89: the JSON_TABLE COLUMNS tree (name == "json_table").
+        json_table: Option<&'a JsonTableSpec>,
     },
     Derived {
         sub: &'a SelectStmt,
@@ -1367,6 +1389,7 @@ pub(crate) fn lateral_right_schema(
             alias,
             col_aliases,
             col_defs,
+            json_table,
         } => lateral_function_schema(
             eng,
             snap,
@@ -1377,6 +1400,7 @@ pub(crate) fn lateral_right_schema(
             alias,
             col_aliases,
             col_defs,
+            *json_table,
             // v1.10: arg type inference sees the innermost scope (the
             // immediate left input), as before.
             scope_schemas.last().copied().unwrap_or(&[]),
@@ -1808,9 +1832,18 @@ pub(crate) fn eval_lateral_right(
             alias,
             col_aliases,
             col_defs,
+            json_table,
         } => {
-            let (_, frows) =
-                eval_function_item(q, scopes, name, args, alias, col_aliases, col_defs)?;
+            let (_, frows) = eval_function_item(
+                q,
+                scopes,
+                name,
+                args,
+                alias,
+                col_aliases,
+                col_defs,
+                *json_table,
+            )?;
             Ok(frows)
         }
         LateralRight::Derived { sub, .. } => {
@@ -1899,6 +1932,7 @@ pub(crate) fn eval_lateral_right(
 /// other table function is all-text. Shared by the executor and the
 /// Describe path so wire OIDs agree with execution.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lateral_function_schema(
     eng: &Engine,
     snap: &Snapshot,
@@ -1909,8 +1943,19 @@ pub(crate) fn lateral_function_schema(
     alias: &Option<String>,
     col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
+    json_table: Option<&JsonTableSpec>,
     left: &[QCol],
 ) -> Result<Vec<QCol>, ExecError> {
+    // v1.89: JSON_TABLE's schema comes from its COLUMNS tree.
+    if name == "json_table" {
+        let spec = json_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "json_table FROM item without a COLUMNS tree".to_string(),
+            )
+        })?;
+        return super::jsontable::jt_schema(eng, snap, own, session, spec, alias, col_aliases);
+    }
     // v1.84: record-returning json functions: static schema from the
     // column definition list or the populate base's named type.
     if is_json_record_function(name) {
@@ -2619,8 +2664,18 @@ pub(crate) fn build_source(
             alias,
             col_aliases,
             col_defs,
+            json_table,
             ..
-        } => eval_function_item(q, outer, name, args, alias, col_aliases, col_defs),
+        } => eval_function_item(
+            q,
+            outer,
+            name,
+            args,
+            alias,
+            col_aliases,
+            col_defs,
+            json_table.as_deref(),
+        ),
         FromItem::Derived {
             sub,
             alias,
@@ -2805,6 +2860,7 @@ pub(crate) fn build_source(
                     col_aliases,
                     col_defs,
                     lateral,
+                    json_table,
                 } if *lateral || (is_comma && function_args_lateral(args, &lschema0)) => {
                     Some(LateralRight::Func {
                         name: name.as_str(),
@@ -2812,6 +2868,7 @@ pub(crate) fn build_source(
                         alias: falias,
                         col_aliases: col_aliases.as_slice(),
                         col_defs: col_defs.as_slice(),
+                        json_table: json_table.as_deref(),
                     })
                 }
                 FromItem::Derived {

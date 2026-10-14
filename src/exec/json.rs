@@ -442,11 +442,25 @@ pub(crate) fn json_path<'a>(node: &'a JsonNode, path: &[String]) -> Option<&'a J
 
 /// `->>`/`#>>` text conversion (PG's `normalize_results`): JSON null ->
 /// None (SQL NULL); strings de-escaped; everything else as source text.
-pub(crate) fn json_scalar_text(doc: &JsonDoc, node: &JsonNode) -> Option<String> {
+/// A string containing U+0000 cannot become a PG text value: jsonapi.c
+/// errors "unsupported Unicode escape sequence" (the jsonb tree
+/// conversion in jsonb_from_node has the same check).
+pub(crate) fn json_scalar_text(
+    doc: &JsonDoc,
+    node: &JsonNode,
+) -> Result<Option<String>, ExecError> {
     match &node.kind {
-        JsonKind::Null => None,
-        JsonKind::Str(s) => Some(s.clone()),
-        _ => Some(node_text(doc, node).to_string()),
+        JsonKind::Null => Ok(None),
+        JsonKind::Str(s) => {
+            if s.contains('\0') {
+                return Err(exec_err(
+                    "22P02",
+                    "unsupported Unicode escape sequence: \\u0000 cannot be converted to text",
+                ));
+            }
+            Ok(Some(s.clone()))
+        }
+        _ => Ok(Some(node_text(doc, node).to_string())),
     }
 }
 
@@ -484,9 +498,9 @@ mod tests {
     fn path_and_text() {
         let d = parse_json(r#"{"f2": ["f3", 1]}"#).unwrap();
         let n = json_path(&d.root, &["f2".to_string(), "0".to_string()]).unwrap();
-        assert_eq!(json_scalar_text(&d, n).as_deref(), Some("f3"));
+        assert_eq!(json_scalar_text(&d, n).unwrap().as_deref(), Some("f3"));
         let n = json_path(&d.root, &["f2".to_string(), "1".to_string()]).unwrap();
-        assert_eq!(json_scalar_text(&d, n).as_deref(), Some("1"));
+        assert_eq!(json_scalar_text(&d, n).unwrap().as_deref(), Some("1"));
         assert!(json_path(&d.root, &["nope".to_string()]).is_none());
         // empty path -> whole document
         let n = json_path(&d.root, &[]).unwrap();
@@ -653,7 +667,7 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
         None => Ok(Value::Null),
         // `->>`/`#>>`: JSON null -> SQL NULL, strings de-escaped
         // (PG's `normalize_results`).
-        Some(n) if as_text => match json_scalar_text(&doc, n) {
+        Some(n) if as_text => match json_scalar_text(&doc, n)? {
             Some(s) => Ok(Value::text(s)),
             None => Ok(Value::Null),
         },
@@ -2578,6 +2592,7 @@ pub(crate) const SJ_EMPTY_ARRAY: i64 = 4;
 pub(crate) const SJ_EMPTY_OBJECT: i64 = 5;
 pub(crate) const SJ_TRUE: i64 = 6;
 pub(crate) const SJ_FALSE: i64 = 7;
+pub(crate) const SJ_UNKNOWN: i64 = 8;
 
 fn sj_kind(v: &Value) -> i64 {
     match v {
@@ -2657,6 +2672,208 @@ fn jsonbval_of_sql_value(v: &Value) -> JsonbVal {
     }
 }
 
+/// v1.89: q-aware JSON_VALUE evaluation (intercepted in eval_func).
+/// Identical flow to the `__sqljson_value` arm of eval_sqljson_func,
+/// except the RETURNING conversion resolves the type spec against
+/// the catalog: a domain/composite name converts through the
+/// JSON_TABLE converter (domain NOT NULL / CHECK enforcement —
+/// PG errors coercing a JSON null or a violating scalar into a
+/// NOT NULL domain even under the default behaviors), and a builtin
+/// typmod spec (char(n), varchar(n), numeric(p,s)) converts through
+/// populate_typed's assignment semantics (22001 / typmod overflow
+/// are conversion errors, subject to ON ERROR). Everything else
+/// keeps the v1.85 sqljson_convert_return path.
+/// The builtin string-typmod RETURNING spec of a `__sqljson_value`
+/// call ("character(n)" / "character varying(n)"), if it has one.
+fn sj_string_typmod(spec: Option<&Value>) -> Option<crate::storage::ColType> {
+    let Value::Text(t) = spec? else {
+        return None;
+    };
+    let open = t.find('(')?;
+    let n: i32 = t[open + 1..].trim_end_matches(')').trim().parse().ok()?;
+    match t[..open].trim() {
+        "character" => Some(crate::storage::ColType::Char(Some(n))),
+        "character varying" => Some(crate::storage::ColType::Varchar(Some(n))),
+        _ => None,
+    }
+}
+
+pub(crate) fn eval_sqljson_value_q(q: &mut Q, vals_in: &[Value]) -> Result<Value, ExecError> {
+    if vals_in[0] == Value::Null {
+        return Ok(Value::Null);
+    }
+    // String-category RETURNING with a typmod (char(n)/varchar(n)):
+    // the parser leaves DEFAULT behavior expressions unwrapped (a
+    // plain cast truncates silently); PG coerces them with an
+    // ASSIGNMENT cast (transformJsonBehavior), so an over-length
+    // default is a hard 22001. Apply that coercion eagerly — before
+    // the path runs — mirroring PG's analysis-time coercion of
+    // constant defaults.
+    let mut owned: Vec<Value>;
+    let vals: &[Value] = match sj_string_typmod(vals_in.get(7)) {
+        Some(ty) => {
+            owned = vals_in.to_vec();
+            for (kind_slot, expr_slot) in [(3usize, 4usize), (5usize, 6usize)] {
+                if sj_kind(&owned[kind_slot]) == SJ_EXPR {
+                    owned[expr_slot] = super::cast::eval_assign_cast(&owned[expr_slot], &ty)?;
+                }
+            }
+            &owned
+        }
+        None => vals_in,
+    };
+    let name = "__sqljson_value";
+    let oe_kind = sj_kind(&vals[3]);
+    let or_kind = sj_kind(&vals[5]);
+    let seq = sqljson_run(name, vals, or_kind, &vals[6])?;
+    let seq = match seq {
+        None => return Ok(Value::Null),
+        Some(s) => s,
+    };
+    let item = if seq.is_empty() {
+        match oe_kind {
+            SJ_NULL => return Ok(Value::Null),
+            SJ_EXPR => return Ok(vals[4].clone()),
+            _ => return Err(exec_err("22035", "no SQL/JSON item".to_string())),
+        }
+    } else if seq.len() > 1 {
+        match or_kind {
+            SJ_NULL => return Ok(Value::Null),
+            SJ_EXPR => return Ok(vals[6].clone()),
+            _ => {
+                return Err(exec_err(
+                    "22038",
+                    "singleton SQL/JSON item required".to_string(),
+                ));
+            }
+        }
+    } else {
+        seq.into_iter().next().unwrap()
+    };
+    let spec = match &vals[7] {
+        Value::Text(t) => Some(t.to_string()),
+        _ => None,
+    };
+    // The ON ERROR behavior applied to a RETURNING-conversion error.
+    let on_err = |e: ExecError| -> Result<Value, ExecError> {
+        match or_kind {
+            SJ_NULL => Ok(Value::Null),
+            SJ_EXPR => Ok(vals[6].clone()),
+            _ => Err(e),
+        }
+    };
+    match item {
+        JsonbVal::Null => {
+            // A JSON null converts to SQL NULL — unless the RETURNING
+            // type is a NOT NULL domain, whose coercion PG performs
+            // (and fails) regardless of the item.
+            if let Some(spec) = &spec {
+                if q.eng.db.types.contains_key(spec.as_str()) {
+                    let base = super::jsontable::jt_static_leaf_type(
+                        q.eng,
+                        q.snap,
+                        q.own,
+                        q.session,
+                        crate::storage::ColType::Composite,
+                        &Some(spec.clone()),
+                    )?;
+                    return match super::jsontable::jt_coerce_sql_value(
+                        q,
+                        Value::Null,
+                        base,
+                        &Some(spec.clone()),
+                        None,
+                    ) {
+                        Ok(v) => Ok(v),
+                        Err(e) => on_err(e),
+                    };
+                }
+            }
+            Ok(Value::Null)
+        }
+        JsonbVal::Array(_) | JsonbVal::Object(_) => match or_kind {
+            SJ_NULL => Ok(Value::Null),
+            SJ_EXPR => Ok(vals[6].clone()),
+            _ => Err(exec_err("2203F", "SQL/JSON scalar required".to_string())),
+        },
+        scalar => match sqljson_value_convert(q, &scalar, spec.as_deref()) {
+            Ok(v) => Ok(v),
+            Err(e) => on_err(e),
+        },
+    }
+}
+
+/// The RETURNING conversion for eval_sqljson_value_q (see its docs).
+fn sqljson_value_convert(
+    q: &mut Q,
+    item: &JsonbVal,
+    spec: Option<&str>,
+) -> Result<Value, ExecError> {
+    let Some(spec) = spec else {
+        return Ok(match item {
+            JsonbVal::Bool(b) => Value::Bool(*b),
+            JsonbVal::Number(n) => Value::Numeric(n.clone()),
+            JsonbVal::Str(s) => Value::text(s.clone()),
+            _ => unreachable!(),
+        });
+    };
+    // Domain / composite RETURNING type: full conversion with domain
+    // checks via the JSON_TABLE item converter.
+    if q.eng.db.types.contains_key(spec) {
+        let base = super::jsontable::jt_static_leaf_type(
+            q.eng,
+            q.snap,
+            q.own,
+            q.session,
+            crate::storage::ColType::Composite,
+            &Some(spec.to_string()),
+        )?;
+        return super::jsontable::jt_convert_item(
+            q,
+            item,
+            base,
+            &Some(spec.to_string()),
+            None,
+            false,
+            None,
+        );
+    }
+    // Builtin type with a typmod: char(n) / varchar(n) / numeric(p,s)
+    // convert with assignment semantics via populate_typed.
+    if let Some(open) = spec.find('(') {
+        let (base_name, rest) = spec.split_at(open);
+        let nums: Vec<i64> = rest
+            .trim_matches(|c| c == '(' || c == ')')
+            .split(',')
+            .filter_map(|p| p.trim().parse::<i64>().ok())
+            .collect();
+        let ty = match (base_name.trim(), nums.as_slice()) {
+            ("character", [n]) => Some(crate::storage::ColType::Char(Some(*n as i32))),
+            ("character varying", [n]) => Some(crate::storage::ColType::Varchar(Some(*n as i32))),
+            ("numeric", [p, s]) => Some(crate::storage::ColType::Numeric(Some((
+                *p as u32, *s as i32,
+            )))),
+            _ => None,
+        };
+        if let Some(ty) = ty {
+            let text = match item {
+                JsonbVal::Str(s) => s.clone(),
+                JsonbVal::Number(n) => n.to_text(),
+                JsonbVal::Bool(b) => b.to_string(),
+                _ => item.render(),
+            };
+            let f = super::funcs::PopField {
+                name: String::new(),
+                ty,
+                named: None,
+                sub: None,
+            };
+            return super::funcs::populate_typed(q, &f, None, &JsonbVal::Str(text));
+        }
+    }
+    sqljson_convert_return(item, spec)
+}
+
 /// The __sqljson_* internal builtins the parser desugars
 /// JSON_VALUE / JSON_QUERY / JSON_EXISTS into.
 pub(crate) fn eval_sqljson_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
@@ -2684,6 +2901,7 @@ pub(crate) fn eval_sqljson_func(name: &str, vals: &[Value]) -> Result<Value, Exe
                     return match or_kind {
                         SJ_TRUE => Ok(Value::Bool(true)),
                         SJ_FALSE => Ok(Value::Bool(false)),
+                        SJ_UNKNOWN => Ok(Value::Null),
                         _ => Err(e),
                     };
                 }
@@ -2693,6 +2911,7 @@ pub(crate) fn eval_sqljson_func(name: &str, vals: &[Value]) -> Result<Value, Exe
                 Err(e) => match or_kind {
                     SJ_TRUE => Ok(Value::Bool(true)),
                     SJ_FALSE => Ok(Value::Bool(false)),
+                    SJ_UNKNOWN => Ok(Value::Null),
                     _ => Err(e),
                 },
             }

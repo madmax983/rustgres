@@ -1018,6 +1018,10 @@ impl Parser {
                 | "time"     // v1.86
                 | "timetz"   // v1.86
                 | "interval" // v1.86
+                | "json"     // v1.89: json/jsonb/jsonpath typed literals
+                | "jsonb"    // (jsonb '123' never parsed before — the
+                | "jsonpath" // v1.85 types were registered by name but
+                // not as typed-literal starts)
                 | "bytea"
                 | "uuid"
                 | "regclass"
@@ -6524,6 +6528,7 @@ impl Parser {
         }
         // RETURNING type (VALUE and QUERY).
         let mut returning: Option<ColType> = None;
+        let mut returning_named: Option<String> = None;
         if kind != 2 && self.eat_keyword("returning") {
             let tname = match self.next() {
                 Token::Ident(s) => s,
@@ -6534,12 +6539,20 @@ impl Parser {
                     )));
                 }
             };
-            let (ty, _) = self.parse_type_name_rest(tname)?;
+            // PG19 parse_expr.c: RETURNING a pseudo-type is rejected.
+            if tname == "record" {
+                return Err(err(
+                    "returning pseudo-types is not supported in SQL/JSON functions",
+                ));
+            }
+            let (ty, named) = self.parse_type_name_rest(tname)?;
             returning = Some(ty);
+            returning_named = named;
         }
         // JSON_QUERY wrapper / quotes clauses.
         let mut wrapper: i64 = 0; // 0 without, 1 unconditional, 2 conditional
         let mut keep_quotes = false;
+        let mut quotes_seen = false;
         if kind == 1 {
             loop {
                 if self.eat_keyword("without") {
@@ -6557,12 +6570,21 @@ impl Parser {
                 } else if self.eat_keyword("keep") {
                     self.expect_keyword("quotes")?;
                     keep_quotes = true;
+                    quotes_seen = true;
                 } else if self.eat_keyword("omit") {
                     self.expect_keyword("quotes")?;
                     keep_quotes = false;
+                    quotes_seen = true;
                 } else {
                     break;
                 }
+            }
+            // PG19: QUOTES must not be specified when WITH WRAPPER is
+            // used (either flavor).
+            if wrapper != 0 && quotes_seen {
+                return Err(err(
+                    "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used",
+                ));
             }
         }
         // Behavior clauses: `<behavior> ON EMPTY|ON ERROR` in either
@@ -6594,15 +6616,112 @@ impl Parser {
                 break;
             }
         }
+        // PG19 behavior validity (parse_expr.c transformJsonBehavior
+        // / JsonExpr op dispatch): JSON_VALUE accepts only ERROR,
+        // NULL, or DEFAULT in either clause; JSON_QUERY additionally
+        // accepts the EMPTY family; JSON_EXISTS accepts only ERROR,
+        // TRUE, FALSE, or UNKNOWN ON ERROR.
+        match kind {
+            0 => {
+                if ![0, 1, 2].contains(&oe_kind) {
+                    return Err(err("invalid ON EMPTY behavior"));
+                }
+                if ![0, 1, 2].contains(&or_kind) {
+                    return Err(err("invalid ON ERROR behavior"));
+                }
+            }
+            1 => {
+                if ![0, 1, 2, 3, 4, 5].contains(&oe_kind) {
+                    return Err(err("invalid ON EMPTY behavior"));
+                }
+                if ![0, 1, 2, 3, 4, 5].contains(&or_kind) {
+                    return Err(err("invalid ON ERROR behavior"));
+                }
+            }
+            _ => {
+                if ![0, 6, 7, 8].contains(&or_kind) {
+                    return Err(err("invalid ON ERROR behavior"));
+                }
+            }
+        }
         self.expect(Token::RParen, "')'")?;
         let int_lit = |v: i64| Expr::Literal(Literal::Int(v));
+        // v1.89: PG coerces a DEFAULT behavior expression to the
+        // RETURNING type at plan time — coercion failure (domain NOT
+        // NULL / CHECK, char or numeric typmod overflow, bit length)
+        // is a hard error even when the behavior never fires. For
+        // JSON_VALUE (kind 0), whose evaluator converts items itself,
+        // the desugar therefore wraps a DEFAULT expr in the same cast
+        // a user-written cast would build (CastNamed for domains and
+        // composites, Cast for builtins) — except string-typmod
+        // targets, below. JSON_QUERY (kind 1) defaults are NOT
+        // wrapped: they ride the item path of the query arm and the
+        // outer RETURNING Cast converts the result (the v1.88
+        // semantics); wrapping a jsonb DEFAULT in a plain Cast would
+        // truncate its rendered text ('"bb"' -> '"b' for char(2))
+        // instead of populating the item.
+        let wrap_default = |e: Expr, bk: i64| -> Expr {
+            if bk != 2 || kind != 0 {
+                return e;
+            }
+            match (&returning, &returning_named) {
+                (Some(_), Some(n)) => Expr::CastNamed {
+                    expr: Box::new(e),
+                    name: n.clone(),
+                },
+                (Some(to), None) => {
+                    // PG's transformJsonBehavior coerces a JSON_VALUE
+                    // DEFAULT to a string-category RETURNING type with
+                    // an ASSIGNMENT cast (parse_expr.c: "inputs
+                    // exceeding length cause an error instead of
+                    // silent truncation"). A plain Expr::Cast has
+                    // explicit-cast semantics and would truncate
+                    // 'toolong' to 'too' for varchar(3), so for a
+                    // builtin char/varchar target WITH a typmod the
+                    // default rides unwrapped and eval_sqljson_value_q
+                    // applies eval_assign_cast (22001) eagerly.
+                    if matches!(to, ColType::Char(Some(_)) | ColType::Varchar(Some(_))) {
+                        e
+                    } else {
+                        Expr::Cast {
+                            expr: Box::new(e),
+                            to: *to,
+                            written: None,
+                        }
+                    }
+                }
+                _ => e,
+            }
+        };
+        let oe_expr = wrap_default(oe_expr, oe_kind);
+        let or_expr = wrap_default(or_expr, or_kind);
         // JSON_VALUE's RETURNING conversion is NOT a plain cast in
         // PG (it uses the target type's input semantics — "1.234"
         // to int errors), so the type name rides as an argument and
         // __sqljson_value converts strictly. JSON_QUERY keeps the
-        // plain Cast wrap.
+        // plain Cast wrap. v1.89: the spec keeps the domain/composite
+        // name and any typmod (char(n), numeric(p,s), bit(n)) so the
+        // evaluator can apply domain checks and assignment semantics.
         let ret_name = match (kind, &returning) {
-            (0, Some(ty)) => Expr::Literal(Literal::Text(ty.sql_name().into())),
+            (0, Some(ty)) => {
+                let spec = if let Some(n) = &returning_named {
+                    n.clone()
+                } else {
+                    match ty {
+                        ColType::Char(n) => match n {
+                            Some(n) => format!("character({})", n),
+                            None => "character".to_string(),
+                        },
+                        ColType::Varchar(n) => match n {
+                            Some(n) => format!("character varying({})", n),
+                            None => "character varying".to_string(),
+                        },
+                        ColType::Numeric(Some((p, s))) => format!("numeric({},{})", p, s),
+                        t => t.sql_name(),
+                    }
+                };
+                Expr::Literal(Literal::Text(spec.into()))
+            }
             _ => Expr::Literal(Literal::Null),
         };
         let call = match kind {
@@ -6667,6 +6786,10 @@ impl Parser {
             Token::Ident(s) if s == "false" => {
                 self.next();
                 Ok((7, Expr::Literal(Literal::Null)))
+            }
+            Token::Ident(s) if s == "unknown" => {
+                self.next();
+                Ok((8, Expr::Literal(Literal::Null)))
             }
             Token::Ident(s) if s == "empty" => {
                 self.next();
@@ -8804,6 +8927,14 @@ impl Parser {
             };
             // v0.32: `FROM func(args)` — set-returning table function.
             if *self.peek() == Token::LParen {
+                // v1.89: JSON_TABLE has its own grammar (COLUMNS tree,
+                // PASSING, path names) — a dedicated production. PG
+                // marks JSON_TABLE implicitly LATERAL (its deparse
+                // even gains the keyword), so `lateral` is forced.
+                if name == "json_table" {
+                    self.next();
+                    return self.parse_json_table_from();
+                }
                 self.next();
                 let mut args = Vec::new();
                 if *self.peek() != Token::RParen {
@@ -8853,6 +8984,7 @@ impl Parser {
                     col_aliases,
                     col_defs,
                     lateral,
+                    json_table: None,
                 });
             }
             let alias = self.parse_alias_opt()?;
@@ -8869,6 +9001,370 @@ impl Parser {
                 only,
             })
         }
+    }
+
+    /// v1.89: `JSON_TABLE(doc, path [AS name] [PASSING ...]
+    /// COLUMNS (...) [behavior ON ERROR])` — PG19 gram.y JsonTable.
+    /// The opening '(' is already consumed. Produces a
+    /// FromItem::Function named "json_table" with args
+    /// [doc, path-text, vars] and the COLUMNS tree in `json_table`.
+    /// JSON_TABLE is implicitly LATERAL in PG (doc/PASSING may
+    /// reference preceding FROM items on any join kind).
+    pub(crate) fn parse_json_table_from(&mut self) -> Result<FromItem, SqlError> {
+        let doc = self.parse_or()?;
+        self.expect(Token::Comma, "','")?;
+        let path_expr = self.parse_or()?;
+        let path = Self::jt_path_const(&path_expr)?;
+        // Optional root path name: `AS name` (a bare name is not in
+        // PG's grammar here; AS is required).
+        let path_name = if self.eat_keyword("as") {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        // PASSING expr AS name [, ...] — folded into a
+        // jsonb_build_object vars argument, like parse_sqljson_fn.
+        let mut vars = Expr::Literal(Literal::Null);
+        if self.eat_keyword("passing") {
+            let mut kv: Vec<Expr> = Vec::new();
+            loop {
+                let v = self.parse_or()?;
+                self.expect_keyword("as")?;
+                let nm = self.expect_ident()?;
+                kv.push(Expr::Literal(Literal::Text(nm.into())));
+                kv.push(v);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            vars = Expr::Func {
+                name: "jsonb_build_object".to_string(),
+                args: kv,
+            };
+        }
+        self.expect_keyword("columns")?;
+        self.expect(Token::LParen, "'('")?;
+        let columns = self.parse_jt_columns()?;
+        self.expect(Token::RParen, "')'")?;
+        // Table-level behavior: a single `<behavior> ON ERROR`
+        // (PG has no table-level ON EMPTY). Only ERROR / EMPTY /
+        // EMPTY ARRAY / EMPTY OBJECT are valid — validated here so a
+        // bad behavior errors even for a query that would return no
+        // rows (PG: "invalid ON ERROR behavior").
+        // PG19: the JSON_TABLE-level ON ERROR default is EMPTY (a
+        // root-path error yields zero rows), unlike the ERROR default
+        // of the SQL/JSON query functions — proven by
+        // JSON_TABLE(jsonb'"1.23"', 'strict $.a' ...) returning an
+        // empty table while the same shape with an explicit
+        // ERROR ON ERROR raises.
+        let mut on_error = JtBehavior {
+            kind: 3,
+            expr: Expr::Literal(Literal::Null),
+        };
+        {
+            let save = self.pos;
+            if let Ok((bk, bx)) = self.parse_jt_behavior() {
+                if self.eat_keyword("on") {
+                    if self.eat_keyword("error") {
+                        if !matches!(bk, 0 | 3 | 4 | 5) {
+                            return Err(err(
+                                "invalid ON ERROR behavior: only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause",
+                            ));
+                        }
+                        on_error = JtBehavior { kind: bk, expr: bx };
+                    } else {
+                        return Err(err("syntax error: expected ERROR after ON in JSON_TABLE"));
+                    }
+                } else {
+                    self.pos = save;
+                }
+            } else {
+                self.pos = save;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        let alias = self.parse_alias_opt()?;
+        let col_aliases = self.parse_col_alias_list()?;
+        Ok(FromItem::Function {
+            name: "json_table".to_string(),
+            args: vec![doc, Expr::Literal(Literal::Text(path.into())), vars],
+            alias,
+            col_aliases,
+            col_defs: Vec::new(),
+            lateral: true,
+            json_table: Some(Box::new(JsonTableSpec {
+                path_name,
+                columns,
+                on_error,
+            })),
+        })
+    }
+
+    /// A JSON_TABLE path specification must be a string constant
+    /// (PG19: "only string constants are supported in JSON_TABLE path
+    /// specification"). A cast of a constant (`'$'::text`) is also a
+    /// constant for this purpose.
+    fn jt_path_const(e: &Expr) -> Result<String, SqlError> {
+        match e {
+            Expr::Literal(Literal::Text(s)) => Ok(s.to_string()),
+            Expr::Cast { expr, .. } => Self::jt_path_const(expr),
+            Expr::CastNamed { expr, .. } => Self::jt_path_const(expr),
+            _ => Err(err(
+                "only string constants are supported in JSON_TABLE path specification",
+            )),
+        }
+    }
+
+    /// One JSON_TABLE behavior: the parse_sqljson_behavior set plus
+    /// UNKNOWN (kind 8). Returns (kind, expr).
+    fn parse_jt_behavior(&mut self) -> Result<(i64, Expr), SqlError> {
+        if matches!(self.peek(), Token::Ident(s) if s == "unknown") {
+            self.next();
+            return Ok((8, Expr::Literal(Literal::Null)));
+        }
+        self.parse_sqljson_behavior()
+    }
+
+    /// Parse `<behavior> ON EMPTY|ON ERROR` clauses (each at most
+    /// once, either order) into (on_empty, on_error), starting from
+    /// the PG defaults for the column kind.
+    fn parse_jt_behaviors(
+        &mut self,
+        on_empty: &mut JtBehavior,
+        on_error: &mut JtBehavior,
+    ) -> Result<(bool, bool), SqlError> {
+        let mut seen_empty = false;
+        let mut seen_error = false;
+        for _ in 0..2 {
+            let save = self.pos;
+            let (bk, bx) = match self.parse_jt_behavior() {
+                Ok(x) => x,
+                Err(_) => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            if self.eat_keyword("on") {
+                if self.eat_keyword("empty") {
+                    *on_empty = JtBehavior { kind: bk, expr: bx };
+                    seen_empty = true;
+                } else if self.eat_keyword("error") {
+                    *on_error = JtBehavior { kind: bk, expr: bx };
+                    seen_error = true;
+                } else {
+                    return Err(err("syntax error: expected EMPTY or ERROR after ON"));
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        Ok((seen_empty, seen_error))
+    }
+
+    /// v1.89: the COLUMNS (...) list of a JSON_TABLE node (the '(' is
+    /// already consumed; the caller consumes the ')'). At least one
+    /// column is required (an empty list is a syntax error in PG).
+    pub(crate) fn parse_jt_columns(&mut self) -> Result<Vec<JtColumn>, SqlError> {
+        let mut cols: Vec<JtColumn> = Vec::new();
+        let mut ordinality_seen = false;
+        loop {
+            // NESTED PATH '...' [AS name] COLUMNS (...)
+            if matches!(self.peek(), Token::Ident(s) if s == "nested") {
+                self.next();
+                self.expect_keyword("path")?;
+                let pexpr = self.parse_or()?;
+                let path = Self::jt_path_const(&pexpr)?;
+                let path_name = if self.eat_keyword("as") {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                self.expect_keyword("columns")?;
+                self.expect(Token::LParen, "'('")?;
+                let sub = self.parse_jt_columns()?;
+                self.expect(Token::RParen, "')'")?;
+                cols.push(JtColumn::Nested {
+                    path,
+                    path_name,
+                    columns: sub,
+                });
+            } else {
+                let cname = self.expect_ident()?;
+                if self.eat_keyword("for") {
+                    self.expect_keyword("ordinality")?;
+                    if ordinality_seen {
+                        return Err(err("only one FOR ORDINALITY column is allowed"));
+                    }
+                    ordinality_seen = true;
+                    cols.push(JtColumn::Ordinality { name: cname });
+                } else {
+                    // Column type. bit(n)/varbit(n): ColType::Bit
+                    // drops the typmod, so consume it here when the
+                    // type parser left it behind.
+                    let is_bit =
+                        matches!(self.peek(), Token::Ident(s) if s == "bit" || s == "varbit");
+                    let (ty, named) = self.parse_type_name()?;
+                    let bit_len = if is_bit && *self.peek() == Token::LParen {
+                        self.parse_opt_typmod()?
+                    } else {
+                        None
+                    };
+                    let format_json = if self.eat_keyword("format") {
+                        self.expect_keyword("json")?;
+                        // Optional ENCODING xxx — accepted, ignored
+                        // (the engine is UTF-8 throughout).
+                        if self.eat_keyword("encoding") {
+                            let _ = self.expect_ident()?;
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    let null_b = || JtBehavior {
+                        kind: 1,
+                        expr: Expr::Literal(Literal::Null),
+                    };
+                    if self.eat_keyword("exists") {
+                        // EXISTS [PATH '...'] [behavior ON ERROR].
+                        // The path defaults to the implicit one.
+                        let path = if self.eat_keyword("path") {
+                            let pe = self.parse_or()?;
+                            Self::jt_path_const(&pe)?
+                        } else {
+                            format!("$.\"{}\"", cname.replace('"', "\"\""))
+                        };
+                        // PG's default ON ERROR for EXISTS is FALSE.
+                        let mut on_error = JtBehavior {
+                            kind: 7,
+                            expr: Expr::Literal(Literal::Null),
+                        };
+                        let mut on_empty = null_b();
+                        let (seen_empty, _) =
+                            self.parse_jt_behaviors(&mut on_empty, &mut on_error)?;
+                        if seen_empty {
+                            return Err(err(
+                                "syntax error: ON EMPTY clause is not allowed for EXISTS columns",
+                            ));
+                        }
+                        // PG19 parse_expr.c: EXISTS columns allow
+                        // only ERROR, TRUE, FALSE, or UNKNOWN ON ERROR.
+                        if !matches!(on_error.kind, 0 | 6 | 7 | 8) {
+                            return Err(err(format!(
+                                "invalid ON ERROR behavior for column \"{cname}\""
+                            )));
+                        }
+                        cols.push(JtColumn::Exists {
+                            name: cname,
+                            ty,
+                            named,
+                            bit_len,
+                            path,
+                            on_error,
+                        });
+                    } else {
+                        // [PATH '...'] — omitted means '$."<name>"'.
+                        let path = if self.eat_keyword("path") {
+                            let pe = self.parse_or()?;
+                            Self::jt_path_const(&pe)?
+                        } else {
+                            format!("$.\"{}\"", cname.replace('"', "\"\""))
+                        };
+                        // Wrapper / quotes clauses, either order.
+                        let mut wrapper: i64 = 0;
+                        let mut quotes: Option<bool> = None;
+                        loop {
+                            if self.eat_keyword("without") {
+                                self.expect_keyword("wrapper")?;
+                                wrapper = 0;
+                            } else if self.eat_keyword("with") {
+                                if self.eat_keyword("conditional") {
+                                    wrapper = 2;
+                                } else {
+                                    self.eat_keyword("unconditional");
+                                    wrapper = 1;
+                                }
+                                self.expect_keyword("wrapper")?;
+                            } else if self.eat_keyword("keep") {
+                                self.expect_keyword("quotes")?;
+                                // PG19: KEEP QUOTES [ON SCALAR STRING]
+                                self.eat_keyword("on");
+                                if matches!(self.peek(), Token::Ident(s) if s == "scalar") {
+                                    self.next();
+                                    self.expect_keyword("string")?;
+                                }
+                                quotes = Some(true);
+                            } else if self.eat_keyword("omit") {
+                                self.expect_keyword("quotes")?;
+                                self.eat_keyword("on");
+                                if matches!(self.peek(), Token::Ident(s) if s == "scalar") {
+                                    self.next();
+                                    self.expect_keyword("string")?;
+                                }
+                                quotes = Some(false);
+                            } else {
+                                break;
+                            }
+                        }
+                        if wrapper != 0 && quotes == Some(false) {
+                            return Err(err(
+                                "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used",
+                            ));
+                        }
+                        // Defaults for a regular JSON_TABLE column
+                        // are NULL ON EMPTY / NULL ON ERROR (PG19 —
+                        // proven by the json_table_test expected
+                        // output, where failed conversions and type
+                        // errors land as NULL without an error).
+                        let mut on_empty = null_b();
+                        let mut on_error = null_b();
+                        self.parse_jt_behaviors(&mut on_empty, &mut on_error)?;
+                        // PG19 parse_expr.c behavior validity: a
+                        // scalar (JSON_VALUE) column allows only
+                        // ERROR, NULL, or DEFAULT in either clause; a
+                        // formatted (JSON_QUERY) column additionally
+                        // allows EMPTY / EMPTY ARRAY / EMPTY OBJECT.
+                        let formatted = format_json || quotes.is_some() || wrapper != 0;
+                        let valid = |k: i64| {
+                            matches!(k, 0 | 1 | 2) || (formatted && matches!(k, 3 | 4 | 5))
+                        };
+                        if !valid(on_empty.kind) {
+                            return Err(err(format!(
+                                "invalid ON EMPTY behavior for column \"{cname}\""
+                            )));
+                        }
+                        if !valid(on_error.kind) {
+                            return Err(err(format!(
+                                "invalid ON ERROR behavior for column \"{cname}\""
+                            )));
+                        }
+                        cols.push(JtColumn::Regular {
+                            name: cname,
+                            ty,
+                            named,
+                            bit_len,
+                            format_json,
+                            path,
+                            wrapper,
+                            quotes,
+                            on_empty,
+                            on_error,
+                        });
+                    }
+                }
+            }
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        if cols.is_empty() {
+            return Err(err("syntax error: JSON_TABLE requires at least one column"));
+        }
+        Ok(cols)
     }
 
     /// `(a, b, c)` column alias list after a table alias, or empty when
